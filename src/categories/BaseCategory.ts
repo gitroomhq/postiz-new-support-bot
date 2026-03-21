@@ -49,7 +49,8 @@ export abstract class BaseCategory {
   async handleModalSubmit(
     interaction: ModalSubmitInteraction,
     responder: (prompt: string, onUpdate?: (messages: string[]) => void) => Promise<string | string[]>,
-    threadsChannel: TextChannel
+    threadsChannel: TextChannel,
+    userInfo?: { postizUserId?: string | null; stripeCustomerId?: string | null }
   ): Promise<void> {
     await interaction.deferReply({ flags: 64 });
 
@@ -69,6 +70,17 @@ export abstract class BaseCategory {
         .setTitle("Your question")
         .setDescription(userInput)
         .setColor(0x2b2d31);
+
+      if (userInfo?.postizUserId || userInfo?.stripeCustomerId) {
+        const fields: { name: string; value: string; inline: boolean }[] = [];
+        if (userInfo.postizUserId) {
+          fields.push({ name: "Postiz ID", value: `\`${userInfo.postizUserId}\``, inline: true });
+        }
+        if (userInfo.stripeCustomerId) {
+          fields.push({ name: "Stripe ID", value: `\`${userInfo.stripeCustomerId}\``, inline: true });
+        }
+        questionEmbed.addFields(fields);
+      }
 
       await thread.send({ embeds: [questionEmbed] });
 

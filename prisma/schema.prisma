@@ -9,8 +9,9 @@ datasource db {
 
 model UserSession {
   id              String   @id @default(cuid())
-  discordUserId   String   @unique
-  accessToken     String
+  discordUserId    String   @unique
+  accessToken      String
+  postizUserId     String?
   stripeCustomerId String?
   authenticatedAt DateTime @default(now())
   updatedAt       DateTime @updatedAt

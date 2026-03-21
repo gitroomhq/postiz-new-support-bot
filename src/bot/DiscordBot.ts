@@ -242,7 +242,10 @@ export class DiscordBot {
     const responder = (prompt: string, onUpdate?: (messages: string[]) => void) =>
       this.claudeRunner.run(prompt, onUpdate);
 
-    await category.handleModalSubmit(interaction, responder, threadsChannel);
+    await category.handleModalSubmit(interaction, responder, threadsChannel, {
+      postizUserId: session.postizUserId,
+      stripeCustomerId: session.stripeCustomerId,
+    });
   }
 
   private async handleCreateIssue(interaction: ButtonInteraction): Promise<void> {

@@ -3,11 +3,11 @@ import { PrismaClient } from "../generated/prisma/client";
 export class SessionStore {
   constructor(private prisma: PrismaClient) {}
 
-  async setSession(discordUserId: string, accessToken: string, stripeCustomerId?: string): Promise<void> {
+  async setSession(discordUserId: string, accessToken: string, postizUserId?: string, stripeCustomerId?: string): Promise<void> {
     await this.prisma.userSession.upsert({
       where: { discordUserId },
-      update: { accessToken, stripeCustomerId, authenticatedAt: new Date() },
-      create: { discordUserId, accessToken, stripeCustomerId },
+      update: { accessToken, postizUserId, stripeCustomerId, authenticatedAt: new Date() },
+      create: { discordUserId, accessToken, postizUserId, stripeCustomerId },
     });
   }
 

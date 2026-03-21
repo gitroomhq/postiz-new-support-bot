@@ -21,7 +21,7 @@ export class OAuthManager {
     return `${this.config.postiz.frontendUrl}/oauth/authorize?${params.toString()}`;
   }
 
-  async exchangeCode(code: string): Promise<{ accessToken: string; stripeCustomerId?: string }> {
+  async exchangeCode(code: string): Promise<{ accessToken: string; postizUserId?: string; stripeCustomerId?: string }> {
     const response = await fetch(`${this.config.postiz.apiUrl}/oauth/token`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -38,8 +38,8 @@ export class OAuthManager {
       throw new Error(`Token exchange failed: ${(error as any).error || response.statusText}`);
     }
 
-    const data = (await response.json()) as { access_token: string; cus?: string };
-    return { accessToken: data.access_token, stripeCustomerId: data.cus };
+    const data = (await response.json()) as { access_token: string; id?: string; cus?: string };
+    return { accessToken: data.access_token, postizUserId: data.id, stripeCustomerId: data.cus };
   }
 
   async handleCallback(code: string, state: string): Promise<{ discordUserId: string; channelId: string }> {
@@ -48,8 +48,8 @@ export class OAuthManager {
       throw new Error("Invalid or expired state parameter");
     }
 
-    const { accessToken, stripeCustomerId } = await this.exchangeCode(code);
-    await this.sessionStore.setSession(pending.discordUserId, accessToken, stripeCustomerId);
+    const { accessToken, postizUserId, stripeCustomerId } = await this.exchangeCode(code);
+    await this.sessionStore.setSession(pending.discordUserId, accessToken, postizUserId, stripeCustomerId);
 
     return { discordUserId: pending.discordUserId, channelId: pending.channelId };
   }
