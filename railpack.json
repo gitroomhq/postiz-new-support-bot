@@ -1,0 +1,15 @@
+{
+  "$schema": "https://schema.railpack.com",
+  "buildAptPackages": ["git"],
+  "steps": {
+    "install": {
+      "commands": [
+        "...",
+        "npm install -g @anthropic-ai/claude-code"
+      ]
+    }
+  },
+  "deploy": {
+    "aptPackages": ["git"]
+  }
+}

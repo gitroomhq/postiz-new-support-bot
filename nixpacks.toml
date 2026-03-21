@@ -1,5 +1,0 @@
-[phases.setup]
-nixPkgs = ["...", "git"]
-
-[phases.install]
-cmds = ["pnpm install", "npm install -g @anthropic-ai/claude-code"]
