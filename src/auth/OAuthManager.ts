@@ -1,0 +1,56 @@
+import crypto from "crypto";
+import { BotConfig } from "../config";
+import { SessionStore } from "./SessionStore";
+
+export class OAuthManager {
+  constructor(
+    private config: BotConfig,
+    private sessionStore: SessionStore
+  ) {}
+
+  async generateAuthUrl(discordUserId: string, channelId: string): Promise<string> {
+    const state = crypto.randomBytes(32).toString("hex");
+    await this.sessionStore.addPendingAuth(state, discordUserId, channelId);
+
+    const params = new URLSearchParams({
+      client_id: this.config.postiz.clientId,
+      response_type: "code",
+      state,
+    });
+
+    return `${this.config.postiz.frontendUrl}/oauth/authorize?${params.toString()}`;
+  }
+
+  async exchangeCode(code: string): Promise<{ accessToken: string; stripeCustomerId?: string }> {
+    const response = await fetch(`${this.config.postiz.apiUrl}/oauth/token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        grant_type: "authorization_code",
+        code,
+        client_id: this.config.postiz.clientId,
+        client_secret: this.config.postiz.clientSecret,
+      }),
+    });
+
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({}));
+      throw new Error(`Token exchange failed: ${(error as any).error || response.statusText}`);
+    }
+
+    const data = (await response.json()) as { access_token: string; cus?: string };
+    return { accessToken: data.access_token, stripeCustomerId: data.cus };
+  }
+
+  async handleCallback(code: string, state: string): Promise<{ discordUserId: string; channelId: string }> {
+    const pending = await this.sessionStore.consumePendingAuth(state);
+    if (!pending) {
+      throw new Error("Invalid or expired state parameter");
+    }
+
+    const { accessToken, stripeCustomerId } = await this.exchangeCode(code);
+    await this.sessionStore.setSession(pending.discordUserId, accessToken, stripeCustomerId);
+
+    return { discordUserId: pending.discordUserId, channelId: pending.channelId };
+  }
+}

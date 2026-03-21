@@ -1,0 +1,39 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model UserSession {
+  id              String   @id @default(cuid())
+  discordUserId   String   @unique
+  accessToken     String
+  stripeCustomerId String?
+  authenticatedAt DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@map("user_sessions")
+}
+
+model BillingAction {
+  id              String   @id @default(cuid())
+  discordUserId   String
+  stripeInvoiceId String   @unique
+  action          String   // "refund" or "discount"
+  createdAt       DateTime @default(now())
+
+  @@map("billing_actions")
+}
+
+model PendingAuth {
+  id            String   @id @default(cuid())
+  state         String   @unique
+  discordUserId String
+  channelId     String
+  createdAt     DateTime @default(now())
+
+  @@map("pending_auths")
+}
