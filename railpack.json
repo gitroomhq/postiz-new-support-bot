@@ -1,11 +1,11 @@
 {
   "$schema": "https://schema.railpack.com",
-  "buildAptPackages": ["git"],
+  "buildAptPackages": ["git", "curl"],
   "steps": {
     "install": {
       "commands": [
         "...",
-        "npm install -g @anthropic-ai/claude-code"
+        "curl -fsSL https://claude.ai/install.sh | bash"
       ]
     }
   },

@@ -34,6 +34,7 @@ export class ClaudeCodeRunner {
         timeout: 120_000,
         env: {
           ...process.env,
+          PATH: `${process.env.HOME}/.claude/bin:${process.env.PATH}`,
           ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY,
         },
       });
