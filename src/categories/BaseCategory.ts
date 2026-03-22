@@ -89,15 +89,8 @@ export abstract class BaseCategory {
       });
 
       // Thinking animation until first real content arrives
-      const thinkingMsg = await thread.send({ content: "Thinking" });
-      let dotCount = 0;
+      const thinkingMsg = await thread.send({ content: "Thinking (that might take a while)..." });
       let hasContent = false;
-      const thinkingInterval = setInterval(() => {
-        if (hasContent) return;
-        dotCount = (dotCount + 1) % 4;
-        const dots = ".".repeat(dotCount);
-        thinkingMsg.edit({ content: `Thinking${dots}` }).catch(() => {});
-      }, 1000);
 
       // One Discord message per assistant message, updated as they stream in
       const discordMessages = new Map<number, Message>();
@@ -107,7 +100,6 @@ export abstract class BaseCategory {
       const result = await responder(prompt, (messages: string[]) => {
         if (!hasContent) {
           hasContent = true;
-          clearInterval(thinkingInterval);
           // Reuse thinking message for the first streamed message
           discordMessages.set(0, thinkingMsg);
         }
@@ -131,8 +123,6 @@ export abstract class BaseCategory {
           }
         }
       });
-
-      clearInterval(thinkingInterval);
 
       // If no streaming happened, reuse the thinking message for the final result
       if (!hasContent) {
