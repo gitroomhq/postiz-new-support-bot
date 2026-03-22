@@ -380,7 +380,25 @@ export class DiscordBot {
     const callbackServer = new CallbackServer(
       this.config,
       this.oauthManager,
-      this.client
+      this.client,
+      async (discordUserId: string) => {
+        const user = await this.client.users.fetch(discordUserId);
+        const selectMenu = this.buildCategorySelectMenu();
+        const selectRow = new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(selectMenu);
+
+        const logoutButton = new ButtonBuilder()
+          .setCustomId(`auth_logout:${discordUserId}`)
+          .setLabel("Logout")
+          .setEmoji("🚪")
+          .setStyle(ButtonStyle.Danger);
+
+        const buttonRow = new ActionRowBuilder<ButtonBuilder>().addComponents(logoutButton);
+
+        await user.send({
+          content: "You're now authenticated! Select a category below:",
+          components: [selectRow, buttonRow],
+        });
+      }
     );
     callbackServer.start();
   }

@@ -9,7 +9,8 @@ export class CallbackServer {
   constructor(
     private config: BotConfig,
     private oauthManager: OAuthManager,
-    private discordClient: Client
+    private discordClient: Client,
+    private onAuthSuccess?: (discordUserId: string) => Promise<void>
   ) {
     this.app = express();
     this.setupRoutes();
@@ -38,8 +39,9 @@ export class CallbackServer {
         res.send("Successfully authenticated! You can close this window and return to Discord.");
 
         try {
-          const user = await this.discordClient.users.fetch(discordUserId);
-          await user.send("You're now authenticated! Head back to the support channel and click a category to get help.");
+          if (this.onAuthSuccess) {
+            await this.onAuthSuccess(discordUserId);
+          }
         } catch {
           // User may have DMs disabled — that's fine, they'll see it works when they click a button
         }
