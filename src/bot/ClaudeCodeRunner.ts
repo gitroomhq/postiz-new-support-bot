@@ -17,7 +17,7 @@ export class ClaudeCodeRunner {
     return new Promise((resolve, reject) => {
       const args = [
         "-p",
-        prompt,
+        "We need support for Postiz cloud version only (not self-hosted), and try to output the reference of line and file in github in the end: " + prompt,
         "--allowedTools", "Read", "Glob", "Grep",
         "--permission-mode", "bypassPermissions",
         "--model", "sonnet",
