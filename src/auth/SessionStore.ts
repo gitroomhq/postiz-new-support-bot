@@ -30,9 +30,9 @@ export class SessionStore {
     return session !== null;
   }
 
-  async addPendingAuth(state: string, discordUserId: string, channelId: string): Promise<void> {
+  async addPendingAuth(state: string, discordUserId: string, channelId: string, interactionToken?: string): Promise<void> {
     await this.prisma.pendingAuth.create({
-      data: { state, discordUserId, channelId },
+      data: { state, discordUserId, channelId, interactionToken },
     });
   }
 

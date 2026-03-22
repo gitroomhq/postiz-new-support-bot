@@ -1,7 +1,6 @@
 import express, { type Express } from "express";
 import { BotConfig } from "../config";
 import { OAuthManager } from "../auth/OAuthManager";
-import { Client } from "discord.js";
 
 export class CallbackServer {
   private app: Express;
@@ -9,8 +8,7 @@ export class CallbackServer {
   constructor(
     private config: BotConfig,
     private oauthManager: OAuthManager,
-    private discordClient: Client,
-    private onAuthSuccess?: (discordUserId: string) => Promise<void>
+    private onAuthSuccess?: (discordUserId: string, interactionToken: string | null) => Promise<void>
   ) {
     this.app = express();
     this.setupRoutes();
@@ -31,7 +29,7 @@ export class CallbackServer {
       }
 
       try {
-        const { discordUserId, channelId } = await this.oauthManager.handleCallback(
+        const { discordUserId, interactionToken } = await this.oauthManager.handleCallback(
           code as string,
           state as string
         );
@@ -40,10 +38,10 @@ export class CallbackServer {
 
         try {
           if (this.onAuthSuccess) {
-            await this.onAuthSuccess(discordUserId);
+            await this.onAuthSuccess(discordUserId, interactionToken);
           }
         } catch {
-          // User may have DMs disabled — that's fine, they'll see it works when they click a button
+          // Interaction token may have expired — that's fine, they'll see it works when they click Start Here again
         }
       } catch (err) {
         console.error("OAuth callback error:", err);

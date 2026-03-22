@@ -30,11 +30,12 @@ model BillingAction {
 }
 
 model PendingAuth {
-  id            String   @id @default(cuid())
-  state         String   @unique
-  discordUserId String
-  channelId     String
-  createdAt     DateTime @default(now())
+  id               String   @id @default(cuid())
+  state            String   @unique
+  discordUserId    String
+  channelId        String
+  interactionToken String?
+  createdAt        DateTime @default(now())
 
   @@map("pending_auths")
 }

@@ -6,6 +6,7 @@ import {
   ButtonStyle,
   StringSelectMenuBuilder,
   EmbedBuilder,
+  WebhookClient,
   type Interaction,
   type ChatInputCommandInteraction,
   type ButtonInteraction,
@@ -141,7 +142,8 @@ export class DiscordBot {
     if (!(await this.sessionStore.isAuthenticated(interaction.user.id))) {
       const authUrl = await this.oauthManager.generateAuthUrl(
         interaction.user.id,
-        interaction.channelId
+        interaction.channelId,
+        interaction.token
       );
 
       const embed = new EmbedBuilder()
@@ -380,9 +382,9 @@ export class DiscordBot {
     const callbackServer = new CallbackServer(
       this.config,
       this.oauthManager,
-      this.client,
-      async (discordUserId: string) => {
-        const user = await this.client.users.fetch(discordUserId);
+      async (discordUserId: string, interactionToken: string | null) => {
+        if (!interactionToken) return;
+
         const selectMenu = this.buildCategorySelectMenu();
         const selectRow = new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(selectMenu);
 
@@ -394,8 +396,9 @@ export class DiscordBot {
 
         const buttonRow = new ActionRowBuilder<ButtonBuilder>().addComponents(logoutButton);
 
-        await user.send({
-          content: "You're now authenticated! Select a category below:",
+        const webhook = new WebhookClient({ id: this.config.discord.clientId, token: interactionToken });
+        await webhook.editMessage("@original", {
+          embeds: [],
           components: [selectRow, buttonRow],
         });
       }

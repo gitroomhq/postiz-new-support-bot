@@ -8,9 +8,9 @@ export class OAuthManager {
     private sessionStore: SessionStore
   ) {}
 
-  async generateAuthUrl(discordUserId: string, channelId: string): Promise<string> {
+  async generateAuthUrl(discordUserId: string, channelId: string, interactionToken?: string): Promise<string> {
     const state = crypto.randomBytes(32).toString("hex");
-    await this.sessionStore.addPendingAuth(state, discordUserId, channelId);
+    await this.sessionStore.addPendingAuth(state, discordUserId, channelId, interactionToken);
 
     const params = new URLSearchParams({
       client_id: this.config.postiz.clientId,
@@ -42,7 +42,7 @@ export class OAuthManager {
     return { accessToken: data.access_token, postizUserId: data.id, stripeCustomerId: data.cus };
   }
 
-  async handleCallback(code: string, state: string): Promise<{ discordUserId: string; channelId: string }> {
+  async handleCallback(code: string, state: string): Promise<{ discordUserId: string; channelId: string; interactionToken: string | null }> {
     const pending = await this.sessionStore.consumePendingAuth(state);
     if (!pending) {
       throw new Error("Invalid or expired state parameter");
@@ -51,6 +51,6 @@ export class OAuthManager {
     const { accessToken, postizUserId, stripeCustomerId } = await this.exchangeCode(code);
     await this.sessionStore.setSession(pending.discordUserId, accessToken, postizUserId, stripeCustomerId);
 
-    return { discordUserId: pending.discordUserId, channelId: pending.channelId };
+    return { discordUserId: pending.discordUserId, channelId: pending.channelId, interactionToken: pending.interactionToken };
   }
 }
