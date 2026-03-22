@@ -30,7 +30,6 @@ export class ClaudeCodeRunner {
 
       const claudeBin = path.resolve(__dirname, "../../node_modules/.bin/claude");
 
-
       const child = spawn(claudeBin, args, {
         cwd: this.searchDir,
         stdio: ["pipe", "pipe", "pipe"],

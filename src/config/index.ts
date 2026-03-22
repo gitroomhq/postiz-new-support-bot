@@ -49,8 +49,8 @@ export function loadConfig(): BotConfig {
       clientSecret: required("POSTIZ_CLIENT_SECRET"),
     },
     github: {
-      token: required("GITHUB_TOKEN"),
-      repo: required("GITHUB_REPO"),
+      token: required("GH_BOT_TOKEN"),
+      repo: required("GH_BOT_REPO"),
     },
     stripe: {
       secretKey: required("STRIPE_SECRET_KEY"),
