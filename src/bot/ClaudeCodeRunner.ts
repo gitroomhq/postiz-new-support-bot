@@ -37,6 +37,7 @@ export class ClaudeCodeRunner {
         env: {
           ...process.env,
           ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY,
+          IS_SANDBOX: "1",
         },
       });
 
