@@ -39,7 +39,7 @@ export class DiscordBot {
     private categoryRegistry: CategoryRegistry
   ) {
     this.client = new Client({
-      intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages],
+      intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.GuildMembers],
     });
 
     this.rest = new REST({ version: "10" }).setToken(config.discord.token);
@@ -247,7 +247,7 @@ export class DiscordBot {
     await category.handleModalSubmit(interaction, responder, threadsChannel, {
       postizUserId: session.postizUserId,
       stripeCustomerId: session.stripeCustomerId,
-    });
+    }, this.config.discord.supportRoleId);
   }
 
   private async handleCreateIssue(interaction: ButtonInteraction): Promise<void> {

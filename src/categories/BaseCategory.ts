@@ -50,7 +50,8 @@ export abstract class BaseCategory {
     interaction: ModalSubmitInteraction,
     responder: (prompt: string, onUpdate?: (messages: string[]) => void) => Promise<string | string[]>,
     threadsChannel: TextChannel,
-    userInfo?: { postizUserId?: string | null; stripeCustomerId?: string | null }
+    userInfo?: { postizUserId?: string | null; stripeCustomerId?: string | null },
+    supportRoleId?: string
   ): Promise<void> {
     await interaction.deferReply({ flags: 64 });
 
@@ -65,6 +66,24 @@ export abstract class BaseCategory {
       });
 
       await thread.members.add(interaction.user.id);
+
+      // Add support role members so staff can see ticket content
+      if (supportRoleId) {
+        try {
+          const guild = threadsChannel.guild;
+          const role = await guild.roles.fetch(supportRoleId);
+          if (role) {
+            const members = role.members;
+            for (const [memberId] of members) {
+              if (memberId !== interaction.user.id) {
+                await thread.members.add(memberId).catch(() => {});
+              }
+            }
+          }
+        } catch {
+          // Don't block ticket creation if adding support members fails
+        }
+      }
 
       const questionEmbed = new EmbedBuilder()
         .setTitle("Your question")
