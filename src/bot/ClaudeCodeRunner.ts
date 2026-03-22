@@ -28,13 +28,14 @@ export class ClaudeCodeRunner {
         "--include-partial-messages",
       ];
 
-      const child = spawn("claude", args, {
+      const claudeBin = path.resolve(__dirname, "../../node_modules/.bin/claude");
+
+      const child = spawn(claudeBin, args, {
         cwd: this.searchDir,
         stdio: ["pipe", "pipe", "pipe"],
         timeout: 120_000,
         env: {
           ...process.env,
-          PATH: `${process.env.HOME}/.claude/bin:${process.env.PATH}`,
           ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY,
         },
       });
