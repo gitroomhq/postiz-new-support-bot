@@ -39,3 +39,16 @@ model PendingAuth {
 
   @@map("pending_auths")
 }
+
+model SupportThread {
+  id               String    @id @default(cuid())
+  threadId         String    @unique
+  guildId          String
+  lastActivityAt   DateTime  @default(now())
+  warningSentAt    DateTime?
+  warningMessageId String?
+  closedAt         DateTime?
+  createdAt        DateTime  @default(now())
+
+  @@map("support_threads")
+}

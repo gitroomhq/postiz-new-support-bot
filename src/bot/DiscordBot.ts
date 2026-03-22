@@ -24,10 +24,13 @@ import { GitHubClient } from "./GitHubClient";
 import { CategoryRegistry } from "./CategoryRegistry";
 import { CallbackServer } from "../server/CallbackServer";
 import { BillingCategory } from "../categories/BillingCategory";
+import { ThreadStore } from "../auth/ThreadStore";
+import { ThreadInactivityMonitor } from "./ThreadInactivityMonitor";
 
 export class DiscordBot {
   readonly client: Client;
   private rest: REST;
+  private inactivityMonitor: ThreadInactivityMonitor | null = null;
 
   constructor(
     private config: BotConfig,
@@ -36,7 +39,8 @@ export class DiscordBot {
     private apiClient: PostizApiClient,
     private claudeRunner: ClaudeCodeRunner,
     private githubClient: GitHubClient,
-    private categoryRegistry: CategoryRegistry
+    private categoryRegistry: CategoryRegistry,
+    private threadStore: ThreadStore
   ) {
     this.client = new Client({
       intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.GuildMembers],
@@ -53,6 +57,13 @@ export class DiscordBot {
 
     this.client.on("interactionCreate", (interaction) => {
       this.handleInteraction(interaction).catch(console.error);
+    });
+
+    this.client.on("messageCreate", (message) => {
+      // Update the thread's last-activity timestamp whenever a human sends a message
+      if (!message.author.bot && message.channel.isThread()) {
+        this.threadStore.updateActivity(message.channelId).catch(() => {});
+      }
     });
   }
 
@@ -91,6 +102,11 @@ export class DiscordBot {
   }
 
   private async handleButton(interaction: ButtonInteraction): Promise<void> {
+    if (interaction.customId === "inactivity_yes" || interaction.customId === "inactivity_no") {
+      await this.handleInactivityResponse(interaction);
+      return;
+    }
+
     if (interaction.customId.startsWith("feedback_yes:") || interaction.customId.startsWith("feedback_no:")) {
       await this.handleFeedback(interaction);
       return;
@@ -198,7 +214,9 @@ export class DiscordBot {
         await interaction.reply({ content: "Support threads channel is misconfigured.", flags: 64 });
         return;
       }
-      await this.getBillingCategory().handleBillingSubOption(interaction, threadsChannel);
+      const onThreadCreated = (threadId: string, guildId: string) =>
+        this.threadStore.registerThread(threadId, guildId).catch(console.error);
+      await this.getBillingCategory().handleBillingSubOption(interaction, threadsChannel, onThreadCreated);
       return;
     }
 
@@ -244,10 +262,17 @@ export class DiscordBot {
     const responder = (prompt: string, onUpdate?: (messages: string[]) => void) =>
       this.claudeRunner.run(prompt, onUpdate);
 
-    await category.handleModalSubmit(interaction, responder, threadsChannel, {
-      postizUserId: session.postizUserId,
-      stripeCustomerId: session.stripeCustomerId,
-    }, this.config.discord.supportRoleId);
+    const onThreadCreated = (threadId: string, guildId: string) =>
+      this.threadStore.registerThread(threadId, guildId).catch(console.error);
+
+    await category.handleModalSubmit(
+      interaction,
+      responder,
+      threadsChannel,
+      { postizUserId: session.postizUserId, stripeCustomerId: session.stripeCustomerId },
+      this.config.discord.supportRoleId,
+      onThreadCreated
+    );
   }
 
   private async handleCreateIssue(interaction: ButtonInteraction): Promise<void> {
@@ -327,6 +352,39 @@ export class DiscordBot {
     }
   }
 
+  private async handleInactivityResponse(interaction: ButtonInteraction): Promise<void> {
+    const thread = interaction.channel;
+    if (!thread?.isThread()) {
+      await interaction.reply({ content: "Could not find the thread.", flags: 64 });
+      return;
+    }
+
+    const isStillNeedsHelp = interaction.customId === "inactivity_yes";
+
+    // Disable the warning message buttons
+    const disabledRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId("inactivity_responded")
+        .setLabel(isStillNeedsHelp ? "Support Notified" : "Ticket Closed")
+        .setStyle(isStillNeedsHelp ? ButtonStyle.Primary : ButtonStyle.Secondary)
+        .setDisabled(true)
+    );
+    await interaction.message.edit({ components: [disabledRow] }).catch(() => {});
+
+    if (isStillNeedsHelp) {
+      // Reset warning timer and ping support
+      await this.threadStore.resetWarning(thread.id).catch(console.error);
+      await interaction.reply(
+        `We're here to help! <@&${this.config.discord.supportRoleId}> please assist here.`
+      );
+    } else {
+      // Close the thread
+      await this.threadStore.closeThread(thread.id).catch(console.error);
+      await interaction.reply("Thanks for letting us know! This ticket has been closed.");
+      await thread.setArchived(true).catch(() => {});
+    }
+  }
+
   private async handleFeedback(interaction: ButtonInteraction): Promise<void> {
     const allowedUserId = interaction.customId.split(":")[1];
     if (interaction.user.id !== allowedUserId) {
@@ -375,9 +433,22 @@ export class DiscordBot {
     console.log("Slash commands registered");
   }
 
+  stop(): void {
+    this.inactivityMonitor?.stop();
+    this.client.destroy();
+  }
+
   async start(): Promise<void> {
     await this.registerCommands();
     await this.client.login(this.config.discord.token);
+
+    // Start the inactivity monitor after the client is ready
+    this.inactivityMonitor = new ThreadInactivityMonitor(
+      this.threadStore,
+      this.client,
+      this.config.discord.supportRoleId
+    );
+    this.inactivityMonitor.start();
 
     const callbackServer = new CallbackServer(
       this.config,

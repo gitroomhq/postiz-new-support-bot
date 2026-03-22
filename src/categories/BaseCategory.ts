@@ -51,7 +51,8 @@ export abstract class BaseCategory {
     responder: (prompt: string, onUpdate?: (messages: string[]) => void) => Promise<string | string[]>,
     threadsChannel: TextChannel,
     userInfo?: { postizUserId?: string | null; stripeCustomerId?: string | null },
-    supportRoleId?: string
+    supportRoleId?: string,
+    onThreadCreated?: (threadId: string, guildId: string) => void
   ): Promise<void> {
     await interaction.deferReply({ flags: 64 });
 
@@ -64,6 +65,8 @@ export abstract class BaseCategory {
         type: ChannelType.PrivateThread,
         invitable: false,
       });
+
+      onThreadCreated?.(thread.id, threadsChannel.guild.id);
 
       await thread.members.add(interaction.user.id);
 

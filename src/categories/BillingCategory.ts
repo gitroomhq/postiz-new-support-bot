@@ -73,7 +73,8 @@ export class BillingCategory extends BaseCategory {
 
   async handleBillingSubOption(
     interaction: StringSelectMenuInteraction,
-    threadsChannel: TextChannel
+    threadsChannel: TextChannel,
+    onThreadCreated?: (threadId: string, guildId: string) => void
   ): Promise<void> {
     const value = interaction.values[0];
 
@@ -83,13 +84,14 @@ export class BillingCategory extends BaseCategory {
     }
 
     if (value === "refund") {
-      await this.handleRefundRequest(interaction, threadsChannel);
+      await this.handleRefundRequest(interaction, threadsChannel, onThreadCreated);
     }
   }
 
   private async handleRefundRequest(
     interaction: StringSelectMenuInteraction,
-    threadsChannel: TextChannel
+    threadsChannel: TextChannel,
+    onThreadCreated?: (threadId: string, guildId: string) => void
   ): Promise<void> {
     await interaction.deferReply({ flags: 64 });
 
@@ -125,6 +127,8 @@ export class BillingCategory extends BaseCategory {
         type: ChannelType.PrivateThread,
         invitable: false,
       });
+
+      onThreadCreated?.(thread.id, threadsChannel.guild.id);
 
       await thread.members.add(interaction.user.id);
 

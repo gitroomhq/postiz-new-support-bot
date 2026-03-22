@@ -11,6 +11,7 @@ import { StripeClient } from "./bot/StripeClient";
 import { CategoryRegistry } from "./bot/CategoryRegistry";
 import { DiscordBot } from "./bot/DiscordBot";
 import { HowToCategory, BugsCategory, BillingCategory } from "./categories";
+import { ThreadStore } from "./auth/ThreadStore";
 
 async function main() {
   const config = loadConfig();
@@ -21,6 +22,7 @@ async function main() {
   console.log("Connected to database");
 
   const sessionStore = new SessionStore(prisma);
+  const threadStore = new ThreadStore(prisma);
   const oauthManager = new OAuthManager(config, sessionStore);
   const apiClient = new PostizApiClient(config);
   const claudeRunner = new ClaudeCodeRunner(process.cwd());
@@ -32,7 +34,7 @@ async function main() {
     .register(new BugsCategory())
     .register(new BillingCategory(stripeClient, sessionStore));
 
-  const bot = new DiscordBot(config, sessionStore, oauthManager, apiClient, claudeRunner, githubClient, categoryRegistry);
+  const bot = new DiscordBot(config, sessionStore, oauthManager, apiClient, claudeRunner, githubClient, categoryRegistry, threadStore);
   await bot.start();
 
   // Clean expired pending auths every 5 minutes
@@ -41,7 +43,7 @@ async function main() {
   // Graceful shutdown
   const shutdown = async () => {
     console.log("Shutting down...");
-    bot.client.destroy();
+    bot.stop();
     await prisma.$disconnect();
     process.exit(0);
   };
