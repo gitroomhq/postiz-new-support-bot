@@ -12,6 +12,7 @@ import {
   type Message,
   type ThreadChannel,
 } from "discord.js";
+import { ClaudeApiLimitError } from "../bot/ClaudeCodeRunner";
 
 export abstract class BaseCategory {
   abstract readonly id: string;
@@ -58,8 +59,9 @@ export abstract class BaseCategory {
     const userInput = interaction.fields.getTextInputValue("user_input");
     const prompt = this.buildPrompt(userInput);
 
+    let thread: ThreadChannel | null = null;
     try {
-      const thread = await threadsChannel.threads.create({
+      thread = await threadsChannel.threads.create({
         name: `${this.emoji} ${interaction.user.displayName} — ${this.label}`,
         type: ChannelType.PrivateThread,
         invitable: false,
@@ -136,7 +138,7 @@ export abstract class BaseCategory {
           if (existing) {
             existing.edit({ content }).catch(() => {});
           } else {
-            thread.send({ content }).then((msg) => {
+            thread!.send({ content }).then((msg) => {
               discordMessages.set(i, msg);
             }).catch(() => {});
           }
@@ -218,9 +220,18 @@ export abstract class BaseCategory {
         await thread.send({ content: "Did this answer help you?", components: [row] });
       }
     } catch (error) {
-      await interaction.editReply({
-        content: "Something went wrong while processing your request. Please try again later.",
-      });
+      if (error instanceof ClaudeApiLimitError) {
+        const unavailableMsg = "The automated AI response is currently not available, please wait on a support member to assist you.";
+        if (thread) {
+          await thread.send({ content: unavailableMsg }).catch(() => {});
+        } else {
+          await interaction.editReply({ content: unavailableMsg });
+        }
+      } else {
+        await interaction.editReply({
+          content: "Something went wrong while processing your request. Please try again later.",
+        });
+      }
     }
   }
 

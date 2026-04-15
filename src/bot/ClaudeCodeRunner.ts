@@ -6,6 +6,25 @@ interface StreamMessage {
   text: string;
 }
 
+export class ClaudeApiLimitError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ClaudeApiLimitError";
+  }
+}
+
+function isApiLimitError(text: string): boolean {
+  const lower = text.toLowerCase();
+  return (
+    lower.includes("api usage limits") ||
+    lower.includes("you have reached your specified") ||
+    lower.includes("credit balance is too low") ||
+    lower.includes("credit balance") ||
+    lower.includes("you will regain access") ||
+    lower.includes("usage limit")
+  );
+}
+
 export class ClaudeCodeRunner {
   private searchDir: string;
 
@@ -150,7 +169,11 @@ export class ClaudeCodeRunner {
         if (code !== 0) {
           console.error("Claude Code exited with code:", code, "signal:", signal);
           console.error("Claude Code stderr:", stderr || "(empty)");
-          reject(new Error("Failed to get a response from Claude Code"));
+          if (isApiLimitError(stderr)) {
+            reject(new ClaudeApiLimitError(stderr.trim()));
+          } else {
+            reject(new Error("Failed to get a response from Claude Code"));
+          }
           return;
         }
 
