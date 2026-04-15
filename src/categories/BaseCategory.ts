@@ -60,6 +60,7 @@ export abstract class BaseCategory {
     const prompt = this.buildPrompt(userInput);
 
     let thread: ThreadChannel | null = null;
+    let thinkingMsg: Message | null = null;
     try {
       thread = await threadsChannel.threads.create({
         name: `${this.emoji} ${interaction.user.displayName} — ${this.label}`,
@@ -110,7 +111,7 @@ export abstract class BaseCategory {
       });
 
       // Thinking animation until first real content arrives
-      const thinkingMsg = await thread.send({ content: "Thinking (that might take a while)..." });
+      thinkingMsg = await thread.send({ content: "Thinking (that might take a while)..." });
       let hasContent = false;
 
       // One Discord message per assistant message, updated as they stream in
@@ -222,7 +223,10 @@ export abstract class BaseCategory {
     } catch (error) {
       if (error instanceof ClaudeApiLimitError) {
         const unavailableMsg = "The automated AI response is currently not available, please wait on a support member to assist you.";
-        if (thread) {
+        if (thinkingMsg) {
+          // Overwrite the message that may already contain partial API error text
+          await thinkingMsg.edit({ content: unavailableMsg }).catch(() => {});
+        } else if (thread) {
           await thread.send({ content: unavailableMsg }).catch(() => {});
         } else {
           await interaction.editReply({ content: unavailableMsg });

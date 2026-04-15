@@ -181,6 +181,13 @@ export class ClaudeCodeRunner {
           .map((id) => messages.get(id)!.text)
           .filter((t) => t.length > 0);
 
+        // API limit errors can surface as streamed content on stdout (not stderr)
+        const combinedText = allMessages.join("\n");
+        if (isApiLimitError(combinedText)) {
+          reject(new ClaudeApiLimitError(combinedText));
+          return;
+        }
+
         if (allMessages.length === 0) {
           reject(new Error("Empty response from Claude Code"));
           return;
