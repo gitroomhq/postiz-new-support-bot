@@ -123,7 +123,7 @@ export abstract class BaseCategory {
         if (!hasContent) {
           hasContent = true;
           // Reuse thinking message for the first streamed message
-          discordMessages.set(0, thinkingMsg);
+          discordMessages.set(0, thinkingMsg!);
         }
 
         const now = Date.now();
@@ -148,7 +148,7 @@ export abstract class BaseCategory {
 
       // If no streaming happened, reuse the thinking message for the final result
       if (!hasContent) {
-        discordMessages.set(0, thinkingMsg);
+        discordMessages.set(0, thinkingMsg!);
       }
 
       // Final state: convert all messages to embeds

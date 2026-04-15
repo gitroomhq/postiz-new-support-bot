@@ -5,3 +5,7 @@ node_modules
 
 /src/generated/prisma
 search
+
+.vscode
+
+dist/
