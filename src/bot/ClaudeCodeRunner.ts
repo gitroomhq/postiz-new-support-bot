@@ -68,8 +68,32 @@ export class ClaudeCodeRunner {
       let currentTextIndex: number | null = null;
       let stderr = "";
       let buffer = "";
+      let apiLimitDetected = false;
+
+      const detectApiLimit = (text: string): boolean => {
+        if (apiLimitDetected) return true;
+        if (!text) return false;
+        if (isApiLimitError(text)) {
+          apiLimitDetected = true;
+          // Kill the process so the close handler fires quickly — Claude Code
+          // may otherwise retry/hang after a 400, leaving Discord stuck on
+          // the partial error + "Generating..." streaming state.
+          try {
+            if (!child.killed) child.kill("SIGTERM");
+          } catch {}
+          // Safety net in case SIGTERM is ignored
+          setTimeout(() => {
+            try {
+              if (!child.killed) child.kill("SIGKILL");
+            } catch {}
+          }, 1000).unref?.();
+          return true;
+        }
+        return false;
+      };
 
       const emitUpdate = () => {
+        if (apiLimitDetected) return;
         const texts = messageOrder
           .map((id) => messages.get(id)!.text)
           .filter((t) => t.length > 0);
@@ -86,6 +110,10 @@ export class ClaudeCodeRunner {
 
         for (const line of lines) {
           if (!line.trim()) continue;
+          // Check raw line for API limit signatures — catches event types
+          // we don't specifically handle (system, result, etc.) and raw
+          // non-JSON error prints alike.
+          if (detectApiLimit(line)) continue;
           try {
             const event = JSON.parse(line);
 
@@ -123,6 +151,7 @@ export class ClaudeCodeRunner {
                 const msg = messages.get(currentMsgId);
                 if (msg) {
                   msg.text += streamEvent.delta.text;
+                  detectApiLimit(msg.text);
                   emitUpdate();
                 }
               }
@@ -148,17 +177,22 @@ export class ClaudeCodeRunner {
                 if (!messages.has(msgId)) {
                   messageOrder.push(msgId);
                 }
-                messages.set(msgId, { id: msgId, text: textParts.join("") });
+                const joined = textParts.join("");
+                messages.set(msgId, { id: msgId, text: joined });
+                detectApiLimit(joined);
                 emitUpdate();
               }
             }
           } catch {
-            // skip non-JSON lines
+            // Non-JSON line — already checked via detectApiLimit above.
           }
         }
       });
 
-      child.stderr.on("data", (data) => { stderr += data; });
+      child.stderr.on("data", (data) => {
+        stderr += data;
+        detectApiLimit(stderr);
+      });
 
       child.on("error", (err) => {
         console.error("Claude Code spawn error:", err);
@@ -166,6 +200,18 @@ export class ClaudeCodeRunner {
       });
 
       child.on("close", (code, signal) => {
+        // If we detected the API limit mid-stream, always surface that —
+        // the non-zero exit code or signal is just a side-effect of our kill.
+        if (apiLimitDetected) {
+          const combinedText = messageOrder
+            .map((id) => messages.get(id)?.text || "")
+            .filter((t) => t.length > 0)
+            .join("\n");
+          const errorText = (combinedText || stderr || "API usage limit reached").trim();
+          reject(new ClaudeApiLimitError(errorText));
+          return;
+        }
+
         if (code !== 0) {
           console.error("Claude Code exited with code:", code, "signal:", signal);
           console.error("Claude Code stderr:", stderr || "(empty)");
