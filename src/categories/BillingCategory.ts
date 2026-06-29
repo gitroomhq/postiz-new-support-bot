@@ -205,6 +205,8 @@ export class BillingCategory extends BaseCategory {
         .setColor(0x57f287);
 
       await interaction.editReply({ embeds: [embed] });
+
+      await this.closeTicketThread(interaction);
     } catch (error) {
       console.error("Stripe discount error:", error);
       await interaction.editReply({
@@ -275,6 +277,8 @@ export class BillingCategory extends BaseCategory {
         .setColor(0x57f287);
 
       await interaction.editReply({ embeds: [embed] });
+
+      await this.closeTicketThread(interaction);
     } catch (error) {
       console.error("Stripe refund error:", error);
       await interaction.editReply({
@@ -286,6 +290,16 @@ export class BillingCategory extends BaseCategory {
   async handleCancelRefund(interaction: ButtonInteraction): Promise<void> {
     await this.disableConfirmButtons(interaction);
     await interaction.reply({ embeds: [makeEmbed("Refund cancelled. If you change your mind, please start a new request.", COLORS.neutral)] });
+  }
+
+  // Closes the refund/discount thread once the action succeeds. We lock + archive
+  // the thread directly instead of going through StatusService so that no status
+  // tag is set on the ticket — the resolution is self-evident from the result embed.
+  private async closeTicketThread(interaction: ButtonInteraction): Promise<void> {
+    const thread = interaction.channel;
+    if (!thread?.isThread()) return;
+    await thread.setLocked(true).catch(() => {});
+    await thread.setArchived(true).catch(() => {});
   }
 
   private async disableConfirmButtons(interaction: ButtonInteraction): Promise<void> {
