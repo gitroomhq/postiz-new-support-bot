@@ -479,7 +479,7 @@ export class DiscordBot {
     const member = await this.requireSupportOrAdmin(interaction);
     if (!member) return;
 
-    const channel = interaction.channel;
+    const channel = interaction.channel ?? (await this.client.channels.fetch(interaction.channelId).catch(() => null));
     if (!channel?.isThread()) {
       await interaction.reply({ content: "Use this inside a ticket thread.", flags: 64 });
       return;
@@ -516,20 +516,32 @@ export class DiscordBot {
     const member = await this.requireSupportOrAdmin(interaction);
     if (!member) return;
 
-    const channel = interaction.channel;
-    if (!channel?.isThread()) return;
+    // interaction.channel can be null on a cold cache (e.g. right after a restart) — fetch it.
+    const channel = interaction.channel ?? (await this.client.channels.fetch(interaction.channelId).catch(() => null));
+    if (!channel?.isThread()) {
+      await interaction.reply({ content: "This can only be used inside a ticket thread.", flags: 64 });
+      return;
+    }
     const thread = channel as ThreadChannel;
 
     const tag = this.settingsStore.tagById(interaction.values[0]);
     const ticket = await this.ticketStore.getByThreadId(thread.id);
     if (!tag || !ticket) {
-      await interaction.reply({ content: "Couldn't apply that status.", flags: 64 });
+      await interaction.reply({
+        content: "Couldn't apply that status — this thread isn't tracked yet. Run /set-status again.",
+        flags: 64,
+      });
       return;
     }
 
     await interaction.deferUpdate();
-    await this.statusService.applyStatus(thread, ticket, tag, { actorLabel: `<@${member.id}>`, actorId: member.id });
-    await interaction.editReply({ content: `Status set to ${tag.emoji} ${tag.label}.`, components: [] });
+    try {
+      await this.statusService.applyStatus(thread, ticket, tag, { actorLabel: `<@${member.id}>` });
+      await interaction.editReply({ content: `Status set to ${tag.emoji} ${tag.label}.`, components: [] });
+    } catch (error) {
+      console.error("set-status apply failed:", error);
+      await interaction.editReply({ content: "Something went wrong applying that status.", components: [] });
+    }
   }
 
   private async adoptThread(thread: ThreadChannel) {

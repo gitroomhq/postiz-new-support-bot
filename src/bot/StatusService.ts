@@ -6,12 +6,30 @@ const RESOLVED_EMOJI = "✅";
 
 export interface ApplyStatusOptions {
   actorLabel: string;
-  actorId?: string; // when set, the audit line pings this user
   silent?: boolean; // skip the audit line + customer notice (used for bulk reassignment)
 }
 
 export class StatusService {
+  // Serializes changes per thread so rapid updates don't interleave their messages.
+  private chains = new Map<string, Promise<unknown>>();
+
   constructor(private ticketStore: TicketStore) {}
+
+  async applyStatus(
+    thread: ThreadChannel,
+    ticket: { threadId: string; customerId: string | null },
+    tag: StatusTag,
+    options: ApplyStatusOptions
+  ): Promise<void> {
+    const prev = this.chains.get(ticket.threadId) ?? Promise.resolve();
+    const next = prev.catch(() => {}).then(() => this.runApplyStatus(thread, ticket, tag, options));
+    this.chains.set(ticket.threadId, next);
+    try {
+      await next;
+    } finally {
+      if (this.chains.get(ticket.threadId) === next) this.chains.delete(ticket.threadId);
+    }
+  }
 
   // Replaces the leading emoji of "{emoji} {user} — {label}" with the new one.
   buildThreadName(currentName: string, emoji: string): string {
@@ -19,7 +37,7 @@ export class StatusService {
     return `${emoji} ${rest}`.slice(0, 100);
   }
 
-  async applyStatus(
+  private async runApplyStatus(
     thread: ThreadChannel,
     ticket: { threadId: string; customerId: string | null },
     tag: StatusTag,
@@ -40,7 +58,8 @@ export class StatusService {
       await thread
         .send({
           content: `Status changed to "${tag.emoji} ${tag.label}" by ${options.actorLabel}`,
-          allowedMentions: { users: options.actorId ? [options.actorId] : [] },
+          // Render the actor as a mention, but don't actually notify them.
+          allowedMentions: { parse: [] },
         })
         .catch(() => {});
 
