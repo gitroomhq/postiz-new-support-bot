@@ -14,6 +14,7 @@ import { TicketStore } from "./bot/TicketStore";
 import { StatusService } from "./bot/StatusService";
 import { ReminderScheduler } from "./bot/ReminderScheduler";
 import { DiscordBot } from "./bot/DiscordBot";
+import { ensureSchema } from "./db/ensureSchema";
 import { HowToCategory, BugsCategory, BillingCategory } from "./categories";
 
 async function main() {
@@ -23,6 +24,9 @@ async function main() {
   const prisma = new PrismaClient({ adapter });
   await prisma.$connect();
   console.log("Connected to database");
+
+  await ensureSchema(prisma);
+  console.log("Schema ensured");
 
   const sessionStore = new SessionStore(prisma);
   const settingsStore = new SettingsStore(prisma);
