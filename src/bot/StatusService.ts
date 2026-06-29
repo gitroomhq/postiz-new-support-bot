@@ -45,9 +45,11 @@ export class StatusService {
     tag: StatusTag,
     options: ApplyStatusOptions
   ): Promise<void> {
-    // Reopen a closed thread when moving to a non-closing status.
+    // Reopen a closed thread when moving to a non-closing status: unarchive first
+    // so it's editable, then unlock.
     if (!tag.closesThread && (thread.archived || thread.locked)) {
-      await thread.edit({ archived: false, locked: false }).catch(() => {});
+      await thread.setArchived(false).catch(() => {});
+      await thread.setLocked(false).catch(() => {});
     }
 
     // Renames can hit Discord's per-thread rename rate limit; keep going on failure
@@ -79,7 +81,10 @@ export class StatusService {
     }
 
     if (tag.closesThread) {
-      await thread.edit({ archived: true, locked: true }).catch(() => {});
+      // Lock while the thread is still active, then archive in a separate call —
+      // doing both in one edit can leave it locked but not archived.
+      await thread.setLocked(true).catch(() => {});
+      await thread.setArchived(true).catch(() => {});
     }
   }
 }
