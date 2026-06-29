@@ -39,3 +39,49 @@ model PendingAuth {
 
   @@map("pending_auths")
 }
+
+model BotSettings {
+  id               String   @id @default("global")
+  threadsChannelId String?
+  supportRoleId    String?
+  githubRepo       String?
+  aiSolveEnabled   Boolean  @default(true)
+  backfillDone     Boolean  @default(false)
+  updatedAt        DateTime @updatedAt
+
+  @@map("bot_settings")
+}
+
+model StatusTag {
+  id              String   @id @default(cuid())
+  emoji           String   @unique
+  label           String
+  isInitial       Boolean  @default(false)
+  closesThread    Boolean  @default(false)
+  reminderEnabled Boolean  @default(false)
+  reminderDays    Int      @default(3)
+  reminderTarget  String   @default("SUPPORT")
+  autoCloseAfter  Int?
+  sortOrder       Int      @default(0)
+  tickets         Ticket[]
+
+  @@map("status_tags")
+}
+
+model Ticket {
+  id                  String     @id @default(cuid())
+  threadId            String     @unique
+  channelId           String
+  customerId          String?
+  customerDisplayName String?
+  categoryId          String?
+  statusTagId         String?
+  statusTag           StatusTag? @relation(fields: [statusTagId], references: [id])
+  lastStatusChangeAt  DateTime   @default(now())
+  lastReminderAt      DateTime?
+  reminderCount       Int        @default(0)
+  closed              Boolean    @default(false)
+  createdAt           DateTime   @default(now())
+
+  @@map("tickets")
+}

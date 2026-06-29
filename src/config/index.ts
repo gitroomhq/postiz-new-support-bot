@@ -39,6 +39,8 @@ export function loadConfig(): BotConfig {
     discord: {
       token: required("DISCORD_TOKEN"),
       clientId: required("DISCORD_CLIENT_ID"),
+      // threadsChannelId / supportRoleId are deprecated here: they only seed the
+      // DB on first run (see SettingsStore). Runtime reads come from /config.
       threadsChannelId: required("DISCORD_THREADS_CHANNEL_ID"),
       supportRoleId: required("DISCORD_SUPPORT_ROLE_ID"),
     },

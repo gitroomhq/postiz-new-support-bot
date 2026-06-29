@@ -14,6 +14,13 @@ import {
 } from "discord.js";
 import { ClaudeApiLimitError } from "../bot/ClaudeCodeRunner";
 
+export interface TicketContext {
+  supportRoleId: string | null;
+  aiSolveEnabled: boolean;
+  initialEmoji: string;
+  onTicketCreated: (thread: ThreadChannel, customerId: string, displayName: string) => Promise<void>;
+}
+
 export abstract class BaseCategory {
   abstract readonly id: string;
   abstract readonly label: string;
@@ -51,8 +58,8 @@ export abstract class BaseCategory {
     interaction: ModalSubmitInteraction,
     responder: (prompt: string, onUpdate?: (messages: string[]) => void) => Promise<string | string[]>,
     threadsChannel: TextChannel,
-    userInfo?: { postizUserId?: string | null; stripeCustomerId?: string | null },
-    supportRoleId?: string
+    ctx: TicketContext,
+    userInfo?: { postizUserId?: string | null; stripeCustomerId?: string | null }
   ): Promise<void> {
     await interaction.deferReply({ flags: 64 });
 
@@ -63,7 +70,7 @@ export abstract class BaseCategory {
     let thinkingMsg: Message | null = null;
     try {
       thread = await threadsChannel.threads.create({
-        name: `${this.emoji} ${interaction.user.displayName} — ${this.label}`,
+        name: `${ctx.initialEmoji} ${interaction.user.displayName} — ${this.label}`,
         type: ChannelType.PrivateThread,
         invitable: false,
       });
@@ -71,10 +78,10 @@ export abstract class BaseCategory {
       await thread.members.add(interaction.user.id);
 
       // Add support role members so staff can see ticket content
-      if (supportRoleId) {
+      if (ctx.supportRoleId) {
         try {
           const guild = threadsChannel.guild;
-          const role = await guild.roles.fetch(supportRoleId);
+          const role = await guild.roles.fetch(ctx.supportRoleId);
           if (role) {
             const members = role.members;
             for (const [memberId] of members) {
@@ -87,6 +94,8 @@ export abstract class BaseCategory {
           // Don't block ticket creation if adding support members fails
         }
       }
+
+      await ctx.onTicketCreated(thread, interaction.user.id, interaction.user.displayName);
 
       const questionEmbed = new EmbedBuilder()
         .setTitle("Your question")
@@ -109,6 +118,16 @@ export abstract class BaseCategory {
       await interaction.editReply({
         content: `Your private support thread has been created: ${thread}`,
       });
+
+      if (!ctx.aiSolveEnabled) {
+        if (ctx.supportRoleId) {
+          await thread.send({
+            content: `<@&${ctx.supportRoleId}> a new support ticket has been opened and needs attention.`,
+            allowedMentions: { roles: [ctx.supportRoleId] },
+          });
+        }
+        return;
+      }
 
       // Thinking animation until first real content arrives
       thinkingMsg = await thread.send({ content: "Thinking (that might take a while)..." });

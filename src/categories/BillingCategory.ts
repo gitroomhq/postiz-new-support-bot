@@ -11,7 +11,7 @@ import {
   type StringSelectMenuInteraction,
   ModalBuilder,
 } from "discord.js";
-import { BaseCategory } from "./BaseCategory";
+import { BaseCategory, TicketContext } from "./BaseCategory";
 import { StripeClient } from "../bot/StripeClient";
 import { SessionStore } from "../auth/SessionStore";
 
@@ -73,7 +73,8 @@ export class BillingCategory extends BaseCategory {
 
   async handleBillingSubOption(
     interaction: StringSelectMenuInteraction,
-    threadsChannel: TextChannel
+    threadsChannel: TextChannel,
+    ctx: TicketContext
   ): Promise<void> {
     const value = interaction.values[0];
 
@@ -83,13 +84,14 @@ export class BillingCategory extends BaseCategory {
     }
 
     if (value === "refund") {
-      await this.handleRefundRequest(interaction, threadsChannel);
+      await this.handleRefundRequest(interaction, threadsChannel, ctx);
     }
   }
 
   private async handleRefundRequest(
     interaction: StringSelectMenuInteraction,
-    threadsChannel: TextChannel
+    threadsChannel: TextChannel,
+    ctx: TicketContext
   ): Promise<void> {
     await interaction.deferReply({ flags: 64 });
 
@@ -121,12 +123,13 @@ export class BillingCategory extends BaseCategory {
 
       // Create a private thread for this refund conversation
       const thread = await threadsChannel.threads.create({
-        name: `💳 ${interaction.user.displayName} — Refund Request`,
+        name: `${ctx.initialEmoji} ${interaction.user.displayName} — Refund Request`,
         type: ChannelType.PrivateThread,
         invitable: false,
       });
 
       await thread.members.add(interaction.user.id);
+      await ctx.onTicketCreated(thread, interaction.user.id, interaction.user.displayName);
 
       await interaction.editReply({
         content: `Your refund request thread has been created: ${thread}`,

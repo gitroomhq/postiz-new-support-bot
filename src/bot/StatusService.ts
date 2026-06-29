@@ -1,0 +1,58 @@
+import { ThreadChannel } from "discord.js";
+import { StatusTag } from "../generated/prisma/client";
+import { TicketStore } from "./TicketStore";
+
+const RESOLVED_EMOJI = "✅";
+
+export interface ApplyStatusOptions {
+  actorLabel: string;
+  silent?: boolean; // skip the audit line + customer notice (used for bulk reassignment)
+}
+
+export class StatusService {
+  constructor(private ticketStore: TicketStore) {}
+
+  // Replaces the leading emoji of "{emoji} {user} — {label}" with the new one.
+  buildThreadName(currentName: string, emoji: string): string {
+    const rest = currentName.includes(" ") ? currentName.replace(/^\S+\s+/, "") : currentName;
+    return `${emoji} ${rest}`.slice(0, 100);
+  }
+
+  async applyStatus(
+    thread: ThreadChannel,
+    ticket: { threadId: string; customerId: string | null },
+    tag: StatusTag,
+    options: ApplyStatusOptions
+  ): Promise<void> {
+    // Reopen a closed thread when moving to a non-closing status.
+    if (!tag.closesThread && (thread.archived || thread.locked)) {
+      await thread.edit({ archived: false, locked: false }).catch(() => {});
+    }
+
+    // Renames can hit Discord's per-thread rename rate limit; keep going on failure
+    // so the DB + audit line stay consistent.
+    await thread.setName(this.buildThreadName(thread.name, tag.emoji)).catch(() => {});
+
+    await this.ticketStore.setStatus(ticket.threadId, tag.id);
+
+    if (!options.silent) {
+      await thread
+        .send({ content: `Status changed to ${tag.emoji} ${tag.label} by ${options.actorLabel}` })
+        .catch(() => {});
+
+      if (tag.closesThread || tag.emoji === RESOLVED_EMOJI) {
+        const who = ticket.customerId ? `<@${ticket.customerId}> ` : "";
+        const note = tag.closesThread
+          ? `${who}this ticket has been closed. Reply here or open a new ticket if you still need help.`
+          : `${who}this ticket has been marked **${tag.label}**. Reply here if you still need help.`;
+        await thread
+          .send({ content: note, allowedMentions: { users: ticket.customerId ? [ticket.customerId] : [] } })
+          .catch(() => {});
+      }
+    }
+
+    if (tag.closesThread) {
+      await thread.edit({ archived: true, locked: true }).catch(() => {});
+    }
+  }
+}

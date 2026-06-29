@@ -3,8 +3,8 @@ import { BotConfig } from "../config";
 export class GitHubClient {
   constructor(private config: BotConfig) {}
 
-  async createIssue(title: string, body: string, labels: string[] = ["feature-request"]): Promise<string> {
-    const [owner, repo] = this.config.github.repo.split("/");
+  async createIssue(title: string, body: string, labels: string[] = ["feature-request"], repoOverride?: string | null): Promise<string> {
+    const [owner, repo] = (repoOverride || this.config.github.repo).split("/");
 
     const response = await fetch(`https://api.github.com/repos/${owner}/${repo}/issues`, {
       method: "POST",
