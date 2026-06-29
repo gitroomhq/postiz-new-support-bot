@@ -28,6 +28,7 @@ import {
   type ThreadChannel,
 } from "discord.js";
 import { BotConfig } from "../config";
+import { embed as makeEmbed, COLORS } from "../util/embeds";
 import { SettingsStore, isUnicodeEmoji, ReminderTarget } from "../config/SettingsStore";
 import { StatusTag } from "../generated/prisma/client";
 import { SessionStore } from "../auth/SessionStore";
@@ -142,7 +143,7 @@ export class DiscordBot {
     ) {
       const allowedUserId = interaction.customId.split(":")[1];
       if (interaction.user.id !== allowedUserId) {
-        await interaction.reply({ content: "Only the original requester can use this.", flags: 64 });
+        await interaction.reply({ embeds: [makeEmbed("Only the original requester can use this.", COLORS.danger)], flags: 64 });
         return;
       }
       const billing = this.getBillingCategory();
@@ -161,11 +162,11 @@ export class DiscordBot {
     if (interaction.customId.startsWith("auth_logout:")) {
       const allowedUserId = interaction.customId.split(":")[1];
       if (interaction.user.id !== allowedUserId) {
-        await interaction.reply({ content: "Only the original requester can use this.", flags: 64 });
+        await interaction.reply({ embeds: [makeEmbed("Only the original requester can use this.", COLORS.danger)], flags: 64 });
         return;
       }
       await this.sessionStore.removeSession(interaction.user.id);
-      await interaction.reply({ content: "You've been logged out.", flags: 64 });
+      await interaction.reply({ embeds: [makeEmbed("You've been logged out.", COLORS.success)], flags: 64 });
       return;
     }
 
@@ -265,7 +266,10 @@ export class DiscordBot {
     if (interaction.customId === "billing_suboption") {
       const threadsChannel = await this.getThreadsChannel();
       if (!threadsChannel) {
-        await interaction.reply({ content: "Support threads channel is not configured. Ask an admin to run /config.", flags: 64 });
+        await interaction.reply({
+          embeds: [makeEmbed("Support threads channel is not configured. Ask an admin to run /config.", COLORS.danger)],
+          flags: 64,
+        });
         return;
       }
       const billing = this.getBillingCategory();
@@ -302,7 +306,7 @@ export class DiscordBot {
     const session = await this.sessionStore.getSession(interaction.user.id);
     if (!session) {
       await interaction.reply({
-        content: "Your session has expired. Please click **Start Here** again.",
+        embeds: [makeEmbed("Your session has expired. Please click **Start Here** again.", COLORS.warn)],
         flags: 64,
       });
       return;
@@ -311,7 +315,7 @@ export class DiscordBot {
     const threadsChannel = await this.getThreadsChannel();
     if (!threadsChannel) {
       await interaction.reply({
-        content: "Support threads channel is not configured. Please contact an admin.",
+        embeds: [makeEmbed("Support threads channel is not configured. Please contact an admin.", COLORS.danger)],
         flags: 64,
       });
       return;
@@ -332,7 +336,7 @@ export class DiscordBot {
     const issueLabel = parts[2] || "feature-request";
 
     if (interaction.user.id !== allowedUserId) {
-      await interaction.reply({ content: "Only the original requester can create this issue.", flags: 64 });
+      await interaction.reply({ embeds: [makeEmbed("Only the original requester can create this issue.", COLORS.danger)], flags: 64 });
       return;
     }
 
@@ -341,7 +345,7 @@ export class DiscordBot {
     try {
       const thread = interaction.channel;
       if (!thread || !thread.isThread()) {
-        await interaction.editReply({ content: "Could not find the thread." });
+        await interaction.editReply({ embeds: [makeEmbed("Could not find the thread.", COLORS.danger)] });
         return;
       }
 
@@ -400,7 +404,7 @@ export class DiscordBot {
       await interaction.editReply({ embeds: [embed] });
     } catch (error) {
       console.error("GitHub issue creation error:", error);
-      await interaction.editReply({ content: "Failed to create the GitHub issue. Please try again later." });
+      await interaction.editReply({ embeds: [makeEmbed("Failed to create the GitHub issue. Please try again later.", COLORS.danger)] });
     }
   }
 
@@ -408,7 +412,7 @@ export class DiscordBot {
   private async handleFeedback(interaction: ButtonInteraction): Promise<void> {
     const allowedUserId = interaction.customId.split(":")[1];
     if (interaction.user.id !== allowedUserId) {
-      await interaction.reply({ content: "Only the original requester can use this.", flags: 64 });
+      await interaction.reply({ embeds: [makeEmbed("Only the original requester can use this.", COLORS.danger)], flags: 64 });
       return;
     }
 
@@ -429,19 +433,22 @@ export class DiscordBot {
 
     if (isPositive) {
       const closing = this.settingsStore.closingTag();
-      await interaction.reply("Glad we could help! Closing this ticket.");
+      await interaction.reply({ embeds: [makeEmbed("Glad we could help! Closing this ticket.", COLORS.success)] });
       if (thread && ticket && closing) {
-        await this.statusService.applyStatus(thread, ticket, closing, { actorLabel: "the bot" });
+        await this.statusService.applyStatus(thread, ticket, closing, { actorName: interaction.user.displayName, actorIconUrl: interaction.user.displayAvatarURL() });
       } else if (thread) {
         await thread.setArchived(true).catch(() => {});
       }
     } else {
       const supportRoleId = this.settingsStore.supportRoleId();
-      const mention = supportRoleId ? `<@&${supportRoleId}>` : "A support team member";
-      await interaction.reply(`${mention} will follow up here shortly.`);
+      await interaction.reply({
+        content: supportRoleId ? `<@&${supportRoleId}>` : undefined,
+        embeds: [makeEmbed("A support team member will follow up here shortly.", COLORS.brand)],
+        allowedMentions: supportRoleId ? { roles: [supportRoleId] } : { parse: [] },
+      });
       const initial = this.settingsStore.initialTag();
       if (thread && ticket && initial) {
-        await this.statusService.applyStatus(thread, ticket, initial, { actorLabel: "the bot" });
+        await this.statusService.applyStatus(thread, ticket, initial, { actorName: interaction.user.displayName, actorIconUrl: interaction.user.displayAvatarURL() });
       }
     }
   }
@@ -467,7 +474,7 @@ export class DiscordBot {
       (member.permissions.has(PermissionFlagsBits.Administrator) ||
         (!!supportRoleId && member.roles.cache.has(supportRoleId)));
     if (!ok) {
-      await interaction.reply({ content: "You don't have permission to do that.", flags: 64 });
+      await interaction.reply({ embeds: [makeEmbed("You don't have permission to do that.", COLORS.danger)], flags: 64 });
       return null;
     }
     return member;
@@ -481,7 +488,7 @@ export class DiscordBot {
 
     const channel = interaction.channel ?? (await this.client.channels.fetch(interaction.channelId).catch(() => null));
     if (!channel?.isThread()) {
-      await interaction.reply({ content: "Use this inside a ticket thread.", flags: 64 });
+      await interaction.reply({ embeds: [makeEmbed("Use this inside a ticket thread.", COLORS.warn)], flags: 64 });
       return;
     }
     const thread = channel as ThreadChannel;
@@ -491,7 +498,7 @@ export class DiscordBot {
       // Adopt a previously-untracked bot-created support thread.
       const adopted = await this.adoptThread(thread);
       if (!adopted) {
-        await interaction.reply({ content: "This thread isn't a tracked support ticket.", flags: 64 });
+        await interaction.reply({ embeds: [makeEmbed("This thread isn't a tracked support ticket.", COLORS.warn)], flags: 64 });
         return;
       }
       ticket = adopted;
@@ -499,7 +506,7 @@ export class DiscordBot {
 
     const tags = this.settingsStore.tags();
     if (tags.length === 0) {
-      await interaction.reply({ content: "No status tags are configured. Ask an admin to run /config.", flags: 64 });
+      await interaction.reply({ embeds: [makeEmbed("No status tags are configured. Ask an admin to run /config.", COLORS.warn)], flags: 64 });
       return;
     }
 
@@ -509,7 +516,7 @@ export class DiscordBot {
       .addOptions(tags.map((t) => ({ label: t.label, value: t.id, emoji: t.emoji })));
 
     const row = new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(menu);
-    await interaction.reply({ content: "Set this ticket's status:", components: [row], flags: 64 });
+    await interaction.reply({ embeds: [makeEmbed("Set this ticket's status:")], components: [row], flags: 64 });
   }
 
   private async handleSetStatusSelect(interaction: StringSelectMenuInteraction): Promise<void> {
@@ -519,7 +526,7 @@ export class DiscordBot {
     // interaction.channel can be null on a cold cache (e.g. right after a restart) — fetch it.
     const channel = interaction.channel ?? (await this.client.channels.fetch(interaction.channelId).catch(() => null));
     if (!channel?.isThread()) {
-      await interaction.reply({ content: "This can only be used inside a ticket thread.", flags: 64 });
+      await interaction.reply({ embeds: [makeEmbed("This can only be used inside a ticket thread.", COLORS.warn)], flags: 64 });
       return;
     }
     const thread = channel as ThreadChannel;
@@ -528,7 +535,7 @@ export class DiscordBot {
     const ticket = await this.ticketStore.getByThreadId(thread.id);
     if (!tag || !ticket) {
       await interaction.reply({
-        content: "Couldn't apply that status — this thread isn't tracked yet. Run /set-status again.",
+        embeds: [makeEmbed("Couldn't apply that status — this thread isn't tracked yet. Run /set-status again.", COLORS.warn)],
         flags: 64,
       });
       return;
@@ -536,11 +543,20 @@ export class DiscordBot {
 
     await interaction.deferUpdate();
     try {
-      await this.statusService.applyStatus(thread, ticket, tag, { actorLabel: `<@${member.id}>` });
-      await interaction.editReply({ content: `Status set to ${tag.emoji} ${tag.label}.`, components: [] });
+      await this.statusService.applyStatus(thread, ticket, tag, {
+        actorName: member.displayName,
+        actorIconUrl: member.displayAvatarURL(),
+      });
+      await interaction.editReply({
+        embeds: [makeEmbed(`Status set to ${tag.emoji} ${tag.label}.`, COLORS.success)],
+        components: [],
+      });
     } catch (error) {
       console.error("set-status apply failed:", error);
-      await interaction.editReply({ content: "Something went wrong applying that status.", components: [] });
+      await interaction.editReply({
+        embeds: [makeEmbed("Something went wrong applying that status.", COLORS.danger)],
+        components: [],
+      });
     }
   }
 
@@ -591,7 +607,7 @@ export class DiscordBot {
 
   private async handleConfigCommand(interaction: ChatInputCommandInteraction): Promise<void> {
     if (!this.isAdmin(interaction)) {
-      await interaction.reply({ content: "Administrator permission required.", flags: 64 });
+      await interaction.reply({ embeds: [makeEmbed("Administrator permission required.", COLORS.danger)], flags: 64 });
       return;
     }
     await interaction.reply({ ...this.buildConfigMainPanel(), flags: 64 });
@@ -732,7 +748,7 @@ export class DiscordBot {
 
   private async handleConfigButton(interaction: ButtonInteraction): Promise<void> {
     if (!this.isAdmin(interaction)) {
-      await interaction.reply({ content: "Administrator permission required.", flags: 64 });
+      await interaction.reply({ embeds: [makeEmbed("Administrator permission required.", COLORS.danger)], flags: 64 });
       return;
     }
 
@@ -784,7 +800,7 @@ export class DiscordBot {
     const [action, tagId] = id.split(":");
     const tag = tagId ? this.settingsStore.tagById(tagId) : undefined;
     if (!tag) {
-      await interaction.reply({ content: "That tag no longer exists.", flags: 64 });
+      await interaction.reply({ embeds: [makeEmbed("That tag no longer exists.", COLORS.warn)], flags: 64 });
       return;
     }
 
@@ -859,14 +875,17 @@ export class DiscordBot {
 
   private async handleConfigModal(interaction: ModalSubmitInteraction): Promise<void> {
     if (!this.isAdmin(interaction)) {
-      await interaction.reply({ content: "Administrator permission required.", flags: 64 });
+      await interaction.reply({ embeds: [makeEmbed("Administrator permission required.", COLORS.danger)], flags: 64 });
       return;
     }
 
     if (interaction.customId === "config_repo_modal") {
       const repo = interaction.fields.getTextInputValue("repo").trim();
       await this.settingsStore.updateGeneral({ githubRepo: repo || null });
-      await interaction.reply({ content: repo ? `GitHub repo set to \`${repo}\`.` : "GitHub repo cleared.", flags: 64 });
+      await interaction.reply({
+        embeds: [makeEmbed(repo ? `GitHub repo set to \`${repo}\`.` : "GitHub repo cleared.", COLORS.success)],
+        flags: 64,
+      });
       return;
     }
 
@@ -882,11 +901,11 @@ export class DiscordBot {
     }
 
     if (!isUnicodeEmoji(emoji)) {
-      await interaction.reply({ content: "Emoji must be a single standard (unicode) emoji.", flags: 64 });
+      await interaction.reply({ embeds: [makeEmbed("Emoji must be a single standard (unicode) emoji.", COLORS.danger)], flags: 64 });
       return;
     }
     if (!label) {
-      await interaction.reply({ content: "Label is required.", flags: 64 });
+      await interaction.reply({ embeds: [makeEmbed("Label is required.", COLORS.danger)], flags: 64 });
       return;
     }
 
@@ -907,7 +926,7 @@ export class DiscordBot {
           reminderTarget,
           autoCloseAfter,
         });
-        await interaction.reply({ content: `Added ${emoji} ${label}.`, flags: 64 });
+        await interaction.reply({ embeds: [makeEmbed(`Added ${emoji} ${label}.`, COLORS.success)], flags: 64 });
       } else if (interaction.customId.startsWith("config_tag_edit_modal:")) {
         const tagId = interaction.customId.split(":")[1];
         await this.settingsStore.editTag(tagId, {
@@ -916,10 +935,10 @@ export class DiscordBot {
           ...(reminderDays != null ? { reminderDays } : {}),
           autoCloseAfter,
         });
-        await interaction.reply({ content: `Updated ${emoji} ${label}.`, flags: 64 });
+        await interaction.reply({ embeds: [makeEmbed(`Updated ${emoji} ${label}.`, COLORS.success)], flags: 64 });
       }
     } catch (error) {
-      await interaction.reply({ content: (error as Error).message || "Failed to save the tag.", flags: 64 });
+      await interaction.reply({ embeds: [makeEmbed((error as Error).message || "Failed to save the tag.", COLORS.danger)], flags: 64 });
     }
   }
 
@@ -937,13 +956,13 @@ export class DiscordBot {
       }
       await interaction.editReply(this.buildTagsPanel());
     } catch (error) {
-      await interaction.followUp({ content: (error as Error).message || "Failed to delete the tag.", flags: 64 });
+      await interaction.followUp({ embeds: [makeEmbed((error as Error).message || "Failed to delete the tag.", COLORS.danger)], flags: 64 });
     }
   }
 
   private async handleConfigTagPick(interaction: StringSelectMenuInteraction): Promise<void> {
     if (!this.isAdmin(interaction)) {
-      await interaction.reply({ content: "Administrator permission required.", flags: 64 });
+      await interaction.reply({ embeds: [makeEmbed("Administrator permission required.", COLORS.danger)], flags: 64 });
       return;
     }
     const tag = this.settingsStore.tagById(interaction.values[0]);
@@ -957,7 +976,7 @@ export class DiscordBot {
   private async handleRoleSelect(interaction: RoleSelectMenuInteraction): Promise<void> {
     if (interaction.customId !== "config_set_supportrole") return;
     if (!this.isAdmin(interaction)) {
-      await interaction.reply({ content: "Administrator permission required.", flags: 64 });
+      await interaction.reply({ embeds: [makeEmbed("Administrator permission required.", COLORS.danger)], flags: 64 });
       return;
     }
     await this.settingsStore.updateGeneral({ supportRoleId: interaction.values[0] });
@@ -967,7 +986,7 @@ export class DiscordBot {
   private async handleChannelSelect(interaction: ChannelSelectMenuInteraction): Promise<void> {
     if (interaction.customId !== "config_set_channel") return;
     if (!this.isAdmin(interaction)) {
-      await interaction.reply({ content: "Administrator permission required.", flags: 64 });
+      await interaction.reply({ embeds: [makeEmbed("Administrator permission required.", COLORS.danger)], flags: 64 });
       return;
     }
     await this.settingsStore.updateGeneral({ threadsChannelId: interaction.values[0] });
@@ -978,14 +997,14 @@ export class DiscordBot {
     await interaction.deferReply({ flags: 64 });
 
     if (this.settingsStore.backfillDone()) {
-      await interaction.editReply({ content: "Backfill has already been completed." });
+      await interaction.editReply({ embeds: [makeEmbed("Backfill has already been completed.", COLORS.neutral)] });
       return;
     }
 
     const channel = await this.getThreadsChannel();
     const initial = this.settingsStore.initialTag();
     if (!channel || !initial) {
-      await interaction.editReply({ content: "Set the threads channel and at least one initial tag first." });
+      await interaction.editReply({ embeds: [makeEmbed("Set the threads channel and at least one initial tag first.", COLORS.warn)] });
       return;
     }
 
@@ -1019,10 +1038,10 @@ export class DiscordBot {
       }
 
       await this.settingsStore.markBackfillDone();
-      await interaction.editReply({ content: `Backfill complete. Tracked ${created} existing ticket(s).` });
+      await interaction.editReply({ embeds: [makeEmbed(`Backfill complete. Tracked ${created} existing ticket(s).`, COLORS.success)] });
     } catch (error) {
       console.error("Backfill error:", error);
-      await interaction.editReply({ content: "Backfill failed; you can try again from /config." });
+      await interaction.editReply({ embeds: [makeEmbed("Backfill failed; you can try again from /config.", COLORS.danger)] });
     }
   }
 

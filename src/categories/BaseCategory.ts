@@ -13,6 +13,7 @@ import {
   type ThreadChannel,
 } from "discord.js";
 import { ClaudeApiLimitError } from "../bot/ClaudeCodeRunner";
+import { embed as makeEmbed, COLORS } from "../util/embeds";
 
 export interface TicketContext {
   supportRoleId: string | null;
@@ -116,13 +117,14 @@ export abstract class BaseCategory {
       await thread.send({ embeds: [questionEmbed] });
 
       await interaction.editReply({
-        content: `Your private support thread has been created: ${thread}`,
+        embeds: [makeEmbed(`Your private support thread has been created: ${thread}`, COLORS.success)],
       });
 
       if (!ctx.aiSolveEnabled) {
         if (ctx.supportRoleId) {
           await thread.send({
-            content: `<@&${ctx.supportRoleId}> a new support ticket has been opened and needs attention.`,
+            content: `<@&${ctx.supportRoleId}>`,
+            embeds: [makeEmbed("A new support ticket has been opened and needs attention.")],
             allowedMentions: { roles: [ctx.supportRoleId] },
           });
         }
@@ -222,7 +224,7 @@ export abstract class BaseCategory {
 
         const row = new ActionRowBuilder<ButtonBuilder>().addComponents(issueButton);
 
-        await thread.send({ content: message, components: [row] });
+        await thread.send({ embeds: [makeEmbed(message, this.getColor())], components: [row] });
       } else {
         // No CTA — ask if the answer helped
         const yesButton = new ButtonBuilder()
@@ -237,22 +239,23 @@ export abstract class BaseCategory {
 
         const row = new ActionRowBuilder<ButtonBuilder>().addComponents(yesButton, noButton);
 
-        await thread.send({ content: "Did this answer help you?", components: [row] });
+        await thread.send({ embeds: [makeEmbed("Did this answer help you?", this.getColor())], components: [row] });
       }
     } catch (error) {
       if (error instanceof ClaudeApiLimitError) {
         const unavailableMsg = "The automated AI response is currently not available, please wait on a support member to assist you.";
+        const unavailableEmbed = makeEmbed(unavailableMsg, COLORS.warn);
         if (thinkingMsg) {
           // Overwrite the message that may already contain partial API error text
-          await thinkingMsg.edit({ content: unavailableMsg }).catch(() => {});
+          await thinkingMsg.edit({ content: "", embeds: [unavailableEmbed] }).catch(() => {});
         } else if (thread) {
-          await thread.send({ content: unavailableMsg }).catch(() => {});
+          await thread.send({ embeds: [unavailableEmbed] }).catch(() => {});
         } else {
-          await interaction.editReply({ content: unavailableMsg });
+          await interaction.editReply({ embeds: [unavailableEmbed] });
         }
       } else {
         await interaction.editReply({
-          content: "Something went wrong while processing your request. Please try again later.",
+          embeds: [makeEmbed("Something went wrong while processing your request. Please try again later.", COLORS.danger)],
         });
       }
     }

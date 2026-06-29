@@ -2,6 +2,7 @@ import { Client, ThreadChannel } from "discord.js";
 import { SettingsStore } from "../config/SettingsStore";
 import { TicketStore, TicketWithTag } from "./TicketStore";
 import { StatusService } from "./StatusService";
+import { embed, COLORS } from "../util/embeds";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const CHECK_INTERVAL_MS = 30 * 60 * 1000;
@@ -66,21 +67,33 @@ export class ReminderScheduler {
     if (target === "CUSTOMER" && tag.autoCloseAfter != null && ticket.reminderCount >= tag.autoCloseAfter) {
       const closingTag = this.settings.closingTag();
       if (closingTag) {
-        await this.statusService.applyStatus(thread, ticket, closingTag, { actorLabel: "the bot" });
+        await this.statusService.applyStatus(thread, ticket, closingTag, { actorName: "Automatic" });
         return;
       }
     }
 
     if (target === "CUSTOMER") {
       await thread.send({
-        content: `<@${ticket.customerId}> we're still waiting on your reply to keep helping you. This ticket may be closed if we don't hear back. (Status: ${tag.emoji} ${tag.label})`,
+        content: `<@${ticket.customerId}>`,
+        embeds: [
+          embed(
+            `We're still waiting on your reply to keep helping you. This ticket may be closed if we don't hear back.\n\nStatus: ${tag.emoji} ${tag.label}`,
+            COLORS.warn
+          ),
+        ],
         allowedMentions: { users: [ticket.customerId!] },
       });
     } else {
       const supportRoleId = this.settings.supportRoleId();
       if (!supportRoleId) return;
       await thread.send({
-        content: `<@&${supportRoleId}> this ticket has gone ${tag.reminderDays} day(s) without a reply — please follow up. (Status: ${tag.emoji} ${tag.label})`,
+        content: `<@&${supportRoleId}>`,
+        embeds: [
+          embed(
+            `This ticket has gone ${tag.reminderDays} day(s) without a reply — please follow up.\n\nStatus: ${tag.emoji} ${tag.label}`,
+            COLORS.warn
+          ),
+        ],
         allowedMentions: { roles: [supportRoleId] },
       });
     }

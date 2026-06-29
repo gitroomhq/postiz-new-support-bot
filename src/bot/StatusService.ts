@@ -1,11 +1,13 @@
 import { ThreadChannel } from "discord.js";
 import { StatusTag } from "../generated/prisma/client";
 import { TicketStore } from "./TicketStore";
+import { embed, COLORS } from "../util/embeds";
 
 const RESOLVED_EMOJI = "✅";
 
 export interface ApplyStatusOptions {
-  actorLabel: string;
+  actorName: string;
+  actorIconUrl?: string;
   silent?: boolean; // skip the audit line + customer notice (used for bulk reassignment)
 }
 
@@ -55,21 +57,23 @@ export class StatusService {
     await this.ticketStore.setStatus(ticket.threadId, tag.id);
 
     if (!options.silent) {
-      await thread
-        .send({
-          content: `Status changed to "${tag.emoji} ${tag.label}" by ${options.actorLabel}`,
-          // Render the actor as a mention, but don't actually notify them.
-          allowedMentions: { parse: [] },
-        })
-        .catch(() => {});
+      const auditEmbed = embed(`Status changed to **${tag.emoji} ${tag.label}**`).setAuthor({
+        name: options.actorName,
+        ...(options.actorIconUrl ? { iconURL: options.actorIconUrl } : {}),
+      });
+      await thread.send({ embeds: [auditEmbed] }).catch(() => {});
 
       if (tag.closesThread || tag.emoji === RESOLVED_EMOJI) {
-        const who = ticket.customerId ? `<@${ticket.customerId}> ` : "";
         const note = tag.closesThread
-          ? `${who}this ticket has been closed. Reply here or open a new ticket if you still need help.`
-          : `${who}this ticket has been marked **${tag.label}**. Reply here if you still need help.`;
+          ? "This ticket has been closed. Reply here or open a new ticket if you still need help."
+          : `This ticket has been marked **${tag.label}**. Reply here if you still need help.`;
+        // The customer mention stays in content so they actually get notified.
         await thread
-          .send({ content: note, allowedMentions: { users: ticket.customerId ? [ticket.customerId] : [] } })
+          .send({
+            content: ticket.customerId ? `<@${ticket.customerId}>` : undefined,
+            embeds: [embed(note, tag.closesThread ? COLORS.neutral : COLORS.success)],
+            allowedMentions: { users: ticket.customerId ? [ticket.customerId] : [] },
+          })
           .catch(() => {});
       }
     }

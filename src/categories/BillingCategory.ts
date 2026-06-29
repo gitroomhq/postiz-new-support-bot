@@ -12,6 +12,7 @@ import {
   ModalBuilder,
 } from "discord.js";
 import { BaseCategory, TicketContext } from "./BaseCategory";
+import { embed as makeEmbed, COLORS } from "../util/embeds";
 import { StripeClient } from "../bot/StripeClient";
 import { SessionStore } from "../auth/SessionStore";
 
@@ -98,7 +99,7 @@ export class BillingCategory extends BaseCategory {
     const session = await this.sessionStore.getSession(interaction.user.id);
     if (!session?.stripeCustomerId) {
       await interaction.editReply({
-        content: "No Stripe account linked to your profile. Please contact support directly.",
+        embeds: [makeEmbed("No Stripe account linked to your profile. Please contact support directly.", COLORS.danger)],
       });
       return;
     }
@@ -108,7 +109,12 @@ export class BillingCategory extends BaseCategory {
 
       if (!invoice) {
         await interaction.editReply({
-          content: "No recent subscription charge found in the last month. If you believe this is an error, please contact support directly.",
+          embeds: [
+            makeEmbed(
+              "No recent subscription charge found in the last month. If you believe this is an error, please contact support directly.",
+              COLORS.warn
+            ),
+          ],
         });
         return;
       }
@@ -116,7 +122,12 @@ export class BillingCategory extends BaseCategory {
       // Check if this charge was already refunded/discounted
       if (await this.sessionStore.hasBillingAction(invoice.chargeId)) {
         await interaction.editReply({
-          content: "This invoice has already been processed for a refund or discount. Please contact support directly for further assistance.",
+          embeds: [
+            makeEmbed(
+              "This invoice has already been processed for a refund or discount. Please contact support directly for further assistance.",
+              COLORS.warn
+            ),
+          ],
         });
         return;
       }
@@ -132,7 +143,7 @@ export class BillingCategory extends BaseCategory {
       await ctx.onTicketCreated(thread, interaction.user.id, interaction.user.displayName);
 
       await interaction.editReply({
-        content: `Your refund request thread has been created: ${thread}`,
+        embeds: [makeEmbed(`Your refund request thread has been created: ${thread}`, COLORS.success)],
       });
 
       const amount = this.stripeClient.formatAmount(invoice.amountPaid, invoice.currency);
@@ -170,7 +181,7 @@ export class BillingCategory extends BaseCategory {
     } catch (error) {
       console.error("Stripe error:", error);
       await interaction.editReply({
-        content: "Something went wrong while looking up your billing information. Please try again later.",
+        embeds: [makeEmbed("Something went wrong while looking up your billing information. Please try again later.", COLORS.danger)],
       });
     }
   }
@@ -197,7 +208,7 @@ export class BillingCategory extends BaseCategory {
     } catch (error) {
       console.error("Stripe discount error:", error);
       await interaction.editReply({
-        content: "Failed to apply the discount. Please contact support directly.",
+        embeds: [makeEmbed("Failed to apply the discount. Please contact support directly.", COLORS.danger)],
       });
     }
   }
@@ -222,7 +233,12 @@ export class BillingCategory extends BaseCategory {
     const row = new ActionRowBuilder<ButtonBuilder>().addComponents(confirmButton, cancelButton);
 
     await interaction.reply({
-      content: "Are you sure you want to proceed with the refund and cancel your subscription? This action cannot be undone.",
+      embeds: [
+        makeEmbed(
+          "Are you sure you want to proceed with the refund and cancel your subscription? This action cannot be undone.",
+          COLORS.warn
+        ),
+      ],
       components: [row],
     });
   }
@@ -262,14 +278,14 @@ export class BillingCategory extends BaseCategory {
     } catch (error) {
       console.error("Stripe refund error:", error);
       await interaction.editReply({
-        content: "Failed to process the refund and cancellation. Please contact support directly.",
+        embeds: [makeEmbed("Failed to process the refund and cancellation. Please contact support directly.", COLORS.danger)],
       });
     }
   }
 
   async handleCancelRefund(interaction: ButtonInteraction): Promise<void> {
     await this.disableConfirmButtons(interaction);
-    await interaction.reply({ content: "Refund cancelled. If you change your mind, please start a new request." });
+    await interaction.reply({ embeds: [makeEmbed("Refund cancelled. If you change your mind, please start a new request.", COLORS.neutral)] });
   }
 
   private async disableConfirmButtons(interaction: ButtonInteraction): Promise<void> {
