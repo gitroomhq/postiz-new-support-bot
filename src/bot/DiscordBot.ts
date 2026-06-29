@@ -14,10 +14,13 @@ import {
   TextInputStyle,
   PermissionFlagsBits,
   ChannelType,
+  AuditLogEvent,
   REST,
   Routes,
   TextChannel,
   type Interaction,
+  type Message,
+  type PartialGuildMember,
   type ChatInputCommandInteraction,
   type ButtonInteraction,
   type ModalSubmitInteraction,
@@ -38,7 +41,7 @@ import { ClaudeCodeRunner } from "./ClaudeCodeRunner";
 import { GitHubClient } from "./GitHubClient";
 import { CategoryRegistry } from "./CategoryRegistry";
 import { TicketStore } from "./TicketStore";
-import { StatusService } from "./StatusService";
+import { StatusService, RESOLVED_EMOJI } from "./StatusService";
 import { StatusReportService } from "./StatusReportService";
 import { CallbackServer } from "../server/CallbackServer";
 import { BillingCategory } from "../categories/BillingCategory";
@@ -76,6 +79,102 @@ export class DiscordBot {
 
     this.client.on("interactionCreate", (interaction) => {
       this.handleInteraction(interaction).catch(console.error);
+    });
+
+    // Reconcile ticket status with actions taken outside the bot's own UI.
+    this.client.on("guildMemberRemove", (member) => {
+      this.handleMemberLeave(member).catch(console.error);
+    });
+
+    this.client.on("messageCreate", (message) => {
+      this.handleMessage(message).catch(console.error);
+    });
+
+    this.client.on("threadUpdate", (oldThread, newThread) => {
+      this.handleThreadUpdate(oldThread, newThread).catch(console.error);
+    });
+  }
+
+  // A member left the guild: close out every open ticket they own.
+  private async handleMemberLeave(member: GuildMember | PartialGuildMember): Promise<void> {
+    const closingTag = this.settingsStore.closingTag();
+    if (!closingTag) return;
+
+    const tickets = await this.ticketStore.listOpenByCustomerId(member.id);
+    for (const ticket of tickets) {
+      const channel = await this.client.channels.fetch(ticket.threadId).catch(() => null);
+      if (channel?.isThread()) {
+        await this.statusService.applyStatus(channel as ThreadChannel, ticket, closingTag, {
+          actorName: "System (member left)",
+          silent: true,
+        });
+      } else {
+        // Thread is gone/unreachable — still reconcile the DB.
+        await this.ticketStore.close(ticket.threadId).catch(() => {});
+      }
+    }
+  }
+
+  // A customer replied to their Resolved ticket: reopen it to the initial status.
+  private async handleMessage(message: Message): Promise<void> {
+    if (message.author.bot) return;
+    if (!message.channel.isThread()) return;
+
+    const ticket = await this.ticketStore.getByThreadId(message.channelId);
+    if (!ticket) return;
+    // Only Resolved tickets are reopenable by a reply (Closed threads are locked).
+    if (ticket.statusTag?.emoji !== RESOLVED_EMOJI) return;
+    // Only the ticket's own customer reopens it — support/closing notes don't.
+    if (message.author.id !== ticket.customerId) return;
+
+    const initialTag = this.settingsStore.initialTag();
+    if (!initialTag) return;
+
+    await this.statusService.applyStatus(message.channel as ThreadChannel, ticket, initialTag, {
+      actorName: "Customer reply",
+    });
+  }
+
+  // A thread was manually locked/archived in Discord: mirror it as a status change.
+  private async handleThreadUpdate(oldThread: ThreadChannel, newThread: ThreadChannel): Promise<void> {
+    if (newThread.parentId !== this.settingsStore.threadsChannelId()) return;
+
+    const ticket = await this.ticketStore.getByThreadId(newThread.id);
+    if (!ticket) return;
+
+    // Only react to flags being newly set, not cleared (reopen is handled elsewhere).
+    const newlyLocked = !oldThread.locked && newThread.locked;
+    const newlyArchived = !oldThread.archived && newThread.archived;
+    if (!newlyLocked && !newlyArchived) return;
+
+    const target = newlyLocked
+      ? this.settingsStore.closingTag()
+      : this.settingsStore.tagByEmoji(RESOLVED_EMOJI);
+    if (!target) return;
+
+    // Idempotency backstop: applyStatus persists the status BEFORE it locks/archives, so
+    // the bot's own edits re-fire this event already at the target status — skip them.
+    if (ticket.statusTagId === target.id) return;
+
+    // Only act on actions a human performed. The audit log lets us ignore the bot's own
+    // edits and Discord's inactivity auto-archive (which writes no audit entry).
+    try {
+      const logs = await newThread.guild.fetchAuditLogs({
+        type: AuditLogEvent.ThreadUpdate,
+        limit: 5,
+      });
+      const entry = logs.entries.find((e) => e.target?.id === newThread.id);
+      if (!entry) return; // auto-archive / no record → not a manual action
+      if (entry.executorId === this.client.user?.id) return; // the bot itself
+    } catch (error) {
+      // Missing "View Audit Log" permission (or transient failure): skip rather than
+      // misfire on inactivity auto-archives.
+      console.warn("threadUpdate: could not read audit log, skipping status sync:", error);
+      return;
+    }
+
+    await this.statusService.applyStatus(newThread, ticket, target, {
+      actorName: "Manual thread action",
     });
   }
 

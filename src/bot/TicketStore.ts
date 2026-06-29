@@ -62,6 +62,14 @@ export class TicketStore {
     await this.prisma.ticket.update({ where: { threadId }, data: { closed: true, closedAt: new Date() } });
   }
 
+  // A customer's still-open tickets (used to close them out when the member leaves).
+  async listOpenByCustomerId(customerId: string): Promise<TicketWithTag[]> {
+    return this.prisma.ticket.findMany({
+      where: { customerId, closed: false },
+      include: { statusTag: true },
+    });
+  }
+
   // Open tickets whose current status has reminders enabled.
   async listRemindable(): Promise<TicketWithTag[]> {
     return this.prisma.ticket.findMany({
