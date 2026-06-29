@@ -39,6 +39,7 @@ import { GitHubClient } from "./GitHubClient";
 import { CategoryRegistry } from "./CategoryRegistry";
 import { TicketStore } from "./TicketStore";
 import { StatusService } from "./StatusService";
+import { StatusReportService } from "./StatusReportService";
 import { CallbackServer } from "../server/CallbackServer";
 import { BillingCategory } from "../categories/BillingCategory";
 import { BaseCategory, TicketContext } from "../categories/BaseCategory";
@@ -57,7 +58,8 @@ export class DiscordBot {
     private apiClient: PostizApiClient,
     private claudeRunner: ClaudeCodeRunner,
     private githubClient: GitHubClient,
-    private categoryRegistry: CategoryRegistry
+    private categoryRegistry: CategoryRegistry,
+    private reportService: StatusReportService
   ) {
     this.client = new Client({
       intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.GuildMembers],
@@ -100,6 +102,23 @@ export class DiscordBot {
       await this.handleConfigCommand(interaction);
     } else if (interaction.commandName === "set-status") {
       await this.handleSetStatusCommand(interaction);
+    } else if (interaction.commandName === "report") {
+      await this.handleReportCommand(interaction);
+    }
+  }
+
+  private async handleReportCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+    const member = await this.requireSupportOrAdmin(interaction);
+    if (!member) return;
+
+    await interaction.deferReply({ flags: 64 });
+    try {
+      // Manual checks use a trailing 24h window and never advance the scheduled cadence.
+      const { embed } = await this.reportService.build({ since: null });
+      await interaction.editReply({ embeds: [embed] });
+    } catch (error) {
+      console.error("report command failed:", error);
+      await interaction.editReply({ embeds: [makeEmbed("Couldn't build the status report.", COLORS.danger)] });
     }
   }
 
@@ -464,6 +483,16 @@ export class DiscordBot {
     return interaction.memberPermissions?.has(PermissionFlagsBits.Administrator) ?? false;
   }
 
+  private isValidTimezone(tz: string): boolean {
+    if (!tz) return false;
+    try {
+      new Intl.DateTimeFormat("en-GB", { timeZone: tz });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   private async requireSupportOrAdmin(
     interaction: ChatInputCommandInteraction | StringSelectMenuInteraction
   ): Promise<GuildMember | null> {
@@ -625,12 +654,18 @@ export class DiscordBot {
           `**GitHub repo:** ${s.githubRepo() ? `\`${s.githubRepo()}\`` : "_not set_"}`,
           `**AI solve:** ${s.aiSolveEnabled() ? "on" : "off"}`,
           `**Status tags:** ${s.tags().length}`,
+          `**Status report:** ${
+            s.reportEnabled() && s.reportChannelId()
+              ? `every ${s.reportIntervalHours()}h → <#${s.reportChannelId()}>`
+              : "off"
+          }`,
         ].join("\n")
       );
 
     const buttons = [
       new ButtonBuilder().setCustomId("config_general").setLabel("General Settings").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("config_tags").setLabel("Manage Tags").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("config_report").setLabel("Status Report").setStyle(ButtonStyle.Primary),
     ];
     if (!s.backfillDone()) {
       buttons.push(
@@ -675,6 +710,44 @@ export class DiscordBot {
         new ActionRowBuilder<ChannelSelectMenuBuilder>().addComponents(channelSelect),
         buttons,
       ],
+    };
+  }
+
+  private buildReportPanel() {
+    const s = this.settingsStore;
+    const embed = new EmbedBuilder()
+      .setTitle("Status Report")
+      .setColor(0x5865f2)
+      .setDescription(
+        [
+          `**Channel:** ${s.reportChannelId() ? `<#${s.reportChannelId()}>` : "_not set_"}`,
+          `**Enabled:** ${s.reportEnabled() ? "yes" : "no"}`,
+          `**Every:** ${s.reportIntervalHours()} hour(s)`,
+          `**Timezone:** ${s.reportTimezone()}`,
+          "",
+          "Posts an opened/closed + per-status + per-type summary on the interval above. Run `/report` for an instant check anytime.",
+        ].join("\n")
+      );
+
+    const channelSelect = new ChannelSelectMenuBuilder()
+      .setCustomId("config_set_reportchannel")
+      .setPlaceholder("Report channel")
+      .addChannelTypes(ChannelType.GuildText);
+    if (s.reportChannelId()) channelSelect.setDefaultChannels(s.reportChannelId()!);
+
+    const buttons = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId("config_report_toggle")
+        .setLabel(`Reporting: ${s.reportEnabled() ? "on" : "off"}`)
+        .setStyle(s.reportEnabled() ? ButtonStyle.Success : ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("config_report_interval").setLabel("Set Interval").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("config_report_tz").setLabel("Set Timezone").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("config_back_main").setLabel("Back").setStyle(ButtonStyle.Secondary)
+    );
+
+    return {
+      embeds: [embed],
+      components: [new ActionRowBuilder<ChannelSelectMenuBuilder>().addComponents(channelSelect), buttons],
     };
   }
 
@@ -775,6 +848,43 @@ export class DiscordBot {
 
     if (id === "config_backfill") {
       await this.handleBackfill(interaction);
+      return;
+    }
+
+    if (id === "config_report") {
+      await interaction.update(this.buildReportPanel());
+      return;
+    }
+
+    if (id === "config_report_toggle") {
+      await this.settingsStore.updateReport({ reportEnabled: !this.settingsStore.reportEnabled() });
+      await interaction.update(this.buildReportPanel());
+      return;
+    }
+
+    if (id === "config_report_interval") {
+      const modal = new ModalBuilder().setCustomId("config_report_interval_modal").setTitle("Report Interval");
+      const input = new TextInputBuilder()
+        .setCustomId("hours")
+        .setLabel("Post every N hours")
+        .setStyle(TextInputStyle.Short)
+        .setRequired(true)
+        .setValue(String(this.settingsStore.reportIntervalHours()));
+      modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(input));
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (id === "config_report_tz") {
+      const modal = new ModalBuilder().setCustomId("config_report_tz_modal").setTitle("Report Timezone");
+      const input = new TextInputBuilder()
+        .setCustomId("tz")
+        .setLabel("IANA timezone (e.g. Europe/Berlin)")
+        .setStyle(TextInputStyle.Short)
+        .setRequired(true)
+        .setValue(this.settingsStore.reportTimezone());
+      modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(input));
+      await interaction.showModal(modal);
       return;
     }
 
@@ -889,6 +999,29 @@ export class DiscordBot {
       return;
     }
 
+    if (interaction.customId === "config_report_interval_modal") {
+      const raw = interaction.fields.getTextInputValue("hours").trim();
+      const hours = parseInt(raw, 10);
+      if (!Number.isFinite(hours) || hours < 1) {
+        await interaction.reply({ embeds: [makeEmbed("Enter a whole number of hours (1 or more).", COLORS.danger)], flags: 64 });
+        return;
+      }
+      await this.settingsStore.updateReport({ reportIntervalHours: hours });
+      await interaction.reply({ embeds: [makeEmbed(`Report interval set to every ${hours} hour(s).`, COLORS.success)], flags: 64 });
+      return;
+    }
+
+    if (interaction.customId === "config_report_tz_modal") {
+      const tz = interaction.fields.getTextInputValue("tz").trim();
+      if (!this.isValidTimezone(tz)) {
+        await interaction.reply({ embeds: [makeEmbed("That isn't a valid IANA timezone (e.g. Europe/Berlin, UTC).", COLORS.danger)], flags: 64 });
+        return;
+      }
+      await this.settingsStore.updateReport({ reportTimezone: tz });
+      await interaction.reply({ embeds: [makeEmbed(`Report timezone set to ${tz}.`, COLORS.success)], flags: 64 });
+      return;
+    }
+
     const emoji = interaction.fields.getTextInputValue("emoji").trim();
     const label = interaction.fields.getTextInputValue("label").trim();
     const daysRaw = interaction.fields.getTextInputValue("days").trim();
@@ -984,9 +1117,14 @@ export class DiscordBot {
   }
 
   private async handleChannelSelect(interaction: ChannelSelectMenuInteraction): Promise<void> {
-    if (interaction.customId !== "config_set_channel") return;
+    if (interaction.customId !== "config_set_channel" && interaction.customId !== "config_set_reportchannel") return;
     if (!this.isAdmin(interaction)) {
       await interaction.reply({ embeds: [makeEmbed("Administrator permission required.", COLORS.danger)], flags: 64 });
+      return;
+    }
+    if (interaction.customId === "config_set_reportchannel") {
+      await this.settingsStore.updateReport({ reportChannelId: interaction.values[0] });
+      await interaction.update(this.buildReportPanel());
       return;
     }
     await this.settingsStore.updateGeneral({ threadsChannelId: interaction.values[0] });
@@ -1060,6 +1198,10 @@ export class DiscordBot {
       {
         name: "set-status",
         description: "Set the status of this support ticket (support/admin only)",
+      },
+      {
+        name: "report",
+        description: "Show a support status report (support/admin only)",
       },
     ];
 

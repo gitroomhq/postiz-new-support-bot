@@ -34,10 +34,20 @@ export class TicketStore {
     });
   }
 
-  async setStatus(threadId: string, statusTagId: string): Promise<void> {
+  // isDone: the new status closes the thread or marks it resolved. We stamp closedAt
+  // (and the closed flag) so the status report can count "closed since X" accurately, and
+  // clear them when a ticket is moved back to an active status.
+  async setStatus(threadId: string, statusTagId: string, isDone: boolean): Promise<void> {
     await this.prisma.ticket.update({
       where: { threadId },
-      data: { statusTagId, lastStatusChangeAt: new Date(), lastReminderAt: null, reminderCount: 0 },
+      data: {
+        statusTagId,
+        lastStatusChangeAt: new Date(),
+        lastReminderAt: null,
+        reminderCount: 0,
+        closed: isDone,
+        closedAt: isDone ? new Date() : null,
+      },
     });
   }
 
@@ -49,7 +59,7 @@ export class TicketStore {
   }
 
   async close(threadId: string): Promise<void> {
-    await this.prisma.ticket.update({ where: { threadId }, data: { closed: true } });
+    await this.prisma.ticket.update({ where: { threadId }, data: { closed: true, closedAt: new Date() } });
   }
 
   // Open tickets whose current status has reminders enabled.
@@ -62,5 +72,31 @@ export class TicketStore {
 
   async existsForThread(threadId: string): Promise<boolean> {
     return (await this.prisma.ticket.count({ where: { threadId } })) > 0;
+  }
+
+  // ---- Aggregates for the status report ----
+
+  // Ticket counts grouped by current status tag AND category, in one pass. The report
+  // classifies each statusTagId as open/done and derives every breakdown from this.
+  async statusCategoryBreakdown(): Promise<
+    { statusTagId: string | null; categoryId: string | null; count: number }[]
+  > {
+    const rows = await this.prisma.ticket.groupBy({
+      by: ["statusTagId", "categoryId"],
+      _count: { _all: true },
+    });
+    return rows.map((r) => ({
+      statusTagId: r.statusTagId,
+      categoryId: r.categoryId,
+      count: r._count._all,
+    }));
+  }
+
+  async countOpenedSince(since: Date): Promise<number> {
+    return this.prisma.ticket.count({ where: { createdAt: { gte: since } } });
+  }
+
+  async countClosedSince(since: Date): Promise<number> {
+    return this.prisma.ticket.count({ where: { closedAt: { gte: since } } });
   }
 }

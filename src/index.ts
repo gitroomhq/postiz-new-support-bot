@@ -13,6 +13,8 @@ import { CategoryRegistry } from "./bot/CategoryRegistry";
 import { TicketStore } from "./bot/TicketStore";
 import { StatusService } from "./bot/StatusService";
 import { ReminderScheduler } from "./bot/ReminderScheduler";
+import { StatusReportService } from "./bot/StatusReportService";
+import { StatusReportScheduler } from "./bot/StatusReportScheduler";
 import { DiscordBot } from "./bot/DiscordBot";
 import { ensureSchema } from "./db/ensureSchema";
 import { HowToCategory, BugsCategory, BillingCategory } from "./categories";
@@ -44,6 +46,8 @@ async function main() {
     .register(new BugsCategory())
     .register(new BillingCategory(stripeClient, sessionStore));
 
+  const reportService = new StatusReportService(settingsStore, ticketStore, categoryRegistry);
+
   const bot = new DiscordBot(
     config,
     settingsStore,
@@ -54,12 +58,16 @@ async function main() {
     apiClient,
     claudeRunner,
     githubClient,
-    categoryRegistry
+    categoryRegistry,
+    reportService
   );
   await bot.start();
 
   const reminderScheduler = new ReminderScheduler(bot.client, settingsStore, ticketStore, statusService);
   reminderScheduler.start();
+
+  const statusReportScheduler = new StatusReportScheduler(bot.client, settingsStore, reportService);
+  statusReportScheduler.start();
 
   // Clean expired pending auths every 5 minutes
   setInterval(() => sessionStore.cleanExpiredPending(), 5 * 60 * 1000);
@@ -67,6 +75,8 @@ async function main() {
   // Graceful shutdown
   const shutdown = async () => {
     console.log("Shutting down...");
+    reminderScheduler.stop();
+    statusReportScheduler.stop();
     bot.client.destroy();
     await prisma.$disconnect();
     process.exit(0);

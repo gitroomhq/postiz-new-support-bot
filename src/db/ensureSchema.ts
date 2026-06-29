@@ -39,6 +39,12 @@ const STATEMENTS: string[] = [
     "githubRepo" TEXT,
     "aiSolveEnabled" BOOLEAN NOT NULL DEFAULT true,
     "backfillDone" BOOLEAN NOT NULL DEFAULT false,
+    "reportChannelId" TEXT,
+    "reportEnabled" BOOLEAN NOT NULL DEFAULT false,
+    "reportIntervalHours" INTEGER NOT NULL DEFAULT 24,
+    "reportTimezone" TEXT NOT NULL DEFAULT 'UTC',
+    "reportLastRunAt" TIMESTAMP(3),
+    "reportLastSnapshot" JSONB,
     "updatedAt" TIMESTAMP(3) NOT NULL,
     CONSTRAINT "bot_settings_pkey" PRIMARY KEY ("id")
   )`,
@@ -67,6 +73,7 @@ const STATEMENTS: string[] = [
     "lastReminderAt" TIMESTAMP(3),
     "reminderCount" INTEGER NOT NULL DEFAULT 0,
     "closed" BOOLEAN NOT NULL DEFAULT false,
+    "closedAt" TIMESTAMP(3),
     "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT "tickets_pkey" PRIMARY KEY ("id")
   )`,
@@ -84,6 +91,14 @@ const STATEMENTS: string[] = [
     END IF;
   END
   $$`,
+  // Columns added after the tables already existed in production — additive, idempotent.
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "reportChannelId" TEXT`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "reportEnabled" BOOLEAN NOT NULL DEFAULT false`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "reportIntervalHours" INTEGER NOT NULL DEFAULT 24`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "reportTimezone" TEXT NOT NULL DEFAULT 'UTC'`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "reportLastRunAt" TIMESTAMP(3)`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "reportLastSnapshot" JSONB`,
+  `ALTER TABLE "tickets" ADD COLUMN IF NOT EXISTS "closedAt" TIMESTAMP(3)`,
 ];
 
 export async function ensureSchema(prisma: PrismaClient): Promise<void> {

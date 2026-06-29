@@ -3,7 +3,7 @@ import { StatusTag } from "../generated/prisma/client";
 import { TicketStore } from "./TicketStore";
 import { embed, COLORS } from "../util/embeds";
 
-const RESOLVED_EMOJI = "✅";
+export const RESOLVED_EMOJI = "✅";
 
 export interface ApplyStatusOptions {
   actorName: string;
@@ -45,9 +45,14 @@ export class StatusService {
     tag: StatusTag,
     options: ApplyStatusOptions
   ): Promise<void> {
-    // Reopen a closed thread when moving to a non-closing status: unarchive first
-    // so it's editable, then unlock.
-    if (!tag.closesThread && (thread.archived || thread.locked)) {
+    // "Done" = a tag that closes the thread (📁, locks + archives) or marks it resolved
+    // (✅, archives but stays unlocked so the customer can reply to reopen). This also
+    // drives closedAt bookkeeping for the status report (resolved counts alongside closed).
+    const isResolved = tag.emoji === RESOLVED_EMOJI;
+    const isDone = tag.closesThread || isResolved;
+
+    // Reopen when moving to an active status: unarchive first so it's editable, then unlock.
+    if (!isDone && (thread.archived || thread.locked)) {
       await thread.setArchived(false).catch(() => {});
       await thread.setLocked(false).catch(() => {});
     }
@@ -56,7 +61,7 @@ export class StatusService {
     // so the DB + audit line stay consistent.
     await thread.setName(this.buildThreadName(thread.name, tag.emoji)).catch(() => {});
 
-    await this.ticketStore.setStatus(ticket.threadId, tag.id);
+    await this.ticketStore.setStatus(ticket.threadId, tag.id, isDone);
 
     if (!options.silent) {
       const auditEmbed = embed(`Status changed to **${tag.emoji} ${tag.label}**`).setAuthor({
@@ -65,7 +70,7 @@ export class StatusService {
       });
       await thread.send({ embeds: [auditEmbed] }).catch(() => {});
 
-      if (tag.closesThread || tag.emoji === RESOLVED_EMOJI) {
+      if (isDone) {
         const note = tag.closesThread
           ? "This ticket has been closed. Reply here or open a new ticket if you still need help."
           : `This ticket has been marked **${tag.label}**. Reply here if you still need help.`;
@@ -84,6 +89,10 @@ export class StatusService {
       // Lock while the thread is still active, then archive in a separate call —
       // doing both in one edit can leave it locked but not archived.
       await thread.setLocked(true).catch(() => {});
+      await thread.setArchived(true).catch(() => {});
+    } else if (isResolved) {
+      // Resolved = closed but NOT locked, so the customer can still reply (which
+      // auto-unarchives the thread) to pick the conversation back up.
       await thread.setArchived(true).catch(() => {});
     }
   }

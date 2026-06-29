@@ -2,6 +2,13 @@ import { PrismaClient, BotSettings, StatusTag } from "../generated/prisma/client
 
 export type ReminderTarget = "SUPPORT" | "CUSTOMER";
 
+// Totals stored after each scheduled report so the next one can show trend deltas.
+export type ReportSnapshot = {
+  openTotal: number;
+  doneTotal: number;
+  total: number;
+};
+
 export interface TagInput {
   emoji: string;
   label: string;
@@ -94,6 +101,34 @@ export class SettingsStore {
     return this.settings.backfillDone;
   }
 
+  reportChannelId(): string | null {
+    return this.settings.reportChannelId;
+  }
+
+  reportEnabled(): boolean {
+    return this.settings.reportEnabled;
+  }
+
+  reportIntervalHours(): number {
+    return this.settings.reportIntervalHours;
+  }
+
+  reportTimezone(): string {
+    return this.settings.reportTimezone;
+  }
+
+  reportLastRunAt(): Date | null {
+    return this.settings.reportLastRunAt;
+  }
+
+  reportLastSnapshot(): ReportSnapshot | null {
+    const snap = this.settings.reportLastSnapshot as unknown;
+    if (snap && typeof snap === "object" && "openTotal" in snap) {
+      return snap as ReportSnapshot;
+    }
+    return null;
+  }
+
   tags(): StatusTag[] {
     return this.tagList;
   }
@@ -121,6 +156,28 @@ export class SettingsStore {
     aiSolveEnabled?: boolean;
   }): Promise<void> {
     this.settings = await this.prisma.botSettings.update({ where: { id: "global" }, data });
+  }
+
+  async updateReport(data: {
+    reportChannelId?: string | null;
+    reportEnabled?: boolean;
+    reportIntervalHours?: number;
+    reportTimezone?: string;
+  }): Promise<void> {
+    // Enabling the report (re)bases the cadence clock so the first post lands one full
+    // interval from now rather than firing immediately on the next scheduler tick.
+    const rebase = data.reportEnabled === true && !this.settings.reportEnabled;
+    this.settings = await this.prisma.botSettings.update({
+      where: { id: "global" },
+      data: { ...data, ...(rebase ? { reportLastRunAt: new Date() } : {}) },
+    });
+  }
+
+  async recordReportRun(snapshot: ReportSnapshot): Promise<void> {
+    this.settings = await this.prisma.botSettings.update({
+      where: { id: "global" },
+      data: { reportLastRunAt: new Date(), reportLastSnapshot: snapshot },
+    });
   }
 
   async markBackfillDone(): Promise<void> {
@@ -203,7 +260,14 @@ export class SettingsStore {
     await this.prisma.$transaction([
       this.prisma.ticket.updateMany({
         where: { statusTagId: id },
-        data: { statusTagId: initial.id, lastStatusChangeAt: new Date(), lastReminderAt: null, reminderCount: 0 },
+        data: {
+          statusTagId: initial.id,
+          lastStatusChangeAt: new Date(),
+          lastReminderAt: null,
+          reminderCount: 0,
+          closed: false,
+          closedAt: null,
+        },
       }),
       this.prisma.statusTag.delete({ where: { id } }),
     ]);

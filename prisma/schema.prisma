@@ -41,13 +41,19 @@ model PendingAuth {
 }
 
 model BotSettings {
-  id               String   @id @default("global")
-  threadsChannelId String?
-  supportRoleId    String?
-  githubRepo       String?
-  aiSolveEnabled   Boolean  @default(true)
-  backfillDone     Boolean  @default(false)
-  updatedAt        DateTime @updatedAt
+  id                  String    @id @default("global")
+  threadsChannelId    String?
+  supportRoleId       String?
+  githubRepo          String?
+  aiSolveEnabled      Boolean   @default(true)
+  backfillDone        Boolean   @default(false)
+  reportChannelId     String?
+  reportEnabled       Boolean   @default(false)
+  reportIntervalHours Int       @default(24)
+  reportTimezone      String    @default("UTC")
+  reportLastRunAt     DateTime?
+  reportLastSnapshot  Json?
+  updatedAt           DateTime  @updatedAt
 
   @@map("bot_settings")
 }
@@ -81,6 +87,7 @@ model Ticket {
   lastReminderAt      DateTime?
   reminderCount       Int        @default(0)
   closed              Boolean    @default(false)
+  closedAt            DateTime?
   createdAt           DateTime   @default(now())
 
   @@map("tickets")
