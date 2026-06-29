@@ -528,7 +528,7 @@ export class DiscordBot {
     }
 
     await interaction.deferUpdate();
-    await this.statusService.applyStatus(thread, ticket, tag, { actorLabel: member.displayName });
+    await this.statusService.applyStatus(thread, ticket, tag, { actorLabel: `<@${member.id}>`, actorId: member.id });
     await interaction.editReply({ content: `Status set to ${tag.emoji} ${tag.label}.`, components: [] });
   }
 

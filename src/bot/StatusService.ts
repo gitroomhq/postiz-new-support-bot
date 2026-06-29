@@ -6,6 +6,7 @@ const RESOLVED_EMOJI = "✅";
 
 export interface ApplyStatusOptions {
   actorLabel: string;
+  actorId?: string; // when set, the audit line pings this user
   silent?: boolean; // skip the audit line + customer notice (used for bulk reassignment)
 }
 
@@ -37,7 +38,10 @@ export class StatusService {
 
     if (!options.silent) {
       await thread
-        .send({ content: `Status changed to ${tag.emoji} ${tag.label} by ${options.actorLabel}` })
+        .send({
+          content: `Status changed to "${tag.emoji} ${tag.label}" by ${options.actorLabel}`,
+          allowedMentions: { users: options.actorId ? [options.actorId] : [] },
+        })
         .catch(() => {});
 
       if (tag.closesThread || tag.emoji === RESOLVED_EMOJI) {
