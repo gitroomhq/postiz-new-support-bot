@@ -50,6 +50,8 @@ model BotSettings {
   reportChannelId     String?
   reportEnabled       Boolean   @default(false)
   reportIntervalHours Int       @default(24)
+  reportHour          Int?
+  reportMinute        Int?
   reportTimezone      String    @default("UTC")
   reportLastRunAt     DateTime?
   reportLastSnapshot  Json?
