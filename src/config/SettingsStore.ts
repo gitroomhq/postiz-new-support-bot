@@ -114,7 +114,15 @@ export class SettingsStore {
   reportIntervalHours(): number {
     return this.settings.reportIntervalHours;
   }
-
+ 
+  reportHour(): number | null {
+    return this.settings.reportHour;
+  }
+ 
+  reportMinute(): number | null {
+    return this.settings.reportMinute;
+  }
+ 
   reportTimezone(): string {
     return this.settings.reportTimezone;
   }
@@ -164,6 +172,8 @@ export class SettingsStore {
     reportChannelId?: string | null;
     reportEnabled?: boolean;
     reportIntervalHours?: number;
+    reportHour?: number | null;
+    reportMinute?: number | null;
     reportTimezone?: string;
   }): Promise<void> {
     // Enabling the report (re)bases the cadence clock so the first post lands one full

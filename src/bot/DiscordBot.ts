@@ -591,7 +591,11 @@ export class DiscordBot {
       return false;
     }
   }
-
+ 
+  private formatReportTime(hour: number, minute: number): string {
+    return `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
+  }
+ 
   private async requireSupportOrAdmin(
     interaction: ChatInputCommandInteraction | StringSelectMenuInteraction
   ): Promise<GuildMember | null> {
@@ -755,7 +759,7 @@ export class DiscordBot {
           `**Status tags:** ${s.tags().length}`,
           `**Status report:** ${
             s.reportEnabled() && s.reportChannelId()
-              ? `every ${s.reportIntervalHours()}h → <#${s.reportChannelId()}>`
+              ? `${s.reportHour() != null && s.reportMinute() != null ? `daily at ${this.formatReportTime(s.reportHour()!, s.reportMinute()!)} (${s.reportTimezone()})` : `every ${s.reportIntervalHours()}h`} → <#${s.reportChannelId()}>`
               : "off"
           }`,
         ].join("\n")
@@ -821,10 +825,10 @@ export class DiscordBot {
         [
           `**Channel:** ${s.reportChannelId() ? `<#${s.reportChannelId()}>` : "_not set_"}`,
           `**Enabled:** ${s.reportEnabled() ? "yes" : "no"}`,
-          `**Every:** ${s.reportIntervalHours()} hour(s)`,
+          `**Schedule:** ${s.reportHour() != null && s.reportMinute() != null ? `daily at ${this.formatReportTime(s.reportHour()!, s.reportMinute()!)} (${s.reportTimezone()})` : `every ${s.reportIntervalHours()} hour(s)`}`,
           `**Timezone:** ${s.reportTimezone()}`,
           "",
-          "Posts an opened/closed + per-status + per-type summary on the interval above. Run `/report` for an instant check anytime.",
+          "Posts an opened/closed + per-status + per-type summary on the configured schedule. Run `/report` for an instant check anytime.",
         ].join("\n")
       );
 
@@ -839,7 +843,7 @@ export class DiscordBot {
         .setCustomId("config_report_toggle")
         .setLabel(`Reporting: ${s.reportEnabled() ? "on" : "off"}`)
         .setStyle(s.reportEnabled() ? ButtonStyle.Success : ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId("config_report_interval").setLabel("Set Interval").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("config_report_time").setLabel("Set Time").setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId("config_report_tz").setLabel("Set Timezone").setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId("config_back_main").setLabel("Back").setStyle(ButtonStyle.Secondary)
     );
@@ -967,15 +971,24 @@ export class DiscordBot {
       return;
     }
 
-    if (id === "config_report_interval") {
-      const modal = new ModalBuilder().setCustomId("config_report_interval_modal").setTitle("Report Interval");
-      const input = new TextInputBuilder()
-        .setCustomId("hours")
-        .setLabel("Post every N hours")
+    if (id === "config_report_time") {
+      const modal = new ModalBuilder().setCustomId("config_report_time_modal").setTitle("Report Time");
+      const hourInput = new TextInputBuilder()
+        .setCustomId("hour")
+        .setLabel("Hour (0-23)")
         .setStyle(TextInputStyle.Short)
         .setRequired(true)
-        .setValue(String(this.settingsStore.reportIntervalHours()));
-      modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(input));
+        .setValue(String(this.settingsStore.reportHour() ?? 9));
+      const minuteInput = new TextInputBuilder()
+        .setCustomId("minute")
+        .setLabel("Minute (0-59)")
+        .setStyle(TextInputStyle.Short)
+        .setRequired(true)
+        .setValue(String(this.settingsStore.reportMinute() ?? 0));
+      modal.addComponents(
+        new ActionRowBuilder<TextInputBuilder>().addComponents(hourInput),
+        new ActionRowBuilder<TextInputBuilder>().addComponents(minuteInput)
+      );
       await interaction.showModal(modal);
       return;
     }
@@ -1105,15 +1118,20 @@ export class DiscordBot {
       return;
     }
 
-    if (interaction.customId === "config_report_interval_modal") {
-      const raw = interaction.fields.getTextInputValue("hours").trim();
-      const hours = parseInt(raw, 10);
-      if (!Number.isFinite(hours) || hours < 1) {
-        await interaction.reply({ embeds: [makeEmbed("Enter a whole number of hours (1 or more).", COLORS.danger)], flags: 64 });
+    if (interaction.customId === "config_report_time_modal") {
+      const hourRaw = interaction.fields.getTextInputValue("hour").trim();
+      const minuteRaw = interaction.fields.getTextInputValue("minute").trim();
+      const hour = /^\d+$/.test(hourRaw) ? Number(hourRaw) : NaN;
+      const minute = /^\d+$/.test(minuteRaw) ? Number(minuteRaw) : NaN;
+      if (!Number.isInteger(hour) || hour < 0 || hour > 23 || !Number.isInteger(minute) || minute < 0 || minute > 59) {
+        await interaction.reply({ embeds: [makeEmbed("Enter a valid hour (0-23) and minute (0-59).", COLORS.danger)], flags: 64 });
         return;
       }
-      await this.settingsStore.updateReport({ reportIntervalHours: hours });
-      await interaction.reply({ embeds: [makeEmbed(`Report interval set to every ${hours} hour(s).`, COLORS.success)], flags: 64 });
+      await this.settingsStore.updateReport({ reportHour: hour, reportMinute: minute });
+      await interaction.reply({
+        embeds: [makeEmbed(`Status report will publish daily at ${this.formatReportTime(hour, minute)} (${this.settingsStore.reportTimezone()}).`, COLORS.success)],
+        flags: 64,
+      });
       return;
     }
 
