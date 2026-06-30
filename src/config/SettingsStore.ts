@@ -26,7 +26,9 @@ const DEFAULT_TAGS: TagInput[] = [
   { emoji: "🟠", label: "Waiting for Customer", reminderEnabled: true, reminderDays: 3, reminderTarget: "CUSTOMER", autoCloseAfter: 3 },
   { emoji: "🔵", label: "Waiting for Developer", reminderEnabled: true, reminderDays: 5, reminderTarget: "SUPPORT" },
   { emoji: "🟣", label: "Testing", reminderEnabled: true, reminderDays: 5, reminderTarget: "SUPPORT" },
-  { emoji: "✅", label: "Resolved", reminderEnabled: false },
+  // autoCloseAfter on Resolved is read as DAYS of customer silence before the ticket
+  // is auto-closed (locked); on reminder tags it counts reminder rounds instead.
+  { emoji: "✅", label: "Resolved", reminderEnabled: false, autoCloseAfter: 3 },
   { emoji: "📁", label: "Closed", closesThread: true, reminderEnabled: false },
 ];
 

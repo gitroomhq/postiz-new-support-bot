@@ -78,6 +78,16 @@ export class TicketStore {
     });
   }
 
+  // Tickets currently sitting in a given status tag. Used to auto-close Resolved
+  // tickets after a quiet period (Resolved tickets carry closed=true, so we key off
+  // the status tag rather than the closed flag).
+  async listInStatus(statusTagId: string): Promise<TicketWithTag[]> {
+    return this.prisma.ticket.findMany({
+      where: { statusTagId },
+      include: { statusTag: true },
+    });
+  }
+
   async existsForThread(threadId: string): Promise<boolean> {
     return (await this.prisma.ticket.count({ where: { threadId } })) > 0;
   }

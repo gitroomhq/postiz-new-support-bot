@@ -1,11 +1,15 @@
 import { Client, ThreadChannel } from "discord.js";
+import { StatusTag } from "../generated/prisma/client";
 import { SettingsStore } from "../config/SettingsStore";
 import { TicketStore, TicketWithTag } from "./TicketStore";
-import { StatusService } from "./StatusService";
+import { StatusService, RESOLVED_EMOJI } from "./StatusService";
 import { embed, COLORS } from "../util/embeds";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const CHECK_INTERVAL_MS = 30 * 60 * 1000;
+// Days of customer silence after a ticket is marked Resolved before it auto-closes,
+// used when the Resolved tag has no autoCloseAfter configured.
+const DEFAULT_RESOLVED_AUTO_CLOSE_DAYS = 3;
 
 export class ReminderScheduler {
   private timer: NodeJS.Timeout | null = null;
@@ -37,6 +41,49 @@ export class ReminderScheduler {
         console.error(`Reminder check failed for thread ${ticket.threadId}:`, err);
       }
     }
+    await this.processResolvedAutoClose();
+  }
+
+  // Resolved tickets archive but stay unlocked so the customer can reply to reopen.
+  // If they don't reply within the configured window, close (lock + archive) the ticket.
+  private async processResolvedAutoClose(): Promise<void> {
+    const resolvedTag = this.settings.tagByEmoji(RESOLVED_EMOJI);
+    const closingTag = this.settings.closingTag();
+    if (!resolvedTag || !closingTag) return;
+
+    const days = resolvedTag.autoCloseAfter ?? DEFAULT_RESOLVED_AUTO_CLOSE_DAYS;
+    const tickets = await this.ticketStore.listInStatus(resolvedTag.id);
+    for (const ticket of tickets) {
+      try {
+        await this.processResolvedTicket(ticket, closingTag, days);
+      } catch (err) {
+        console.error(`Resolved auto-close failed for thread ${ticket.threadId}:`, err);
+      }
+    }
+  }
+
+  private async processResolvedTicket(
+    ticket: TicketWithTag,
+    closingTag: StatusTag,
+    days: number
+  ): Promise<void> {
+    const channel = await this.client.channels.fetch(ticket.threadId).catch(() => null);
+    if (!channel || !channel.isThread()) {
+      await this.ticketStore.close(ticket.threadId);
+      return;
+    }
+    const thread = channel as ThreadChannel;
+    // Already locked → effectively closed; nothing to do.
+    if (thread.locked) return;
+
+    // A customer reply normally reopens the ticket (see DiscordBot.handleMessage); if one
+    // slipped through, don't auto-close on top of an unanswered customer message.
+    const awaitedAt = await this.lastAwaitedMessageAt(thread, "CUSTOMER", ticket.customerId);
+    if (awaitedAt && awaitedAt > ticket.lastStatusChangeAt.getTime()) return;
+
+    if (Date.now() - ticket.lastStatusChangeAt.getTime() < days * DAY_MS) return;
+
+    await this.statusService.applyStatus(thread, ticket, closingTag, { actorName: "Automatic" });
   }
 
   private async processTicket(ticket: TicketWithTag): Promise<void> {

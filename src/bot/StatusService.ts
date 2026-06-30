@@ -46,8 +46,9 @@ export class StatusService {
     options: ApplyStatusOptions
   ): Promise<void> {
     // "Done" = a tag that closes the thread (📁, locks + archives) or marks it resolved
-    // (✅, archives but stays unlocked so the customer can reply to reopen). This also
-    // drives closedAt bookkeeping for the status report (resolved counts alongside closed).
+    // (✅, stays open and unlocked so the customer can reply to reopen; the scheduler
+    // closes it after N quiet days). This also drives closedAt bookkeeping for the status
+    // report (resolved counts alongside closed).
     const isResolved = tag.emoji === RESOLVED_EMOJI;
     const isDone = tag.closesThread || isResolved;
 
@@ -90,10 +91,8 @@ export class StatusService {
       // doing both in one edit can leave it locked but not archived.
       await thread.setLocked(true).catch(() => {});
       await thread.setArchived(true).catch(() => {});
-    } else if (isResolved) {
-      // Resolved = closed but NOT locked, so the customer can still reply (which
-      // auto-unarchives the thread) to pick the conversation back up.
-      await thread.setArchived(true).catch(() => {});
     }
+    // Resolved deliberately leaves the thread open (not archived, not locked) so the
+    // customer can reply right where they are; the scheduler closes it after N quiet days.
   }
 }

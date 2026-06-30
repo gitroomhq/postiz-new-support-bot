@@ -895,7 +895,13 @@ export class DiscordBot {
           `**Initial:** ${tag.isInitial ? "yes" : "no"}`,
           `**Closes + locks thread:** ${tag.closesThread ? "yes" : "no"}`,
           `**Reminders:** ${tag.reminderEnabled ? `every ${tag.reminderDays} day(s) → ${tag.reminderTarget.toLowerCase()}` : "off"}`,
-          `**Auto-close after:** ${tag.autoCloseAfter ?? "never"}`,
+          `**Auto-close after:** ${
+            tag.autoCloseAfter == null
+              ? "never"
+              : tag.emoji === RESOLVED_EMOJI
+                ? `${tag.autoCloseAfter} day(s) of customer silence`
+                : `${tag.autoCloseAfter} customer reminder(s)`
+          }`,
         ].join("\n")
       );
 
@@ -1050,7 +1056,8 @@ export class DiscordBot {
       .setRequired(false);
     const autoclose = new TextInputBuilder()
       .setCustomId("autoclose")
-      .setLabel("Auto-close after N customer reminders")
+      // Reminder tags: N reminder rounds. Resolved tag: N days of customer silence.
+      .setLabel("Auto-close after N (reminders / days)")
       .setStyle(TextInputStyle.Short)
       .setRequired(false);
 
