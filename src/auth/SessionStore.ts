@@ -17,6 +17,32 @@ export class SessionStore {
     });
   }
 
+  // Reverse lookups for /search-tickets. postizUserId/stripeCustomerId are not @unique,
+  // so a single id can (in theory) map to several Discord accounts — return all of them.
+  async findDiscordIdsByPostizId(postizUserId: string): Promise<string[]> {
+    const rows = await this.prisma.userSession.findMany({
+      where: { postizUserId },
+      select: { discordUserId: true },
+    });
+    return rows.map((r) => r.discordUserId);
+  }
+
+  async findDiscordIdsByStripeId(stripeCustomerId: string): Promise<string[]> {
+    const rows = await this.prisma.userSession.findMany({
+      where: { stripeCustomerId },
+      select: { discordUserId: true },
+    });
+    return rows.map((r) => r.discordUserId);
+  }
+
+  // Batch-resolve sessions for display (Postiz/Stripe id columns) on a page of results.
+  async listByDiscordIds(discordUserIds: string[]) {
+    if (discordUserIds.length === 0) return [];
+    return this.prisma.userSession.findMany({
+      where: { discordUserId: { in: discordUserIds } },
+    });
+  }
+
   async removeSession(discordUserId: string): Promise<void> {
     await this.prisma.userSession.deleteMany({
       where: { discordUserId },

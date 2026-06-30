@@ -176,12 +176,29 @@ export class SettingsStore {
     reportMinute?: number | null;
     reportTimezone?: string;
   }): Promise<void> {
-    // Enabling the report (re)bases the cadence clock so the first post lands one full
-    // interval from now rather than firing immediately on the next scheduler tick.
-    const rebase = data.reportEnabled === true && !this.settings.reportEnabled;
+    const merged = { ...this.settings, ...data };
+    const usesScheduledTime = merged.reportHour != null && merged.reportMinute != null;
+    const enabling = data.reportEnabled === true && !this.settings.reportEnabled;
+    const scheduledTimeChanged =
+      (data.reportHour !== undefined && data.reportHour !== this.settings.reportHour) ||
+      (data.reportMinute !== undefined && data.reportMinute !== this.settings.reportMinute);
+
+    // Decide whether to touch the cadence clock (reportLastRunAt):
+    //  - Interval mode, on enable: stamp "now" so the first post lands one full interval out
+    //    rather than firing immediately on the next tick.
+    //  - Scheduled mode, on enable or when the time changes: clear it so today's scheduled
+    //    time can still fire. Stamping "now" here would make the scheduler's daily same-day
+    //    guard treat today as already-reported and skip today's run.
+    const clock: { reportLastRunAt?: Date | null } = {};
+    if (usesScheduledTime) {
+      if (enabling || scheduledTimeChanged) clock.reportLastRunAt = null;
+    } else if (enabling) {
+      clock.reportLastRunAt = new Date();
+    }
+
     this.settings = await this.prisma.botSettings.update({
       where: { id: "global" },
-      data: { ...data, ...(rebase ? { reportLastRunAt: new Date() } : {}) },
+      data: { ...data, ...clock },
     });
   }
 

@@ -23,6 +23,7 @@ import {
   type PartialGuildMember,
   type ChatInputCommandInteraction,
   type ButtonInteraction,
+  type AutocompleteInteraction,
   type ModalSubmitInteraction,
   type StringSelectMenuInteraction,
   type RoleSelectMenuInteraction,
@@ -47,9 +48,23 @@ import { CallbackServer } from "../server/CallbackServer";
 import { BillingCategory } from "../categories/BillingCategory";
 import { BaseCategory, TicketContext } from "../categories/BaseCategory";
 
+type TicketSearchFilters = {
+  categoryId?: string;
+  statusTagId?: string;
+  closed?: boolean;
+  customerIds?: string[];
+};
+
 export class DiscordBot {
   readonly client: Client;
   private rest: REST;
+
+  // /search-tickets pagination state, keyed by the originating interaction id (the token
+  // embedded in page-button customIds). Pruned by age so it can't grow unbounded.
+  private searchSessions = new Map<
+    string,
+    { filters: TicketSearchFilters; ownerUserId: string; createdAt: number }
+  >();
 
   constructor(
     private config: BotConfig,
@@ -181,6 +196,8 @@ export class DiscordBot {
   private async handleInteraction(interaction: Interaction): Promise<void> {
     if (interaction.isChatInputCommand()) {
       await this.handleCommand(interaction);
+    } else if (interaction.isAutocomplete()) {
+      await this.handleAutocomplete(interaction);
     } else if (interaction.isButton()) {
       await this.handleButton(interaction);
     } else if (interaction.isStringSelectMenu()) {
@@ -203,6 +220,8 @@ export class DiscordBot {
       await this.handleSetStatusCommand(interaction);
     } else if (interaction.commandName === "report") {
       await this.handleReportCommand(interaction);
+    } else if (interaction.commandName === "search-tickets") {
+      await this.handleSearchTicketsCommand(interaction);
     }
   }
 
@@ -218,6 +237,169 @@ export class DiscordBot {
     } catch (error) {
       console.error("report command failed:", error);
       await interaction.editReply({ embeds: [makeEmbed("Couldn't build the status report.", COLORS.danger)] });
+    }
+  }
+
+  // ---- /search-tickets ----
+
+  // Suggest status tags for the `status` option. Tags are runtime-configurable, so this
+  // reads the live list rather than relying on static command choices.
+  private async handleAutocomplete(interaction: AutocompleteInteraction): Promise<void> {
+    if (interaction.commandName !== "search-tickets") return;
+    const focused = interaction.options.getFocused(true);
+    if (focused.name !== "status") {
+      await interaction.respond([]);
+      return;
+    }
+    const query = focused.value.toLowerCase();
+    const choices = this.settingsStore
+      .tags()
+      .filter((t) => t.label.toLowerCase().includes(query))
+      .slice(0, 25)
+      .map((t) => ({ name: `${t.emoji} ${t.label}`, value: t.id }));
+    try {
+      await interaction.respond(choices);
+    } catch {
+      // Autocomplete tokens expire quickly; a late response is harmless to drop.
+    }
+  }
+
+  private async handleSearchTicketsCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+    const member = await this.requireSupportOrAdmin(interaction);
+    if (!member) return;
+
+    await interaction.deferReply({ flags: 64 });
+
+    const type = interaction.options.getString("type");
+    const statusTagId = interaction.options.getString("status");
+    const state = interaction.options.getString("state");
+    const user = interaction.options.getUser("user");
+    const postizId = interaction.options.getString("postiz_id");
+    const stripeId = interaction.options.getString("stripe_id");
+
+    // Resolve the identity filters (Discord user / Postiz id / Stripe id) into a single
+    // customerId allow-list by intersecting each provided filter's set of Discord ids.
+    const idConstraints: string[][] = [];
+    if (user) idConstraints.push([user.id]);
+    if (postizId) idConstraints.push(await this.sessionStore.findDiscordIdsByPostizId(postizId));
+    if (stripeId) idConstraints.push(await this.sessionStore.findDiscordIdsByStripeId(stripeId));
+
+    let customerIds: string[] | undefined;
+    if (idConstraints.length > 0) {
+      customerIds = [...new Set(idConstraints.reduce((acc, ids) => acc.filter((id) => ids.includes(id))))];
+    }
+
+    const filters: TicketSearchFilters = {
+      categoryId: type ?? undefined,
+      statusTagId: statusTagId ?? undefined,
+      closed: state === "open" ? false : state === "closed" ? true : undefined,
+      customerIds,
+    };
+
+    const token = interaction.id;
+    this.pruneSearchSessions();
+    this.searchSessions.set(token, { filters, ownerUserId: interaction.user.id, createdAt: Date.now() });
+
+    const { embed, components } = await this.buildSearchResult(filters, 0, token);
+    await interaction.editReply({ embeds: [embed], components });
+  }
+
+  // Builds one page of results (shared by the command and the pagination buttons).
+  private async buildSearchResult(
+    filters: TicketSearchFilters,
+    page: number,
+    token: string
+  ): Promise<{ embed: EmbedBuilder; components: ActionRowBuilder<ButtonBuilder>[] }> {
+    const pageSize = 10;
+
+    // An identity filter that resolved to nobody → no possible matches.
+    if (filters.customerIds && filters.customerIds.length === 0) {
+      return {
+        embed: makeEmbed("No users match that Discord user / Postiz ID / Stripe ID.", COLORS.warn),
+        components: [],
+      };
+    }
+
+    const { tickets, total } = await this.ticketStore.search(filters, page, pageSize);
+    if (total === 0) {
+      return { embed: makeEmbed("No tickets match those filters.", COLORS.neutral), components: [] };
+    }
+
+    const totalPages = Math.ceil(total / pageSize);
+
+    // Resolve the Postiz/Stripe columns and category labels for just this page.
+    const customerIds = tickets.map((t) => t.customerId).filter((id): id is string => !!id);
+    const sessions = await this.sessionStore.listByDiscordIds(customerIds);
+    const sessionByDiscordId = new Map(sessions.map((s) => [s.discordUserId, s]));
+    const categoryLabels = new Map(this.categoryRegistry.getAll().map((c) => [c.id, c.label]));
+
+    const lines = tickets.map((t) => {
+      const status = t.statusTag ? `${t.statusTag.emoji} ${t.statusTag.label}` : "—";
+      const category = t.categoryId ? categoryLabels.get(t.categoryId) ?? t.categoryId : "—";
+      const who = t.customerId ? `<@${t.customerId}>` : t.customerDisplayName ?? "unknown user";
+      const session = t.customerId ? sessionByDiscordId.get(t.customerId) : undefined;
+      const postiz = session?.postizUserId ? ` · Postiz \`${session.postizUserId}\`` : "";
+      const stripe = session?.stripeCustomerId ? ` · Stripe \`${session.stripeCustomerId}\`` : "";
+      const created = `<t:${Math.floor(t.createdAt.getTime() / 1000)}:R>`;
+      const closedMark = t.closed ? " · 🔒 closed" : "";
+      return `${status} — <#${t.threadId}> — ${category}\n${who}${postiz}${stripe} · ${created}${closedMark}`;
+    });
+
+    const embed = new EmbedBuilder()
+      .setTitle(`Ticket search — ${total} result${total === 1 ? "" : "s"}`)
+      .setDescription(lines.join("\n\n").slice(0, 4096))
+      .setColor(COLORS.brand)
+      .setFooter({ text: `Page ${page + 1}/${totalPages}` });
+
+    const components: ActionRowBuilder<ButtonBuilder>[] = [];
+    if (totalPages > 1) {
+      const prev = new ButtonBuilder()
+        .setCustomId(`search_page:${token}:${page - 1}`)
+        .setLabel("◀ Prev")
+        .setStyle(ButtonStyle.Secondary)
+        .setDisabled(page <= 0);
+      const next = new ButtonBuilder()
+        .setCustomId(`search_page:${token}:${page + 1}`)
+        .setLabel("Next ▶")
+        .setStyle(ButtonStyle.Secondary)
+        .setDisabled(page >= totalPages - 1);
+      components.push(new ActionRowBuilder<ButtonBuilder>().addComponents(prev, next));
+    }
+
+    return { embed, components };
+  }
+
+  private async handleSearchPage(interaction: ButtonInteraction): Promise<void> {
+    const member = await this.requireSupportOrAdmin(interaction);
+    if (!member) return;
+
+    const [, token, pageStr] = interaction.customId.split(":");
+    const stored = this.searchSessions.get(token);
+    if (!stored) {
+      await interaction.reply({
+        embeds: [makeEmbed("This search has expired. Run /search-tickets again.", COLORS.warn)],
+        flags: 64,
+      });
+      return;
+    }
+    if (stored.ownerUserId !== interaction.user.id) {
+      await interaction.reply({
+        embeds: [makeEmbed("Only the person who ran this search can page through it.", COLORS.danger)],
+        flags: 64,
+      });
+      return;
+    }
+
+    const page = Number.parseInt(pageStr, 10);
+    await interaction.deferUpdate();
+    const { embed, components } = await this.buildSearchResult(stored.filters, page, token);
+    await interaction.editReply({ embeds: [embed], components });
+  }
+
+  private pruneSearchSessions(): void {
+    const cutoff = Date.now() - 15 * 60 * 1000;
+    for (const [token, state] of this.searchSessions) {
+      if (state.createdAt < cutoff) this.searchSessions.delete(token);
     }
   }
 
@@ -238,6 +420,11 @@ export class DiscordBot {
   }
 
   private async handleButton(interaction: ButtonInteraction): Promise<void> {
+    if (interaction.customId.startsWith("search_page:")) {
+      await this.handleSearchPage(interaction);
+      return;
+    }
+
     if (interaction.customId.startsWith("config_")) {
       await this.handleConfigButton(interaction);
       return;
@@ -597,7 +784,7 @@ export class DiscordBot {
   }
  
   private async requireSupportOrAdmin(
-    interaction: ChatInputCommandInteraction | StringSelectMenuInteraction
+    interaction: ChatInputCommandInteraction | StringSelectMenuInteraction | ButtonInteraction
   ): Promise<GuildMember | null> {
     const member = await this.fetchMember(interaction);
     const supportRoleId = this.settingsStore.supportRoleId();
@@ -1326,6 +1513,54 @@ export class DiscordBot {
       {
         name: "report",
         description: "Show a support status report (support/admin only)",
+      },
+      {
+        name: "search-tickets",
+        description: "Search support tickets by type, status, user, or billing IDs (support/admin only)",
+        options: [
+          {
+            type: 3, // STRING
+            name: "type",
+            description: "Ticket type",
+            required: false,
+            choices: this.categoryRegistry.getAll().map((c) => ({ name: c.label, value: c.id })),
+          },
+          {
+            type: 3, // STRING
+            name: "status",
+            description: "Ticket status",
+            required: false,
+            autocomplete: true,
+          },
+          {
+            type: 3, // STRING
+            name: "state",
+            description: "Open or closed tickets",
+            required: false,
+            choices: [
+              { name: "Open", value: "open" },
+              { name: "Closed", value: "closed" },
+            ],
+          },
+          {
+            type: 6, // USER
+            name: "user",
+            description: "Discord user who opened the ticket",
+            required: false,
+          },
+          {
+            type: 3, // STRING
+            name: "postiz_id",
+            description: "Postiz user ID",
+            required: false,
+          },
+          {
+            type: 3, // STRING
+            name: "stripe_id",
+            description: "Stripe customer ID",
+            required: false,
+          },
+        ],
       },
     ];
 

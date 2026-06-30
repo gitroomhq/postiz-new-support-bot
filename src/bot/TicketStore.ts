@@ -92,6 +92,38 @@ export class TicketStore {
     return (await this.prisma.ticket.count({ where: { threadId } })) > 0;
   }
 
+  // Operator-facing search for /search-tickets. Every filter is optional and combines with
+  // AND; customerIds (already resolved from user/postiz/stripe filters) restricts to those
+  // Discord customers. Returns one page plus the total match count for pagination.
+  async search(
+    filters: { categoryId?: string; statusTagId?: string; closed?: boolean; customerIds?: string[] },
+    page: number,
+    pageSize: number
+  ): Promise<{ tickets: TicketWithTag[]; total: number }> {
+    const where: {
+      categoryId?: string;
+      statusTagId?: string;
+      closed?: boolean;
+      customerId?: { in: string[] };
+    } = {};
+    if (filters.categoryId) where.categoryId = filters.categoryId;
+    if (filters.statusTagId) where.statusTagId = filters.statusTagId;
+    if (filters.closed !== undefined) where.closed = filters.closed;
+    if (filters.customerIds) where.customerId = { in: filters.customerIds };
+
+    const [tickets, total] = await this.prisma.$transaction([
+      this.prisma.ticket.findMany({
+        where,
+        include: { statusTag: true },
+        orderBy: { createdAt: "desc" },
+        skip: page * pageSize,
+        take: pageSize,
+      }),
+      this.prisma.ticket.count({ where }),
+    ]);
+    return { tickets, total };
+  }
+
   // ---- Aggregates for the status report ----
 
   // Ticket counts grouped by current status tag AND category, in one pass. The report
