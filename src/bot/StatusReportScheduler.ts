@@ -3,8 +3,10 @@ import { SettingsStore } from "../config/SettingsStore";
 import { StatusReportService } from "./StatusReportService";
 
 const HOUR_MS = 60 * 60 * 1000;
-// How often we check whether a report is due; decoupled from the configured interval.
-const CHECK_INTERVAL_MS = 15 * 60 * 1000;
+// How often we re-check whether a report is due. Kept short and decoupled from the configured
+// cadence so that after a restart the scheduled post fires within ~a minute rather than waiting
+// a full interval. The once-per-day guard makes every extra check a cheap in-memory no-op.
+const CHECK_INTERVAL_MS = 60 * 1000;
 
 export class StatusReportScheduler {
   private timer: NodeJS.Timeout | null = null;
@@ -16,9 +18,17 @@ export class StatusReportScheduler {
   ) {}
 
   start(): void {
-    this.timer = setInterval(() => {
-      this.tick().catch((err) => console.error("Status report scheduler error:", err));
-    }, CHECK_INTERVAL_MS);
+    // Check once right away. setInterval's first tick is a full interval out, so without this a
+    // restart after the scheduled time — or a crash-loop that never stays up a whole interval —
+    // would post the report late or miss it for the day entirely. Re-checking on every startup
+    // means the report goes out as long as the process is up at some point past the scheduled
+    // time; the once-per-day guard prevents a double-post.
+    this.runTick();
+    this.timer = setInterval(() => this.runTick(), CHECK_INTERVAL_MS);
+  }
+
+  private runTick(): void {
+    this.tick().catch((err) => console.error("Status report scheduler error:", err));
   }
 
   stop(): void {
