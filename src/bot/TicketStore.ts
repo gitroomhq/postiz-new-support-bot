@@ -11,6 +11,14 @@ export interface CreateTicketInput {
   categoryId?: string | null;
 }
 
+// Fields the Re-Verify sweep may repair. Only the ones actually present are written.
+export interface ReconcileChanges {
+  statusTagId?: string;
+  categoryId?: string;
+  closed?: boolean;
+  closedAt?: Date | null; // only passed on an actual open↔closed transition
+}
+
 export class TicketStore {
   constructor(private prisma: PrismaClient) {}
 
@@ -32,6 +40,28 @@ export class TicketStore {
       where: { threadId },
       include: { statusTag: true },
     });
+  }
+
+  // Every ticket with its status tag joined, for the Re-Verify reconciliation sweep.
+  async getAllWithTag(): Promise<TicketWithTag[]> {
+    return this.prisma.ticket.findMany({
+      include: { statusTag: true },
+      orderBy: { createdAt: "asc" },
+    });
+  }
+
+  // Silent DB repair used by Re-Verify to make a ticket match its Discord thread. Unlike
+  // setStatus(), this deliberately does NOT touch reminderCount / lastReminderAt /
+  // lastStatusChangeAt, so reminder cadence and auto-close-after-quiet-period timers keep
+  // their real values. Writes only the provided fields; a no-op when nothing changed.
+  async reconcile(threadId: string, changes: ReconcileChanges): Promise<void> {
+    const data: ReconcileChanges = {};
+    if (changes.statusTagId !== undefined) data.statusTagId = changes.statusTagId;
+    if (changes.categoryId !== undefined) data.categoryId = changes.categoryId;
+    if (changes.closed !== undefined) data.closed = changes.closed;
+    if (changes.closedAt !== undefined) data.closedAt = changes.closedAt;
+    if (Object.keys(data).length === 0) return;
+    await this.prisma.ticket.update({ where: { threadId }, data });
   }
 
   // isDone: the new status closes the thread or marks it resolved. We stamp closedAt

@@ -41,7 +41,7 @@ import { PostizApiClient } from "./PostizApiClient";
 import { ClaudeCodeRunner } from "./ClaudeCodeRunner";
 import { GitHubClient } from "./GitHubClient";
 import { CategoryRegistry } from "./CategoryRegistry";
-import { TicketStore } from "./TicketStore";
+import { TicketStore, ReconcileChanges } from "./TicketStore";
 import { StatusService, RESOLVED_EMOJI } from "./StatusService";
 import { StatusReportService } from "./StatusReportService";
 import { CallbackServer } from "../server/CallbackServer";
@@ -245,7 +245,7 @@ export class DiscordBot {
   // Suggest status tags for the `status` option. Tags are runtime-configurable, so this
   // reads the live list rather than relying on static command choices.
   private async handleAutocomplete(interaction: AutocompleteInteraction): Promise<void> {
-    if (interaction.commandName !== "search-tickets") return;
+    if (interaction.commandName !== "search-tickets" && interaction.commandName !== "set-status") return;
     const focused = interaction.options.getFocused(true);
     if (focused.name !== "status") {
       await interaction.respond([]);
@@ -440,6 +440,15 @@ export class DiscordBot {
       return;
     }
 
+    if (interaction.customId.startsWith("setstatus_confirm:")) {
+      await this.handleSetStatusConfirm(interaction);
+      return;
+    }
+    if (interaction.customId === "setstatus_cancel") {
+      await this.handleSetStatusCancel(interaction);
+      return;
+    }
+
     if (
       interaction.customId.startsWith("billing_accept_discount:") ||
       interaction.customId.startsWith("billing_decline_discount:") ||
@@ -560,11 +569,6 @@ export class DiscordBot {
   private async handleSelectMenu(interaction: StringSelectMenuInteraction): Promise<void> {
     if (interaction.customId === "config_tag_pick") {
       await this.handleConfigTagPick(interaction);
-      return;
-    }
-
-    if (interaction.customId === "setstatus_select") {
-      await this.handleSetStatusSelect(interaction);
       return;
     }
 
@@ -823,22 +827,26 @@ export class DiscordBot {
       ticket = adopted;
     }
 
-    const tags = this.settingsStore.tags();
-    if (tags.length === 0) {
-      await interaction.reply({ embeds: [makeEmbed("No status tags are configured. Ask an admin to run /config.", COLORS.warn)], flags: 64 });
+    // Status is chosen as an autocompleted command option; confirm before applying.
+    const tagId = interaction.options.getString("status", true);
+    const tag = this.settingsStore.tagById(tagId);
+    if (!tag) {
+      await interaction.reply({ embeds: [makeEmbed("Unknown status — pick one from the list.", COLORS.warn)], flags: 64 });
       return;
     }
 
-    const menu = new StringSelectMenuBuilder()
-      .setCustomId("setstatus_select")
-      .setPlaceholder("Select a status")
-      .addOptions(tags.map((t) => ({ label: t.label, value: t.id, emoji: t.emoji })));
-
-    const row = new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(menu);
-    await interaction.reply({ embeds: [makeEmbed("Set this ticket's status:")], components: [row], flags: 64 });
+    const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId(`setstatus_confirm:${tag.id}`).setLabel("Confirm").setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId("setstatus_cancel").setLabel("Cancel").setStyle(ButtonStyle.Secondary)
+    );
+    await interaction.reply({
+      embeds: [makeEmbed(`Set this ticket's status to **${tag.emoji} ${tag.label}**?`)],
+      components: [row],
+      flags: 64,
+    });
   }
 
-  private async handleSetStatusSelect(interaction: StringSelectMenuInteraction): Promise<void> {
+  private async handleSetStatusConfirm(interaction: ButtonInteraction): Promise<void> {
     const member = await this.requireSupportOrAdmin(interaction);
     if (!member) return;
 
@@ -850,7 +858,7 @@ export class DiscordBot {
     }
     const thread = channel as ThreadChannel;
 
-    const tag = this.settingsStore.tagById(interaction.values[0]);
+    const tag = this.settingsStore.tagById(interaction.customId.split(":")[1]);
     const ticket = await this.ticketStore.getByThreadId(thread.id);
     if (!tag || !ticket) {
       await interaction.reply({
@@ -877,6 +885,10 @@ export class DiscordBot {
         components: [],
       });
     }
+  }
+
+  private async handleSetStatusCancel(interaction: ButtonInteraction): Promise<void> {
+    await interaction.update({ embeds: [makeEmbed("Status change cancelled.", COLORS.neutral)], components: [] });
   }
 
   private async adoptThread(thread: ThreadChannel) {
@@ -922,6 +934,26 @@ export class DiscordBot {
     return { id: null, displayName: null };
   }
 
+  // ---- Re-Verify: reconcile DB status/type against Discord thread state ----
+
+  // The category from the thread name's trailing label (after the LAST " — ", matching
+  // BaseCategory's "{emoji} {name} — {label}" convention), matched case-insensitively against a
+  // registered category. Returns undefined when it can't be determined so callers leave the
+  // stored categoryId untouched — we never clobber a good value back to null / "Other".
+  private deriveCategoryId(threadName: string): string | undefined {
+    const SEP = " — ";
+    const idx = threadName.lastIndexOf(SEP);
+    if (idx === -1) return undefined;
+    const label = threadName.slice(idx + SEP.length).trim();
+    if (!label) return undefined;
+    return this.categoryRegistry.getAll().find((c) => c.label.toLowerCase() === label.toLowerCase())?.id;
+  }
+
+  // The status tag from the thread name's leading emoji, or undefined if it maps to no tag.
+  private deriveStatusTag(threadName: string): StatusTag | undefined {
+    return this.settingsStore.tagByEmoji(threadName.split(" ")[0]);
+  }
+
   // ---- /config panel ----
 
   private async handleConfigCommand(interaction: ChatInputCommandInteraction): Promise<void> {
@@ -956,6 +988,7 @@ export class DiscordBot {
       new ButtonBuilder().setCustomId("config_general").setLabel("General Settings").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("config_tags").setLabel("Manage Tags").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("config_report").setLabel("Status Report").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("config_reverify").setLabel("Re-Verify").setStyle(ButtonStyle.Secondary),
     ];
     if (!s.backfillDone()) {
       buttons.push(
@@ -1144,6 +1177,11 @@ export class DiscordBot {
 
     if (id === "config_backfill") {
       await this.handleBackfill(interaction);
+      return;
+    }
+
+    if (id === "config_reverify") {
+      await this.handleReVerify(interaction);
       return;
     }
 
@@ -1494,6 +1532,131 @@ export class DiscordBot {
     }
   }
 
+  // Re-runnable reconciliation: walk every tracked ticket and repair its DB status/type/closed
+  // state to match the live Discord thread. DB-only — never renames threads, posts audit lines,
+  // or pings customers (so it's safe to run over old/migrated tickets whose categoryId defaulted
+  // to null → "Other"). Idempotent: a second run over an unchanged guild writes ~nothing.
+  private async handleReVerify(interaction: ButtonInteraction): Promise<void> {
+    await interaction.deferReply({ flags: 64 });
+
+    const channel = await this.getThreadsChannel();
+    if (!channel) {
+      await interaction.editReply({
+        embeds: [makeEmbed("Set the threads channel first (/config → General Settings).", COLORS.warn)],
+      });
+      return;
+    }
+
+    try {
+      // Bulk-fetch threads once (same approach as backfill) so most tickets resolve with no
+      // per-ticket REST call.
+      const threadsById = new Map<string, ThreadChannel>();
+      const active = await channel.threads.fetchActive();
+      active.threads.forEach((t) => threadsById.set(t.id, t as ThreadChannel));
+      const archived = await channel.threads.fetchArchived({ type: "private", fetchAll: true }).catch(() => null);
+      archived?.threads.forEach((t) => threadsById.set(t.id, t as ThreadChannel));
+
+      const tickets = await this.ticketStore.getAllWithTag();
+
+      let checked = 0;
+      let fixedStatus = 0;
+      let fixedType = 0;
+      let fixedClosed = 0;
+      let threadsGone = 0;
+      let undetermined = 0;
+
+      for (const ticket of tickets) {
+        checked++;
+
+        // Prefer the bulk sets; fall back to a direct fetch for threads that weren't paginated
+        // (individually archived, or living in another channel).
+        let thread = threadsById.get(ticket.threadId) ?? null;
+        if (!thread) {
+          const fetched = await this.client.channels.fetch(ticket.threadId).catch(() => null);
+          thread = fetched?.isThread() ? (fetched as ThreadChannel) : null;
+        }
+
+        // Thread gone entirely → reconcile it closed. Never stamp now() (that would spike the
+        // report's "closed since" window); createdAt is a safe past timestamp.
+        if (!thread) {
+          threadsGone++;
+          if (!ticket.closed) {
+            await this.ticketStore
+              .reconcile(ticket.threadId, { closed: true, closedAt: ticket.createdAt })
+              .catch((e) => console.error(`reverify: reconcile failed for ${ticket.threadId}:`, e));
+            fixedClosed++;
+          }
+          continue;
+        }
+
+        const derivedTag = this.deriveStatusTag(thread.name);
+        const derivedCategoryId = this.deriveCategoryId(thread.name);
+        const changes: ReconcileChanges = {};
+        let isUndetermined = false;
+
+        // Status from the leading emoji.
+        if (!derivedTag) {
+          isUndetermined = true;
+        } else if (derivedTag.id !== ticket.statusTagId) {
+          changes.statusTagId = derivedTag.id;
+          fixedStatus++;
+        }
+
+        // Type from the trailing label.
+        if (derivedCategoryId === undefined) {
+          isUndetermined = true;
+        } else if (derivedCategoryId !== ticket.categoryId) {
+          changes.categoryId = derivedCategoryId;
+          fixedType++;
+        }
+
+        // Closed state — use the derived tag if known, else the ticket's current tag so a stale
+        // closed flag can still be repaired on an unknown-emoji thread. Resolved (✅) counts as
+        // done even though its thread stays open/unlocked, hence the emoji check.
+        const effectiveTag = derivedTag ?? ticket.statusTag;
+        const desiredClosed =
+          thread.archived ||
+          thread.locked ||
+          (effectiveTag?.closesThread ?? false) ||
+          effectiveTag?.emoji === RESOLVED_EMOJI;
+        if (desiredClosed !== ticket.closed) {
+          changes.closed = desiredClosed;
+          // false→true: safe past timestamp; true→false (reopened): clear it.
+          changes.closedAt = desiredClosed ? (thread.archivedAt ?? ticket.createdAt) : null;
+          fixedClosed++;
+        }
+
+        if (isUndetermined) undetermined++;
+
+        await this.ticketStore
+          .reconcile(ticket.threadId, changes)
+          .catch((e) => console.error(`reverify: reconcile failed for ${ticket.threadId}:`, e));
+      }
+
+      const summary = new EmbedBuilder()
+        .setTitle("Re-Verify complete")
+        .setColor(COLORS.success)
+        .setDescription(
+          [
+            `Checked **${checked}** ticket(s).`,
+            `Fixed status: **${fixedStatus}**`,
+            `Fixed type: **${fixedType}**`,
+            `Fixed closed-state: **${fixedClosed}**`,
+            `Threads gone (marked closed): **${threadsGone}**`,
+            `Undetermined (status/type left unchanged): **${undetermined}**`,
+          ].join("\n")
+        )
+        .setFooter({ text: "DB reconciled to match Discord. No threads were modified." });
+
+      await interaction.editReply({ embeds: [summary] });
+    } catch (error) {
+      console.error("Re-Verify failed:", error);
+      await interaction.editReply({
+        embeds: [makeEmbed("Re-Verify failed; you can try again from /config.", COLORS.danger)],
+      });
+    }
+  }
+
   async registerCommands(): Promise<void> {
     const commands = [
       {
@@ -1509,6 +1672,15 @@ export class DiscordBot {
       {
         name: "set-status",
         description: "Set the status of this support ticket (support/admin only)",
+        options: [
+          {
+            type: 3, // STRING
+            name: "status",
+            description: "New status for this ticket",
+            required: true,
+            autocomplete: true,
+          },
+        ],
       },
       {
         name: "report",
