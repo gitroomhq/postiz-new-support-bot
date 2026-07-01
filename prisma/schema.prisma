@@ -55,6 +55,7 @@ model BotSettings {
   reportTimezone      String    @default("UTC")
   reportLastRunAt     DateTime?
   reportLastSnapshot  Json?
+  overdueThresholdDays Int      @default(7)
   updatedAt           DateTime  @updatedAt
 
   @@map("bot_settings")

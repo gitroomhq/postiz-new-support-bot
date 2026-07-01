@@ -47,6 +47,7 @@ const STATEMENTS: string[] = [
     "reportTimezone" TEXT NOT NULL DEFAULT 'UTC',
     "reportLastRunAt" TIMESTAMP(3),
     "reportLastSnapshot" JSONB,
+    "overdueThresholdDays" INTEGER NOT NULL DEFAULT 7,
     "updatedAt" TIMESTAMP(3) NOT NULL,
     CONSTRAINT "bot_settings_pkey" PRIMARY KEY ("id")
   )`,
@@ -102,6 +103,7 @@ const STATEMENTS: string[] = [
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "reportTimezone" TEXT NOT NULL DEFAULT 'UTC'`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "reportLastRunAt" TIMESTAMP(3)`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "reportLastSnapshot" JSONB`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "overdueThresholdDays" INTEGER NOT NULL DEFAULT 7`,
   `ALTER TABLE "tickets" ADD COLUMN IF NOT EXISTS "closedAt" TIMESTAMP(3)`,
 ];
 

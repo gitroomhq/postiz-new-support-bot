@@ -179,4 +179,20 @@ export class TicketStore {
   async countClosedSince(since: Date): Promise<number> {
     return this.prisma.ticket.count({ where: { closedAt: { gte: since } } });
   }
+
+  // Overdue = still open (closed=false covers both "resolved" and "closed") and created
+  // more than the configured threshold ago. cutoff = now - thresholdDays.
+  async countOverdue(cutoff: Date): Promise<number> {
+    return this.prisma.ticket.count({ where: { closed: false, createdAt: { lt: cutoff } } });
+  }
+
+  // All currently-open tickets, oldest first, with their status tag joined. Backs the
+  // Overdue and Age-Breakdown drill-down buttons (both classify/bucket in memory).
+  async listOpenWithTag(): Promise<TicketWithTag[]> {
+    return this.prisma.ticket.findMany({
+      where: { closed: false },
+      include: { statusTag: true },
+      orderBy: { createdAt: "asc" },
+    });
+  }
 }

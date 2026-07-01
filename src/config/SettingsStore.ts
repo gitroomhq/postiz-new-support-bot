@@ -7,6 +7,7 @@ export type ReportSnapshot = {
   openTotal: number;
   doneTotal: number;
   total: number;
+  overdueTotal: number;
 };
 
 export interface TagInput {
@@ -127,6 +128,10 @@ export class SettingsStore {
     return this.settings.reportTimezone;
   }
 
+  overdueThresholdDays(): number {
+    return this.settings.overdueThresholdDays;
+  }
+
   reportLastRunAt(): Date | null {
     return this.settings.reportLastRunAt;
   }
@@ -175,6 +180,7 @@ export class SettingsStore {
     reportHour?: number | null;
     reportMinute?: number | null;
     reportTimezone?: string;
+    overdueThresholdDays?: number;
   }): Promise<void> {
     const merged = { ...this.settings, ...data };
     const usesScheduledTime = merged.reportHour != null && merged.reportMinute != null;

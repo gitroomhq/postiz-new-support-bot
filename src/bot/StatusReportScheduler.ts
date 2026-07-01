@@ -48,8 +48,8 @@ export class StatusReportScheduler {
  
     // Build first (deltas compare against the stored snapshot), then post and persist the
     // new snapshot + run time so restarts don't double-post.
-    const { embed, snapshot } = await this.reportService.build({ since: lastRunAt });
-    await channel.send({ embeds: [embed] });
+    const { embed, components, snapshot } = await this.reportService.build({ since: lastRunAt });
+    await channel.send({ embeds: [embed], components });
     await this.settings.recordReportRun(snapshot);
   }
  

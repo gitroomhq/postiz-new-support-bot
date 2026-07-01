@@ -232,11 +232,30 @@ export class DiscordBot {
     await interaction.deferReply({ flags: 64 });
     try {
       // Manual checks use a trailing 24h window and never advance the scheduled cadence.
-      const { embed } = await this.reportService.build({ since: null });
-      await interaction.editReply({ embeds: [embed] });
+      const { embed, components } = await this.reportService.build({ since: null });
+      await interaction.editReply({ embeds: [embed], components });
     } catch (error) {
       console.error("report command failed:", error);
       await interaction.editReply({ embeds: [makeEmbed("Couldn't build the status report.", COLORS.danger)] });
+    }
+  }
+
+  // Ephemeral drill-downs behind the report's "Overdue Tickets" / "Age Breakdown" buttons.
+  // Both recompute live from the ticket store, so they keep working on old report messages.
+  private async handleReportDrilldown(interaction: ButtonInteraction): Promise<void> {
+    const member = await this.requireSupportOrAdmin(interaction);
+    if (!member) return;
+
+    await interaction.deferReply({ flags: 64 });
+    try {
+      const embed =
+        interaction.customId === "report_overdue"
+          ? await this.reportService.buildOverdueEmbed()
+          : await this.reportService.buildAgeBreakdownEmbed();
+      await interaction.editReply({ embeds: [embed] });
+    } catch (error) {
+      console.error("report drill-down failed:", error);
+      await interaction.editReply({ embeds: [makeEmbed("Couldn't load that breakdown.", COLORS.danger)] });
     }
   }
 
@@ -422,6 +441,11 @@ export class DiscordBot {
   private async handleButton(interaction: ButtonInteraction): Promise<void> {
     if (interaction.customId.startsWith("search_page:")) {
       await this.handleSearchPage(interaction);
+      return;
+    }
+
+    if (interaction.customId === "report_overdue" || interaction.customId === "report_age") {
+      await this.handleReportDrilldown(interaction);
       return;
     }
 
@@ -1047,6 +1071,7 @@ export class DiscordBot {
           `**Enabled:** ${s.reportEnabled() ? "yes" : "no"}`,
           `**Schedule:** ${s.reportHour() != null && s.reportMinute() != null ? `daily at ${this.formatReportTime(s.reportHour()!, s.reportMinute()!)} (${s.reportTimezone()})` : `every ${s.reportIntervalHours()} hour(s)`}`,
           `**Timezone:** ${s.reportTimezone()}`,
+          `**Overdue threshold:** ${s.overdueThresholdDays()} day(s)`,
           "",
           "Posts an opened/closed + per-status + per-type summary on the configured schedule. Run `/report` for an instant check anytime.",
         ].join("\n")
@@ -1065,6 +1090,7 @@ export class DiscordBot {
         .setStyle(s.reportEnabled() ? ButtonStyle.Success : ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId("config_report_time").setLabel("Set Time").setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId("config_report_tz").setLabel("Set Timezone").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("config_report_overdue").setLabel("Set Overdue Days").setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId("config_back_main").setLabel("Back").setStyle(ButtonStyle.Secondary)
     );
 
@@ -1231,6 +1257,19 @@ export class DiscordBot {
       return;
     }
 
+    if (id === "config_report_overdue") {
+      const modal = new ModalBuilder().setCustomId("config_report_overdue_modal").setTitle("Overdue Threshold");
+      const input = new TextInputBuilder()
+        .setCustomId("days")
+        .setLabel("Days before a ticket counts as overdue")
+        .setStyle(TextInputStyle.Short)
+        .setRequired(true)
+        .setValue(String(this.settingsStore.overdueThresholdDays()));
+      modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(input));
+      await interaction.showModal(modal);
+      return;
+    }
+
     if (id === "config_set_repo") {
       const modal = new ModalBuilder().setCustomId("config_repo_modal").setTitle("GitHub Repo");
       const input = new TextInputBuilder()
@@ -1368,6 +1407,21 @@ export class DiscordBot {
       }
       await this.settingsStore.updateReport({ reportTimezone: tz });
       await interaction.reply({ embeds: [makeEmbed(`Report timezone set to ${tz}.`, COLORS.success)], flags: 64 });
+      return;
+    }
+
+    if (interaction.customId === "config_report_overdue_modal") {
+      const daysRaw = interaction.fields.getTextInputValue("days").trim();
+      const days = /^\d+$/.test(daysRaw) ? Number(daysRaw) : NaN;
+      if (!Number.isInteger(days) || days < 1 || days > 365) {
+        await interaction.reply({ embeds: [makeEmbed("Enter a valid number of days (1-365).", COLORS.danger)], flags: 64 });
+        return;
+      }
+      await this.settingsStore.updateReport({ overdueThresholdDays: days });
+      await interaction.reply({
+        embeds: [makeEmbed(`Tickets now count as overdue after ${days} day(s).`, COLORS.success)],
+        flags: 64,
+      });
       return;
     }
 

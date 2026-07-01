@@ -1,7 +1,7 @@
-import { EmbedBuilder } from "discord.js";
+import { ActionRowBuilder, ButtonBuilder, ButtonStyle, EmbedBuilder } from "discord.js";
 import { StatusTag } from "../generated/prisma/client";
 import { SettingsStore, ReportSnapshot } from "../config/SettingsStore";
-import { TicketStore } from "./TicketStore";
+import { TicketStore, TicketWithTag } from "./TicketStore";
 import { CategoryRegistry } from "./CategoryRegistry";
 import { COLORS } from "../util/embeds";
 import { RESOLVED_EMOJI } from "./StatusService";
@@ -15,6 +15,7 @@ export interface BuildReportOptions {
 
 export interface BuiltReport {
   embed: EmbedBuilder;
+  components: ActionRowBuilder<ButtonBuilder>[];
   snapshot: ReportSnapshot;
 }
 
@@ -36,10 +37,13 @@ export class StatusReportService {
       tags.filter((t) => t.closesThread || t.emoji === RESOLVED_EMOJI).map((t) => t.id)
     );
 
-    const [breakdown, opened, closed] = await Promise.all([
+    const overdueCutoff = new Date(now.getTime() - this.settings.overdueThresholdDays() * DAY_MS);
+
+    const [breakdown, opened, closed, overdueTotal] = await Promise.all([
       this.ticketStore.statusCategoryBreakdown(),
       this.ticketStore.countOpenedSince(windowStart),
       this.ticketStore.countClosedSince(windowStart),
+      this.ticketStore.countOverdue(overdueCutoff),
     ]);
 
     let openTotal = 0;
@@ -60,33 +64,162 @@ export class StatusReportService {
       }
     }
 
-    const snapshot: ReportSnapshot = { openTotal, doneTotal, total };
+    const snapshot: ReportSnapshot = { openTotal, doneTotal, total, overdueTotal };
     const prev = this.settings.reportLastSnapshot();
 
     const net = opened - closed;
+    const thresholdDays = this.settings.overdueThresholdDays();
     const windowLabel = options.since
       ? `Since last report (${this.formatDuration(now.getTime() - windowStart.getTime())})`
       : "Last 24 hours";
 
-    const lines = [
-      `**${windowLabel}**`,
-      `🆕 Opened **${opened}**   📁 Closed **${closed}**   Net ${this.signedTrend(net)}`,
-      "",
-      `**Open tickets: ${openTotal}**${this.delta(openTotal, prev?.openTotal)}`,
-      `**By status:** ${this.formatStatusList(openByStatus, tags)}`,
-      `**By type:** ${this.formatTypeList(openByCategory)}`,
-      "",
-      `**Done: ${doneTotal}**${this.delta(doneTotal, prev?.doneTotal)}   ·   ` +
-        `**Total: ${total}**${this.delta(total, prev?.total)}`,
-    ];
-
     const embed = new EmbedBuilder()
       .setTitle("📊 Support Status")
       .setColor(COLORS.brand)
-      .setDescription(lines.join("\n"))
+      .addFields(
+        {
+          name: `📈 ${windowLabel}`,
+          value: `🆕 Opened **${opened}**\n📁 Closed **${closed}**\nNet ${this.signedTrend(net)}`,
+          inline: true,
+        },
+        {
+          name: "🎫 Open",
+          value: `**${openTotal}**${this.delta(openTotal, prev?.openTotal)}`,
+          inline: true,
+        },
+        {
+          name: "⚠️ Overdue",
+          value: `**${overdueTotal}**${this.delta(overdueTotal, prev?.overdueTotal)}\n_over ${thresholdDays}d old_`,
+          inline: true,
+        },
+        {
+          name: "🏷️ By status",
+          value: this.formatStatusList(openByStatus, tags),
+          inline: false,
+        },
+        {
+          name: "🗂️ By type",
+          value: this.formatTypeList(openByCategory),
+          inline: false,
+        },
+        {
+          name: "✅ Done",
+          value: `**${doneTotal}**${this.delta(doneTotal, prev?.doneTotal)}`,
+          inline: true,
+        },
+        {
+          name: "📚 Total",
+          value: `**${total}**${this.delta(total, prev?.total)}`,
+          inline: true,
+        }
+      )
       .setFooter({ text: this.formatTimestamp(now) });
 
-    return { embed, snapshot };
+    return { embed, components: [this.buildReportButtons()], snapshot };
+  }
+
+  // The two drill-down buttons attached to every report (scheduled and manual). Static
+  // customIds with no state — the handlers recompute live from the ticket store on click.
+  private buildReportButtons(): ActionRowBuilder<ButtonBuilder> {
+    return new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId("report_overdue")
+        .setLabel("Overdue Tickets")
+        .setEmoji("⚠️")
+        .setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId("report_age")
+        .setLabel("Age Breakdown")
+        .setEmoji("📊")
+        .setStyle(ButtonStyle.Secondary)
+    );
+  }
+
+  // One list row for a ticket: current status, a clickable thread link, and relative age.
+  // Mirrors the /search-tickets result formatting.
+  private ticketLine(ticket: TicketWithTag): string {
+    const status = ticket.statusTag ? `${ticket.statusTag.emoji} ${ticket.statusTag.label}` : "❔ Unknown";
+    const created = `<t:${Math.floor(ticket.createdAt.getTime() / 1000)}:R>`;
+    return `${status} · <#${ticket.threadId}> · ${created}`;
+  }
+
+  // Ephemeral drill-down for the "Overdue Tickets" button: open tickets whose age exceeds
+  // the configured threshold, oldest first.
+  async buildOverdueEmbed(): Promise<EmbedBuilder> {
+    const thresholdDays = this.settings.overdueThresholdDays();
+    const cutoff = Date.now() - thresholdDays * DAY_MS;
+    const open = await this.ticketStore.listOpenWithTag();
+    const overdue = open.filter((t) => t.createdAt.getTime() < cutoff); // already oldest-first
+
+    if (overdue.length === 0) {
+      return new EmbedBuilder()
+        .setTitle("⚠️ Overdue Tickets")
+        .setColor(COLORS.success)
+        .setDescription(`No tickets have been open longer than ${thresholdDays} day(s). 🎉`);
+    }
+
+    const cap = 15;
+    const lines = overdue.slice(0, cap).map((t) => this.ticketLine(t));
+    if (overdue.length > cap) lines.push(`…and **${overdue.length - cap}** more`);
+
+    return new EmbedBuilder()
+      .setTitle(`⚠️ Overdue Tickets — ${overdue.length}`)
+      .setColor(COLORS.warn)
+      .setDescription(lines.join("\n"))
+      .setFooter({ text: `Open longer than ${thresholdDays} day(s) · oldest first` });
+  }
+
+  // Ephemeral drill-down for the "Age Breakdown" button: distribution of open tickets across
+  // age buckets, plus the oldest open tickets as an actionable list.
+  async buildAgeBreakdownEmbed(): Promise<EmbedBuilder> {
+    const now = Date.now();
+    const open = await this.ticketStore.listOpenWithTag();
+
+    if (open.length === 0) {
+      return new EmbedBuilder()
+        .setTitle("📊 Open Tickets by Age")
+        .setColor(COLORS.neutral)
+        .setDescription("There are no open tickets right now. 🎉");
+    }
+
+    const buckets = [
+      { label: "< 1 day", min: 0, max: 1 },
+      { label: "1–3 days", min: 1, max: 3 },
+      { label: "3–7 days", min: 3, max: 7 },
+      { label: "> 7 days", min: 7, max: Infinity },
+    ];
+    const counts = buckets.map(() => 0);
+    for (const t of open) {
+      const ageDays = (now - t.createdAt.getTime()) / DAY_MS;
+      const idx = buckets.findIndex((b) => ageDays >= b.min && ageDays < b.max);
+      counts[idx >= 0 ? idx : buckets.length - 1]++;
+    }
+
+    const total = open.length;
+    const maxCount = Math.max(...counts, 1);
+    const barWidth = 12;
+    const distribution = buckets
+      .map((b, i) => {
+        const count = counts[i];
+        const filled = Math.round((count / maxCount) * barWidth);
+        const bar = "█".repeat(filled) + "░".repeat(barWidth - filled);
+        const pct = Math.round((count / total) * 100);
+        return `\`${b.label.padEnd(8)}\` ${bar} **${count}** (${pct}%)`;
+      })
+      .join("\n");
+
+    const cap = 10;
+    const oldest = open.slice(0, cap).map((t) => this.ticketLine(t));
+    if (open.length > cap) oldest.push(`…and **${open.length - cap}** more`);
+
+    return new EmbedBuilder()
+      .setTitle(`📊 Open Tickets by Age — ${total}`)
+      .setColor(COLORS.brand)
+      .addFields(
+        { name: "Distribution", value: distribution, inline: false },
+        { name: "Oldest open", value: oldest.join("\n"), inline: false }
+      )
+      .setFooter({ text: this.formatTimestamp(new Date()) });
   }
 
   private formatStatusList(counts: Map<string | null, number>, tags: StatusTag[]): string {
