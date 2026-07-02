@@ -1005,22 +1005,80 @@ export class DiscordBot {
               ? `${s.reportHour() != null && s.reportMinute() != null ? `daily at ${this.formatReportTime(s.reportHour()!, s.reportMinute()!)} (${s.reportTimezone()})` : `every ${s.reportIntervalHours()}h`} → <#${s.reportChannelId()}>`
               : "off"
           }`,
+          `**Billing audit:** ${s.billingAuditChannelId() ? `<#${s.billingAuditChannelId()}>` : "_in-thread ping_"}`,
+          `**Ticket limits:** ${s.maxOpenTicketsPerUser() > 0 ? `max ${s.maxOpenTicketsPerUser()} open` : "no cap"} · ${s.ticketCooldownMinutes() > 0 ? `${s.ticketCooldownMinutes()}m cooldown` : "no cooldown"}`,
         ].join("\n")
       );
 
-    const buttons = [
+    // Discord caps action rows at 5 buttons, so the panel spans two rows.
+    const primary = [
       new ButtonBuilder().setCustomId("config_general").setLabel("General Settings").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("config_tags").setLabel("Manage Tags").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("config_report").setLabel("Status Report").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("config_billing").setLabel("Billing").setStyle(ButtonStyle.Primary),
+    ];
+    const secondary = [
       new ButtonBuilder().setCustomId("config_reverify").setLabel("Re-Verify").setStyle(ButtonStyle.Secondary),
     ];
     if (!s.backfillDone()) {
-      buttons.push(
+      secondary.push(
         new ButtonBuilder().setCustomId("config_backfill").setLabel("Backfill existing tickets").setStyle(ButtonStyle.Secondary)
       );
     }
 
-    return { embeds: [embed], components: [new ActionRowBuilder<ButtonBuilder>().addComponents(buttons)] };
+    return {
+      embeds: [embed],
+      components: [
+        new ActionRowBuilder<ButtonBuilder>().addComponents(primary),
+        new ActionRowBuilder<ButtonBuilder>().addComponents(secondary),
+      ],
+    };
+  }
+
+  private formatMinorAmount(amount: number, currency: string): string {
+    try {
+      return new Intl.NumberFormat("en-US", { style: "currency", currency: currency.toUpperCase() }).format(amount / 100);
+    } catch {
+      return `${(amount / 100).toFixed(2)} ${currency.toUpperCase()}`;
+    }
+  }
+
+  private buildBillingPanel() {
+    const s = this.settingsStore;
+    const embed = new EmbedBuilder()
+      .setTitle("Billing Settings")
+      .setColor(0x5865f2)
+      .setDescription(
+        [
+          `**Audit channel:** ${s.billingAuditChannelId() ? `<#${s.billingAuditChannelId()}>` : "_not set — audit embeds ping the support role in the refund thread_"}`,
+          `**Max self-service refund:** ${
+            s.refundMaxAmount() != null
+              ? `${this.formatMinorAmount(s.refundMaxAmount()!, s.refundMaxAmountCurrency())} (charges in other currencies go to manual review)`
+              : "_no limit_"
+          }`,
+          `**Max refunds per 24h (all users):** ${s.refundMaxPer24h() ?? "_no limit_"}`,
+          `**Min server membership age:** ${s.refundMinMemberAgeDays() != null ? `${s.refundMinMemberAgeDays()} day(s)` : "_no minimum_"}`,
+          "",
+          "Refunds that trip a limit are not executed — the ticket is handed to the support team for manual review.",
+        ].join("\n")
+      );
+
+    const channelSelect = new ChannelSelectMenuBuilder()
+      .setCustomId("config_set_billingauditchannel")
+      .setPlaceholder("Billing audit channel")
+      .addChannelTypes(ChannelType.GuildText);
+    if (s.billingAuditChannelId()) channelSelect.setDefaultChannels(s.billingAuditChannelId()!);
+
+    const buttons = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId("config_billing_limits").setLabel("Set Limits").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("config_billing_clear_channel").setLabel("Clear Channel").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("config_back_main").setLabel("Back").setStyle(ButtonStyle.Secondary)
+    );
+
+    return {
+      embeds: [embed],
+      components: [new ActionRowBuilder<ChannelSelectMenuBuilder>().addComponents(channelSelect), buttons],
+    };
   }
 
   private buildGeneralPanel() {
@@ -1213,6 +1271,54 @@ export class DiscordBot {
 
     if (id === "config_report") {
       await interaction.update(this.buildReportPanel());
+      return;
+    }
+
+    if (id === "config_billing") {
+      await interaction.update(this.buildBillingPanel());
+      return;
+    }
+
+    if (id === "config_billing_clear_channel") {
+      await this.settingsStore.updateBilling({ billingAuditChannelId: null });
+      await interaction.update(this.buildBillingPanel());
+      return;
+    }
+
+    if (id === "config_billing_limits") {
+      const s = this.settingsStore;
+      const modal = new ModalBuilder().setCustomId("config_billing_limits_modal").setTitle("Refund Guardrails");
+      const amount = new TextInputBuilder()
+        .setCustomId("amount")
+        .setLabel("Max refund (whole units, blank = off)")
+        .setStyle(TextInputStyle.Short)
+        .setRequired(false)
+        .setValue(s.refundMaxAmount() != null ? String(s.refundMaxAmount()! / 100) : "");
+      const currency = new TextInputBuilder()
+        .setCustomId("currency")
+        .setLabel("Limit currency (3-letter code)")
+        .setStyle(TextInputStyle.Short)
+        .setRequired(false)
+        .setValue(s.refundMaxAmountCurrency());
+      const velocity = new TextInputBuilder()
+        .setCustomId("velocity")
+        .setLabel("Max refunds per 24h (blank = off)")
+        .setStyle(TextInputStyle.Short)
+        .setRequired(false)
+        .setValue(s.refundMaxPer24h() != null ? String(s.refundMaxPer24h()) : "");
+      const memberAge = new TextInputBuilder()
+        .setCustomId("member_age")
+        .setLabel("Min membership age, days (blank = off)")
+        .setStyle(TextInputStyle.Short)
+        .setRequired(false)
+        .setValue(s.refundMinMemberAgeDays() != null ? String(s.refundMinMemberAgeDays()) : "");
+      modal.addComponents(
+        new ActionRowBuilder<TextInputBuilder>().addComponents(amount),
+        new ActionRowBuilder<TextInputBuilder>().addComponents(currency),
+        new ActionRowBuilder<TextInputBuilder>().addComponents(velocity),
+        new ActionRowBuilder<TextInputBuilder>().addComponents(memberAge)
+      );
+      await interaction.showModal(modal);
       return;
     }
 
@@ -1410,6 +1516,43 @@ export class DiscordBot {
       return;
     }
 
+    if (interaction.customId === "config_billing_limits_modal") {
+      const amountRaw = interaction.fields.getTextInputValue("amount").trim();
+      const currencyRaw = interaction.fields.getTextInputValue("currency").trim().toLowerCase();
+      const velocityRaw = interaction.fields.getTextInputValue("velocity").trim();
+      const memberAgeRaw = interaction.fields.getTextInputValue("member_age").trim();
+
+      // Whole currency units, stored in minor units (cents).
+      const amountNum = amountRaw ? Number(amountRaw) : null;
+      if (amountRaw && (!Number.isFinite(amountNum!) || amountNum! <= 0)) {
+        await interaction.reply({ embeds: [makeEmbed("Max refund must be a positive number (or blank to disable).", COLORS.danger)], flags: 64 });
+        return;
+      }
+      if (currencyRaw && !/^[a-z]{3}$/.test(currencyRaw)) {
+        await interaction.reply({ embeds: [makeEmbed("Currency must be a 3-letter code like `usd` or `eur`.", COLORS.danger)], flags: 64 });
+        return;
+      }
+      const velocityNum = velocityRaw ? Number(velocityRaw) : null;
+      if (velocityRaw && (!Number.isInteger(velocityNum!) || velocityNum! < 1)) {
+        await interaction.reply({ embeds: [makeEmbed("Max refunds per 24h must be a positive whole number (or blank to disable).", COLORS.danger)], flags: 64 });
+        return;
+      }
+      const memberAgeNum = memberAgeRaw ? Number(memberAgeRaw) : null;
+      if (memberAgeRaw && (!Number.isInteger(memberAgeNum!) || memberAgeNum! < 1 || memberAgeNum! > 3650)) {
+        await interaction.reply({ embeds: [makeEmbed("Min membership age must be 1-3650 days (or blank to disable).", COLORS.danger)], flags: 64 });
+        return;
+      }
+
+      await this.settingsStore.updateBilling({
+        refundMaxAmount: amountNum != null ? Math.round(amountNum * 100) : null,
+        ...(currencyRaw ? { refundMaxAmountCurrency: currencyRaw } : {}),
+        refundMaxPer24h: velocityNum,
+        refundMinMemberAgeDays: memberAgeNum,
+      });
+      await interaction.reply({ embeds: [makeEmbed("Refund guardrails updated.", COLORS.success)], flags: 64 });
+      return;
+    }
+
     if (interaction.customId === "config_report_overdue_modal") {
       const daysRaw = interaction.fields.getTextInputValue("days").trim();
       const days = /^\d+$/.test(daysRaw) ? Number(daysRaw) : NaN;
@@ -1520,7 +1663,12 @@ export class DiscordBot {
   }
 
   private async handleChannelSelect(interaction: ChannelSelectMenuInteraction): Promise<void> {
-    if (interaction.customId !== "config_set_channel" && interaction.customId !== "config_set_reportchannel") return;
+    if (
+      interaction.customId !== "config_set_channel" &&
+      interaction.customId !== "config_set_reportchannel" &&
+      interaction.customId !== "config_set_billingauditchannel"
+    )
+      return;
     if (!this.isAdmin(interaction)) {
       await interaction.reply({ embeds: [makeEmbed("Administrator permission required.", COLORS.danger)], flags: 64 });
       return;
@@ -1528,6 +1676,11 @@ export class DiscordBot {
     if (interaction.customId === "config_set_reportchannel") {
       await this.settingsStore.updateReport({ reportChannelId: interaction.values[0] });
       await interaction.update(this.buildReportPanel());
+      return;
+    }
+    if (interaction.customId === "config_set_billingauditchannel") {
+      await this.settingsStore.updateBilling({ billingAuditChannelId: interaction.values[0] });
+      await interaction.update(this.buildBillingPanel());
       return;
     }
     await this.settingsStore.updateGeneral({ threadsChannelId: interaction.values[0] });

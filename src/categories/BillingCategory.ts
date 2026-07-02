@@ -15,6 +15,11 @@ import { BaseCategory, TicketContext } from "./BaseCategory";
 import { embed as makeEmbed, COLORS } from "../util/embeds";
 import { StripeClient } from "../bot/StripeClient";
 import { SessionStore } from "../auth/SessionStore";
+import { SettingsStore } from "../config/SettingsStore";
+import { StatusService } from "../bot/StatusService";
+import { TicketStore } from "../bot/TicketStore";
+
+const DAY_MS = 24 * 60 * 60 * 1000;
 
 export class BillingCategory extends BaseCategory {
   readonly id = "billing";
@@ -24,7 +29,10 @@ export class BillingCategory extends BaseCategory {
 
   constructor(
     private stripeClient: StripeClient,
-    private sessionStore: SessionStore
+    private sessionStore: SessionStore,
+    private settingsStore: SettingsStore,
+    private statusService: StatusService,
+    private ticketStore: TicketStore
   ) {
     super();
   }
@@ -140,6 +148,7 @@ export class BillingCategory extends BaseCategory {
       });
 
       await thread.members.add(interaction.user.id);
+      await this.addSupportMembers(thread, ctx.supportRoleId, interaction.user.id);
       await ctx.onTicketCreated(thread, interaction.user.id, interaction.user.displayName);
 
       await interaction.editReply({
@@ -193,26 +202,46 @@ export class BillingCategory extends BaseCategory {
 
     await interaction.deferReply();
 
-    try {
-      await this.stripeClient.applyDiscountCoupon(subscriptionId);
-      await this.sessionStore.recordBillingAction(interaction.user.id, chargeId, "discount");
-
+    // Claim the charge BEFORE calling Stripe — the unique index on the billing-action row
+    // is the lock, so a second confirm (even from a parallel refund thread) loses here.
+    if (!(await this.sessionStore.claimBillingAction(interaction.user.id, chargeId, "discount"))) {
       await this.disableButtons(interaction);
+      await interaction.editReply({
+        embeds: [makeEmbed("This charge has already been processed for a refund or discount.", COLORS.warn)],
+      });
+      return;
+    }
 
-      const embed = new EmbedBuilder()
-        .setTitle("Discount Applied!")
-        .setDescription("A **50% discount** has been applied to your next billing cycle. Thank you for staying with us!")
-        .setColor(0x57f287);
-
-      await interaction.editReply({ embeds: [embed] });
-
-      await this.closeTicketThread(interaction);
+    try {
+      await this.stripeClient.applyDiscountCoupon(subscriptionId, `discount-${chargeId}`);
     } catch (error) {
       console.error("Stripe discount error:", error);
+      // Release the lock so the customer can retry; the idempotency key makes a
+      // succeeded-at-Stripe retry safe.
+      await this.sessionStore.releaseBillingAction(chargeId).catch(() => {});
       await interaction.editReply({
         embeds: [makeEmbed("Failed to apply the discount. Please contact support directly.", COLORS.danger)],
       });
+      return;
     }
+
+    await this.disableButtons(interaction);
+
+    const embed = new EmbedBuilder()
+      .setTitle("Discount Applied!")
+      .setDescription("A **50% discount** has been applied to your next billing cycle. Thank you for staying with us!")
+      .setColor(0x57f287);
+
+    await interaction.editReply({ embeds: [embed] });
+
+    await this.notifyBillingAudit(interaction, {
+      action: "Discount",
+      outcome: "50% discount applied to the next billing cycle",
+      amountText: "50% off next cycle",
+      chargeId,
+    });
+
+    await this.closeTicketThread(interaction);
   }
 
   async handleDeclineDiscount(interaction: ButtonInteraction): Promise<void> {
@@ -252,38 +281,229 @@ export class BillingCategory extends BaseCategory {
 
     await interaction.deferReply();
 
+    // Fresh charge state: drives the amount guardrail and catches already-refunded charges.
+    let charge: { amount: number; currency: string; refunded: boolean };
     try {
-      const refund = await this.stripeClient.refundCharge(chargeId);
+      charge = await this.stripeClient.getChargeAmount(chargeId);
+    } catch (error) {
+      console.error("Stripe charge lookup error:", error);
+      await interaction.editReply({
+        embeds: [makeEmbed("Something went wrong while looking up your charge. Please try again later.", COLORS.danger)],
+      });
+      return;
+    }
 
-      // Cancel the active subscription
+    if (charge.refunded) {
+      await this.disableConfirmButtons(interaction);
+      await interaction.editReply({ embeds: [makeEmbed("This charge has already been refunded.", COLORS.warn)] });
+      return;
+    }
+
+    const amountText = this.stripeClient.formatAmount(charge.amount, charge.currency);
+
+    // Guardrails: on breach, no Stripe call and no lock row — a human takes over.
+    const breach = await this.checkRefundGuardrails(interaction, charge);
+    if (breach) {
+      await this.convertToManualReview(interaction, breach, amountText, chargeId);
+      return;
+    }
+
+    // Claim the charge BEFORE calling Stripe. hasBillingAction only ran at thread-creation
+    // time, so two parallel refund flows could both reach this point — the unique index on
+    // the billing-action row makes exactly one confirm win.
+    if (!(await this.sessionStore.claimBillingAction(interaction.user.id, chargeId, "refund"))) {
+      await this.disableConfirmButtons(interaction);
+      await interaction.editReply({
+        embeds: [makeEmbed("This charge has already been processed for a refund or discount.", COLORS.warn)],
+      });
+      return;
+    }
+
+    let refund: { refundId: string; amount: number; currency: string };
+    try {
+      refund = await this.stripeClient.refundCharge(chargeId, `refund-${chargeId}`);
+    } catch (error) {
+      console.error("Stripe refund error:", error);
+      // Release the lock so the customer can retry; the idempotency key makes a
+      // succeeded-at-Stripe retry return the original refund instead of a second one.
+      await this.sessionStore.releaseBillingAction(chargeId).catch(() => {});
+      await interaction.editReply({
+        embeds: [makeEmbed("Failed to process the refund and cancellation. Please contact support directly.", COLORS.danger)],
+      });
+      return;
+    }
+
+    // Money has moved: from here on the lock stays no matter what.
+    let cancelFailed = false;
+    try {
       const session = await this.sessionStore.getSession(interaction.user.id);
       const cancelTarget = subscriptionId || session?.stripeCustomerId;
       if (cancelTarget) {
         await this.stripeClient.cancelSubscription(cancelTarget);
       }
-
-      await this.sessionStore.recordBillingAction(interaction.user.id, chargeId, "refund");
-      const amount = this.stripeClient.formatAmount(refund.amount, refund.currency);
-
-      await this.disableConfirmButtons(interaction);
-
-      const embed = new EmbedBuilder()
-        .setTitle("Refund & Subscription Cancellation Processed")
-        .setDescription(
-          `Your refund of **${amount}** has been processed and your subscription has been cancelled.\n\n` +
-          `Refund ID: \`${refund.refundId}\`\n\n` +
-          `It may take 5-10 business days to appear on your statement.`
-        )
-        .setColor(0x57f287);
-
-      await interaction.editReply({ embeds: [embed] });
-
-      await this.closeTicketThread(interaction);
     } catch (error) {
-      console.error("Stripe refund error:", error);
-      await interaction.editReply({
-        embeds: [makeEmbed("Failed to process the refund and cancellation. Please contact support directly.", COLORS.danger)],
-      });
+      console.error("Stripe subscription cancel error:", error);
+      cancelFailed = true;
+    }
+
+    const amount = this.stripeClient.formatAmount(refund.amount, refund.currency);
+
+    await this.disableConfirmButtons(interaction);
+
+    const embed = new EmbedBuilder()
+      .setTitle(cancelFailed ? "Refund Processed" : "Refund & Subscription Cancellation Processed")
+      .setDescription(
+        `Your refund of **${amount}** has been processed${cancelFailed ? "" : " and your subscription has been cancelled"}.\n\n` +
+        `Refund ID: \`${refund.refundId}\`\n\n` +
+        (cancelFailed
+          ? `We couldn't cancel your subscription automatically — a support member will take care of it shortly.\n\n`
+          : "") +
+        `It may take 5-10 business days to appear on your statement.`
+      )
+      .setColor(0x57f287);
+
+    await interaction.editReply({ embeds: [embed] });
+
+    await this.notifyBillingAudit(interaction, {
+      action: "Refund",
+      outcome: cancelFailed
+        ? "⚠️ Refund processed, but subscription cancellation FAILED — manual action needed"
+        : "Refund processed, subscription cancelled",
+      amountText: amount,
+      chargeId,
+    });
+
+    // Keep manual-follow-up threads open so staff actually handle the cancellation.
+    if (!cancelFailed) {
+      await this.closeTicketThread(interaction);
+    }
+  }
+
+  // First tripped guardrail as a human-readable reason, or null when all pass.
+  private async checkRefundGuardrails(
+    interaction: ButtonInteraction,
+    charge: { amount: number; currency: string }
+  ): Promise<string | null> {
+    const maxAmount = this.settingsStore.refundMaxAmount();
+    if (maxAmount != null) {
+      const capCurrency = this.settingsStore.refundMaxAmountCurrency().toLowerCase();
+      // Minor units are per-currency (JPY has no decimals), so the cap only compares
+      // within its own currency; anything else fails safe to manual review.
+      if (charge.currency.toLowerCase() !== capCurrency) {
+        return `Charge currency (${charge.currency.toUpperCase()}) differs from the self-service limit currency (${capCurrency.toUpperCase()}).`;
+      }
+      if (charge.amount > maxAmount) {
+        return `Charge amount ${this.stripeClient.formatAmount(charge.amount, charge.currency)} exceeds the self-service limit of ${this.stripeClient.formatAmount(maxAmount, capCurrency)}.`;
+      }
+    }
+
+    const maxPer24h = this.settingsStore.refundMaxPer24h();
+    if (maxPer24h != null) {
+      const count = await this.sessionStore.countRefundsSince(new Date(Date.now() - DAY_MS));
+      if (count >= maxPer24h) {
+        return `Self-service refund velocity limit reached (${count} refund(s) in the last 24h, limit ${maxPer24h}).`;
+      }
+    }
+
+    const minAgeDays = this.settingsStore.refundMinMemberAgeDays();
+    if (minAgeDays != null) {
+      const member = interaction.guild
+        ? await interaction.guild.members.fetch(interaction.user.id).catch(() => null)
+        : null;
+      const joinedAt = member?.joinedAt ?? null;
+      // Unknown membership age fails safe to manual review.
+      if (!joinedAt) return "Server membership age could not be verified.";
+      if (Date.now() - joinedAt.getTime() < minAgeDays * DAY_MS) {
+        return `Server membership is younger than ${minAgeDays} day(s).`;
+      }
+    }
+
+    return null;
+  }
+
+  // A guardrail tripped: hand the thread to a human instead of touching Stripe.
+  private async convertToManualReview(
+    interaction: ButtonInteraction,
+    reason: string,
+    amountText: string,
+    chargeId: string
+  ): Promise<void> {
+    await this.disableConfirmButtons(interaction, "Pending Manual Review");
+
+    await interaction.editReply({
+      embeds: [
+        makeEmbed(
+          "Your refund request needs a manual review by our team — a support member will follow up here shortly.",
+          COLORS.warn
+        ),
+      ],
+    });
+
+    const supportRoleId = this.settingsStore.supportRoleId();
+    const thread = interaction.channel;
+    if (thread?.isThread()) {
+      await thread
+        .send({
+          content: supportRoleId ? `<@&${supportRoleId}>` : undefined,
+          embeds: [
+            makeEmbed(
+              `Self-service refund blocked — manual review needed.\n\n**Reason:** ${reason}\n**Amount:** ${amountText}\n**Charge:** \`${chargeId}\``,
+              COLORS.warn
+            ),
+          ],
+          allowedMentions: supportRoleId ? { roles: [supportRoleId] } : { parse: [] },
+        })
+        .catch(() => {});
+    }
+
+    await this.notifyBillingAudit(interaction, {
+      action: "Refund",
+      outcome: `Blocked — manual review. ${reason}`,
+      amountText,
+      chargeId,
+    });
+  }
+
+  // Staff audit trail for every executed or blocked billing action. Goes to the configured
+  // audit channel; falls back to an in-thread support-role ping (staff are thread members
+  // since addSupportMembers). Best-effort — never breaks the customer flow.
+  private async notifyBillingAudit(
+    interaction: ButtonInteraction,
+    payload: { action: string; outcome: string; amountText: string; chargeId: string }
+  ): Promise<void> {
+    try {
+      const thread = interaction.channel?.isThread() ? interaction.channel : null;
+      const embed = new EmbedBuilder()
+        .setTitle(`Billing: ${payload.action}`)
+        .setColor(COLORS.brand)
+        .addFields(
+          { name: "Customer", value: `<@${interaction.user.id}>`, inline: true },
+          { name: "Amount", value: payload.amountText, inline: true },
+          { name: "Charge", value: `\`${payload.chargeId}\``, inline: true },
+          { name: "Ticket", value: thread ? `<#${thread.id}>` : "—", inline: true },
+          { name: "Outcome", value: payload.outcome, inline: false }
+        )
+        .setTimestamp();
+
+      const channelId = this.settingsStore.billingAuditChannelId();
+      if (channelId) {
+        const channel = await interaction.client.channels.fetch(channelId).catch(() => null);
+        if (channel?.isSendable()) {
+          await channel.send({ embeds: [embed] });
+          return;
+        }
+      }
+
+      const supportRoleId = this.settingsStore.supportRoleId();
+      if (thread) {
+        await thread.send({
+          content: supportRoleId ? `<@&${supportRoleId}>` : undefined,
+          embeds: [embed],
+          allowedMentions: supportRoleId ? { roles: [supportRoleId] } : { parse: [] },
+        });
+      }
+    } catch (error) {
+      console.error("Billing audit notification failed:", error);
     }
   }
 
@@ -292,21 +512,37 @@ export class BillingCategory extends BaseCategory {
     await interaction.reply({ embeds: [makeEmbed("Refund cancelled. If you change your mind, please start a new request.", COLORS.neutral)] });
   }
 
-  // Closes the refund/discount thread once the action succeeds. We lock + archive
-  // the thread directly instead of going through StatusService so that no status
-  // tag is set on the ticket — the resolution is self-evident from the result embed.
+  // Closes the refund/discount thread once the action succeeds. Routed through
+  // StatusService so the Ticket row is marked closed too (it used to bypass the DB and
+  // leave refund tickets open in reports forever). silent: the result embed already
+  // explains the outcome, and self-service closures shouldn't trigger follow-up prompts.
   private async closeTicketThread(interaction: ButtonInteraction): Promise<void> {
     const thread = interaction.channel;
     if (!thread?.isThread()) return;
+
+    const ticket = await this.ticketStore.getByThreadId(thread.id).catch(() => null);
+    const closing = this.settingsStore.closingTag();
+    if (ticket && closing) {
+      await this.statusService
+        .applyStatus(thread, ticket, closing, { actorName: interaction.user.displayName, silent: true })
+        .catch(() => {});
+      return;
+    }
+
+    // No closing tag configured or untracked thread — still close what we can.
+    if (ticket) await this.ticketStore.close(thread.id).catch(() => {});
     await thread.setLocked(true).catch(() => {});
     await thread.setArchived(true).catch(() => {});
   }
 
-  private async disableConfirmButtons(interaction: ButtonInteraction): Promise<void> {
+  private async disableConfirmButtons(interaction: ButtonInteraction, label?: string): Promise<void> {
     const disabledRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder()
         .setCustomId("refund_done")
-        .setLabel(interaction.customId.startsWith("billing_confirm_refund:") ? "Refund & Cancellation Processed" : "Cancelled")
+        .setLabel(
+          label ??
+            (interaction.customId.startsWith("billing_confirm_refund:") ? "Refund & Cancellation Processed" : "Cancelled")
+        )
         .setStyle(ButtonStyle.Secondary)
         .setDisabled(true)
     );

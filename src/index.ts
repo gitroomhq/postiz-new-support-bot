@@ -44,7 +44,7 @@ async function main() {
   const categoryRegistry = new CategoryRegistry()
     .register(new HowToCategory())
     .register(new BugsCategory())
-    .register(new BillingCategory(stripeClient, sessionStore));
+    .register(new BillingCategory(stripeClient, sessionStore, settingsStore, statusService, ticketStore));
 
   const reportService = new StatusReportService(settingsStore, ticketStore, categoryRegistry);
 

@@ -55,6 +55,27 @@ export abstract class BaseCategory {
     return false; // false = caller should still reset the select menu
   }
 
+  // Add support role members so staff can see ticket content. Best-effort:
+  // never blocks ticket creation.
+  protected async addSupportMembers(
+    thread: ThreadChannel,
+    supportRoleId: string | null,
+    excludeUserId: string
+  ): Promise<void> {
+    if (!supportRoleId) return;
+    try {
+      const role = await thread.guild.roles.fetch(supportRoleId);
+      if (!role) return;
+      for (const [memberId] of role.members) {
+        if (memberId !== excludeUserId) {
+          await thread.members.add(memberId).catch(() => {});
+        }
+      }
+    } catch {
+      // Don't block ticket creation if adding support members fails
+    }
+  }
+
   async handleModalSubmit(
     interaction: ModalSubmitInteraction,
     responder: (prompt: string, onUpdate?: (messages: string[]) => void) => Promise<string | string[]>,
@@ -78,23 +99,7 @@ export abstract class BaseCategory {
 
       await thread.members.add(interaction.user.id);
 
-      // Add support role members so staff can see ticket content
-      if (ctx.supportRoleId) {
-        try {
-          const guild = threadsChannel.guild;
-          const role = await guild.roles.fetch(ctx.supportRoleId);
-          if (role) {
-            const members = role.members;
-            for (const [memberId] of members) {
-              if (memberId !== interaction.user.id) {
-                await thread.members.add(memberId).catch(() => {});
-              }
-            }
-          }
-        } catch {
-          // Don't block ticket creation if adding support members fails
-        }
-      }
+      await this.addSupportMembers(thread, ctx.supportRoleId, interaction.user.id);
 
       await ctx.onTicketCreated(thread, interaction.user.id, interaction.user.displayName);
 
