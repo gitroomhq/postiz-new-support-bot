@@ -64,10 +64,18 @@ export class StripeClient {
     };
   }
 
-  async applyDiscountCoupon(subscriptionId: string): Promise<void> {
-    await this.stripe.subscriptions.update(subscriptionId, {
-      discounts: [{ coupon: this.config.stripe.discountCouponId }],
-    });
+  async applyDiscountCoupon(subscriptionId: string, idempotencyKey?: string): Promise<void> {
+    await this.stripe.subscriptions.update(
+      subscriptionId,
+      { discounts: [{ coupon: this.config.stripe.discountCouponId }] },
+      idempotencyKey ? { idempotencyKey } : undefined
+    );
+  }
+
+  // Fresh charge state for the refund guardrails (amount cap + already-refunded check).
+  async getChargeAmount(chargeId: string): Promise<{ amount: number; currency: string; refunded: boolean }> {
+    const charge = await this.stripe.charges.retrieve(chargeId);
+    return { amount: charge.amount, currency: charge.currency, refunded: charge.refunded };
   }
 
   async cancelSubscription(subscriptionIdOrCustomerId: string): Promise<void> {
@@ -89,10 +97,11 @@ export class StripeClient {
     }
   }
 
-  async refundCharge(chargeId: string): Promise<{ refundId: string; amount: number; currency: string }> {
-    const refund = await this.stripe.refunds.create({
-      charge: chargeId,
-    });
+  async refundCharge(chargeId: string, idempotencyKey?: string): Promise<{ refundId: string; amount: number; currency: string }> {
+    const refund = await this.stripe.refunds.create(
+      { charge: chargeId },
+      idempotencyKey ? { idempotencyKey } : undefined
+    );
 
     return {
       refundId: refund.id,

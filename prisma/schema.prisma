@@ -56,6 +56,13 @@ model BotSettings {
   reportLastRunAt     DateTime?
   reportLastSnapshot  Json?
   overdueThresholdDays Int      @default(7)
+  maxOpenTicketsPerUser Int     @default(3)
+  ticketCooldownMinutes Int     @default(5)
+  billingAuditChannelId String?
+  refundMaxAmount     Int?
+  refundMaxAmountCurrency String @default("usd")
+  refundMaxPer24h     Int?
+  refundMinMemberAgeDays Int?
   updatedAt           DateTime  @updatedAt
 
   @@map("bot_settings")
@@ -91,7 +98,34 @@ model Ticket {
   reminderCount       Int        @default(0)
   closed              Boolean    @default(false)
   closedAt            DateTime?
+  question            String?
+  firstResponseAt     DateTime?
+  csatScore           Int?
+  csatComment         String?
+  csatPromptedAt      DateTime?
+  csatRatedAt         DateTime?
   createdAt           DateTime   @default(now())
 
   @@map("tickets")
+}
+
+model TicketNote {
+  id             String   @id @default(cuid())
+  ticketThreadId String
+  authorId       String
+  authorName     String
+  text           String
+  createdAt      DateTime @default(now())
+
+  @@index([ticketThreadId])
+  @@map("ticket_notes")
+}
+
+model CannedResponse {
+  id        String   @id @default(cuid())
+  name      String   @unique
+  content   String
+  createdAt DateTime @default(now())
+
+  @@map("canned_responses")
 }

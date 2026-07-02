@@ -136,6 +136,36 @@ export class SettingsStore {
     return this.settings.reportLastRunAt;
   }
 
+  // 0 = disabled for both ticket limits.
+  maxOpenTicketsPerUser(): number {
+    return this.settings.maxOpenTicketsPerUser;
+  }
+
+  ticketCooldownMinutes(): number {
+    return this.settings.ticketCooldownMinutes;
+  }
+
+  billingAuditChannelId(): string | null {
+    return this.settings.billingAuditChannelId;
+  }
+
+  // null = guardrail disabled. Amount is in minor units of refundMaxAmountCurrency.
+  refundMaxAmount(): number | null {
+    return this.settings.refundMaxAmount;
+  }
+
+  refundMaxAmountCurrency(): string {
+    return this.settings.refundMaxAmountCurrency;
+  }
+
+  refundMaxPer24h(): number | null {
+    return this.settings.refundMaxPer24h;
+  }
+
+  refundMinMemberAgeDays(): number | null {
+    return this.settings.refundMinMemberAgeDays;
+  }
+
   reportLastSnapshot(): ReportSnapshot | null {
     const snap = this.settings.reportLastSnapshot as unknown;
     if (snap && typeof snap === "object" && "openTotal" in snap) {
@@ -169,6 +199,18 @@ export class SettingsStore {
     supportRoleId?: string | null;
     githubRepo?: string | null;
     aiSolveEnabled?: boolean;
+    maxOpenTicketsPerUser?: number;
+    ticketCooldownMinutes?: number;
+  }): Promise<void> {
+    this.settings = await this.prisma.botSettings.update({ where: { id: "global" }, data });
+  }
+
+  async updateBilling(data: {
+    billingAuditChannelId?: string | null;
+    refundMaxAmount?: number | null;
+    refundMaxAmountCurrency?: string;
+    refundMaxPer24h?: number | null;
+    refundMinMemberAgeDays?: number | null;
   }): Promise<void> {
     this.settings = await this.prisma.botSettings.update({ where: { id: "global" }, data });
   }
