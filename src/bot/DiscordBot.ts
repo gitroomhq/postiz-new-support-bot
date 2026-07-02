@@ -35,8 +35,8 @@ import {
 import { BotConfig } from "../config";
 import { embed as makeEmbed, COLORS } from "../util/embeds";
 import { SettingsStore, isUnicodeEmoji, ReminderTarget } from "../config/SettingsStore";
-import { CannedResponseStore } from "../config/CannedResponseStore";
-import { StatusTag, CannedResponse } from "../generated/prisma/client";
+import { CannedResponseStore, normalizeName } from "../config/CannedResponseStore";
+import { StatusTag } from "../generated/prisma/client";
 import { SessionStore } from "../auth/SessionStore";
 import { OAuthManager } from "../auth/OAuthManager";
 import { PostizApiClient } from "./PostizApiClient";
@@ -305,12 +305,94 @@ export class DiscordBot {
     await interaction.reply({ embeds: [embed], flags: 64 });
   }
 
-  // ---- /canned: post an admin-managed reply template into a ticket thread ----
+  // ---- /canned: reply templates managed by the support team ----
+  // add → collects the content in a modal (slash options are single-line),
+  // use → posts the template into a ticket thread, delete → removes it.
+  // Templates are team-wide unless created with visibility "Only me".
 
   private async handleCannedCommand(interaction: ChatInputCommandInteraction): Promise<void> {
     const member = await this.requireSupportOrAdmin(interaction);
     if (!member) return;
 
+    const sub = interaction.options.getSubcommand();
+    if (sub === "add") {
+      await this.handleCannedAdd(interaction);
+    } else if (sub === "delete") {
+      await this.handleCannedDelete(interaction, member);
+    } else {
+      await this.handleCannedUse(interaction, member);
+    }
+  }
+
+  private async handleCannedAdd(interaction: ChatInputCommandInteraction): Promise<void> {
+    const name = normalizeName(interaction.options.getString("name", true));
+    if (!name) {
+      await interaction.reply({ embeds: [makeEmbed("Name is required.", COLORS.warn)], flags: 64 });
+      return;
+    }
+    const personal = interaction.options.getString("visibility") === "personal";
+    const ownerId = personal ? interaction.user.id : null;
+
+    // Catch name clashes before the modal so nobody types a long response and loses it.
+    if (this.cannedStore.getExact(name, ownerId)) {
+      await interaction.reply({
+        embeds: [
+          makeEmbed(
+            personal
+              ? `You already have a personal canned response named \`${name}\`. Delete it first with \`/canned delete\`.`
+              : `A team canned response named \`${name}\` already exists. Delete it first with \`/canned delete\`.`,
+            COLORS.warn
+          ),
+        ],
+        flags: 64,
+      });
+      return;
+    }
+
+    // Name (≤50 chars) and scope ride in the customId; content comes from the modal.
+    const modal = new ModalBuilder()
+      .setCustomId(`canned_add_modal:${personal ? "p" : "t"}:${name}`)
+      .setTitle(personal ? "Add Personal Canned Response" : "Add Team Canned Response");
+    const content = new TextInputBuilder()
+      .setCustomId("content")
+      .setLabel("Content")
+      .setStyle(TextInputStyle.Paragraph)
+      .setRequired(true)
+      .setMaxLength(4000);
+    modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(content));
+    await interaction.showModal(modal);
+  }
+
+  private async handleCannedAddModal(interaction: ModalSubmitInteraction): Promise<void> {
+    const rest = interaction.customId.slice("canned_add_modal:".length);
+    const personal = rest.startsWith("p:");
+    const name = rest.slice(2);
+    const content = interaction.fields.getTextInputValue("content").trim();
+    if (!content) {
+      await interaction.reply({ embeds: [makeEmbed("Content is required.", COLORS.warn)], flags: 64 });
+      return;
+    }
+
+    try {
+      const created = await this.cannedStore.add(name, content, personal ? interaction.user.id : null);
+      await interaction.reply({
+        embeds: [
+          makeEmbed(
+            `Added ${personal ? "personal" : "team"} canned response \`${created.name}\`. Post it in a ticket with \`/canned use ${created.name}\`.`,
+            COLORS.success
+          ),
+        ],
+        flags: 64,
+      });
+    } catch (error) {
+      await interaction.reply({
+        embeds: [makeEmbed((error as Error).message || "Failed to save the canned response.", COLORS.danger)],
+        flags: 64,
+      });
+    }
+  }
+
+  private async handleCannedUse(interaction: ChatInputCommandInteraction, member: GuildMember): Promise<void> {
     const channel = interaction.channel ?? (await this.client.channels.fetch(interaction.channelId).catch(() => null));
     if (!channel?.isThread() || !(await this.ticketStore.getByThreadId(channel.id))) {
       await interaction.reply({ embeds: [makeEmbed("Use this inside a tracked ticket thread.", COLORS.warn)], flags: 64 });
@@ -318,10 +400,10 @@ export class DiscordBot {
     }
 
     const name = interaction.options.getString("name", true);
-    const canned = this.cannedStore.getByName(name);
+    const canned = this.cannedStore.resolve(name, member.id);
     if (!canned) {
       await interaction.reply({
-        embeds: [makeEmbed(`No canned response named \`${name}\`. Manage them in /config → Canned Responses.`, COLORS.warn)],
+        embeds: [makeEmbed(`No canned response named \`${name}\`. Create one with \`/canned add\`.`, COLORS.warn)],
         flags: 64,
       });
       return;
@@ -332,6 +414,23 @@ export class DiscordBot {
       .setColor(COLORS.brand)
       .setAuthor({ name: `Sent by ${member.displayName}`, iconURL: member.displayAvatarURL() });
     await interaction.reply({ embeds: [embed] });
+  }
+
+  private async handleCannedDelete(interaction: ChatInputCommandInteraction, member: GuildMember): Promise<void> {
+    const name = interaction.options.getString("name", true);
+    // resolve() never returns another user's personal template, so support members
+    // can delete team templates and their own personal ones — nothing else.
+    const canned = this.cannedStore.resolve(name, member.id);
+    if (!canned) {
+      await interaction.reply({ embeds: [makeEmbed(`No canned response named \`${name}\`.`, COLORS.warn)], flags: 64 });
+      return;
+    }
+
+    await this.cannedStore.remove(canned.id);
+    await interaction.reply({
+      embeds: [makeEmbed(`Deleted ${canned.ownerId ? "your personal" : "the team"} canned response \`${canned.name}\`.`, COLORS.success)],
+      flags: 64,
+    });
   }
 
   private async handleReportCommand(interaction: ChatInputCommandInteraction): Promise<void> {
@@ -380,11 +479,13 @@ export class DiscordBot {
 
     let choices: { name: string; value: string }[] = [];
     if (interaction.commandName === "canned" && focused.name === "name") {
+      // Values are ids so a personal template and a team template with the same
+      // name stay distinguishable; hand-typed names still resolve in the handler.
       choices = this.cannedStore
-        .list()
+        .listFor(interaction.user.id)
         .filter((c) => c.name.includes(query))
         .slice(0, 25)
-        .map((c) => ({ name: c.name, value: c.name }));
+        .map((c) => ({ name: `${c.name}${c.ownerId ? " (only you)" : ""}`, value: c.id }));
     } else if (
       (interaction.commandName === "search-tickets" || interaction.commandName === "set-status") &&
       focused.name === "status"
@@ -803,16 +904,6 @@ export class DiscordBot {
       return;
     }
 
-    if (interaction.customId === "config_canned_pick") {
-      if (!this.isAdmin(interaction)) {
-        await interaction.reply({ embeds: [makeEmbed("Administrator permission required.", COLORS.danger)], flags: 64 });
-        return;
-      }
-      const canned = this.cannedStore.getById(interaction.values[0]);
-      await interaction.update(canned ? this.buildCannedEditPanel(canned) : this.buildCannedPanel());
-      return;
-    }
-
     if (interaction.customId === "billing_suboption") {
       const threadsChannel = await this.getThreadsChannel();
       if (!threadsChannel) {
@@ -852,6 +943,11 @@ export class DiscordBot {
 
     if (interaction.customId.startsWith("csat_comment:")) {
       await this.handleCsatCommentModal(interaction);
+      return;
+    }
+
+    if (interaction.customId.startsWith("canned_add_modal:")) {
+      await this.handleCannedAddModal(interaction);
       return;
     }
 
@@ -1306,7 +1402,6 @@ export class DiscordBot {
       new ButtonBuilder().setCustomId("config_tags").setLabel("Manage Tags").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("config_report").setLabel("Status Report").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("config_billing").setLabel("Billing").setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId("config_canned").setLabel("Canned Responses").setStyle(ButtonStyle.Primary),
     ];
     const secondary = [
       new ButtonBuilder().setCustomId("config_reverify").setLabel("Re-Verify").setStyle(ButtonStyle.Secondary),
@@ -1524,89 +1619,6 @@ export class DiscordBot {
     return { embeds: [embed], components: [toggles, actions] };
   }
 
-  // ---- Canned responses config (mirrors the Tags panel pattern) ----
-
-  private buildCannedPanel() {
-    const list = this.cannedStore.list();
-    // Discord select menus cap at 25 options; say so instead of hiding entries silently.
-    const shown = list.slice(0, 25);
-    const embed = new EmbedBuilder()
-      .setTitle("Canned Responses")
-      .setColor(0x5865f2)
-      .setDescription(
-        list.length
-          ? shown
-              .map((c) => {
-                const preview = c.content.replace(/\s+/g, " ").slice(0, 60);
-                return `**${c.name}** — ${preview}${c.content.length > 60 ? "…" : ""}`;
-              })
-              .join("\n") +
-              (list.length > 25 ? `\n\n_Showing the first 25 of ${list.length}. All names remain usable via \`/canned\` autocomplete._` : "")
-          : "_No canned responses yet. Add one below; support posts them with `/canned <name>`._"
-      );
-
-    const components: ActionRowBuilder<any>[] = [];
-    if (shown.length) {
-      const pick = new StringSelectMenuBuilder()
-        .setCustomId("config_canned_pick")
-        .setPlaceholder("Edit a canned response")
-        .addOptions(shown.map((c) => ({ label: c.name.slice(0, 100), value: c.id })));
-      components.push(new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(pick));
-    }
-    components.push(
-      new ActionRowBuilder<ButtonBuilder>().addComponents(
-        new ButtonBuilder().setCustomId("config_canned_add").setLabel("Add Response").setStyle(ButtonStyle.Success),
-        new ButtonBuilder().setCustomId("config_back_main").setLabel("Back").setStyle(ButtonStyle.Secondary)
-      )
-    );
-
-    return { embeds: [embed], components };
-  }
-
-  private buildCannedEditPanel(canned: CannedResponse) {
-    const embed = new EmbedBuilder()
-      .setTitle(`Canned response: ${canned.name}`)
-      .setColor(0x5865f2)
-      .setDescription(canned.content.slice(0, 4096));
-
-    const buttons = new ActionRowBuilder<ButtonBuilder>().addComponents(
-      new ButtonBuilder().setCustomId(`config_canned_edit:${canned.id}`).setLabel("Edit").setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId(`config_canned_delete:${canned.id}`).setLabel("Delete").setStyle(ButtonStyle.Danger),
-      new ButtonBuilder().setCustomId("config_canned").setLabel("Back").setStyle(ButtonStyle.Secondary)
-    );
-
-    return { embeds: [embed], components: [buttons] };
-  }
-
-  private buildCannedModal(canned?: CannedResponse): ModalBuilder {
-    const modal = new ModalBuilder()
-      .setCustomId(canned ? `config_canned_edit_modal:${canned.id}` : "config_canned_add_modal")
-      .setTitle(canned ? "Edit Canned Response" : "Add Canned Response");
-
-    const name = new TextInputBuilder()
-      .setCustomId("name")
-      .setLabel("Name (used with /canned)")
-      .setStyle(TextInputStyle.Short)
-      .setRequired(true)
-      .setMaxLength(50);
-    const content = new TextInputBuilder()
-      .setCustomId("content")
-      .setLabel("Content")
-      .setStyle(TextInputStyle.Paragraph)
-      .setRequired(true)
-      .setMaxLength(4000);
-    if (canned) {
-      name.setValue(canned.name);
-      content.setValue(canned.content);
-    }
-
-    modal.addComponents(
-      new ActionRowBuilder<TextInputBuilder>().addComponents(name),
-      new ActionRowBuilder<TextInputBuilder>().addComponents(content)
-    );
-    return modal;
-  }
-
   private async handleConfigButton(interaction: ButtonInteraction): Promise<void> {
     if (!this.isAdmin(interaction)) {
       await interaction.reply({ embeds: [makeEmbed("Administrator permission required.", COLORS.danger)], flags: 64 });
@@ -1788,30 +1800,6 @@ export class DiscordBot {
 
     if (id === "config_tag_add") {
       await interaction.showModal(this.buildTagModal());
-      return;
-    }
-
-    if (id === "config_canned") {
-      await interaction.update(this.buildCannedPanel());
-      return;
-    }
-    if (id === "config_canned_add") {
-      await interaction.showModal(this.buildCannedModal());
-      return;
-    }
-    if (id.startsWith("config_canned_edit:") || id.startsWith("config_canned_delete:")) {
-      const cannedId = id.split(":")[1];
-      const canned = this.cannedStore.getById(cannedId);
-      if (!canned) {
-        await interaction.update(this.buildCannedPanel());
-        return;
-      }
-      if (id.startsWith("config_canned_edit:")) {
-        await interaction.showModal(this.buildCannedModal(canned));
-      } else {
-        await this.cannedStore.remove(canned.id);
-        await interaction.update(this.buildCannedPanel());
-      }
       return;
     }
 
@@ -2011,30 +1999,6 @@ export class DiscordBot {
         embeds: [makeEmbed(`Tickets now count as overdue after ${days} day(s).`, COLORS.success)],
         flags: 64,
       });
-      return;
-    }
-
-    if (interaction.customId === "config_canned_add_modal" || interaction.customId.startsWith("config_canned_edit_modal:")) {
-      const name = interaction.fields.getTextInputValue("name").trim();
-      const content = interaction.fields.getTextInputValue("content").trim();
-      try {
-        if (interaction.customId === "config_canned_add_modal") {
-          const created = await this.cannedStore.add(name, content);
-          await interaction.reply({
-            embeds: [makeEmbed(`Added canned response \`${created.name}\`. Support can post it with \`/canned ${created.name}\`.`, COLORS.success)],
-            flags: 64,
-          });
-        } else {
-          const cannedId = interaction.customId.split(":")[1];
-          const updated = await this.cannedStore.edit(cannedId, name, content);
-          await interaction.reply({ embeds: [makeEmbed(`Updated canned response \`${updated.name}\`.`, COLORS.success)], flags: 64 });
-        }
-      } catch (error) {
-        await interaction.reply({
-          embeds: [makeEmbed((error as Error).message || "Failed to save the canned response.", COLORS.danger)],
-          flags: 64,
-        });
-      }
       return;
     }
 
@@ -2390,14 +2354,59 @@ export class DiscordBot {
       },
       {
         name: "canned",
-        description: "Post a canned response in this ticket (support/admin only)",
+        description: "Canned reply templates (support/admin only)",
         options: [
           {
-            type: 3, // STRING
-            name: "name",
-            description: "Template name",
-            required: true,
-            autocomplete: true,
+            type: 1, // SUB_COMMAND
+            name: "add",
+            description: "Create a canned response (a form opens for the content)",
+            options: [
+              {
+                type: 3, // STRING
+                name: "name",
+                description: "Template name",
+                required: true,
+                max_length: 50,
+              },
+              {
+                type: 3, // STRING
+                name: "visibility",
+                description: "Who can use it (default: whole team)",
+                required: false,
+                choices: [
+                  { name: "Whole team", value: "team" },
+                  { name: "Only me", value: "personal" },
+                ],
+              },
+            ],
+          },
+          {
+            type: 1, // SUB_COMMAND
+            name: "use",
+            description: "Post a canned response in this ticket",
+            options: [
+              {
+                type: 3, // STRING
+                name: "name",
+                description: "Template name",
+                required: true,
+                autocomplete: true,
+              },
+            ],
+          },
+          {
+            type: 1, // SUB_COMMAND
+            name: "delete",
+            description: "Delete a canned response",
+            options: [
+              {
+                type: 3, // STRING
+                name: "name",
+                description: "Template name",
+                required: true,
+                autocomplete: true,
+              },
+            ],
           },
         ],
       },

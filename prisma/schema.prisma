@@ -123,9 +123,12 @@ model TicketNote {
 
 model CannedResponse {
   id        String   @id @default(cuid())
-  name      String   @unique
+  name      String
   content   String
+  // Discord user id when the response is personal; null means the whole team can use it.
+  ownerId   String?
   createdAt DateTime @default(now())
 
+  @@unique([name, ownerId])
   @@map("canned_responses")
 }

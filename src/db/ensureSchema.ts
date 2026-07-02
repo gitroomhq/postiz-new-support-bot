@@ -108,10 +108,10 @@ const STATEMENTS: string[] = [
     "id" TEXT NOT NULL,
     "name" TEXT NOT NULL,
     "content" TEXT NOT NULL,
+    "ownerId" TEXT,
     "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT "canned_responses_pkey" PRIMARY KEY ("id")
   )`,
-  `CREATE UNIQUE INDEX IF NOT EXISTS "canned_responses_name_key" ON "canned_responses"("name")`,
   // Columns added after the tables already existed in production — additive, idempotent.
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "reportChannelId" TEXT`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "reportEnabled" BOOLEAN NOT NULL DEFAULT false`,
@@ -136,6 +136,11 @@ const STATEMENTS: string[] = [
   `ALTER TABLE "tickets" ADD COLUMN IF NOT EXISTS "csatComment" TEXT`,
   `ALTER TABLE "tickets" ADD COLUMN IF NOT EXISTS "csatPromptedAt" TIMESTAMP(3)`,
   `ALTER TABLE "tickets" ADD COLUMN IF NOT EXISTS "csatRatedAt" TIMESTAMP(3)`,
+  // Canned responses gained per-user scoping: name is now unique per owner
+  // (ownerId null = team-wide), replacing the old global unique on name.
+  `ALTER TABLE "canned_responses" ADD COLUMN IF NOT EXISTS "ownerId" TEXT`,
+  `DROP INDEX IF EXISTS "canned_responses_name_key"`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS "canned_responses_name_ownerId_key" ON "canned_responses"("name", "ownerId")`,
 ];
 
 export async function ensureSchema(prisma: PrismaClient): Promise<void> {
