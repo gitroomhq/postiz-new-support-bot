@@ -67,24 +67,27 @@ export class StatusReportService {
       }
     }
 
-    const snapshot: ReportSnapshot = { openTotal, doneTotal, total, overdueTotal };
+    const snapshot: ReportSnapshot = {
+      openTotal,
+      doneTotal,
+      total,
+      overdueTotal,
+      awaitingTotal: awaitingFirstResponse,
+    };
     const prev = this.settings.reportLastSnapshot();
 
     const net = opened - closed;
-    const thresholdDays = this.settings.overdueThresholdDays();
     const windowLabel = options.since
       ? `Since last report (${this.formatDuration(now.getTime() - windowStart.getTime())})`
       : "Last 24 hours";
 
+    // Field order groups by concern: backlog state now → what it consists of → activity
+    // in the window → speed in the window → lifetime totals. Inline flags are chosen so
+    // Discord renders rows of [3] [full] [full] [2] [full].
     const embed = new EmbedBuilder()
       .setTitle("Support Status")
       .setColor(COLORS.brand)
       .addFields(
-        {
-          name: windowLabel,
-          value: `Opened **${opened}**\nClosed **${closed}**\nNet ${this.signedTrend(net)}`,
-          inline: true,
-        },
         {
           name: "Open",
           value: `**${openTotal}**${this.delta(openTotal, prev?.openTotal)}`,
@@ -92,45 +95,47 @@ export class StatusReportService {
         },
         {
           name: "Overdue",
-          value: `**${overdueTotal}**${this.delta(overdueTotal, prev?.overdueTotal)}\n_over ${thresholdDays}d old_`,
+          value: `**${overdueTotal}**${this.delta(overdueTotal, prev?.overdueTotal)}`,
           inline: true,
         },
         {
-          name: "By status",
+          name: "Awaiting reply",
+          value: `**${awaitingFirstResponse}**${this.delta(awaitingFirstResponse, prev?.awaitingTotal)}`,
+          inline: true,
+        },
+        {
+          name: "Open by status",
           value: this.formatStatusList(openByStatus, tags),
           inline: false,
         },
         {
-          name: "By type",
+          name: "Open by type",
           value: this.formatTypeList(openByCategory),
           inline: false,
         },
         {
-          name: "Done",
-          value: `**${doneTotal}**${this.delta(doneTotal, prev?.doneTotal)}`,
+          name: windowLabel,
+          value: `Opened **${opened}**\nClosed **${closed}**\nNet ${this.signedTrend(net)}`,
           inline: true,
         },
         {
-          name: "Total",
-          value: `**${total}**${this.delta(total, prev?.total)}`,
-          inline: true,
-        },
-        {
-          name: "Response times (closed in window)",
+          name: "Response times",
           value: [
             `First response ${medians.firstResponseS != null ? `**${this.formatDuration(medians.firstResponseS * 1000)}**` : "_no data_"}`,
             `Resolution ${medians.resolutionS != null ? `**${this.formatDuration(medians.resolutionS * 1000)}**` : "_no data_"}`,
-            `Awaiting first response **${awaitingFirstResponse}**`,
           ].join("\n"),
           inline: true,
         },
         {
-          name: "Average Feedback",
-          value:
+          name: "All-time",
+          value: [
+            `Done **${doneTotal}**${this.delta(doneTotal, prev?.doneTotal)}`,
+            `Total **${total}**${this.delta(total, prev?.total)}`,
             csat.average != null
-              ? `⭐ **${csat.average.toFixed(1)}**/5 (${csat.rated} rating${csat.rated === 1 ? "" : "s"})`
-              : "_no ratings yet_",
-          inline: true,
+              ? `Feedback **${csat.average.toFixed(1)}**/5 (${csat.rated} rating${csat.rated === 1 ? "" : "s"})`
+              : "Feedback _no ratings yet_",
+          ].join(" · "),
+          inline: false,
         }
       )
       .setFooter({ text: this.formatTimestamp(now) });
@@ -311,10 +316,10 @@ export class StatusReportService {
     const parts: string[] = [];
     for (const tag of tags) {
       const count = counts.get(tag.id);
-      if (count) parts.push(`${tag.emoji} ${tag.label} ${count}`);
+      if (count) parts.push(`${tag.label} ${count}`);
     }
     const unknown = counts.get(null);
-    if (unknown) parts.push(`❔ Unknown ${unknown}`);
+    if (unknown) parts.push(`Unknown ${unknown}`);
     return parts.length ? parts.join(" · ") : "_none_";
   }
 
@@ -324,13 +329,13 @@ export class StatusReportService {
     let other = counts.get(null) ?? 0;
     for (const category of categories) {
       const count = counts.get(category.id);
-      if (count) parts.push(`${category.emoji} ${category.label} ${count}`);
+      if (count) parts.push(`${category.label} ${count}`);
     }
     // Any stored categoryId that no longer maps to a registered category → fold into "Other".
     for (const [key, value] of counts) {
       if (key !== null && !categories.some((c) => c.id === key)) other += value;
     }
-    if (other) parts.push(`❔ Other ${other}`);
+    if (other) parts.push(`Other ${other}`);
     return parts.length ? parts.join(" · ") : "_none_";
   }
 

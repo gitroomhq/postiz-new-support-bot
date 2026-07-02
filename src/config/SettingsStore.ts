@@ -8,6 +8,8 @@ export type ReportSnapshot = {
   doneTotal: number;
   total: number;
   overdueTotal: number;
+  // Absent in snapshots stored before this field existed; those simply show no delta.
+  awaitingTotal?: number;
 };
 
 export interface TagInput {
