@@ -104,6 +104,12 @@ export class BillingCategory extends BaseCategory {
   ): Promise<void> {
     await interaction.deferReply({ flags: 64 });
 
+    const blockReason = await ctx.guardTicketCreate(interaction.user.id, interaction.guild);
+    if (blockReason) {
+      await interaction.editReply({ embeds: [makeEmbed(blockReason, COLORS.warn)] });
+      return;
+    }
+
     const session = await this.sessionStore.getSession(interaction.user.id);
     if (!session?.stripeCustomerId) {
       await interaction.editReply({
@@ -149,7 +155,7 @@ export class BillingCategory extends BaseCategory {
 
       await thread.members.add(interaction.user.id);
       await this.addSupportMembers(thread, ctx.supportRoleId, interaction.user.id);
-      await ctx.onTicketCreated(thread, interaction.user.id, interaction.user.displayName);
+      await ctx.onTicketCreated(thread, interaction.user.id, interaction.user.displayName, "Refund request");
 
       await interaction.editReply({
         embeds: [makeEmbed(`Your refund request thread has been created: ${thread}`, COLORS.success)],

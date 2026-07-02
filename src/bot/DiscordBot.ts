@@ -28,6 +28,7 @@ import {
   type StringSelectMenuInteraction,
   type RoleSelectMenuInteraction,
   type ChannelSelectMenuInteraction,
+  type Guild,
   type GuildMember,
   type ThreadChannel,
 } from "discord.js";
@@ -53,6 +54,9 @@ type TicketSearchFilters = {
   statusTagId?: string;
   closed?: boolean;
   customerIds?: string[];
+  text?: string;
+  createdAfter?: Date;
+  createdBefore?: Date;
 };
 
 export class DiscordBot {
@@ -295,6 +299,34 @@ export class DiscordBot {
     const user = interaction.options.getUser("user");
     const postizId = interaction.options.getString("postiz_id");
     const stripeId = interaction.options.getString("stripe_id");
+    const text = interaction.options.getString("text");
+    const openedAfterRaw = interaction.options.getString("opened_after");
+    const openedBeforeRaw = interaction.options.getString("opened_before");
+
+    // Date filters: YYYY-MM-DD, interpreted as UTC days; opened_before includes that whole day.
+    const parseDay = (raw: string): Date | null => {
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(raw)) return null;
+      const date = new Date(`${raw}T00:00:00Z`);
+      return Number.isNaN(date.getTime()) ? null : date;
+    };
+    let createdAfter: Date | undefined;
+    let createdBefore: Date | undefined;
+    if (openedAfterRaw) {
+      const parsed = parseDay(openedAfterRaw.trim());
+      if (!parsed) {
+        await interaction.editReply({ embeds: [makeEmbed("`opened_after` must be a valid date like `2026-06-15`.", COLORS.warn)] });
+        return;
+      }
+      createdAfter = parsed;
+    }
+    if (openedBeforeRaw) {
+      const parsed = parseDay(openedBeforeRaw.trim());
+      if (!parsed) {
+        await interaction.editReply({ embeds: [makeEmbed("`opened_before` must be a valid date like `2026-06-15`.", COLORS.warn)] });
+        return;
+      }
+      createdBefore = new Date(parsed.getTime() + 24 * 60 * 60 * 1000);
+    }
 
     // Resolve the identity filters (Discord user / Postiz id / Stripe id) into a single
     // customerId allow-list by intersecting each provided filter's set of Discord ids.
@@ -313,6 +345,9 @@ export class DiscordBot {
       statusTagId: statusTagId ?? undefined,
       closed: state === "open" ? false : state === "closed" ? true : undefined,
       customerIds,
+      text: text?.trim() || undefined,
+      createdAfter,
+      createdBefore,
     };
 
     const token = interaction.id;
@@ -361,7 +396,12 @@ export class DiscordBot {
       const stripe = session?.stripeCustomerId ? ` · Stripe \`${session.stripeCustomerId}\`` : "";
       const created = `<t:${Math.floor(t.createdAt.getTime() / 1000)}:R>`;
       const closedMark = t.closed ? " · 🔒 closed" : "";
-      return `${status} — <#${t.threadId}> — ${category}\n${who}${postiz}${stripe} · ${created}${closedMark}`;
+      // With a free-text filter active, show what actually matched.
+      const snippet =
+        filters.text && t.question
+          ? `\n> ${t.question.replace(/\s+/g, " ").slice(0, 80)}${t.question.length > 80 ? "…" : ""}`
+          : "";
+      return `${status} — <#${t.threadId}> — ${category}\n${who}${postiz}${stripe} · ${created}${closedMark}${snippet}`;
     });
 
     const embed = new EmbedBuilder()
@@ -576,7 +616,8 @@ export class DiscordBot {
       supportRoleId: this.settingsStore.supportRoleId(),
       aiSolveEnabled: this.settingsStore.aiSolveEnabled(),
       initialEmoji: initial?.emoji ?? "🟢",
-      onTicketCreated: async (thread, customerId, displayName) => {
+      guardTicketCreate: (userId, guild) => this.ticketCreationBlockReason(userId, guild),
+      onTicketCreated: async (thread, customerId, displayName, question) => {
         if (!initial) return;
         await this.ticketStore.create({
           threadId: thread.id,
@@ -585,9 +626,50 @@ export class DiscordBot {
           customerDisplayName: displayName,
           categoryId: category.id,
           statusTagId: initial.id,
+          question: question ?? null,
         });
       },
     };
+  }
+
+  // Per-user ticket rate limits: open-ticket cap + creation cooldown, both configurable
+  // (0 = off). Staff are exempt. Returns the customer-facing rejection, or null to allow.
+  private async ticketCreationBlockReason(userId: string, guild: Guild | null): Promise<string | null> {
+    const max = this.settingsStore.maxOpenTicketsPerUser();
+    const cooldownMin = this.settingsStore.ticketCooldownMinutes();
+    if (max <= 0 && cooldownMin <= 0) return null;
+
+    if (guild) {
+      const member = await guild.members.fetch(userId).catch(() => null);
+      const supportRoleId = this.settingsStore.supportRoleId();
+      if (
+        member &&
+        (member.permissions.has(PermissionFlagsBits.Administrator) ||
+          (!!supportRoleId && member.roles.cache.has(supportRoleId)))
+      ) {
+        return null;
+      }
+    }
+
+    if (max > 0) {
+      const open = await this.ticketStore.listOpenByCustomerId(userId);
+      if (open.length >= max) {
+        const link = open[0] ? ` Please continue in your existing ticket: <#${open[0].threadId}>` : "";
+        return `You already have **${open.length}** open ticket(s) (limit ${max}).${link}`;
+      }
+    }
+
+    if (cooldownMin > 0) {
+      const latest = await this.ticketStore.latestByCustomerId(userId);
+      if (latest) {
+        const readyAt = latest.createdAt.getTime() + cooldownMin * 60_000;
+        if (Date.now() < readyAt) {
+          return `You're opening tickets too quickly — you can open another one <t:${Math.floor(readyAt / 1000)}:R>.`;
+        }
+      }
+    }
+
+    return null;
   }
 
   private async handleSelectMenu(interaction: StringSelectMenuInteraction): Promise<void> {
@@ -1105,6 +1187,7 @@ export class DiscordBot {
         .setLabel(`AI solve: ${s.aiSolveEnabled() ? "on" : "off"}`)
         .setStyle(s.aiSolveEnabled() ? ButtonStyle.Success : ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId("config_set_repo").setLabel("Set GitHub Repo").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("config_limits").setLabel("Ticket Limits").setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId("config_back_main").setLabel("Back").setStyle(ButtonStyle.Secondary)
     );
 
@@ -1376,6 +1459,28 @@ export class DiscordBot {
       return;
     }
 
+    if (id === "config_limits") {
+      const modal = new ModalBuilder().setCustomId("config_limits_modal").setTitle("Ticket Limits");
+      const maxOpen = new TextInputBuilder()
+        .setCustomId("max_open")
+        .setLabel("Max open tickets per user (0 = off)")
+        .setStyle(TextInputStyle.Short)
+        .setRequired(true)
+        .setValue(String(this.settingsStore.maxOpenTicketsPerUser()));
+      const cooldown = new TextInputBuilder()
+        .setCustomId("cooldown")
+        .setLabel("Minutes between new tickets (0 = off)")
+        .setStyle(TextInputStyle.Short)
+        .setRequired(true)
+        .setValue(String(this.settingsStore.ticketCooldownMinutes()));
+      modal.addComponents(
+        new ActionRowBuilder<TextInputBuilder>().addComponents(maxOpen),
+        new ActionRowBuilder<TextInputBuilder>().addComponents(cooldown)
+      );
+      await interaction.showModal(modal);
+      return;
+    }
+
     if (id === "config_set_repo") {
       const modal = new ModalBuilder().setCustomId("config_repo_modal").setTitle("GitHub Repo");
       const input = new TextInputBuilder()
@@ -1513,6 +1618,31 @@ export class DiscordBot {
       }
       await this.settingsStore.updateReport({ reportTimezone: tz });
       await interaction.reply({ embeds: [makeEmbed(`Report timezone set to ${tz}.`, COLORS.success)], flags: 64 });
+      return;
+    }
+
+    if (interaction.customId === "config_limits_modal") {
+      const maxRaw = interaction.fields.getTextInputValue("max_open").trim();
+      const cooldownRaw = interaction.fields.getTextInputValue("cooldown").trim();
+      const max = /^\d+$/.test(maxRaw) ? Number(maxRaw) : NaN;
+      const cooldown = /^\d+$/.test(cooldownRaw) ? Number(cooldownRaw) : NaN;
+      if (!Number.isInteger(max) || max < 0 || max > 100 || !Number.isInteger(cooldown) || cooldown < 0 || cooldown > 1440) {
+        await interaction.reply({
+          embeds: [makeEmbed("Enter a valid max (0-100) and cooldown in minutes (0-1440). 0 disables a limit.", COLORS.danger)],
+          flags: 64,
+        });
+        return;
+      }
+      await this.settingsStore.updateGeneral({ maxOpenTicketsPerUser: max, ticketCooldownMinutes: cooldown });
+      await interaction.reply({
+        embeds: [
+          makeEmbed(
+            `Ticket limits updated: ${max > 0 ? `max ${max} open ticket(s) per user` : "no open-ticket cap"}, ${cooldown > 0 ? `${cooldown}m cooldown between tickets` : "no cooldown"}.`,
+            COLORS.success
+          ),
+        ],
+        flags: 64,
+      });
       return;
     }
 
@@ -1937,6 +2067,24 @@ export class DiscordBot {
             type: 3, // STRING
             name: "stripe_id",
             description: "Stripe customer ID",
+            required: false,
+          },
+          {
+            type: 3, // STRING
+            name: "text",
+            description: "Free-text match on the ticket question or customer name",
+            required: false,
+          },
+          {
+            type: 3, // STRING
+            name: "opened_after",
+            description: "Only tickets opened on/after this date (YYYY-MM-DD)",
+            required: false,
+          },
+          {
+            type: 3, // STRING
+            name: "opened_before",
+            description: "Only tickets opened on/before this date (YYYY-MM-DD)",
             required: false,
           },
         ],

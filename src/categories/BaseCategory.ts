@@ -8,6 +8,7 @@ import {
   ButtonBuilder,
   ButtonStyle,
   TextChannel,
+  type Guild,
   type ModalSubmitInteraction,
   type Message,
   type ThreadChannel,
@@ -19,7 +20,10 @@ export interface TicketContext {
   supportRoleId: string | null;
   aiSolveEnabled: boolean;
   initialEmoji: string;
-  onTicketCreated: (thread: ThreadChannel, customerId: string, displayName: string) => Promise<void>;
+  // Per-user rate limiting. Returns a customer-facing rejection message, or null when
+  // the user may open a ticket. Must run before any thread is created.
+  guardTicketCreate: (userId: string, guild: Guild | null) => Promise<string | null>;
+  onTicketCreated: (thread: ThreadChannel, customerId: string, displayName: string, question?: string) => Promise<void>;
 }
 
 export abstract class BaseCategory {
@@ -85,6 +89,12 @@ export abstract class BaseCategory {
   ): Promise<void> {
     await interaction.deferReply({ flags: 64 });
 
+    const blockReason = await ctx.guardTicketCreate(interaction.user.id, interaction.guild);
+    if (blockReason) {
+      await interaction.editReply({ embeds: [makeEmbed(blockReason, COLORS.warn)] });
+      return;
+    }
+
     const userInput = interaction.fields.getTextInputValue("user_input");
     const prompt = this.buildPrompt(userInput);
 
@@ -101,7 +111,7 @@ export abstract class BaseCategory {
 
       await this.addSupportMembers(thread, ctx.supportRoleId, interaction.user.id);
 
-      await ctx.onTicketCreated(thread, interaction.user.id, interaction.user.displayName);
+      await ctx.onTicketCreated(thread, interaction.user.id, interaction.user.displayName, userInput);
 
       const questionEmbed = new EmbedBuilder()
         .setTitle("Your question")
