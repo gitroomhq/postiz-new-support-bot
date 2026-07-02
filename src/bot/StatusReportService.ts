@@ -183,10 +183,14 @@ export class StatusReportService {
     }
 
     const buckets = [
-      { label: "< 1 day", min: 0, max: 1 },
-      { label: "1–3 days", min: 1, max: 3 },
-      { label: "3–7 days", min: 3, max: 7 },
-      { label: "> 7 days", min: 7, max: Infinity },
+      { label: "< 12 h", min: 0, max: 0.5 },
+      { label: "12–24 h", min: 0.5, max: 1 },
+      { label: "1–2 days", min: 1, max: 2 },
+      { label: "2–3 days", min: 2, max: 3 },
+      { label: "3–5 days", min: 3, max: 5 },
+      { label: "5–7 days", min: 5, max: 7 },
+      { label: "7–14 days", min: 7, max: 14 },
+      { label: "> 14 days", min: 14, max: Infinity },
     ];
     const counts = buckets.map(() => 0);
     for (const t of open) {
@@ -204,11 +208,11 @@ export class StatusReportService {
         const filled = Math.round((count / maxCount) * barWidth);
         const bar = "█".repeat(filled) + "░".repeat(barWidth - filled);
         const pct = Math.round((count / total) * 100);
-        return `\`${b.label.padEnd(8)}\` ${bar} **${count}** (${pct}%)`;
+        return `\`${b.label.padEnd(9)}\` ${bar} **${count}** (${pct}%)`;
       })
       .join("\n");
 
-    const cap = 10;
+    const cap = 5;
     const oldest = open.slice(0, cap).map((t) => this.ticketLine(t));
     if (open.length > cap) oldest.push(`…and **${open.length - cap}** more`);
 
