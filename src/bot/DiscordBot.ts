@@ -360,7 +360,9 @@ export class DiscordBot {
       const embed =
         interaction.customId === "report_overdue"
           ? await this.reportService.buildOverdueEmbed()
-          : await this.reportService.buildAgeBreakdownEmbed();
+          : interaction.customId === "report_feedback"
+            ? await this.reportService.buildFeedbackEmbed()
+            : await this.reportService.buildAgeBreakdownEmbed();
       await interaction.editReply({ embeds: [embed] });
     } catch (error) {
       console.error("report drill-down failed:", error);
@@ -598,7 +600,11 @@ export class DiscordBot {
       return;
     }
 
-    if (interaction.customId === "report_overdue" || interaction.customId === "report_age") {
+    if (
+      interaction.customId === "report_overdue" ||
+      interaction.customId === "report_age" ||
+      interaction.customId === "report_feedback"
+    ) {
       await this.handleReportDrilldown(interaction);
       return;
     }

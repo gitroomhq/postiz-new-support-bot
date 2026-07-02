@@ -39,11 +39,14 @@ export class StatusReportService {
 
     const overdueCutoff = new Date(now.getTime() - this.settings.overdueThresholdDays() * DAY_MS);
 
-    const [breakdown, opened, closed, overdueTotal] = await Promise.all([
+    const [breakdown, opened, closed, overdueTotal, medians, awaitingFirstResponse, csat] = await Promise.all([
       this.ticketStore.statusCategoryBreakdown(),
       this.ticketStore.countOpenedSince(windowStart),
       this.ticketStore.countClosedSince(windowStart),
       this.ticketStore.countOverdue(overdueCutoff),
+      this.ticketStore.responseTimeMedians(windowStart),
+      this.ticketStore.countAwaitingFirstResponse(),
+      this.ticketStore.csatStats(),
     ]);
 
     let openTotal = 0;
@@ -111,6 +114,23 @@ export class StatusReportService {
           name: "Total",
           value: `**${total}**${this.delta(total, prev?.total)}`,
           inline: true,
+        },
+        {
+          name: "Response times (closed in window)",
+          value: [
+            `First response ${medians.firstResponseS != null ? `**${this.formatDuration(medians.firstResponseS * 1000)}**` : "_no data_"}`,
+            `Resolution ${medians.resolutionS != null ? `**${this.formatDuration(medians.resolutionS * 1000)}**` : "_no data_"}`,
+            `Awaiting first response **${awaitingFirstResponse}**`,
+          ].join("\n"),
+          inline: true,
+        },
+        {
+          name: "Average Feedback",
+          value:
+            csat.average != null
+              ? `⭐ **${csat.average.toFixed(1)}**/5 (${csat.rated} rating${csat.rated === 1 ? "" : "s"})`
+              : "_no ratings yet_",
+          inline: true,
         }
       )
       .setFooter({ text: this.formatTimestamp(now) });
@@ -131,8 +151,69 @@ export class StatusReportService {
         .setCustomId("report_age")
         .setLabel("Age Breakdown")
         .setEmoji("📊")
+        .setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId("report_feedback")
+        .setLabel("Feedback")
+        .setEmoji("💬")
         .setStyle(ButtonStyle.Secondary)
     );
+  }
+
+  // Ephemeral drill-down for the "Feedback" button: all-time 1-5 star distribution
+  // (same bar style as the age breakdown), average, response rate, recent comments.
+  async buildFeedbackEmbed(): Promise<EmbedBuilder> {
+    const stats = await this.ticketStore.csatStats();
+
+    if (stats.rated === 0) {
+      return new EmbedBuilder()
+        .setTitle("💬 Customer Feedback")
+        .setColor(COLORS.neutral)
+        .setDescription(
+          stats.prompted > 0
+            ? `No ratings yet — ${stats.prompted} customer(s) have been asked so far.`
+            : "No ratings yet. Customers get a rating prompt when their ticket is completed."
+        );
+    }
+
+    const barWidth = 12;
+    const maxCount = Math.max(...[1, 2, 3, 4, 5].map((s) => stats.counts.get(s) ?? 0), 1);
+    const distribution = [5, 4, 3, 2, 1]
+      .map((score) => {
+        const count = stats.counts.get(score) ?? 0;
+        const filled = Math.round((count / maxCount) * barWidth);
+        const bar = "█".repeat(filled) + "░".repeat(barWidth - filled);
+        const pct = Math.round((count / stats.rated) * 100);
+        return `\`${score} ⭐\` ${bar} **${count}** (${pct}%)`;
+      })
+      .join("\n");
+
+    const responseRate = stats.prompted > 0 ? Math.round((stats.rated / stats.prompted) * 100) : 0;
+
+    const embed = new EmbedBuilder()
+      .setTitle(`💬 Customer Feedback — ${stats.rated} rating${stats.rated === 1 ? "" : "s"} (all-time)`)
+      .setColor(COLORS.brand)
+      .addFields(
+        { name: "Distribution", value: distribution, inline: false },
+        {
+          name: "Summary",
+          value: `Average ⭐ **${stats.average!.toFixed(2)}**/5 · response rate **${responseRate}%** (${stats.rated}/${stats.prompted} asked)`,
+          inline: false,
+        }
+      )
+      .setFooter({ text: this.formatTimestamp(new Date()) });
+
+    const comments = await this.ticketStore.recentCsatComments(3);
+    if (comments.length > 0) {
+      const lines = comments.map((c) => {
+        const text = (c.csatComment ?? "").replace(/\s+/g, " ").slice(0, 150);
+        const when = c.csatRatedAt ? ` — <t:${Math.floor(c.csatRatedAt.getTime() / 1000)}:R>` : "";
+        return `${c.csatScore ?? "?"} ⭐${when}\n> ${text}`;
+      });
+      embed.addFields({ name: "Recent comments", value: lines.join("\n").slice(0, 1024), inline: false });
+    }
+
+    return embed;
   }
 
   // One list row for a ticket: current status, a clickable thread link, and relative age.
