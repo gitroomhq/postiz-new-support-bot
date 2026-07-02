@@ -22,6 +22,7 @@ import { SettingsStore } from "../config/SettingsStore";
 import { StatusService } from "../bot/StatusService";
 import { TicketStore } from "../bot/TicketStore";
 import { AuditLogger } from "../bot/AuditLogger";
+import { EscalationTierStore } from "../config/EscalationTierStore";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -37,9 +38,16 @@ export class BillingCategory extends BaseCategory {
     private settingsStore: SettingsStore,
     private statusService: StatusService,
     private ticketStore: TicketStore,
-    private audit: AuditLogger
+    private audit: AuditLogger,
+    private tierStore: EscalationTierStore
   ) {
     super();
+  }
+
+  // Role that owns the ticket right now: its escalation tier, else the base tier.
+  private async staffPingRoleFor(threadId: string | null): Promise<string | null> {
+    const ticket = threadId ? await this.ticketStore.getByThreadId(threadId).catch(() => null) : null;
+    return this.tierStore.pingRoleIdFor(ticket?.escalationTierId, this.settingsStore.supportRoleId());
   }
 
   protected getInputLabel(): string {
@@ -159,7 +167,7 @@ export class BillingCategory extends BaseCategory {
       });
 
       await thread.members.add(interaction.user.id);
-      await this.addSupportMembers(thread, ctx.supportRoleId, interaction.user.id);
+      await this.addSupportMembers(thread, ctx.staffPingRoleId, interaction.user.id);
       await ctx.onTicketCreated(thread, interaction.user.id, interaction.user.displayName, "Refund request");
 
       await interaction.editReply({
@@ -470,18 +478,18 @@ export class BillingCategory extends BaseCategory {
         .catch((e) => console.error("Pending charge review persist failed:", e));
     }
 
-    const supportRoleId = this.settingsStore.supportRoleId();
+    const pingRoleId = await this.staffPingRoleFor(thread?.id ?? null);
     if (thread) {
       await thread
         .send({
-          content: supportRoleId ? `<@&${supportRoleId}>` : undefined,
+          content: pingRoleId ? `<@&${pingRoleId}>` : undefined,
           embeds: [
             makeEmbed(
               `Self-service refund blocked — manual review needed.\n\n**Reason:** ${reason}\n**Amount:** ${amountText}\n**Charge:** \`${chargeId}\`\n\nStaff: run \`/charge approve\` or \`/charge deny\` in this thread.`,
               COLORS.warn
             ),
           ],
-          allowedMentions: supportRoleId ? { roles: [supportRoleId] } : { parse: [] },
+          allowedMentions: pingRoleId ? { roles: [pingRoleId] } : { parse: [] },
         })
         .catch(() => {});
     }
@@ -525,12 +533,12 @@ export class BillingCategory extends BaseCategory {
         }
       }
 
-      const supportRoleId = this.settingsStore.supportRoleId();
+      const pingRoleId = await this.staffPingRoleFor(thread?.id ?? null);
       if (thread) {
         await thread.send({
-          content: supportRoleId ? `<@&${supportRoleId}>` : undefined,
+          content: pingRoleId ? `<@&${pingRoleId}>` : undefined,
           embeds: [embed],
-          allowedMentions: supportRoleId ? { roles: [supportRoleId] } : { parse: [] },
+          allowedMentions: pingRoleId ? { roles: [pingRoleId] } : { parse: [] },
         });
       }
     } catch (error) {

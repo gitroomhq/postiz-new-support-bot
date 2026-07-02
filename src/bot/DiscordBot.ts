@@ -37,7 +37,8 @@ import { embed as makeEmbed, COLORS } from "../util/embeds";
 import { formatDuration } from "../util/format";
 import { SettingsStore, isUnicodeEmoji, ReminderTarget } from "../config/SettingsStore";
 import { CannedResponseStore, normalizeName } from "../config/CannedResponseStore";
-import { StatusTag } from "../generated/prisma/client";
+import { EscalationTier, StatusTag } from "../generated/prisma/client";
+import { EscalationTierStore } from "../config/EscalationTierStore";
 import { SessionStore } from "../auth/SessionStore";
 import { OAuthManager } from "../auth/OAuthManager";
 import { PostizApiClient } from "./PostizApiClient";
@@ -86,7 +87,8 @@ export class DiscordBot {
     private categoryRegistry: CategoryRegistry,
     private reportService: StatusReportService,
     private cannedStore: CannedResponseStore,
-    private audit: AuditLogger
+    private audit: AuditLogger,
+    private tierStore: EscalationTierStore
   ) {
     this.client = new Client({
       intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.GuildMembers],
@@ -153,12 +155,8 @@ export class DiscordBot {
     // another invited human (or the customer) can't skew the metric.
     if (!ticket.closed && !ticket.firstResponseAt && ticket.customerId && message.author.id !== ticket.customerId) {
       const member = message.member ?? (await message.guild?.members.fetch(message.author.id).catch(() => null)) ?? null;
-      const supportRoleId = this.settingsStore.supportRoleId();
-      const isSupport =
-        !!member &&
-        (member.permissions.has(PermissionFlagsBits.Administrator) ||
-          (!!supportRoleId && member.roles.cache.has(supportRoleId)));
-      if (isSupport) {
+      const isSupport = !!member && this.isStaffMember(member);
+      if (isSupport && member) {
         try {
           await this.ticketStore.setFirstResponse(ticket.threadId, message.createdAt);
           void this.audit.log({
@@ -268,6 +266,8 @@ export class DiscordBot {
       await this.handleSearchTicketsCommand(interaction);
     } else if (interaction.commandName === "note") {
       await this.handleNoteCommand(interaction);
+    } else if (interaction.commandName === "escalate") {
+      await this.handleEscalateCommand(interaction);
     } else if (interaction.commandName === "canned") {
       await this.handleCannedCommand(interaction);
     } else if (interaction.commandName === "charge") {
@@ -345,6 +345,87 @@ export class DiscordBot {
       .setColor(COLORS.brand)
       .setDescription(lines.join("\n\n").slice(0, 4096));
     await interaction.reply({ embeds: [embed], flags: 64 });
+  }
+
+  // ---- /escalate: move a ticket up/down the escalation-tier ladder ----
+  // Up pings the target tier's role; down just posts a notice (no ping).
+
+  private async handleEscalateCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+    const member = await this.requireSupportOrAdmin(interaction);
+    if (!member) return;
+
+    const channel = interaction.channel ?? (await this.client.channels.fetch(interaction.channelId).catch(() => null));
+    if (!channel?.isThread()) {
+      await interaction.reply({ embeds: [makeEmbed("Use this inside a ticket thread.", COLORS.warn)], flags: 64 });
+      return;
+    }
+    const thread = channel as ThreadChannel;
+
+    let ticket = await this.ticketStore.getByThreadId(thread.id);
+    if (!ticket) {
+      ticket = await this.adoptThread(thread);
+      if (!ticket) {
+        await interaction.reply({ embeds: [makeEmbed("This thread isn't a tracked support ticket.", COLORS.warn)], flags: 64 });
+        return;
+      }
+    }
+    if (ticket.closed) {
+      await interaction.reply({ embeds: [makeEmbed("This ticket is closed — reopen it before escalating.", COLORS.warn)], flags: 64 });
+      return;
+    }
+
+    const tiers = this.tierStore.list();
+    if (tiers.length === 0) {
+      await interaction.reply({
+        embeds: [makeEmbed("No escalation tiers configured. An admin can add them in `/config` → Escalation.", COLORS.warn)],
+        flags: 64,
+      });
+      return;
+    }
+
+    // null or a stale (deleted-tier) id both mean the base tier.
+    const currentIdx = Math.max(0, tiers.findIndex((t) => t.id === ticket.escalationTierId));
+    const up = interaction.options.getSubcommand() === "up";
+    const target = tiers[currentIdx + (up ? 1 : -1)];
+    if (!target) {
+      await interaction.reply({
+        embeds: [makeEmbed(`Already at the ${up ? "highest" : "lowest"} tier (**${tiers[currentIdx].name}**).`, COLORS.warn)],
+        flags: 64,
+      });
+      return;
+    }
+    const reason = interaction.options.getString("reason")?.trim() || null;
+
+    await this.ticketStore.setEscalationTier(thread.id, target.id);
+
+    await thread
+      .send({
+        content: up ? `<@&${target.roleId}>` : undefined,
+        embeds: [
+          makeEmbed(
+            `${up ? "⬆️ Escalated to" : "⬇️ De-escalated to"} **${target.name}** by ${member.displayName}.` +
+              (reason ? `\n**Reason:** ${reason}` : ""),
+            up ? COLORS.warn : COLORS.neutral
+          ),
+        ],
+        allowedMentions: up ? { roles: [target.roleId] } : { parse: [] },
+      })
+      .catch(() => {});
+
+    void this.audit.log({
+      title: up ? "⬆️ Ticket escalated" : "⬇️ Ticket de-escalated",
+      severity: up ? "warn" : "neutral",
+      actor: member.displayName,
+      actorIconUrl: member.displayAvatarURL(),
+      threadId: thread.id,
+      fields: [
+        { name: "From", value: tiers[currentIdx].name, inline: true },
+        { name: "To", value: target.name, inline: true },
+        ...(reason ? [{ name: "Reason", value: reason }] : []),
+      ],
+    });
+
+    await interaction.reply({ embeds: [makeEmbed(`Ticket moved to **${target.name}**.`, COLORS.success)], flags: 64 });
   }
 
   // ---- /canned: reply templates managed by the support team ----
@@ -907,7 +988,7 @@ export class DiscordBot {
   private buildTicketContext(category: BaseCategory): TicketContext {
     const initial = this.settingsStore.initialTag();
     return {
-      supportRoleId: this.settingsStore.supportRoleId(),
+      staffPingRoleId: this.tierStore.newTicketRoleId(this.settingsStore.supportRoleId()),
       aiSolveEnabled: this.settingsStore.aiSolveEnabled(),
       initialEmoji: initial?.emoji ?? "🟢",
       guardTicketCreate: (userId, guild) => this.ticketCreationBlockReason(userId, guild),
@@ -946,12 +1027,7 @@ export class DiscordBot {
 
     if (guild) {
       const member = await guild.members.fetch(userId).catch(() => null);
-      const supportRoleId = this.settingsStore.supportRoleId();
-      if (
-        member &&
-        (member.permissions.has(PermissionFlagsBits.Administrator) ||
-          (!!supportRoleId && member.roles.cache.has(supportRoleId)))
-      ) {
+      if (member && this.isStaffMember(member)) {
         return null;
       }
     }
@@ -980,6 +1056,11 @@ export class DiscordBot {
   private async handleSelectMenu(interaction: StringSelectMenuInteraction): Promise<void> {
     if (interaction.customId === "config_tag_pick") {
       await this.handleConfigTagPick(interaction);
+      return;
+    }
+
+    if (interaction.customId === "config_tier_pick") {
+      await this.handleConfigTierPick(interaction);
       return;
     }
 
@@ -1277,11 +1358,11 @@ export class DiscordBot {
         await thread.setArchived(true).catch(() => {});
       }
     } else {
-      const supportRoleId = this.settingsStore.supportRoleId();
+      const pingRoleId = this.tierStore.pingRoleIdFor(ticket?.escalationTierId, this.settingsStore.supportRoleId());
       await interaction.reply({
-        content: supportRoleId ? `<@&${supportRoleId}>` : undefined,
+        content: pingRoleId ? `<@&${pingRoleId}>` : undefined,
         embeds: [makeEmbed("A support team member will follow up here shortly.", COLORS.brand)],
-        allowedMentions: supportRoleId ? { roles: [supportRoleId] } : { parse: [] },
+        allowedMentions: pingRoleId ? { roles: [pingRoleId] } : { parse: [] },
       });
       const initial = this.settingsStore.initialTag();
       if (thread && ticket && initial) {
@@ -1299,6 +1380,15 @@ export class DiscordBot {
 
   private isAdmin(interaction: ButtonInteraction | StringSelectMenuInteraction | RoleSelectMenuInteraction | ChannelSelectMenuInteraction | ChatInputCommandInteraction | ModalSubmitInteraction): boolean {
     return interaction.memberPermissions?.has(PermissionFlagsBits.Administrator) ?? false;
+  }
+
+  // Staff = Administrator or a member of any escalation-tier role (legacy support
+  // role while no tiers are configured).
+  private isStaffMember(member: GuildMember): boolean {
+    if (member.permissions.has(PermissionFlagsBits.Administrator)) return true;
+    return this.tierStore
+      .staffRoleIds(this.settingsStore.supportRoleId())
+      .some((roleId) => member.roles.cache.has(roleId));
   }
 
   // One audit entry per admin config mutation, e.g. "AI solve → off".
@@ -1333,11 +1423,7 @@ export class DiscordBot {
     interaction: ChatInputCommandInteraction | StringSelectMenuInteraction | ButtonInteraction
   ): Promise<GuildMember | null> {
     const member = await this.fetchMember(interaction);
-    const supportRoleId = this.settingsStore.supportRoleId();
-    const ok =
-      !!member &&
-      (member.permissions.has(PermissionFlagsBits.Administrator) ||
-        (!!supportRoleId && member.roles.cache.has(supportRoleId)));
+    const ok = !!member && this.isStaffMember(member);
     if (!ok) {
       await interaction.reply({ embeds: [makeEmbed("You don't have permission to do that.", COLORS.danger)], flags: 64 });
       return null;
@@ -1462,9 +1548,9 @@ export class DiscordBot {
   }
 
   // Best-effort: the customer is the only non-bot human in a private thread who
-  // isn't on the support role. Returns nulls when it can't be determined.
+  // isn't on a staff (escalation-tier) role. Returns nulls when it can't be determined.
   private async deriveCustomerId(thread: ThreadChannel): Promise<{ id: string | null; displayName: string | null }> {
-    const supportRoleId = this.settingsStore.supportRoleId();
+    const staffRoleIds = this.tierStore.staffRoleIds(this.settingsStore.supportRoleId());
     try {
       const members = await thread.members.fetch();
       const candidates: GuildMember[] = [];
@@ -1472,7 +1558,7 @@ export class DiscordBot {
         if (tm.id === this.client.user?.id) continue;
         const gm = await thread.guild.members.fetch(tm.id).catch(() => null);
         if (!gm || gm.user.bot) continue;
-        if (supportRoleId && gm.roles.cache.has(supportRoleId)) continue;
+        if (staffRoleIds.some((roleId) => gm.roles.cache.has(roleId))) continue;
         candidates.push(gm);
       }
       if (candidates.length === 1) {
@@ -1522,7 +1608,13 @@ export class DiscordBot {
       .setDescription(
         [
           `**Threads channel:** ${s.threadsChannelId() ? `<#${s.threadsChannelId()}>` : "_not set_"}`,
-          `**Support role:** ${s.supportRoleId() ? `<@&${s.supportRoleId()}>` : "_not set_"}`,
+          `**Escalation tiers:** ${
+            this.tierStore.list().length
+              ? this.tierStore.list().map((t) => t.name).join(" → ")
+              : s.supportRoleId()
+                ? "_none — legacy support role fallback_"
+                : "_not set_"
+          }`,
           `**GitHub repo:** ${s.githubRepo() ? `\`${s.githubRepo()}\`` : "_not set_"}`,
           `**AI solve:** ${s.aiSolveEnabled() ? "on" : "off"}`,
           `**Status tags:** ${s.tags().length}`,
@@ -1546,6 +1638,7 @@ export class DiscordBot {
       new ButtonBuilder().setCustomId("config_audit").setLabel("Audit Log").setStyle(ButtonStyle.Primary),
     ];
     const secondary = [
+      new ButtonBuilder().setCustomId("config_escalation").setLabel("Escalation").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("config_reverify").setLabel("Re-Verify").setStyle(ButtonStyle.Secondary),
     ];
     if (!s.backfillDone()) {
@@ -1645,12 +1738,7 @@ export class DiscordBot {
     const embed = new EmbedBuilder()
       .setTitle("General Settings")
       .setColor(0x5865f2)
-      .setDescription("Pick the support role and threads channel, toggle AI, or set the GitHub repo.");
-
-    const roleSelect = new RoleSelectMenuBuilder()
-      .setCustomId("config_set_supportrole")
-      .setPlaceholder("Support role");
-    if (s.supportRoleId()) roleSelect.setDefaultRoles(s.supportRoleId()!);
+      .setDescription("Pick the threads channel, toggle AI, or set the GitHub repo. Staff roles are managed under Escalation.");
 
     const channelSelect = new ChannelSelectMenuBuilder()
       .setCustomId("config_set_channel")
@@ -1671,7 +1759,6 @@ export class DiscordBot {
     return {
       embeds: [embed],
       components: [
-        new ActionRowBuilder<RoleSelectMenuBuilder>().addComponents(roleSelect),
         new ActionRowBuilder<ChannelSelectMenuBuilder>().addComponents(channelSelect),
         buttons,
       ],
@@ -1790,6 +1877,60 @@ export class DiscordBot {
     );
 
     return { embeds: [embed], components: [toggles, actions] };
+  }
+
+  private buildEscalationPanel() {
+    const tiers = this.tierStore.list();
+    const embed = new EmbedBuilder()
+      .setTitle("Escalation Tiers")
+      .setColor(0x5865f2)
+      .setDescription(
+        tiers.length
+          ? tiers.map((t, i) => `**${i + 1}.** ${t.name} — <@&${t.roleId}>`).join("\n")
+          : "_No tiers yet — the legacy support role is used as fallback._"
+      )
+      .setFooter({
+        text: "Tier 1 gets new-ticket pings and its members are added to ticket threads. Any tier role counts as staff. Move tickets with /escalate up|down.",
+      });
+
+    const components: ActionRowBuilder<any>[] = [];
+    if (tiers.length) {
+      const pick = new StringSelectMenuBuilder()
+        .setCustomId("config_tier_pick")
+        .setPlaceholder("Edit a tier")
+        .addOptions(tiers.map((t, i) => ({ label: `${i + 1}. ${t.name}`, value: t.id })));
+      components.push(new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(pick));
+    }
+    const addSelect = new RoleSelectMenuBuilder()
+      .setCustomId("config_tier_add_role")
+      .setPlaceholder("Add tier: pick its Discord role");
+    components.push(new ActionRowBuilder<RoleSelectMenuBuilder>().addComponents(addSelect));
+    components.push(
+      new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder().setCustomId("config_back_main").setLabel("Back").setStyle(ButtonStyle.Secondary)
+      )
+    );
+
+    return { embeds: [embed], components };
+  }
+
+  private buildTierEditPanel(tier: EscalationTier) {
+    const tiers = this.tierStore.list();
+    const position = tiers.findIndex((t) => t.id === tier.id);
+    const embed = new EmbedBuilder()
+      .setTitle(`Edit tier: ${tier.name}`)
+      .setColor(0x5865f2)
+      .setDescription([`**Role:** <@&${tier.roleId}>`, `**Position:** ${position + 1} of ${tiers.length}`].join("\n"));
+
+    const buttons = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId(`config_tier_up:${tier.id}`).setLabel("Move Up").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId(`config_tier_down:${tier.id}`).setLabel("Move Down").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId(`config_tier_rename:${tier.id}`).setLabel("Rename").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId(`config_tier_delete:${tier.id}`).setLabel("Delete").setStyle(ButtonStyle.Danger),
+      new ButtonBuilder().setCustomId("config_escalation").setLabel("Back").setStyle(ButtonStyle.Secondary)
+    );
+
+    return { embeds: [embed], components: [buttons] };
   }
 
   private async handleConfigButton(interaction: ButtonInteraction): Promise<void> {
@@ -1998,6 +2139,49 @@ export class DiscordBot {
       return;
     }
 
+    if (id === "config_escalation") {
+      await interaction.update(this.buildEscalationPanel());
+      return;
+    }
+
+    // Tier-scoped buttons: customId is `config_tier_<action>:<tierId>`
+    if (id.startsWith("config_tier_")) {
+      const [tierAction, tierId] = id.split(":");
+      const tier = this.tierStore.byId(tierId);
+      if (!tier) {
+        await interaction.update(this.buildEscalationPanel());
+        return;
+      }
+      if (tierAction === "config_tier_up" || tierAction === "config_tier_down") {
+        // "Up" in the displayed list = toward tier 1 (lower position index).
+        await this.tierStore.move(tier.id, tierAction === "config_tier_up" ? -1 : 1);
+        this.auditConfig(interaction, `Escalation tier ${tier.name} → moved ${tierAction === "config_tier_up" ? "up" : "down"}`);
+        const moved = this.tierStore.byId(tier.id);
+        await interaction.update(moved ? this.buildTierEditPanel(moved) : this.buildEscalationPanel());
+        return;
+      }
+      if (tierAction === "config_tier_rename") {
+        const modal = new ModalBuilder().setCustomId(`config_tier_rename_modal:${tier.id}`).setTitle("Rename Tier");
+        const input = new TextInputBuilder()
+          .setCustomId("name")
+          .setLabel("Tier name")
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true)
+          .setMaxLength(80)
+          .setValue(tier.name);
+        modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(input));
+        await interaction.showModal(modal);
+        return;
+      }
+      if (tierAction === "config_tier_delete") {
+        await this.tierStore.remove(tier.id);
+        this.auditConfig(interaction, `Escalation tier deleted → ${tier.name}`);
+        await interaction.update(this.buildEscalationPanel());
+        return;
+      }
+      return;
+    }
+
     // Tag-scoped buttons: customId is `config_tag_<action>:<tagId>`
     const [action, tagId] = id.split(":");
     const tag = tagId ? this.settingsStore.tagById(tagId) : undefined;
@@ -2191,6 +2375,24 @@ export class DiscordBot {
       return;
     }
 
+    if (interaction.customId.startsWith("config_tier_rename_modal:")) {
+      const tierId = interaction.customId.split(":")[1];
+      const tier = this.tierStore.byId(tierId);
+      if (!tier) {
+        await interaction.reply({ embeds: [makeEmbed("That tier no longer exists.", COLORS.warn)], flags: 64 });
+        return;
+      }
+      const name = interaction.fields.getTextInputValue("name").trim();
+      if (!name) {
+        await interaction.reply({ embeds: [makeEmbed("Tier name is required.", COLORS.danger)], flags: 64 });
+        return;
+      }
+      await this.tierStore.rename(tier.id, name);
+      this.auditConfig(interaction, `Escalation tier renamed → ${tier.name} → ${name}`);
+      await interaction.reply({ embeds: [makeEmbed(`Tier renamed to **${name}**.`, COLORS.success)], flags: 64 });
+      return;
+    }
+
     if (interaction.customId === "config_report_overdue_modal") {
       const daysRaw = interaction.fields.getTextInputValue("days").trim();
       const days = /^\d+$/.test(daysRaw) ? Number(daysRaw) : NaN;
@@ -2295,15 +2497,31 @@ export class DiscordBot {
     await interaction.update(this.buildTagEditPanel(tag));
   }
 
-  private async handleRoleSelect(interaction: RoleSelectMenuInteraction): Promise<void> {
-    if (interaction.customId !== "config_set_supportrole") return;
+  private async handleConfigTierPick(interaction: StringSelectMenuInteraction): Promise<void> {
     if (!this.isAdmin(interaction)) {
       await interaction.reply({ embeds: [makeEmbed("Administrator permission required.", COLORS.danger)], flags: 64 });
       return;
     }
-    await this.settingsStore.updateGeneral({ supportRoleId: interaction.values[0] });
-    this.auditConfig(interaction, `Support role → <@&${interaction.values[0]}>`);
-    await interaction.update(this.buildGeneralPanel());
+    const tier = this.tierStore.byId(interaction.values[0]);
+    if (!tier) {
+      await interaction.update(this.buildEscalationPanel());
+      return;
+    }
+    await interaction.update(this.buildTierEditPanel(tier));
+  }
+
+  private async handleRoleSelect(interaction: RoleSelectMenuInteraction): Promise<void> {
+    if (interaction.customId !== "config_tier_add_role") return;
+    if (!this.isAdmin(interaction)) {
+      await interaction.reply({ embeds: [makeEmbed("Administrator permission required.", COLORS.danger)], flags: 64 });
+      return;
+    }
+    const roleId = interaction.values[0];
+    const role = await interaction.guild?.roles.fetch(roleId).catch(() => null);
+    // The tier name defaults to the Discord role name; rename it afterwards if needed.
+    const tier = await this.tierStore.add(role?.name ?? "Tier", roleId);
+    this.auditConfig(interaction, `Escalation tier added → ${tier.name} (<@&${roleId}>)`);
+    await interaction.update(this.buildEscalationPanel());
   }
 
   private async handleChannelSelect(interaction: ChannelSelectMenuInteraction): Promise<void> {
@@ -2570,6 +2788,40 @@ export class DiscordBot {
             type: 1, // SUB_COMMAND
             name: "list",
             description: "List the staff notes on this ticket",
+          },
+        ],
+      },
+      {
+        name: "escalate",
+        description: "Move this ticket up or down the escalation ladder (support/admin only)",
+        options: [
+          {
+            type: 1, // SUB_COMMAND
+            name: "up",
+            description: "Escalate this ticket to the next tier",
+            options: [
+              {
+                type: 3, // STRING
+                name: "reason",
+                description: "Why this is being escalated",
+                required: false,
+                max_length: 500,
+              },
+            ],
+          },
+          {
+            type: 1, // SUB_COMMAND
+            name: "down",
+            description: "Step this ticket back down to the previous tier",
+            options: [
+              {
+                type: 3, // STRING
+                name: "reason",
+                description: "Why this is being de-escalated",
+                required: false,
+                max_length: 500,
+              },
+            ],
           },
         ],
       },

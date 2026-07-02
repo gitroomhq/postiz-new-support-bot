@@ -90,6 +90,8 @@ export class SettingsStore {
     return this.settings.threadsChannelId;
   }
 
+  // Deprecated: staff roles live in EscalationTierStore now. This survives only
+  // as the fallback while no tiers are configured (and to seed tier 1 once).
   supportRoleId(): string | null {
     return this.settings.supportRoleId;
   }

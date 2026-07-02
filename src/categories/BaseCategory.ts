@@ -17,7 +17,9 @@ import { ClaudeApiLimitError } from "../bot/ClaudeCodeRunner";
 import { embed as makeEmbed, COLORS } from "../util/embeds";
 
 export interface TicketContext {
-  supportRoleId: string | null;
+  // Lowest escalation tier's role (legacy support role as fallback): pinged on
+  // new tickets and its members are added to the thread.
+  staffPingRoleId: string | null;
   aiSolveEnabled: boolean;
   initialEmoji: string;
   // Per-user rate limiting. Returns a customer-facing rejection message, or null when
@@ -109,7 +111,7 @@ export abstract class BaseCategory {
 
       await thread.members.add(interaction.user.id);
 
-      await this.addSupportMembers(thread, ctx.supportRoleId, interaction.user.id);
+      await this.addSupportMembers(thread, ctx.staffPingRoleId, interaction.user.id);
 
       await ctx.onTicketCreated(thread, interaction.user.id, interaction.user.displayName, userInput);
 
@@ -136,11 +138,11 @@ export abstract class BaseCategory {
       });
 
       if (!ctx.aiSolveEnabled) {
-        if (ctx.supportRoleId) {
+        if (ctx.staffPingRoleId) {
           await thread.send({
-            content: `<@&${ctx.supportRoleId}>`,
+            content: `<@&${ctx.staffPingRoleId}>`,
             embeds: [makeEmbed("A new support ticket has been opened and needs attention.")],
-            allowedMentions: { roles: [ctx.supportRoleId] },
+            allowedMentions: { roles: [ctx.staffPingRoleId] },
           });
         }
         return;

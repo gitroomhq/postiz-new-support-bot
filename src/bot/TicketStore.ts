@@ -100,6 +100,11 @@ export class TicketStore {
     });
   }
 
+  // null = back to the base tier (tier 0 of the escalation ladder).
+  async setEscalationTier(threadId: string, escalationTierId: string | null): Promise<void> {
+    await this.prisma.ticket.update({ where: { threadId }, data: { escalationTierId } });
+  }
+
   async recordReminder(threadId: string): Promise<void> {
     await this.prisma.ticket.update({
       where: { threadId },

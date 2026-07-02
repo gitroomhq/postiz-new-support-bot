@@ -4,6 +4,7 @@ import { PrismaClient } from "./generated/prisma/client";
 import { loadConfig } from "./config";
 import { SettingsStore } from "./config/SettingsStore";
 import { CannedResponseStore } from "./config/CannedResponseStore";
+import { EscalationTierStore } from "./config/EscalationTierStore";
 import { SessionStore } from "./auth/SessionStore";
 import { OAuthManager } from "./auth/OAuthManager";
 import { PostizApiClient } from "./bot/PostizApiClient";
@@ -37,6 +38,11 @@ async function main() {
   await settingsStore.load();
   const cannedStore = new CannedResponseStore(prisma);
   await cannedStore.load();
+  const tierStore = new EscalationTierStore(prisma);
+  await tierStore.load();
+  if (await tierStore.seedFromLegacySupportRole(settingsStore.supportRoleId())) {
+    console.log("Seeded escalation tier 1 from legacy support role");
+  }
   const ticketStore = new TicketStore(prisma);
   const auditLogger = new AuditLogger(settingsStore);
   const statusService = new StatusService(ticketStore, auditLogger);
@@ -49,7 +55,7 @@ async function main() {
   const categoryRegistry = new CategoryRegistry()
     .register(new HowToCategory())
     .register(new BugsCategory())
-    .register(new BillingCategory(stripeClient, sessionStore, settingsStore, statusService, ticketStore, auditLogger));
+    .register(new BillingCategory(stripeClient, sessionStore, settingsStore, statusService, ticketStore, auditLogger, tierStore));
 
   const reportService = new StatusReportService(settingsStore, ticketStore, categoryRegistry);
 
@@ -66,13 +72,14 @@ async function main() {
     categoryRegistry,
     reportService,
     cannedStore,
-    auditLogger
+    auditLogger,
+    tierStore
   );
   // The client exists as soon as the constructor ran; nothing fires before login.
   auditLogger.bindClient(bot.client);
   await bot.start();
 
-  const reminderScheduler = new ReminderScheduler(bot.client, settingsStore, ticketStore, statusService, auditLogger);
+  const reminderScheduler = new ReminderScheduler(bot.client, settingsStore, ticketStore, statusService, auditLogger, tierStore);
   reminderScheduler.start();
 
   const statusReportScheduler = new StatusReportScheduler(bot.client, settingsStore, reportService);

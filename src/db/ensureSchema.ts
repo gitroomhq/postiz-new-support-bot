@@ -158,6 +158,25 @@ const STATEMENTS: string[] = [
   `ALTER TABLE "canned_responses" ADD COLUMN IF NOT EXISTS "ownerId" TEXT`,
   `DROP INDEX IF EXISTS "canned_responses_name_key"`,
   `CREATE UNIQUE INDEX IF NOT EXISTS "canned_responses_name_ownerId_key" ON "canned_responses"("name", "ownerId")`,
+  // Escalation tiers: ordered staff ladder replacing the single support role.
+  `CREATE TABLE IF NOT EXISTS "escalation_tiers" (
+    "id" TEXT NOT NULL,
+    "name" TEXT NOT NULL,
+    "roleId" TEXT NOT NULL,
+    "position" INTEGER NOT NULL DEFAULT 0,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT "escalation_tiers_pkey" PRIMARY KEY ("id")
+  )`,
+  `ALTER TABLE "tickets" ADD COLUMN IF NOT EXISTS "escalationTierId" TEXT`,
+  `DO $$
+  BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'tickets_escalationTierId_fkey') THEN
+      ALTER TABLE "tickets" ADD CONSTRAINT "tickets_escalationTierId_fkey"
+        FOREIGN KEY ("escalationTierId") REFERENCES "escalation_tiers"("id")
+        ON DELETE SET NULL ON UPDATE CASCADE;
+    END IF;
+  END
+  $$`,
 ];
 
 export async function ensureSchema(prisma: PrismaClient): Promise<void> {

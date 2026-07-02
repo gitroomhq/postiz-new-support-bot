@@ -112,6 +112,8 @@ model Ticket {
   categoryId          String?
   statusTagId         String?
   statusTag           StatusTag? @relation(fields: [statusTagId], references: [id])
+  escalationTierId    String?
+  escalationTier      EscalationTier? @relation(fields: [escalationTierId], references: [id])
   lastStatusChangeAt  DateTime   @default(now())
   lastReminderAt      DateTime?
   reminderCount       Int        @default(0)
@@ -138,6 +140,20 @@ model TicketNote {
 
   @@index([ticketThreadId])
   @@map("ticket_notes")
+}
+
+// Ordered staff ladder (position 0 = lowest tier). Tier 0 gets new-ticket pings
+// and its members are added to ticket threads; membership in any tier role counts
+// as staff. Replaces the legacy single BotSettings.supportRoleId.
+model EscalationTier {
+  id        String   @id @default(cuid())
+  name      String
+  roleId    String
+  position  Int      @default(0)
+  createdAt DateTime @default(now())
+  tickets   Ticket[]
+
+  @@map("escalation_tiers")
 }
 
 model CannedResponse {

@@ -1,6 +1,7 @@
 import { Client, ThreadChannel } from "discord.js";
 import { StatusTag } from "../generated/prisma/client";
 import { SettingsStore } from "../config/SettingsStore";
+import { EscalationTierStore } from "../config/EscalationTierStore";
 import { TicketStore, TicketWithTag } from "./TicketStore";
 import { StatusService, RESOLVED_EMOJI } from "./StatusService";
 import { AuditLogger } from "./AuditLogger";
@@ -20,7 +21,8 @@ export class ReminderScheduler {
     private settings: SettingsStore,
     private ticketStore: TicketStore,
     private statusService: StatusService,
-    private audit: AuditLogger
+    private audit: AuditLogger,
+    private tierStore: EscalationTierStore
   ) {}
 
   start(): void {
@@ -133,17 +135,18 @@ export class ReminderScheduler {
         allowedMentions: { users: [ticket.customerId!] },
       });
     } else {
-      const supportRoleId = this.settings.supportRoleId();
-      if (!supportRoleId) return;
+      // Ping whoever owns the ticket now: its escalation tier, else the base tier.
+      const pingRoleId = this.tierStore.pingRoleIdFor(ticket.escalationTierId, this.settings.supportRoleId());
+      if (!pingRoleId) return;
       await thread.send({
-        content: `<@&${supportRoleId}>`,
+        content: `<@&${pingRoleId}>`,
         embeds: [
           embed(
             `This ticket has gone ${tag.reminderDays} day(s) without a reply — please follow up.\n\nStatus: ${tag.emoji} ${tag.label}`,
             COLORS.warn
           ),
         ],
-        allowedMentions: { roles: [supportRoleId] },
+        allowedMentions: { roles: [pingRoleId] },
       });
     }
 
