@@ -74,41 +74,41 @@ export class StatusReportService {
       : "Last 24 hours";
 
     const embed = new EmbedBuilder()
-      .setTitle("📊 Support Status")
+      .setTitle("Support Status")
       .setColor(COLORS.brand)
       .addFields(
         {
-          name: `📈 ${windowLabel}`,
-          value: `🆕 Opened **${opened}**\n📁 Closed **${closed}**\nNet ${this.signedTrend(net)}`,
+          name: windowLabel,
+          value: `Opened **${opened}**\nClosed **${closed}**\nNet ${this.signedTrend(net)}`,
           inline: true,
         },
         {
-          name: "🎫 Open",
+          name: "Open",
           value: `**${openTotal}**${this.delta(openTotal, prev?.openTotal)}`,
           inline: true,
         },
         {
-          name: "⚠️ Overdue",
+          name: "Overdue",
           value: `**${overdueTotal}**${this.delta(overdueTotal, prev?.overdueTotal)}\n_over ${thresholdDays}d old_`,
           inline: true,
         },
         {
-          name: "🏷️ By status",
+          name: "By status",
           value: this.formatStatusList(openByStatus, tags),
           inline: false,
         },
         {
-          name: "🗂️ By type",
+          name: "By type",
           value: this.formatTypeList(openByCategory),
           inline: false,
         },
         {
-          name: "✅ Done",
+          name: "Done",
           value: `**${doneTotal}**${this.delta(doneTotal, prev?.doneTotal)}`,
           inline: true,
         },
         {
-          name: "📚 Total",
+          name: "Total",
           value: `**${total}**${this.delta(total, prev?.total)}`,
           inline: true,
         }
