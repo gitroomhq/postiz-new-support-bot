@@ -35,7 +35,8 @@ import {
 import { BotConfig } from "../config";
 import { embed as makeEmbed, COLORS } from "../util/embeds";
 import { SettingsStore, isUnicodeEmoji, ReminderTarget } from "../config/SettingsStore";
-import { StatusTag } from "../generated/prisma/client";
+import { CannedResponseStore } from "../config/CannedResponseStore";
+import { StatusTag, CannedResponse } from "../generated/prisma/client";
 import { SessionStore } from "../auth/SessionStore";
 import { OAuthManager } from "../auth/OAuthManager";
 import { PostizApiClient } from "./PostizApiClient";
@@ -81,7 +82,8 @@ export class DiscordBot {
     private claudeRunner: ClaudeCodeRunner,
     private githubClient: GitHubClient,
     private categoryRegistry: CategoryRegistry,
-    private reportService: StatusReportService
+    private reportService: StatusReportService,
+    private cannedStore: CannedResponseStore
   ) {
     this.client = new Client({
       intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.GuildMembers],
@@ -245,7 +247,91 @@ export class DiscordBot {
       await this.handleReportCommand(interaction);
     } else if (interaction.commandName === "search-tickets") {
       await this.handleSearchTicketsCommand(interaction);
+    } else if (interaction.commandName === "note") {
+      await this.handleNoteCommand(interaction);
+    } else if (interaction.commandName === "canned") {
+      await this.handleCannedCommand(interaction);
     }
+  }
+
+  // ---- /note: staff-only notes on a ticket (always ephemeral — the customer is in the thread) ----
+
+  private async handleNoteCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+    const member = await this.requireSupportOrAdmin(interaction);
+    if (!member) return;
+
+    const channel = interaction.channel ?? (await this.client.channels.fetch(interaction.channelId).catch(() => null));
+    if (!channel?.isThread()) {
+      await interaction.reply({ embeds: [makeEmbed("Use this inside a ticket thread.", COLORS.warn)], flags: 64 });
+      return;
+    }
+    const thread = channel as ThreadChannel;
+
+    let ticket = await this.ticketStore.getByThreadId(thread.id);
+    if (!ticket) {
+      ticket = await this.adoptThread(thread);
+      if (!ticket) {
+        await interaction.reply({ embeds: [makeEmbed("This thread isn't a tracked support ticket.", COLORS.warn)], flags: 64 });
+        return;
+      }
+    }
+
+    if (interaction.options.getSubcommand() === "add") {
+      const text = interaction.options.getString("text", true).trim();
+      if (!text) {
+        await interaction.reply({ embeds: [makeEmbed("Note text is required.", COLORS.warn)], flags: 64 });
+        return;
+      }
+      await this.ticketStore.addNote(thread.id, member.id, member.displayName, text);
+      await interaction.reply({
+        embeds: [makeEmbed("Staff note added. Only support/admins can read it via `/note list`.", COLORS.success)],
+        flags: 64,
+      });
+      return;
+    }
+
+    const notes = await this.ticketStore.listNotes(thread.id);
+    if (notes.length === 0) {
+      await interaction.reply({ embeds: [makeEmbed("No staff notes on this ticket yet.", COLORS.neutral)], flags: 64 });
+      return;
+    }
+    const lines = notes.map(
+      (n) => `**${n.authorName}** <t:${Math.floor(n.createdAt.getTime() / 1000)}:R>\n${n.text}`
+    );
+    const embed = new EmbedBuilder()
+      .setTitle(`Staff notes — ${notes.length} most recent`)
+      .setColor(COLORS.brand)
+      .setDescription(lines.join("\n\n").slice(0, 4096));
+    await interaction.reply({ embeds: [embed], flags: 64 });
+  }
+
+  // ---- /canned: post an admin-managed reply template into a ticket thread ----
+
+  private async handleCannedCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+    const member = await this.requireSupportOrAdmin(interaction);
+    if (!member) return;
+
+    const channel = interaction.channel ?? (await this.client.channels.fetch(interaction.channelId).catch(() => null));
+    if (!channel?.isThread() || !(await this.ticketStore.getByThreadId(channel.id))) {
+      await interaction.reply({ embeds: [makeEmbed("Use this inside a tracked ticket thread.", COLORS.warn)], flags: 64 });
+      return;
+    }
+
+    const name = interaction.options.getString("name", true);
+    const canned = this.cannedStore.getByName(name);
+    if (!canned) {
+      await interaction.reply({
+        embeds: [makeEmbed(`No canned response named \`${name}\`. Manage them in /config → Canned Responses.`, COLORS.warn)],
+        flags: 64,
+      });
+      return;
+    }
+
+    const embed = new EmbedBuilder()
+      .setDescription(canned.content.slice(0, 4096))
+      .setColor(COLORS.brand)
+      .setAuthor({ name: `Sent by ${member.displayName}`, iconURL: member.displayAvatarURL() });
+    await interaction.reply({ embeds: [embed] });
   }
 
   private async handleReportCommand(interaction: ChatInputCommandInteraction): Promise<void> {
@@ -284,21 +370,30 @@ export class DiscordBot {
 
   // ---- /search-tickets ----
 
-  // Suggest status tags for the `status` option. Tags are runtime-configurable, so this
-  // reads the live list rather than relying on static command choices.
+  // Live autocomplete: status tags (runtime-configurable) and canned response names
+  // (cached in memory, zero DB cost).
   private async handleAutocomplete(interaction: AutocompleteInteraction): Promise<void> {
-    if (interaction.commandName !== "search-tickets" && interaction.commandName !== "set-status") return;
     const focused = interaction.options.getFocused(true);
-    if (focused.name !== "status") {
-      await interaction.respond([]);
-      return;
-    }
     const query = focused.value.toLowerCase();
-    const choices = this.settingsStore
-      .tags()
-      .filter((t) => t.label.toLowerCase().includes(query))
-      .slice(0, 25)
-      .map((t) => ({ name: `${t.emoji} ${t.label}`, value: t.id }));
+
+    let choices: { name: string; value: string }[] = [];
+    if (interaction.commandName === "canned" && focused.name === "name") {
+      choices = this.cannedStore
+        .list()
+        .filter((c) => c.name.includes(query))
+        .slice(0, 25)
+        .map((c) => ({ name: c.name, value: c.name }));
+    } else if (
+      (interaction.commandName === "search-tickets" || interaction.commandName === "set-status") &&
+      focused.name === "status"
+    ) {
+      choices = this.settingsStore
+        .tags()
+        .filter((t) => t.label.toLowerCase().includes(query))
+        .slice(0, 25)
+        .map((t) => ({ name: `${t.emoji} ${t.label}`, value: t.id }));
+    }
+
     try {
       await interaction.respond(choices);
     } catch {
@@ -699,6 +794,16 @@ export class DiscordBot {
   private async handleSelectMenu(interaction: StringSelectMenuInteraction): Promise<void> {
     if (interaction.customId === "config_tag_pick") {
       await this.handleConfigTagPick(interaction);
+      return;
+    }
+
+    if (interaction.customId === "config_canned_pick") {
+      if (!this.isAdmin(interaction)) {
+        await interaction.reply({ embeds: [makeEmbed("Administrator permission required.", COLORS.danger)], flags: 64 });
+        return;
+      }
+      const canned = this.cannedStore.getById(interaction.values[0]);
+      await interaction.update(canned ? this.buildCannedEditPanel(canned) : this.buildCannedPanel());
       return;
     }
 
@@ -1195,6 +1300,7 @@ export class DiscordBot {
       new ButtonBuilder().setCustomId("config_tags").setLabel("Manage Tags").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("config_report").setLabel("Status Report").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("config_billing").setLabel("Billing").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("config_canned").setLabel("Canned Responses").setStyle(ButtonStyle.Primary),
     ];
     const secondary = [
       new ButtonBuilder().setCustomId("config_reverify").setLabel("Re-Verify").setStyle(ButtonStyle.Secondary),
@@ -1412,6 +1518,89 @@ export class DiscordBot {
     return { embeds: [embed], components: [toggles, actions] };
   }
 
+  // ---- Canned responses config (mirrors the Tags panel pattern) ----
+
+  private buildCannedPanel() {
+    const list = this.cannedStore.list();
+    // Discord select menus cap at 25 options; say so instead of hiding entries silently.
+    const shown = list.slice(0, 25);
+    const embed = new EmbedBuilder()
+      .setTitle("Canned Responses")
+      .setColor(0x5865f2)
+      .setDescription(
+        list.length
+          ? shown
+              .map((c) => {
+                const preview = c.content.replace(/\s+/g, " ").slice(0, 60);
+                return `**${c.name}** — ${preview}${c.content.length > 60 ? "…" : ""}`;
+              })
+              .join("\n") +
+              (list.length > 25 ? `\n\n_Showing the first 25 of ${list.length}. All names remain usable via \`/canned\` autocomplete._` : "")
+          : "_No canned responses yet. Add one below; support posts them with `/canned <name>`._"
+      );
+
+    const components: ActionRowBuilder<any>[] = [];
+    if (shown.length) {
+      const pick = new StringSelectMenuBuilder()
+        .setCustomId("config_canned_pick")
+        .setPlaceholder("Edit a canned response")
+        .addOptions(shown.map((c) => ({ label: c.name.slice(0, 100), value: c.id })));
+      components.push(new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(pick));
+    }
+    components.push(
+      new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder().setCustomId("config_canned_add").setLabel("Add Response").setStyle(ButtonStyle.Success),
+        new ButtonBuilder().setCustomId("config_back_main").setLabel("Back").setStyle(ButtonStyle.Secondary)
+      )
+    );
+
+    return { embeds: [embed], components };
+  }
+
+  private buildCannedEditPanel(canned: CannedResponse) {
+    const embed = new EmbedBuilder()
+      .setTitle(`Canned response: ${canned.name}`)
+      .setColor(0x5865f2)
+      .setDescription(canned.content.slice(0, 4096));
+
+    const buttons = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId(`config_canned_edit:${canned.id}`).setLabel("Edit").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId(`config_canned_delete:${canned.id}`).setLabel("Delete").setStyle(ButtonStyle.Danger),
+      new ButtonBuilder().setCustomId("config_canned").setLabel("Back").setStyle(ButtonStyle.Secondary)
+    );
+
+    return { embeds: [embed], components: [buttons] };
+  }
+
+  private buildCannedModal(canned?: CannedResponse): ModalBuilder {
+    const modal = new ModalBuilder()
+      .setCustomId(canned ? `config_canned_edit_modal:${canned.id}` : "config_canned_add_modal")
+      .setTitle(canned ? "Edit Canned Response" : "Add Canned Response");
+
+    const name = new TextInputBuilder()
+      .setCustomId("name")
+      .setLabel("Name (used with /canned)")
+      .setStyle(TextInputStyle.Short)
+      .setRequired(true)
+      .setMaxLength(50);
+    const content = new TextInputBuilder()
+      .setCustomId("content")
+      .setLabel("Content")
+      .setStyle(TextInputStyle.Paragraph)
+      .setRequired(true)
+      .setMaxLength(4000);
+    if (canned) {
+      name.setValue(canned.name);
+      content.setValue(canned.content);
+    }
+
+    modal.addComponents(
+      new ActionRowBuilder<TextInputBuilder>().addComponents(name),
+      new ActionRowBuilder<TextInputBuilder>().addComponents(content)
+    );
+    return modal;
+  }
+
   private async handleConfigButton(interaction: ButtonInteraction): Promise<void> {
     if (!this.isAdmin(interaction)) {
       await interaction.reply({ embeds: [makeEmbed("Administrator permission required.", COLORS.danger)], flags: 64 });
@@ -1593,6 +1782,30 @@ export class DiscordBot {
 
     if (id === "config_tag_add") {
       await interaction.showModal(this.buildTagModal());
+      return;
+    }
+
+    if (id === "config_canned") {
+      await interaction.update(this.buildCannedPanel());
+      return;
+    }
+    if (id === "config_canned_add") {
+      await interaction.showModal(this.buildCannedModal());
+      return;
+    }
+    if (id.startsWith("config_canned_edit:") || id.startsWith("config_canned_delete:")) {
+      const cannedId = id.split(":")[1];
+      const canned = this.cannedStore.getById(cannedId);
+      if (!canned) {
+        await interaction.update(this.buildCannedPanel());
+        return;
+      }
+      if (id.startsWith("config_canned_edit:")) {
+        await interaction.showModal(this.buildCannedModal(canned));
+      } else {
+        await this.cannedStore.remove(canned.id);
+        await interaction.update(this.buildCannedPanel());
+      }
       return;
     }
 
@@ -1792,6 +2005,30 @@ export class DiscordBot {
         embeds: [makeEmbed(`Tickets now count as overdue after ${days} day(s).`, COLORS.success)],
         flags: 64,
       });
+      return;
+    }
+
+    if (interaction.customId === "config_canned_add_modal" || interaction.customId.startsWith("config_canned_edit_modal:")) {
+      const name = interaction.fields.getTextInputValue("name").trim();
+      const content = interaction.fields.getTextInputValue("content").trim();
+      try {
+        if (interaction.customId === "config_canned_add_modal") {
+          const created = await this.cannedStore.add(name, content);
+          await interaction.reply({
+            embeds: [makeEmbed(`Added canned response \`${created.name}\`. Support can post it with \`/canned ${created.name}\`.`, COLORS.success)],
+            flags: 64,
+          });
+        } else {
+          const cannedId = interaction.customId.split(":")[1];
+          const updated = await this.cannedStore.edit(cannedId, name, content);
+          await interaction.reply({ embeds: [makeEmbed(`Updated canned response \`${updated.name}\`.`, COLORS.success)], flags: 64 });
+        }
+      } catch (error) {
+        await interaction.reply({
+          embeds: [makeEmbed((error as Error).message || "Failed to save the canned response.", COLORS.danger)],
+          flags: 64,
+        });
+      }
       return;
     }
 
@@ -2119,6 +2356,44 @@ export class DiscordBot {
       {
         name: "report",
         description: "Show a support status report (support/admin only)",
+      },
+      {
+        name: "note",
+        description: "Staff-only notes on this ticket (support/admin only)",
+        options: [
+          {
+            type: 1, // SUB_COMMAND
+            name: "add",
+            description: "Add a private staff note to this ticket",
+            options: [
+              {
+                type: 3, // STRING
+                name: "text",
+                description: "Note text (only staff can read it)",
+                required: true,
+                max_length: 1000,
+              },
+            ],
+          },
+          {
+            type: 1, // SUB_COMMAND
+            name: "list",
+            description: "List the staff notes on this ticket",
+          },
+        ],
+      },
+      {
+        name: "canned",
+        description: "Post a canned response in this ticket (support/admin only)",
+        options: [
+          {
+            type: 3, // STRING
+            name: "name",
+            description: "Template name",
+            required: true,
+            autocomplete: true,
+          },
+        ],
       },
       {
         name: "search-tickets",

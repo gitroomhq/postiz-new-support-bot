@@ -3,6 +3,7 @@ import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "./generated/prisma/client";
 import { loadConfig } from "./config";
 import { SettingsStore } from "./config/SettingsStore";
+import { CannedResponseStore } from "./config/CannedResponseStore";
 import { SessionStore } from "./auth/SessionStore";
 import { OAuthManager } from "./auth/OAuthManager";
 import { PostizApiClient } from "./bot/PostizApiClient";
@@ -33,6 +34,8 @@ async function main() {
   const sessionStore = new SessionStore(prisma);
   const settingsStore = new SettingsStore(prisma);
   await settingsStore.load();
+  const cannedStore = new CannedResponseStore(prisma);
+  await cannedStore.load();
   const ticketStore = new TicketStore(prisma);
   const statusService = new StatusService(ticketStore);
   const oauthManager = new OAuthManager(config, sessionStore);
@@ -59,7 +62,8 @@ async function main() {
     claudeRunner,
     githubClient,
     categoryRegistry,
-    reportService
+    reportService,
+    cannedStore
   );
   await bot.start();
 
