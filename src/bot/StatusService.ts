@@ -1,9 +1,17 @@
-import { ThreadChannel } from "discord.js";
+import { ActionRowBuilder, ButtonBuilder, ButtonStyle, ThreadChannel } from "discord.js";
 import { StatusTag } from "../generated/prisma/client";
 import { TicketStore } from "./TicketStore";
 import { embed, COLORS } from "../util/embeds";
 
 export const RESOLVED_EMOJI = "✅";
+
+// The subset of a Ticket that applyStatus needs. csatPromptedAt gates the one-time
+// rating prompt; callers always pass full ticket rows, so this is type-only.
+export interface StatusTicket {
+  threadId: string;
+  customerId: string | null;
+  csatPromptedAt?: Date | null;
+}
 
 export interface ApplyStatusOptions {
   actorName: string;
@@ -19,7 +27,7 @@ export class StatusService {
 
   async applyStatus(
     thread: ThreadChannel,
-    ticket: { threadId: string; customerId: string | null },
+    ticket: StatusTicket,
     tag: StatusTag,
     options: ApplyStatusOptions
   ): Promise<void> {
@@ -41,7 +49,7 @@ export class StatusService {
 
   private async runApplyStatus(
     thread: ThreadChannel,
-    ticket: { threadId: string; customerId: string | null },
+    ticket: StatusTicket,
     tag: StatusTag,
     options: ApplyStatusOptions
   ): Promise<void> {
@@ -83,6 +91,12 @@ export class StatusService {
             allowedMentions: { users: ticket.customerId ? [ticket.customerId] : [] },
           })
           .catch(() => {});
+
+        // One-time satisfaction prompt. Must run BEFORE the lock/archive below so the
+        // in-thread fallback (customer has DMs closed) can still post its message.
+        if (ticket.customerId && !ticket.csatPromptedAt) {
+          await this.sendCsatPrompt(thread, ticket).catch((e) => console.error("CSAT prompt failed:", e));
+        }
       }
     }
 
@@ -94,5 +108,45 @@ export class StatusService {
     }
     // Resolved deliberately leaves the thread open (not archived, not locked) so the
     // customer can reply right where they are; the scheduler closes it after N quiet days.
+  }
+
+  // 1-5 star rating prompt, sent by DM so it survives the thread being locked/archived.
+  // The customerId rides in the customId so the click handler needs no DB read before
+  // acking, and the threadId because the click arrives from the DM channel.
+  private async sendCsatPrompt(thread: ThreadChannel, ticket: StatusTicket): Promise<void> {
+    if (!ticket.customerId) return;
+
+    const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      [1, 2, 3, 4, 5].map((score) =>
+        new ButtonBuilder()
+          .setCustomId(`csat:${ticket.threadId}:${ticket.customerId}:${score}`)
+          .setLabel(`${score} ⭐`)
+          .setStyle(ButtonStyle.Secondary)
+      )
+    );
+
+    try {
+      const user = await thread.client.users.fetch(ticket.customerId);
+      await user.send({
+        embeds: [
+          embed(
+            `Your support ticket [**${thread.name}**](${thread.url}) has been completed.\n\nHow was your support experience? Tap a rating below.`
+          ),
+        ],
+        components: [row],
+      });
+    } catch {
+      // DMs closed — fall back to the thread (we're still pre-lock here).
+      await thread
+        .send({
+          content: `<@${ticket.customerId}>`,
+          embeds: [embed("How was your support experience? Tap a rating below.")],
+          components: [row],
+          allowedMentions: { users: [ticket.customerId] },
+        })
+        .catch(() => {});
+    }
+
+    await this.ticketStore.markCsatPrompted(ticket.threadId);
   }
 }

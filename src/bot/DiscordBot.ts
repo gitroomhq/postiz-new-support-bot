@@ -134,13 +134,32 @@ export class DiscordBot {
     }
   }
 
-  // A customer replied to their Resolved ticket: reopen it to the initial status.
+  // Human messages in tracked ticket threads drive two things:
+  // 1. the first support reply stamps firstResponseAt (response-time metrics),
+  // 2. a customer reply to a Resolved ticket reopens it to the initial status.
   private async handleMessage(message: Message): Promise<void> {
     if (message.author.bot) return;
     if (!message.channel.isThread()) return;
 
     const ticket = await this.ticketStore.getByThreadId(message.channelId);
     if (!ticket) return;
+
+    // First support reply on an open ticket. Only support/admin members count, so
+    // another invited human (or the customer) can't skew the metric.
+    if (!ticket.closed && !ticket.firstResponseAt && ticket.customerId && message.author.id !== ticket.customerId) {
+      const member = message.member ?? (await message.guild?.members.fetch(message.author.id).catch(() => null)) ?? null;
+      const supportRoleId = this.settingsStore.supportRoleId();
+      const isSupport =
+        !!member &&
+        (member.permissions.has(PermissionFlagsBits.Administrator) ||
+          (!!supportRoleId && member.roles.cache.has(supportRoleId)));
+      if (isSupport) {
+        await this.ticketStore.setFirstResponse(ticket.threadId, message.createdAt).catch((e) => {
+          console.error("firstResponse stamp failed:", e);
+        });
+      }
+    }
+
     // Only Resolved tickets are reopenable by a reply (Closed threads are locked).
     if (ticket.statusTag?.emoji !== RESOLVED_EMOJI) return;
     // Only the ticket's own customer reopens it — support/closing notes don't.
@@ -499,6 +518,11 @@ export class DiscordBot {
       return;
     }
 
+    if (interaction.customId.startsWith("csat:")) {
+      await this.handleCsatRating(interaction);
+      return;
+    }
+
     if (interaction.customId.startsWith("create_issue:")) {
       await this.handleCreateIssue(interaction);
       return;
@@ -715,6 +739,11 @@ export class DiscordBot {
       return;
     }
 
+    if (interaction.customId.startsWith("csat_comment:")) {
+      await this.handleCsatCommentModal(interaction);
+      return;
+    }
+
     const category = this.categoryRegistry.findByModalId(interaction.customId);
     if (!category) return;
 
@@ -821,6 +850,74 @@ export class DiscordBot {
       console.error("GitHub issue creation error:", error);
       await interaction.editReply({ embeds: [makeEmbed("Failed to create the GitHub issue. Please try again later.", COLORS.danger)] });
     }
+  }
+
+  // ---- CSAT (1-5 star rating on ticket close, usually via DM) ----
+
+  // customId: csat:{threadId}:{customerId}:{score}. The owner check is a pure string
+  // comparison and showModal is the FIRST response — no DB work before the ack, because
+  // showModal can't follow a defer and the token window is ~3s.
+  private async handleCsatRating(interaction: ButtonInteraction): Promise<void> {
+    const [, threadId, customerId, scoreRaw] = interaction.customId.split(":");
+    if (interaction.user.id !== customerId) {
+      await interaction.reply({ embeds: [makeEmbed("Only the ticket owner can rate this ticket.", COLORS.danger)], flags: 64 });
+      return;
+    }
+    const score = Number.parseInt(scoreRaw, 10);
+    if (!Number.isInteger(score) || score < 1 || score > 5) return;
+
+    const modal = new ModalBuilder()
+      .setCustomId(`csat_comment:${threadId}:${score}`)
+      .setTitle(`Thanks for the ${score}-star rating!`);
+    const comment = new TextInputBuilder()
+      .setCustomId("comment")
+      .setLabel("Anything to add about how it went?")
+      .setStyle(TextInputStyle.Paragraph)
+      .setRequired(false)
+      .setMaxLength(1000);
+    modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(comment));
+    await interaction.showModal(modal);
+
+    // Record after the ack. A dismissed modal still keeps the rating; only the first
+    // rating ever wins (recordCsat guards on csatScore null).
+    const recorded = await this.ticketStore.recordCsat(threadId, score).catch((e) => {
+      console.error("CSAT record failed:", e);
+      return false;
+    });
+    if (recorded) {
+      const doneRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder()
+          .setCustomId("csat_done")
+          .setLabel(`Rated ${score} ⭐ — thank you!`)
+          .setStyle(ButtonStyle.Success)
+          .setDisabled(true)
+      );
+      // Best-effort: editing can fail on an archived in-thread fallback message.
+      await interaction.message.edit({ components: [doneRow] }).catch(() => {});
+    }
+  }
+
+  private async handleCsatCommentModal(interaction: ModalSubmitInteraction): Promise<void> {
+    const [, threadId] = interaction.customId.split(":");
+    const comment = interaction.fields.getTextInputValue("comment").trim();
+
+    const ticket = await this.ticketStore.getByThreadId(threadId).catch(() => null);
+    if (!ticket || ticket.csatScore == null) {
+      await interaction.reply({ embeds: [makeEmbed("This rating prompt has expired — thanks anyway!", COLORS.neutral)], flags: 64 });
+      return;
+    }
+
+    if (comment) {
+      const stored = await this.ticketStore.setCsatComment(threadId, comment).catch(() => false);
+      if (!stored) {
+        await interaction.reply({ embeds: [makeEmbed("You've already left feedback for this ticket — thank you!", COLORS.warn)], flags: 64 });
+        return;
+      }
+    }
+    await interaction.reply({
+      embeds: [makeEmbed(`Thanks for the feedback${comment ? " and the comment" : ""}! It helps us improve. ⭐`, COLORS.success)],
+      flags: 64,
+    });
   }
 
   // Legacy feedback buttons (only shown when AI solve is on). Yes → closing tag, No → initial tag.
