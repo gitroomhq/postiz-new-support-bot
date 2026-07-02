@@ -7,8 +7,11 @@ import {
   StringSelectMenuBuilder,
   TextChannel,
   type ButtonInteraction,
+  type ChatInputCommandInteraction,
+  type GuildMember,
   type ModalSubmitInteraction,
   type StringSelectMenuInteraction,
+  type ThreadChannel,
   ModalBuilder,
 } from "discord.js";
 import { BaseCategory, TicketContext } from "./BaseCategory";
@@ -18,6 +21,7 @@ import { SessionStore } from "../auth/SessionStore";
 import { SettingsStore } from "../config/SettingsStore";
 import { StatusService } from "../bot/StatusService";
 import { TicketStore } from "../bot/TicketStore";
+import { AuditLogger } from "../bot/AuditLogger";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -32,7 +36,8 @@ export class BillingCategory extends BaseCategory {
     private sessionStore: SessionStore,
     private settingsStore: SettingsStore,
     private statusService: StatusService,
-    private ticketStore: TicketStore
+    private ticketStore: TicketStore,
+    private audit: AuditLogger
   ) {
     super();
   }
@@ -245,6 +250,7 @@ export class BillingCategory extends BaseCategory {
       outcome: "50% discount applied to the next billing cycle",
       amountText: "50% off next cycle",
       chargeId,
+      customerId: interaction.user.id,
     });
 
     await this.closeTicketThread(interaction);
@@ -310,7 +316,7 @@ export class BillingCategory extends BaseCategory {
     // Guardrails: on breach, no Stripe call and no lock row — a human takes over.
     const breach = await this.checkRefundGuardrails(interaction, charge);
     if (breach) {
-      await this.convertToManualReview(interaction, breach, amountText, chargeId);
+      await this.convertToManualReview(interaction, breach, charge, chargeId, subscriptionId);
       return;
     }
 
@@ -377,6 +383,7 @@ export class BillingCategory extends BaseCategory {
         : "Refund processed, subscription cancelled",
       amountText: amount,
       chargeId,
+      customerId: interaction.user.id,
     });
 
     // Keep manual-follow-up threads open so staff actually handle the cancellation.
@@ -428,12 +435,15 @@ export class BillingCategory extends BaseCategory {
   }
 
   // A guardrail tripped: hand the thread to a human instead of touching Stripe.
+  // The block is persisted so staff can later run /charge approve|deny in the thread.
   private async convertToManualReview(
     interaction: ButtonInteraction,
     reason: string,
-    amountText: string,
-    chargeId: string
+    charge: { amount: number; currency: string },
+    chargeId: string,
+    subscriptionId: string
   ): Promise<void> {
+    const amountText = this.stripeClient.formatAmount(charge.amount, charge.currency);
     await this.disableConfirmButtons(interaction, "Pending Manual Review");
 
     await interaction.editReply({
@@ -445,15 +455,29 @@ export class BillingCategory extends BaseCategory {
       ],
     });
 
+    const thread = interaction.channel?.isThread() ? interaction.channel : null;
+    if (thread) {
+      await this.sessionStore
+        .createPendingChargeReview({
+          threadId: thread.id,
+          chargeId,
+          subscriptionId: subscriptionId || null,
+          customerId: interaction.user.id,
+          amount: charge.amount,
+          currency: charge.currency,
+          reason,
+        })
+        .catch((e) => console.error("Pending charge review persist failed:", e));
+    }
+
     const supportRoleId = this.settingsStore.supportRoleId();
-    const thread = interaction.channel;
-    if (thread?.isThread()) {
+    if (thread) {
       await thread
         .send({
           content: supportRoleId ? `<@&${supportRoleId}>` : undefined,
           embeds: [
             makeEmbed(
-              `Self-service refund blocked — manual review needed.\n\n**Reason:** ${reason}\n**Amount:** ${amountText}\n**Charge:** \`${chargeId}\``,
+              `Self-service refund blocked — manual review needed.\n\n**Reason:** ${reason}\n**Amount:** ${amountText}\n**Charge:** \`${chargeId}\`\n\nStaff: run \`/charge approve\` or \`/charge deny\` in this thread.`,
               COLORS.warn
             ),
           ],
@@ -467,6 +491,7 @@ export class BillingCategory extends BaseCategory {
       outcome: `Blocked — manual review. ${reason}`,
       amountText,
       chargeId,
+      customerId: interaction.user.id,
     });
   }
 
@@ -474,8 +499,8 @@ export class BillingCategory extends BaseCategory {
   // audit channel; falls back to an in-thread support-role ping (staff are thread members
   // since addSupportMembers). Best-effort — never breaks the customer flow.
   private async notifyBillingAudit(
-    interaction: ButtonInteraction,
-    payload: { action: string; outcome: string; amountText: string; chargeId: string }
+    interaction: ButtonInteraction | ChatInputCommandInteraction,
+    payload: { action: string; outcome: string; amountText: string; chargeId: string; customerId: string }
   ): Promise<void> {
     try {
       const thread = interaction.channel?.isThread() ? interaction.channel : null;
@@ -483,7 +508,7 @@ export class BillingCategory extends BaseCategory {
         .setTitle(`Billing: ${payload.action}`)
         .setColor(COLORS.brand)
         .addFields(
-          { name: "Customer", value: `<@${interaction.user.id}>`, inline: true },
+          { name: "Customer", value: `<@${payload.customerId}>`, inline: true },
           { name: "Amount", value: payload.amountText, inline: true },
           { name: "Charge", value: `\`${payload.chargeId}\``, inline: true },
           { name: "Ticket", value: thread ? `<#${thread.id}>` : "—", inline: true },
@@ -510,7 +535,199 @@ export class BillingCategory extends BaseCategory {
       }
     } catch (error) {
       console.error("Billing audit notification failed:", error);
+    } finally {
+      // Mirror into the general audit trail, unless both settings point at the
+      // same channel (the billing embed above already landed there).
+      if (this.settingsStore.auditLogChannelId() !== this.settingsStore.billingAuditChannelId()) {
+        void this.audit.log({
+          title: `💳 Billing: ${payload.action}`,
+          severity: "warn",
+          threadId: interaction.channel?.isThread() ? interaction.channel.id : undefined,
+          fields: [
+            { name: "Customer", value: `<@${payload.customerId}>`, inline: true },
+            { name: "Amount", value: payload.amountText, inline: true },
+            { name: "Charge", value: `\`${payload.chargeId}\``, inline: true },
+            { name: "Outcome", value: payload.outcome },
+          ],
+        });
+      }
     }
+  }
+
+  // ---- /charge approve|deny: staff resolution of guardrail-blocked refunds ----
+
+  // The pending review for the current thread. Blocks recorded before this feature
+  // existed only live as bot messages — recover those by parsing the bot's own
+  // "refund blocked" embed and re-fetching the charge from Stripe.
+  private async findBlockedCharge(thread: ThreadChannel) {
+    const review = await this.sessionStore.getPendingChargeReview(thread.id);
+    if (review) return review;
+
+    // Never resurrect a resolved review from the old message.
+    if (await this.sessionStore.hasChargeReview(thread.id)) return null;
+
+    const messages = await thread.messages.fetch({ limit: 100 }).catch(() => null);
+    if (!messages) return null;
+    for (const message of messages.values()) {
+      if (message.author.id !== thread.client.user?.id) continue;
+      const description = message.embeds[0]?.description ?? "";
+      if (!description.startsWith("Self-service refund blocked")) continue;
+
+      const chargeId = /\*\*Charge:\*\* `([^`]+)`/.exec(description)?.[1];
+      if (!chargeId) continue;
+      const reason = /\*\*Reason:\*\* (.+)/.exec(description)?.[1] ?? "Recovered from thread message";
+
+      const ticket = await this.ticketStore.getByThreadId(thread.id).catch(() => null);
+      if (!ticket?.customerId) return null;
+      const charge = await this.stripeClient.getChargeAmount(chargeId).catch(() => null);
+      if (!charge) return null;
+
+      await this.sessionStore.createPendingChargeReview({
+        threadId: thread.id,
+        chargeId,
+        subscriptionId: null, // unknown for old blocks; cancel falls back to the customer's Stripe account
+        customerId: ticket.customerId,
+        amount: charge.amount,
+        currency: charge.currency,
+        reason,
+      });
+      return this.sessionStore.getPendingChargeReview(thread.id);
+    }
+    return null;
+  }
+
+  async approveBlockedCharge(interaction: ChatInputCommandInteraction, member: GuildMember): Promise<void> {
+    const thread = interaction.channel?.isThread() ? interaction.channel : null;
+    if (!thread) {
+      await interaction.reply({ embeds: [makeEmbed("Use this inside a refund ticket thread.", COLORS.warn)], flags: 64 });
+      return;
+    }
+
+    // Recovery can hit Stripe + message history; ack first.
+    await interaction.deferReply();
+
+    const review = await this.findBlockedCharge(thread);
+    if (!review) {
+      await interaction.editReply({ embeds: [makeEmbed("No blocked charge is pending review in this ticket.", COLORS.warn)] });
+      return;
+    }
+
+    // Fresh charge state: it may have been refunded in the Stripe dashboard meanwhile.
+    let charge: { amount: number; currency: string; refunded: boolean };
+    try {
+      charge = await this.stripeClient.getChargeAmount(review.chargeId);
+    } catch (error) {
+      console.error("Stripe charge lookup error:", error);
+      await interaction.editReply({ embeds: [makeEmbed("Couldn't look up the charge on Stripe. Please try again later.", COLORS.danger)] });
+      return;
+    }
+
+    if (charge.refunded) {
+      await this.sessionStore.resolvePendingChargeReview(thread.id, "ALREADY_PROCESSED", member.id);
+      await interaction.editReply({ embeds: [makeEmbed("This charge has already been refunded on Stripe — nothing to do.", COLORS.warn)] });
+      return;
+    }
+
+    // Same lock as the self-service flow: exactly one refund per charge, ever.
+    if (!(await this.sessionStore.claimBillingAction(review.customerId, review.chargeId, "refund"))) {
+      await this.sessionStore.resolvePendingChargeReview(thread.id, "ALREADY_PROCESSED", member.id);
+      await interaction.editReply({ embeds: [makeEmbed("This charge has already been processed for a refund or discount.", COLORS.warn)] });
+      return;
+    }
+
+    let refund: { refundId: string; amount: number; currency: string };
+    try {
+      refund = await this.stripeClient.refundCharge(review.chargeId, `refund-${review.chargeId}`);
+    } catch (error) {
+      console.error("Stripe refund error:", error);
+      await this.sessionStore.releaseBillingAction(review.chargeId).catch(() => {});
+      await interaction.editReply({ embeds: [makeEmbed("Failed to process the refund. Please try again or handle it in the Stripe dashboard.", COLORS.danger)] });
+      return;
+    }
+
+    let cancelFailed = false;
+    try {
+      const session = await this.sessionStore.getSession(review.customerId);
+      const cancelTarget = review.subscriptionId || session?.stripeCustomerId;
+      if (cancelTarget) {
+        await this.stripeClient.cancelSubscription(cancelTarget);
+      }
+    } catch (error) {
+      console.error("Stripe subscription cancel error:", error);
+      cancelFailed = true;
+    }
+
+    await this.sessionStore.resolvePendingChargeReview(thread.id, "APPROVED", member.id);
+
+    const amount = this.stripeClient.formatAmount(refund.amount, refund.currency);
+    await interaction.editReply({
+      content: `<@${review.customerId}>`,
+      embeds: [
+        new EmbedBuilder()
+          .setTitle(cancelFailed ? "Refund Approved" : "Refund Approved & Subscription Cancelled")
+          .setDescription(
+            `After manual review, your refund of **${amount}** has been approved and processed${cancelFailed ? "" : ", and your subscription has been cancelled"}.\n\n` +
+              `Refund ID: \`${refund.refundId}\`\n\n` +
+              (cancelFailed ? "We couldn't cancel your subscription automatically — a support member will take care of it shortly.\n\n" : "") +
+              `It may take 5-10 business days to appear on your statement.`
+          )
+          .setColor(0x57f287),
+      ],
+      allowedMentions: { users: [review.customerId] },
+    });
+
+    await this.notifyBillingAudit(interaction, {
+      action: "Refund (manual approval)",
+      outcome: `Approved by ${member.displayName}${cancelFailed ? " — ⚠️ subscription cancellation FAILED, manual action needed" : ", subscription cancelled"}`,
+      amountText: amount,
+      chargeId: review.chargeId,
+      customerId: review.customerId,
+    });
+
+    // Keep manual-follow-up threads open so staff actually handle the cancellation.
+    if (!cancelFailed) {
+      await this.closeTicketThread(interaction);
+    }
+  }
+
+  async denyBlockedCharge(interaction: ChatInputCommandInteraction, member: GuildMember): Promise<void> {
+    const thread = interaction.channel?.isThread() ? interaction.channel : null;
+    if (!thread) {
+      await interaction.reply({ embeds: [makeEmbed("Use this inside a refund ticket thread.", COLORS.warn)], flags: 64 });
+      return;
+    }
+
+    await interaction.deferReply();
+
+    const review = await this.findBlockedCharge(thread);
+    if (!review) {
+      await interaction.editReply({ embeds: [makeEmbed("No blocked charge is pending review in this ticket.", COLORS.warn)] });
+      return;
+    }
+
+    const reason = interaction.options.getString("reason")?.trim() || null;
+    await this.sessionStore.resolvePendingChargeReview(thread.id, "DENIED", member.id);
+
+    const amountText = this.stripeClient.formatAmount(review.amount, review.currency);
+    // The thread stays open so the conversation can continue; staff close it via /set-status.
+    await interaction.editReply({
+      content: `<@${review.customerId}>`,
+      embeds: [
+        makeEmbed(
+          `After manual review, we're unable to process this refund automatically.${reason ? `\n\n**Reason:** ${reason}` : ""}\n\nA support member can help you further here.`,
+          COLORS.warn
+        ),
+      ],
+      allowedMentions: { users: [review.customerId] },
+    });
+
+    await this.notifyBillingAudit(interaction, {
+      action: "Refund (manual review)",
+      outcome: `Denied by ${member.displayName}${reason ? ` — ${reason}` : ""}`,
+      amountText,
+      chargeId: review.chargeId,
+      customerId: review.customerId,
+    });
   }
 
   async handleCancelRefund(interaction: ButtonInteraction): Promise<void> {
@@ -522,7 +739,7 @@ export class BillingCategory extends BaseCategory {
   // StatusService so the Ticket row is marked closed too (it used to bypass the DB and
   // leave refund tickets open in reports forever). silent: the result embed already
   // explains the outcome, and self-service closures shouldn't trigger follow-up prompts.
-  private async closeTicketThread(interaction: ButtonInteraction): Promise<void> {
+  private async closeTicketThread(interaction: ButtonInteraction | ChatInputCommandInteraction): Promise<void> {
     const thread = interaction.channel;
     if (!thread?.isThread()) return;
 

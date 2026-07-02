@@ -113,6 +113,47 @@ export class SessionStore {
     });
   }
 
+  // ---- Blocked-charge manual reviews (staff /charge approve|deny) ----
+
+  // A retried self-service refund can trip a guardrail again in the same thread;
+  // upsert keeps the latest block as the pending one.
+  async createPendingChargeReview(data: {
+    threadId: string;
+    chargeId: string;
+    subscriptionId: string | null;
+    customerId: string;
+    amount: number;
+    currency: string;
+    reason: string;
+  }): Promise<void> {
+    await this.prisma.pendingChargeReview.upsert({
+      where: { threadId: data.threadId },
+      update: { ...data, status: "PENDING", reviewerId: null, resolvedAt: null },
+      create: data,
+    });
+  }
+
+  async getPendingChargeReview(threadId: string) {
+    return this.prisma.pendingChargeReview.findFirst({ where: { threadId, status: "PENDING" } });
+  }
+
+  // Any-status lookup: guards the message-based recovery of pre-feature blocks
+  // from resurrecting an already-resolved review.
+  async hasChargeReview(threadId: string): Promise<boolean> {
+    return (await this.prisma.pendingChargeReview.findUnique({ where: { threadId } })) !== null;
+  }
+
+  async resolvePendingChargeReview(
+    threadId: string,
+    status: "APPROVED" | "DENIED" | "ALREADY_PROCESSED",
+    reviewerId: string
+  ): Promise<void> {
+    await this.prisma.pendingChargeReview.updateMany({
+      where: { threadId, status: "PENDING" },
+      data: { status, reviewerId, resolvedAt: new Date() },
+    });
+  }
+
   async cleanExpiredPending(maxAgeMs: number = 10 * 60 * 1000): Promise<void> {
     const cutoff = new Date(Date.now() - maxAgeMs);
     await this.prisma.pendingAuth.deleteMany({

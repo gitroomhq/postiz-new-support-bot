@@ -34,6 +34,7 @@ import {
 } from "discord.js";
 import { BotConfig } from "../config";
 import { embed as makeEmbed, COLORS } from "../util/embeds";
+import { formatDuration } from "../util/format";
 import { SettingsStore, isUnicodeEmoji, ReminderTarget } from "../config/SettingsStore";
 import { CannedResponseStore, normalizeName } from "../config/CannedResponseStore";
 import { StatusTag } from "../generated/prisma/client";
@@ -45,6 +46,7 @@ import { GitHubClient } from "./GitHubClient";
 import { CategoryRegistry } from "./CategoryRegistry";
 import { TicketStore, ReconcileChanges } from "./TicketStore";
 import { StatusService, RESOLVED_EMOJI } from "./StatusService";
+import { AuditLogger } from "./AuditLogger";
 import { StatusReportService } from "./StatusReportService";
 import { CallbackServer } from "../server/CallbackServer";
 import { BillingCategory } from "../categories/BillingCategory";
@@ -83,7 +85,8 @@ export class DiscordBot {
     private githubClient: GitHubClient,
     private categoryRegistry: CategoryRegistry,
     private reportService: StatusReportService,
-    private cannedStore: CannedResponseStore
+    private cannedStore: CannedResponseStore,
+    private audit: AuditLogger
   ) {
     this.client = new Client({
       intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.GuildMembers],
@@ -156,9 +159,25 @@ export class DiscordBot {
         (member.permissions.has(PermissionFlagsBits.Administrator) ||
           (!!supportRoleId && member.roles.cache.has(supportRoleId)));
       if (isSupport) {
-        await this.ticketStore.setFirstResponse(ticket.threadId, message.createdAt).catch((e) => {
+        try {
+          await this.ticketStore.setFirstResponse(ticket.threadId, message.createdAt);
+          void this.audit.log({
+            title: "💬 First response",
+            severity: "success",
+            actor: member.displayName,
+            actorIconUrl: member.displayAvatarURL(),
+            threadId: ticket.threadId,
+            fields: [
+              {
+                name: "Response time",
+                value: formatDuration(message.createdAt.getTime() - ticket.createdAt.getTime()),
+                inline: true,
+              },
+            ],
+          });
+        } catch (e) {
           console.error("firstResponse stamp failed:", e);
-        });
+        }
       }
     }
 
@@ -251,6 +270,22 @@ export class DiscordBot {
       await this.handleNoteCommand(interaction);
     } else if (interaction.commandName === "canned") {
       await this.handleCannedCommand(interaction);
+    } else if (interaction.commandName === "charge") {
+      await this.handleChargeCommand(interaction);
+    }
+  }
+
+  // ---- /charge: staff resolution of guardrail-blocked self-service refunds ----
+
+  private async handleChargeCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+    const member = await this.requireSupportOrAdmin(interaction);
+    if (!member) return;
+
+    const billing = this.getBillingCategory();
+    if (interaction.options.getSubcommand() === "approve") {
+      await billing.approveBlockedCharge(interaction, member);
+    } else {
+      await billing.denyBlockedCharge(interaction, member);
     }
   }
 
@@ -283,6 +318,13 @@ export class DiscordBot {
         return;
       }
       await this.ticketStore.addNote(thread.id, member.id, member.displayName, text);
+      void this.audit.log({
+        title: "📝 Note added",
+        actor: member.displayName,
+        actorIconUrl: member.displayAvatarURL(),
+        threadId: thread.id,
+        fields: [{ name: "Note", value: text }],
+      });
       await interaction.reply({
         embeds: [makeEmbed("Staff note added. Only support/admins can read it via `/note list`.", COLORS.success)],
         flags: 64,
@@ -375,6 +417,15 @@ export class DiscordBot {
 
     try {
       const created = await this.cannedStore.add(name, content, personal ? interaction.user.id : null);
+      void this.audit.log({
+        title: "💬 Canned response added",
+        actor: interaction.user.displayName,
+        actorIconUrl: interaction.user.displayAvatarURL(),
+        fields: [
+          { name: "Name", value: `\`${created.name}\``, inline: true },
+          { name: "Scope", value: personal ? "personal" : "team", inline: true },
+        ],
+      });
       await interaction.reply({
         embeds: [
           makeEmbed(
@@ -414,6 +465,13 @@ export class DiscordBot {
       .setColor(COLORS.brand)
       .setAuthor({ name: `Sent by ${member.displayName}`, iconURL: member.displayAvatarURL() });
     await interaction.reply({ embeds: [embed] });
+    void this.audit.log({
+      title: "💬 Canned response used",
+      actor: member.displayName,
+      actorIconUrl: member.displayAvatarURL(),
+      threadId: channel.id,
+      fields: [{ name: "Name", value: `\`${canned.name}\``, inline: true }],
+    });
   }
 
   private async handleCannedDelete(interaction: ChatInputCommandInteraction, member: GuildMember): Promise<void> {
@@ -427,6 +485,16 @@ export class DiscordBot {
     }
 
     await this.cannedStore.remove(canned.id);
+    void this.audit.log({
+      title: "🗑️ Canned response deleted",
+      severity: "warn",
+      actor: member.displayName,
+      actorIconUrl: member.displayAvatarURL(),
+      fields: [
+        { name: "Name", value: `\`${canned.name}\``, inline: true },
+        { name: "Scope", value: canned.ownerId ? "personal" : "team", inline: true },
+      ],
+    });
     await interaction.reply({
       embeds: [makeEmbed(`Deleted ${canned.ownerId ? "your personal" : "the team"} canned response \`${canned.name}\`.`, COLORS.success)],
       flags: 64,
@@ -854,6 +922,17 @@ export class DiscordBot {
           statusTagId: initial.id,
           question: question ?? null,
         });
+        void this.audit.log({
+          title: "🎫 Ticket opened",
+          severity: "success",
+          actor: displayName,
+          threadId: thread.id,
+          fields: [
+            { name: "Customer", value: `<@${customerId}>`, inline: true },
+            { name: "Category", value: `${category.emoji} ${category.label}`, inline: true },
+            ...(question ? [{ name: "Question", value: question }] : []),
+          ],
+        });
       },
     };
   }
@@ -1037,6 +1116,17 @@ export class DiscordBot {
         this.settingsStore.githubRepo()
       );
 
+      void this.audit.log({
+        title: "🐙 GitHub issue created",
+        actor: interaction.user.displayName,
+        actorIconUrl: interaction.user.displayAvatarURL(),
+        threadId: interaction.channel?.isThread() ? interaction.channelId : undefined,
+        fields: [
+          { name: "Issue", value: issueUrl, inline: true },
+          { name: "Type", value: issueLabel, inline: true },
+        ],
+      });
+
       // Disable the button after use
       const disabledButton = new ButtonBuilder()
         .setCustomId(interaction.customId)
@@ -1092,6 +1182,14 @@ export class DiscordBot {
       return false;
     });
     if (recorded) {
+      void this.audit.log({
+        title: "⭐ CSAT rating",
+        severity: score >= 4 ? "success" : score === 3 ? "warn" : "danger",
+        actor: interaction.user.displayName,
+        actorIconUrl: interaction.user.displayAvatarURL(),
+        threadId,
+        fields: [{ name: "Score", value: `${score}/5 ⭐`, inline: true }],
+      });
       const doneRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
         new ButtonBuilder()
           .setCustomId("csat_done")
@@ -1120,6 +1218,16 @@ export class DiscordBot {
         await interaction.reply({ embeds: [makeEmbed("You've already left feedback for this ticket — thank you!", COLORS.warn)], flags: 64 });
         return;
       }
+      void this.audit.log({
+        title: "💬 CSAT comment",
+        actor: interaction.user.displayName,
+        actorIconUrl: interaction.user.displayAvatarURL(),
+        threadId,
+        fields: [
+          { name: "Score", value: `${ticket.csatScore}/5 ⭐`, inline: true },
+          { name: "Comment", value: comment },
+        ],
+      });
     }
     await interaction.reply({
       embeds: [makeEmbed(`Thanks for the feedback${comment ? " and the comment" : ""}! It helps us improve. ⭐`, COLORS.success)],
@@ -1149,6 +1257,16 @@ export class DiscordBot {
 
     const thread = channel?.isThread() ? (channel as ThreadChannel) : null;
     const ticket = thread ? await this.ticketStore.getByThreadId(thread.id) : null;
+
+    // The status change this triggers is audited separately by StatusService;
+    // this records the feedback signal itself.
+    void this.audit.log({
+      title: isPositive ? "👍 AI answer helped" : "👎 Escalated to support",
+      severity: isPositive ? "success" : "warn",
+      actor: interaction.user.displayName,
+      actorIconUrl: interaction.user.displayAvatarURL(),
+      threadId: thread?.id,
+    });
 
     if (isPositive) {
       const closing = this.settingsStore.closingTag();
@@ -1181,6 +1299,20 @@ export class DiscordBot {
 
   private isAdmin(interaction: ButtonInteraction | StringSelectMenuInteraction | RoleSelectMenuInteraction | ChannelSelectMenuInteraction | ChatInputCommandInteraction | ModalSubmitInteraction): boolean {
     return interaction.memberPermissions?.has(PermissionFlagsBits.Administrator) ?? false;
+  }
+
+  // One audit entry per admin config mutation, e.g. "AI solve → off".
+  private auditConfig(
+    interaction: { user: { displayName: string; displayAvatarURL(): string } },
+    change: string
+  ): void {
+    void this.audit.log({
+      title: "⚙️ Config updated",
+      severity: "neutral",
+      actor: interaction.user.displayName,
+      actorIconUrl: interaction.user.displayAvatarURL(),
+      fields: [{ name: "Change", value: change }],
+    });
   }
 
   private isValidTimezone(tz: string): boolean {
@@ -1318,6 +1450,14 @@ export class DiscordBot {
       customerDisplayName: customer.displayName,
       statusTagId: tag.id,
     });
+    void this.audit.log({
+      title: "📌 Ticket adopted",
+      threadId: thread.id,
+      fields: [
+        { name: "Customer", value: customer.id ? `<@${customer.id}>` : "unknown", inline: true },
+        { name: "Status", value: `${tag.emoji} ${tag.label}`, inline: true },
+      ],
+    });
     return this.ticketStore.getByThreadId(thread.id);
   }
 
@@ -1392,6 +1532,7 @@ export class DiscordBot {
               : "off"
           }`,
           `**Billing audit:** ${s.billingAuditChannelId() ? `<#${s.billingAuditChannelId()}>` : "_in-thread ping_"}`,
+          `**Audit log:** ${s.auditLogChannelId() ? `<#${s.auditLogChannelId()}>` : "off"}`,
           `**Ticket limits:** ${s.maxOpenTicketsPerUser() > 0 ? `max ${s.maxOpenTicketsPerUser()} open` : "no cap"} · ${s.ticketCooldownMinutes() > 0 ? `${s.ticketCooldownMinutes()}m cooldown` : "no cooldown"}`,
         ].join("\n")
       );
@@ -1402,6 +1543,7 @@ export class DiscordBot {
       new ButtonBuilder().setCustomId("config_tags").setLabel("Manage Tags").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("config_report").setLabel("Status Report").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("config_billing").setLabel("Billing").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("config_audit").setLabel("Audit Log").setStyle(ButtonStyle.Primary),
     ];
     const secondary = [
       new ButtonBuilder().setCustomId("config_reverify").setLabel("Re-Verify").setStyle(ButtonStyle.Secondary),
@@ -1458,6 +1600,37 @@ export class DiscordBot {
     const buttons = new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder().setCustomId("config_billing_limits").setLabel("Set Limits").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("config_billing_clear_channel").setLabel("Clear Channel").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("config_back_main").setLabel("Back").setStyle(ButtonStyle.Secondary)
+    );
+
+    return {
+      embeds: [embed],
+      components: [new ActionRowBuilder<ChannelSelectMenuBuilder>().addComponents(channelSelect), buttons],
+    };
+  }
+
+  private buildAuditPanel() {
+    const s = this.settingsStore;
+    const embed = new EmbedBuilder()
+      .setTitle("Audit Log")
+      .setColor(0x5865f2)
+      .setDescription(
+        [
+          `**Channel:** ${s.auditLogChannelId() ? `<#${s.auditLogChannelId()}>` : "_not set — audit trail disabled_"}`,
+          "",
+          "Every action is posted here: tickets opened/closed/resolved/reopened, status changes, staff notes, canned responses, CSAT ratings, reminders, GitHub issues, and config changes.",
+          "⚠️ Staff notes appear in this channel — make sure it is **staff-only**.",
+        ].join("\n")
+      );
+
+    const channelSelect = new ChannelSelectMenuBuilder()
+      .setCustomId("config_set_auditlogchannel")
+      .setPlaceholder("Audit log channel")
+      .addChannelTypes(ChannelType.GuildText);
+    if (s.auditLogChannelId()) channelSelect.setDefaultChannels(s.auditLogChannelId()!);
+
+    const buttons = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId("config_audit_clear_channel").setLabel("Clear Channel").setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId("config_back_main").setLabel("Back").setStyle(ButtonStyle.Secondary)
     );
 
@@ -1642,6 +1815,7 @@ export class DiscordBot {
 
     if (id === "config_toggle_ai") {
       await this.settingsStore.updateGeneral({ aiSolveEnabled: !this.settingsStore.aiSolveEnabled() });
+      this.auditConfig(interaction, `AI solve → ${this.settingsStore.aiSolveEnabled() ? "on" : "off"}`);
       await interaction.update(this.buildGeneralPanel());
       return;
     }
@@ -1668,7 +1842,27 @@ export class DiscordBot {
 
     if (id === "config_billing_clear_channel") {
       await this.settingsStore.updateBilling({ billingAuditChannelId: null });
+      this.auditConfig(interaction, "Billing audit channel → cleared");
       await interaction.update(this.buildBillingPanel());
+      return;
+    }
+
+    if (id === "config_audit") {
+      await interaction.update(this.buildAuditPanel());
+      return;
+    }
+
+    if (id === "config_audit_clear_channel") {
+      // Log before clearing so the "turned off" entry still reaches the channel.
+      await this.audit.log({
+        title: "⚙️ Config updated",
+        severity: "neutral",
+        actor: interaction.user.displayName,
+        actorIconUrl: interaction.user.displayAvatarURL(),
+        fields: [{ name: "Change", value: "Audit log channel → cleared (audit trail off)" }],
+      });
+      await this.settingsStore.updateGeneral({ auditLogChannelId: null });
+      await interaction.update(this.buildAuditPanel());
       return;
     }
 
@@ -1711,6 +1905,7 @@ export class DiscordBot {
 
     if (id === "config_report_toggle") {
       await this.settingsStore.updateReport({ reportEnabled: !this.settingsStore.reportEnabled() });
+      this.auditConfig(interaction, `Status report → ${this.settingsStore.reportEnabled() ? "on" : "off"}`);
       await interaction.update(this.buildReportPanel());
       return;
     }
@@ -1813,13 +2008,17 @@ export class DiscordBot {
 
     if (action === "config_tag_set_initial") {
       await this.settingsStore.editTag(tag.id, { isInitial: true });
+      this.auditConfig(interaction, `Status tag ${tag.emoji} ${tag.label} → set as initial`);
     } else if (action === "config_tag_toggle_closes") {
       await this.settingsStore.editTag(tag.id, { closesThread: !tag.closesThread });
+      this.auditConfig(interaction, `Status tag ${tag.emoji} ${tag.label} → closes thread: ${!tag.closesThread ? "on" : "off"}`);
     } else if (action === "config_tag_toggle_reminder") {
       await this.settingsStore.editTag(tag.id, { reminderEnabled: !tag.reminderEnabled });
+      this.auditConfig(interaction, `Status tag ${tag.emoji} ${tag.label} → reminders: ${!tag.reminderEnabled ? "on" : "off"}`);
     } else if (action === "config_tag_target") {
       const next: ReminderTarget = tag.reminderTarget === "CUSTOMER" ? "SUPPORT" : "CUSTOMER";
       await this.settingsStore.editTag(tag.id, { reminderTarget: next });
+      this.auditConfig(interaction, `Status tag ${tag.emoji} ${tag.label} → reminder target: ${next.toLowerCase()}`);
     } else if (action === "config_tag_edit_basic") {
       await interaction.showModal(this.buildTagModal(tag));
       return;
@@ -1890,6 +2089,7 @@ export class DiscordBot {
     if (interaction.customId === "config_repo_modal") {
       const repo = interaction.fields.getTextInputValue("repo").trim();
       await this.settingsStore.updateGeneral({ githubRepo: repo || null });
+      this.auditConfig(interaction, repo ? `GitHub repo → \`${repo}\`` : "GitHub repo → cleared");
       await interaction.reply({
         embeds: [makeEmbed(repo ? `GitHub repo set to \`${repo}\`.` : "GitHub repo cleared.", COLORS.success)],
         flags: 64,
@@ -1907,6 +2107,7 @@ export class DiscordBot {
         return;
       }
       await this.settingsStore.updateReport({ reportHour: hour, reportMinute: minute });
+      this.auditConfig(interaction, `Report time → ${this.formatReportTime(hour, minute)}`);
       await interaction.reply({
         embeds: [makeEmbed(`Status report will publish daily at ${this.formatReportTime(hour, minute)} (${this.settingsStore.reportTimezone()}).`, COLORS.success)],
         flags: 64,
@@ -1921,6 +2122,7 @@ export class DiscordBot {
         return;
       }
       await this.settingsStore.updateReport({ reportTimezone: tz });
+      this.auditConfig(interaction, `Report timezone → ${tz}`);
       await interaction.reply({ embeds: [makeEmbed(`Report timezone set to ${tz}.`, COLORS.success)], flags: 64 });
       return;
     }
@@ -1938,6 +2140,7 @@ export class DiscordBot {
         return;
       }
       await this.settingsStore.updateGeneral({ maxOpenTicketsPerUser: max, ticketCooldownMinutes: cooldown });
+      this.auditConfig(interaction, `Ticket limits → max ${max || "∞"} open, ${cooldown || "no"} min cooldown`);
       await interaction.reply({
         embeds: [
           makeEmbed(
@@ -1983,6 +2186,7 @@ export class DiscordBot {
         refundMaxPer24h: velocityNum,
         refundMinMemberAgeDays: memberAgeNum,
       });
+      this.auditConfig(interaction, "Refund guardrails updated");
       await interaction.reply({ embeds: [makeEmbed("Refund guardrails updated.", COLORS.success)], flags: 64 });
       return;
     }
@@ -1995,6 +2199,7 @@ export class DiscordBot {
         return;
       }
       await this.settingsStore.updateReport({ overdueThresholdDays: days });
+      this.auditConfig(interaction, `Overdue threshold → ${days} day(s)`);
       await interaction.reply({
         embeds: [makeEmbed(`Tickets now count as overdue after ${days} day(s).`, COLORS.success)],
         flags: 64,
@@ -2039,6 +2244,7 @@ export class DiscordBot {
           reminderTarget,
           autoCloseAfter,
         });
+        this.auditConfig(interaction, `Status tag added → ${emoji} ${label}`);
         await interaction.reply({ embeds: [makeEmbed(`Added ${emoji} ${label}.`, COLORS.success)], flags: 64 });
       } else if (interaction.customId.startsWith("config_tag_edit_modal:")) {
         const tagId = interaction.customId.split(":")[1];
@@ -2048,6 +2254,7 @@ export class DiscordBot {
           ...(reminderDays != null ? { reminderDays } : {}),
           autoCloseAfter,
         });
+        this.auditConfig(interaction, `Status tag edited → ${emoji} ${label}`);
         await interaction.reply({ embeds: [makeEmbed(`Updated ${emoji} ${label}.`, COLORS.success)], flags: 64 });
       }
     } catch (error) {
@@ -2058,7 +2265,9 @@ export class DiscordBot {
   private async handleTagDelete(interaction: ButtonInteraction, tagId: string): Promise<void> {
     await interaction.deferUpdate();
     try {
+      const tag = this.settingsStore.tagById(tagId);
       const { reassignedThreadIds, initial } = await this.settingsStore.removeTag(tagId);
+      if (tag) this.auditConfig(interaction, `Status tag deleted → ${tag.emoji} ${tag.label}`);
       // Rename reassigned threads to the initial tag's emoji (best-effort).
       for (const threadId of reassignedThreadIds) {
         const channel = await this.client.channels.fetch(threadId).catch(() => null);
@@ -2093,6 +2302,7 @@ export class DiscordBot {
       return;
     }
     await this.settingsStore.updateGeneral({ supportRoleId: interaction.values[0] });
+    this.auditConfig(interaction, `Support role → <@&${interaction.values[0]}>`);
     await interaction.update(this.buildGeneralPanel());
   }
 
@@ -2100,7 +2310,8 @@ export class DiscordBot {
     if (
       interaction.customId !== "config_set_channel" &&
       interaction.customId !== "config_set_reportchannel" &&
-      interaction.customId !== "config_set_billingauditchannel"
+      interaction.customId !== "config_set_billingauditchannel" &&
+      interaction.customId !== "config_set_auditlogchannel"
     )
       return;
     if (!this.isAdmin(interaction)) {
@@ -2109,15 +2320,25 @@ export class DiscordBot {
     }
     if (interaction.customId === "config_set_reportchannel") {
       await this.settingsStore.updateReport({ reportChannelId: interaction.values[0] });
+      this.auditConfig(interaction, `Report channel → <#${interaction.values[0]}>`);
       await interaction.update(this.buildReportPanel());
       return;
     }
     if (interaction.customId === "config_set_billingauditchannel") {
       await this.settingsStore.updateBilling({ billingAuditChannelId: interaction.values[0] });
+      this.auditConfig(interaction, `Billing audit channel → <#${interaction.values[0]}>`);
       await interaction.update(this.buildBillingPanel());
       return;
     }
+    if (interaction.customId === "config_set_auditlogchannel") {
+      await this.settingsStore.updateGeneral({ auditLogChannelId: interaction.values[0] });
+      // Naturally the first entry in the newly configured channel.
+      this.auditConfig(interaction, `Audit log channel → <#${interaction.values[0]}>`);
+      await interaction.update(this.buildAuditPanel());
+      return;
+    }
     await this.settingsStore.updateGeneral({ threadsChannelId: interaction.values[0] });
+    this.auditConfig(interaction, `Threads channel → <#${interaction.values[0]}>`);
     await interaction.update(this.buildGeneralPanel());
   }
 
@@ -2405,6 +2626,31 @@ export class DiscordBot {
                 description: "Template name",
                 required: true,
                 autocomplete: true,
+              },
+            ],
+          },
+        ],
+      },
+      {
+        name: "charge",
+        description: "Approve or deny a blocked self-service refund (support/admin only)",
+        options: [
+          {
+            type: 1, // SUB_COMMAND
+            name: "approve",
+            description: "Approve the blocked refund in this ticket and execute it",
+          },
+          {
+            type: 1, // SUB_COMMAND
+            name: "deny",
+            description: "Deny the blocked refund in this ticket",
+            options: [
+              {
+                type: 3, // STRING
+                name: "reason",
+                description: "Reason shown to the customer",
+                required: false,
+                max_length: 500,
               },
             ],
           },

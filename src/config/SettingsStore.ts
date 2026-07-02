@@ -151,6 +151,10 @@ export class SettingsStore {
     return this.settings.billingAuditChannelId;
   }
 
+  auditLogChannelId(): string | null {
+    return this.settings.auditLogChannelId;
+  }
+
   // null = guardrail disabled. Amount is in minor units of refundMaxAmountCurrency.
   refundMaxAmount(): number | null {
     return this.settings.refundMaxAmount;
@@ -203,6 +207,7 @@ export class SettingsStore {
     aiSolveEnabled?: boolean;
     maxOpenTicketsPerUser?: number;
     ticketCooldownMinutes?: number;
+    auditLogChannelId?: string | null;
   }): Promise<void> {
     this.settings = await this.prisma.botSettings.update({ where: { id: "global" }, data });
   }

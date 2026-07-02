@@ -29,6 +29,24 @@ model BillingAction {
   @@map("billing_actions")
 }
 
+// A self-service refund blocked by a guardrail, awaiting staff /charge approve|deny.
+model PendingChargeReview {
+  id             String    @id @default(cuid())
+  threadId       String    @unique
+  chargeId       String
+  subscriptionId String?
+  customerId     String
+  amount         Int
+  currency       String
+  reason         String
+  status         String    @default("PENDING") // PENDING | APPROVED | DENIED | ALREADY_PROCESSED
+  reviewerId     String?
+  resolvedAt     DateTime?
+  createdAt      DateTime  @default(now())
+
+  @@map("pending_charge_reviews")
+}
+
 model PendingAuth {
   id               String   @id @default(cuid())
   state            String   @unique
@@ -63,6 +81,7 @@ model BotSettings {
   refundMaxAmountCurrency String @default("usd")
   refundMaxPer24h     Int?
   refundMinMemberAgeDays Int?
+  auditLogChannelId   String?
   updatedAt           DateTime  @updatedAt
 
   @@map("bot_settings")

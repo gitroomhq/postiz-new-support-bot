@@ -1,16 +1,20 @@
 import { ActionRowBuilder, ButtonBuilder, ButtonStyle, ThreadChannel } from "discord.js";
 import { StatusTag } from "../generated/prisma/client";
 import { TicketStore } from "./TicketStore";
+import { AuditLogger } from "./AuditLogger";
 import { embed, COLORS } from "../util/embeds";
 
 export const RESOLVED_EMOJI = "✅";
 
 // The subset of a Ticket that applyStatus needs. csatPromptedAt gates the one-time
-// rating prompt; callers always pass full ticket rows, so this is type-only.
+// rating prompt, statusTag is the previous tag shown in the audit trail; callers
+// always pass full ticket rows, so this is type-only.
 export interface StatusTicket {
   threadId: string;
   customerId: string | null;
   csatPromptedAt?: Date | null;
+  closed?: boolean;
+  statusTag?: { emoji: string; label: string } | null;
 }
 
 export interface ApplyStatusOptions {
@@ -23,7 +27,10 @@ export class StatusService {
   // Serializes changes per thread so rapid updates don't interleave their messages.
   private chains = new Map<string, Promise<unknown>>();
 
-  constructor(private ticketStore: TicketStore) {}
+  constructor(
+    private ticketStore: TicketStore,
+    private audit: AuditLogger
+  ) {}
 
   async applyStatus(
     thread: ThreadChannel,
@@ -59,6 +66,9 @@ export class StatusService {
     // report (resolved counts alongside closed).
     const isResolved = tag.emoji === RESOLVED_EMOJI;
     const isDone = tag.closesThread || isResolved;
+    // Resolved tickets stay unarchived but are marked closed in the DB, so the
+    // reopen detection needs both signals.
+    const wasInactive = Boolean(thread.archived || thread.locked || ticket.closed);
 
     // Reopen when moving to an active status: unarchive first so it's editable, then unlock.
     if (!isDone && (thread.archived || thread.locked)) {
@@ -71,6 +81,28 @@ export class StatusService {
     await thread.setName(this.buildThreadName(thread.name, tag.emoji)).catch(() => {});
 
     await this.ticketStore.setStatus(ticket.threadId, tag.id, isDone);
+
+    // Audit trail — runs even for silent changes (bulk reassignment, member-left
+    // closes): the channel is the complete record, silent only mutes the thread.
+    const [title, severity]: [string, "info" | "success" | "warn" | "neutral"] =
+      tag.closesThread && options.actorName === "Automatic"
+        ? ["📁 Ticket auto-closed", "neutral"]
+        : tag.closesThread
+          ? ["📁 Ticket closed", "neutral"]
+          : isResolved
+            ? ["✅ Ticket resolved", "success"]
+            : wasInactive
+              ? ["🔓 Ticket reopened", "warn"]
+              : ["🔄 Status changed", "info"];
+    const prevTag = ticket.statusTag ? `${ticket.statusTag.emoji} ${ticket.statusTag.label}` : "—";
+    void this.audit.log({
+      title,
+      severity,
+      actor: options.actorName,
+      actorIconUrl: options.actorIconUrl,
+      threadId: ticket.threadId,
+      fields: [{ name: "Status", value: `${prevTag} → ${tag.emoji} ${tag.label}`, inline: true }],
+    });
 
     if (!options.silent) {
       const auditEmbed = embed(`Status changed to **${tag.emoji} ${tag.label}**`).setAuthor({

@@ -3,6 +3,7 @@ import { StatusTag } from "../generated/prisma/client";
 import { SettingsStore } from "../config/SettingsStore";
 import { TicketStore, TicketWithTag } from "./TicketStore";
 import { StatusService, RESOLVED_EMOJI } from "./StatusService";
+import { AuditLogger } from "./AuditLogger";
 import { embed, COLORS } from "../util/embeds";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -18,7 +19,8 @@ export class ReminderScheduler {
     private client: Client,
     private settings: SettingsStore,
     private ticketStore: TicketStore,
-    private statusService: StatusService
+    private statusService: StatusService,
+    private audit: AuditLogger
   ) {}
 
   start(): void {
@@ -146,6 +148,17 @@ export class ReminderScheduler {
     }
 
     await this.ticketStore.recordReminder(ticket.threadId);
+    void this.audit.log({
+      title: "⏰ Reminder sent",
+      severity: "warn",
+      actor: "Automatic",
+      threadId: ticket.threadId,
+      fields: [
+        { name: "Target", value: target.toLowerCase(), inline: true },
+        { name: "Status", value: `${tag.emoji} ${tag.label}`, inline: true },
+        { name: "Round", value: String(ticket.reminderCount + 1), inline: true },
+      ],
+    });
   }
 
   // Timestamp of the most recent message from the party we're waiting on; bot

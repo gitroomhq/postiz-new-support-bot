@@ -13,6 +13,7 @@ import { StripeClient } from "./bot/StripeClient";
 import { CategoryRegistry } from "./bot/CategoryRegistry";
 import { TicketStore } from "./bot/TicketStore";
 import { StatusService } from "./bot/StatusService";
+import { AuditLogger } from "./bot/AuditLogger";
 import { ReminderScheduler } from "./bot/ReminderScheduler";
 import { StatusReportService } from "./bot/StatusReportService";
 import { StatusReportScheduler } from "./bot/StatusReportScheduler";
@@ -37,7 +38,8 @@ async function main() {
   const cannedStore = new CannedResponseStore(prisma);
   await cannedStore.load();
   const ticketStore = new TicketStore(prisma);
-  const statusService = new StatusService(ticketStore);
+  const auditLogger = new AuditLogger(settingsStore);
+  const statusService = new StatusService(ticketStore, auditLogger);
   const oauthManager = new OAuthManager(config, sessionStore);
   const apiClient = new PostizApiClient(config);
   const claudeRunner = new ClaudeCodeRunner(process.cwd());
@@ -47,7 +49,7 @@ async function main() {
   const categoryRegistry = new CategoryRegistry()
     .register(new HowToCategory())
     .register(new BugsCategory())
-    .register(new BillingCategory(stripeClient, sessionStore, settingsStore, statusService, ticketStore));
+    .register(new BillingCategory(stripeClient, sessionStore, settingsStore, statusService, ticketStore, auditLogger));
 
   const reportService = new StatusReportService(settingsStore, ticketStore, categoryRegistry);
 
@@ -63,11 +65,14 @@ async function main() {
     githubClient,
     categoryRegistry,
     reportService,
-    cannedStore
+    cannedStore,
+    auditLogger
   );
+  // The client exists as soon as the constructor ran; nothing fires before login.
+  auditLogger.bindClient(bot.client);
   await bot.start();
 
-  const reminderScheduler = new ReminderScheduler(bot.client, settingsStore, ticketStore, statusService);
+  const reminderScheduler = new ReminderScheduler(bot.client, settingsStore, ticketStore, statusService, auditLogger);
   reminderScheduler.start();
 
   const statusReportScheduler = new StatusReportScheduler(bot.client, settingsStore, reportService);
