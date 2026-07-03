@@ -47,6 +47,7 @@ import { GitHubClient } from "./GitHubClient";
 import { CategoryRegistry } from "./CategoryRegistry";
 import { TicketStore, ReconcileChanges } from "./TicketStore";
 import { StatusService, RESOLVED_EMOJI } from "./StatusService";
+import { RECLOSE_DELAY_MS } from "./RecloseScheduler";
 import { AuditLogger } from "./AuditLogger";
 import { StatusReportService } from "./StatusReportService";
 import { CallbackServer } from "../server/CallbackServer";
@@ -177,6 +178,14 @@ export class DiscordBot {
           console.error("firstResponse stamp failed:", e);
         }
       }
+    }
+
+    // Activity in a Closed ticket (staff can post into locked threads; posting un-archives
+    // them): don't reopen, just re-close after 30 quiet minutes. Every message — customer
+    // or support — pushes the deadline back. Resolved (✅) is handled below instead.
+    if (ticket.closed && ticket.statusTag?.closesThread) {
+      await this.ticketStore.scheduleReclose(ticket.threadId, new Date(Date.now() + RECLOSE_DELAY_MS));
+      return;
     }
 
     // Only Resolved tickets are reopenable by a reply (Closed threads are locked).

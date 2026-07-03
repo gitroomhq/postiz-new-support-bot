@@ -96,7 +96,30 @@ export class TicketStore {
         reminderCount: 0,
         closed: isDone,
         closedAt: isDone ? new Date() : null,
+        // Any real status change supersedes a pending re-close: reopening cancels it,
+        // closing locks the thread right away anyway.
+        recloseAt: null,
       },
+    });
+  }
+
+  // ---- Re-close after activity in a closed ticket ----
+
+  // (Re)stamps the re-close deadline; called on every message, so the timer resets.
+  async scheduleReclose(threadId: string, at: Date): Promise<void> {
+    await this.prisma.ticket.update({ where: { threadId }, data: { recloseAt: at } });
+  }
+
+  async clearReclose(threadId: string): Promise<void> {
+    await this.prisma.ticket.update({ where: { threadId }, data: { recloseAt: null } });
+  }
+
+  // Closed tickets whose quiet period has elapsed. Guarded on closed + closesThread so a
+  // ticket that was properly reopened (or whose tag changed) never re-locks by accident.
+  async listRecloseDue(now: Date): Promise<TicketWithTag[]> {
+    return this.prisma.ticket.findMany({
+      where: { recloseAt: { lte: now }, closed: true, statusTag: { closesThread: true } },
+      include: { statusTag: true },
     });
   }
 

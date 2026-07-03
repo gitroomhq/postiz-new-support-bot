@@ -16,6 +16,7 @@ import { TicketStore } from "./bot/TicketStore";
 import { StatusService } from "./bot/StatusService";
 import { AuditLogger } from "./bot/AuditLogger";
 import { ReminderScheduler } from "./bot/ReminderScheduler";
+import { RecloseScheduler } from "./bot/RecloseScheduler";
 import { StatusReportService } from "./bot/StatusReportService";
 import { StatusReportScheduler } from "./bot/StatusReportScheduler";
 import { DiscordBot } from "./bot/DiscordBot";
@@ -85,6 +86,9 @@ async function main() {
   const statusReportScheduler = new StatusReportScheduler(bot.client, settingsStore, reportService);
   statusReportScheduler.start();
 
+  const recloseScheduler = new RecloseScheduler(bot.client, ticketStore, auditLogger);
+  recloseScheduler.start();
+
   // Clean expired pending auths every 5 minutes
   setInterval(() => sessionStore.cleanExpiredPending(), 5 * 60 * 1000);
 
@@ -93,6 +97,7 @@ async function main() {
     console.log("Shutting down...");
     reminderScheduler.stop();
     statusReportScheduler.stop();
+    recloseScheduler.stop();
     bot.client.destroy();
     await prisma.$disconnect();
     process.exit(0);

@@ -119,6 +119,9 @@ model Ticket {
   reminderCount       Int        @default(0)
   closed              Boolean    @default(false)
   closedAt            DateTime?
+  // When set, the re-close scheduler locks/archives the thread again at this time.
+  // Stamped (last message + 30m) whenever someone writes in an already-closed ticket.
+  recloseAt           DateTime?
   question            String?
   firstResponseAt     DateTime?
   csatScore           Int?
