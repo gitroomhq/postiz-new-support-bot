@@ -169,6 +169,7 @@ const STATEMENTS: string[] = [
   )`,
   `ALTER TABLE "tickets" ADD COLUMN IF NOT EXISTS "escalationTierId" TEXT`,
   `ALTER TABLE "tickets" ADD COLUMN IF NOT EXISTS "recloseAt" TIMESTAMP(3)`,
+  `ALTER TABLE "tickets" ADD COLUMN IF NOT EXISTS "prevStatusTagId" TEXT`,
   `DO $$
   BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'tickets_escalationTierId_fkey') THEN

@@ -188,6 +188,29 @@ export class DiscordBot {
       return;
     }
 
+    // The customer answered a Waiting-for-Customer ticket: put it back to the status it
+    // had before, so it re-enters the team's active queue instead of idling until a
+    // reminder fires. Falls back to the initial status when the previous one is unknown
+    // or unusable (deleted, closes the thread, resolved, or itself waiting-on-customer).
+    if (
+      !ticket.closed &&
+      ticket.statusTag?.reminderTarget === "CUSTOMER" &&
+      !ticket.statusTag.closesThread &&
+      ticket.statusTag.emoji !== RESOLVED_EMOJI &&
+      message.author.id === ticket.customerId
+    ) {
+      const prevTag = ticket.prevStatusTagId ? this.settingsStore.tagById(ticket.prevStatusTagId) : undefined;
+      const usablePrev =
+        prevTag && !prevTag.closesThread && prevTag.emoji !== RESOLVED_EMOJI && prevTag.reminderTarget !== "CUSTOMER";
+      const target = usablePrev ? prevTag : this.settingsStore.initialTag();
+      if (target && target.id !== ticket.statusTagId) {
+        await this.statusService.applyStatus(message.channel as ThreadChannel, ticket, target, {
+          actorName: "Customer reply",
+        });
+      }
+      return;
+    }
+
     // Only Resolved tickets are reopenable by a reply (Closed threads are locked).
     if (ticket.statusTag?.emoji !== RESOLVED_EMOJI) return;
     // Only the ticket's own customer reopens it — support/closing notes don't.

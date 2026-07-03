@@ -87,10 +87,18 @@ export class TicketStore {
   // (and the closed flag) so the status report can count "closed since X" accurately, and
   // clear them when a ticket is moved back to an active status.
   async setStatus(threadId: string, statusTagId: string, isDone: boolean): Promise<void> {
+    // Remember where the ticket came from (skipped when re-applying the same status, so
+    // the real previous status survives) — restores Waiting-for-Customer on reply.
+    const current = await this.prisma.ticket.findUnique({
+      where: { threadId },
+      select: { statusTagId: true },
+    });
+    const cameFrom = current?.statusTagId;
     await this.prisma.ticket.update({
       where: { threadId },
       data: {
         statusTagId,
+        ...(cameFrom && cameFrom !== statusTagId ? { prevStatusTagId: cameFrom } : {}),
         lastStatusChangeAt: new Date(),
         lastReminderAt: null,
         reminderCount: 0,

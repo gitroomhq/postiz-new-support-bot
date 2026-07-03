@@ -112,6 +112,10 @@ model Ticket {
   categoryId          String?
   statusTagId         String?
   statusTag           StatusTag? @relation(fields: [statusTagId], references: [id])
+  // Status the ticket had before the last status change (plain id, no FK — resolved via
+  // the SettingsStore cache). Used to restore a "Waiting for Customer" ticket when the
+  // customer replies.
+  prevStatusTagId     String?
   escalationTierId    String?
   escalationTier      EscalationTier? @relation(fields: [escalationTierId], references: [id])
   lastStatusChangeAt  DateTime   @default(now())
