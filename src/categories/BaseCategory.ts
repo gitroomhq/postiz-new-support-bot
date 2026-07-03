@@ -22,6 +22,9 @@ export interface TicketContext {
   staffPingRoleId: string | null;
   aiSolveEnabled: boolean;
   initialEmoji: string;
+  // Emoji of the initial priority, or null when none is configured (title then
+  // carries only the status emoji).
+  initialPriorityEmoji: string | null;
   // Per-user rate limiting. Returns a customer-facing rejection message, or null when
   // the user may open a ticket. Must run before any thread is created.
   guardTicketCreate: (userId: string, guild: Guild | null) => Promise<string | null>;
@@ -104,7 +107,7 @@ export abstract class BaseCategory {
     let thinkingMsg: Message | null = null;
     try {
       thread = await threadsChannel.threads.create({
-        name: `${ctx.initialEmoji} ${interaction.user.displayName} — ${this.label}`,
+        name: `${ctx.initialEmoji}${ctx.initialPriorityEmoji ? ` ${ctx.initialPriorityEmoji}` : ""} ${interaction.user.displayName} — ${this.label}`,
         type: ChannelType.PrivateThread,
         invitable: false,
       });

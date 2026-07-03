@@ -103,6 +103,17 @@ model StatusTag {
   @@map("status_tags")
 }
 
+model PriorityTag {
+  id        String   @id @default(cuid())
+  emoji     String   @unique
+  label     String
+  isInitial Boolean  @default(false)
+  sortOrder Int      @default(0)
+  tickets   Ticket[]
+
+  @@map("priority_tags")
+}
+
 model Ticket {
   id                  String     @id @default(cuid())
   threadId            String     @unique
@@ -116,6 +127,8 @@ model Ticket {
   // the SettingsStore cache). Used to restore a "Waiting for Customer" ticket when the
   // customer replies.
   prevStatusTagId     String?
+  priorityTagId       String?
+  priorityTag         PriorityTag? @relation(fields: [priorityTagId], references: [id])
   escalationTierId    String?
   escalationTier      EscalationTier? @relation(fields: [escalationTierId], references: [id])
   lastStatusChangeAt  DateTime   @default(now())
@@ -147,6 +160,24 @@ model TicketNote {
 
   @@index([ticketThreadId])
   @@map("ticket_notes")
+}
+
+// Append-only status/priority change history. Emoji+label are snapshotted as text
+// so history survives tag edits and deletions.
+model TicketTagChange {
+  id             String   @id @default(cuid())
+  ticketThreadId String
+  kind           String   // "STATUS" | "PRIORITY"
+  fromEmoji      String?
+  fromLabel      String?
+  toEmoji        String
+  toLabel        String
+  actorId        String?
+  actorName      String
+  createdAt      DateTime @default(now())
+
+  @@index([ticketThreadId, kind])
+  @@map("ticket_tag_changes")
 }
 
 // Ordered staff ladder (position 0 = lowest tier). Tier 0 gets new-ticket pings

@@ -161,7 +161,7 @@ export class BillingCategory extends BaseCategory {
 
       // Create a private thread for this refund conversation
       const thread = await threadsChannel.threads.create({
-        name: `${ctx.initialEmoji} ${interaction.user.displayName} — Refund Request`,
+        name: `${ctx.initialEmoji}${ctx.initialPriorityEmoji ? ` ${ctx.initialPriorityEmoji}` : ""} ${interaction.user.displayName} — Refund Request`,
         type: ChannelType.PrivateThread,
         invitable: false,
       });
@@ -717,7 +717,7 @@ export class BillingCategory extends BaseCategory {
     await this.sessionStore.resolvePendingChargeReview(thread.id, "DENIED", member.id);
 
     const amountText = this.stripeClient.formatAmount(review.amount, review.currency);
-    // The thread stays open so the conversation can continue; staff close it via /set-status.
+    // The thread stays open so the conversation can continue; staff close it via /status set.
     await interaction.editReply({
       content: `<@${review.customerId}>`,
       embeds: [

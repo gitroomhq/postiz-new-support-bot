@@ -1,11 +1,14 @@
-import { PrismaClient, Ticket, StatusTag, TicketNote } from "../generated/prisma/client";
+import { PrismaClient, Ticket, StatusTag, TicketNote, TicketTagChange } from "../generated/prisma/client";
 
 export type TicketWithTag = Ticket & { statusTag: StatusTag | null };
+
+export type TagChangeKind = "STATUS" | "PRIORITY";
 
 export interface CreateTicketInput {
   threadId: string;
   channelId: string;
   statusTagId: string;
+  priorityTagId?: string | null;
   customerId?: string | null;
   customerDisplayName?: string | null;
   categoryId?: string | null;
@@ -37,6 +40,7 @@ export class TicketStore {
         threadId: input.threadId,
         channelId: input.channelId,
         statusTagId: input.statusTagId,
+        priorityTagId: input.priorityTagId ?? null,
         customerId: input.customerId ?? null,
         customerDisplayName: input.customerDisplayName ?? null,
         categoryId: input.categoryId ?? null,
@@ -136,6 +140,12 @@ export class TicketStore {
     await this.prisma.ticket.update({ where: { threadId }, data: { escalationTierId } });
   }
 
+  // Priority is a pure label: unlike setStatus it never touches reminder cadence,
+  // closed state, or the re-close timer.
+  async setPriority(threadId: string, priorityTagId: string): Promise<void> {
+    await this.prisma.ticket.update({ where: { threadId }, data: { priorityTagId } });
+  }
+
   async recordReminder(threadId: string): Promise<void> {
     await this.prisma.ticket.update({
       where: { threadId },
@@ -184,6 +194,7 @@ export class TicketStore {
     filters: {
       categoryId?: string;
       statusTagId?: string;
+      priorityTagId?: string;
       closed?: boolean;
       customerIds?: string[];
       text?: string;
@@ -196,6 +207,7 @@ export class TicketStore {
     const where: {
       categoryId?: string;
       statusTagId?: string;
+      priorityTagId?: string;
       closed?: boolean;
       customerId?: { in: string[] };
       OR?: object[];
@@ -203,6 +215,7 @@ export class TicketStore {
     } = {};
     if (filters.categoryId) where.categoryId = filters.categoryId;
     if (filters.statusTagId) where.statusTagId = filters.statusTagId;
+    if (filters.priorityTagId) where.priorityTagId = filters.priorityTagId;
     if (filters.closed !== undefined) where.closed = filters.closed;
     if (filters.customerIds) where.customerId = { in: filters.customerIds };
     if (filters.text) {
@@ -376,6 +389,42 @@ export class TicketStore {
   async listNotes(ticketThreadId: string, limit = 15): Promise<TicketNote[]> {
     return this.prisma.ticketNote.findMany({
       where: { ticketThreadId },
+      orderBy: { createdAt: "desc" },
+      take: limit,
+    });
+  }
+
+  // ---- Status/priority change history ----
+  // Emoji+label are snapshotted as text so /status history and /priority history
+  // survive tag edits and deletions.
+
+  async addTagChange(input: {
+    ticketThreadId: string;
+    kind: TagChangeKind;
+    fromEmoji?: string | null;
+    fromLabel?: string | null;
+    toEmoji: string;
+    toLabel: string;
+    actorId?: string | null;
+    actorName: string;
+  }): Promise<void> {
+    await this.prisma.ticketTagChange.create({
+      data: {
+        ticketThreadId: input.ticketThreadId,
+        kind: input.kind,
+        fromEmoji: input.fromEmoji ?? null,
+        fromLabel: input.fromLabel ?? null,
+        toEmoji: input.toEmoji,
+        toLabel: input.toLabel,
+        actorId: input.actorId ?? null,
+        actorName: input.actorName,
+      },
+    });
+  }
+
+  async listTagChanges(ticketThreadId: string, kind: TagChangeKind, limit = 15): Promise<TicketTagChange[]> {
+    return this.prisma.ticketTagChange.findMany({
+      where: { ticketThreadId, kind },
       orderBy: { createdAt: "desc" },
       take: limit,
     });

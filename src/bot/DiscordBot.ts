@@ -37,7 +37,8 @@ import { embed as makeEmbed, COLORS } from "../util/embeds";
 import { formatDuration } from "../util/format";
 import { SettingsStore, isUnicodeEmoji, ReminderTarget } from "../config/SettingsStore";
 import { CannedResponseStore, normalizeName } from "../config/CannedResponseStore";
-import { EscalationTier, StatusTag } from "../generated/prisma/client";
+import { EscalationTier, StatusTag, PriorityTag } from "../generated/prisma/client";
+import { applyTitleEmojis } from "../util/threadTitle";
 import { EscalationTierStore } from "../config/EscalationTierStore";
 import { SessionStore } from "../auth/SessionStore";
 import { OAuthManager } from "../auth/OAuthManager";
@@ -57,6 +58,7 @@ import { BaseCategory, TicketContext } from "../categories/BaseCategory";
 type TicketSearchFilters = {
   categoryId?: string;
   statusTagId?: string;
+  priorityTagId?: string;
   closed?: boolean;
   customerIds?: string[];
   text?: string;
@@ -290,8 +292,10 @@ export class DiscordBot {
       await this.postSupportPanel(interaction);
     } else if (interaction.commandName === "config") {
       await this.handleConfigCommand(interaction);
-    } else if (interaction.commandName === "set-status") {
-      await this.handleSetStatusCommand(interaction);
+    } else if (interaction.commandName === "status") {
+      await this.handleStatusCommand(interaction);
+    } else if (interaction.commandName === "priority") {
+      await this.handlePriorityCommand(interaction);
     } else if (interaction.commandName === "report") {
       await this.handleReportCommand(interaction);
     } else if (interaction.commandName === "search-tickets") {
@@ -696,7 +700,7 @@ export class DiscordBot {
         .slice(0, 25)
         .map((c) => ({ name: `${c.name}${c.ownerId ? " (only you)" : ""}`, value: c.id }));
     } else if (
-      (interaction.commandName === "search-tickets" || interaction.commandName === "set-status") &&
+      (interaction.commandName === "search-tickets" || interaction.commandName === "status") &&
       focused.name === "status"
     ) {
       choices = this.settingsStore
@@ -704,6 +708,15 @@ export class DiscordBot {
         .filter((t) => t.label.toLowerCase().includes(query))
         .slice(0, 25)
         .map((t) => ({ name: `${t.emoji} ${t.label}`, value: t.id }));
+    } else if (
+      (interaction.commandName === "search-tickets" || interaction.commandName === "priority") &&
+      focused.name === "priority"
+    ) {
+      choices = this.settingsStore
+        .priorities()
+        .filter((p) => p.label.toLowerCase().includes(query))
+        .slice(0, 25)
+        .map((p) => ({ name: `${p.emoji} ${p.label}`, value: p.id }));
     } else if (interaction.commandName === "escalate" && focused.name === "tier") {
       choices = this.tierStore
         .list()
@@ -727,6 +740,7 @@ export class DiscordBot {
 
     const type = interaction.options.getString("type");
     const statusTagId = interaction.options.getString("status");
+    const priorityTagId = interaction.options.getString("priority");
     const state = interaction.options.getString("state");
     const user = interaction.options.getUser("user");
     const postizId = interaction.options.getString("postiz_id");
@@ -775,6 +789,7 @@ export class DiscordBot {
     const filters: TicketSearchFilters = {
       categoryId: type ?? undefined,
       statusTagId: statusTagId ?? undefined,
+      priorityTagId: priorityTagId ?? undefined,
       closed: state === "open" ? false : state === "closed" ? true : undefined,
       customerIds,
       text: text?.trim() || undefined,
@@ -821,6 +836,8 @@ export class DiscordBot {
 
     const lines = tickets.map((t) => {
       const status = t.statusTag ? `${t.statusTag.emoji} ${t.statusTag.label}` : "—";
+      const priorityTag = t.priorityTagId ? this.settingsStore.priorityById(t.priorityTagId) : undefined;
+      const priority = priorityTag ? ` · ${priorityTag.emoji} ${priorityTag.label}` : "";
       const category = t.categoryId ? categoryLabels.get(t.categoryId) ?? t.categoryId : "—";
       const who = t.customerId ? `<@${t.customerId}>` : t.customerDisplayName ?? "unknown user";
       const session = t.customerId ? sessionByDiscordId.get(t.customerId) : undefined;
@@ -833,7 +850,7 @@ export class DiscordBot {
         filters.text && t.question
           ? `\n> ${t.question.replace(/\s+/g, " ").slice(0, 80)}${t.question.length > 80 ? "…" : ""}`
           : "";
-      return `${status} — <#${t.threadId}> — ${category}\n${who}${postiz}${stripe} · ${created}${closedMark}${snippet}`;
+      return `${status}${priority} — <#${t.threadId}> — ${category}\n${who}${postiz}${stripe} · ${created}${closedMark}${snippet}`;
     });
 
     const embed = new EmbedBuilder()
@@ -953,6 +970,14 @@ export class DiscordBot {
       await this.handleSetStatusCancel(interaction);
       return;
     }
+    if (interaction.customId.startsWith("setpriority_confirm:")) {
+      await this.handleSetPriorityConfirm(interaction);
+      return;
+    }
+    if (interaction.customId === "setpriority_cancel") {
+      await this.handleSetPriorityCancel(interaction);
+      return;
+    }
 
     if (
       interaction.customId.startsWith("billing_accept_discount:") ||
@@ -1053,10 +1078,12 @@ export class DiscordBot {
 
   private buildTicketContext(category: BaseCategory): TicketContext {
     const initial = this.settingsStore.initialTag();
+    const initialPriority = this.settingsStore.initialPriority();
     return {
       staffPingRoleId: this.tierStore.newTicketRoleId(this.settingsStore.supportRoleId()),
       aiSolveEnabled: this.settingsStore.aiSolveEnabled(),
       initialEmoji: initial?.emoji ?? "🟢",
+      initialPriorityEmoji: initialPriority?.emoji ?? null,
       guardTicketCreate: (userId, guild) => this.ticketCreationBlockReason(userId, guild),
       onTicketCreated: async (thread, customerId, displayName, question) => {
         if (!initial) return;
@@ -1067,6 +1094,7 @@ export class DiscordBot {
           customerDisplayName: displayName,
           categoryId: category.id,
           statusTagId: initial.id,
+          priorityTagId: initialPriority?.id ?? null,
           question: question ?? null,
         });
         void this.audit.log({
@@ -1122,6 +1150,11 @@ export class DiscordBot {
   private async handleSelectMenu(interaction: StringSelectMenuInteraction): Promise<void> {
     if (interaction.customId === "config_tag_pick") {
       await this.handleConfigTagPick(interaction);
+      return;
+    }
+
+    if (interaction.customId === "config_priority_pick") {
+      await this.handleConfigPriorityPick(interaction);
       return;
     }
 
@@ -1497,28 +1530,41 @@ export class DiscordBot {
     return member;
   }
 
-  // ---- /set-status ----
+  // ---- /status & /priority (set | history) ----
 
-  private async handleSetStatusCommand(interaction: ChatInputCommandInteraction): Promise<void> {
-    const member = await this.requireSupportOrAdmin(interaction);
-    if (!member) return;
-
+  // Shared preamble for both commands: must run inside a tracked ticket thread,
+  // adopting a previously-untracked bot-created support thread on the way.
+  private async resolveTicketThread(
+    interaction: ChatInputCommandInteraction
+  ): Promise<ThreadChannel | null> {
     const channel = interaction.channel ?? (await this.client.channels.fetch(interaction.channelId).catch(() => null));
     if (!channel?.isThread()) {
       await interaction.reply({ embeds: [makeEmbed("Use this inside a ticket thread.", COLORS.warn)], flags: 64 });
-      return;
+      return null;
     }
     const thread = channel as ThreadChannel;
 
-    let ticket = await this.ticketStore.getByThreadId(thread.id);
+    const ticket = await this.ticketStore.getByThreadId(thread.id);
     if (!ticket) {
-      // Adopt a previously-untracked bot-created support thread.
       const adopted = await this.adoptThread(thread);
       if (!adopted) {
         await interaction.reply({ embeds: [makeEmbed("This thread isn't a tracked support ticket.", COLORS.warn)], flags: 64 });
-        return;
+        return null;
       }
-      ticket = adopted;
+    }
+    return thread;
+  }
+
+  private async handleStatusCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+    const member = await this.requireSupportOrAdmin(interaction);
+    if (!member) return;
+
+    const thread = await this.resolveTicketThread(interaction);
+    if (!thread) return;
+
+    if (interaction.options.getSubcommand() === "history") {
+      await this.replyTagHistory(interaction, thread.id, "STATUS", "Status");
+      return;
     }
 
     // Status is chosen as an autocompleted command option; confirm before applying.
@@ -1540,6 +1586,62 @@ export class DiscordBot {
     });
   }
 
+  private async handlePriorityCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+    const member = await this.requireSupportOrAdmin(interaction);
+    if (!member) return;
+
+    const thread = await this.resolveTicketThread(interaction);
+    if (!thread) return;
+
+    if (interaction.options.getSubcommand() === "history") {
+      await this.replyTagHistory(interaction, thread.id, "PRIORITY", "Priority");
+      return;
+    }
+
+    const priorityId = interaction.options.getString("priority", true);
+    const priority = this.settingsStore.priorityById(priorityId);
+    if (!priority) {
+      await interaction.reply({ embeds: [makeEmbed("Unknown priority — pick one from the list.", COLORS.warn)], flags: 64 });
+      return;
+    }
+
+    const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId(`setpriority_confirm:${priority.id}`).setLabel("Confirm").setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId("setpriority_cancel").setLabel("Cancel").setStyle(ButtonStyle.Secondary)
+    );
+    await interaction.reply({
+      embeds: [makeEmbed(`Set this ticket's priority to **${priority.emoji} ${priority.label}**?`)],
+      components: [row],
+      flags: 64,
+    });
+  }
+
+  // Ephemeral changelog backing /status history and /priority history.
+  private async replyTagHistory(
+    interaction: ChatInputCommandInteraction,
+    threadId: string,
+    kind: "STATUS" | "PRIORITY",
+    noun: string
+  ): Promise<void> {
+    const changes = await this.ticketStore.listTagChanges(threadId, kind);
+    if (changes.length === 0) {
+      await interaction.reply({
+        embeds: [makeEmbed(`No ${noun.toLowerCase()} changes recorded on this ticket yet.`, COLORS.neutral)],
+        flags: 64,
+      });
+      return;
+    }
+    const lines = changes.map((c) => {
+      const from = c.fromEmoji ? `${c.fromEmoji} ${c.fromLabel}` : "—";
+      return `**${c.actorName}** <t:${Math.floor(c.createdAt.getTime() / 1000)}:R>\n${from} → ${c.toEmoji} ${c.toLabel}`;
+    });
+    const embed = new EmbedBuilder()
+      .setTitle(`${noun} history — ${changes.length} most recent`)
+      .setColor(COLORS.brand)
+      .setDescription(lines.join("\n\n").slice(0, 4096));
+    await interaction.reply({ embeds: [embed], flags: 64 });
+  }
+
   private async handleSetStatusConfirm(interaction: ButtonInteraction): Promise<void> {
     const member = await this.requireSupportOrAdmin(interaction);
     if (!member) return;
@@ -1556,7 +1658,7 @@ export class DiscordBot {
     const ticket = await this.ticketStore.getByThreadId(thread.id);
     if (!tag || !ticket) {
       await interaction.reply({
-        embeds: [makeEmbed("Couldn't apply that status — this thread isn't tracked yet. Run /set-status again.", COLORS.warn)],
+        embeds: [makeEmbed("Couldn't apply that status — this thread isn't tracked yet. Run /status set again.", COLORS.warn)],
         flags: 64,
       });
       return;
@@ -1567,13 +1669,14 @@ export class DiscordBot {
       await this.statusService.applyStatus(thread, ticket, tag, {
         actorName: member.displayName,
         actorIconUrl: member.displayAvatarURL(),
+        actorId: member.id,
       });
       await interaction.editReply({
         embeds: [makeEmbed(`Status set to ${tag.emoji} ${tag.label}.`, COLORS.success)],
         components: [],
       });
     } catch (error) {
-      console.error("set-status apply failed:", error);
+      console.error("status set apply failed:", error);
       await interaction.editReply({
         embeds: [makeEmbed("Something went wrong applying that status.", COLORS.danger)],
         components: [],
@@ -1583,6 +1686,51 @@ export class DiscordBot {
 
   private async handleSetStatusCancel(interaction: ButtonInteraction): Promise<void> {
     await interaction.update({ embeds: [makeEmbed("Status change cancelled.", COLORS.neutral)], components: [] });
+  }
+
+  private async handleSetPriorityConfirm(interaction: ButtonInteraction): Promise<void> {
+    const member = await this.requireSupportOrAdmin(interaction);
+    if (!member) return;
+
+    const channel = interaction.channel ?? (await this.client.channels.fetch(interaction.channelId).catch(() => null));
+    if (!channel?.isThread()) {
+      await interaction.reply({ embeds: [makeEmbed("This can only be used inside a ticket thread.", COLORS.warn)], flags: 64 });
+      return;
+    }
+    const thread = channel as ThreadChannel;
+
+    const priority = this.settingsStore.priorityById(interaction.customId.split(":")[1]);
+    const ticket = await this.ticketStore.getByThreadId(thread.id);
+    if (!priority || !ticket) {
+      await interaction.reply({
+        embeds: [makeEmbed("Couldn't apply that priority — this thread isn't tracked yet. Run /priority set again.", COLORS.warn)],
+        flags: 64,
+      });
+      return;
+    }
+
+    await interaction.deferUpdate();
+    try {
+      await this.statusService.applyPriority(thread, ticket, priority, {
+        actorName: member.displayName,
+        actorIconUrl: member.displayAvatarURL(),
+        actorId: member.id,
+      });
+      await interaction.editReply({
+        embeds: [makeEmbed(`Priority set to ${priority.emoji} ${priority.label}.`, COLORS.success)],
+        components: [],
+      });
+    } catch (error) {
+      console.error("priority set apply failed:", error);
+      await interaction.editReply({
+        embeds: [makeEmbed("Something went wrong applying that priority.", COLORS.danger)],
+        components: [],
+      });
+    }
+  }
+
+  private async handleSetPriorityCancel(interaction: ButtonInteraction): Promise<void> {
+    await interaction.update({ embeds: [makeEmbed("Priority change cancelled.", COLORS.neutral)], components: [] });
   }
 
   private async adoptThread(thread: ThreadChannel) {
@@ -1684,6 +1832,7 @@ export class DiscordBot {
           `**GitHub repo:** ${s.githubRepo() ? `\`${s.githubRepo()}\`` : "_not set_"}`,
           `**AI solve:** ${s.aiSolveEnabled() ? "on" : "off"}`,
           `**Status tags:** ${s.tags().length}`,
+          `**Priorities:** ${s.priorities().length}`,
           `**Status report:** ${
             s.reportEnabled() && s.reportChannelId()
               ? `${s.reportHour() != null && s.reportMinute() != null ? `daily at ${this.formatReportTime(s.reportHour()!, s.reportMinute()!)} (${s.reportTimezone()})` : `every ${s.reportIntervalHours()}h`} → <#${s.reportChannelId()}>`
@@ -1704,6 +1853,7 @@ export class DiscordBot {
       new ButtonBuilder().setCustomId("config_audit").setLabel("Audit Log").setStyle(ButtonStyle.Primary),
     ];
     const secondary = [
+      new ButtonBuilder().setCustomId("config_priorities").setLabel("Manage Priorities").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("config_escalation").setLabel("Escalation").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("config_reverify").setLabel("Re-Verify").setStyle(ButtonStyle.Secondary),
     ];
@@ -1943,6 +2093,75 @@ export class DiscordBot {
     );
 
     return { embeds: [embed], components: [toggles, actions] };
+  }
+
+  private buildPrioritiesPanel() {
+    const priorities = this.settingsStore.priorities();
+    const embed = new EmbedBuilder()
+      .setTitle("Priorities")
+      .setColor(0x5865f2)
+      .setDescription(
+        priorities.length
+          ? priorities.map((p) => `${p.emoji} **${p.label}**${p.isInitial ? " (initial)" : ""}`).join("\n")
+          : "_No priorities yet._"
+      )
+      .setFooter({ text: "The initial priority is applied to new tickets. Change a ticket's priority with /priority set." });
+
+    const components: ActionRowBuilder<any>[] = [];
+    if (priorities.length) {
+      const pick = new StringSelectMenuBuilder()
+        .setCustomId("config_priority_pick")
+        .setPlaceholder("Edit a priority")
+        .addOptions(priorities.map((p) => ({ label: p.label, value: p.id, emoji: p.emoji })));
+      components.push(new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(pick));
+    }
+    components.push(
+      new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder().setCustomId("config_priority_add").setLabel("Add Priority").setStyle(ButtonStyle.Success),
+        new ButtonBuilder().setCustomId("config_back_main").setLabel("Back").setStyle(ButtonStyle.Secondary)
+      )
+    );
+
+    return { embeds: [embed], components };
+  }
+
+  private buildPriorityEditPanel(priority: PriorityTag) {
+    const embed = new EmbedBuilder()
+      .setTitle(`Edit ${priority.emoji} ${priority.label}`)
+      .setColor(0x5865f2)
+      .setDescription(`**Initial:** ${priority.isInitial ? "yes" : "no"}`);
+
+    const actions = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`config_priority_set_initial:${priority.id}`)
+        .setLabel(priority.isInitial ? "Initial ✓" : "Set as Initial")
+        .setStyle(priority.isInitial ? ButtonStyle.Success : ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId(`config_priority_edit_basic:${priority.id}`).setLabel("Edit emoji/label").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId(`config_priority_delete:${priority.id}`).setLabel("Delete").setStyle(ButtonStyle.Danger),
+      new ButtonBuilder().setCustomId("config_priorities").setLabel("Back").setStyle(ButtonStyle.Secondary)
+    );
+
+    return { embeds: [embed], components: [actions] };
+  }
+
+  private buildPriorityModal(priority?: PriorityTag): ModalBuilder {
+    const modal = new ModalBuilder()
+      .setCustomId(priority ? `config_priority_edit_modal:${priority.id}` : "config_priority_add_modal")
+      .setTitle(priority ? "Edit Priority" : "Add Priority");
+
+    const emoji = new TextInputBuilder().setCustomId("emoji").setLabel("Emoji").setStyle(TextInputStyle.Short).setRequired(true);
+    const label = new TextInputBuilder().setCustomId("label").setLabel("Label").setStyle(TextInputStyle.Short).setRequired(true);
+
+    if (priority) {
+      emoji.setValue(priority.emoji);
+      label.setValue(priority.label);
+    }
+
+    modal.addComponents(
+      new ActionRowBuilder<TextInputBuilder>().addComponents(emoji),
+      new ActionRowBuilder<TextInputBuilder>().addComponents(label)
+    );
+    return modal;
   }
 
   private buildEscalationPanel() {
@@ -2205,6 +2424,16 @@ export class DiscordBot {
       return;
     }
 
+    if (id === "config_priorities") {
+      await interaction.update(this.buildPrioritiesPanel());
+      return;
+    }
+
+    if (id === "config_priority_add") {
+      await interaction.showModal(this.buildPriorityModal());
+      return;
+    }
+
     if (id === "config_escalation") {
       await interaction.update(this.buildEscalationPanel());
       return;
@@ -2243,6 +2472,34 @@ export class DiscordBot {
         await this.tierStore.remove(tier.id);
         this.auditConfig(interaction, `Escalation tier deleted → ${tier.name}`);
         await interaction.update(this.buildEscalationPanel());
+        return;
+      }
+      return;
+    }
+
+    // Priority-scoped buttons: customId is `config_priority_<action>:<priorityId>`.
+    // Must be handled before the tag fallthrough below, which split(":")-parses
+    // any remaining id as a tag action.
+    if (id.startsWith("config_priority_")) {
+      const [priorityAction, priorityId] = id.split(":");
+      const priority = priorityId ? this.settingsStore.priorityById(priorityId) : undefined;
+      if (!priority) {
+        await interaction.update(this.buildPrioritiesPanel());
+        return;
+      }
+      if (priorityAction === "config_priority_set_initial") {
+        await this.settingsStore.editPriority(priority.id, { isInitial: true });
+        this.auditConfig(interaction, `Priority ${priority.emoji} ${priority.label} → set as initial`);
+        const updated = this.settingsStore.priorityById(priority.id);
+        await interaction.update(updated ? this.buildPriorityEditPanel(updated) : this.buildPrioritiesPanel());
+        return;
+      }
+      if (priorityAction === "config_priority_edit_basic") {
+        await interaction.showModal(this.buildPriorityModal(priority));
+        return;
+      }
+      if (priorityAction === "config_priority_delete") {
+        await this.handlePriorityDelete(interaction, priority.id);
         return;
       }
       return;
@@ -2475,6 +2732,36 @@ export class DiscordBot {
       return;
     }
 
+    // Priority modals only carry emoji + label — handle them before the tag-modal
+    // parse below, which reads fields (days/autoclose) they don't have.
+    if (interaction.customId === "config_priority_add_modal" || interaction.customId.startsWith("config_priority_edit_modal:")) {
+      const emoji = interaction.fields.getTextInputValue("emoji").trim();
+      const label = interaction.fields.getTextInputValue("label").trim();
+      if (!isUnicodeEmoji(emoji)) {
+        await interaction.reply({ embeds: [makeEmbed("Emoji must be a single standard (unicode) emoji.", COLORS.danger)], flags: 64 });
+        return;
+      }
+      if (!label) {
+        await interaction.reply({ embeds: [makeEmbed("Label is required.", COLORS.danger)], flags: 64 });
+        return;
+      }
+      try {
+        if (interaction.customId === "config_priority_add_modal") {
+          await this.settingsStore.addPriority({ emoji, label });
+          this.auditConfig(interaction, `Priority added → ${emoji} ${label}`);
+          await interaction.reply({ embeds: [makeEmbed(`Added ${emoji} ${label}.`, COLORS.success)], flags: 64 });
+        } else {
+          const priorityId = interaction.customId.split(":")[1];
+          await this.settingsStore.editPriority(priorityId, { emoji, label });
+          this.auditConfig(interaction, `Priority edited → ${emoji} ${label}`);
+          await interaction.reply({ embeds: [makeEmbed(`Updated ${emoji} ${label}.`, COLORS.success)], flags: 64 });
+        }
+      } catch (error) {
+        await interaction.reply({ embeds: [makeEmbed((error as Error).message || "Failed to save the priority.", COLORS.danger)], flags: 64 });
+      }
+      return;
+    }
+
     const emoji = interaction.fields.getTextInputValue("emoji").trim();
     const label = interaction.fields.getTextInputValue("label").trim();
     const daysRaw = interaction.fields.getTextInputValue("days").trim();
@@ -2550,6 +2837,28 @@ export class DiscordBot {
     }
   }
 
+  private async handlePriorityDelete(interaction: ButtonInteraction, priorityId: string): Promise<void> {
+    await interaction.deferUpdate();
+    try {
+      const priority = this.settingsStore.priorityById(priorityId);
+      const { reassignedThreadIds, initial } = await this.settingsStore.removePriority(priorityId);
+      if (priority) this.auditConfig(interaction, `Priority deleted → ${priority.emoji} ${priority.label}`);
+      // Rename reassigned threads to the initial priority's emoji (best-effort).
+      for (const threadId of reassignedThreadIds) {
+        const channel = await this.client.channels.fetch(threadId).catch(() => null);
+        if (channel?.isThread()) {
+          const thread = channel as ThreadChannel;
+          await thread
+            .setName(applyTitleEmojis(thread.name, { priorityEmoji: initial.emoji }, (t) => !!this.settingsStore.priorityByEmoji(t)))
+            .catch(() => {});
+        }
+      }
+      await interaction.editReply(this.buildPrioritiesPanel());
+    } catch (error) {
+      await interaction.followUp({ embeds: [makeEmbed((error as Error).message || "Failed to delete the priority.", COLORS.danger)], flags: 64 });
+    }
+  }
+
   private async handleConfigTagPick(interaction: StringSelectMenuInteraction): Promise<void> {
     if (!this.isAdmin(interaction)) {
       await interaction.reply({ embeds: [makeEmbed("Administrator permission required.", COLORS.danger)], flags: 64 });
@@ -2561,6 +2870,19 @@ export class DiscordBot {
       return;
     }
     await interaction.update(this.buildTagEditPanel(tag));
+  }
+
+  private async handleConfigPriorityPick(interaction: StringSelectMenuInteraction): Promise<void> {
+    if (!this.isAdmin(interaction)) {
+      await interaction.reply({ embeds: [makeEmbed("Administrator permission required.", COLORS.danger)], flags: 64 });
+      return;
+    }
+    const priority = this.settingsStore.priorityById(interaction.values[0]);
+    if (!priority) {
+      await interaction.update(this.buildPrioritiesPanel());
+      return;
+    }
+    await interaction.update(this.buildPriorityEditPanel(priority));
   }
 
   private async handleConfigTierPick(interaction: StringSelectMenuInteraction): Promise<void> {
@@ -2816,15 +3138,52 @@ export class DiscordBot {
         default_member_permissions: "8", // ADMINISTRATOR
       },
       {
-        name: "set-status",
-        description: "Set the status of this support ticket (support/admin only)",
+        name: "status",
+        description: "Ticket status (support/admin only)",
         options: [
           {
-            type: 3, // STRING
-            name: "status",
-            description: "New status for this ticket",
-            required: true,
-            autocomplete: true,
+            type: 1, // SUB_COMMAND
+            name: "set",
+            description: "Set the status of this support ticket",
+            options: [
+              {
+                type: 3, // STRING
+                name: "status",
+                description: "New status for this ticket",
+                required: true,
+                autocomplete: true,
+              },
+            ],
+          },
+          {
+            type: 1, // SUB_COMMAND
+            name: "history",
+            description: "Show this ticket's status change history",
+          },
+        ],
+      },
+      {
+        name: "priority",
+        description: "Ticket priority (support/admin only)",
+        options: [
+          {
+            type: 1, // SUB_COMMAND
+            name: "set",
+            description: "Set the priority of this support ticket",
+            options: [
+              {
+                type: 3, // STRING
+                name: "priority",
+                description: "New priority for this ticket",
+                required: true,
+                autocomplete: true,
+              },
+            ],
+          },
+          {
+            type: 1, // SUB_COMMAND
+            name: "history",
+            description: "Show this ticket's priority change history",
           },
         ],
       },
@@ -3003,6 +3362,13 @@ export class DiscordBot {
             type: 3, // STRING
             name: "status",
             description: "Ticket status",
+            required: false,
+            autocomplete: true,
+          },
+          {
+            type: 3, // STRING
+            name: "priority",
+            description: "Ticket priority",
             required: false,
             autocomplete: true,
           },

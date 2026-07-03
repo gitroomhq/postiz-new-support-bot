@@ -1,8 +1,10 @@
 import { ActionRowBuilder, ButtonBuilder, ButtonStyle, ThreadChannel } from "discord.js";
-import { StatusTag } from "../generated/prisma/client";
+import { StatusTag, PriorityTag } from "../generated/prisma/client";
 import { TicketStore } from "./TicketStore";
 import { AuditLogger } from "./AuditLogger";
+import { SettingsStore } from "../config/SettingsStore";
 import { embed, COLORS } from "../util/embeds";
+import { applyTitleEmojis } from "../util/threadTitle";
 
 export const RESOLVED_EMOJI = "✅";
 
@@ -15,12 +17,14 @@ export interface StatusTicket {
   csatPromptedAt?: Date | null;
   closed?: boolean;
   statusTag?: { emoji: string; label: string } | null;
+  priorityTagId?: string | null;
 }
 
 export interface ApplyStatusOptions {
   actorName: string;
   actorIconUrl?: string;
-  silent?: boolean; // skip the audit line + customer notice (used for bulk reassignment)
+  actorId?: string; // recorded in the per-ticket change history
+  silent?: boolean; // skip the customer notice (used for bulk reassignment)
 }
 
 export class StatusService {
@@ -29,7 +33,8 @@ export class StatusService {
 
   constructor(
     private ticketStore: TicketStore,
-    private audit: AuditLogger
+    private audit: AuditLogger,
+    private settingsStore: SettingsStore
   ) {}
 
   async applyStatus(
@@ -48,10 +53,67 @@ export class StatusService {
     }
   }
 
-  // Replaces the leading emoji of "{emoji} {user} — {label}" with the new one.
+  // Replaces the leading status emoji of "{status} {priority?} {user} — {label}",
+  // leaving a priority emoji in the second slot untouched.
   buildThreadName(currentName: string, emoji: string): string {
-    const rest = currentName.includes(" ") ? currentName.replace(/^\S+\s+/, "") : currentName;
-    return `${emoji} ${rest}`.slice(0, 100);
+    return applyTitleEmojis(currentName, { statusEmoji: emoji }, (t) => !!this.settingsStore.priorityByEmoji(t));
+  }
+
+  // Mirror of applyStatus for the priority axis: rename + persist + history + audit.
+  // Shares the same per-thread chain so concurrent status/priority renames don't
+  // clobber each other's thread.name reads.
+  async applyPriority(
+    thread: ThreadChannel,
+    ticket: StatusTicket,
+    priority: PriorityTag,
+    options: ApplyStatusOptions
+  ): Promise<void> {
+    const prev = this.chains.get(ticket.threadId) ?? Promise.resolve();
+    const next = prev.catch(() => {}).then(() => this.runApplyPriority(thread, ticket, priority, options));
+    this.chains.set(ticket.threadId, next);
+    try {
+      await next;
+    } finally {
+      if (this.chains.get(ticket.threadId) === next) this.chains.delete(ticket.threadId);
+    }
+  }
+
+  private async runApplyPriority(
+    thread: ThreadChannel,
+    ticket: StatusTicket,
+    priority: PriorityTag,
+    options: ApplyStatusOptions
+  ): Promise<void> {
+    const prevPriority = ticket.priorityTagId ? this.settingsStore.priorityById(ticket.priorityTagId) : undefined;
+
+    await thread
+      .setName(applyTitleEmojis(thread.name, { priorityEmoji: priority.emoji }, (t) => !!this.settingsStore.priorityByEmoji(t)))
+      .catch(() => {});
+
+    await this.ticketStore.setPriority(ticket.threadId, priority.id);
+
+    void this.ticketStore
+      .addTagChange({
+        ticketThreadId: ticket.threadId,
+        kind: "PRIORITY",
+        fromEmoji: prevPriority?.emoji ?? null,
+        fromLabel: prevPriority?.label ?? null,
+        toEmoji: priority.emoji,
+        toLabel: priority.label,
+        actorId: options.actorId ?? null,
+        actorName: options.actorName,
+      })
+      .catch((e) => console.error("Failed to record priority change:", e));
+
+    const prevText = prevPriority ? `${prevPriority.emoji} ${prevPriority.label}` : "—";
+    void this.audit.log({
+      title: "⚡ Priority changed",
+      severity: "info",
+      actor: options.actorName,
+      actorIconUrl: options.actorIconUrl,
+      threadId: ticket.threadId,
+      fields: [{ name: "Priority", value: `${prevText} → ${priority.emoji} ${priority.label}`, inline: true }],
+    });
   }
 
   private async runApplyStatus(
@@ -82,6 +144,22 @@ export class StatusService {
 
     await this.ticketStore.setStatus(ticket.threadId, tag.id, isDone);
 
+    // Per-ticket history backing /status history — recorded for silent changes too,
+    // same philosophy as the audit channel: the record is complete, silent only
+    // mutes the thread.
+    void this.ticketStore
+      .addTagChange({
+        ticketThreadId: ticket.threadId,
+        kind: "STATUS",
+        fromEmoji: ticket.statusTag?.emoji ?? null,
+        fromLabel: ticket.statusTag?.label ?? null,
+        toEmoji: tag.emoji,
+        toLabel: tag.label,
+        actorId: options.actorId ?? null,
+        actorName: options.actorName,
+      })
+      .catch((e) => console.error("Failed to record status change:", e));
+
     // Audit trail — runs even for silent changes (bulk reassignment, member-left
     // closes): the channel is the complete record, silent only mutes the thread.
     const [title, severity]: [string, "info" | "success" | "warn" | "neutral"] =
@@ -104,31 +182,25 @@ export class StatusService {
       fields: [{ name: "Status", value: `${prevTag} → ${tag.emoji} ${tag.label}`, inline: true }],
     });
 
-    if (!options.silent) {
-      const auditEmbed = embed(`Status changed to **${tag.emoji} ${tag.label}**`).setAuthor({
-        name: options.actorName,
-        ...(options.actorIconUrl ? { iconURL: options.actorIconUrl } : {}),
-      });
-      await thread.send({ embeds: [auditEmbed] }).catch(() => {});
+    // Plain status changes post nothing in-thread (history lives in /status history);
+    // only closing/resolving still notifies the customer.
+    if (!options.silent && isDone) {
+      const note = tag.closesThread
+        ? "This ticket has been closed. Reply here or open a new ticket if you still need help."
+        : `This ticket has been marked **${tag.label}**. Reply here if you still need help.`;
+      // The customer mention stays in content so they actually get notified.
+      await thread
+        .send({
+          content: ticket.customerId ? `<@${ticket.customerId}>` : undefined,
+          embeds: [embed(note, tag.closesThread ? COLORS.neutral : COLORS.success)],
+          allowedMentions: { users: ticket.customerId ? [ticket.customerId] : [] },
+        })
+        .catch(() => {});
 
-      if (isDone) {
-        const note = tag.closesThread
-          ? "This ticket has been closed. Reply here or open a new ticket if you still need help."
-          : `This ticket has been marked **${tag.label}**. Reply here if you still need help.`;
-        // The customer mention stays in content so they actually get notified.
-        await thread
-          .send({
-            content: ticket.customerId ? `<@${ticket.customerId}>` : undefined,
-            embeds: [embed(note, tag.closesThread ? COLORS.neutral : COLORS.success)],
-            allowedMentions: { users: ticket.customerId ? [ticket.customerId] : [] },
-          })
-          .catch(() => {});
-
-        // One-time satisfaction prompt. Must run BEFORE the lock/archive below so the
-        // in-thread fallback (customer has DMs closed) can still post its message.
-        if (ticket.customerId && !ticket.csatPromptedAt) {
-          await this.sendCsatPrompt(thread, ticket).catch((e) => console.error("CSAT prompt failed:", e));
-        }
+      // One-time satisfaction prompt. Must run BEFORE the lock/archive below so the
+      // in-thread fallback (customer has DMs closed) can still post its message.
+      if (ticket.customerId && !ticket.csatPromptedAt) {
+        await this.sendCsatPrompt(thread, ticket).catch((e) => console.error("CSAT prompt failed:", e));
       }
     }
 

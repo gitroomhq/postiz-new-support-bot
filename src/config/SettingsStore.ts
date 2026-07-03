@@ -1,4 +1,4 @@
-import { PrismaClient, BotSettings, StatusTag } from "../generated/prisma/client";
+import { PrismaClient, BotSettings, StatusTag, PriorityTag } from "../generated/prisma/client";
 
 export type ReminderTarget = "SUPPORT" | "CUSTOMER";
 
@@ -35,6 +35,21 @@ const DEFAULT_TAGS: TagInput[] = [
   { emoji: "📁", label: "Closed", closesThread: true, reminderEnabled: false },
 ];
 
+export interface PriorityInput {
+  emoji: string;
+  label: string;
+  isInitial?: boolean;
+}
+
+const DEFAULT_PRIORITIES: PriorityInput[] = [
+  { emoji: "⬜", label: "Very Low" },
+  { emoji: "🟩", label: "Low" },
+  { emoji: "🟨", label: "Medium", isInitial: true },
+  { emoji: "🟧", label: "High" },
+  { emoji: "🟥", label: "Very High" },
+  { emoji: "🚨", label: "Critical" },
+];
+
 export function isUnicodeEmoji(input: string): boolean {
   const s = input.trim();
   if (!s) return false;
@@ -47,6 +62,7 @@ export function isUnicodeEmoji(input: string): boolean {
 export class SettingsStore {
   private settings!: BotSettings;
   private tagList: StatusTag[] = [];
+  private priorityList: PriorityTag[] = [];
 
   constructor(private prisma: PrismaClient) {}
 
@@ -80,10 +96,26 @@ export class SettingsStore {
       });
     }
     await this.refreshTags();
+
+    if ((await this.prisma.priorityTag.count()) === 0) {
+      await this.prisma.priorityTag.createMany({
+        data: DEFAULT_PRIORITIES.map((p, i) => ({
+          emoji: p.emoji,
+          label: p.label,
+          isInitial: p.isInitial ?? false,
+          sortOrder: i,
+        })),
+      });
+    }
+    await this.refreshPriorities();
   }
 
   private async refreshTags(): Promise<void> {
     this.tagList = await this.prisma.statusTag.findMany({ orderBy: { sortOrder: "asc" } });
+  }
+
+  private async refreshPriorities(): Promise<void> {
+    this.priorityList = await this.prisma.priorityTag.findMany({ orderBy: { sortOrder: "asc" } });
   }
 
   threadsChannelId(): string | null {
@@ -202,6 +234,22 @@ export class SettingsStore {
     return this.tagList.find((t) => t.closesThread);
   }
 
+  priorities(): PriorityTag[] {
+    return this.priorityList;
+  }
+
+  priorityById(id: string): PriorityTag | undefined {
+    return this.priorityList.find((p) => p.id === id);
+  }
+
+  priorityByEmoji(emoji: string): PriorityTag | undefined {
+    return this.priorityList.find((p) => p.emoji === emoji);
+  }
+
+  initialPriority(): PriorityTag | undefined {
+    return this.priorityList.find((p) => p.isInitial);
+  }
+
   async updateGeneral(data: {
     threadsChannelId?: string | null;
     supportRoleId?: string | null;
@@ -268,6 +316,11 @@ export class SettingsStore {
     if (this.tagByEmoji(input.emoji.trim())) {
       throw new Error(`A tag with the emoji ${input.emoji.trim()} already exists.`);
     }
+    // Status and priority emojis must stay disjoint — thread-title parsing tells
+    // the two slots apart by which list the emoji belongs to.
+    if (this.priorityByEmoji(input.emoji.trim())) {
+      throw new Error(`The emoji ${input.emoji.trim()} is already used by a priority.`);
+    }
     const nextOrder = this.tagList.reduce((max, t) => Math.max(max, t.sortOrder), -1) + 1;
     const created = await this.prisma.$transaction(async (tx) => {
       if (input.isInitial) {
@@ -296,6 +349,9 @@ export class SettingsStore {
       const clash = this.tagByEmoji(input.emoji.trim());
       if (clash && clash.id !== id) {
         throw new Error(`A tag with the emoji ${input.emoji.trim()} already exists.`);
+      }
+      if (this.priorityByEmoji(input.emoji.trim())) {
+        throw new Error(`The emoji ${input.emoji.trim()} is already used by a priority.`);
       }
     }
     const updated = await this.prisma.$transaction(async (tx) => {
@@ -350,6 +406,86 @@ export class SettingsStore {
     ]);
 
     await this.refreshTags();
+    return { reassignedThreadIds: affected.map((t) => t.threadId), initial };
+  }
+
+  async addPriority(input: PriorityInput): Promise<PriorityTag> {
+    const emoji = input.emoji.trim();
+    if (this.priorityByEmoji(emoji)) {
+      throw new Error(`A priority with the emoji ${emoji} already exists.`);
+    }
+    if (this.tagByEmoji(emoji)) {
+      throw new Error(`The emoji ${emoji} is already used by a status tag.`);
+    }
+    const nextOrder = this.priorityList.reduce((max, p) => Math.max(max, p.sortOrder), -1) + 1;
+    const created = await this.prisma.$transaction(async (tx) => {
+      if (input.isInitial) {
+        await tx.priorityTag.updateMany({ data: { isInitial: false } });
+      }
+      return tx.priorityTag.create({
+        data: {
+          emoji,
+          label: input.label.trim(),
+          isInitial: input.isInitial ?? false,
+          sortOrder: nextOrder,
+        },
+      });
+    });
+    await this.refreshPriorities();
+    return created;
+  }
+
+  async editPriority(id: string, input: Partial<PriorityInput>): Promise<PriorityTag> {
+    if (input.emoji) {
+      const emoji = input.emoji.trim();
+      const clash = this.priorityByEmoji(emoji);
+      if (clash && clash.id !== id) {
+        throw new Error(`A priority with the emoji ${emoji} already exists.`);
+      }
+      if (this.tagByEmoji(emoji)) {
+        throw new Error(`The emoji ${emoji} is already used by a status tag.`);
+      }
+    }
+    const updated = await this.prisma.$transaction(async (tx) => {
+      if (input.isInitial) {
+        await tx.priorityTag.updateMany({ where: { id: { not: id } }, data: { isInitial: false } });
+      }
+      return tx.priorityTag.update({
+        where: { id },
+        data: {
+          ...(input.emoji !== undefined ? { emoji: input.emoji.trim() } : {}),
+          ...(input.label !== undefined ? { label: input.label.trim() } : {}),
+          ...(input.isInitial !== undefined ? { isInitial: input.isInitial } : {}),
+        },
+      });
+    });
+    await this.refreshPriorities();
+    return updated;
+  }
+
+  // Deletes a priority, reassigning any open tickets that used it to the initial
+  // priority. Returns the threadIds of reassigned tickets so callers can rename them.
+  async removePriority(id: string): Promise<{ reassignedThreadIds: string[]; initial: PriorityTag }> {
+    const priority = this.priorityById(id);
+    if (!priority) throw new Error("Priority not found.");
+    if (priority.isInitial) throw new Error("The initial priority can't be removed. Mark another priority as initial first.");
+    const initial = this.initialPriority();
+    if (!initial) throw new Error("No initial priority is configured.");
+
+    const affected = await this.prisma.ticket.findMany({
+      where: { priorityTagId: id, closed: false },
+      select: { threadId: true },
+    });
+
+    await this.prisma.$transaction([
+      this.prisma.ticket.updateMany({
+        where: { priorityTagId: id },
+        data: { priorityTagId: initial.id },
+      }),
+      this.prisma.priorityTag.delete({ where: { id } }),
+    ]);
+
+    await this.refreshPriorities();
     return { reassignedThreadIds: affected.map((t) => t.threadId), initial };
   }
 }

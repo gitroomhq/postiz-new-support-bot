@@ -46,7 +46,7 @@ async function main() {
   }
   const ticketStore = new TicketStore(prisma);
   const auditLogger = new AuditLogger(settingsStore);
-  const statusService = new StatusService(ticketStore, auditLogger);
+  const statusService = new StatusService(ticketStore, auditLogger, settingsStore);
   const oauthManager = new OAuthManager(config, sessionStore);
   const apiClient = new PostizApiClient(config);
   const claudeRunner = new ClaudeCodeRunner(process.cwd());
