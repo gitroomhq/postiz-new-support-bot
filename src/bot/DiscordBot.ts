@@ -417,15 +417,43 @@ export class DiscordBot {
 
     // null or a stale (deleted-tier) id both mean the base tier.
     const currentIdx = Math.max(0, tiers.findIndex((t) => t.id === ticket.escalationTierId));
-    const up = interaction.options.getSubcommand() === "up";
-    const target = tiers[currentIdx + (up ? 1 : -1)];
+    const stepUp = interaction.options.getSubcommand() === "up";
+
+    // Optional target tier: jump straight there (e.g. tier 1 → 3) instead of stepping.
+    // Autocomplete supplies ids; hand-typed names still resolve.
+    const tierRaw = interaction.options.getString("tier")?.trim();
+    let targetIdx: number;
+    if (tierRaw) {
+      targetIdx = tiers.findIndex((t) => t.id === tierRaw);
+      if (targetIdx === -1) targetIdx = tiers.findIndex((t) => t.name.toLowerCase() === tierRaw.toLowerCase());
+      if (targetIdx === -1) {
+        await interaction.reply({
+          embeds: [makeEmbed(`Unknown tier **${tierRaw}** — pick one from the autocomplete list.`, COLORS.warn)],
+          flags: 64,
+        });
+        return;
+      }
+      if (targetIdx === currentIdx) {
+        await interaction.reply({
+          embeds: [makeEmbed(`Ticket is already at **${tiers[currentIdx].name}**.`, COLORS.warn)],
+          flags: 64,
+        });
+        return;
+      }
+    } else {
+      targetIdx = currentIdx + (stepUp ? 1 : -1);
+    }
+
+    const target = tiers[targetIdx];
     if (!target) {
       await interaction.reply({
-        embeds: [makeEmbed(`Already at the ${up ? "highest" : "lowest"} tier (**${tiers[currentIdx].name}**).`, COLORS.warn)],
+        embeds: [makeEmbed(`Already at the ${stepUp ? "highest" : "lowest"} tier (**${tiers[currentIdx].name}**).`, COLORS.warn)],
         flags: 64,
       });
       return;
     }
+    // Ping/wording follow the actual direction of the move, not the subcommand used.
+    const up = targetIdx > currentIdx;
     const reason = interaction.options.getString("reason")?.trim() || null;
 
     await this.ticketStore.setEscalationTier(thread.id, target.id);
@@ -676,6 +704,12 @@ export class DiscordBot {
         .filter((t) => t.label.toLowerCase().includes(query))
         .slice(0, 25)
         .map((t) => ({ name: `${t.emoji} ${t.label}`, value: t.id }));
+    } else if (interaction.commandName === "escalate" && focused.name === "tier") {
+      choices = this.tierStore
+        .list()
+        .map((t, i) => ({ name: `Tier ${i + 1} — ${t.name}`, value: t.id }))
+        .filter((c) => c.name.toLowerCase().includes(query))
+        .slice(0, 25);
     }
 
     try {
@@ -1922,7 +1956,7 @@ export class DiscordBot {
           : "_No tiers yet — the legacy support role is used as fallback._"
       )
       .setFooter({
-        text: "Tier 1 gets new-ticket pings and its members are added to ticket threads. Any tier role counts as staff. Move tickets with /escalate up|down.",
+        text: "Tier 1 gets new-ticket pings and its members are added to ticket threads. Any tier role counts as staff. Move tickets with /escalate up|down, optionally straight to a tier.",
       });
 
     const components: ActionRowBuilder<any>[] = [];
@@ -2830,8 +2864,15 @@ export class DiscordBot {
           {
             type: 1, // SUB_COMMAND
             name: "up",
-            description: "Escalate this ticket to the next tier",
+            description: "Escalate this ticket to the next tier, or straight to a specific one",
             options: [
+              {
+                type: 3, // STRING
+                name: "tier",
+                description: "Jump directly to this tier (default: one tier up)",
+                required: false,
+                autocomplete: true,
+              },
               {
                 type: 3, // STRING
                 name: "reason",
@@ -2844,8 +2885,15 @@ export class DiscordBot {
           {
             type: 1, // SUB_COMMAND
             name: "down",
-            description: "Step this ticket back down to the previous tier",
+            description: "Step this ticket back down a tier, or straight to a specific one",
             options: [
+              {
+                type: 3, // STRING
+                name: "tier",
+                description: "Jump directly to this tier (default: one tier down)",
+                required: false,
+                autocomplete: true,
+              },
               {
                 type: 3, // STRING
                 name: "reason",
