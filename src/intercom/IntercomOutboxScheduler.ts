@@ -235,10 +235,10 @@ export class IntercomOutboxScheduler {
   // Contact + conversation + converted ticket, resumable: the link row is
   // written the moment the conversation exists (ticketId null), so a retry
   // after a mid-ensure failure resumes at the convert step instead of creating
-  // a duplicate conversation.
+  // a duplicate conversation. Every finishing step below is idempotent, so a
+  // re-run ("Retry failed" on a dead ensure) completes whatever is missing.
   private async ensureBridge(threadId: string, payload: EnsurePayload): Promise<void> {
     let link = await this.store.getLink(threadId);
-    if (link?.ticketId) return; // idempotent re-run
 
     if (!link) {
       const externalId = externalIdFor(payload, threadId);
@@ -250,35 +250,43 @@ export class IntercomOutboxScheduler {
       link = await this.store.createLink(threadId, contactId, externalId, conversationId);
     }
 
-    const ticketId = await this.attachTicket(threadId, link.conversationId, link.contactId, payload);
+    const ticketId = link.ticketId ?? (await this.attachTicket(threadId, link.conversationId, link.contactId, payload));
 
-    // Initial ticket state + attributes. Attribute failures degrade to
-    // state-only (the definitions may not exist yet — /config "Ensure
-    // attributes" or a one-time manual creation fixes that).
-    const stateId = payload.statusTagId
-      ? this.settingsStore.tagById(payload.statusTagId)?.intercomTicketStateId ?? null
-      : null;
+    // Ticket attributes; the definitions may not exist yet ("/config → Ensure
+    // Attributes" or a one-time manual creation fixes that) — degrade.
     const attributes: Record<string, unknown> = { [TICKET_ATTR_THREAD]: threadId };
     if (payload.priorityLabel) attributes[TICKET_ATTR_PRIORITY] = payload.priorityLabel;
     try {
-      await this.withAuthor((a) => this.client.updateTicket(ticketId, { stateId: stateId ?? undefined, attributes, adminId: a }));
+      await this.withAuthor((a) => this.client.updateTicket(ticketId, { attributes, adminId: a }));
     } catch (e) {
-      if (e instanceof IntercomHttpError && (e.status === 400 || e.status === 422) && stateId) {
-        await this.withAuthor((a) => this.client.updateTicket(ticketId, { stateId, adminId: a }));
-      } else if (!(e instanceof IntercomHttpError && (e.status === 400 || e.status === 422))) {
-        throw e;
-      }
+      if (!(e instanceof IntercomHttpError && (e.status === 400 || e.status === 422))) throw e;
     }
-    if (stateId) await this.store.setLastSyncedStateId(threadId, stateId);
+
+    // Initial ticket state. A freshly converted ticket often already sits in
+    // the mapped state (the type's default) — Intercom rejects that with
+    // 400 "Cannot transition ticket to the same state", which for the bridge
+    // means: already done.
+    const stateId = payload.statusTagId
+      ? this.settingsStore.tagById(payload.statusTagId)?.intercomTicketStateId ?? null
+      : null;
+    if (stateId) {
+      try {
+        await this.withAuthor((a) => this.client.updateTicket(ticketId, { stateId, adminId: a }));
+      } catch (e) {
+        if (!isSameStateError(e)) throw e;
+      }
+      await this.store.setLastSyncedStateId(threadId, stateId);
+    }
 
     await this.markDiscordOrigin(threadId, link.conversationId);
 
     // Conversation open/close parity: API-created conversations start open.
-    if (payload.closed || payload.resolved) {
+    const target: "open" | "closed" = payload.closed || payload.resolved ? "closed" : "open";
+    if (target === "closed" && link.lastSyncedOpen !== "closed") {
       await this.withAuthor((a) => this.client.setConversationOpen(link.conversationId, false, a));
-      await this.store.setLastSyncedOpen(threadId, "closed");
-    } else {
-      await this.store.setLastSyncedOpen(threadId, "open");
+    }
+    if (link.lastSyncedOpen !== target) {
+      await this.store.setLastSyncedOpen(threadId, target);
     }
   }
 
@@ -503,7 +511,14 @@ export class IntercomOutboxScheduler {
     const tag = payload.statusTagId ? this.settingsStore.tagById(payload.statusTagId) : undefined;
     const stateId = tag?.intercomTicketStateId ?? null;
     if (link.ticketId && stateId && link.lastSyncedStateId !== stateId) {
-      await this.withAuthor((a) => this.client.updateTicket(link.ticketId!, { stateId, adminId: a }));
+      try {
+        await this.withAuthor((a) => this.client.updateTicket(link.ticketId!, { stateId, adminId: a }));
+      } catch (e) {
+        // "Cannot transition ticket to the same state" — already there
+        // (e.g. an agent moved it while the mode was push, or two bot tags
+        // map to one Intercom state). Success for the bridge.
+        if (!isSameStateError(e)) throw e;
+      }
       await this.store.setLastSyncedStateId(threadId, stateId);
     }
 
@@ -566,6 +581,12 @@ export class IntercomOutboxScheduler {
 
 function isPermanent4xx(e: unknown): boolean {
   return e instanceof IntercomHttpError && e.status >= 400 && e.status < 500 && e.status !== 408 && e.status !== 429;
+}
+
+// Intercom rejects a transition to the ticket's current state with a 400 —
+// for the bridge that outcome IS the desired end state.
+function isSameStateError(e: unknown): boolean {
+  return e instanceof IntercomHttpError && e.status === 400 && /same state/i.test(e.message);
 }
 
 function isImageUrl(url: string): boolean {
