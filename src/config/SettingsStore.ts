@@ -2,6 +2,10 @@ import { PrismaClient, BotSettings, StatusTag, PriorityTag } from "../generated/
 
 export type ReminderTarget = "SUPPORT" | "CUSTOMER";
 
+// Chatwoot bridge mode for Discord-created tickets: none = off, push = one-way
+// mirror Discord → Chatwoot, bi = push + relay agent replies/status back.
+export type ChatwootMode = "none" | "push" | "bi";
+
 // Totals stored after each scheduled report so the next one can show trend deltas.
 export type ReportSnapshot = {
   openTotal: number;
@@ -214,6 +218,50 @@ export class SettingsStore {
     return null;
   }
 
+  chatwootMode(): ChatwootMode {
+    const mode = this.settings.chatwootMode;
+    return mode === "push" || mode === "bi" ? mode : "none";
+  }
+
+  chatwootBaseUrl(): string | null {
+    return this.settings.chatwootBaseUrl;
+  }
+
+  chatwootAccountId(): string | null {
+    return this.settings.chatwootAccountId;
+  }
+
+  // The API-channel inbox's identifier token (Client API path segment).
+  chatwootInboxIdentifier(): string | null {
+    return this.settings.chatwootInboxIdentifier;
+  }
+
+  // Identity-validation HMAC key of the inbox; optional (only needed when the
+  // inbox enforces user identity validation).
+  chatwootHmacKey(): string | null {
+    return this.settings.chatwootHmacKey;
+  }
+
+  // Agent Bot access token — the only agent-side credential the bridge gets.
+  chatwootBotToken(): string | null {
+    return this.settings.chatwootBotToken;
+  }
+
+  chatwootWebhookSecret(): string | null {
+    return this.settings.chatwootWebhookSecret;
+  }
+
+  // The bridge only runs with a complete connection; the webhook secret is separate
+  // (only gates the inbound endpoint) and the HMAC key is optional.
+  chatwootConfigured(): boolean {
+    return Boolean(
+      this.settings.chatwootBaseUrl &&
+        this.settings.chatwootAccountId &&
+        this.settings.chatwootInboxIdentifier &&
+        this.settings.chatwootBotToken
+    );
+  }
+
   tags(): StatusTag[] {
     return this.tagList;
   }
@@ -268,6 +316,18 @@ export class SettingsStore {
     refundMaxAmountCurrency?: string;
     refundMaxPer24h?: number | null;
     refundMinMemberAgeDays?: number | null;
+  }): Promise<void> {
+    this.settings = await this.prisma.botSettings.update({ where: { id: "global" }, data });
+  }
+
+  async updateChatwoot(data: {
+    chatwootMode?: ChatwootMode;
+    chatwootBaseUrl?: string | null;
+    chatwootAccountId?: string | null;
+    chatwootInboxIdentifier?: string | null;
+    chatwootHmacKey?: string | null;
+    chatwootBotToken?: string | null;
+    chatwootWebhookSecret?: string | null;
   }): Promise<void> {
     this.settings = await this.prisma.botSettings.update({ where: { id: "global" }, data });
   }

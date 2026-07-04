@@ -214,6 +214,45 @@ const STATEMENTS: string[] = [
     CONSTRAINT "ticket_tag_changes_pkey" PRIMARY KEY ("id")
   )`,
   `CREATE INDEX IF NOT EXISTS "ticket_tag_changes_ticketThreadId_kind_idx" ON "ticket_tag_changes"("ticketThreadId", "kind")`,
+  // Chatwoot bridge: mode + credentials live in bot_settings (deploy env has no .env
+  // access, so everything is edited via /config), links map threads to conversations,
+  // and the outbox is a durable per-ticket-FIFO queue of pending API calls.
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "chatwootMode" TEXT NOT NULL DEFAULT 'none'`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "chatwootBaseUrl" TEXT`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "chatwootAccountId" TEXT`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "chatwootInboxIdentifier" TEXT`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "chatwootHmacKey" TEXT`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "chatwootBotToken" TEXT`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "chatwootWebhookSecret" TEXT`,
+  `CREATE TABLE IF NOT EXISTS "chatwoot_links" (
+    "id" TEXT NOT NULL,
+    "ticketThreadId" TEXT NOT NULL,
+    "contactId" INTEGER NOT NULL,
+    "contactSourceId" TEXT NOT NULL,
+    "conversationId" INTEGER NOT NULL,
+    "agentWarnedAt" TIMESTAMP(3),
+    "lastSyncedStatus" TEXT,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT "chatwoot_links_pkey" PRIMARY KEY ("id")
+  )`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS "chatwoot_links_ticketThreadId_key" ON "chatwoot_links"("ticketThreadId")`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS "chatwoot_links_conversationId_key" ON "chatwoot_links"("conversationId")`,
+  `CREATE TABLE IF NOT EXISTS "chatwoot_outbox" (
+    "id" TEXT NOT NULL,
+    "seq" SERIAL NOT NULL,
+    "ticketThreadId" TEXT NOT NULL,
+    "type" TEXT NOT NULL,
+    "payload" JSONB NOT NULL,
+    "status" TEXT NOT NULL DEFAULT 'PENDING',
+    "attempts" INTEGER NOT NULL DEFAULT 0,
+    "nextAttemptAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "lastError" TEXT,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT "chatwoot_outbox_pkey" PRIMARY KEY ("id")
+  )`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS "chatwoot_outbox_seq_key" ON "chatwoot_outbox"("seq")`,
+  `CREATE INDEX IF NOT EXISTS "chatwoot_outbox_ticketThreadId_seq_idx" ON "chatwoot_outbox"("ticketThreadId", "seq")`,
+  `CREATE INDEX IF NOT EXISTS "chatwoot_outbox_status_nextAttemptAt_idx" ON "chatwoot_outbox"("status", "nextAttemptAt")`,
 ];
 
 export async function ensureSchema(prisma: PrismaClient): Promise<void> {
