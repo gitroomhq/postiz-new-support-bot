@@ -247,7 +247,8 @@ export class ChatwootOutboxScheduler {
         continue;
       }
       try {
-        const response = await fetch(attachment.url);
+        // Timeout so a hung CDN download can't freeze the drainer.
+        const response = await fetch(attachment.url, { signal: AbortSignal.timeout(60_000) });
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         files.push({
           filename: attachment.filename,

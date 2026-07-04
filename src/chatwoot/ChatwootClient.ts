@@ -76,11 +76,16 @@ export class ChatwootClient {
     return (text ? JSON.parse(text) : undefined) as T;
   }
 
+  // Every call gets a hard timeout: a single hung request must never freeze the
+  // outbox drainer (its overlap guard would otherwise block all future ticks).
+  private static readonly REQUEST_TIMEOUT_MS = 30_000;
+
   private async json<T>(url: string, method: string, headers: Record<string, string>, body: unknown, what: string): Promise<T> {
     const response = await fetch(url, {
       method,
       headers: { ...headers, "Content-Type": "application/json" },
       body: body === undefined ? undefined : JSON.stringify(body),
+      signal: AbortSignal.timeout(ChatwootClient.REQUEST_TIMEOUT_MS),
     });
     return this.parse<T>(response, what);
   }
@@ -159,7 +164,11 @@ export class ChatwootClient {
       await this.json(url, "POST", {}, { content }, "contact message");
       return;
     }
-    const response = await fetch(url, { method: "POST", body: this.buildForm({ content }, files) });
+    const response = await fetch(url, {
+      method: "POST",
+      body: this.buildForm({ content }, files),
+      signal: AbortSignal.timeout(ChatwootClient.REQUEST_TIMEOUT_MS * 2),
+    });
     await this.parse(response, "contact message");
   }
 
@@ -195,7 +204,12 @@ export class ChatwootClient {
     const fields: Record<string, string> = { content: input.content, message_type: "outgoing" };
     if (input.private) fields.private = "true";
     if (input.contentAttributes) fields.content_attributes = JSON.stringify(input.contentAttributes);
-    const response = await fetch(url, { method: "POST", headers: this.botHeaders(), body: this.buildForm(fields, files) });
+    const response = await fetch(url, {
+      method: "POST",
+      headers: this.botHeaders(),
+      body: this.buildForm(fields, files),
+      signal: AbortSignal.timeout(ChatwootClient.REQUEST_TIMEOUT_MS * 2),
+    });
     await this.parse(response, "bot message");
   }
 

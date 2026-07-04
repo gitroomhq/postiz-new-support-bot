@@ -2072,7 +2072,8 @@ export class DiscordBot {
         .setCustomId("config_chatwoot_mode_bi")
         .setLabel("Bidirectional")
         .setStyle(mode === "bi" ? ButtonStyle.Success : ButtonStyle.Secondary)
-        .setDisabled(mode === "bi")
+        .setDisabled(mode === "bi"),
+      new ButtonBuilder().setCustomId("config_chatwoot_reset").setLabel("Reset bridge data").setStyle(ButtonStyle.Danger)
     );
 
     const actionButtons = new ActionRowBuilder<ButtonBuilder>().addComponents(
@@ -2436,6 +2437,45 @@ export class DiscordBot {
       if (before === "none" && mode !== "none") {
         void this.runChatwootBackfill(interaction).catch((e) => console.error("Chatwoot backfill failed:", e));
       }
+      return;
+    }
+
+    if (id === "config_chatwoot_reset") {
+      const [links, outbox] = await Promise.all([this.chatwootStore.countLinks(), this.chatwootStore.counts()]);
+      const confirm = new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder().setCustomId("config_chatwoot_reset_confirm").setLabel("Yes, wipe bridge data").setStyle(ButtonStyle.Danger),
+        new ButtonBuilder().setCustomId("config_chatwoot").setLabel("Cancel").setStyle(ButtonStyle.Secondary)
+      );
+      await interaction.update({
+        embeds: [
+          makeEmbed(
+            [
+              `This deletes the bot's local bridge state: **${links}** conversation link(s) and **${outbox.pending + outbox.dead}** queued event(s).`,
+              "",
+              "Nothing is deleted in Chatwoot itself. Use this when the Chatwoot side was cleared or recreated and the bookkeeping is stale — the next **Backfill** rebuilds every ticket from Discord.",
+              "⚠️ If conversations still exist in Chatwoot, the next backfill will create duplicates.",
+            ].join("\n"),
+            COLORS.warn
+          ),
+        ],
+        components: [confirm],
+      });
+      return;
+    }
+
+    if (id === "config_chatwoot_reset_confirm") {
+      const result = await this.chatwootStore.resetAll();
+      this.auditConfig(interaction, `Chatwoot bridge data reset (${result.links} links, ${result.events} queued events deleted)`);
+      await interaction.update(await this.buildChatwootPanel());
+      await interaction.followUp({
+        embeds: [
+          makeEmbed(
+            `Bridge data wiped: ${result.links} link(s), ${result.events} event(s). Run **Backfill tickets** to rebuild.`,
+            COLORS.success
+          ),
+        ],
+        flags: 64,
+      });
       return;
     }
 
