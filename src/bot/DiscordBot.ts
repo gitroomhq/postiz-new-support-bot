@@ -1891,46 +1891,68 @@ export class DiscordBot {
 
   private buildConfigMainPanel() {
     const s = this.settingsStore;
+    const tiers = this.tierStore.list();
     const embed = new EmbedBuilder()
       .setTitle("Support Bot Configuration")
       .setColor(0x5865f2)
-      .setDescription(
-        [
-          `**Threads channel:** ${s.threadsChannelId() ? `<#${s.threadsChannelId()}>` : "_not set_"}`,
-          `**Escalation tiers:** ${
-            this.tierStore.list().length
-              ? this.tierStore.list().map((t) => t.name).join(" → ")
-              : s.supportRoleId()
-                ? "_none — legacy support role fallback_"
-                : "_not set_"
-          }`,
-          `**GitHub repo:** ${s.githubRepo() ? `\`${s.githubRepo()}\`` : "_not set_"}`,
-          `**AI solve:** ${s.aiSolveEnabled() ? "on" : "off"}`,
-          `**Status tags:** ${s.tags().length}`,
-          `**Priorities:** ${s.priorities().length}`,
-          `**Status report:** ${
-            s.reportEnabled() && s.reportChannelId()
-              ? `${s.reportHour() != null && s.reportMinute() != null ? `daily at ${this.formatReportTime(s.reportHour()!, s.reportMinute()!)} (${s.reportTimezone()})` : `every ${s.reportIntervalHours()}h`} → <#${s.reportChannelId()}>`
-              : "off"
-          }`,
-          `**Billing audit:** ${s.billingAuditChannelId() ? `<#${s.billingAuditChannelId()}>` : "_in-thread ping_"}`,
-          `**Audit log:** ${s.auditLogChannelId() ? `<#${s.auditLogChannelId()}>` : "off"}`,
-          `**Ticket limits:** ${s.maxOpenTicketsPerUser() > 0 ? `max ${s.maxOpenTicketsPerUser()} open` : "no cap"} · ${s.ticketCooldownMinutes() > 0 ? `${s.ticketCooldownMinutes()}m cooldown` : "no cooldown"}`,
-          `**Intercom:** ${s.intercomMode() === "none" ? "off" : `${s.intercomMode()}${s.intercomConfigured() ? "" : " ⚠️ not configured"}`}`,
-        ].join("\n")
+      .addFields(
+        {
+          name: "General",
+          value: [
+            `Threads channel: ${s.threadsChannelId() ? `<#${s.threadsChannelId()}>` : "_not set_"}`,
+            `AI solve: ${s.aiSolveEnabled() ? "on" : "off"}`,
+            `GitHub repo: ${s.githubRepo() ? `\`${s.githubRepo()}\`` : "_not set_"}`,
+            `Ticket limits: ${s.maxOpenTicketsPerUser() > 0 ? `max ${s.maxOpenTicketsPerUser()} open` : "no cap"} · ${s.ticketCooldownMinutes() > 0 ? `${s.ticketCooldownMinutes()}m cooldown` : "no cooldown"}`,
+          ].join("\n"),
+          inline: true,
+        },
+        {
+          name: "Workflow",
+          value: [
+            `Status tags: ${s.tags().length}`,
+            `Priorities: ${s.priorities().length}`,
+            `Escalation: ${
+              tiers.length
+                ? tiers.map((t) => t.name).join(" → ")
+                : s.supportRoleId()
+                  ? "_legacy support role_"
+                  : "_not set_"
+            }`,
+          ].join("\n"),
+          inline: true,
+        },
+        {
+          name: "Reporting & Audit",
+          value: [
+            `Status report: ${
+              s.reportEnabled() && s.reportChannelId()
+                ? `${s.reportHour() != null && s.reportMinute() != null ? `daily at ${this.formatReportTime(s.reportHour()!, s.reportMinute()!)} (${s.reportTimezone()})` : `every ${s.reportIntervalHours()}h`} → <#${s.reportChannelId()}>`
+                : "off"
+            }`,
+            `Audit log: ${s.auditLogChannelId() ? `<#${s.auditLogChannelId()}>` : "off"}`,
+            `Billing audit: ${s.billingAuditChannelId() ? `<#${s.billingAuditChannelId()}>` : "_in-thread ping_"}`,
+          ].join("\n"),
+          inline: false,
+        },
+        {
+          name: "Integrations",
+          value: `Intercom: ${s.intercomMode() === "none" ? "off" : `${s.intercomMode()}${s.intercomConfigured() ? "" : " ⚠️ not configured"}`}`,
+          inline: false,
+        }
       );
 
     // Discord caps action rows at 5 buttons, so the panel spans two rows.
+    // Button order mirrors the embed sections: General/Workflow first, then Reporting/Integrations/actions.
     const primary = [
       new ButtonBuilder().setCustomId("config_general").setLabel("General Settings").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("config_tags").setLabel("Manage Tags").setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId("config_report").setLabel("Status Report").setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId("config_billing").setLabel("Billing").setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId("config_audit").setLabel("Audit Log").setStyle(ButtonStyle.Primary),
-    ];
-    const secondary = [
       new ButtonBuilder().setCustomId("config_priorities").setLabel("Manage Priorities").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("config_escalation").setLabel("Escalation").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("config_billing").setLabel("Billing").setStyle(ButtonStyle.Primary),
+    ];
+    const secondary = [
+      new ButtonBuilder().setCustomId("config_report").setLabel("Status Report").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("config_audit").setLabel("Audit Log").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("config_intercom").setLabel("Intercom").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("config_reverify").setLabel("Re-Verify").setStyle(ButtonStyle.Secondary),
     ];
@@ -1957,15 +1979,6 @@ export class DiscordBot {
     }
   }
 
-  // TEMP DEBUG — remove after checking key type: shows Stripe key kind/mode only, never the secret
-  private describeStripeKey(): string {
-    const key = this.config.stripe.secretKey;
-    const m = key.match(/^(sk|rk)_(live|test)_/);
-    if (!m) return "`?` — unrecognized key format";
-    const kind = m[1] === "rk" ? "restricted key (scoped permissions)" : "standard secret key (full account access)";
-    return `\`${m[1]}_${m[2]}_…${key.slice(-4)}\` — ${kind}, ${m[2]} mode`;
-  }
-
   private buildBillingPanel() {
     const s = this.settingsStore;
     const embed = new EmbedBuilder()
@@ -1973,7 +1986,6 @@ export class DiscordBot {
       .setColor(0x5865f2)
       .setDescription(
         [
-          `**Stripe key (debug):** ${this.describeStripeKey()}`,
           `**Audit channel:** ${s.billingAuditChannelId() ? `<#${s.billingAuditChannelId()}>` : "_not set — audit embeds ping the support role in the refund thread_"}`,
           `**Max self-service refund:** ${
             s.refundMaxAmount() != null
@@ -2340,7 +2352,16 @@ export class DiscordBot {
     const embed = new EmbedBuilder()
       .setTitle("General Settings")
       .setColor(0x5865f2)
-      .setDescription("Pick the threads channel, toggle AI, or set the GitHub repo. Staff roles are managed under Escalation.");
+      .setDescription(
+        [
+          `**Threads channel:** ${s.threadsChannelId() ? `<#${s.threadsChannelId()}>` : "_not set_"}`,
+          `**AI solve:** ${s.aiSolveEnabled() ? "on" : "off"}`,
+          `**GitHub repo:** ${s.githubRepo() ? `\`${s.githubRepo()}\`` : "_not set_"}`,
+          `**Ticket limits:** ${s.maxOpenTicketsPerUser() > 0 ? `max ${s.maxOpenTicketsPerUser()} open` : "no cap"} · ${s.ticketCooldownMinutes() > 0 ? `${s.ticketCooldownMinutes()}m cooldown` : "no cooldown"}`,
+          "",
+          "Staff roles are managed under Escalation.",
+        ].join("\n")
+      );
 
     const channelSelect = new ChannelSelectMenuBuilder()
       .setCustomId("config_set_channel")
