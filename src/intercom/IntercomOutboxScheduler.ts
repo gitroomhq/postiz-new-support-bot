@@ -378,21 +378,35 @@ export class IntercomOutboxScheduler {
         ticketId = (await this.client.convertToTicket(conversationId, ticketTypeId)).ticketId;
       } catch (e2) {
         if (!isPermanent4xx(e2)) throw e2;
-        ticketId = (
-          await this.client.createTicket({ ticketTypeId, contactId, createdAtIso: payload.createdAtIso })
-        ).ticketId;
-        await this.postAdminNote(
-          threadId,
-          conversationId,
-          `🔗 Convert was rejected — created a standalone Intercom ticket instead: ${ticketId}`
-        ).catch(() => {});
-        void this.audit.log({
-          title: "🌉 Intercom convert failed — unlinked ticket created",
-          severity: "warn",
-          actor: "Intercom bridge",
-          threadId,
-          fields: [{ name: "Ticket", value: ticketId, inline: true }],
-        });
+        try {
+          // create+link is valid for back-office/tracker types — still a real
+          // Intercom-side link, just not via convert.
+          ticketId = (
+            await this.client.createTicket({
+              ticketTypeId,
+              contactId,
+              createdAtIso: payload.createdAtIso,
+              conversationToLinkId: conversationId,
+            })
+          ).ticketId;
+        } catch (e3) {
+          if (!isPermanent4xx(e3)) throw e3;
+          ticketId = (
+            await this.client.createTicket({ ticketTypeId, contactId, createdAtIso: payload.createdAtIso })
+          ).ticketId;
+          await this.postAdminNote(
+            threadId,
+            conversationId,
+            `🔗 Convert was rejected — created a standalone Intercom ticket instead: ${ticketId}`
+          ).catch(() => {});
+          void this.audit.log({
+            title: "🌉 Intercom convert failed — unlinked ticket created",
+            severity: "warn",
+            actor: "Intercom bridge",
+            threadId,
+            fields: [{ name: "Ticket", value: ticketId, inline: true }],
+          });
+        }
       }
     }
     await this.store.setTicketId(threadId, ticketId);

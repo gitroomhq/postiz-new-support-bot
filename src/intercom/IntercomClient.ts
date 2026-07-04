@@ -318,13 +318,16 @@ export class IntercomClient {
     return { ticketId: String(data.id) };
   }
 
-  // Fallback when convert is rejected: an unlinked customer ticket (the link
-  // then only exists in our DB, cross-referenced via notes).
+  // Fallback when convert is rejected. conversationToLinkId is valid for
+  // back-office/tracker ticket types only (conversation↔customer-ticket links
+  // can only be made by convert) — callers retry without it on rejection, and
+  // the link then only exists in our DB, cross-referenced via notes.
   async createTicket(input: {
     ticketTypeId: string;
     contactId: string;
     attributes?: Record<string, unknown>;
     createdAtIso?: string;
+    conversationToLinkId?: string;
   }): Promise<{ ticketId: string }> {
     const data = await this.json<{ id?: string | number }>(
       "/tickets",
@@ -334,6 +337,7 @@ export class IntercomClient {
         contacts: [{ id: input.contactId }],
         ...(input.attributes && Object.keys(input.attributes).length > 0 ? { ticket_attributes: input.attributes } : {}),
         ...(input.createdAtIso ? { created_at: toUnix(input.createdAtIso) } : {}),
+        ...(input.conversationToLinkId ? { conversation_to_link_id: input.conversationToLinkId } : {}),
         skip_notifications: true,
       },
       "ticket create"

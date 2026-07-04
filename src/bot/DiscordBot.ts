@@ -2147,13 +2147,17 @@ export class DiscordBot {
       await interaction.deferUpdate();
       try {
         const types = await this.intercomClient.listTicketTypes();
-        // Customer-category types are what the bridge creates; fall back to the
-        // full list if the workspace reports no category field.
-        const customer = types.filter((t) => (t.category ?? "").toLowerCase() === "customer");
-        const pool = customer.length > 0 ? customer : types;
+        // Both Customer and Back-office types work (back-office avoids the
+        // channel gate on Intercom's "ticket created" workflow trigger); list
+        // everything, back-office first, category visible in the description.
+        const rank = (t: { category?: string | null }) => {
+          const c = (t.category ?? "").toLowerCase();
+          return c === "back-office" ? 0 : c === "customer" ? 1 : 2;
+        };
+        const pool = [...types].sort((a, b) => rank(a) - rank(b));
         if (pool.length === 0) {
           await interaction.followUp({
-            embeds: [makeEmbed("Intercom returned no ticket types — create a Customer ticket type in Intercom first.", COLORS.warn)],
+            embeds: [makeEmbed("Intercom returned no ticket types — create one in Intercom first (Back-office recommended).", COLORS.warn)],
             flags: 64,
           });
           return;
@@ -2274,7 +2278,10 @@ export class DiscordBot {
     return {
       embeds: [
         makeEmbed(
-          "Map each ticket category to an Intercom **ticket type** (Customer category). The **Default** mapping is required — it catches tickets with no category-specific mapping.",
+          [
+            "Map each ticket category to an Intercom **ticket type**. The **Default** mapping is required — it catches tickets with no category-specific mapping.",
+            "**Back-office types are recommended**: Intercom's \"ticket created\" workflow trigger channel-gates Customer tickets (API-created ones never match), while back-office tickets trigger without a channel filter — and your customers never see Intercom anyway.",
+          ].join("\n"),
           COLORS.neutral
         ),
       ],
