@@ -214,6 +214,21 @@ const STATEMENTS: string[] = [
     CONSTRAINT "ticket_tag_changes_pkey" PRIMARY KEY ("id")
   )`,
   `CREATE INDEX IF NOT EXISTS "ticket_tag_changes_ticketThreadId_kind_idx" ON "ticket_tag_changes"("ticketThreadId", "kind")`,
+  // Cleanup of the removed Chatwoot bridge (replaced by Intercom): drops the
+  // bridge tables and bot_settings columns from deployments that ran it. These
+  // have no counterpart in schema.prisma — they exist only to converge old DBs
+  // — and are idempotent no-ops everywhere else.
+  `DROP TABLE IF EXISTS "chatwoot_outbox"`,
+  `DROP TABLE IF EXISTS "chatwoot_links"`,
+  `ALTER TABLE "bot_settings" DROP COLUMN IF EXISTS "chatwootMode"`,
+  `ALTER TABLE "bot_settings" DROP COLUMN IF EXISTS "chatwootBaseUrl"`,
+  `ALTER TABLE "bot_settings" DROP COLUMN IF EXISTS "chatwootAccountId"`,
+  `ALTER TABLE "bot_settings" DROP COLUMN IF EXISTS "chatwootInboxIdentifier"`,
+  `ALTER TABLE "bot_settings" DROP COLUMN IF EXISTS "chatwootHmacKey"`,
+  `ALTER TABLE "bot_settings" DROP COLUMN IF EXISTS "chatwootBotToken"`,
+  `ALTER TABLE "bot_settings" DROP COLUMN IF EXISTS "chatwootWebhookSecret"`,
+  `ALTER TABLE "bot_settings" DROP COLUMN IF EXISTS "chatwootApiToken"`,
+  `ALTER TABLE "bot_settings" DROP COLUMN IF EXISTS "chatwootInboxId"`,
 ];
 
 export async function ensureSchema(prisma: PrismaClient): Promise<void> {
