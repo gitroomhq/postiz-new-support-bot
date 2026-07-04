@@ -145,6 +145,22 @@ export class StripeClient {
     return { charges: res.data, nextPage: res.next_page ?? null };
   }
 
+  // last4 is far from unique — callers should aggregate by fingerprint for exact
+  // identification. Both inputs are validated by the caller (digits / [a-z_]) since
+  // they are interpolated into the query string.
+  async searchChargesByCardLast4(
+    last4: string,
+    brand: string | undefined,
+    limit = 10,
+    page?: string
+  ): Promise<{ charges: Stripe.Charge[]; nextPage: string | null }> {
+    const query =
+      `payment_method_details.card.last4:"${last4}"` +
+      (brand ? ` AND payment_method_details.card.brand:"${brand}"` : "");
+    const res = await this.stripe.charges.search({ query, limit, ...(page ? { page } : {}) });
+    return { charges: res.data, nextPage: res.next_page ?? null };
+  }
+
   async getCustomer(customerId: string): Promise<Stripe.Customer | null> {
     const customer = await this.stripe.customers.retrieve(customerId);
     return customer.deleted ? null : (customer as Stripe.Customer);

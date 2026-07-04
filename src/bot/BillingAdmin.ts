@@ -23,7 +23,7 @@ import { SessionStore } from "../auth/SessionStore";
 import { embed as makeEmbed, COLORS } from "../util/embeds";
 
 // Actions that first resolve "a user" to a Stripe customer before running.
-const TARGET_ACTIONS = ["cards", "overview", "charges", "invoices", "fraud", "discount", "editcust"] as const;
+const TARGET_ACTIONS = ["cards", "overview", "charges", "invoices", "fraud", "discount", "editcust", "delcust"] as const;
 type TargetAction = (typeof TARGET_ACTIONS)[number];
 
 const TARGET_TITLES: Record<TargetAction | "link", string> = {
@@ -34,6 +34,7 @@ const TARGET_TITLES: Record<TargetAction | "link", string> = {
   fraud: "Disputes & fraud signals",
   discount: "Apply discount coupon",
   editcust: "Edit customer info",
+  delcust: "Delete a customer",
   link: "Link / unlink Stripe customer",
 };
 
@@ -101,6 +102,10 @@ export class BillingAdmin {
 
     if (id === "billadmin_root") {
       await interaction.update(this.buildRootPanel());
+      return;
+    }
+    if (id.startsWith("billadmin_hub:")) {
+      await interaction.update(this.buildHubPanel(id.split(":")[1]));
       return;
     }
     if (id === "billadmin_promo_check") {
@@ -172,7 +177,7 @@ export class BillingAdmin {
         await this.stripeClient.cancelSubscription(session.subscriptionId!);
         await interaction.editReply({
           embeds: [makeEmbed(`🔚 Subscription \`${session.subscriptionId}\` cancelled.`, COLORS.success)],
-          components: [this.backRow()],
+          components: [this.backRow("billadmin_hub:subs")],
         });
       });
       return;
@@ -190,7 +195,7 @@ export class BillingAdmin {
               COLORS.success
             ),
           ],
-          components: [this.backRow()],
+          components: [this.backRow("billadmin_hub:subs")],
         });
       });
       return;
@@ -208,7 +213,7 @@ export class BillingAdmin {
               COLORS.success
             ),
           ],
-          components: [this.backRow()],
+          components: [this.backRow("billadmin_hub:subs")],
         });
       });
       return;
@@ -284,7 +289,7 @@ export class BillingAdmin {
               COLORS.success
             ),
           ],
-          components: [this.backRow()],
+          components: [this.backRow("billadmin_hub:customers")],
         });
       });
       return;
@@ -293,23 +298,7 @@ export class BillingAdmin {
       const token = id.split(":")[1];
       const session = await this.getOwnedSession(token, interaction);
       if (!session?.customerId) return;
-      const embed = new EmbedBuilder()
-        .setTitle("Delete customer")
-        .setColor(COLORS.danger)
-        .setDescription(
-          `⚠️ This **permanently deletes** \`${session.customerId}\` in Stripe: active subscriptions are ` +
-            "cancelled immediately, and the deletion **cannot be undone**. Payment history stays visible " +
-            "in the Stripe dashboard, but the customer object is gone."
-        );
-      await interaction.update({
-        embeds: [embed],
-        components: [
-          this.buttonRow(
-            this.btn(`billadmin_cust_delete_exec:${token}`, "Delete customer", ButtonStyle.Danger),
-            this.btn(`billadmin_editcust_show:${token}`, "Back", ButtonStyle.Secondary)
-          ),
-        ],
-      });
+      await interaction.update(this.buildCustomerDeleteConfirm(token));
       return;
     }
     if (id.startsWith("billadmin_cards_show:")) {
@@ -538,6 +527,10 @@ export class BillingAdmin {
       await this.handleFingerprintModal(interaction, id.split(":")[1]);
       return;
     }
+    if (id === "billadmin_last4_modal") {
+      await this.handleLast4Modal(interaction);
+      return;
+    }
     if (id === "billadmin_refund_modal") {
       await this.handleRefundModal(interaction);
       return;
@@ -596,6 +589,9 @@ export class BillingAdmin {
       case "chargesbycard":
         await interaction.showModal(this.buildFingerprintModal(action));
         return;
+      case "cardsbylast4":
+        await interaction.showModal(this.buildLast4Modal());
+        return;
       case "refund":
         await interaction.showModal(this.buildRefundModal());
         return;
@@ -645,6 +641,18 @@ export class BillingAdmin {
       case "editcust":
         await this.renderEditCustomer(interaction, token);
         return;
+      case "delcust": {
+        const customer = await this.stripeClient.getCustomer(session.customerId!);
+        if (!customer) {
+          await interaction.editReply({
+            embeds: [makeEmbed(`No such Stripe customer: \`${session.customerId}\` (or already deleted).`, COLORS.warn)],
+            components: [this.backRow("billadmin_hub:customers")],
+          });
+          return;
+        }
+        await interaction.editReply(this.buildCustomerDeleteConfirm(token, customer));
+        return;
+      }
     }
   }
 
@@ -695,7 +703,7 @@ export class BillingAdmin {
           return;
         }
         const token = this.newSession(interaction, { pendingAction: action });
-        await interaction.editReply(this.buildCustomerPickPanel(customers, token));
+        await interaction.editReply(this.buildCustomerPickPanel(customers, token, this.hubFor(action)));
         return;
       }
 
@@ -723,7 +731,7 @@ export class BillingAdmin {
         );
       await interaction.editReply({
         embeds: [makeEmbed(`Postiz user \`${target}\` maps to ${stripeIds.length} Stripe customers.`, COLORS.warn)],
-        components: [this.selectRow(select), this.backRow()],
+        components: [this.selectRow(select), this.backRow(this.hubFor(action))],
       });
     });
   }
@@ -753,6 +761,80 @@ export class BillingAdmin {
     });
   }
 
+  private async handleLast4Modal(interaction: ModalSubmitInteraction): Promise<void> {
+    const last4 = interaction.fields.getTextInputValue("last4").trim();
+    const brand = interaction.fields.getTextInputValue("brand").trim().toLowerCase();
+    if (!/^\d{4}$/.test(last4)) {
+      await interaction.reply({ embeds: [makeEmbed("Enter exactly the 4 digits.", COLORS.danger)], flags: 64 });
+      return;
+    }
+    if (brand && !/^[a-z_]+$/.test(brand)) {
+      await interaction.reply({
+        embeds: [makeEmbed("Brand must be letters only (visa, mastercard, amex, …).", COLORS.danger)],
+        flags: 64,
+      });
+      return;
+    }
+
+    await this.ackModal(interaction);
+    await this.tryRender(interaction, async () => {
+      const { charges, nextPage } = await this.stripeClient.searchChargesByCardLast4(last4, brand || undefined, 100);
+      if (charges.length === 0) {
+        await interaction.editReply({
+          embeds: [makeEmbed(`No charges found for cards ending \`${last4}\`${brand ? ` (${brand})` : ""}.`, COLORS.neutral)],
+          components: [this.backRow("billadmin_hub:cards")],
+        });
+        return;
+      }
+
+      // last4 is not unique, so group by fingerprint — that's the id the other
+      // card tools take for exact matching.
+      type Group = { label: string; exp: string; fp: string | null; count: number; customers: Map<string, string | null> };
+      const groups = new Map<string, Group>();
+      for (const charge of charges) {
+        const card = charge.payment_method_details?.card;
+        if (!card) continue;
+        const key = card.fingerprint ?? `${card.brand}-${card.last4}-nofp`;
+        const group = groups.get(key) ?? {
+          label: `${card.brand ?? "card"} •••• ${card.last4 ?? last4}`,
+          exp: `${card.exp_month ?? "?"}/${card.exp_year ?? "?"}`,
+          fp: card.fingerprint ?? null,
+          count: 0,
+          customers: new Map(),
+        };
+        group.count++;
+        const cusId = typeof charge.customer === "string" ? charge.customer : charge.customer?.id;
+        if (cusId && !group.customers.has(cusId)) {
+          group.customers.set(cusId, charge.billing_details?.email ?? charge.receipt_email ?? null);
+        }
+        groups.set(key, group);
+      }
+
+      const lines = [...groups.values()].map((g) => {
+        const customers = [...g.customers.entries()]
+          .slice(0, 5)
+          .map(([id, email]) => `\`${id}\`${email ? ` (${email})` : ""}`)
+          .join(", ");
+        const more = g.customers.size > 5 ? ` +${g.customers.size - 5} more` : "";
+        return (
+          `**${g.label}** · exp ${g.exp} · ${g.count} charge(s)\n` +
+          `fingerprint: ${g.fp ? `\`${g.fp}\`` : "—"}\ncustomers: ${customers || "—"}${more}`
+        );
+      });
+
+      const embed = new EmbedBuilder()
+        .setTitle(`Cards ending •••• ${last4}${brand ? ` (${brand})` : ""}`)
+        .setColor(COLORS.brand)
+        .setDescription(lines.join("\n\n").slice(0, 4096))
+        .setFooter({
+          text:
+            `From the ${charges.length} most recent matching charges${nextPage ? " — more exist" : ""} · ` +
+            "last4 is not unique — use the fingerprint tools for exact matches · Search data can lag ~1 min",
+        });
+      await interaction.editReply({ embeds: [embed], components: [this.backRow("billadmin_hub:cards")] });
+    });
+  }
+
   private async renderUsersByCard(
     interaction: { editReply: (payload: Panel) => Promise<unknown> },
     fingerprint: string
@@ -761,7 +843,7 @@ export class BillingAdmin {
     if (charges.length === 0) {
       await interaction.editReply({
         embeds: [makeEmbed(`No charges found for card fingerprint \`${fingerprint}\`.`, COLORS.neutral)],
-        components: [this.backRow()],
+        components: [this.backRow("billadmin_hub:cards")],
       });
       return;
     }
@@ -791,7 +873,7 @@ export class BillingAdmin {
           `Aggregated from the ${charges.length} most recent matching charges` +
           `${nextPage ? " — more exist" : ""} · Search data can lag ~1 min`,
       });
-    await interaction.editReply({ embeds: [embed], components: [this.backRow()] });
+    await interaction.editReply({ embeds: [embed], components: [this.backRow("billadmin_hub:cards")] });
   }
 
   // ---- customer-scoped renderers ----
@@ -850,7 +932,7 @@ export class BillingAdmin {
     if (cards.size === 0) {
       await interaction.editReply({
         embeds: [makeEmbed(`No card payment methods or card charges found for \`${customerId}\`.`, COLORS.neutral)],
-        components: [this.backRow()],
+        components: [this.backRow("billadmin_hub:cards")],
       });
       return;
     }
@@ -893,7 +975,7 @@ export class BillingAdmin {
         );
       components.push(this.selectRow(select));
     }
-    components.push(this.backRow());
+    components.push(this.backRow("billadmin_hub:cards"));
     await interaction.editReply({ embeds: [embed], components });
   }
 
@@ -913,7 +995,7 @@ export class BillingAdmin {
     if (!customer) {
       await interaction.editReply({
         embeds: [makeEmbed(`No such Stripe customer: \`${customerId}\` (or it was deleted).`, COLORS.warn)],
-        components: [this.backRow()],
+        components: [this.backRow("billadmin_hub:customers")],
       });
       return;
     }
@@ -963,7 +1045,7 @@ export class BillingAdmin {
           this.btn(`billadmin_goto:invoices:${token}`, "Invoices", ButtonStyle.Primary),
           this.btn(`billadmin_goto:fraud:${token}`, "Disputes & Fraud", ButtonStyle.Primary)
         ),
-        this.backRow(),
+        this.backRow("billadmin_hub:customers"),
       ],
     });
   }
@@ -1022,7 +1104,7 @@ export class BillingAdmin {
         this.buttonRow(
           this.btn(`billadmin_page:${token}:${page - 1}`, "◀ Prev", ButtonStyle.Secondary, page <= 0),
           this.btn(`billadmin_page:${token}:${page + 1}`, "Next ▶", ButtonStyle.Secondary, !hasNext),
-          this.btn("billadmin_root", "Back", ButtonStyle.Secondary)
+          this.btn(session.view === "fpcharges" ? "billadmin_hub:cards" : "billadmin_hub:charges", "Back", ButtonStyle.Secondary)
         ),
       ],
     });
@@ -1094,7 +1176,7 @@ export class BillingAdmin {
       .setFooter({
         text: "risk_score requires Radar for Fraud Teams · EFW match covers the 100 most recent warnings · Search data can lag ~1 min",
       });
-    await interaction.editReply({ embeds: [embed], components: [this.backRow()] });
+    await interaction.editReply({ embeds: [embed], components: [this.backRow("billadmin_hub:charges")] });
   }
 
   // ---- discount flow ----
@@ -1109,7 +1191,7 @@ export class BillingAdmin {
     if (!this.config.stripe.discountCouponId) {
       await interaction.editReply({
         embeds: [makeEmbed("No discount coupon configured (STRIPE_DISCOUNT_COUPON_ID).", COLORS.danger)],
-        components: [this.backRow()],
+        components: [this.backRow("billadmin_hub:subs")],
       });
       return;
     }
@@ -1119,7 +1201,7 @@ export class BillingAdmin {
     if (candidates.length === 0) {
       await interaction.editReply({
         embeds: [makeEmbed(`\`${session.customerId}\` has no active subscription to discount.`, COLORS.warn)],
-        components: [this.backRow()],
+        components: [this.backRow("billadmin_hub:subs")],
       });
       return;
     }
@@ -1141,7 +1223,7 @@ export class BillingAdmin {
       );
     await interaction.editReply({
       embeds: [makeEmbed(`\`${session.customerId}\` has ${candidates.length} eligible subscriptions.`, COLORS.brand)],
-      components: [this.selectRow(select), this.backRow()],
+      components: [this.selectRow(select), this.backRow("billadmin_hub:subs")],
     });
   }
 
@@ -1167,7 +1249,7 @@ export class BillingAdmin {
       components: [
         this.buttonRow(
           this.btn(`billadmin_discount_exec:${token}`, "Apply coupon", ButtonStyle.Danger),
-          this.btn("billadmin_root", "Cancel", ButtonStyle.Secondary)
+          this.btn("billadmin_hub:subs", "Cancel", ButtonStyle.Secondary)
         ),
       ],
     };
@@ -1206,7 +1288,7 @@ export class BillingAdmin {
               embeds: [
                 makeEmbed(`\`${charge.currency}\` is a zero-decimal currency — whole amounts only.`, COLORS.danger),
               ],
-              components: [this.backRow()],
+              components: [this.backRow("billadmin_hub:charges")],
             });
             return;
           }
@@ -1221,14 +1303,14 @@ export class BillingAdmin {
       if (charge.refunded || remaining <= 0) {
         await interaction.editReply({
           embeds: [makeEmbed(`Already fully refunded (${fmt(charge.amount_refunded)} of ${fmt(charge.amount)}).`, COLORS.warn)],
-          components: [this.backRow()],
+          components: [this.backRow("billadmin_hub:charges")],
         });
         return;
       }
       if (amountMinor != null && (amountMinor <= 0 || amountMinor > remaining)) {
         await interaction.editReply({
           embeds: [makeEmbed(`Requested amount exceeds the un-refunded remainder of ${fmt(remaining)}.`, COLORS.danger)],
-          components: [this.backRow()],
+          components: [this.backRow("billadmin_hub:charges")],
         });
         return;
       }
@@ -1270,7 +1352,7 @@ export class BillingAdmin {
           this.buttonRow(
             this.btn(`billadmin_refund_exec:${token}`, "Refund", ButtonStyle.Danger),
             this.btn(`billadmin_refund_execsub:${token}`, "Refund + cancel sub", ButtonStyle.Danger),
-            this.btn("billadmin_root", "Cancel", ButtonStyle.Secondary)
+            this.btn("billadmin_hub:charges", "Cancel", ButtonStyle.Secondary)
           ),
         ],
       });
@@ -1314,7 +1396,7 @@ export class BillingAdmin {
             COLORS.success
           ),
         ],
-        components: [this.backRow()],
+        components: [this.backRow("billadmin_hub:charges")],
       });
     });
   }
@@ -1343,7 +1425,7 @@ export class BillingAdmin {
       if (!sub || sub.status === "canceled") {
         await interaction.editReply({
           embeds: [makeEmbed(`No active subscription found for \`${target}\`.`, COLORS.warn)],
-          components: [this.backRow()],
+          components: [this.backRow("billadmin_hub:subs")],
         });
         return;
       }
@@ -1371,7 +1453,7 @@ export class BillingAdmin {
           this.buttonRow(
             this.btn(`billadmin_cancelsub_exec:${token}`, "Cancel now", ButtonStyle.Danger),
             this.btn(`billadmin_cancelsub_softexec:${token}`, "Cancel at period end", ButtonStyle.Primary),
-            this.btn("billadmin_root", "Back", ButtonStyle.Secondary)
+            this.btn("billadmin_hub:subs", "Back", ButtonStyle.Secondary)
           ),
         ],
       });
@@ -1393,7 +1475,7 @@ export class BillingAdmin {
       if (customers.length === 0) {
         await interaction.editReply({
           embeds: [makeEmbed(`No Stripe customer found for \`${email}\` (exact match).`, COLORS.warn)],
-          components: [this.backRow()],
+          components: [this.backRow("billadmin_hub:customers")],
         });
         return;
       }
@@ -1403,11 +1485,11 @@ export class BillingAdmin {
         return;
       }
       const token = this.newSession(interaction, { pendingAction: "overview" });
-      await interaction.editReply(this.buildCustomerPickPanel(customers, token));
+      await interaction.editReply(this.buildCustomerPickPanel(customers, token, "billadmin_hub:customers"));
     });
   }
 
-  private buildCustomerPickPanel(customers: Stripe.Customer[], token: string): Panel {
+  private buildCustomerPickPanel(customers: Stripe.Customer[], token: string, backTarget: string): Panel {
     const select = new StringSelectMenuBuilder()
       .setCustomId(`billadmin_cuspick:${token}`)
       .setPlaceholder("Several customers matched — pick one")
@@ -1420,7 +1502,7 @@ export class BillingAdmin {
       );
     return {
       embeds: [makeEmbed(`${customers.length} Stripe customers matched.`, COLORS.brand)],
-      components: [this.selectRow(select), this.backRow()],
+      components: [this.selectRow(select), this.backRow(backTarget)],
     };
   }
 
@@ -1457,7 +1539,7 @@ export class BillingAdmin {
     if (row?.stripeCustomerId) {
       buttons.push(this.btn(`billadmin_link_clear:${token}`, "Unlink", ButtonStyle.Danger));
     }
-    buttons.push(this.btn("billadmin_root", "Back", ButtonStyle.Secondary));
+    buttons.push(this.btn("billadmin_hub:customers", "Back", ButtonStyle.Secondary));
     return { embeds: [embed], components: [this.buttonRow(...buttons)] };
   }
 
@@ -1505,7 +1587,7 @@ export class BillingAdmin {
     if (!customer) {
       await interaction.editReply({
         embeds: [makeEmbed(`No such Stripe customer: \`${session.customerId}\` (or it was deleted).`, COLORS.warn)],
-        components: [this.backRow()],
+        components: [this.backRow("billadmin_hub:customers")],
       });
       return;
     }
@@ -1549,7 +1631,7 @@ export class BillingAdmin {
           this.btn(`billadmin_taxid_add:${token}`, "Add tax ID", ButtonStyle.Primary),
           this.btn(`billadmin_taxid_remove:${token}`, "Remove tax ID", ButtonStyle.Secondary, taxIds.length === 0),
           this.btn(`billadmin_cust_delete:${token}`, "Delete customer", ButtonStyle.Danger),
-          this.btn("billadmin_root", "Back", ButtonStyle.Secondary)
+          this.btn("billadmin_hub:customers", "Back", ButtonStyle.Secondary)
         ),
       ],
     });
@@ -2039,10 +2121,11 @@ export class BillingAdmin {
       .setColor(COLORS.brand)
       .setDescription(
         [
-          "**Card tools** — fingerprints of a user, users/charges by fingerprint",
-          "**Customer** — overview, email lookup, charges, invoices, disputes & fraud",
-          "**Money** — refunds, subscription cancel, discounts, promo codes",
-          "**Identity** — edit customer info, link/unlink Stripe ↔ Discord",
+          "💳 **Cards** — lookups by user, fingerprint or last 4 · set default · detach",
+          "👤 **Customers** — overview, email lookup, create, edit (VAT/address), link, delete",
+          "💰 **Charges** — charge & invoice history, disputes & fraud, refunds",
+          "🔄 **Subscriptions** — view, apply discount, cancel",
+          "🎟️ **Promos** — promo codes & coupons",
         ].join("\n")
       )
       .setFooter({
@@ -2053,30 +2136,139 @@ export class BillingAdmin {
       embeds: [embed],
       components: [
         this.buttonRow(
-          this.btn("billadmin_open:cards", "User's Cards", ButtonStyle.Primary),
-          this.btn("billadmin_open:usersbycard", "Users by Card", ButtonStyle.Primary),
-          this.btn("billadmin_open:chargesbycard", "Charges by Card", ButtonStyle.Primary)
-        ),
-        this.buttonRow(
-          this.btn("billadmin_open:overview", "Overview", ButtonStyle.Primary),
-          this.btn("billadmin_open:email", "Find by Email", ButtonStyle.Primary),
-          this.btn("billadmin_open:charges", "Charges", ButtonStyle.Primary),
-          this.btn("billadmin_open:invoices", "Invoices", ButtonStyle.Primary),
-          this.btn("billadmin_open:fraud", "Disputes & Fraud", ButtonStyle.Primary)
-        ),
-        this.buttonRow(
-          this.btn("billadmin_open:refund", "Refund Charge", ButtonStyle.Danger),
-          this.btn("billadmin_open:cancelsub", "Cancel Subscription", ButtonStyle.Danger),
-          this.btn("billadmin_open:discount", "Apply Discount", ButtonStyle.Primary),
-          this.btn("billadmin_open:promo", "Promo Codes", ButtonStyle.Primary)
-        ),
-        this.buttonRow(
-          this.btn("billadmin_open:editcust", "Edit Customer", ButtonStyle.Primary),
-          this.btn("billadmin_open:createcust", "Create Customer", ButtonStyle.Primary),
-          this.btn("billadmin_open:link", "Link / Unlink User", ButtonStyle.Secondary)
+          this.btn("billadmin_hub:cards", "💳 Cards", ButtonStyle.Primary),
+          this.btn("billadmin_hub:customers", "👤 Customers", ButtonStyle.Primary),
+          this.btn("billadmin_hub:charges", "💰 Charges", ButtonStyle.Primary),
+          this.btn("billadmin_hub:subs", "🔄 Subscriptions", ButtonStyle.Primary),
+          this.btn("billadmin_open:promo", "🎟️ Promos", ButtonStyle.Primary)
         ),
       ],
     };
+  }
+
+  // Second navigation level: one hub per top-level area, grouping its actions
+  // by CRUD verb. The concrete flows (target pickers, modals, results) hang off
+  // the same billadmin_open:/billadmin_manual: ids as before.
+  private buildHubPanel(area: string): Panel {
+    if (area === "cards") {
+      const embed = new EmbedBuilder()
+        .setTitle("💳 Cards")
+        .setColor(COLORS.brand)
+        .setDescription(
+          [
+            "**Read** — a user's cards, or hunt cards account-wide by fingerprint / last 4.",
+            "**Update / Delete** — open *User's Cards* and pick a saved card to set it as default or detach it.",
+          ].join("\n")
+        );
+      return {
+        embeds: [embed],
+        components: [
+          this.buttonRow(
+            this.btn("billadmin_open:cards", "User's Cards", ButtonStyle.Primary),
+            this.btn("billadmin_open:usersbycard", "Users by Card", ButtonStyle.Primary),
+            this.btn("billadmin_open:chargesbycard", "Charges by Card", ButtonStyle.Primary),
+            this.btn("billadmin_open:cardsbylast4", "Cards by Last 4", ButtonStyle.Primary)
+          ),
+          this.backRow(),
+        ],
+      };
+    }
+    if (area === "customers") {
+      const embed = new EmbedBuilder()
+        .setTitle("👤 Customers")
+        .setColor(COLORS.brand)
+        .setDescription(
+          [
+            "**Read** — full overview, or find a customer by email.",
+            "**Create** — a bare Stripe customer.",
+            "**Update** — details, address, VAT/tax IDs · link/unlink the Discord ↔ Stripe mapping.",
+            "**Delete** — permanently remove a customer (cancels their subscriptions).",
+          ].join("\n")
+        );
+      return {
+        embeds: [embed],
+        components: [
+          this.buttonRow(
+            this.btn("billadmin_open:overview", "Overview", ButtonStyle.Primary),
+            this.btn("billadmin_open:email", "Find by Email", ButtonStyle.Primary)
+          ),
+          this.buttonRow(
+            this.btn("billadmin_open:createcust", "Create", ButtonStyle.Success),
+            this.btn("billadmin_open:editcust", "Edit", ButtonStyle.Primary),
+            this.btn("billadmin_open:link", "Link / Unlink", ButtonStyle.Secondary)
+          ),
+          this.buttonRow(
+            this.btn("billadmin_open:delcust", "Delete Customer", ButtonStyle.Danger),
+            this.btn("billadmin_root", "◀ Back", ButtonStyle.Secondary)
+          ),
+        ],
+      };
+    }
+    if (area === "charges") {
+      const embed = new EmbedBuilder()
+        .setTitle("💰 Charges")
+        .setColor(COLORS.brand)
+        .setDescription(
+          [
+            "**Read** — a user's charge and invoice history, plus disputes & fraud signals.",
+            "**Refund** — full or partial refund of a charge, optionally cancelling the subscription.",
+          ].join("\n")
+        );
+      return {
+        embeds: [embed],
+        components: [
+          this.buttonRow(
+            this.btn("billadmin_open:charges", "Charges for User", ButtonStyle.Primary),
+            this.btn("billadmin_open:invoices", "Invoices", ButtonStyle.Primary),
+            this.btn("billadmin_open:fraud", "Disputes & Fraud", ButtonStyle.Primary)
+          ),
+          this.buttonRow(
+            this.btn("billadmin_open:refund", "Refund a Charge", ButtonStyle.Danger),
+            this.btn("billadmin_root", "◀ Back", ButtonStyle.Secondary)
+          ),
+        ],
+      };
+    }
+    if (area === "subs") {
+      const embed = new EmbedBuilder()
+        .setTitle("🔄 Subscriptions")
+        .setColor(COLORS.brand)
+        .setDescription(
+          [
+            "**Read** — subscriptions are listed in the customer *Overview*.",
+            "**Update** — apply the configured discount coupon.",
+            "**Delete** — cancel now, or at the end of the current period.",
+          ].join("\n")
+        );
+      return {
+        embeds: [embed],
+        components: [
+          this.buttonRow(
+            this.btn("billadmin_open:overview", "View (Overview)", ButtonStyle.Primary),
+            this.btn("billadmin_open:discount", "Apply Discount", ButtonStyle.Primary),
+            this.btn("billadmin_open:cancelsub", "Cancel Subscription", ButtonStyle.Danger)
+          ),
+          this.backRow(),
+        ],
+      };
+    }
+    return this.buildRootPanel();
+  }
+
+  // Which hub a detail flow's Back button returns to.
+  private hubFor(action: TargetAction | "link"): string {
+    switch (action) {
+      case "cards":
+        return "billadmin_hub:cards";
+      case "charges":
+      case "invoices":
+      case "fraud":
+        return "billadmin_hub:charges";
+      case "discount":
+        return "billadmin_hub:subs";
+      default:
+        return "billadmin_hub:customers"; // overview, editcust, delcust, link
+    }
   }
 
   private buildTargetPanel(action: TargetAction | "link", error?: string): Panel {
@@ -2102,7 +2294,7 @@ export class BillingAdmin {
     if (action !== "link") {
       buttons.push(this.btn(`billadmin_manual:${action}`, "Enter cus_ / email / Postiz ID", ButtonStyle.Secondary));
     }
-    buttons.push(this.btn("billadmin_root", "◀ Back", ButtonStyle.Secondary));
+    buttons.push(this.btn(this.hubFor(action), "◀ Back", ButtonStyle.Secondary));
 
     return {
       embeds: [embed],
@@ -2150,6 +2342,23 @@ export class BillingAdmin {
           this.textInput("fingerprint", "Card fingerprint", {
             required: true,
             placeholder: "e.g. Xt5EWLLDS7FJjR1c",
+          })
+        )
+      );
+  }
+
+  private buildLast4Modal(): ModalBuilder {
+    return new ModalBuilder()
+      .setCustomId("billadmin_last4_modal")
+      .setTitle("Cards by last 4 digits")
+      .addComponents(
+        new ActionRowBuilder<TextInputBuilder>().addComponents(
+          this.textInput("last4", "Last 4 digits", { required: true, placeholder: "4242", maxLength: 4 })
+        ),
+        new ActionRowBuilder<TextInputBuilder>().addComponents(
+          this.textInput("brand", "Brand filter (optional)", {
+            required: false,
+            placeholder: "visa / mastercard / amex — narrows results",
           })
         )
       );
@@ -2505,8 +2714,33 @@ export class BillingAdmin {
     return new ActionRowBuilder<MessageActionRowComponentBuilder>().addComponents(select);
   }
 
-  private backRow(): ActionRowBuilder<MessageActionRowComponentBuilder> {
-    return this.buttonRow(this.btn("billadmin_root", "◀ Back", ButtonStyle.Secondary));
+  // The delete confirm is reachable both from the customers hub (delcust) and
+  // from inside the edit panel; the optional customer object enriches the former.
+  private buildCustomerDeleteConfirm(token: string, customer?: Stripe.Customer): Panel {
+    const session = this.sessions.get(token);
+    const customerId = session?.customerId ?? "?";
+    const who = customer ? ` (${[customer.email, customer.name].filter(Boolean).join(", ") || "no email/name"})` : "";
+    const embed = new EmbedBuilder()
+      .setTitle("Delete customer")
+      .setColor(COLORS.danger)
+      .setDescription(
+        `⚠️ This **permanently deletes** \`${customerId}\`${who} in Stripe: active subscriptions are ` +
+          "cancelled immediately, and the deletion **cannot be undone**. Payment history stays visible " +
+          "in the Stripe dashboard, but the customer object is gone."
+      );
+    return {
+      embeds: [embed],
+      components: [
+        this.buttonRow(
+          this.btn(`billadmin_cust_delete_exec:${token}`, "Delete customer", ButtonStyle.Danger),
+          this.btn(`billadmin_editcust_show:${token}`, "Back", ButtonStyle.Secondary)
+        ),
+      ],
+    };
+  }
+
+  private backRow(target = "billadmin_root"): ActionRowBuilder<MessageActionRowComponentBuilder> {
+    return this.buttonRow(this.btn(target, "◀ Back", ButtonStyle.Secondary));
   }
 
   private promoBackRow(): ActionRowBuilder<MessageActionRowComponentBuilder> {
