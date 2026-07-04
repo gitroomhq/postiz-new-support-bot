@@ -279,6 +279,7 @@ const STATEMENTS: string[] = [
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "intercomAdminId" TEXT`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "intercomOperatorAdminId" TEXT`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "intercomTicketTypeMap" JSONB`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "intercomTeamId" TEXT`,
   `ALTER TABLE "status_tags" ADD COLUMN IF NOT EXISTS "intercomTicketStateId" TEXT`,
 ];
 

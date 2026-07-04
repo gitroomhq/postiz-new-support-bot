@@ -280,6 +280,31 @@ export class IntercomOutboxScheduler {
 
     await this.markDiscordOrigin(threadId, link.conversationId);
 
+    // Team routing (Intercom's workflow triggers can't see API-created
+    // conversations/tickets, so the bridge assigns directly). Permanent
+    // failures degrade with an audit warning — a wrong/deleted team id must
+    // not dead-letter tickets — and only apply on creation: later reassignment
+    // by agents is never overridden.
+    const teamId = this.settingsStore.intercomTeamId();
+    if (teamId) {
+      try {
+        await this.withAuthor((a) => this.client.assignConversationToTeam(link.conversationId, teamId, a));
+        await this.withAuthor((a) => this.client.updateTicket(ticketId, { assigneeId: teamId, adminId: a }));
+      } catch (e) {
+        if (!isPermanent4xx(e)) throw e;
+        void this.audit.log({
+          title: "🌉 Intercom team assignment failed",
+          severity: "warn",
+          actor: "Intercom bridge",
+          threadId,
+          fields: [
+            { name: "Team", value: teamId, inline: true },
+            { name: "Error", value: (e instanceof Error ? e.message : String(e)).slice(0, 1024), inline: false },
+          ],
+        });
+      }
+    }
+
     // Conversation open/close parity: API-created conversations start open.
     const target: "open" | "closed" = payload.closed || payload.resolved ? "closed" : "open";
     if (target === "closed" && link.lastSyncedOpen !== "closed") {

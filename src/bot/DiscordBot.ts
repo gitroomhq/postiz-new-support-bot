@@ -2071,6 +2071,7 @@ export class DiscordBot {
           `**Authoring as:** ${authorLine}`,
           `**Ticket types:** ${typesLine}`,
           `**Status states mapped:** ${mappedStates}/${s.tags().length}`,
+          `**Team routing:** ${s.intercomTeamId() ? `team \`${s.intercomTeamId()}\`` : "_unassigned_"}`,
           "",
           `**Bridged tickets:** ${links}/${totalTickets}`,
           `**Outbox:** ${outbox.pending} pending · ${outbox.dead} failed`,
@@ -2111,6 +2112,7 @@ export class DiscordBot {
     );
 
     const actionButtons = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId("config_intercom_team").setLabel("Assign Team").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("config_intercom_backfill").setLabel("Backfill tickets").setStyle(ButtonStyle.Secondary),
       new ButtonBuilder()
         .setCustomId("config_intercom_retry_dead")
@@ -2139,6 +2141,14 @@ export class DiscordBot {
     if (id === "config_intercom_admin_pick") {
       await this.settingsStore.updateIntercom({ intercomAdminId: value });
       this.auditConfig(interaction, `Intercom fallback admin → ${value}`);
+      await interaction.update(await this.buildIntercomPanel());
+      return;
+    }
+
+    if (id === "config_intercom_team_pick") {
+      const teamId = value === "__none__" ? null : value;
+      await this.settingsStore.updateIntercom({ intercomTeamId: teamId });
+      this.auditConfig(interaction, `Intercom team routing → ${teamId ?? "unassigned"}`);
       await interaction.update(await this.buildIntercomPanel());
       return;
     }
@@ -2789,6 +2799,44 @@ export class DiscordBot {
       } catch (e) {
         await interaction.followUp({
           embeds: [makeEmbed(`Could not list Intercom admins: ${e instanceof Error ? e.message : e}`, COLORS.danger)],
+          flags: 64,
+        });
+      }
+      return;
+    }
+
+    if (id === "config_intercom_team") {
+      await interaction.deferUpdate();
+      try {
+        const teams = await this.intercomClient.listTeams();
+        const current = this.settingsStore.intercomTeamId();
+        const select = new StringSelectMenuBuilder()
+          .setCustomId("config_intercom_team_pick")
+          .setPlaceholder("Team for new bridged conversations/tickets")
+          .addOptions([
+            { label: "— unassigned —", value: "__none__", description: "Don't route; conversations land in the shared inbox", default: !current },
+            ...teams.slice(0, 24).map((t) => ({
+              label: t.name.slice(0, 100),
+              value: t.id,
+              description: `id ${t.id}`,
+              default: t.id === current,
+            })),
+          ]);
+        const back = new ActionRowBuilder<ButtonBuilder>().addComponents(
+          new ButtonBuilder().setCustomId("config_intercom").setLabel("Back").setStyle(ButtonStyle.Secondary)
+        );
+        await interaction.editReply({
+          embeds: [
+            makeEmbed(
+              "Every new bridged conversation **and** its ticket get assigned to this team on creation (Intercom workflow triggers can't see API-created conversations, so the bridge routes directly). Agents can reassign afterwards — the bridge never overrides.",
+              COLORS.neutral
+            ),
+          ],
+          components: [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(select), back],
+        });
+      } catch (e) {
+        await interaction.followUp({
+          embeds: [makeEmbed(`Could not list Intercom teams: ${e instanceof Error ? e.message : e}`, COLORS.danger)],
           flags: 64,
         });
       }

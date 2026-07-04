@@ -90,6 +90,7 @@ model BotSettings {
   intercomAdminId       String?                  // configured authoring admin (fallback)
   intercomOperatorAdminId String?                // auto-detected Operator/Fin; null = rejected/not found
   intercomTicketTypeMap Json?                    // { "<categoryId>"|"_default": "<ticketTypeId>" }
+  intercomTeamId        String?                  // team the bridge assigns new conversations/tickets to (null = unassigned)
   updatedAt           DateTime  @updatedAt
 
   @@map("bot_settings")

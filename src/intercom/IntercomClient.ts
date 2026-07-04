@@ -112,6 +112,18 @@ export class IntercomClient {
       .map((a) => ({ id: String(a.id), name: a.name ?? null, email: a.email ?? null }));
   }
 
+  async listTeams(): Promise<Array<{ id: string; name: string }>> {
+    const data = await this.json<{ teams?: Array<{ id?: string | number; name?: string }> }>(
+      "/teams",
+      "GET",
+      undefined,
+      "teams"
+    );
+    return (data.teams ?? [])
+      .filter((t) => t.id != null)
+      .map((t) => ({ id: String(t.id), name: t.name ?? `Team ${t.id}` }));
+  }
+
   // ---- Contacts ----
 
   async findContactByExternalId(externalId: string): Promise<{ id: string } | null> {
@@ -284,6 +296,16 @@ export class IntercomClient {
     );
   }
 
+  // Manage endpoint: route the conversation to a team inbox.
+  async assignConversationToTeam(conversationId: string, teamId: string, adminId: string): Promise<void> {
+    await this.json(
+      `/conversations/${encodeURIComponent(conversationId)}/parts`,
+      "POST",
+      { message_type: "assignment", type: "team", admin_id: adminId, assignee_id: teamId },
+      "conversation assignment"
+    );
+  }
+
   // Manage endpoint: close/open the conversation (admin-authored part).
   async setConversationOpen(conversationId: string, open: boolean, adminId: string): Promise<void> {
     await this.json(
@@ -346,11 +368,12 @@ export class IntercomClient {
     return { ticketId: String(data.id) };
   }
 
-  // Custom state transitions and/or attribute writes. admin_id is numeric in
-  // this endpoint's schema ("needed for workflows").
+  // Custom state transitions, attribute writes and assignment. admin_id is
+  // numeric in this endpoint's schema ("needed for workflows"); assigneeId
+  // accepts an admin OR team id.
   async updateTicket(
     ticketId: string,
-    input: { stateId?: string; attributes?: Record<string, unknown>; adminId?: string }
+    input: { stateId?: string; attributes?: Record<string, unknown>; adminId?: string; assigneeId?: string }
   ): Promise<void> {
     const adminIdNum = input.adminId != null ? Number(input.adminId) : NaN;
     await this.json(
@@ -360,6 +383,7 @@ export class IntercomClient {
         ...(input.stateId ? { ticket_state_id: input.stateId } : {}),
         ...(input.attributes && Object.keys(input.attributes).length > 0 ? { ticket_attributes: input.attributes } : {}),
         ...(Number.isFinite(adminIdNum) ? { admin_id: adminIdNum } : {}),
+        ...(input.assigneeId ? { assignee_id: input.assigneeId } : {}),
         skip_notifications: true,
       },
       "ticket update"

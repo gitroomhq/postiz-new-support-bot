@@ -289,6 +289,10 @@ export class SettingsStore {
     return this.intercomOperatorAdminId() ?? this.intercomAdminId();
   }
 
+  intercomTeamId(): string | null {
+    return this.settings.intercomTeamId ?? process.env.INTERCOM_TEAM_ID ?? null;
+  }
+
   intercomTicketTypeMap(): Record<string, string> {
     const map = this.settings.intercomTicketTypeMap as unknown;
     if (map && typeof map === "object" && !Array.isArray(map)) {
@@ -314,6 +318,7 @@ export class SettingsStore {
     intercomAdminId?: string | null;
     intercomOperatorAdminId?: string | null;
     intercomTicketTypeMap?: Record<string, string> | null;
+    intercomTeamId?: string | null;
   }): Promise<void> {
     const { intercomTicketTypeMap, ...rest } = data;
     this.settings = await this.prisma.botSettings.update({
