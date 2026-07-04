@@ -256,6 +256,34 @@ export class IntercomClient {
     return { partId: last?.id != null ? String(last.id) : null };
   }
 
+  // Find-or-create by name (tag names are case-insensitive unique per workspace).
+  async findOrCreateTag(name: string): Promise<{ id: string }> {
+    const data = await this.json<{ id?: string | number }>("/tags", "POST", { name }, "tag create");
+    if (data.id == null) throw new IntercomHttpError(500, "Intercom tag create: missing id in response");
+    return { id: String(data.id) };
+  }
+
+  async tagConversation(conversationId: string, tagId: string, adminId: string): Promise<void> {
+    await this.json(
+      `/conversations/${encodeURIComponent(conversationId)}/tags`,
+      "POST",
+      { id: tagId, admin_id: adminId },
+      "conversation tag"
+    );
+  }
+
+  // Conversation custom attributes must be predefined in Intercom's UI
+  // (Settings → Data → Conversations) — the data_attributes API only covers
+  // contact/company models, so writes 4xx until the definitions exist.
+  async setConversationAttributes(conversationId: string, attributes: Record<string, unknown>): Promise<void> {
+    await this.json(
+      `/conversations/${encodeURIComponent(conversationId)}`,
+      "PUT",
+      { custom_attributes: attributes },
+      "conversation update"
+    );
+  }
+
   // Manage endpoint: close/open the conversation (admin-authored part).
   async setConversationOpen(conversationId: string, open: boolean, adminId: string): Promise<void> {
     await this.json(

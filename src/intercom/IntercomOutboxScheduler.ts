@@ -30,6 +30,11 @@ const MAX_ATTACHMENT_URLS = 10;
 export const TICKET_ATTR_PRIORITY = "Priority";
 export const TICKET_ATTR_CSAT = "CSAT";
 export const TICKET_ATTR_THREAD = "Discord Thread";
+// "Came from Discord" markers on the conversation itself: a tag (find-or-create
+// via API, works with zero setup) and an Origin attribute (definition is
+// UI-managed, so it only lands once created in the workspace).
+export const CONVERSATION_TAG = "Discord";
+export const CONV_ATTR_ORIGIN = "Origin";
 
 // Drains the intercom_outbox: per tick it takes the head event of each ticket
 // queue (per-ticket FIFO — a failing event blocks only its own ticket) and
@@ -40,6 +45,7 @@ export class IntercomOutboxScheduler {
   private draining = false;
   private lastEchoCleanupAt = 0;
   private contactAttrsEnsured = false;
+  private discordTagId: string | null = null;
 
   constructor(
     private client: IntercomClient,
@@ -265,12 +271,41 @@ export class IntercomOutboxScheduler {
     }
     if (stateId) await this.store.setLastSyncedStateId(threadId, stateId);
 
+    await this.markDiscordOrigin(threadId, link.conversationId);
+
     // Conversation open/close parity: API-created conversations start open.
     if (payload.closed || payload.resolved) {
       await this.withAuthor((a) => this.client.setConversationOpen(link.conversationId, false, a));
       await this.store.setLastSyncedOpen(threadId, "closed");
     } else {
       await this.store.setLastSyncedOpen(threadId, "open");
+    }
+  }
+
+  // Best-effort "came from Discord" markers on the conversation. Never fails
+  // the ensure: the tag needs no setup (find-or-create, cached per process);
+  // the attributes 4xx until their definitions are created in the Intercom UI
+  // and are skipped silently until then.
+  private async markDiscordOrigin(threadId: string, conversationId: string): Promise<void> {
+    try {
+      if (!this.discordTagId) {
+        this.discordTagId = (await this.client.findOrCreateTag(CONVERSATION_TAG)).id;
+      }
+      const tagId = this.discordTagId;
+      await this.withAuthor((a) => this.client.tagConversation(conversationId, tagId, a));
+    } catch (e) {
+      this.discordTagId = null; // stale cache (tag deleted in Intercom) — recreate next time
+      console.warn(`Intercom: tagging conversation ${conversationId} failed:`, e instanceof Error ? e.message : e);
+    }
+    try {
+      await this.client.setConversationAttributes(conversationId, {
+        [CONV_ATTR_ORIGIN]: "Discord",
+        [TICKET_ATTR_THREAD]: threadId,
+      });
+    } catch (e) {
+      if (!(e instanceof IntercomHttpError && (e.status === 400 || e.status === 422))) {
+        console.warn(`Intercom: conversation attributes for ${conversationId} failed:`, e instanceof Error ? e.message : e);
+      }
     }
   }
 

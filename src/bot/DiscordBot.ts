@@ -2839,6 +2839,8 @@ export class DiscordBot {
               ...(failed
                 ? ["", "✗ = could not create via API. Add the attribute manually in Intercom: Settings → Ticket types → add a text attribute with exactly that name."]
                 : []),
+              "",
+              "Conversations are marked with a **Discord** tag automatically. For the optional `Origin` + `Discord Thread` conversation attributes, create them once by hand (Settings → Data → Conversations) — the API can't define conversation attributes.",
             ].join("\n"),
             failed ? COLORS.warn : COLORS.success
           ),
