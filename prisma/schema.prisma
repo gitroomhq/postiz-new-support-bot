@@ -82,57 +82,9 @@ model BotSettings {
   refundMaxPer24h     Int?
   refundMinMemberAgeDays Int?
   auditLogChannelId   String?
-  // Chatwoot bridge (all edited via /config → Chatwoot, no env access on deploy).
-  // Auth model: NO agent API key — the contact side uses the public Client API
-  // (inbox identifier + identity-validation HMAC), the agent side an Agent Bot token.
-  chatwootMode        String    @default("none") // "none" | "push" | "bi"
-  chatwootBaseUrl     String?
-  chatwootAccountId   String?
-  chatwootInboxIdentifier String?
-  chatwootHmacKey     String?
-  chatwootBotToken    String?
-  chatwootWebhookSecret String?
   updatedAt           DateTime  @updatedAt
 
   @@map("bot_settings")
-}
-
-// One row per Discord ticket bridged to a Chatwoot conversation.
-// conversationId is Chatwoot's display_id (used by bot endpoints and webhooks);
-// contactSourceId is the Client-API contact identifier (source_id) needed to
-// post customer messages as the contact.
-model ChatwootLink {
-  id               String    @id @default(cuid())
-  ticketThreadId   String    @unique
-  contactId        Int
-  contactSourceId  String
-  conversationId   Int       @unique
-  // Push mode: stamped when the one-time "one-way mirror" warning note was sent.
-  agentWarnedAt    DateTime?
-  // Last open/resolved state the bridge pushed — damps status echo loops.
-  lastSyncedStatus String?
-  createdAt        DateTime  @default(now())
-
-  @@map("chatwoot_links")
-}
-
-// Durable queue of pending Chatwoot API calls. Global seq gives per-ticket FIFO;
-// the drainer only processes the head event per ticketThreadId.
-model ChatwootOutboxEvent {
-  id             String   @id @default(cuid())
-  seq            Int      @unique @default(autoincrement())
-  ticketThreadId String
-  type           String   // ensure_conversation | message | note | status | priority | csat
-  payload        Json
-  status         String   @default("PENDING") // PENDING | DEAD
-  attempts       Int      @default(0)
-  nextAttemptAt  DateTime @default(now())
-  lastError      String?
-  createdAt      DateTime @default(now())
-
-  @@index([ticketThreadId, seq])
-  @@index([status, nextAttemptAt])
-  @@map("chatwoot_outbox")
 }
 
 model StatusTag {

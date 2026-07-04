@@ -54,10 +54,6 @@ import { StatusReportService } from "./StatusReportService";
 import { CallbackServer } from "../server/CallbackServer";
 import { BillingCategory } from "../categories/BillingCategory";
 import { BaseCategory, TicketContext } from "../categories/BaseCategory";
-import { ChatwootSyncService, BridgeSourceMessage } from "../chatwoot/ChatwootSyncService";
-import { ChatwootStore } from "../chatwoot/ChatwootStore";
-import { ChatwootWebhookHandler } from "../chatwoot/ChatwootWebhookHandler";
-import { ChatwootMode } from "../config/SettingsStore";
 
 type TicketSearchFilters = {
   categoryId?: string;
@@ -95,21 +91,10 @@ export class DiscordBot {
     private reportService: StatusReportService,
     private cannedStore: CannedResponseStore,
     private audit: AuditLogger,
-    private tierStore: EscalationTierStore,
-    private chatwootSync: ChatwootSyncService,
-    private chatwootStore: ChatwootStore,
-    private chatwootWebhook: ChatwootWebhookHandler
+    private tierStore: EscalationTierStore
   ) {
     this.client = new Client({
-      // MessageContent is privileged (enable it in the Dev Portal too) — without it
-      // message bodies/attachments of other users are empty, and the Chatwoot
-      // mirror would push blanks.
-      intents: [
-        GatewayIntentBits.Guilds,
-        GatewayIntentBits.GuildMessages,
-        GatewayIntentBits.GuildMembers,
-        GatewayIntentBits.MessageContent,
-      ],
+      intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.GuildMembers],
     });
 
     this.rest = new REST({ version: "10" }).setToken(config.discord.token);
@@ -153,37 +138,10 @@ export class DiscordBot {
           silent: true,
         });
       } else {
-        // Thread is gone/unreachable — still reconcile the DB. This path bypasses
-        // StatusService, so the Chatwoot push needs its own hook.
+        // Thread is gone/unreachable — still reconcile the DB.
         await this.ticketStore.close(ticket.threadId).catch(() => {});
-        void this.chatwootSync
-          .onStatusChanged(ticket.threadId, ticket.statusTag ?? null, closingTag, "System (member left)")
-          .catch((e) => console.error("Chatwoot status push failed:", e));
       }
     }
-  }
-
-  // Reduces a discord.js message to the bridge shape (also used by the backfill
-  // walker). Embed-only messages (historical AI answers, the "Your question"
-  // embed) are flattened to text so they don't mirror as blanks.
-  private toBridgeMessage(message: Message, member: GuildMember | null): BridgeSourceMessage {
-    const embedText = message.embeds
-      .map((e) => [e.title, e.description].filter(Boolean).join("\n"))
-      .filter(Boolean)
-      .join("\n\n");
-    return {
-      discordMessageId: message.id,
-      authorId: message.author.id,
-      authorName: member?.displayName ?? message.author.displayName ?? message.author.username,
-      authorIsBot: message.author.bot,
-      content: message.content || embedText || "",
-      attachments: message.attachments.map((a) => ({
-        url: a.url,
-        filename: a.name ?? "attachment",
-        size: a.size,
-      })),
-      createdAt: message.createdAt,
-    };
   }
 
   // Human messages in tracked ticket threads drive two things:
@@ -196,19 +154,11 @@ export class DiscordBot {
     const ticket = await this.ticketStore.getByThreadId(message.channelId);
     if (!ticket) return;
 
-    // Mirror every human message to Chatwoot (before the early returns below —
-    // chatter in closed tickets must mirror too). Fire-and-forget: a Chatwoot
-    // problem never touches the Discord flow.
-    const member = message.member ?? (await message.guild?.members.fetch(message.author.id).catch(() => null)) ?? null;
-    const isStaff = !!member && this.isStaffMember(member);
-    void this.chatwootSync
-      .onHumanMessage(ticket, this.toBridgeMessage(message, member), isStaff)
-      .catch((e) => console.error("Chatwoot message push failed:", e));
-
     // First support reply on an open ticket. Only support/admin members count, so
     // another invited human (or the customer) can't skew the metric.
     if (!ticket.closed && !ticket.firstResponseAt && ticket.customerId && message.author.id !== ticket.customerId) {
-      const isSupport = isStaff;
+      const member = message.member ?? (await message.guild?.members.fetch(message.author.id).catch(() => null)) ?? null;
+      const isSupport = !!member && this.isStaffMember(member);
       if (isSupport && member) {
         try {
           await this.ticketStore.setFirstResponse(ticket.threadId, message.createdAt);
@@ -404,9 +354,6 @@ export class DiscordBot {
         return;
       }
       await this.ticketStore.addNote(thread.id, member.id, member.displayName, text);
-      void this.chatwootSync
-        .onNoteAdded(thread.id, member.displayName, text)
-        .catch((e) => console.error("Chatwoot note push failed:", e));
       void this.audit.log({
         title: "📝 Note added",
         actor: member.displayName,
@@ -1161,14 +1108,6 @@ export class DiscordBot {
             ...(question ? [{ name: "Question", value: question }] : []),
           ],
         });
-        void this.chatwootSync
-          .onTicketCreated(thread.id, category.label, question ?? null)
-          .catch((e) => console.error("Chatwoot ticket push failed:", e));
-      },
-      onAiAnswer: async (thread, finalText) => {
-        void this.chatwootSync
-          .onAiAnswer(thread.id, finalText)
-          .catch((e) => console.error("Chatwoot AI answer push failed:", e));
       },
     };
   }
@@ -1423,9 +1362,6 @@ export class DiscordBot {
       return false;
     });
     if (recorded) {
-      void this.chatwootSync
-        .onCsat(threadId, score)
-        .catch((e) => console.error("Chatwoot CSAT push failed:", e));
       void this.audit.log({
         title: "⭐ CSAT rating",
         severity: score >= 4 ? "success" : score === 3 ? "warn" : "danger",
@@ -1462,9 +1398,6 @@ export class DiscordBot {
         await interaction.reply({ embeds: [makeEmbed("You've already left feedback for this ticket — thank you!", COLORS.warn)], flags: 64 });
         return;
       }
-      void this.chatwootSync
-        .onCsat(threadId, ticket.csatScore, comment)
-        .catch((e) => console.error("Chatwoot CSAT push failed:", e));
       void this.audit.log({
         title: "💬 CSAT comment",
         actor: interaction.user.displayName,
@@ -1908,7 +1841,6 @@ export class DiscordBot {
           `**Billing audit:** ${s.billingAuditChannelId() ? `<#${s.billingAuditChannelId()}>` : "_in-thread ping_"}`,
           `**Audit log:** ${s.auditLogChannelId() ? `<#${s.auditLogChannelId()}>` : "off"}`,
           `**Ticket limits:** ${s.maxOpenTicketsPerUser() > 0 ? `max ${s.maxOpenTicketsPerUser()} open` : "no cap"} · ${s.ticketCooldownMinutes() > 0 ? `${s.ticketCooldownMinutes()}m cooldown` : "no cooldown"}`,
-          `**Chatwoot:** ${s.chatwootMode() === "none" ? "off" : `${s.chatwootMode()}${s.chatwootConfigured() ? "" : " ⚠️ not configured"}`}`,
         ].join("\n")
       );
 
@@ -1923,7 +1855,6 @@ export class DiscordBot {
     const secondary = [
       new ButtonBuilder().setCustomId("config_priorities").setLabel("Manage Priorities").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("config_escalation").setLabel("Escalation").setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId("config_chatwoot").setLabel("Chatwoot").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("config_reverify").setLabel("Re-Verify").setStyle(ButtonStyle.Secondary),
     ];
     if (!s.backfillDone()) {
@@ -2016,79 +1947,6 @@ export class DiscordBot {
       embeds: [embed],
       components: [new ActionRowBuilder<ChannelSelectMenuBuilder>().addComponents(channelSelect), buttons],
     };
-  }
-
-  private async buildChatwootPanel() {
-    const s = this.settingsStore;
-    const mode = s.chatwootMode();
-    const [links, totalTickets, outbox] = await Promise.all([
-      this.chatwootStore.countLinks().catch(() => 0),
-      this.ticketStore.getAllWithTag().then((t) => t.length).catch(() => 0),
-      this.chatwootStore.counts().catch(() => ({ pending: 0, dead: 0 })),
-    ]);
-
-    const mask = (value: string | null) => (value ? `••••${value.slice(-4)}` : "_not set_");
-    const modeLine =
-      mode === "none"
-        ? "**none** — bridge off, tickets stay Discord-only"
-        : mode === "push"
-          ? "**push** — one-way mirror Discord → Chatwoot"
-          : "**bi** — full sync, agent replies & status come back";
-
-    const embed = new EmbedBuilder()
-      .setTitle("Chatwoot Bridge")
-      .setColor(0x5865f2)
-      .setDescription(
-        [
-          `**Mode:** ${modeLine}`,
-          ...(s.chatwootConfigured()
-            ? []
-            : ["⚠️ **Connection incomplete** — the bridge queues events but pushes nothing until it is set."]),
-          "",
-          `**Base URL:** ${s.chatwootBaseUrl() ? `\`${s.chatwootBaseUrl()}\`` : "_not set_"}`,
-          `**Account / Inbox identifier:** ${s.chatwootAccountId() ?? "_not set_"} / ${s.chatwootInboxIdentifier() ? `\`${s.chatwootInboxIdentifier()}\`` : "_not set_"}`,
-          `**Bot token:** ${mask(s.chatwootBotToken())} · **HMAC key:** ${s.chatwootHmacKey() ? mask(s.chatwootHmacKey()) : "_off_"}`,
-          `**Webhook secret:** ${s.chatwootWebhookSecret() ? "set — endpoint `POST /chatwoot/webhook?secret=…`" : "_not set — inbound webhook disabled_"}`,
-          "",
-          `**Bridged tickets:** ${links}/${totalTickets}`,
-          `**Outbox:** ${outbox.pending} pending · ${outbox.dead} failed`,
-          "",
-          "Modes apply to tickets created inside Discord only; Chatwoot-native conversations (email/live chat) are never touched.",
-        ].join("\n")
-      );
-
-    const modeButtons = new ActionRowBuilder<ButtonBuilder>().addComponents(
-      new ButtonBuilder()
-        .setCustomId("config_chatwoot_mode_none")
-        .setLabel("Off")
-        .setStyle(mode === "none" ? ButtonStyle.Success : ButtonStyle.Secondary)
-        .setDisabled(mode === "none"),
-      new ButtonBuilder()
-        .setCustomId("config_chatwoot_mode_push")
-        .setLabel("Push (one-way)")
-        .setStyle(mode === "push" ? ButtonStyle.Success : ButtonStyle.Secondary)
-        .setDisabled(mode === "push"),
-      new ButtonBuilder()
-        .setCustomId("config_chatwoot_mode_bi")
-        .setLabel("Bidirectional")
-        .setStyle(mode === "bi" ? ButtonStyle.Success : ButtonStyle.Secondary)
-        .setDisabled(mode === "bi"),
-      new ButtonBuilder().setCustomId("config_chatwoot_reset").setLabel("Reset bridge data").setStyle(ButtonStyle.Danger)
-    );
-
-    const actionButtons = new ActionRowBuilder<ButtonBuilder>().addComponents(
-      new ButtonBuilder().setCustomId("config_chatwoot_connection").setLabel("Set Connection").setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId("config_chatwoot_secrets").setLabel("Set Secrets").setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId("config_chatwoot_backfill").setLabel("Backfill tickets").setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder()
-        .setCustomId("config_chatwoot_retry_dead")
-        .setLabel(`Retry failed (${outbox.dead})`)
-        .setStyle(ButtonStyle.Secondary)
-        .setDisabled(outbox.dead === 0),
-      new ButtonBuilder().setCustomId("config_back_main").setLabel("Back").setStyle(ButtonStyle.Secondary)
-    );
-
-    return { embeds: [embed], components: [modeButtons, actionButtons] };
   }
 
   private buildGeneralPanel() {
@@ -2420,138 +2278,6 @@ export class DiscordBot {
       return;
     }
 
-    if (id === "config_chatwoot") {
-      await interaction.update(await this.buildChatwootPanel());
-      return;
-    }
-
-    if (id.startsWith("config_chatwoot_mode_")) {
-      const mode = id.slice("config_chatwoot_mode_".length) as ChatwootMode;
-      if (mode !== "none" && mode !== "push" && mode !== "bi") return;
-      const before = this.settingsStore.chatwootMode();
-      await this.settingsStore.updateChatwoot({ chatwootMode: mode });
-      this.auditConfig(interaction, `Chatwoot mode → ${mode}`);
-      await interaction.update(await this.buildChatwootPanel());
-      // Turning the bridge on backfills every existing ticket (open + closed);
-      // already-bridged tickets are skipped, so repeat switches are harmless.
-      if (before === "none" && mode !== "none") {
-        void this.runChatwootBackfill(interaction).catch((e) => console.error("Chatwoot backfill failed:", e));
-      }
-      return;
-    }
-
-    if (id === "config_chatwoot_reset") {
-      const [links, outbox] = await Promise.all([this.chatwootStore.countLinks(), this.chatwootStore.counts()]);
-      const confirm = new ActionRowBuilder<ButtonBuilder>().addComponents(
-        new ButtonBuilder().setCustomId("config_chatwoot_reset_confirm").setLabel("Yes, wipe bridge data").setStyle(ButtonStyle.Danger),
-        new ButtonBuilder().setCustomId("config_chatwoot").setLabel("Cancel").setStyle(ButtonStyle.Secondary)
-      );
-      await interaction.update({
-        embeds: [
-          makeEmbed(
-            [
-              `This deletes the bot's local bridge state: **${links}** conversation link(s) and **${outbox.pending + outbox.dead}** queued event(s).`,
-              "",
-              "Nothing is deleted in Chatwoot itself. Use this when the Chatwoot side was cleared or recreated and the bookkeeping is stale — the next **Backfill** rebuilds every ticket from Discord.",
-              "⚠️ If conversations still exist in Chatwoot, the next backfill will create duplicates.",
-            ].join("\n"),
-            COLORS.warn
-          ),
-        ],
-        components: [confirm],
-      });
-      return;
-    }
-
-    if (id === "config_chatwoot_reset_confirm") {
-      const result = await this.chatwootStore.resetAll();
-      this.auditConfig(interaction, `Chatwoot bridge data reset (${result.links} links, ${result.events} queued events deleted)`);
-      await interaction.update(await this.buildChatwootPanel());
-      await interaction.followUp({
-        embeds: [
-          makeEmbed(
-            `Bridge data wiped: ${result.links} link(s), ${result.events} event(s). Run **Backfill tickets** to rebuild.`,
-            COLORS.success
-          ),
-        ],
-        flags: 64,
-      });
-      return;
-    }
-
-    if (id === "config_chatwoot_retry_dead") {
-      const requeued = await this.chatwootStore.retryDead();
-      this.auditConfig(interaction, `Chatwoot outbox → requeued ${requeued} failed event(s)`);
-      await interaction.update(await this.buildChatwootPanel());
-      return;
-    }
-
-    if (id === "config_chatwoot_backfill") {
-      await interaction.deferReply({ flags: 64 });
-      await this.runChatwootBackfill(interaction);
-      return;
-    }
-
-    if (id === "config_chatwoot_connection") {
-      const s = this.settingsStore;
-      const modal = new ModalBuilder().setCustomId("config_chatwoot_connection_modal").setTitle("Chatwoot Connection");
-      const baseUrl = new TextInputBuilder()
-        .setCustomId("base_url")
-        .setLabel("Base URL (https://chatwoot.example.com)")
-        .setStyle(TextInputStyle.Short)
-        .setRequired(true)
-        .setValue(s.chatwootBaseUrl() ?? "");
-      const accountId = new TextInputBuilder()
-        .setCustomId("account_id")
-        .setLabel("Account ID (number in the Chatwoot URL)")
-        .setStyle(TextInputStyle.Short)
-        .setRequired(true)
-        .setValue(s.chatwootAccountId() ?? "");
-      const inboxIdentifier = new TextInputBuilder()
-        .setCustomId("inbox_identifier")
-        .setLabel("Inbox identifier (API inbox settings)")
-        .setStyle(TextInputStyle.Short)
-        .setRequired(true)
-        .setValue(s.chatwootInboxIdentifier() ?? "");
-      modal.addComponents(
-        new ActionRowBuilder<TextInputBuilder>().addComponents(baseUrl),
-        new ActionRowBuilder<TextInputBuilder>().addComponents(accountId),
-        new ActionRowBuilder<TextInputBuilder>().addComponents(inboxIdentifier)
-      );
-      await interaction.showModal(modal);
-      return;
-    }
-
-    if (id === "config_chatwoot_secrets") {
-      const s = this.settingsStore;
-      const modal = new ModalBuilder().setCustomId("config_chatwoot_secrets_modal").setTitle("Chatwoot Secrets");
-      const botToken = new TextInputBuilder()
-        .setCustomId("bot_token")
-        .setLabel("Agent Bot access token")
-        .setStyle(TextInputStyle.Short)
-        .setRequired(true)
-        .setValue(s.chatwootBotToken() ?? "");
-      const hmacKey = new TextInputBuilder()
-        .setCustomId("hmac_key")
-        .setLabel("Identity-validation HMAC key (optional)")
-        .setStyle(TextInputStyle.Short)
-        .setRequired(false)
-        .setValue(s.chatwootHmacKey() ?? "");
-      const webhookSecret = new TextInputBuilder()
-        .setCustomId("webhook_secret")
-        .setLabel("Webhook secret (blank = inbound off)")
-        .setStyle(TextInputStyle.Short)
-        .setRequired(false)
-        .setValue(s.chatwootWebhookSecret() ?? "");
-      modal.addComponents(
-        new ActionRowBuilder<TextInputBuilder>().addComponents(botToken),
-        new ActionRowBuilder<TextInputBuilder>().addComponents(hmacKey),
-        new ActionRowBuilder<TextInputBuilder>().addComponents(webhookSecret)
-      );
-      await interaction.showModal(modal);
-      return;
-    }
-
     if (id === "config_audit_clear_channel") {
       // Log before clearing so the "turned off" entry still reaches the channel.
       await this.audit.log({
@@ -2873,83 +2599,6 @@ export class DiscordBot {
       this.auditConfig(interaction, repo ? `GitHub repo → \`${repo}\`` : "GitHub repo → cleared");
       await interaction.reply({
         embeds: [makeEmbed(repo ? `GitHub repo set to \`${repo}\`.` : "GitHub repo cleared.", COLORS.success)],
-        flags: 64,
-      });
-      return;
-    }
-
-    if (interaction.customId === "config_chatwoot_connection_modal") {
-      const baseUrlRaw = interaction.fields.getTextInputValue("base_url").trim().replace(/\/+$/, "");
-      const accountId = interaction.fields.getTextInputValue("account_id").trim();
-      const inboxIdentifier = interaction.fields.getTextInputValue("inbox_identifier").trim();
-
-      if (!/^https?:\/\/.+/i.test(baseUrlRaw)) {
-        await interaction.reply({
-          embeds: [makeEmbed("Base URL must start with http(s)://, e.g. `https://chatwoot.example.com`.", COLORS.danger)],
-          flags: 64,
-        });
-        return;
-      }
-      if (!/^\d+$/.test(accountId)) {
-        await interaction.reply({
-          embeds: [makeEmbed("Account ID must be a number (it's in the Chatwoot URL: `/app/accounts/<id>/…`).", COLORS.danger)],
-          flags: 64,
-        });
-        return;
-      }
-      if (!inboxIdentifier) {
-        await interaction.reply({
-          embeds: [makeEmbed("Inbox identifier is required (API inbox → Configuration → Inbox Identifier).", COLORS.danger)],
-          flags: 64,
-        });
-        return;
-      }
-
-      await this.settingsStore.updateChatwoot({
-        chatwootBaseUrl: baseUrlRaw,
-        chatwootAccountId: accountId,
-        chatwootInboxIdentifier: inboxIdentifier,
-      });
-      this.auditConfig(interaction, `Chatwoot connection → ${baseUrlRaw} (account ${accountId})`);
-      await interaction.reply({
-        embeds: [
-          makeEmbed(
-            `Chatwoot connection saved for \`${baseUrlRaw}\`.${this.settingsStore.chatwootBotToken() ? "" : "\nNow add the Agent Bot token under **Set Secrets**."}`,
-            COLORS.success
-          ),
-        ],
-        flags: 64,
-      });
-      return;
-    }
-
-    if (interaction.customId === "config_chatwoot_secrets_modal") {
-      const botToken = interaction.fields.getTextInputValue("bot_token").trim();
-      const hmacKey = interaction.fields.getTextInputValue("hmac_key").trim();
-      const webhookSecret = interaction.fields.getTextInputValue("webhook_secret").trim();
-
-      await this.settingsStore.updateChatwoot({
-        chatwootBotToken: botToken,
-        chatwootHmacKey: hmacKey || null,
-        chatwootWebhookSecret: webhookSecret || null,
-      });
-      // Deliberately no secret values in the audit line.
-      this.auditConfig(
-        interaction,
-        `Chatwoot secrets updated (bot token ${botToken ? "set" : "cleared"}, HMAC ${hmacKey ? "set" : "off"}, webhook secret ${webhookSecret ? "set" : "off"})`
-      );
-      await interaction.reply({
-        embeds: [
-          makeEmbed(
-            [
-              "Chatwoot secrets saved.",
-              webhookSecret
-                ? "Point the webhook at `POST <public-url>/chatwoot/webhook?secret=<your secret>` (events: message_created, conversation_status_changed)."
-                : "No webhook secret set — the inbound webhook endpoint stays disabled (needed for bi mode and the push-mode agent warning).",
-            ].join("\n"),
-            COLORS.success
-          ),
-        ],
         flags: 64,
       });
       return;
@@ -3349,88 +2998,6 @@ export class DiscordBot {
       console.error("Backfill error:", error);
       await interaction.editReply({ embeds: [makeEmbed("Backfill failed; you can try again from /config.", COLORS.danger)] });
     }
-  }
-
-  // Chatwoot backfill: enqueue a full historical replay (ALL tickets, open and
-  // closed) into the outbox. Idempotent — tickets that already have a link or a
-  // pending ensure_conversation are skipped, so re-runs and crash-recovery are
-  // safe. Enqueueing is DB-only and fast; the actual pushing happens in the
-  // outbox drainer at its own pace. Runs after the mode switch none→push/bi and
-  // from the panel's "Backfill tickets" button.
-  private async runChatwootBackfill(interaction: ButtonInteraction): Promise<void> {
-    // Mode-switch calls arrive after interaction.update(); button calls after
-    // deferReply(). followUp works for both.
-    const progress = await interaction
-      .followUp({ embeds: [makeEmbed("Chatwoot backfill started…", COLORS.neutral)], flags: 64 })
-      .catch(() => null);
-    const report = async (text: string, color: number = COLORS.neutral) => {
-      if (!progress) return;
-      await interaction.webhook.editMessage(progress.id, { embeds: [makeEmbed(text, color)] }).catch(() => {});
-    };
-
-    try {
-      const tickets = await this.ticketStore.getAllWithTag(); // oldest first
-      let enqueuedTickets = 0;
-      let enqueuedEvents = 0;
-      let skipped = 0;
-      let processed = 0;
-
-      for (const ticket of tickets) {
-        processed++;
-        if (await this.chatwootStore.hasLinkOrPendingEnsure(ticket.threadId)) {
-          skipped++;
-          continue;
-        }
-
-        const channel = await this.client.channels.fetch(ticket.threadId).catch(() => null);
-        const thread = channel?.isThread() ? (channel as ThreadChannel) : null;
-        const messages = thread ? await this.fetchAllThreadMessages(thread) : null;
-        const [notes, tagChanges] = await Promise.all([
-          this.ticketStore.listAllNotes(ticket.threadId),
-          this.ticketStore.listAllTagChanges(ticket.threadId),
-        ]);
-
-        const count = await this.chatwootSync.backfillTicket(ticket, messages, notes, tagChanges);
-        if (count != null) {
-          enqueuedTickets++;
-          enqueuedEvents += count;
-        } else {
-          skipped++;
-        }
-
-        if (processed % 10 === 0) {
-          await report(`Chatwoot backfill: ${processed}/${tickets.length} tickets scanned, ${enqueuedEvents} events queued…`);
-        }
-      }
-
-      const summary = `Chatwoot backfill queued **${enqueuedTickets}** ticket(s) (**${enqueuedEvents}** events), skipped ${skipped} already bridged. The outbox pushes them in the background — watch the count in /config → Chatwoot.`;
-      await report(summary, COLORS.success);
-      void this.audit.log({
-        title: "🌉 Chatwoot backfill",
-        severity: "info",
-        actor: interaction.user.displayName,
-        fields: [{ name: "Result", value: summary }],
-      });
-    } catch (error) {
-      console.error("Chatwoot backfill error:", error);
-      await report("Chatwoot backfill failed — check the logs; you can safely run it again from /config → Chatwoot.", COLORS.danger);
-    }
-  }
-
-  // Full history of a thread, oldest first (paged; works on archived threads).
-  private async fetchAllThreadMessages(thread: ThreadChannel): Promise<BridgeSourceMessage[]> {
-    const collected: BridgeSourceMessage[] = [];
-    let before: string | undefined;
-    for (;;) {
-      const batch = await thread.messages.fetch({ limit: 100, ...(before ? { before } : {}) }).catch(() => null);
-      if (!batch || batch.size === 0) break;
-      for (const message of batch.values()) {
-        collected.push(this.toBridgeMessage(message, message.member));
-      }
-      before = batch.last()?.id;
-      if (batch.size < 100) break;
-    }
-    return collected.sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
   }
 
   // Re-runnable reconciliation: walk every tracked ticket and repair its DB status/type/closed
@@ -3888,11 +3455,6 @@ export class DiscordBot {
           embeds: [],
           components: [selectRow, buttonRow],
         });
-      },
-      {
-        // Secret is read per request: it lives in BotSettings and can change live.
-        getSecret: () => this.settingsStore.chatwootWebhookSecret(),
-        handle: (body) => this.chatwootWebhook.handle(body),
       }
     );
     callbackServer.start();

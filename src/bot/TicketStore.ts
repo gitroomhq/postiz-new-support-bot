@@ -394,14 +394,6 @@ export class TicketStore {
     });
   }
 
-  // Full note history oldest-first (Chatwoot backfill; listNotes caps at 15 for /note list).
-  async listAllNotes(ticketThreadId: string): Promise<TicketNote[]> {
-    return this.prisma.ticketNote.findMany({
-      where: { ticketThreadId },
-      orderBy: { createdAt: "asc" },
-    });
-  }
-
   // ---- Status/priority change history ----
   // Emoji+label are snapshotted as text so /status history and /priority history
   // survive tag edits and deletions.
@@ -435,14 +427,6 @@ export class TicketStore {
       where: { ticketThreadId, kind },
       orderBy: { createdAt: "desc" },
       take: limit,
-    });
-  }
-
-  // Full status+priority history oldest-first (Chatwoot backfill).
-  async listAllTagChanges(ticketThreadId: string): Promise<TicketTagChange[]> {
-    return this.prisma.ticketTagChange.findMany({
-      where: { ticketThreadId },
-      orderBy: { createdAt: "asc" },
     });
   }
 }

@@ -29,8 +29,6 @@ export interface TicketContext {
   // the user may open a ticket. Must run before any thread is created.
   guardTicketCreate: (userId: string, guild: Guild | null) => Promise<string | null>;
   onTicketCreated: (thread: ThreadChannel, customerId: string, displayName: string, question?: string) => Promise<void>;
-  // Fired once with the complete AI answer after streaming finishes (Chatwoot mirror).
-  onAiAnswer?: (thread: ThreadChannel, finalText: string) => Promise<void>;
 }
 
 export abstract class BaseCategory {
@@ -229,9 +227,6 @@ export abstract class BaseCategory {
           await thread.send({ embeds: [embed] });
         }
       }
-
-      // One push with the complete answer (not per stream edit).
-      void ctx.onAiAnswer?.(thread, finalMessages.join("\n\n")).catch(() => {});
 
       // Offer to create a GitHub issue
       if (featureNotFound || bugConfirmed) {

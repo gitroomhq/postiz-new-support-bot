@@ -22,11 +22,6 @@ import { StatusReportScheduler } from "./bot/StatusReportScheduler";
 import { DiscordBot } from "./bot/DiscordBot";
 import { ensureSchema } from "./db/ensureSchema";
 import { HowToCategory, BugsCategory, BillingCategory } from "./categories";
-import { ChatwootClient } from "./chatwoot/ChatwootClient";
-import { ChatwootStore } from "./chatwoot/ChatwootStore";
-import { ChatwootSyncService } from "./chatwoot/ChatwootSyncService";
-import { ChatwootOutboxScheduler } from "./chatwoot/ChatwootOutboxScheduler";
-import { ChatwootWebhookHandler } from "./chatwoot/ChatwootWebhookHandler";
 
 async function main() {
   const config = loadConfig();
@@ -51,11 +46,7 @@ async function main() {
   }
   const ticketStore = new TicketStore(prisma);
   const auditLogger = new AuditLogger(settingsStore);
-  const chatwootStore = new ChatwootStore(prisma);
-  const chatwootClient = new ChatwootClient(settingsStore);
-  const chatwootSync = new ChatwootSyncService(settingsStore, chatwootStore, sessionStore, ticketStore);
-  const statusService = new StatusService(ticketStore, auditLogger, settingsStore, chatwootSync);
-  const chatwootWebhookHandler = new ChatwootWebhookHandler(settingsStore, ticketStore, statusService, chatwootStore, chatwootSync);
+  const statusService = new StatusService(ticketStore, auditLogger, settingsStore);
   const oauthManager = new OAuthManager(config, sessionStore);
   const apiClient = new PostizApiClient(config);
   const claudeRunner = new ClaudeCodeRunner(process.cwd());
@@ -83,14 +74,10 @@ async function main() {
     reportService,
     cannedStore,
     auditLogger,
-    tierStore,
-    chatwootSync,
-    chatwootStore,
-    chatwootWebhookHandler
+    tierStore
   );
   // The client exists as soon as the constructor ran; nothing fires before login.
   auditLogger.bindClient(bot.client);
-  chatwootWebhookHandler.bindClient(bot.client);
   await bot.start();
 
   const reminderScheduler = new ReminderScheduler(bot.client, settingsStore, ticketStore, statusService, auditLogger, tierStore);
@@ -102,16 +89,6 @@ async function main() {
   const recloseScheduler = new RecloseScheduler(bot.client, ticketStore, auditLogger);
   recloseScheduler.start();
 
-  const chatwootOutboxScheduler = new ChatwootOutboxScheduler(
-    chatwootClient,
-    chatwootStore,
-    settingsStore,
-    ticketStore,
-    chatwootSync,
-    auditLogger
-  );
-  chatwootOutboxScheduler.start();
-
   // Clean expired pending auths every 5 minutes
   setInterval(() => sessionStore.cleanExpiredPending(), 5 * 60 * 1000);
 
@@ -121,7 +98,6 @@ async function main() {
     reminderScheduler.stop();
     statusReportScheduler.stop();
     recloseScheduler.stop();
-    chatwootOutboxScheduler.stop();
     bot.client.destroy();
     await prisma.$disconnect();
     process.exit(0);
