@@ -23,7 +23,7 @@ import { SessionStore } from "../auth/SessionStore";
 import { embed as makeEmbed, COLORS } from "../util/embeds";
 
 // Actions that first resolve "a user" to a Stripe customer before running.
-const TARGET_ACTIONS = ["cards", "overview", "charges", "invoices", "fraud", "discount", "editcust", "delcust"] as const;
+const TARGET_ACTIONS = ["cards", "overview", "charges", "invoices", "fraud", "discount", "changeplan", "editcust", "delcust"] as const;
 type TargetAction = (typeof TARGET_ACTIONS)[number];
 
 const TARGET_TITLES: Record<TargetAction | "link", string> = {
@@ -33,6 +33,7 @@ const TARGET_TITLES: Record<TargetAction | "link", string> = {
   invoices: "Invoice history",
   fraud: "Disputes & fraud signals",
   discount: "Apply discount coupon",
+  changeplan: "Change subscription plan",
   editcust: "Edit customer info",
   delcust: "Delete a customer",
   link: "Link / unlink Stripe customer",
@@ -54,6 +55,16 @@ interface BillAdminSession {
   chargeId?: string;
   refundAmountMinor?: number | null; // null = full remaining amount
   subscriptionId?: string;
+  // Change-plan flow state.
+  pendingSubAction?: "discount" | "changeplan";
+  subItemId?: string;
+  newPriceId?: string;
+  discountChoice?: string; // "keep" | "remove" | a coupon id
+  planFrom?: string;
+  planTo?: string;
+  // Hub area the flow was entered from — Back buttons return here when an
+  // action (e.g. Overview) is listed in more than one hub.
+  originHub?: string;
   targetDiscordUserId?: string;
   promoCodeId?: string;
   paymentMethodId?: string;
@@ -131,12 +142,13 @@ export class BillingAdmin {
       return;
     }
     if (id.startsWith("billadmin_open:")) {
-      await this.handleOpen(interaction, id.split(":")[1]);
+      const [, action, origin] = id.split(":");
+      await this.handleOpen(interaction, action, origin);
       return;
     }
     if (id.startsWith("billadmin_manual:")) {
-      const action = id.split(":")[1] as TargetAction;
-      await interaction.showModal(this.buildTargetModal(action));
+      const [, action, origin] = id.split(":");
+      await interaction.showModal(this.buildTargetModal(action as TargetAction, origin));
       return;
     }
     if (id.startsWith("billadmin_page:")) {
@@ -210,6 +222,85 @@ export class BillingAdmin {
           embeds: [
             makeEmbed(
               `💸 Coupon \`${this.config.stripe.discountCouponId}\` applied to \`${session.subscriptionId}\`.`,
+              COLORS.success
+            ),
+          ],
+          components: [this.backRow("billadmin_hub:subs")],
+        });
+      });
+      return;
+    }
+    if (id.startsWith("billadmin_dchoice:")) {
+      const [, token, choice] = id.split(":");
+      const session = await this.getOwnedSession(token, interaction);
+      if (!session?.newPriceId) return;
+      if (choice === "change") {
+        await interaction.deferUpdate();
+        await this.tryRender(interaction, async () => {
+          const coupons = await this.stripeClient.listCoupons(25);
+          if (coupons.length === 0) {
+            await interaction.editReply({
+              embeds: [
+                makeEmbed(
+                  "No coupons exist — create one under 🎟️ Promos first, or continue without changing the discount.",
+                  COLORS.warn
+                ),
+              ],
+              components: [
+                this.buttonRow(
+                  this.btn(`billadmin_dchoice:${token}:keep`, "Keep as-is", ButtonStyle.Primary),
+                  this.btn(`billadmin_dchoice:${token}:remove`, "Remove discount", ButtonStyle.Danger),
+                  this.btn("billadmin_hub:subs", "Cancel", ButtonStyle.Secondary)
+                ),
+              ],
+            });
+            return;
+          }
+          const select = new StringSelectMenuBuilder()
+            .setCustomId(`billadmin_dcouponpick:${token}`)
+            .setPlaceholder("Pick the coupon for the new plan")
+            .addOptions(
+              coupons.slice(0, 25).map((c) => ({
+                label: `${c.id}${c.name ? ` (${c.name})` : ""}`.slice(0, 100),
+                description: this.couponDesc(c).slice(0, 100),
+                value: c.id,
+              }))
+            );
+          await interaction.editReply({
+            embeds: [makeEmbed("Pick the coupon to apply to the new plan:", COLORS.brand)],
+            components: [this.selectRow(select), this.backRow("billadmin_hub:subs")],
+          });
+        });
+        return;
+      }
+      session.discountChoice = choice === "remove" ? "remove" : "keep";
+      await interaction.update(this.buildChangePlanConfirm(token));
+      return;
+    }
+    if (id.startsWith("billadmin_planexec:")) {
+      const [, token, mode] = id.split(":");
+      const session = await this.getOwnedSession(token, interaction);
+      if (!session?.subscriptionId || !session.subItemId || !session.newPriceId) return;
+      await interaction.deferUpdate();
+      await this.tryRender(interaction, async () => {
+        const choice = session.discountChoice ?? "keep";
+        await this.stripeClient.changeSubscriptionPlan(
+          {
+            subscriptionId: session.subscriptionId!,
+            itemId: session.subItemId!,
+            priceId: session.newPriceId!,
+            prorationBehavior: mode === "prorate" ? "create_prorations" : "none",
+            discounts: choice === "remove" ? "clear" : choice === "keep" ? undefined : choice,
+          },
+          `billadmin-plan-${interaction.id}`
+        );
+        await interaction.editReply({
+          embeds: [
+            makeEmbed(
+              `✅ \`${session.subscriptionId}\` changed to **${session.planTo}** ` +
+                `(${mode === "prorate" ? "prorated" : "no proration"}). Discount ${
+                  choice === "keep" ? "unchanged" : choice === "remove" ? "removed" : `set to \`${choice}\``
+                }.`,
               COLORS.success
             ),
           ],
@@ -357,7 +448,7 @@ export class BillingAdmin {
 
   async handleUserSelect(interaction: UserSelectMenuInteraction): Promise<void> {
     if (!(await this.requireAdmin(interaction))) return;
-    const action = interaction.customId.split(":")[1];
+    const [, action, origin] = interaction.customId.split(":");
     const pickedId = interaction.values[0];
     if (!pickedId) return;
     await interaction.deferUpdate();
@@ -372,7 +463,8 @@ export class BillingAdmin {
               "link",
               `<@${pickedId}> has never authenticated with the bot, so there is no session row to attach a ` +
                 `Stripe customer to (creating one would let them skip the OAuth login). Ask them to click ` +
-                `**Start Here** and log in first.`
+                `**Start Here** and log in first.`,
+              origin
             )
           );
           return;
@@ -388,7 +480,8 @@ export class BillingAdmin {
           this.buildTargetPanel(
             action,
             `<@${pickedId}> has no bot session — they've never logged in via **Start Here**. ` +
-              `Use manual entry (cus_… / email) instead.`
+              `Use manual entry (cus_… / email) instead.`,
+            origin
           )
         );
         return;
@@ -398,12 +491,13 @@ export class BillingAdmin {
           this.buildTargetPanel(
             action,
             `<@${pickedId}> has a session but no linked Stripe customer. Link one via ` +
-              `**Link / Unlink User**, or use manual entry (cus_… / email).`
+              `**Link / Unlink User**, or use manual entry (cus_… / email).`,
+            origin
           )
         );
         return;
       }
-      const token = this.newSession(interaction, { customerId: row.stripeCustomerId });
+      const token = this.newSession(interaction, { customerId: row.stripeCustomerId, originHub: origin });
       await this.runTargetAction(interaction, token, action);
     });
   }
@@ -432,8 +526,34 @@ export class BillingAdmin {
       await this.tryRender(interaction, async () => {
         const sub = await this.stripeClient.getSubscription(value);
         session.subscriptionId = sub.id;
-        await interaction.editReply(this.buildDiscountConfirmPanel(sub, token));
+        if (session.pendingSubAction === "changeplan") {
+          await this.showPlanPicker(interaction, token, sub);
+        } else {
+          await interaction.editReply(this.buildDiscountConfirmPanel(sub, token));
+        }
       });
+      return;
+    }
+    if (id.startsWith("billadmin_planpick:")) {
+      const token = id.split(":")[1];
+      const session = await this.getOwnedSession(token, interaction);
+      if (!session?.subscriptionId) return;
+      await interaction.deferUpdate();
+      await this.tryRender(interaction, async () => {
+        const price = await this.stripeClient.getPrice(value);
+        session.newPriceId = price.id;
+        session.planTo = this.priceLabel(price);
+        const sub = await this.stripeClient.getSubscription(session.subscriptionId!);
+        await interaction.editReply(this.buildDiscountChoicePanel(sub, token));
+      });
+      return;
+    }
+    if (id.startsWith("billadmin_dcouponpick:")) {
+      const token = id.split(":")[1];
+      const session = await this.getOwnedSession(token, interaction);
+      if (!session?.newPriceId) return;
+      session.discountChoice = value;
+      await interaction.update(this.buildChangePlanConfirm(token));
       return;
     }
     if (id.startsWith("billadmin_taxidpick:")) {
@@ -520,7 +640,8 @@ export class BillingAdmin {
     const id = interaction.customId;
 
     if (id.startsWith("billadmin_target_modal:")) {
-      await this.handleTargetModal(interaction, id.split(":")[1] as TargetAction);
+      const [, action, origin] = id.split(":");
+      await this.handleTargetModal(interaction, action as TargetAction, origin);
       return;
     }
     if (id.startsWith("billadmin_fp_modal:")) {
@@ -579,9 +700,9 @@ export class BillingAdmin {
 
   // ---- root dispatch ----
 
-  private async handleOpen(interaction: ButtonInteraction, action: string): Promise<void> {
+  private async handleOpen(interaction: ButtonInteraction, action: string, origin?: string): Promise<void> {
     if (this.isTargetAction(action) || action === "link") {
-      await interaction.update(this.buildTargetPanel(action as TargetAction | "link"));
+      await interaction.update(this.buildTargetPanel(action as TargetAction | "link", undefined, origin));
       return;
     }
     switch (action) {
@@ -638,6 +759,9 @@ export class BillingAdmin {
       case "discount":
         await this.startDiscount(interaction, token);
         return;
+      case "changeplan":
+        await this.startChangePlan(interaction, token);
+        return;
       case "editcust":
         await this.renderEditCustomer(interaction, token);
         return;
@@ -658,7 +782,11 @@ export class BillingAdmin {
 
   // ---- target resolution via modal (cus_ id, email, or Postiz user id) ----
 
-  private async handleTargetModal(interaction: ModalSubmitInteraction, action: TargetAction): Promise<void> {
+  private async handleTargetModal(
+    interaction: ModalSubmitInteraction,
+    action: TargetAction,
+    origin?: string
+  ): Promise<void> {
     const target = interaction.fields.getTextInputValue("target").trim();
     const fingerprint = action === "fraud" ? interaction.fields.getTextInputValue("fingerprint").trim() : "";
 
@@ -686,7 +814,7 @@ export class BillingAdmin {
       }
 
       if (target.startsWith("cus_")) {
-        const token = this.newSession(interaction, { customerId: target });
+        const token = this.newSession(interaction, { customerId: target, originHub: origin });
         await this.runTargetAction(interaction, token, action);
         return;
       }
@@ -694,16 +822,18 @@ export class BillingAdmin {
       if (target.includes("@")) {
         const customers = await this.stripeClient.findCustomersByEmail(target);
         if (customers.length === 0) {
-          await interaction.editReply(this.buildTargetPanel(action, `No Stripe customer found for \`${target}\`.`));
+          await interaction.editReply(
+            this.buildTargetPanel(action, `No Stripe customer found for \`${target}\`.`, origin)
+          );
           return;
         }
         if (customers.length === 1) {
-          const token = this.newSession(interaction, { customerId: customers[0].id });
+          const token = this.newSession(interaction, { customerId: customers[0].id, originHub: origin });
           await this.runTargetAction(interaction, token, action);
           return;
         }
-        const token = this.newSession(interaction, { pendingAction: action });
-        await interaction.editReply(this.buildCustomerPickPanel(customers, token, this.hubFor(action)));
+        const token = this.newSession(interaction, { pendingAction: action, originHub: origin });
+        await interaction.editReply(this.buildCustomerPickPanel(customers, token, this.hubBack(action, origin)));
         return;
       }
 
@@ -713,16 +843,16 @@ export class BillingAdmin {
       const stripeIds = [...new Set(rows.map((r) => r.stripeCustomerId).filter((v): v is string => !!v))];
       if (stripeIds.length === 0) {
         await interaction.editReply(
-          this.buildTargetPanel(action, `No linked Stripe customer found for Postiz user \`${target}\`.`)
+          this.buildTargetPanel(action, `No linked Stripe customer found for Postiz user \`${target}\`.`, origin)
         );
         return;
       }
       if (stripeIds.length === 1) {
-        const token = this.newSession(interaction, { customerId: stripeIds[0] });
+        const token = this.newSession(interaction, { customerId: stripeIds[0], originHub: origin });
         await this.runTargetAction(interaction, token, action);
         return;
       }
-      const token = this.newSession(interaction, { pendingAction: action });
+      const token = this.newSession(interaction, { pendingAction: action, originHub: origin });
       const select = new StringSelectMenuBuilder()
         .setCustomId(`billadmin_cuspick:${token}`)
         .setPlaceholder("Several Stripe customers are linked — pick one")
@@ -731,7 +861,7 @@ export class BillingAdmin {
         );
       await interaction.editReply({
         embeds: [makeEmbed(`Postiz user \`${target}\` maps to ${stripeIds.length} Stripe customers.`, COLORS.warn)],
-        components: [this.selectRow(select), this.backRow(this.hubFor(action))],
+        components: [this.selectRow(select), this.backRow(this.hubBack(action, origin))],
       });
     });
   }
@@ -995,7 +1125,7 @@ export class BillingAdmin {
     if (!customer) {
       await interaction.editReply({
         embeds: [makeEmbed(`No such Stripe customer: \`${customerId}\` (or it was deleted).`, COLORS.warn)],
-        components: [this.backRow("billadmin_hub:customers")],
+        components: [this.backRow(this.hubBack("overview", session.originHub))],
       });
       return;
     }
@@ -1045,7 +1175,7 @@ export class BillingAdmin {
           this.btn(`billadmin_goto:invoices:${token}`, "Invoices", ButtonStyle.Primary),
           this.btn(`billadmin_goto:fraud:${token}`, "Disputes & Fraud", ButtonStyle.Primary)
         ),
-        this.backRow("billadmin_hub:customers"),
+        this.backRow(this.hubBack("overview", session.originHub)),
       ],
     });
   }
@@ -1211,6 +1341,7 @@ export class BillingAdmin {
       return;
     }
 
+    session.pendingSubAction = "discount";
     const select = new StringSelectMenuBuilder()
       .setCustomId(`billadmin_subpick:${token}`)
       .setPlaceholder("Pick the subscription to discount")
@@ -1249,6 +1380,160 @@ export class BillingAdmin {
       components: [
         this.buttonRow(
           this.btn(`billadmin_discount_exec:${token}`, "Apply coupon", ButtonStyle.Danger),
+          this.btn("billadmin_hub:subs", "Cancel", ButtonStyle.Secondary)
+        ),
+      ],
+    };
+  }
+
+  // ---- change plan flow ----
+
+  private async startChangePlan(
+    interaction: { editReply: (payload: Panel) => Promise<unknown> },
+    token: string
+  ): Promise<void> {
+    const session = this.sessions.get(token);
+    if (!session?.customerId) return;
+
+    const subscriptions = await this.stripeClient.listSubscriptions(session.customerId);
+    const candidates = subscriptions.filter((s) => ["active", "trialing", "past_due"].includes(s.status));
+    if (candidates.length === 0) {
+      await interaction.editReply({
+        embeds: [makeEmbed(`\`${session.customerId}\` has no active subscription.`, COLORS.warn)],
+        components: [this.backRow("billadmin_hub:subs")],
+      });
+      return;
+    }
+    if (candidates.length === 1) {
+      await this.showPlanPicker(interaction, token, candidates[0]);
+      return;
+    }
+
+    session.pendingSubAction = "changeplan";
+    const select = new StringSelectMenuBuilder()
+      .setCustomId(`billadmin_subpick:${token}`)
+      .setPlaceholder("Pick the subscription to change")
+      .addOptions(
+        candidates.slice(0, 25).map((sub) => ({
+          label: sub.id.slice(0, 100),
+          description: sub.status,
+          value: sub.id,
+        }))
+      );
+    await interaction.editReply({
+      embeds: [makeEmbed(`\`${session.customerId}\` has ${candidates.length} eligible subscriptions.`, COLORS.brand)],
+      components: [this.selectRow(select), this.backRow("billadmin_hub:subs")],
+    });
+  }
+
+  private async showPlanPicker(
+    interaction: { editReply: (payload: Panel) => Promise<unknown> },
+    token: string,
+    sub: Stripe.Subscription
+  ): Promise<void> {
+    const session = this.sessions.get(token);
+    if (!session) return;
+    const item = sub.items.data[0];
+    if (!item) {
+      await interaction.editReply({
+        embeds: [makeEmbed(`\`${sub.id}\` has no items to change.`, COLORS.warn)],
+        components: [this.backRow("billadmin_hub:subs")],
+      });
+      return;
+    }
+
+    session.subscriptionId = sub.id;
+    session.subItemId = item.id;
+
+    const prices = await this.stripeClient.listRecurringPrices();
+    // The item's own price has an unexpanded product — prefer the listed copy for its name.
+    const current = prices.find((p) => p.id === item.price.id);
+    session.planFrom = this.priceLabel(current ?? item.price);
+
+    const options = prices.filter((p) => p.id !== item.price.id).slice(0, 25);
+    if (options.length === 0) {
+      await interaction.editReply({
+        embeds: [makeEmbed("No other active recurring prices exist in this Stripe account.", COLORS.warn)],
+        components: [this.backRow("billadmin_hub:subs")],
+      });
+      return;
+    }
+
+    const select = new StringSelectMenuBuilder()
+      .setCustomId(`billadmin_planpick:${token}`)
+      .setPlaceholder("Pick the new plan")
+      .addOptions(
+        options.map((p) => ({
+          label: this.priceLabel(p).slice(0, 100),
+          description: p.id.slice(0, 100),
+          value: p.id,
+        }))
+      );
+
+    const embed = new EmbedBuilder()
+      .setTitle("Change plan")
+      .setColor(COLORS.brand)
+      .setDescription(
+        `\`${sub.id}\` is currently on **${session.planFrom}**.` +
+          (sub.items.data.length > 1 ? "\n⚠️ Multi-item subscription — only the first item's plan is changed." : "") +
+          "\nPick the new plan:"
+      );
+    await interaction.editReply({
+      embeds: [embed],
+      components: [this.selectRow(select), this.backRow("billadmin_hub:subs")],
+    });
+  }
+
+  private buildDiscountChoicePanel(sub: Stripe.Subscription, token: string): Panel {
+    const session = this.sessions.get(token);
+    const discounts = this.describeDiscounts(sub);
+    const embed = new EmbedBuilder()
+      .setTitle("Discount handling")
+      .setColor(COLORS.brand)
+      .setDescription(
+        `Changing \`${sub.id}\` to **${session?.planTo ?? "?"}**.\n\n` +
+          (discounts.length
+            ? `Current discount: ${discounts.join(", ")}\n\nKeep it on the new plan, remove it, or set a different coupon?`
+            : "The subscription has no discount. Continue without one, or add a coupon?")
+      );
+    const buttons = discounts.length
+      ? [
+          this.btn(`billadmin_dchoice:${token}:keep`, "Keep discount", ButtonStyle.Primary),
+          this.btn(`billadmin_dchoice:${token}:remove`, "Remove discount", ButtonStyle.Danger),
+          this.btn(`billadmin_dchoice:${token}:change`, "Set different coupon", ButtonStyle.Secondary),
+        ]
+      : [
+          this.btn(`billadmin_dchoice:${token}:keep`, "No discount", ButtonStyle.Primary),
+          this.btn(`billadmin_dchoice:${token}:change`, "Add a coupon", ButtonStyle.Secondary),
+        ];
+    buttons.push(this.btn("billadmin_hub:subs", "Cancel", ButtonStyle.Secondary));
+    return { embeds: [embed], components: [this.buttonRow(...buttons)] };
+  }
+
+  private buildChangePlanConfirm(token: string): Panel {
+    const session = this.sessions.get(token);
+    const choice = session?.discountChoice ?? "keep";
+    const discountLine =
+      choice === "keep" ? "unchanged" : choice === "remove" ? "**removed**" : `set to \`${choice}\``;
+    const embed = new EmbedBuilder()
+      .setTitle("Confirm plan change")
+      .setColor(COLORS.warn)
+      .addFields(
+        { name: "Subscription", value: `\`${session?.subscriptionId}\``, inline: false },
+        { name: "From", value: session?.planFrom ?? "—", inline: true },
+        { name: "To", value: session?.planTo ?? "—", inline: true },
+        { name: "Discount", value: discountLine, inline: false }
+      )
+      .setDescription(
+        "**Prorate** credits unused time on the old plan and bills the difference. " +
+          "**No proration** just switches — the new price applies from the next invoice."
+      );
+    return {
+      embeds: [embed],
+      components: [
+        this.buttonRow(
+          this.btn(`billadmin_planexec:${token}:prorate`, "Change (prorate)", ButtonStyle.Danger),
+          this.btn(`billadmin_planexec:${token}:none`, "Change (no proration)", ButtonStyle.Danger),
           this.btn("billadmin_hub:subs", "Cancel", ButtonStyle.Secondary)
         ),
       ],
@@ -2124,7 +2409,7 @@ export class BillingAdmin {
           "💳 **Cards** — lookups by user, fingerprint or last 4 · set default · detach",
           "👤 **Customers** — overview, email lookup, create, edit (VAT/address), link, delete",
           "💰 **Charges** — charge & invoice history, disputes & fraud, refunds",
-          "🔄 **Subscriptions** — view, apply discount, cancel",
+          "🔄 **Subscriptions** — view, change plan, apply discount, cancel",
           "🎟️ **Promos** — promo codes & coupons",
         ].join("\n")
       )
@@ -2236,19 +2521,22 @@ export class BillingAdmin {
         .setDescription(
           [
             "**Read** — subscriptions are listed in the customer *Overview*.",
-            "**Update** — apply the configured discount coupon.",
+            "**Update** — change plan (keep / remove / swap the discount along the way) · apply the configured discount coupon.",
             "**Delete** — cancel now, or at the end of the current period.",
           ].join("\n")
         );
       return {
         embeds: [embed],
         components: [
+          this.buttonRow(this.btn("billadmin_open:overview:subs", "View (Overview)", ButtonStyle.Primary)),
           this.buttonRow(
-            this.btn("billadmin_open:overview", "View (Overview)", ButtonStyle.Primary),
-            this.btn("billadmin_open:discount", "Apply Discount", ButtonStyle.Primary),
-            this.btn("billadmin_open:cancelsub", "Cancel Subscription", ButtonStyle.Danger)
+            this.btn("billadmin_open:changeplan", "Change Plan", ButtonStyle.Primary),
+            this.btn("billadmin_open:discount", "Apply Discount", ButtonStyle.Primary)
           ),
-          this.backRow(),
+          this.buttonRow(
+            this.btn("billadmin_open:cancelsub", "Cancel Subscription", ButtonStyle.Danger),
+            this.btn("billadmin_root", "◀ Back", ButtonStyle.Secondary)
+          ),
         ],
       };
     }
@@ -2265,13 +2553,21 @@ export class BillingAdmin {
       case "fraud":
         return "billadmin_hub:charges";
       case "discount":
+      case "changeplan":
         return "billadmin_hub:subs";
       default:
         return "billadmin_hub:customers"; // overview, editcust, delcust, link
     }
   }
 
-  private buildTargetPanel(action: TargetAction | "link", error?: string): Panel {
+  // Prefer the hub the flow actually came from over the action's default hub.
+  private hubBack(action: TargetAction | "link", origin?: string): string {
+    return origin && ["cards", "customers", "charges", "subs"].includes(origin)
+      ? `billadmin_hub:${origin}`
+      : this.hubFor(action);
+  }
+
+  private buildTargetPanel(action: TargetAction | "link", error?: string, origin?: string): Panel {
     const embed = new EmbedBuilder()
       .setTitle(TARGET_TITLES[action])
       .setColor(error ? COLORS.warn : COLORS.brand)
@@ -2286,15 +2582,16 @@ export class BillingAdmin {
           .join("\n")
       );
 
+    const suffix = origin ? `:${origin}` : "";
     const userSelect = new UserSelectMenuBuilder()
-      .setCustomId(`billadmin_user:${action}`)
+      .setCustomId(`billadmin_user:${action}${suffix}`)
       .setPlaceholder("Pick a Discord user");
 
     const buttons: ButtonBuilder[] = [];
     if (action !== "link") {
-      buttons.push(this.btn(`billadmin_manual:${action}`, "Enter cus_ / email / Postiz ID", ButtonStyle.Secondary));
+      buttons.push(this.btn(`billadmin_manual:${action}${suffix}`, "Enter cus_ / email / Postiz ID", ButtonStyle.Secondary));
     }
-    buttons.push(this.btn(this.hubFor(action), "◀ Back", ButtonStyle.Secondary));
+    buttons.push(this.btn(this.hubBack(action, origin), "◀ Back", ButtonStyle.Secondary));
 
     return {
       embeds: [embed],
@@ -2304,9 +2601,9 @@ export class BillingAdmin {
 
   // ---- modals ----
 
-  private buildTargetModal(action: TargetAction): ModalBuilder {
+  private buildTargetModal(action: TargetAction, origin?: string): ModalBuilder {
     const modal = new ModalBuilder()
-      .setCustomId(`billadmin_target_modal:${action}`)
+      .setCustomId(`billadmin_target_modal:${action}${origin ? `:${origin}` : ""}`)
       .setTitle(TARGET_TITLES[action].slice(0, 45));
     modal.addComponents(
       new ActionRowBuilder<TextInputBuilder>().addComponents(
@@ -2581,6 +2878,39 @@ export class BillingAdmin {
   private promoCouponId(promo: Stripe.PromotionCode): string {
     const coupon = promo.promotion?.coupon;
     return typeof coupon === "string" ? coupon : coupon?.id ?? "—";
+  }
+
+  private couponDesc(coupon: Stripe.Coupon): string {
+    return coupon.percent_off != null
+      ? `${coupon.percent_off}% off`
+      : coupon.amount_off != null
+        ? `${this.stripeClient.formatAmount(coupon.amount_off, coupon.currency ?? "usd")} off`
+        : "—";
+  }
+
+  private priceLabel(price: Stripe.Price): string {
+    const product =
+      price.product && typeof price.product !== "string" && !("deleted" in price.product && price.product.deleted)
+        ? (price.product as Stripe.Product)
+        : null;
+    const name = product?.name ?? price.nickname ?? price.id;
+    const amount =
+      price.unit_amount != null ? this.stripeClient.formatAmount(price.unit_amount, price.currency) : "custom";
+    const interval = price.recurring
+      ? `/${price.recurring.interval_count > 1 ? `${price.recurring.interval_count} ` : ""}${price.recurring.interval}`
+      : "";
+    return `${name} — ${amount}${interval}`;
+  }
+
+  private describeDiscounts(sub: Stripe.Subscription): string[] {
+    return (sub.discounts ?? []).map((d) => {
+      if (typeof d === "string") return `\`${d}\``;
+      const coupon = d.source?.coupon;
+      const couponObj = coupon && typeof coupon !== "string" ? coupon : null;
+      const couponId = typeof coupon === "string" ? coupon : couponObj?.id;
+      const off = couponObj ? this.couponDesc(couponObj) : "";
+      return `\`${couponId ?? d.id}\`${couponObj?.name ? ` (${couponObj.name})` : ""}${off && off !== "—" ? ` · ${off}` : ""}`;
+    });
   }
 
   private async requireAdmin(interaction: AdminGateInteraction): Promise<boolean> {

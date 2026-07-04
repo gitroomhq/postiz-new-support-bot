@@ -171,13 +171,60 @@ export class StripeClient {
     return res.data;
   }
 
+  // Discounts are expanded so panels can show the coupon behind each discount.
   async listSubscriptions(customerId: string): Promise<Stripe.Subscription[]> {
-    const res = await this.stripe.subscriptions.list({ customer: customerId, status: "all", limit: 100 });
+    const res = await this.stripe.subscriptions.list({
+      customer: customerId,
+      status: "all",
+      limit: 100,
+      expand: ["data.discounts.source.coupon"],
+    });
     return res.data;
   }
 
   async getSubscription(subscriptionId: string): Promise<Stripe.Subscription> {
-    return this.stripe.subscriptions.retrieve(subscriptionId);
+    return this.stripe.subscriptions.retrieve(subscriptionId, { expand: ["discounts.source.coupon"] });
+  }
+
+  async listRecurringPrices(limit = 100): Promise<Stripe.Price[]> {
+    const res = await this.stripe.prices.list({
+      active: true,
+      type: "recurring",
+      limit,
+      expand: ["data.product"],
+    });
+    return res.data;
+  }
+
+  async getPrice(priceId: string): Promise<Stripe.Price> {
+    return this.stripe.prices.retrieve(priceId, { expand: ["product"] });
+  }
+
+  // Plan change on one subscription item. Discounts: undefined = keep existing
+  // (Stripe's default on price changes), "clear" = remove all, coupon id = replace.
+  async changeSubscriptionPlan(
+    params: {
+      subscriptionId: string;
+      itemId: string;
+      priceId: string;
+      prorationBehavior: "create_prorations" | "none";
+      discounts?: "clear" | string;
+    },
+    idempotencyKey: string
+  ): Promise<Stripe.Subscription> {
+    return this.stripe.subscriptions.update(
+      params.subscriptionId,
+      {
+        items: [{ id: params.itemId, price: params.priceId }],
+        proration_behavior: params.prorationBehavior,
+        ...(params.discounts === "clear"
+          ? { discounts: "" }
+          : params.discounts
+            ? { discounts: [{ coupon: params.discounts }] }
+            : {}),
+      },
+      { idempotencyKey }
+    );
   }
 
   async listInvoices(
