@@ -1957,6 +1957,15 @@ export class DiscordBot {
     }
   }
 
+  // TEMP DEBUG — remove after checking key type: shows Stripe key kind/mode only, never the secret
+  private describeStripeKey(): string {
+    const key = this.config.stripe.secretKey;
+    const m = key.match(/^(sk|rk)_(live|test)_/);
+    if (!m) return "`?` — unrecognized key format";
+    const kind = m[1] === "rk" ? "restricted key (scoped permissions)" : "standard secret key (full account access)";
+    return `\`${m[1]}_${m[2]}_…${key.slice(-4)}\` — ${kind}, ${m[2]} mode`;
+  }
+
   private buildBillingPanel() {
     const s = this.settingsStore;
     const embed = new EmbedBuilder()
@@ -1964,6 +1973,7 @@ export class DiscordBot {
       .setColor(0x5865f2)
       .setDescription(
         [
+          `**Stripe key (debug):** ${this.describeStripeKey()}`,
           `**Audit channel:** ${s.billingAuditChannelId() ? `<#${s.billingAuditChannelId()}>` : "_not set — audit embeds ping the support role in the refund thread_"}`,
           `**Max self-service refund:** ${
             s.refundMaxAmount() != null
