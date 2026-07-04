@@ -61,7 +61,8 @@ interface BillAdminSession {
   pendingSubAction?: "discount" | "changeplan" | "createsub";
   subItemId?: string;
   newPriceId?: string;
-  discountChoice?: string; // "keep" | "remove" | a coupon id
+  discountChoice?: string; // "keep" | "remove" | coupon id | "pc:<promo id>"
+  discountLabel?: string; // human label for pc: choices (the code string)
   planFrom?: string;
   planTo?: string;
   trialDays?: number;
@@ -314,6 +315,13 @@ export class BillingAdmin {
       await interaction.showModal(this.buildTrialModal(token));
       return;
     }
+    if (id.startsWith("billadmin_cspromo:")) {
+      const token = id.split(":")[1];
+      const session = await this.getOwnedSession(token, interaction);
+      if (!session?.newPriceId) return;
+      await interaction.showModal(this.buildPromoEntryModal(token));
+      return;
+    }
     if (id.startsWith("billadmin_cscreate:")) {
       const [, token, mode] = id.split(":");
       const session = await this.getOwnedSession(token, interaction);
@@ -321,11 +329,14 @@ export class BillingAdmin {
       await interaction.deferUpdate();
       await this.tryRender(interaction, async () => {
         const choice = session.discountChoice ?? "keep";
+        const isPromo = choice.startsWith("pc:");
+        const noDiscount = choice === "keep" || choice === "remove";
         const sub = await this.stripeClient.createSubscription(
           {
             customerId: session.customerId!,
             priceId: session.newPriceId!,
-            couponId: choice === "keep" || choice === "remove" ? undefined : choice,
+            couponId: noDiscount || isPromo ? undefined : choice,
+            promotionCodeId: isPromo ? choice.slice(3) : undefined,
             trialDays: session.trialDays,
             collection: mode === "invoice" ? "invoice" : "charge",
           },
@@ -627,7 +638,8 @@ export class BillingAdmin {
         session.newPriceId = price.id;
         session.planTo = this.priceLabel(price);
         if (isCreate) {
-          await interaction.editReply(this.buildCreateSubDiscountPanel(token));
+          const promos = await this.stripeClient.listPromotionCodes(25, true);
+          await interaction.editReply(this.buildCreateSubDiscountPanel(token, promos));
         } else {
           const sub = await this.stripeClient.getSubscription(session.subscriptionId!);
           await interaction.editReply(this.buildDiscountChoicePanel(sub, token));
@@ -643,6 +655,27 @@ export class BillingAdmin {
       await interaction.update(
         session.pendingSubAction === "createsub" ? this.buildCreateSubConfirm(token) : this.buildChangePlanConfirm(token)
       );
+      return;
+    }
+    if (id.startsWith("billadmin_cspromopick:")) {
+      const token = id.split(":")[1];
+      const session = await this.getOwnedSession(token, interaction);
+      if (!session?.newPriceId) return;
+      await interaction.deferUpdate();
+      await this.tryRender(interaction, async () => {
+        const promo = await this.stripeClient.getPromotionCode(value);
+        const problem = this.promoProblem(promo, session.customerId);
+        if (problem) {
+          await interaction.editReply({
+            embeds: [makeEmbed(`❌ ${problem}`, COLORS.danger)],
+            components: [this.backRow("billadmin_hub:subs")],
+          });
+          return;
+        }
+        session.discountChoice = `pc:${promo.id}`;
+        session.discountLabel = promo.code;
+        await interaction.editReply(this.buildCreateSubConfirm(token));
+      });
       return;
     }
     if (id.startsWith("billadmin_taxidpick:")) {
@@ -763,6 +796,37 @@ export class BillingAdmin {
     }
     if (id === "billadmin_createcust_modal") {
       await this.handleCreateCustomerModal(interaction);
+      return;
+    }
+    if (id.startsWith("billadmin_cspromo_modal:")) {
+      const token = id.split(":")[1];
+      const session = await this.getOwnedSession(token, interaction);
+      if (!session?.newPriceId) return;
+      const code = interaction.fields.getTextInputValue("code").trim();
+      await this.ackModal(interaction);
+      await this.tryRender(interaction, async () => {
+        const matches = code.startsWith("promo_")
+          ? [await this.stripeClient.getPromotionCode(code)]
+          : await this.stripeClient.findPromotionCodes(code);
+        const promo = matches.find((p) => p.active) ?? matches[0];
+        const problem = promo ? this.promoProblem(promo, session.customerId) : `No promotion code matching \`${code}\`.`;
+        if (!promo || problem) {
+          await interaction.editReply({
+            embeds: [makeEmbed(`❌ ${problem}`, COLORS.danger)],
+            components: [
+              this.buttonRow(
+                this.btn(`billadmin_cspromo:${token}`, "Try another code", ButtonStyle.Secondary),
+                this.btn(`billadmin_dchoice:${token}:keep`, "No discount", ButtonStyle.Primary),
+                this.btn("billadmin_hub:subs", "Cancel", ButtonStyle.Secondary)
+              ),
+            ],
+          });
+          return;
+        }
+        session.discountChoice = `pc:${promo.id}`;
+        session.discountLabel = promo.code;
+        await interaction.editReply(this.buildCreateSubConfirm(token));
+      });
       return;
     }
     if (id.startsWith("billadmin_cstrial_modal:")) {
@@ -1720,30 +1784,83 @@ export class BillingAdmin {
     });
   }
 
-  private buildCreateSubDiscountPanel(token: string): Panel {
+  private buildCreateSubDiscountPanel(token: string, promos: Stripe.PromotionCode[]): Panel {
     const session = this.sessions.get(token);
     const embed = new EmbedBuilder()
       .setTitle("Discount")
       .setColor(COLORS.brand)
       .setDescription(
-        `Creating **${session?.planTo ?? "?"}** for \`${session?.customerId}\`.\n\nStart it with a coupon?`
+        `Creating **${session?.planTo ?? "?"}** for \`${session?.customerId}\`.\n\n` +
+          "Start it with a discount? Pick an active promo code below, enter one manually, " +
+          "pick a raw coupon — or continue without."
       );
-    return {
-      embeds: [embed],
-      components: [
-        this.buttonRow(
-          this.btn(`billadmin_dchoice:${token}:keep`, "No discount", ButtonStyle.Primary),
-          this.btn(`billadmin_dchoice:${token}:change`, "Add a coupon", ButtonStyle.Secondary),
-          this.btn("billadmin_hub:subs", "Cancel", ButtonStyle.Secondary)
-        ),
-      ],
-    };
+
+    const components: ActionRowBuilder<MessageActionRowComponentBuilder>[] = [];
+    if (promos.length > 0) {
+      const select = new StringSelectMenuBuilder()
+        .setCustomId(`billadmin_cspromopick:${token}`)
+        .setPlaceholder("Pick an active promo code")
+        .addOptions(
+          promos.slice(0, 25).map((p) => {
+            const coupon = this.promoCoupon(p);
+            return {
+              label: `${p.code}${coupon ? ` — ${this.couponDesc(coupon)}` : ""}`.slice(0, 100),
+              description: `${p.times_redeemed}/${p.max_redemptions ?? "∞"} used · ${p.id}`.slice(0, 100),
+              value: p.id,
+            };
+          })
+        );
+      components.push(this.selectRow(select));
+    }
+    components.push(
+      this.buttonRow(
+        this.btn(`billadmin_dchoice:${token}:keep`, "No discount", ButtonStyle.Primary),
+        this.btn(`billadmin_cspromo:${token}`, "Enter promo code", ButtonStyle.Secondary),
+        this.btn(`billadmin_dchoice:${token}:change`, "Pick a coupon", ButtonStyle.Secondary),
+        this.btn("billadmin_hub:subs", "Cancel", ButtonStyle.Secondary)
+      )
+    );
+    return { embeds: [embed], components };
+  }
+
+  // Everything that would make Stripe reject the code at create time — checked
+  // up front so the admin sees why instead of a generic API error.
+  private promoProblem(promo: Stripe.PromotionCode, customerId?: string): string | null {
+    const now = Math.floor(Date.now() / 1000);
+    if (!promo.active) return `\`${promo.code}\` is deactivated.`;
+    if (promo.expires_at && promo.expires_at < now) return `\`${promo.code}\` has expired.`;
+    if (promo.max_redemptions != null && promo.times_redeemed >= promo.max_redemptions) {
+      return `\`${promo.code}\` has reached its redemption limit.`;
+    }
+    const coupon = this.promoCoupon(promo);
+    if (coupon && !coupon.valid) return `The coupon behind \`${promo.code}\` is no longer valid.`;
+    const restrictedTo = typeof promo.customer === "string" ? promo.customer : promo.customer?.id;
+    if (restrictedTo && restrictedTo !== customerId) {
+      return `\`${promo.code}\` is restricted to a different customer (\`${restrictedTo}\`).`;
+    }
+    return null;
+  }
+
+  private buildPromoEntryModal(token: string): ModalBuilder {
+    return new ModalBuilder()
+      .setCustomId(`billadmin_cspromo_modal:${token}`)
+      .setTitle("Apply a promo code")
+      .addComponents(
+        new ActionRowBuilder<TextInputBuilder>().addComponents(
+          this.textInput("code", "Promo code", { required: true, placeholder: "e.g. WELCOME50 or promo_…" })
+        )
+      );
   }
 
   private buildCreateSubConfirm(token: string): Panel {
     const session = this.sessions.get(token);
     const choice = session?.discountChoice ?? "keep";
-    const discountLine = choice === "keep" || choice === "remove" ? "none" : `\`${choice}\``;
+    const discountLine =
+      choice === "keep" || choice === "remove"
+        ? "none"
+        : choice.startsWith("pc:")
+          ? `\`${session?.discountLabel ?? choice.slice(3)}\` (promo code)`
+          : `\`${choice}\` (coupon)`;
     const payNote = session?.hasDefaultPm
       ? "**Create & charge** bills the customer's default payment method for the first period now (unless a trial is set)."
       : "⚠️ The customer has **no default payment method** — **Create & charge** will fail. Use **Create + email invoice** (due in 7 days), or set a trial.";

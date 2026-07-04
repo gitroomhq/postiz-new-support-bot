@@ -233,6 +233,7 @@ export class StripeClient {
       customerId: string;
       priceId: string;
       couponId?: string;
+      promotionCodeId?: string;
       trialDays?: number;
       collection: "charge" | "invoice";
     },
@@ -242,7 +243,11 @@ export class StripeClient {
       {
         customer: params.customerId,
         items: [{ price: params.priceId }],
-        ...(params.couponId ? { discounts: [{ coupon: params.couponId }] } : {}),
+        ...(params.couponId
+          ? { discounts: [{ coupon: params.couponId }] }
+          : params.promotionCodeId
+            ? { discounts: [{ promotion_code: params.promotionCodeId }] }
+            : {}),
         ...(params.trialDays ? { trial_period_days: params.trialDays } : {}),
         ...(params.collection === "invoice"
           ? { collection_method: "send_invoice", days_until_due: 7 }
@@ -365,8 +370,12 @@ export class StripeClient {
     return this.stripe.promotionCodes.update(promotionCodeId, { active, expand: ["promotion.coupon"] });
   }
 
-  async listPromotionCodes(limit = 25): Promise<Stripe.PromotionCode[]> {
-    const res = await this.stripe.promotionCodes.list({ limit, expand: ["data.promotion.coupon"] });
+  async listPromotionCodes(limit = 25, activeOnly = false): Promise<Stripe.PromotionCode[]> {
+    const res = await this.stripe.promotionCodes.list({
+      limit,
+      ...(activeOnly ? { active: true } : {}),
+      expand: ["data.promotion.coupon"],
+    });
     return res.data;
   }
 
