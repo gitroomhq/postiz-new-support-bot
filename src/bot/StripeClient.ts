@@ -200,6 +200,32 @@ export class StripeClient {
     return this.stripe.prices.retrieve(priceId, { expand: ["product"] });
   }
 
+  // "charge" bills the default payment method immediately and errors visibly if
+  // that isn't possible; "invoice" emails an invoice due in 7 days instead.
+  async createSubscription(
+    params: {
+      customerId: string;
+      priceId: string;
+      couponId?: string;
+      trialDays?: number;
+      collection: "charge" | "invoice";
+    },
+    idempotencyKey: string
+  ): Promise<Stripe.Subscription> {
+    return this.stripe.subscriptions.create(
+      {
+        customer: params.customerId,
+        items: [{ price: params.priceId }],
+        ...(params.couponId ? { discounts: [{ coupon: params.couponId }] } : {}),
+        ...(params.trialDays ? { trial_period_days: params.trialDays } : {}),
+        ...(params.collection === "invoice"
+          ? { collection_method: "send_invoice", days_until_due: 7 }
+          : { payment_behavior: "error_if_incomplete" }),
+      },
+      { idempotencyKey }
+    );
+  }
+
   // Plan change on one subscription item. Discounts: undefined = keep existing
   // (Stripe's default on price changes), "clear" = remove all, coupon id = replace.
   async changeSubscriptionPlan(
