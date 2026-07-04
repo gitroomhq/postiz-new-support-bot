@@ -3,6 +3,7 @@ import { StatusTag, PriorityTag } from "../generated/prisma/client";
 import { TicketStore } from "./TicketStore";
 import { AuditLogger } from "./AuditLogger";
 import { SettingsStore } from "../config/SettingsStore";
+import { IntercomSyncService } from "../intercom/IntercomSyncService";
 import { embed, COLORS } from "../util/embeds";
 import { applyTitleEmojis } from "../util/threadTitle";
 
@@ -34,7 +35,8 @@ export class StatusService {
   constructor(
     private ticketStore: TicketStore,
     private audit: AuditLogger,
-    private settingsStore: SettingsStore
+    private settingsStore: SettingsStore,
+    private intercomSync: IntercomSyncService
   ) {}
 
   async applyStatus(
@@ -92,6 +94,10 @@ export class StatusService {
 
     await this.ticketStore.setPriority(ticket.threadId, priority.id);
 
+    void this.intercomSync
+      .onPriorityChanged(ticket.threadId, prevPriority ?? null, priority, options.actorName)
+      .catch((e) => console.error("Intercom priority push failed:", e));
+
     void this.ticketStore
       .addTagChange({
         ticketThreadId: ticket.threadId,
@@ -143,6 +149,13 @@ export class StatusService {
     await thread.setName(this.buildThreadName(thread.name, tag.emoji)).catch(() => {});
 
     await this.ticketStore.setStatus(ticket.threadId, tag.id, isDone);
+
+    // Covers every status path: /status, feedback buttons, reminder auto-closes,
+    // member-leave, manual lock/archive, Intercom-initiated changes (converges —
+    // the executor's lastSynced* guards make the echo push a no-op).
+    void this.intercomSync
+      .onStatusChanged(ticket.threadId, ticket.statusTag ?? null, tag, options.actorName)
+      .catch((e) => console.error("Intercom status push failed:", e));
 
     // Per-ticket history backing /status history — recorded for silent changes too,
     // same philosophy as the audit channel: the record is complete, silent only

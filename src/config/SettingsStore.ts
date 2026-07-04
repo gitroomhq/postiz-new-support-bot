@@ -1,6 +1,9 @@
-import { PrismaClient, BotSettings, StatusTag, PriorityTag } from "../generated/prisma/client";
+import { Prisma, PrismaClient, BotSettings, StatusTag, PriorityTag } from "../generated/prisma/client";
 
 export type ReminderTarget = "SUPPORT" | "CUSTOMER";
+
+export type IntercomMode = "none" | "push" | "bi";
+export type IntercomRegion = "us" | "eu" | "au";
 
 // Totals stored after each scheduled report so the next one can show trend deltas.
 export type ReportSnapshot = {
@@ -248,6 +251,86 @@ export class SettingsStore {
 
   initialPriority(): PriorityTag | undefined {
     return this.priorityList.find((p) => p.isInitial);
+  }
+
+  // ---- Intercom bridge ----
+  // Credentials can come from the DB (/config panel, wins) or from env vars —
+  // the deploy may provide either; the panel edits the DB copy live.
+
+  intercomMode(): IntercomMode {
+    const mode = this.settings.intercomMode;
+    return mode === "push" || mode === "bi" ? mode : "none";
+  }
+
+  intercomRegion(): IntercomRegion {
+    const region = this.settings.intercomRegion ?? process.env.INTERCOM_REGION;
+    return region === "eu" || region === "au" ? region : "us";
+  }
+
+  intercomAccessToken(): string | null {
+    return this.settings.intercomAccessToken ?? process.env.INTERCOM_ACCESS_TOKEN ?? null;
+  }
+
+  intercomClientSecret(): string | null {
+    return this.settings.intercomClientSecret ?? process.env.INTERCOM_CLIENT_SECRET ?? null;
+  }
+
+  intercomAdminId(): string | null {
+    return this.settings.intercomAdminId ?? process.env.INTERCOM_ADMIN_ID ?? null;
+  }
+
+  intercomOperatorAdminId(): string | null {
+    return this.settings.intercomOperatorAdminId;
+  }
+
+  // Identity used for admin-side API calls: the auto-detected Operator/Fin bot
+  // when available (no seat cost), otherwise the configured admin.
+  intercomAuthorAdminId(): string | null {
+    return this.intercomOperatorAdminId() ?? this.intercomAdminId();
+  }
+
+  intercomTicketTypeMap(): Record<string, string> {
+    const map = this.settings.intercomTicketTypeMap as unknown;
+    if (map && typeof map === "object" && !Array.isArray(map)) {
+      return map as Record<string, string>;
+    }
+    return {};
+  }
+
+  intercomTicketTypeIdFor(categoryId: string | null): string | null {
+    const map = this.intercomTicketTypeMap();
+    return (categoryId ? map[categoryId] : undefined) ?? map["_default"] ?? null;
+  }
+
+  intercomConfigured(): boolean {
+    return Boolean(this.intercomAccessToken() && this.intercomAuthorAdminId() && this.intercomTicketTypeIdFor(null));
+  }
+
+  async updateIntercom(data: {
+    intercomMode?: IntercomMode;
+    intercomRegion?: IntercomRegion;
+    intercomAccessToken?: string | null;
+    intercomClientSecret?: string | null;
+    intercomAdminId?: string | null;
+    intercomOperatorAdminId?: string | null;
+    intercomTicketTypeMap?: Record<string, string> | null;
+  }): Promise<void> {
+    const { intercomTicketTypeMap, ...rest } = data;
+    this.settings = await this.prisma.botSettings.update({
+      where: { id: "global" },
+      data: {
+        ...rest,
+        // Nullable JSON columns need the DbNull sentinel instead of null.
+        ...(intercomTicketTypeMap !== undefined
+          ? { intercomTicketTypeMap: intercomTicketTypeMap ?? Prisma.DbNull }
+          : {}),
+      },
+    });
+  }
+
+  async setTagIntercomState(tagId: string, stateId: string | null): Promise<void> {
+    await this.prisma.statusTag.update({ where: { id: tagId }, data: { intercomTicketStateId: stateId } });
+    await this.refreshTags();
   }
 
   async updateGeneral(data: {

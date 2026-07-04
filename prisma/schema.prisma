@@ -82,6 +82,14 @@ model BotSettings {
   refundMaxPer24h     Int?
   refundMinMemberAgeDays Int?
   auditLogChannelId   String?
+  // Intercom bridge (all edited via /config → Intercom; deploy has no .env access).
+  intercomMode          String  @default("none") // "none" | "push" | "bi"
+  intercomRegion        String  @default("us")   // "us" | "eu" | "au"
+  intercomAccessToken   String?
+  intercomClientSecret  String?                  // app client secret — webhook HMAC
+  intercomAdminId       String?                  // configured authoring admin (fallback)
+  intercomOperatorAdminId String?                // auto-detected Operator/Fin; null = rejected/not found
+  intercomTicketTypeMap Json?                    // { "<categoryId>"|"_default": "<ticketTypeId>" }
   updatedAt           DateTime  @updatedAt
 
   @@map("bot_settings")
@@ -98,6 +106,8 @@ model StatusTag {
   reminderTarget  String   @default("SUPPORT")
   autoCloseAfter  Int?
   sortOrder       Int      @default(0)
+  // Intercom ticket state this tag maps to (set via /config → Intercom → States).
+  intercomTicketStateId String?
   tickets         Ticket[]
 
   @@map("status_tags")
@@ -204,4 +214,57 @@ model CannedResponse {
 
   @@unique([name, ownerId])
   @@map("canned_responses")
+}
+
+// Discord ticket ↔ Intercom conversation + converted customer ticket. ticketId is
+// null between conversation creation and a successful convert, which makes the
+// ensure job crash-resumable.
+model IntercomLink {
+  id                String    @id @default(cuid())
+  ticketThreadId    String    @unique
+  contactId         String // Intercom contact id
+  contactExternalId String // external_id we registered (postizUserId / discord:{id})
+  conversationId    String    @unique
+  ticketId          String?   @unique // Intercom ticket API id (NOT the human ticket_id)
+  agentWarnedAt     DateTime? // push mode: one-time "replies don't reach the customer" note
+  lastSyncedStateId String? // last ticket_state_id the bridge pushed (echo damper)
+  lastSyncedOpen    String? // "open" | "closed" — conversation open/close parity damper
+  createdAt         DateTime  @default(now())
+
+  @@map("intercom_links")
+}
+
+model IntercomOutboxEvent {
+  id             String   @id @default(cuid())
+  // Global monotonic sequence; per-ticket FIFO comes from draining only the
+  // lowest-seq PENDING event per ticket.
+  seq            Int      @unique @default(autoincrement())
+  ticketThreadId String
+  type           String // ensure | message | note | status | priority | csat
+  payload        Json
+  status         String   @default("PENDING") // PENDING | DEAD
+  attempts       Int      @default(0)
+  nextAttemptAt  DateTime @default(now())
+  lastError      String?
+  createdAt      DateTime @default(now())
+
+  @@index([ticketThreadId, seq])
+  @@index([status, nextAttemptAt])
+  @@map("intercom_outbox")
+}
+
+// Part-id ledger for echo suppression (Intercom has no writable content stamp).
+// The outbox records every conversation/ticket part the bridge creates; the
+// webhook handler atomically claims each part it sees — a conflict means it's
+// either the bridge's own echo or a duplicate delivery, and gets dropped.
+model IntercomEchoPart {
+  id             String   @id @default(cuid())
+  kind           String // "c" = conversation part, "t" = ticket part
+  partId         String
+  ticketThreadId String
+  createdAt      DateTime @default(now())
+
+  @@unique([kind, partId])
+  @@index([createdAt])
+  @@map("intercom_echo_parts")
 }

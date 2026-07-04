@@ -54,6 +54,12 @@ import { StatusReportService } from "./StatusReportService";
 import { CallbackServer } from "../server/CallbackServer";
 import { BillingCategory } from "../categories/BillingCategory";
 import { BaseCategory, TicketContext } from "../categories/BaseCategory";
+import { IntercomSyncService, BridgeSourceMessage } from "../intercom/IntercomSyncService";
+import { IntercomStore } from "../intercom/IntercomStore";
+import { IntercomClient } from "../intercom/IntercomClient";
+import { IntercomWebhookHandler } from "../intercom/IntercomWebhookHandler";
+import { TICKET_ATTR_PRIORITY, TICKET_ATTR_CSAT, TICKET_ATTR_THREAD } from "../intercom/IntercomOutboxScheduler";
+import { IntercomMode, IntercomRegion } from "../config/SettingsStore";
 
 type TicketSearchFilters = {
   categoryId?: string;
@@ -91,10 +97,22 @@ export class DiscordBot {
     private reportService: StatusReportService,
     private cannedStore: CannedResponseStore,
     private audit: AuditLogger,
-    private tierStore: EscalationTierStore
+    private tierStore: EscalationTierStore,
+    private intercomSync: IntercomSyncService,
+    private intercomStore: IntercomStore,
+    private intercomClient: IntercomClient,
+    private intercomWebhook: IntercomWebhookHandler
   ) {
     this.client = new Client({
-      intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.GuildMembers],
+      // MessageContent is privileged (enable it in the Dev Portal too) — without it
+      // message bodies/attachments of other users are empty, and the Intercom
+      // mirror would push blanks.
+      intents: [
+        GatewayIntentBits.Guilds,
+        GatewayIntentBits.GuildMessages,
+        GatewayIntentBits.GuildMembers,
+        GatewayIntentBits.MessageContent,
+      ],
     });
 
     this.rest = new REST({ version: "10" }).setToken(config.discord.token);
@@ -138,10 +156,37 @@ export class DiscordBot {
           silent: true,
         });
       } else {
-        // Thread is gone/unreachable — still reconcile the DB.
+        // Thread is gone/unreachable — still reconcile the DB. This path bypasses
+        // StatusService, so the Intercom push needs its own hook.
         await this.ticketStore.close(ticket.threadId).catch(() => {});
+        void this.intercomSync
+          .onStatusChanged(ticket.threadId, ticket.statusTag ?? null, closingTag, "System (member left)")
+          .catch((e) => console.error("Intercom status push failed:", e));
       }
     }
+  }
+
+  // Reduces a discord.js message to the bridge shape (also used by the backfill
+  // walker). Embed-only messages (historical AI answers, the "Your question"
+  // embed) are flattened to text so they don't mirror as blanks.
+  private toBridgeMessage(message: Message, member: GuildMember | null): BridgeSourceMessage {
+    const embedText = message.embeds
+      .map((e) => [e.title, e.description].filter(Boolean).join("\n"))
+      .filter(Boolean)
+      .join("\n\n");
+    return {
+      discordMessageId: message.id,
+      authorId: message.author.id,
+      authorName: member?.displayName ?? message.author.displayName ?? message.author.username,
+      authorIsBot: message.author.bot,
+      content: message.content || embedText || "",
+      attachments: message.attachments.map((a) => ({
+        url: a.url,
+        filename: a.name ?? "attachment",
+        size: a.size,
+      })),
+      createdAt: message.createdAt,
+    };
   }
 
   // Human messages in tracked ticket threads drive two things:
@@ -154,11 +199,19 @@ export class DiscordBot {
     const ticket = await this.ticketStore.getByThreadId(message.channelId);
     if (!ticket) return;
 
+    // Mirror every human message to Intercom (before the early returns below —
+    // chatter in closed tickets must mirror too). Fire-and-forget: an Intercom
+    // problem never touches the Discord flow.
+    const member = message.member ?? (await message.guild?.members.fetch(message.author.id).catch(() => null)) ?? null;
+    const isStaff = !!member && this.isStaffMember(member);
+    void this.intercomSync
+      .onHumanMessage(ticket, this.toBridgeMessage(message, member), isStaff)
+      .catch((e) => console.error("Intercom message push failed:", e));
+
     // First support reply on an open ticket. Only support/admin members count, so
     // another invited human (or the customer) can't skew the metric.
     if (!ticket.closed && !ticket.firstResponseAt && ticket.customerId && message.author.id !== ticket.customerId) {
-      const member = message.member ?? (await message.guild?.members.fetch(message.author.id).catch(() => null)) ?? null;
-      const isSupport = !!member && this.isStaffMember(member);
+      const isSupport = isStaff;
       if (isSupport && member) {
         try {
           await this.ticketStore.setFirstResponse(ticket.threadId, message.createdAt);
@@ -354,6 +407,9 @@ export class DiscordBot {
         return;
       }
       await this.ticketStore.addNote(thread.id, member.id, member.displayName, text);
+      void this.intercomSync
+        .onNoteAdded(thread.id, member.displayName, text)
+        .catch((e) => console.error("Intercom note push failed:", e));
       void this.audit.log({
         title: "📝 Note added",
         actor: member.displayName,
@@ -1108,6 +1164,14 @@ export class DiscordBot {
             ...(question ? [{ name: "Question", value: question }] : []),
           ],
         });
+        void this.intercomSync
+          .onTicketCreated(thread.id, category.label, question ?? null)
+          .catch((e) => console.error("Intercom ticket push failed:", e));
+      },
+      onAiAnswer: async (thread, finalText) => {
+        void this.intercomSync
+          .onAiAnswer(thread.id, finalText)
+          .catch((e) => console.error("Intercom AI answer push failed:", e));
       },
     };
   }
@@ -1160,6 +1224,11 @@ export class DiscordBot {
 
     if (interaction.customId === "config_tier_pick") {
       await this.handleConfigTierPick(interaction);
+      return;
+    }
+
+    if (interaction.customId.startsWith("config_intercom_")) {
+      await this.handleIntercomSelect(interaction);
       return;
     }
 
@@ -1362,6 +1431,9 @@ export class DiscordBot {
       return false;
     });
     if (recorded) {
+      void this.intercomSync
+        .onCsat(threadId, score)
+        .catch((e) => console.error("Intercom CSAT push failed:", e));
       void this.audit.log({
         title: "⭐ CSAT rating",
         severity: score >= 4 ? "success" : score === 3 ? "warn" : "danger",
@@ -1398,6 +1470,9 @@ export class DiscordBot {
         await interaction.reply({ embeds: [makeEmbed("You've already left feedback for this ticket — thank you!", COLORS.warn)], flags: 64 });
         return;
       }
+      void this.intercomSync
+        .onCsat(threadId, ticket.csatScore, comment)
+        .catch((e) => console.error("Intercom CSAT push failed:", e));
       void this.audit.log({
         title: "💬 CSAT comment",
         actor: interaction.user.displayName,
@@ -1841,6 +1916,7 @@ export class DiscordBot {
           `**Billing audit:** ${s.billingAuditChannelId() ? `<#${s.billingAuditChannelId()}>` : "_in-thread ping_"}`,
           `**Audit log:** ${s.auditLogChannelId() ? `<#${s.auditLogChannelId()}>` : "off"}`,
           `**Ticket limits:** ${s.maxOpenTicketsPerUser() > 0 ? `max ${s.maxOpenTicketsPerUser()} open` : "no cap"} · ${s.ticketCooldownMinutes() > 0 ? `${s.ticketCooldownMinutes()}m cooldown` : "no cooldown"}`,
+          `**Intercom:** ${s.intercomMode() === "none" ? "off" : `${s.intercomMode()}${s.intercomConfigured() ? "" : " ⚠️ not configured"}`}`,
         ].join("\n")
       );
 
@@ -1855,6 +1931,7 @@ export class DiscordBot {
     const secondary = [
       new ButtonBuilder().setCustomId("config_priorities").setLabel("Manage Priorities").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("config_escalation").setLabel("Escalation").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("config_intercom").setLabel("Intercom").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("config_reverify").setLabel("Re-Verify").setStyle(ButtonStyle.Secondary),
     ];
     if (!s.backfillDone()) {
@@ -1946,6 +2023,287 @@ export class DiscordBot {
     return {
       embeds: [embed],
       components: [new ActionRowBuilder<ChannelSelectMenuBuilder>().addComponents(channelSelect), buttons],
+    };
+  }
+
+  private async buildIntercomPanel() {
+    const s = this.settingsStore;
+    const mode = s.intercomMode();
+    const [links, totalTickets, outbox] = await Promise.all([
+      this.intercomStore.countLinks().catch(() => 0),
+      this.ticketStore.getAllWithTag().then((t) => t.length).catch(() => 0),
+      this.intercomStore.counts().catch(() => ({ pending: 0, dead: 0 })),
+    ]);
+
+    const mask = (value: string | null) => (value ? `••••${value.slice(-4)}` : "_not set_");
+    const modeLine =
+      mode === "none"
+        ? "**none** — bridge off, tickets stay Discord-only"
+        : mode === "push"
+          ? "**push** — one-way mirror Discord → Intercom"
+          : "**bi** — full sync, agent replies & states come back";
+
+    const operator = s.intercomOperatorAdminId();
+    const admin = s.intercomAdminId();
+    const authorLine = operator
+      ? `Operator/Fin \`${operator}\`${admin ? ` (fallback admin \`${admin}\`)` : " ⚠️ no fallback admin"}`
+      : admin
+        ? `Admin \`${admin}\``
+        : "⚠️ _none — set secrets (auto-detect) or pick an admin_";
+
+    const typeMap = s.intercomTicketTypeMap();
+    const categoryIds = [...this.categoryRegistry.getAll().map((c) => c.id), "_default"];
+    const typesLine = categoryIds.map((id) => `${id} ${typeMap[id] ? "✓" : "✗"}`).join(" · ");
+    const mappedStates = s.tags().filter((t) => t.intercomTicketStateId).length;
+
+    const embed = new EmbedBuilder()
+      .setTitle("Intercom Bridge")
+      .setColor(0x5865f2)
+      .setDescription(
+        [
+          `**Mode:** ${modeLine}`,
+          ...(s.intercomConfigured()
+            ? []
+            : ["⚠️ **Setup incomplete** — the bridge queues events but pushes nothing until token, author and a Default ticket type are set."]),
+          "",
+          `**Region:** ${s.intercomRegion().toUpperCase()}`,
+          `**Access token:** ${mask(s.intercomAccessToken())} · **Client secret:** ${s.intercomClientSecret() ? mask(s.intercomClientSecret()) : "_off_"}`,
+          `**Authoring as:** ${authorLine}`,
+          `**Ticket types:** ${typesLine}`,
+          `**Status states mapped:** ${mappedStates}/${s.tags().length}`,
+          "",
+          `**Bridged tickets:** ${links}/${totalTickets}`,
+          `**Outbox:** ${outbox.pending} pending · ${outbox.dead} failed`,
+          "",
+          s.intercomClientSecret()
+            ? "Webhook endpoint: `POST <public-url>/intercom/webhook` (signed via X-Hub-Signature). Topics: conversation.admin.replied / noted / closed / opened, conversation.operator.replied, ticket.state.updated, ticket.admin.replied."
+            : "_No client secret set — the inbound webhook stays disabled (needed for bi mode and the push-mode agent warning)._",
+          "",
+          "Modes apply to tickets created inside Discord only; Intercom-native conversations are never touched.",
+        ].join("\n")
+      );
+
+    const modeButtons = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId("config_intercom_mode_none")
+        .setLabel("Off")
+        .setStyle(mode === "none" ? ButtonStyle.Success : ButtonStyle.Secondary)
+        .setDisabled(mode === "none"),
+      new ButtonBuilder()
+        .setCustomId("config_intercom_mode_push")
+        .setLabel("Push (one-way)")
+        .setStyle(mode === "push" ? ButtonStyle.Success : ButtonStyle.Secondary)
+        .setDisabled(mode === "push"),
+      new ButtonBuilder()
+        .setCustomId("config_intercom_mode_bi")
+        .setLabel("Bidirectional")
+        .setStyle(mode === "bi" ? ButtonStyle.Success : ButtonStyle.Secondary)
+        .setDisabled(mode === "bi"),
+      new ButtonBuilder().setCustomId("config_intercom_reset").setLabel("Reset bridge data").setStyle(ButtonStyle.Danger)
+    );
+
+    const setupButtons = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId("config_intercom_secrets").setLabel("Set Secrets").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("config_intercom_admin").setLabel("Pick Admin").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("config_intercom_types").setLabel("Map Ticket Types").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("config_intercom_states").setLabel("Map States").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("config_intercom_attrs").setLabel("Ensure Attributes").setStyle(ButtonStyle.Secondary)
+    );
+
+    const actionButtons = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId("config_intercom_backfill").setLabel("Backfill tickets").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId("config_intercom_retry_dead")
+        .setLabel(`Retry failed (${outbox.dead})`)
+        .setStyle(ButtonStyle.Secondary)
+        .setDisabled(outbox.dead === 0),
+      new ButtonBuilder()
+        .setCustomId("config_intercom_region")
+        .setLabel(`Region: ${s.intercomRegion().toUpperCase()}`)
+        .setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("config_back_main").setLabel("Back").setStyle(ButtonStyle.Secondary)
+    );
+
+    return { embeds: [embed], components: [modeButtons, setupButtons, actionButtons] };
+  }
+
+  // All Intercom-panel string selects: admin picker + the two two-step mapping flows.
+  private async handleIntercomSelect(interaction: StringSelectMenuInteraction): Promise<void> {
+    if (!this.isAdmin(interaction)) {
+      await interaction.reply({ embeds: [makeEmbed("Administrator permission required.", COLORS.danger)], flags: 64 });
+      return;
+    }
+    const id = interaction.customId;
+    const value = interaction.values[0];
+
+    if (id === "config_intercom_admin_pick") {
+      await this.settingsStore.updateIntercom({ intercomAdminId: value });
+      this.auditConfig(interaction, `Intercom fallback admin → ${value}`);
+      await interaction.update(await this.buildIntercomPanel());
+      return;
+    }
+
+    if (id === "config_intercom_map_cat_pick") {
+      await interaction.deferUpdate();
+      try {
+        const types = await this.intercomClient.listTicketTypes();
+        // Customer-category types are what the bridge creates; fall back to the
+        // full list if the workspace reports no category field.
+        const customer = types.filter((t) => (t.category ?? "").toLowerCase() === "customer");
+        const pool = customer.length > 0 ? customer : types;
+        if (pool.length === 0) {
+          await interaction.followUp({
+            embeds: [makeEmbed("Intercom returned no ticket types — create a Customer ticket type in Intercom first.", COLORS.warn)],
+            flags: 64,
+          });
+          return;
+        }
+        const current = this.settingsStore.intercomTicketTypeMap()[value];
+        const select = new StringSelectMenuBuilder()
+          .setCustomId(`config_intercom_map_type_pick:${value}`)
+          .setPlaceholder(`Ticket type for "${value}"`)
+          .addOptions(
+            pool.slice(0, 25).map((t) => ({
+              label: t.name.slice(0, 100),
+              value: t.id,
+              description: `${t.category ?? "?"} · id ${t.id}`.slice(0, 100),
+              default: t.id === current,
+            }))
+          );
+        const back = new ActionRowBuilder<ButtonBuilder>().addComponents(
+          new ButtonBuilder().setCustomId("config_intercom_types").setLabel("Back").setStyle(ButtonStyle.Secondary)
+        );
+        await interaction.editReply({
+          embeds: [makeEmbed(`Pick the Intercom ticket type for **${value}**.`, COLORS.neutral)],
+          components: [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(select), back],
+        });
+      } catch (e) {
+        await interaction.followUp({
+          embeds: [makeEmbed(`Could not list ticket types: ${e instanceof Error ? e.message : e}`, COLORS.danger)],
+          flags: 64,
+        });
+      }
+      return;
+    }
+
+    if (id.startsWith("config_intercom_map_type_pick:")) {
+      const categoryId = id.slice("config_intercom_map_type_pick:".length);
+      const map = { ...this.settingsStore.intercomTicketTypeMap(), [categoryId]: value };
+      await this.settingsStore.updateIntercom({ intercomTicketTypeMap: map });
+      this.auditConfig(interaction, `Intercom ticket type mapping → ${categoryId} = ${value}`);
+      await interaction.update(await this.buildIntercomPanel());
+      return;
+    }
+
+    if (id === "config_intercom_map_status_pick") {
+      await interaction.deferUpdate();
+      try {
+        const states = (await this.intercomClient.listTicketStates()).filter((s) => !s.archived);
+        if (states.length === 0) {
+          await interaction.followUp({
+            embeds: [makeEmbed("Intercom returned no ticket states — create them in Intercom first (Settings → Ticket states).", COLORS.warn)],
+            flags: 64,
+          });
+          return;
+        }
+        const tag = this.settingsStore.tagById(value);
+        const select = new StringSelectMenuBuilder()
+          .setCustomId(`config_intercom_map_state_pick:${value}`)
+          .setPlaceholder(`Intercom state for ${tag ? `${tag.emoji} ${tag.label}` : value}`)
+          .addOptions([
+            { label: "— unmapped —", value: "__none__", description: "Don't touch the Intercom state for this tag", default: !tag?.intercomTicketStateId },
+            ...states.slice(0, 24).map((s) => ({
+              label: s.internalLabel.slice(0, 100),
+              value: s.id,
+              description: `${s.category ?? "?"} · id ${s.id}`.slice(0, 100),
+              default: s.id === tag?.intercomTicketStateId,
+            })),
+          ]);
+        const back = new ActionRowBuilder<ButtonBuilder>().addComponents(
+          new ButtonBuilder().setCustomId("config_intercom_states").setLabel("Back").setStyle(ButtonStyle.Secondary)
+        );
+        await interaction.editReply({
+          embeds: [makeEmbed(`Pick the Intercom ticket state for **${tag ? `${tag.emoji} ${tag.label}` : value}**.`, COLORS.neutral)],
+          components: [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(select), back],
+        });
+      } catch (e) {
+        await interaction.followUp({
+          embeds: [makeEmbed(`Could not list ticket states: ${e instanceof Error ? e.message : e}`, COLORS.danger)],
+          flags: 64,
+        });
+      }
+      return;
+    }
+
+    if (id.startsWith("config_intercom_map_state_pick:")) {
+      const tagId = id.slice("config_intercom_map_state_pick:".length);
+      const stateId = value === "__none__" ? null : value;
+      await this.settingsStore.setTagIntercomState(tagId, stateId);
+      const tag = this.settingsStore.tagById(tagId);
+      this.auditConfig(
+        interaction,
+        `Intercom state mapping → ${tag ? `${tag.emoji} ${tag.label}` : tagId} = ${stateId ?? "unmapped"}`
+      );
+      await interaction.update(await this.buildIntercomPanel());
+      return;
+    }
+  }
+
+  // Category → Intercom ticket type mapping, step 1: pick the category.
+  private buildIntercomTypePickPanel() {
+    const typeMap = this.settingsStore.intercomTicketTypeMap();
+    const options = [
+      ...this.categoryRegistry.getAll().map((c) => ({
+        label: `${c.label} (${c.id})`,
+        value: c.id,
+        description: typeMap[c.id] ? `mapped → ticket type ${typeMap[c.id]}` : "not mapped",
+      })),
+      {
+        label: "Default (fallback for everything unmapped)",
+        value: "_default",
+        description: typeMap["_default"] ? `mapped → ticket type ${typeMap["_default"]}` : "not mapped — required",
+      },
+    ];
+    const select = new StringSelectMenuBuilder()
+      .setCustomId("config_intercom_map_cat_pick")
+      .setPlaceholder("Pick a category to map")
+      .addOptions(options.slice(0, 25));
+    const back = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId("config_intercom").setLabel("Back").setStyle(ButtonStyle.Secondary)
+    );
+    return {
+      embeds: [
+        makeEmbed(
+          "Map each ticket category to an Intercom **ticket type** (Customer category). The **Default** mapping is required — it catches tickets with no category-specific mapping.",
+          COLORS.neutral
+        ),
+      ],
+      components: [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(select), back],
+    };
+  }
+
+  // Status tag → Intercom ticket state mapping, step 1: pick the tag.
+  private buildIntercomStatePickPanel() {
+    const options = this.settingsStore.tags().map((t) => ({
+      label: `${t.emoji} ${t.label}`,
+      value: t.id,
+      description: t.intercomTicketStateId ? `mapped → state ${t.intercomTicketStateId}` : "not mapped",
+    }));
+    const select = new StringSelectMenuBuilder()
+      .setCustomId("config_intercom_map_status_pick")
+      .setPlaceholder("Pick a status tag to map")
+      .addOptions(options.slice(0, 25));
+    const back = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId("config_intercom").setLabel("Back").setStyle(ButtonStyle.Secondary)
+    );
+    return {
+      embeds: [
+        makeEmbed(
+          "Map each bot status tag to an Intercom **ticket state**. Unmapped tags leave the Intercom state untouched (the conversation still closes/reopens on closing statuses). In bi mode, agents changing the state in Intercom move the ticket to the mapped tag.",
+          COLORS.neutral
+        ),
+      ],
+      components: [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(select), back],
     };
   }
 
@@ -2270,6 +2628,222 @@ export class DiscordBot {
       await this.settingsStore.updateBilling({ billingAuditChannelId: null });
       this.auditConfig(interaction, "Billing audit channel → cleared");
       await interaction.update(this.buildBillingPanel());
+      return;
+    }
+
+    if (id === "config_intercom") {
+      await interaction.update(await this.buildIntercomPanel());
+      return;
+    }
+
+    if (id.startsWith("config_intercom_mode_")) {
+      const mode = id.slice("config_intercom_mode_".length) as IntercomMode;
+      if (mode !== "none" && mode !== "push" && mode !== "bi") return;
+      const before = this.settingsStore.intercomMode();
+      await this.settingsStore.updateIntercom({ intercomMode: mode });
+      this.auditConfig(interaction, `Intercom mode → ${mode}`);
+      await interaction.update(await this.buildIntercomPanel());
+      // Turning the bridge on backfills every existing ticket (open + closed);
+      // already-bridged tickets are skipped, so repeat switches are harmless.
+      if (before === "none" && mode !== "none") {
+        void this.runIntercomBackfill(interaction).catch((e) => console.error("Intercom backfill failed:", e));
+      }
+      return;
+    }
+
+    if (id === "config_intercom_region") {
+      const order: IntercomRegion[] = ["us", "eu", "au"];
+      const next = order[(order.indexOf(this.settingsStore.intercomRegion()) + 1) % order.length];
+      await this.settingsStore.updateIntercom({ intercomRegion: next });
+      this.auditConfig(interaction, `Intercom region → ${next.toUpperCase()}`);
+      await interaction.update(await this.buildIntercomPanel());
+      return;
+    }
+
+    if (id === "config_intercom_reset") {
+      const [links, outbox] = await Promise.all([this.intercomStore.countLinks(), this.intercomStore.counts()]);
+      const confirm = new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder().setCustomId("config_intercom_reset_confirm").setLabel("Yes, wipe bridge data").setStyle(ButtonStyle.Danger),
+        new ButtonBuilder().setCustomId("config_intercom").setLabel("Cancel").setStyle(ButtonStyle.Secondary)
+      );
+      await interaction.update({
+        embeds: [
+          makeEmbed(
+            [
+              `This deletes the bot's local bridge state: **${links}** link(s) and **${outbox.pending + outbox.dead}** queued event(s).`,
+              "",
+              "Nothing is deleted in Intercom itself. Use this when the Intercom side was cleared or recreated and the bookkeeping is stale — the next **Backfill** rebuilds every ticket from Discord.",
+              "⚠️ If the conversations/tickets still exist in Intercom, the next backfill will create duplicates.",
+            ].join("\n"),
+            COLORS.warn
+          ),
+        ],
+        components: [confirm],
+      });
+      return;
+    }
+
+    if (id === "config_intercom_reset_confirm") {
+      const result = await this.intercomStore.resetAll();
+      this.auditConfig(
+        interaction,
+        `Intercom bridge data reset (${result.links} links, ${result.events} queued events, ${result.parts} echo parts deleted)`
+      );
+      await interaction.update(await this.buildIntercomPanel());
+      await interaction.followUp({
+        embeds: [
+          makeEmbed(
+            `Bridge data wiped: ${result.links} link(s), ${result.events} event(s). Run **Backfill tickets** to rebuild.`,
+            COLORS.success
+          ),
+        ],
+        flags: 64,
+      });
+      return;
+    }
+
+    if (id === "config_intercom_retry_dead") {
+      const requeued = await this.intercomStore.retryDead();
+      this.auditConfig(interaction, `Intercom outbox → requeued ${requeued} failed event(s)`);
+      await interaction.update(await this.buildIntercomPanel());
+      return;
+    }
+
+    if (id === "config_intercom_backfill") {
+      await interaction.deferReply({ flags: 64 });
+      await this.runIntercomBackfill(interaction);
+      return;
+    }
+
+    if (id === "config_intercom_secrets") {
+      const s = this.settingsStore;
+      const modal = new ModalBuilder().setCustomId("config_intercom_secrets_modal").setTitle("Intercom Secrets");
+      const accessToken = new TextInputBuilder()
+        .setCustomId("access_token")
+        .setLabel("Access token (Developer Hub → your app)")
+        .setStyle(TextInputStyle.Short)
+        .setRequired(true)
+        .setValue(s.intercomAccessToken() ?? "");
+      const clientSecret = new TextInputBuilder()
+        .setCustomId("client_secret")
+        .setLabel("Client secret (blank = inbound webhook off)")
+        .setStyle(TextInputStyle.Short)
+        .setRequired(false)
+        .setValue(s.intercomClientSecret() ?? "");
+      modal.addComponents(
+        new ActionRowBuilder<TextInputBuilder>().addComponents(accessToken),
+        new ActionRowBuilder<TextInputBuilder>().addComponents(clientSecret)
+      );
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (id === "config_intercom_admin") {
+      await interaction.deferUpdate();
+      try {
+        const [admins, me] = await Promise.all([
+          this.intercomClient.listAdmins(),
+          this.intercomClient.getMe().catch(() => null),
+        ]);
+        const current = this.settingsStore.intercomAdminId();
+        const options = admins.slice(0, 25).map((a) => ({
+          label: (a.name || `Admin ${a.id}`).slice(0, 100),
+          value: a.id,
+          description: (a.email ?? undefined)?.slice(0, 100),
+          default: a.id === current,
+        }));
+        if (me && !options.some((o) => o.value === me.id)) {
+          options.pop();
+          options.push({ label: `${me.name ?? "Token owner"} (token owner)`, value: me.id, description: me.email ?? undefined, default: me.id === current });
+        }
+        if (options.length === 0) {
+          await interaction.followUp({ embeds: [makeEmbed("Intercom returned no admins — check the access token.", COLORS.danger)], flags: 64 });
+          return;
+        }
+        const select = new StringSelectMenuBuilder()
+          .setCustomId("config_intercom_admin_pick")
+          .setPlaceholder("Fallback authoring admin")
+          .addOptions(options);
+        const back = new ActionRowBuilder<ButtonBuilder>().addComponents(
+          new ButtonBuilder().setCustomId("config_intercom").setLabel("Back").setStyle(ButtonStyle.Secondary)
+        );
+        await interaction.editReply({
+          embeds: [
+            makeEmbed(
+              [
+                "Pick the admin the bridge authors as when the Operator/Fin bot is rejected (or was never detected).",
+                "The bridge prefers the auto-detected Operator — this admin is the fallback. Echo suppression is part-id based, so even an admin who actually answers tickets is safe to pick.",
+              ].join("\n"),
+              COLORS.neutral
+            ),
+          ],
+          components: [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(select), back],
+        });
+      } catch (e) {
+        await interaction.followUp({
+          embeds: [makeEmbed(`Could not list Intercom admins: ${e instanceof Error ? e.message : e}`, COLORS.danger)],
+          flags: 64,
+        });
+      }
+      return;
+    }
+
+    if (id === "config_intercom_types") {
+      await interaction.update(this.buildIntercomTypePickPanel());
+      return;
+    }
+
+    if (id === "config_intercom_states") {
+      await interaction.update(this.buildIntercomStatePickPanel());
+      return;
+    }
+
+    if (id === "config_intercom_attrs") {
+      await interaction.deferReply({ flags: 64 });
+      const typeIds = [...new Set(Object.values(this.settingsStore.intercomTicketTypeMap()))];
+      if (typeIds.length === 0) {
+        await interaction.editReply({ embeds: [makeEmbed("Map at least one ticket type first.", COLORS.warn)] });
+        return;
+      }
+      const lines: string[] = [];
+      const types = await this.intercomClient.listTicketTypes().catch(() => null);
+      for (const typeId of typeIds) {
+        const existing = types?.find((t) => t.id === typeId)?.attributeNames ?? [];
+        const results: string[] = [];
+        for (const [name, description] of [
+          [TICKET_ATTR_PRIORITY, "Ticket priority mirrored from the Discord support bot"],
+          [TICKET_ATTR_CSAT, "CSAT rating mirrored from the Discord support bot"],
+          [TICKET_ATTR_THREAD, "Discord thread id of the bridged ticket"],
+        ] as const) {
+          if (existing.includes(name)) {
+            results.push(`${name} ✓`);
+            continue;
+          }
+          try {
+            await this.intercomClient.createTicketTypeAttribute(typeId, name, description);
+            results.push(`${name} ✓`);
+          } catch (e) {
+            const message = e instanceof Error ? e.message : String(e);
+            // "Already exists"-shaped rejections count as success.
+            results.push(/exist|taken|unique/i.test(message) ? `${name} ✓` : `${name} ✗`);
+          }
+        }
+        lines.push(`Type \`${typeId}\`: ${results.join(" · ")}`);
+      }
+      const failed = lines.some((l) => l.includes("✗"));
+      await interaction.editReply({
+        embeds: [
+          makeEmbed(
+            [
+              ...lines,
+              ...(failed
+                ? ["", "✗ = could not create via API. Add the attribute manually in Intercom: Settings → Ticket types → add a text attribute with exactly that name."]
+                : []),
+            ].join("\n"),
+            failed ? COLORS.warn : COLORS.success
+          ),
+        ],
+      });
       return;
     }
 
@@ -2601,6 +3175,70 @@ export class DiscordBot {
         embeds: [makeEmbed(repo ? `GitHub repo set to \`${repo}\`.` : "GitHub repo cleared.", COLORS.success)],
         flags: 64,
       });
+      return;
+    }
+
+    if (interaction.customId === "config_intercom_secrets_modal") {
+      const accessToken = interaction.fields.getTextInputValue("access_token").trim();
+      const clientSecret = interaction.fields.getTextInputValue("client_secret").trim();
+
+      await this.settingsStore.updateIntercom({
+        intercomAccessToken: accessToken,
+        intercomClientSecret: clientSecret || null,
+      });
+      // Deliberately no secret values in the audit line.
+      this.auditConfig(
+        interaction,
+        `Intercom secrets updated (access token ${accessToken ? "set" : "cleared"}, client secret ${clientSecret ? "set" : "off"})`
+      );
+      await interaction.reply({
+        embeds: [
+          makeEmbed(
+            [
+              "Intercom secrets saved — probing the workspace…",
+              clientSecret
+                ? "Point the app's webhook at `POST <public-url>/intercom/webhook` and subscribe: conversation.admin.replied / noted / closed / opened, conversation.operator.replied, ticket.state.updated, ticket.admin.replied."
+                : "No client secret set — the inbound webhook endpoint stays disabled (needed for bi mode and the push-mode agent warning).",
+            ].join("\n"),
+            COLORS.success
+          ),
+        ],
+        flags: 64,
+      });
+
+      // Post-save probe: verify the token, seed the fallback admin from the
+      // token's owner, sanity-check the region, and auto-detect Operator/Fin.
+      void (async () => {
+        const notes: string[] = [];
+        try {
+          const me = await this.intercomClient.getMe();
+          if (!this.settingsStore.intercomAdminId()) {
+            await this.settingsStore.updateIntercom({ intercomAdminId: me.id });
+            notes.push(`Fallback admin seeded from the token owner: **${me.name ?? me.id}**.`);
+          }
+          const region = this.settingsStore.intercomRegion();
+          if (me.region && me.region.toLowerCase() !== region) {
+            notes.push(`⚠️ Workspace region is **${me.region.toUpperCase()}** but the bridge is set to **${region.toUpperCase()}** — fix it via the Region button.`);
+          }
+        } catch (e) {
+          notes.push(`⚠️ Token check failed: ${e instanceof Error ? e.message : e}`);
+        }
+        try {
+          const admins = await this.intercomClient.listAdmins();
+          const operator = admins.find((a) => /^(operator|fin)(\s|$)/i.test(a.name ?? ""));
+          if (operator) {
+            await this.settingsStore.updateIntercom({ intercomOperatorAdminId: operator.id });
+            notes.push(`Operator/Fin detected: **${operator.name}** (\`${operator.id}\`) — the bridge authors as it (no seat needed).`);
+          } else {
+            notes.push("Operator/Fin bot not found in the admin list — the bridge authors as the fallback admin.");
+          }
+        } catch {
+          // Token check above already reported the failure.
+        }
+        if (notes.length > 0) {
+          await interaction.followUp({ embeds: [makeEmbed(notes.join("\n"), COLORS.neutral)], flags: 64 }).catch(() => {});
+        }
+      })();
       return;
     }
 
@@ -2998,6 +3636,88 @@ export class DiscordBot {
       console.error("Backfill error:", error);
       await interaction.editReply({ embeds: [makeEmbed("Backfill failed; you can try again from /config.", COLORS.danger)] });
     }
+  }
+
+  // Intercom backfill: enqueue a full historical replay (ALL tickets, open and
+  // closed) into the outbox. Idempotent — tickets that already have a link or a
+  // pending ensure are skipped, so re-runs and crash-recovery are safe.
+  // Enqueueing is DB-only and fast; the actual pushing happens in the outbox
+  // drainer at its own pace. Runs after the mode switch none→push/bi and from
+  // the panel's "Backfill tickets" button.
+  private async runIntercomBackfill(interaction: ButtonInteraction): Promise<void> {
+    // Mode-switch calls arrive after interaction.update(); button calls after
+    // deferReply(). followUp works for both.
+    const progress = await interaction
+      .followUp({ embeds: [makeEmbed("Intercom backfill started…", COLORS.neutral)], flags: 64 })
+      .catch(() => null);
+    const report = async (text: string, color: number = COLORS.neutral) => {
+      if (!progress) return;
+      await interaction.webhook.editMessage(progress.id, { embeds: [makeEmbed(text, color)] }).catch(() => {});
+    };
+
+    try {
+      const tickets = await this.ticketStore.getAllWithTag(); // oldest first
+      let enqueuedTickets = 0;
+      let enqueuedEvents = 0;
+      let skipped = 0;
+      let processed = 0;
+
+      for (const ticket of tickets) {
+        processed++;
+        if (await this.intercomStore.hasLinkOrPendingEnsure(ticket.threadId)) {
+          skipped++;
+          continue;
+        }
+
+        const channel = await this.client.channels.fetch(ticket.threadId).catch(() => null);
+        const thread = channel?.isThread() ? (channel as ThreadChannel) : null;
+        const messages = thread ? await this.fetchAllThreadMessages(thread) : null;
+        const [notes, tagChanges] = await Promise.all([
+          this.ticketStore.listAllNotes(ticket.threadId),
+          this.ticketStore.listAllTagChanges(ticket.threadId),
+        ]);
+
+        const count = await this.intercomSync.backfillTicket(ticket, messages, notes, tagChanges);
+        if (count != null) {
+          enqueuedTickets++;
+          enqueuedEvents += count;
+        } else {
+          skipped++;
+        }
+
+        if (processed % 10 === 0) {
+          await report(`Intercom backfill: ${processed}/${tickets.length} tickets scanned, ${enqueuedEvents} events queued…`);
+        }
+      }
+
+      const summary = `Intercom backfill queued **${enqueuedTickets}** ticket(s) (**${enqueuedEvents}** events), skipped ${skipped} already bridged. The outbox pushes them in the background — watch the count in /config → Intercom.`;
+      await report(summary, COLORS.success);
+      void this.audit.log({
+        title: "🌉 Intercom backfill",
+        severity: "info",
+        actor: interaction.user.displayName,
+        fields: [{ name: "Result", value: summary }],
+      });
+    } catch (error) {
+      console.error("Intercom backfill error:", error);
+      await report("Intercom backfill failed — check the logs; you can safely run it again from /config → Intercom.", COLORS.danger);
+    }
+  }
+
+  // Full history of a thread, oldest first (paged; works on archived threads).
+  private async fetchAllThreadMessages(thread: ThreadChannel): Promise<BridgeSourceMessage[]> {
+    const collected: BridgeSourceMessage[] = [];
+    let before: string | undefined;
+    for (;;) {
+      const batch = await thread.messages.fetch({ limit: 100, ...(before ? { before } : {}) }).catch(() => null);
+      if (!batch || batch.size === 0) break;
+      for (const message of batch.values()) {
+        collected.push(this.toBridgeMessage(message, message.member));
+      }
+      before = batch.last()?.id;
+      if (batch.size < 100) break;
+    }
+    return collected.sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
   }
 
   // Re-runnable reconciliation: walk every tracked ticket and repair its DB status/type/closed
@@ -3455,6 +4175,11 @@ export class DiscordBot {
           embeds: [],
           components: [selectRow, buttonRow],
         });
+      },
+      {
+        // Secret is read per request: it lives in BotSettings and can change live.
+        getClientSecret: () => this.settingsStore.intercomClientSecret(),
+        handle: (body) => this.intercomWebhook.handle(body),
       }
     );
     callbackServer.start();

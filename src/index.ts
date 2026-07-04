@@ -22,6 +22,11 @@ import { StatusReportScheduler } from "./bot/StatusReportScheduler";
 import { DiscordBot } from "./bot/DiscordBot";
 import { ensureSchema } from "./db/ensureSchema";
 import { HowToCategory, BugsCategory, BillingCategory } from "./categories";
+import { IntercomClient } from "./intercom/IntercomClient";
+import { IntercomStore } from "./intercom/IntercomStore";
+import { IntercomSyncService } from "./intercom/IntercomSyncService";
+import { IntercomOutboxScheduler } from "./intercom/IntercomOutboxScheduler";
+import { IntercomWebhookHandler } from "./intercom/IntercomWebhookHandler";
 
 async function main() {
   const config = loadConfig();
@@ -46,7 +51,11 @@ async function main() {
   }
   const ticketStore = new TicketStore(prisma);
   const auditLogger = new AuditLogger(settingsStore);
-  const statusService = new StatusService(ticketStore, auditLogger, settingsStore);
+  const intercomStore = new IntercomStore(prisma);
+  const intercomClient = new IntercomClient(settingsStore);
+  const intercomSync = new IntercomSyncService(settingsStore, intercomStore, sessionStore, ticketStore);
+  const statusService = new StatusService(ticketStore, auditLogger, settingsStore, intercomSync);
+  const intercomWebhookHandler = new IntercomWebhookHandler(settingsStore, ticketStore, statusService, intercomStore, intercomSync);
   const oauthManager = new OAuthManager(config, sessionStore);
   const apiClient = new PostizApiClient(config);
   const claudeRunner = new ClaudeCodeRunner(process.cwd());
@@ -74,10 +83,15 @@ async function main() {
     reportService,
     cannedStore,
     auditLogger,
-    tierStore
+    tierStore,
+    intercomSync,
+    intercomStore,
+    intercomClient,
+    intercomWebhookHandler
   );
   // The client exists as soon as the constructor ran; nothing fires before login.
   auditLogger.bindClient(bot.client);
+  intercomWebhookHandler.bindClient(bot.client);
   await bot.start();
 
   const reminderScheduler = new ReminderScheduler(bot.client, settingsStore, ticketStore, statusService, auditLogger, tierStore);
@@ -89,6 +103,16 @@ async function main() {
   const recloseScheduler = new RecloseScheduler(bot.client, ticketStore, auditLogger);
   recloseScheduler.start();
 
+  const intercomOutboxScheduler = new IntercomOutboxScheduler(
+    intercomClient,
+    intercomStore,
+    settingsStore,
+    ticketStore,
+    intercomSync,
+    auditLogger
+  );
+  intercomOutboxScheduler.start();
+
   // Clean expired pending auths every 5 minutes
   setInterval(() => sessionStore.cleanExpiredPending(), 5 * 60 * 1000);
 
@@ -98,6 +122,7 @@ async function main() {
     reminderScheduler.stop();
     statusReportScheduler.stop();
     recloseScheduler.stop();
+    intercomOutboxScheduler.stop();
     bot.client.destroy();
     await prisma.$disconnect();
     process.exit(0);

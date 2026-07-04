@@ -229,6 +229,57 @@ const STATEMENTS: string[] = [
   `ALTER TABLE "bot_settings" DROP COLUMN IF EXISTS "chatwootWebhookSecret"`,
   `ALTER TABLE "bot_settings" DROP COLUMN IF EXISTS "chatwootApiToken"`,
   `ALTER TABLE "bot_settings" DROP COLUMN IF EXISTS "chatwootInboxId"`,
+  // Intercom bridge: link map, durable outbox, echo-part ledger + settings columns.
+  `CREATE TABLE IF NOT EXISTS "intercom_links" (
+    "id" TEXT NOT NULL,
+    "ticketThreadId" TEXT NOT NULL,
+    "contactId" TEXT NOT NULL,
+    "contactExternalId" TEXT NOT NULL,
+    "conversationId" TEXT NOT NULL,
+    "ticketId" TEXT,
+    "agentWarnedAt" TIMESTAMP(3),
+    "lastSyncedStateId" TEXT,
+    "lastSyncedOpen" TEXT,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT "intercom_links_pkey" PRIMARY KEY ("id")
+  )`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS "intercom_links_ticketThreadId_key" ON "intercom_links"("ticketThreadId")`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS "intercom_links_conversationId_key" ON "intercom_links"("conversationId")`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS "intercom_links_ticketId_key" ON "intercom_links"("ticketId")`,
+  `CREATE TABLE IF NOT EXISTS "intercom_outbox" (
+    "id" TEXT NOT NULL,
+    "seq" SERIAL,
+    "ticketThreadId" TEXT NOT NULL,
+    "type" TEXT NOT NULL,
+    "payload" JSONB NOT NULL,
+    "status" TEXT NOT NULL DEFAULT 'PENDING',
+    "attempts" INTEGER NOT NULL DEFAULT 0,
+    "nextAttemptAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "lastError" TEXT,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT "intercom_outbox_pkey" PRIMARY KEY ("id")
+  )`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS "intercom_outbox_seq_key" ON "intercom_outbox"("seq")`,
+  `CREATE INDEX IF NOT EXISTS "intercom_outbox_ticketThreadId_seq_idx" ON "intercom_outbox"("ticketThreadId", "seq")`,
+  `CREATE INDEX IF NOT EXISTS "intercom_outbox_status_nextAttemptAt_idx" ON "intercom_outbox"("status", "nextAttemptAt")`,
+  `CREATE TABLE IF NOT EXISTS "intercom_echo_parts" (
+    "id" TEXT NOT NULL,
+    "kind" TEXT NOT NULL,
+    "partId" TEXT NOT NULL,
+    "ticketThreadId" TEXT NOT NULL,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT "intercom_echo_parts_pkey" PRIMARY KEY ("id")
+  )`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS "intercom_echo_parts_kind_partId_key" ON "intercom_echo_parts"("kind", "partId")`,
+  `CREATE INDEX IF NOT EXISTS "intercom_echo_parts_createdAt_idx" ON "intercom_echo_parts"("createdAt")`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "intercomMode" TEXT NOT NULL DEFAULT 'none'`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "intercomRegion" TEXT NOT NULL DEFAULT 'us'`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "intercomAccessToken" TEXT`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "intercomClientSecret" TEXT`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "intercomAdminId" TEXT`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "intercomOperatorAdminId" TEXT`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "intercomTicketTypeMap" JSONB`,
+  `ALTER TABLE "status_tags" ADD COLUMN IF NOT EXISTS "intercomTicketStateId" TEXT`,
 ];
 
 export async function ensureSchema(prisma: PrismaClient): Promise<void> {
