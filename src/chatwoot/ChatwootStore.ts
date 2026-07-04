@@ -134,4 +134,15 @@ export class ChatwootStore {
     ]);
     return { pending, dead };
   }
+
+  // Full bridge-state wipe (links + queue). Touches NOTHING in Chatwoot itself —
+  // use when the Chatwoot side was cleared/recreated and the local bookkeeping
+  // is stale; the next backfill rebuilds everything from Discord.
+  async resetAll(): Promise<{ links: number; events: number }> {
+    const [links, events] = await this.prisma.$transaction([
+      this.prisma.chatwootLink.deleteMany(),
+      this.prisma.chatwootOutboxEvent.deleteMany(),
+    ]);
+    return { links: links.count, events: events.count };
+  }
 }
