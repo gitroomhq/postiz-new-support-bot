@@ -35,6 +35,26 @@ export class SessionStore {
     return rows.map((r) => r.discordUserId);
   }
 
+  // Admin link/unlink (/billing). Update-only by design: creating a row would flip
+  // isAuthenticated() for a user who never OAuth'd (accessToken is owned by the OAuth flow).
+  async updateStripeCustomerId(discordUserId: string, stripeCustomerId: string | null): Promise<boolean> {
+    const res = await this.prisma.userSession.updateMany({
+      where: { discordUserId },
+      data: { stripeCustomerId },
+    });
+    return res.count > 0;
+  }
+
+  // After a customer is deleted in Stripe, stale links would point support staff
+  // at a dead id — clear them everywhere (the column is not unique).
+  async unlinkStripeCustomerEverywhere(stripeCustomerId: string): Promise<number> {
+    const res = await this.prisma.userSession.updateMany({
+      where: { stripeCustomerId },
+      data: { stripeCustomerId: null },
+    });
+    return res.count;
+  }
+
   // Batch-resolve sessions for display (Postiz/Stripe id columns) on a page of results.
   async listByDiscordIds(discordUserIds: string[]) {
     if (discordUserIds.length === 0) return [];

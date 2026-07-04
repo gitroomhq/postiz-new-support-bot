@@ -11,6 +11,7 @@ import { PostizApiClient } from "./bot/PostizApiClient";
 import { ClaudeCodeRunner } from "./bot/ClaudeCodeRunner";
 import { GitHubClient } from "./bot/GitHubClient";
 import { StripeClient } from "./bot/StripeClient";
+import { BillingAdmin } from "./bot/BillingAdmin";
 import { CategoryRegistry } from "./bot/CategoryRegistry";
 import { TicketStore } from "./bot/TicketStore";
 import { StatusService } from "./bot/StatusService";
@@ -61,6 +62,7 @@ async function main() {
   const claudeRunner = new ClaudeCodeRunner(process.cwd());
   const githubClient = new GitHubClient(config);
   const stripeClient = new StripeClient(config);
+  const billingAdmin = new BillingAdmin(config, stripeClient, sessionStore);
 
   const categoryRegistry = new CategoryRegistry()
     .register(new HowToCategory())
@@ -87,7 +89,8 @@ async function main() {
     intercomSync,
     intercomStore,
     intercomClient,
-    intercomWebhookHandler
+    intercomWebhookHandler,
+    billingAdmin
   );
   // The client exists as soon as the constructor ran; nothing fires before login.
   auditLogger.bindClient(bot.client);

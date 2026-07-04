@@ -58,6 +58,7 @@ import { IntercomSyncService, BridgeSourceMessage } from "../intercom/IntercomSy
 import { IntercomStore } from "../intercom/IntercomStore";
 import { IntercomClient, IntercomHttpError } from "../intercom/IntercomClient";
 import { IntercomWebhookHandler } from "../intercom/IntercomWebhookHandler";
+import { BillingAdmin } from "./BillingAdmin";
 import { TICKET_ATTR_PRIORITY, TICKET_ATTR_CSAT, TICKET_ATTR_THREAD } from "../intercom/IntercomOutboxScheduler";
 import { IntercomMode, IntercomRegion } from "../config/SettingsStore";
 
@@ -101,7 +102,8 @@ export class DiscordBot {
     private intercomSync: IntercomSyncService,
     private intercomStore: IntercomStore,
     private intercomClient: IntercomClient,
-    private intercomWebhook: IntercomWebhookHandler
+    private intercomWebhook: IntercomWebhookHandler,
+    private billingAdmin: BillingAdmin
   ) {
     this.client = new Client({
       // MessageContent is privileged (enable it in the Dev Portal too) — without it
@@ -335,6 +337,11 @@ export class DiscordBot {
       await this.handleRoleSelect(interaction);
     } else if (interaction.isChannelSelectMenu()) {
       await this.handleChannelSelect(interaction);
+    } else if (interaction.isUserSelectMenu()) {
+      // Only /billing uses user-select menus so far.
+      if (interaction.customId.startsWith("billadmin_")) {
+        await this.billingAdmin.handleUserSelect(interaction);
+      }
     } else if (interaction.isModalSubmit()) {
       await this.handleModal(interaction);
     }
@@ -361,6 +368,8 @@ export class DiscordBot {
       await this.handleCannedCommand(interaction);
     } else if (interaction.commandName === "charge") {
       await this.handleChargeCommand(interaction);
+    } else if (interaction.commandName === "billing") {
+      await this.billingAdmin.handleCommand(interaction);
     }
   }
 
@@ -1003,6 +1012,13 @@ export class DiscordBot {
       return;
     }
 
+    // billadmin_ is the /billing admin panel — distinct from the customer-facing
+    // billing_ prefix owned by BillingCategory.
+    if (interaction.customId.startsWith("billadmin_")) {
+      await this.billingAdmin.handleButton(interaction);
+      return;
+    }
+
     if (interaction.customId.startsWith("feedback_yes:") || interaction.customId.startsWith("feedback_no:")) {
       await this.handleFeedback(interaction);
       return;
@@ -1232,6 +1248,11 @@ export class DiscordBot {
       return;
     }
 
+    if (interaction.customId.startsWith("billadmin_")) {
+      await this.billingAdmin.handleSelectMenu(interaction);
+      return;
+    }
+
     if (interaction.customId === "billing_suboption") {
       const threadsChannel = await this.getThreadsChannel();
       if (!threadsChannel) {
@@ -1266,6 +1287,12 @@ export class DiscordBot {
   private async handleModal(interaction: ModalSubmitInteraction): Promise<void> {
     if (interaction.customId.startsWith("config_")) {
       await this.handleConfigModal(interaction);
+      return;
+    }
+
+    // Must run before the category fall-through below.
+    if (interaction.customId.startsWith("billadmin_")) {
+      await this.billingAdmin.handleModal(interaction);
       return;
     }
 
@@ -4330,6 +4357,11 @@ export class DiscordBot {
             ],
           },
         ],
+      },
+      {
+        name: "billing",
+        description: "Stripe billing admin panel (admin only)",
+        default_member_permissions: "8", // ADMINISTRATOR
       },
       {
         name: "search-tickets",
