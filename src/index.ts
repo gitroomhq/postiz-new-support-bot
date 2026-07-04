@@ -62,7 +62,7 @@ async function main() {
   const claudeRunner = new ClaudeCodeRunner(process.cwd());
   const githubClient = new GitHubClient(config);
   const stripeClient = new StripeClient(config);
-  const billingAdmin = new BillingAdmin(config, stripeClient, sessionStore);
+  const billingAdmin = new BillingAdmin(config, stripeClient, sessionStore, settingsStore);
 
   const categoryRegistry = new CategoryRegistry()
     .register(new HowToCategory())

@@ -20,6 +20,7 @@ import type Stripe from "stripe";
 import { BotConfig } from "../config";
 import { StripeClient } from "./StripeClient";
 import { SessionStore } from "../auth/SessionStore";
+import { SettingsStore } from "../config/SettingsStore";
 import { embed as makeEmbed, COLORS } from "../util/embeds";
 
 // Actions that first resolve "a user" to a Stripe customer before running.
@@ -96,11 +97,15 @@ const SESSION_TTL_MS = 15 * 60 * 1000;
 // with per-panel state held in a token session keyed by the creating interaction id.
 export class BillingAdmin {
   private sessions = new Map<string, BillAdminSession>();
+  // Per-price active-subscription counts are a full sweep of the account —
+  // cache them briefly so saving the allowlist doesn't recount.
+  private planUsage?: { counts: Map<string, number>; scanned: number; truncated: boolean; at: number };
 
   constructor(
     private config: BotConfig,
     private stripeClient: StripeClient,
-    private sessionStore: SessionStore
+    private sessionStore: SessionStore,
+    private settingsStore: SettingsStore
   ) {}
 
   // ---- entry points (routed from DiscordBot by the billadmin_ prefix) ----
@@ -285,6 +290,21 @@ export class BillingAdmin {
       await interaction.update(
         session.pendingSubAction === "createsub" ? this.buildCreateSubConfirm(token) : this.buildChangePlanConfirm(token)
       );
+      return;
+    }
+    if (id.startsWith("billadmin_plansettings")) {
+      const force = id.endsWith(":refresh");
+      await interaction.deferUpdate();
+      await this.tryRender(interaction, async () => {
+        const stale = force || !this.planUsage || Date.now() - this.planUsage.at >= 5 * 60 * 1000;
+        if (stale) {
+          await interaction.editReply({
+            embeds: [makeEmbed("⏳ Counting active subscriptions per plan — this can take a moment…", COLORS.neutral)],
+            components: [],
+          });
+        }
+        await this.renderPlanSettings(interaction, undefined, force);
+      });
       return;
     }
     if (id.startsWith("billadmin_cstrial:")) {
@@ -554,6 +574,19 @@ export class BillingAdmin {
     const id = interaction.customId;
     const value = interaction.values[0];
 
+    if (id === "billadmin_plansel") {
+      await interaction.deferUpdate();
+      await this.tryRender(interaction, async () => {
+        await this.settingsStore.updateAllowedPriceIds(interaction.values);
+        await this.renderPlanSettings(
+          interaction,
+          interaction.values.length
+            ? `✅ Allowlist set to ${interaction.values.length} plan(s).`
+            : "✅ Allowlist cleared — all active plans are offered."
+        );
+      });
+      return;
+    }
     if (id.startsWith("billadmin_cuspick:")) {
       const token = id.split(":")[1];
       const session = await this.getOwnedSession(token, interaction);
@@ -1528,10 +1561,18 @@ export class BillingAdmin {
     const current = prices.find((p) => p.id === item.price.id);
     session.planFrom = this.priceLabel(current ?? item.price);
 
-    const options = prices.filter((p) => p.id !== item.price.id).slice(0, 25);
+    const { offered, limited } = this.filterAllowedPrices(prices);
+    const options = offered.filter((p) => p.id !== item.price.id).slice(0, 25);
     if (options.length === 0) {
       await interaction.editReply({
-        embeds: [makeEmbed("No other active recurring prices exist in this Stripe account.", COLORS.warn)],
+        embeds: [
+          makeEmbed(
+            limited
+              ? "No other plans are allowed — adjust 🔧 Plan Settings in the Subscriptions hub."
+              : "No other active recurring prices exist in this Stripe account.",
+            COLORS.warn
+          ),
+        ],
         components: [this.backRow("billadmin_hub:subs")],
       });
       return;
@@ -1554,7 +1595,8 @@ export class BillingAdmin {
       .setDescription(
         `\`${sub.id}\` is currently on **${session.planFrom}**.` +
           (sub.items.data.length > 1 ? "\n⚠️ Multi-item subscription — only the first item's plan is changed." : "") +
-          "\nPick the new plan:"
+          "\nPick the new plan:" +
+          (limited ? "\n-# Plans limited by 🔧 Plan Settings" : "")
       );
     await interaction.editReply({
       embeds: [embed],
@@ -1639,9 +1681,17 @@ export class BillingAdmin {
     session.hasDefaultPm = !!(customer.invoice_settings?.default_payment_method ?? customer.default_source);
 
     const prices = await this.stripeClient.listRecurringPrices();
-    if (prices.length === 0) {
+    const { offered, limited } = this.filterAllowedPrices(prices);
+    if (offered.length === 0) {
       await interaction.editReply({
-        embeds: [makeEmbed("No active recurring prices exist in this Stripe account.", COLORS.warn)],
+        embeds: [
+          makeEmbed(
+            limited
+              ? "No plans are allowed — adjust 🔧 Plan Settings in the Subscriptions hub."
+              : "No active recurring prices exist in this Stripe account.",
+            COLORS.warn
+          ),
+        ],
         components: [this.backRow("billadmin_hub:subs")],
       });
       return;
@@ -1651,7 +1701,7 @@ export class BillingAdmin {
       .setCustomId(`billadmin_planpick:${token}`)
       .setPlaceholder("Pick the plan")
       .addOptions(
-        prices.slice(0, 25).map((p) => ({
+        offered.slice(0, 25).map((p) => ({
           label: this.priceLabel(p).slice(0, 100),
           description: p.id.slice(0, 100),
           value: p.id,
@@ -1661,7 +1711,8 @@ export class BillingAdmin {
       .setTitle("Create subscription")
       .setColor(COLORS.brand)
       .setDescription(
-        `New subscription for \`${customer.id}\`${customer.email ? ` (${customer.email})` : ""}. Pick the plan:`
+        `New subscription for \`${customer.id}\`${customer.email ? ` (${customer.email})` : ""}. Pick the plan:` +
+          (limited ? "\n-# Plans limited by 🔧 Plan Settings" : "")
       );
     await interaction.editReply({
       embeds: [embed],
@@ -1732,6 +1783,95 @@ export class BillingAdmin {
           })
         )
       );
+  }
+
+  // ---- plan settings (allowlist + usage debug) ----
+
+  private filterAllowedPrices(prices: Stripe.Price[]): { offered: Stripe.Price[]; limited: boolean } {
+    const allowed = this.settingsStore.allowedPriceIds();
+    if (allowed.length === 0) return { offered: prices, limited: false };
+    const set = new Set(allowed);
+    return { offered: prices.filter((p) => set.has(p.id)), limited: true };
+  }
+
+  private async getPlanUsage(force = false): Promise<NonNullable<BillingAdmin["planUsage"]>> {
+    if (!force && this.planUsage && Date.now() - this.planUsage.at < 5 * 60 * 1000) return this.planUsage;
+    const res = await this.stripeClient.countActiveSubscriptionsByPrice();
+    this.planUsage = { ...res, at: Date.now() };
+    return this.planUsage;
+  }
+
+  private async renderPlanSettings(
+    interaction: { editReply: (payload: Panel) => Promise<unknown> },
+    notice?: string,
+    forceRecount = false
+  ): Promise<void> {
+    const [usage, prices] = await Promise.all([
+      this.getPlanUsage(forceRecount),
+      this.stripeClient.listRecurringPrices(),
+    ]);
+    const allowed = new Set(this.settingsStore.allowedPriceIds());
+
+    const sorted = [...prices].sort(
+      (a, b) => (usage.counts.get(b.id) ?? 0) - (usage.counts.get(a.id) ?? 0)
+    );
+    const lines = sorted.map((p) => {
+      const n = usage.counts.get(p.id) ?? 0;
+      return `**${n}×** — ${this.priceLabel(p)} — \`${p.id}\`${allowed.has(p.id) ? " ✅" : ""}`;
+    });
+    // Prices no longer active but still carrying subscriptions — pure debug info.
+    const activeIds = new Set(prices.map((p) => p.id));
+    const archived = [...usage.counts.entries()]
+      .filter(([priceId]) => !activeIds.has(priceId))
+      .sort((a, b) => b[1] - a[1]);
+    for (const [priceId, n] of archived.slice(0, 10)) {
+      lines.push(`**${n}×** — _archived/inactive price_ — \`${priceId}\``);
+    }
+
+    const embed = new EmbedBuilder()
+      .setTitle("🔧 Plan Settings")
+      .setColor(COLORS.brand)
+      .setDescription(
+        [
+          notice,
+          "The selection below defines which plans the **Create Subscription** and **Change Plan** " +
+            "pickers offer. Empty selection = all active plans. ✅ = currently allowed.",
+          "",
+          ...lines,
+        ]
+          .filter((l): l is string => l != null)
+          .join("\n")
+          .slice(0, 4096)
+      )
+      .setFooter({
+        text:
+          `${usage.scanned} active subscriptions scanned${usage.truncated ? " (truncated)" : ""} · ` +
+          "counts cached for 5 min — Recount to refresh",
+      });
+
+    const options = sorted.slice(0, 25).map((p) => ({
+      label: `${usage.counts.get(p.id) ?? 0}× · ${this.priceLabel(p)}`.slice(0, 100),
+      description: p.id.slice(0, 100),
+      value: p.id,
+      default: allowed.has(p.id),
+    }));
+    const components: ActionRowBuilder<MessageActionRowComponentBuilder>[] = [];
+    if (options.length > 0) {
+      const select = new StringSelectMenuBuilder()
+        .setCustomId("billadmin_plansel")
+        .setPlaceholder("Select the allowed plans (empty = all)")
+        .setMinValues(0)
+        .setMaxValues(options.length)
+        .addOptions(options);
+      components.push(this.selectRow(select));
+    }
+    components.push(
+      this.buttonRow(
+        this.btn("billadmin_plansettings:refresh", "🔄 Recount", ButtonStyle.Secondary),
+        this.btn("billadmin_hub:subs", "◀ Back", ButtonStyle.Secondary)
+      )
+    );
+    await interaction.editReply({ embeds: [embed], components });
   }
 
   // ---- refund flow ----
@@ -2701,6 +2841,7 @@ export class BillingAdmin {
           ),
           this.buttonRow(
             this.btn("billadmin_open:cancelsub", "Cancel Subscription", ButtonStyle.Danger),
+            this.btn("billadmin_plansettings", "🔧 Plan Settings", ButtonStyle.Secondary),
             this.btn("billadmin_root", "◀ Back", ButtonStyle.Secondary)
           ),
         ],

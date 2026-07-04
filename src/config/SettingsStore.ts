@@ -209,6 +209,12 @@ export class SettingsStore {
     return this.settings.refundMinMemberAgeDays;
   }
 
+  // /billing plan allowlist (comma-separated price ids in the DB). Empty = all
+  // active recurring prices are offered in the create/change-plan pickers.
+  allowedPriceIds(): string[] {
+    return (this.settings.allowedPriceIds ?? "").split(",").filter(Boolean);
+  }
+
   reportLastSnapshot(): ReportSnapshot | null {
     const snap = this.settings.reportLastSnapshot as unknown;
     if (snap && typeof snap === "object" && "openTotal" in snap) {
@@ -358,6 +364,13 @@ export class SettingsStore {
     refundMinMemberAgeDays?: number | null;
   }): Promise<void> {
     this.settings = await this.prisma.botSettings.update({ where: { id: "global" }, data });
+  }
+
+  async updateAllowedPriceIds(priceIds: string[]): Promise<void> {
+    this.settings = await this.prisma.botSettings.update({
+      where: { id: "global" },
+      data: { allowedPriceIds: priceIds.join(",") },
+    });
   }
 
   async updateReport(data: {

@@ -81,6 +81,9 @@ model BotSettings {
   refundMaxAmountCurrency String @default("usd")
   refundMaxPer24h     Int?
   refundMinMemberAgeDays Int?
+  // /billing plan allowlist: comma-separated Stripe price ids. Empty = all
+  // active recurring prices are offered in the create/change-plan pickers.
+  allowedPriceIds     String    @default("")
   auditLogChannelId   String?
   // Intercom bridge (all edited via /config → Intercom; deploy has no .env access).
   intercomMode          String  @default("none") // "none" | "push" | "bi"

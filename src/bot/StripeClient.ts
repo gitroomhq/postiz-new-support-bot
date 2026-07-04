@@ -200,6 +200,32 @@ export class StripeClient {
     return this.stripe.prices.retrieve(priceId, { expand: ["product"] });
   }
 
+  // Full sweep of active subscriptions, counting how many use each price —
+  // there is no Stripe API for per-price totals. 100/page; capped as a runaway guard.
+  async countActiveSubscriptionsByPrice(
+    maxPages = 50
+  ): Promise<{ counts: Map<string, number>; scanned: number; truncated: boolean }> {
+    const counts = new Map<string, number>();
+    let scanned = 0;
+    let startingAfter: string | undefined;
+    for (let page = 0; page < maxPages; page++) {
+      const res = await this.stripe.subscriptions.list({
+        status: "active",
+        limit: 100,
+        ...(startingAfter ? { starting_after: startingAfter } : {}),
+      });
+      for (const sub of res.data) {
+        scanned++;
+        for (const item of sub.items.data) {
+          counts.set(item.price.id, (counts.get(item.price.id) ?? 0) + 1);
+        }
+      }
+      if (!res.has_more || res.data.length === 0) return { counts, scanned, truncated: false };
+      startingAfter = res.data[res.data.length - 1].id;
+    }
+    return { counts, scanned, truncated: true };
+  }
+
   // "charge" bills the default payment method immediately and errors visibly if
   // that isn't possible; "invoice" emails an invoice due in 7 days instead.
   async createSubscription(
