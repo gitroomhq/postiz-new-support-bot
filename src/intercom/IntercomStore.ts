@@ -84,6 +84,11 @@ export class IntercomStore {
     return this.prisma.intercomLink.count();
   }
 
+  // Snapshot of every bridged object (the remote-wipe walks this).
+  async listAllLinks(): Promise<IntercomLink[]> {
+    return this.prisma.intercomLink.findMany({ orderBy: { createdAt: "asc" } });
+  }
+
   // ---- Echo-part ledger ----
   // Intercom has no writable content stamp, so echo suppression is id-based:
   // the outbox records every part it creates, and the webhook handler claims

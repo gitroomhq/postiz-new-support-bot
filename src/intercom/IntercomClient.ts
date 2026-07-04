@@ -400,6 +400,21 @@ export class IntercomClient {
     }
   }
 
+  // ---- Deletion (the /config "Wipe Intercom data" button) ----
+  // All three are permanent and irreversible on Intercom's side.
+
+  async deleteConversation(conversationId: string): Promise<void> {
+    await this.json(`/conversations/${encodeURIComponent(conversationId)}`, "DELETE", undefined, "conversation delete");
+  }
+
+  async deleteTicket(ticketId: string): Promise<void> {
+    await this.json(`/tickets/${encodeURIComponent(ticketId)}`, "DELETE", undefined, "ticket delete");
+  }
+
+  async deleteContact(contactId: string): Promise<void> {
+    await this.json(`/contacts/${encodeURIComponent(contactId)}`, "DELETE", undefined, "contact delete");
+  }
+
   // ---- Workspace metadata (/config pickers + attribute bootstrap) ----
 
   async listTicketTypes(): Promise<IntercomTicketType[]> {

@@ -56,7 +56,7 @@ import { BillingCategory } from "../categories/BillingCategory";
 import { BaseCategory, TicketContext } from "../categories/BaseCategory";
 import { IntercomSyncService, BridgeSourceMessage } from "../intercom/IntercomSyncService";
 import { IntercomStore } from "../intercom/IntercomStore";
-import { IntercomClient } from "../intercom/IntercomClient";
+import { IntercomClient, IntercomHttpError } from "../intercom/IntercomClient";
 import { IntercomWebhookHandler } from "../intercom/IntercomWebhookHandler";
 import { TICKET_ATTR_PRIORITY, TICKET_ATTR_CSAT, TICKET_ATTR_THREAD } from "../intercom/IntercomOutboxScheduler";
 import { IntercomMode, IntercomRegion } from "../config/SettingsStore";
@@ -2100,7 +2100,8 @@ export class DiscordBot {
         .setLabel("Bidirectional")
         .setStyle(mode === "bi" ? ButtonStyle.Success : ButtonStyle.Secondary)
         .setDisabled(mode === "bi"),
-      new ButtonBuilder().setCustomId("config_intercom_reset").setLabel("Reset bridge data").setStyle(ButtonStyle.Danger)
+      new ButtonBuilder().setCustomId("config_intercom_reset").setLabel("Reset bridge data").setStyle(ButtonStyle.Danger),
+      new ButtonBuilder().setCustomId("config_intercom_wipe").setLabel("Wipe Intercom data").setStyle(ButtonStyle.Danger)
     );
 
     const setupButtons = new ActionRowBuilder<ButtonBuilder>().addComponents(
@@ -2723,6 +2724,41 @@ export class DiscordBot {
       const requeued = await this.intercomStore.retryDead();
       this.auditConfig(interaction, `Intercom outbox → requeued ${requeued} failed event(s)`);
       await interaction.update(await this.buildIntercomPanel());
+      return;
+    }
+
+    if (id === "config_intercom_wipe") {
+      const links = await this.intercomStore.listAllLinks();
+      const contacts = new Set(links.map((l) => l.contactId)).size;
+      const tickets = links.filter((l) => l.ticketId).length;
+      const confirm = new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder()
+          .setCustomId("config_intercom_wipe_confirm")
+          .setLabel("Yes, delete everything from Intercom")
+          .setStyle(ButtonStyle.Danger)
+          .setDisabled(links.length === 0),
+        new ButtonBuilder().setCustomId("config_intercom").setLabel("Cancel").setStyle(ButtonStyle.Secondary)
+      );
+      await interaction.update({
+        embeds: [
+          makeEmbed(
+            [
+              `⚠️ This **permanently deletes from Intercom**: **${links.length}** conversation(s), **${tickets}** converted ticket(s) and **${contacts}** bridge-created contact(s). Intercom cannot restore them.`,
+              "",
+              "The bot's local bridge state (links + queued events + echo ledger) is wiped too, so a later **Backfill** can rebuild everything cleanly.",
+              "Only bridge-created objects are touched — Intercom-native conversations/contacts and all Discord threads stay untouched.",
+            ].join("\n"),
+            COLORS.danger
+          ),
+        ],
+        components: [confirm],
+      });
+      return;
+    }
+
+    if (id === "config_intercom_wipe_confirm") {
+      await interaction.deferReply({ flags: 64 });
+      await this.runIntercomWipe(interaction);
       return;
     }
 
@@ -3758,6 +3794,86 @@ export class DiscordBot {
     } catch (error) {
       console.error("Intercom backfill error:", error);
       await report("Intercom backfill failed — check the logs; you can safely run it again from /config → Intercom.", COLORS.danger);
+    }
+  }
+
+  // Remote wipe: permanently deletes every bridge-created object from Intercom
+  // (tickets → conversations → contacts) and clears the local bridge state.
+  // Local state goes FIRST so the outbox drainer can't race the wipe (an
+  // in-flight event would otherwise 404-self-heal and recreate objects).
+  // Failures are collected and reported, never fatal — leftovers can be
+  // removed by hand in Intercom.
+  private async runIntercomWipe(interaction: ButtonInteraction): Promise<void> {
+    const report = async (text: string, color: number = COLORS.neutral) => {
+      await interaction.editReply({ embeds: [makeEmbed(text, color)] }).catch(() => {});
+    };
+    const pause = () => new Promise((r) => setTimeout(r, 150));
+    const isGone = (e: unknown) => e instanceof IntercomHttpError && e.status === 404;
+
+    try {
+      const links = await this.intercomStore.listAllLinks();
+      const local = await this.intercomStore.resetAll();
+      await report(`Intercom wipe started — ${links.length} conversation(s) to delete…`);
+
+      let tickets = 0;
+      let conversations = 0;
+      let contacts = 0;
+      const failures: string[] = [];
+      let processed = 0;
+
+      for (const link of links) {
+        processed++;
+        if (link.ticketId) {
+          try {
+            await this.intercomClient.deleteTicket(link.ticketId);
+            tickets++;
+          } catch (e) {
+            if (!isGone(e)) failures.push(`ticket ${link.ticketId}`);
+          }
+          await pause();
+        }
+        try {
+          await this.intercomClient.deleteConversation(link.conversationId);
+          conversations++;
+        } catch (e) {
+          if (!isGone(e)) failures.push(`conversation ${link.conversationId}`);
+        }
+        await pause();
+        if (processed % 10 === 0) {
+          await report(`Intercom wipe: ${processed}/${links.length} conversations processed…`);
+        }
+      }
+
+      // Contacts last (deduped — one contact can own several conversations).
+      for (const contactId of [...new Set(links.map((l) => l.contactId))]) {
+        try {
+          await this.intercomClient.deleteContact(contactId);
+          contacts++;
+        } catch (e) {
+          if (!isGone(e)) failures.push(`contact ${contactId}`);
+        }
+        await pause();
+      }
+
+      const summary = [
+        `Intercom wipe done: deleted **${tickets}** ticket(s), **${conversations}** conversation(s), **${contacts}** contact(s); local state cleared (${local.links} links, ${local.events} queued events).`,
+        ...(failures.length > 0
+          ? [`⚠️ ${failures.length} deletion(s) failed — remove these in Intercom by hand: ${failures.slice(0, 10).join(", ")}${failures.length > 10 ? ", …" : ""}`]
+          : []),
+      ].join("\n");
+      await report(summary, failures.length > 0 ? COLORS.warn : COLORS.success);
+      void this.audit.log({
+        title: "🌉 Intercom data wiped",
+        severity: "warn",
+        actor: interaction.user.displayName,
+        fields: [{ name: "Result", value: summary.slice(0, 1024) }],
+      });
+    } catch (error) {
+      console.error("Intercom wipe error:", error);
+      await report(
+        "Intercom wipe failed — check the logs. Local state may already be cleared; re-running the wipe only affects objects that still have links, so remaining Intercom objects must be removed by hand.",
+        COLORS.danger
+      );
     }
   }
 
