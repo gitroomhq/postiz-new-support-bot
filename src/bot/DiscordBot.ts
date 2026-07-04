@@ -1941,23 +1941,18 @@ export class DiscordBot {
         }
       );
 
-    // Discord caps action rows at 5 buttons, so the panel spans two rows.
-    // Button order mirrors the embed sections: General/Workflow first, then Reporting/Integrations/actions.
-    const primary = [
+    // One nav button per embed section; Workflow and Reporting & Audit open sub-menus.
+    const nav = [
       new ButtonBuilder().setCustomId("config_general").setLabel("General Settings").setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId("config_tags").setLabel("Manage Tags").setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId("config_priorities").setLabel("Manage Priorities").setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId("config_escalation").setLabel("Escalation").setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId("config_billing").setLabel("Billing").setStyle(ButtonStyle.Primary),
-    ];
-    const secondary = [
-      new ButtonBuilder().setCustomId("config_report").setLabel("Status Report").setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId("config_audit").setLabel("Audit Log").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("config_workflow").setLabel("Workflow").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("config_reporting").setLabel("Reporting & Audit").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("config_intercom").setLabel("Intercom").setStyle(ButtonStyle.Primary),
+    ];
+    const actions = [
       new ButtonBuilder().setCustomId("config_reverify").setLabel("Re-Verify").setStyle(ButtonStyle.Secondary),
     ];
     if (!s.backfillDone()) {
-      secondary.push(
+      actions.push(
         new ButtonBuilder().setCustomId("config_backfill").setLabel("Backfill existing tickets").setStyle(ButtonStyle.Secondary)
       );
     }
@@ -1965,10 +1960,67 @@ export class DiscordBot {
     return {
       embeds: [embed],
       components: [
-        new ActionRowBuilder<ButtonBuilder>().addComponents(primary),
-        new ActionRowBuilder<ButtonBuilder>().addComponents(secondary),
+        new ActionRowBuilder<ButtonBuilder>().addComponents(nav),
+        new ActionRowBuilder<ButtonBuilder>().addComponents(actions),
       ],
     };
+  }
+
+  private buildWorkflowHubPanel() {
+    const s = this.settingsStore;
+    const tiers = this.tierStore.list();
+    const embed = new EmbedBuilder()
+      .setTitle("Workflow")
+      .setColor(0x5865f2)
+      .setDescription(
+        [
+          `**Status tags:** ${s.tags().length ? s.tags().map((t) => `${t.emoji} ${t.label}`).join(" · ") : "_none_"}`,
+          `**Priorities:** ${s.priorities().length ? s.priorities().map((p) => `${p.emoji} ${p.label}`).join(" · ") : "_none_"}`,
+          `**Escalation:** ${
+            tiers.length
+              ? tiers.map((t) => t.name).join(" → ")
+              : s.supportRoleId()
+                ? "_legacy support role_"
+                : "_not set_"
+          }`,
+        ].join("\n")
+      );
+
+    const buttons = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId("config_tags").setLabel("Manage Tags").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("config_priorities").setLabel("Manage Priorities").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("config_escalation").setLabel("Escalation").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("config_back_main").setLabel("Back").setStyle(ButtonStyle.Secondary)
+    );
+
+    return { embeds: [embed], components: [buttons] };
+  }
+
+  private buildReportingHubPanel() {
+    const s = this.settingsStore;
+    const embed = new EmbedBuilder()
+      .setTitle("Reporting & Audit")
+      .setColor(0x5865f2)
+      .setDescription(
+        [
+          `**Status report:** ${
+            s.reportEnabled() && s.reportChannelId()
+              ? `${s.reportHour() != null && s.reportMinute() != null ? `daily at ${this.formatReportTime(s.reportHour()!, s.reportMinute()!)} (${s.reportTimezone()})` : `every ${s.reportIntervalHours()}h`} → <#${s.reportChannelId()}>`
+              : "off"
+          }`,
+          `**Audit log:** ${s.auditLogChannelId() ? `<#${s.auditLogChannelId()}>` : "off"}`,
+          `**Billing audit:** ${s.billingAuditChannelId() ? `<#${s.billingAuditChannelId()}>` : "_in-thread ping_"}`,
+        ].join("\n")
+      );
+
+    const buttons = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId("config_report").setLabel("Status Report").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("config_audit").setLabel("Audit Log").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("config_billing").setLabel("Billing").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("config_back_main").setLabel("Back").setStyle(ButtonStyle.Secondary)
+    );
+
+    return { embeds: [embed], components: [buttons] };
   }
 
   private formatMinorAmount(amount: number, currency: string): string {
@@ -2008,7 +2060,7 @@ export class DiscordBot {
     const buttons = new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder().setCustomId("config_billing_limits").setLabel("Set Limits").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("config_billing_clear_channel").setLabel("Clear Channel").setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId("config_back_main").setLabel("Back").setStyle(ButtonStyle.Secondary)
+      new ButtonBuilder().setCustomId("config_reporting").setLabel("Back").setStyle(ButtonStyle.Secondary)
     );
 
     return {
@@ -2039,7 +2091,7 @@ export class DiscordBot {
 
     const buttons = new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder().setCustomId("config_audit_clear_channel").setLabel("Clear Channel").setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId("config_back_main").setLabel("Back").setStyle(ButtonStyle.Secondary)
+      new ButtonBuilder().setCustomId("config_reporting").setLabel("Back").setStyle(ButtonStyle.Secondary)
     );
 
     return {
@@ -2419,7 +2471,7 @@ export class DiscordBot {
       new ButtonBuilder().setCustomId("config_report_time").setLabel("Set Time").setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId("config_report_tz").setLabel("Set Timezone").setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId("config_report_overdue").setLabel("Set Overdue Days").setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId("config_back_main").setLabel("Back").setStyle(ButtonStyle.Secondary)
+      new ButtonBuilder().setCustomId("config_reporting").setLabel("Back").setStyle(ButtonStyle.Secondary)
     );
 
     return {
@@ -2457,7 +2509,7 @@ export class DiscordBot {
     components.push(
       new ActionRowBuilder<ButtonBuilder>().addComponents(
         new ButtonBuilder().setCustomId("config_tag_add").setLabel("Add Tag").setStyle(ButtonStyle.Success),
-        new ButtonBuilder().setCustomId("config_back_main").setLabel("Back").setStyle(ButtonStyle.Secondary)
+        new ButtonBuilder().setCustomId("config_workflow").setLabel("Back").setStyle(ButtonStyle.Secondary)
       )
     );
 
@@ -2525,7 +2577,7 @@ export class DiscordBot {
     components.push(
       new ActionRowBuilder<ButtonBuilder>().addComponents(
         new ButtonBuilder().setCustomId("config_priority_add").setLabel("Add Priority").setStyle(ButtonStyle.Success),
-        new ButtonBuilder().setCustomId("config_back_main").setLabel("Back").setStyle(ButtonStyle.Secondary)
+        new ButtonBuilder().setCustomId("config_workflow").setLabel("Back").setStyle(ButtonStyle.Secondary)
       )
     );
 
@@ -2599,7 +2651,7 @@ export class DiscordBot {
     components.push(new ActionRowBuilder<RoleSelectMenuBuilder>().addComponents(addSelect));
     components.push(
       new ActionRowBuilder<ButtonBuilder>().addComponents(
-        new ButtonBuilder().setCustomId("config_back_main").setLabel("Back").setStyle(ButtonStyle.Secondary)
+        new ButtonBuilder().setCustomId("config_workflow").setLabel("Back").setStyle(ButtonStyle.Secondary)
       )
     );
 
@@ -2635,6 +2687,14 @@ export class DiscordBot {
 
     if (id === "config_general") {
       await interaction.update(this.buildGeneralPanel());
+      return;
+    }
+    if (id === "config_workflow") {
+      await interaction.update(this.buildWorkflowHubPanel());
+      return;
+    }
+    if (id === "config_reporting") {
+      await interaction.update(this.buildReportingHubPanel());
       return;
     }
     if (id === "config_tags") {
