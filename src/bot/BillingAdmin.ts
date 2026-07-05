@@ -13,6 +13,7 @@ import { SettingsStore } from "../config/SettingsStore";
 import { AuditLogger } from "./AuditLogger";
 import { embed as makeEmbed, COLORS } from "../util/embeds";
 import {
+  popNav,
   type AdminGateInteraction,
   type Panel,
   type RouteEntry,
@@ -32,7 +33,6 @@ import { SubscriptionsHub } from "./billing/hubs/SubscriptionsHub";
 import { PromosHub } from "./billing/hubs/PromosHub";
 import { InvoicesHub } from "./billing/hubs/InvoicesHub";
 import { PaymentsHub } from "./billing/hubs/PaymentsHub";
-import { SigmaHub } from "./billing/hubs/SigmaHub";
 
 type Handler<I> = (interaction: I) => Promise<void>;
 
@@ -76,7 +76,6 @@ export class BillingAdmin {
   private promos: PromosHub;
   private invoices: InvoicesHub;
   private payments: PaymentsHub;
-  private sigma: SigmaHub;
 
   private buttonRoutes = new RouteTable<ButtonInteraction>();
   private selectRoutes = new RouteTable<StringSelectMenuInteraction>();
@@ -110,7 +109,6 @@ export class BillingAdmin {
     this.promos = new PromosHub(ctx);
     this.invoices = new InvoicesHub(ctx);
     this.payments = new PaymentsHub(ctx);
-    this.sigma = new SigmaHub(ctx);
 
     // The resolver dispatches a resolved customer to the owning hub's renderer.
     this.targets.bindHandlers({
@@ -135,7 +133,6 @@ export class BillingAdmin {
       this.promos,
       this.invoices,
       this.payments,
-      this.sigma,
       { routes: this.facadeRoutes() },
     ];
     for (const source of sources) {
@@ -189,7 +186,51 @@ export class BillingAdmin {
           await this.handleOpen(interaction, action, origin);
         },
       },
+      // Universal origin-aware Back: pop the previous panel's re-render id off
+      // the session's nav stack and re-invoke that panel's own button route.
+      {
+        kind: "button",
+        id: "billadmin_nav_back:",
+        match: "prefix",
+        handler: (interaction) => this.handleNavBack(interaction),
+      },
     ];
+  }
+
+  // Pops the nav stack and re-renders the previous panel by dispatching its
+  // re-render custom-id through the normal button route table. An empty stack
+  // falls back to the session's hub panel (originHub) or the root panel.
+  private async handleNavBack(interaction: ButtonInteraction): Promise<void> {
+    const token = interaction.customId.split(":")[1];
+    const session = await this.sessions.getOwnedSession(token, interaction);
+    if (!session) return;
+
+    const target =
+      popNav(session) ?? (session.originHub ? `billadmin_hub:${session.originHub}` : "billadmin_root");
+    const handler = this.buttonRoutes.find(target);
+    if (!handler) {
+      await interaction.update(this.buildRootPanel());
+      return;
+    }
+    // Re-invoke the previous panel's route with this interaction. The route
+    // parses interaction.customId for its token/page, so swap it to the target
+    // id first. navSkipPush stops routes that double as navigation entries
+    // (e.g. billadmin_sub_list) from re-growing the stack during this render.
+    interaction.customId = target;
+    session.navSkipPush = true;
+    try {
+      await handler(interaction);
+    } finally {
+      session.navSkipPush = false;
+    }
+  }
+
+  // /config → Billing → "Plan Allowlist": renders the plan-settings panel that
+  // used to live in the /billing Subscriptions hub. All its billadmin_ routes
+  // (recount, allowlist select) keep working; only the entry point moved.
+  // Admin gating is /config's — this is not reachable via billadmin_ ids.
+  async openPlanSettings(interaction: ButtonInteraction): Promise<void> {
+    await this.subs.openPlanSettings(interaction);
   }
 
   // ---- entry points (routed from DiscordBot by the billadmin_ prefix) ----

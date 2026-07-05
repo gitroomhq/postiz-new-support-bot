@@ -44,6 +44,14 @@ export interface BillAdminSession {
   chargeId?: string;
   refundAmountMinor?: number | null; // null = full remaining amount
   subscriptionId?: string;
+  paymentIntentId?: string;
+  // Origin-aware Back navigation: a stack of re-renderable button custom-ids
+  // (pushed at navigation time, popped by billadmin_nav_back:<token>).
+  nav?: string[];
+  // Set by the nav-back dispatcher while re-invoking a popped route, so that a
+  // route which normally pushes (it doubles as a navigation entry) doesn't
+  // re-grow the stack when it merely re-renders as a Back target.
+  navSkipPush?: boolean;
   // Change-plan / create-subscription flow state.
   pendingSubAction?: "discount" | "changeplan" | "createsub";
   subItemId?: string;
@@ -85,6 +93,31 @@ export type AdminGateInteraction =
   | StringSelectMenuInteraction
   | UserSelectMenuInteraction
   | ModalSubmitInteraction;
+
+// ---- origin-aware Back navigation (billadmin_nav_back:<token>) ----
+
+// Deep-but-bounded: 12 levels of panel nesting is beyond anything the UI can
+// realistically produce; beyond that the oldest entries are dropped.
+export const NAV_STACK_MAX = 12;
+
+// Records the CURRENT panel's re-render custom-id right before navigating into
+// another panel, so that panel's Back can restore this one. Consecutive
+// duplicates are collapsed (re-entering the same panel must not require two
+// Back presses to leave).
+export function pushNav(session: BillAdminSession, currentPanelId: string): void {
+  if (session.navSkipPush) {
+    session.navSkipPush = false;
+    return;
+  }
+  session.nav ??= [];
+  if (session.nav[session.nav.length - 1] === currentPanelId) return;
+  session.nav.push(currentPanelId);
+  if (session.nav.length > NAV_STACK_MAX) session.nav.splice(0, session.nav.length - NAV_STACK_MAX);
+}
+
+export function popNav(session: BillAdminSession): string | undefined {
+  return session.nav?.pop();
+}
 
 export const FINGERPRINT_RE = /^[A-Za-z0-9]{8,64}$/;
 // Sliding TTL: getOwnedSession refreshes the timestamp on every owned access.

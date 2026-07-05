@@ -301,6 +301,8 @@ export class CardsHub {
     const session = this.ctx.sessions.get(token);
     if (!session?.customerId) return;
     const customerId = session.customerId;
+    // Empty-nav-stack fallback for this panel's Back button.
+    session.originHub ??= "cards";
 
     const [paymentMethods, chargesRes, customer] = await Promise.all([
       this.ctx.stripe.listCustomerCards(customerId),
@@ -347,7 +349,7 @@ export class CardsHub {
     if (cards.size === 0) {
       await interaction.editReply({
         embeds: [makeEmbed(`No card payment methods or card charges found for \`${customerId}\`.`, COLORS.neutral)],
-        components: [backRow("billadmin_hub:cards")],
+        components: [backRow(`billadmin_nav_back:${token}`)],
       });
       return;
     }
@@ -390,7 +392,7 @@ export class CardsHub {
         );
       components.push(selectRow(select));
     }
-    components.push(backRow("billadmin_hub:cards"));
+    components.push(backRow(`billadmin_nav_back:${token}`));
     await interaction.editReply({ embeds: [embed], components });
   }
 }

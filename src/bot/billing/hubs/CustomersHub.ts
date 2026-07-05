@@ -13,7 +13,7 @@ import {
 import type Stripe from "stripe";
 import { embed as makeEmbed, COLORS } from "../../../util/embeds";
 import { Logger } from "../../../util/logger";
-import { backRow, btn, buttonRow, formatAddress, hubBack, selectRow, stripeErrorEmbed, subPlanLabel, textInput } from "../ui";
+import { backRow, btn, buttonRow, formatAddress, selectRow, stripeErrorEmbed, subPlanLabel, textInput } from "../ui";
 import type { BillAdminSession, Panel, RenderInteraction, RouteEntry } from "../types";
 import type { HubContext } from "./HubContext";
 
@@ -366,6 +366,8 @@ export class CustomersHub {
     const session = this.ctx.sessions.get(token);
     if (!session?.customerId) return;
     const customerId = session.customerId;
+    // Empty-nav-stack fallback for this panel's Back button.
+    session.originHub ??= "customers";
 
     const [customer, subscriptions, openInvoices, paymentMethods, chargesRes, linkRows, priceMap] = await Promise.all([
       this.ctx.stripe.getCustomer(customerId),
@@ -382,7 +384,7 @@ export class CustomersHub {
     if (!customer) {
       await interaction.editReply({
         embeds: [makeEmbed(`No such Stripe customer: \`${customerId}\` (or it was deleted).`, COLORS.warn)],
-        components: [backRow(hubBack("overview", session.originHub))],
+        components: [backRow(`billadmin_nav_back:${token}`)],
       });
       return;
     }
@@ -510,7 +512,7 @@ export class CustomersHub {
         selectRow(actionSelect),
         buttonRow(
           btn(`billadmin_c360_refresh:${token}`, "🔄 Refresh", ButtonStyle.Secondary),
-          btn(hubBack("overview", session.originHub), "◀ Back", ButtonStyle.Secondary)
+          btn(`billadmin_nav_back:${token}`, "◀ Back", ButtonStyle.Secondary)
         ),
       ],
     });
@@ -599,6 +601,7 @@ export class CustomersHub {
   async renderEditCustomer(interaction: RenderInteraction, token: string, notice?: string): Promise<void> {
     const session = this.ctx.sessions.get(token);
     if (!session?.customerId) return;
+    session.originHub ??= "customers";
 
     const [customer, taxIds] = await Promise.all([
       this.ctx.stripe.getCustomer(session.customerId),
@@ -702,7 +705,7 @@ export class CustomersHub {
           btn(`billadmin_taxid_add:${token}`, "Add tax ID", ButtonStyle.Primary),
           btn(`billadmin_taxid_remove:${token}`, "Remove tax ID", ButtonStyle.Secondary, taxIds.length === 0),
           btn(`billadmin_cust_delete:${token}`, "Delete customer", ButtonStyle.Danger),
-          btn("billadmin_hub:customers", "◀ Back", ButtonStyle.Secondary)
+          btn(`billadmin_nav_back:${token}`, "◀ Back", ButtonStyle.Secondary)
         ),
       ],
     });

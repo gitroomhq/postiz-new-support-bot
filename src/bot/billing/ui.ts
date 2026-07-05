@@ -214,7 +214,6 @@ export function buildRootPanel(config: BotConfig): Panel {
         "🎟️ **Promos** — promo codes & coupons",
         "🧾 **Invoices** — invoice list & detail, one-off invoices, credit notes",
         "💸 **Payments** — payment methods, account credits/debits, balance history, manual charges",
-        "📊 **Sigma** — Stripe analytics: scheduled query results & ad-hoc SQL (when available)",
       ].join("\n")
     )
     .setFooter({
@@ -233,8 +232,7 @@ export function buildRootPanel(config: BotConfig): Panel {
       ),
       buttonRow(
         btn("billadmin_hub:invoices", "🧾 Invoices", ButtonStyle.Primary),
-        btn("billadmin_hub:pay", "💸 Payments", ButtonStyle.Primary),
-        btn("billadmin_hub:sigma", "📊 Sigma", ButtonStyle.Primary)
+        btn("billadmin_hub:pay", "💸 Payments", ButtonStyle.Primary)
       ),
     ],
   };
@@ -345,7 +343,6 @@ export function buildHubPanel(area: string, config: BotConfig): Panel {
         ),
         buttonRow(
           btn("billadmin_open:cancelsub", "Cancel Subscription", ButtonStyle.Danger),
-          btn("billadmin_plansettings", "🔧 Plan Settings", ButtonStyle.Secondary),
           btn("billadmin_root", "◀ Back", ButtonStyle.Secondary)
         ),
       ],

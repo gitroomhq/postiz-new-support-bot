@@ -2095,6 +2095,7 @@ export class DiscordBot {
           }`,
           `**Max refunds per 24h (all users):** ${s.refundMaxPer24h() ?? "_no limit_"}`,
           `**Min server membership age:** ${s.refundMinMemberAgeDays() != null ? `${s.refundMinMemberAgeDays()} day(s)` : "_no minimum_"}`,
+          `**Plan allowlist:** ${s.allowedPriceIds().length ? `${s.allowedPriceIds().length} plan(s) offered in /billing pickers` : "_all active plans offered_"}`,
           "",
           "Refunds that trip a limit are not executed — the ticket is handed to the support team for manual review.",
         ].join("\n")
@@ -2108,6 +2109,7 @@ export class DiscordBot {
 
     const buttons = new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder().setCustomId("config_billing_limits").setLabel("Set Limits").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("config_billing_plans").setLabel("Plan Allowlist").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("config_billing_clear_channel").setLabel("Clear Channel").setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId("config_reporting").setLabel("Back").setStyle(ButtonStyle.Secondary)
     );
@@ -2808,6 +2810,13 @@ export class DiscordBot {
       await this.settingsStore.updateBilling({ billingAuditChannelId: null });
       this.auditConfig(interaction, "Billing audit channel → cleared");
       await interaction.update(this.buildBillingPanel());
+      return;
+    }
+
+    if (id === "config_billing_plans") {
+      // Plan allowlist for the /billing subscription pickers — the panel and
+      // its flows live in the billing admin; its Back returns to config_billing.
+      await this.billingAdmin.openPlanSettings(interaction);
       return;
     }
 

@@ -16,7 +16,7 @@ import type Stripe from "stripe";
 import { StripeClient } from "../../StripeClient";
 import { embed as makeEmbed, COLORS } from "../../../util/embeds";
 import { backRow, btn, buttonRow, invoiceLine, selectRow, textInput } from "../ui";
-import { SESSION_TTL_MS, type Panel, type RenderInteraction, type RouteEntry } from "../types";
+import { SESSION_TTL_MS, pushNav, type Panel, type RenderInteraction, type RouteEntry } from "../types";
 import type { HubContext } from "./HubContext";
 
 // Entry modes of the hub: list all invoices, list open invoices, or build a
@@ -38,6 +38,8 @@ interface InvState {
   createdAt: number;
   mode: InvMode;
   listStatus?: "open"; // undefined = all statuses
+  // Last rendered list page — the detail's nav-stack entry points back to it.
+  page?: number;
   invoiceId?: string;
   // Credit note flow (paid invoices).
   cnCurrency?: string;
@@ -191,8 +193,11 @@ export class InvoicesHub {
         const token = interaction.customId.split(":")[1];
         const session = await this.ctx.sessions.getOwnedSession(token, interaction);
         if (!session) return;
-        this.getState(token).invoiceId = interaction.values[0];
+        const state = this.getState(token);
+        state.invoiceId = interaction.values[0];
         await interaction.deferUpdate();
+        // The detail's Back returns to the exact list page it was opened from.
+        pushNav(session, `billadmin_inv_page:${token}:${state.page ?? 0}`);
         await this.ctx.sessions.tryRender(interaction, () => this.renderDetail(interaction, token));
       },
     },
@@ -668,6 +673,10 @@ export class InvoicesHub {
     const state = this.getState(token);
     if (!session?.customerId) return;
     if (!session.cursors) session.cursors = [undefined];
+    // Empty-nav-stack fallback for this panel's Back button (hub:invoices is
+    // the hub's own exact route), plus the page the detail's Back returns to.
+    session.originHub ??= "invoices";
+    state.page = page;
 
     const res = await this.ctx.stripe.listInvoicesByStatus(
       session.customerId,
@@ -707,7 +716,7 @@ export class InvoicesHub {
       buttonRow(
         btn(`billadmin_inv_page:${token}:${page - 1}`, "◀ Prev", ButtonStyle.Secondary, page <= 0),
         btn(`billadmin_inv_page:${token}:${page + 1}`, "Next ▶", ButtonStyle.Secondary, !res.has_more),
-        btn("billadmin_hub:invoices", "Back", ButtonStyle.Secondary)
+        btn(`billadmin_nav_back:${token}`, "Back", ButtonStyle.Secondary)
       )
     );
     await interaction.editReply({ embeds: [embed], components });
@@ -769,7 +778,7 @@ export class InvoicesHub {
 
   // Status-contextual action rows for the detail panel.
   private detailRows(status: Stripe.Invoice.Status | null, token: string): Panel["components"] {
-    const back = btn(`billadmin_inv_list:${token}`, "◀ Back", ButtonStyle.Secondary);
+    const back = btn(`billadmin_nav_back:${token}`, "◀ Back", ButtonStyle.Secondary);
     switch (status) {
       case "draft":
         return [

@@ -17,6 +17,7 @@ import { embed as makeEmbed, COLORS } from "../../util/embeds";
 import {
   FINGERPRINT_RE,
   TARGET_TITLES,
+  pushNav,
   type Panel,
   type RenderInteraction,
   type RouteEntry,
@@ -107,6 +108,9 @@ export class TargetResolver {
         const session = await this.ctx.sessions.getOwnedSession(token, interaction);
         if (!session?.customerId) return;
         await interaction.deferUpdate();
+        // These buttons only exist on the Customer-360 panel — the target's
+        // Back returns there via the nav stack.
+        pushNav(session, `billadmin_c360_refresh:${token}`);
         await this.ctx.sessions.tryRender(interaction, () => this.runTargetAction(interaction, token, action));
       },
     },
@@ -135,6 +139,10 @@ export class TargetResolver {
     }
 
     await interaction.deferUpdate();
+    // Only editcust lands on a panel whose Back walks the nav stack — the other
+    // choices open flows with their own explicit cancels/returns (rule: confirm
+    // and modal flows keep their explicit returns).
+    if (choice === "editcust") pushNav(session, `billadmin_c360_refresh:${token}`);
     await this.ctx.sessions.tryRender(interaction, async () => {
       if (choice === "link") {
         if (session.targetDiscordUserId) {

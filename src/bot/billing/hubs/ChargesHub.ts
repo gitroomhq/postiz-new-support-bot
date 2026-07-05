@@ -13,7 +13,7 @@ import { StripeClient } from "../../StripeClient";
 import { embed as makeEmbed, COLORS } from "../../../util/embeds";
 import { Logger } from "../../../util/logger";
 import { backRow, btn, buttonRow, chargeLine, invoiceLine, selectRow, textInput } from "../ui";
-import type { Panel, RenderInteraction, RouteEntry } from "../types";
+import { pushNav, type BillAdminSession, type Panel, type RenderInteraction, type RouteEntry } from "../types";
 import type { HubContext } from "./HubContext";
 
 const logger = new Logger("billing-admin:charges");
@@ -27,6 +27,42 @@ interface ChargeWithInvoiceRef extends Stripe.Charge {
 function chargeInvoiceId(charge: Stripe.Charge): string | null {
   const ref = (charge as ChargeWithInvoiceRef).invoice;
   return typeof ref === "string" ? ref : ref?.id ?? null;
+}
+
+// Same Basil situation on PaymentIntent: `invoice` is gone from the type but
+// still present on the wire for invoice-backed intents.
+interface PaymentIntentWithInvoiceRef extends Stripe.PaymentIntent {
+  invoice?: string | { id: string } | null;
+}
+
+function piInvoiceId(pi: Stripe.PaymentIntent): string | null {
+  const ref = (pi as PaymentIntentWithInvoiceRef).invoice;
+  return typeof ref === "string" ? ref : ref?.id ?? null;
+}
+
+// Statuses in which Stripe allows paymentIntents.cancel.
+const PI_CANCELABLE = new Set<Stripe.PaymentIntent.Status>([
+  "requires_payment_method",
+  "requires_confirmation",
+  "requires_action",
+  "processing",
+]);
+
+// The customer's chargeless PaymentIntents (attempts that never reached the
+// card network), fetched once per panel session and interleaved into the first
+// charges page. Keyed on the session object so the cache dies with the session.
+const chargelessPiCache = new WeakMap<BillAdminSession, Stripe.PaymentIntent[]>();
+
+// List row for a PaymentIntent that never produced a charge — visually distinct
+// from charge rows and carrying the decline info when Stripe recorded one.
+function piLine(stripe: StripeClient, pi: Stripe.PaymentIntent): string {
+  const parts = [
+    `⛔ **${stripe.formatAmount(pi.amount, pi.currency)}** — ${pi.status} (never reached card network)`,
+    `<t:${pi.created}:R>`,
+  ];
+  const decline = pi.last_payment_error?.decline_code ?? pi.last_payment_error?.code;
+  if (decline) parts.push(`decline: \`${decline}\``);
+  return parts.join(" · ");
 }
 
 // One pager for the three list views; the session records which view is active
@@ -47,8 +83,10 @@ export async function renderListPage(
   let hasNext = false;
   let footerExtra = "";
   let pageCharges: Stripe.Charge[] = [];
+  let pagePis: Stripe.PaymentIntent[] = [];
 
   if (session.view === "invoices") {
+    session.originHub ??= "charges";
     const { invoices, hasMore } = await ctx.stripe.listInvoices(session.customerId!, 10, session.cursors[page]);
     const last = invoices[invoices.length - 1];
     if (hasMore && last?.id) session.cursors[page + 1] = last.id;
@@ -56,6 +94,7 @@ export async function renderListPage(
     title = `Invoices — \`${session.customerId}\``;
     lines = invoices.map((inv) => invoiceLine(ctx.stripe, inv));
   } else if (session.view === "fpcharges") {
+    session.originHub ??= "cards";
     const { charges, nextPage } = await ctx.stripe.searchChargesByCardFingerprint(
       session.fingerprint!,
       10,
@@ -67,13 +106,35 @@ export async function renderListPage(
     lines = charges.map((c) => chargeLine(ctx.stripe, c, true));
     footerExtra = " · Search data can lag ~1 min";
   } else {
+    session.originHub ??= "charges";
     const { charges, hasMore } = await ctx.stripe.listCharges(session.customerId!, 10, session.cursors[page]);
     const last = charges[charges.length - 1];
     if (hasMore && last) session.cursors[page + 1] = last.id;
     hasNext = hasMore;
     title = `Charges — \`${session.customerId}\``;
-    lines = charges.map((c) => chargeLine(ctx.stripe, c, false));
     pageCharges = charges;
+
+    // PaymentIntents that died before creating a charge (declined at confirm,
+    // abandoned 3DS, canceled, awaiting confirmation) are invisible to
+    // charges.list — fetch them once per session and interleave them into the
+    // FIRST page; later pages stay charges-only (see footer note).
+    let chargelessPis = chargelessPiCache.get(session);
+    if (!chargelessPis) {
+      const intents = await ctx.stripe.listPaymentIntents(session.customerId!, 100);
+      // latest_charge is expandable (string | Charge | null) — anything
+      // non-null means a charge exists and charges.list already shows it.
+      chargelessPis = intents.filter((pi) => pi.latest_charge == null);
+      chargelessPiCache.set(session, chargelessPis);
+    }
+    pagePis = page === 0 ? chargelessPis : [];
+
+    lines = [
+      ...charges.map((c) => ({ created: c.created, line: chargeLine(ctx.stripe, c, false) })),
+      ...pagePis.map((pi) => ({ created: pi.created, line: piLine(ctx.stripe, pi) })),
+    ]
+      .sort((a, b) => b.created - a.created)
+      .map((row) => row.line);
+    if (chargelessPis.length > 0) footerExtra = " · ⛔ incomplete attempts shown on first page";
   }
 
   const embed = new EmbedBuilder()
@@ -83,19 +144,36 @@ export async function renderListPage(
     .setFooter({ text: `Page ${page + 1}${footerExtra}` });
 
   const components: Panel["components"] = [];
-  if (session.view === "charges" && pageCharges.length > 0) {
-    const pick = new StringSelectMenuBuilder()
-      .setCustomId(`billadmin_ch_pick:${token}:${page}`)
-      .setPlaceholder("Open a charge…")
-      .addOptions(
-        pageCharges.slice(0, 25).map((c) => ({
+  if (session.view === "charges" && (pageCharges.length > 0 || pagePis.length > 0)) {
+    // One merged picker: ch_ values open the charge detail, pi_ values the
+    // PaymentIntent detail — the id prefix is the discriminator.
+    const options = [
+      ...pageCharges.map((c) => ({
+        created: c.created,
+        option: {
           label: `${ctx.stripe.formatAmount(c.amount, c.currency)} · ${c.status}${
             c.refunded ? " · refunded" : c.amount_refunded > 0 ? " · partly refunded" : ""
           }${c.disputed ? " · 🚩 disputed" : ""}`.slice(0, 100),
           description: c.id.slice(0, 100),
           value: c.id,
-        }))
-      );
+        },
+      })),
+      ...pagePis.map((pi) => ({
+        created: pi.created,
+        option: {
+          label: `⛔ ${ctx.stripe.formatAmount(pi.amount, pi.currency)} · ${pi.status}`.slice(0, 100),
+          description: pi.id.slice(0, 100),
+          value: pi.id,
+        },
+      })),
+    ]
+      .sort((a, b) => b.created - a.created)
+      .slice(0, 25)
+      .map((row) => row.option);
+    const pick = new StringSelectMenuBuilder()
+      .setCustomId(`billadmin_ch_pick:${token}:${page}`)
+      .setPlaceholder("Open a charge or incomplete attempt…")
+      .addOptions(options);
     components.push(selectRow(pick));
   }
   const navButtons = [
@@ -107,9 +185,7 @@ export async function renderListPage(
   if (session.view !== "fpcharges" && session.customerId) {
     navButtons.push(btn(`billadmin_c360_refresh:${token}`, "👤 360", ButtonStyle.Secondary));
   }
-  navButtons.push(
-    btn(session.view === "fpcharges" ? "billadmin_hub:cards" : "billadmin_hub:charges", "Back", ButtonStyle.Secondary)
-  );
+  navButtons.push(btn(`billadmin_nav_back:${token}`, "Back", ButtonStyle.Secondary));
   components.push(buttonRow(...navButtons));
 
   await interaction.editReply({ embeds: [embed], components });
@@ -142,6 +218,9 @@ export class ChargesHub {
         const session = await this.ctx.sessions.getOwnedSession(token, interaction);
         if (!session?.customerId) return;
         await interaction.deferUpdate();
+        // billadmin_goto: buttons only exist on the Customer-360 panel — record
+        // it so the target list's Back returns there.
+        pushNav(session, `billadmin_c360_refresh:${token}`);
         await this.ctx.sessions.tryRender(interaction, async () => {
           if (view === "fraud") {
             session.fingerprint = undefined;
@@ -154,7 +233,8 @@ export class ChargesHub {
         });
       },
     },
-    // Charge detail: picked from the charges list select.
+    // Charge / PaymentIntent detail: picked from the merged charges-list select.
+    // The value's id prefix discriminates: ch_/py_ → charge, pi_ → PaymentIntent.
     {
       kind: "select",
       id: "billadmin_ch_pick:",
@@ -164,9 +244,78 @@ export class ChargesHub {
         const session = await this.ctx.sessions.getOwnedSession(token, interaction);
         if (!session) return;
         await interaction.deferUpdate();
-        session.chargeId = interaction.values[0];
         const page = Math.max(0, Number.parseInt(pageStr, 10) || 0);
+        // The detail's Back returns to the exact list page it was opened from.
+        pushNav(session, `billadmin_page:${token}:${page}`);
+        const picked = interaction.values[0];
+        if (picked.startsWith("pi_")) {
+          session.paymentIntentId = picked;
+          await this.ctx.sessions.tryRender(interaction, () => this.renderPiDetail(interaction, token, page));
+          return;
+        }
+        session.chargeId = picked;
         await this.ctx.sessions.tryRender(interaction, () => this.renderChargeDetail(interaction, token, page));
+      },
+    },
+    // PaymentIntent detail re-render (Back target of its confirm step).
+    {
+      kind: "button",
+      id: "billadmin_pi_det:",
+      match: "prefix",
+      handler: async (interaction) => {
+        const [, token, pageStr] = interaction.customId.split(":");
+        const session = await this.ctx.sessions.getOwnedSession(token, interaction);
+        if (!session?.paymentIntentId) return;
+        await interaction.deferUpdate();
+        const page = Math.max(0, Number.parseInt(pageStr, 10) || 0);
+        await this.ctx.sessions.tryRender(interaction, () => this.renderPiDetail(interaction, token, page));
+      },
+    },
+    // Cancel-PaymentIntent confirm step (danger confirm, PI pre-loaded).
+    {
+      kind: "button",
+      id: "billadmin_pi_cancel:",
+      match: "prefix",
+      handler: async (interaction) => {
+        const [, token, pageStr] = interaction.customId.split(":");
+        const session = await this.ctx.sessions.getOwnedSession(token, interaction);
+        if (!session?.paymentIntentId) return;
+        await interaction.deferUpdate();
+        const page = Math.max(0, Number.parseInt(pageStr, 10) || 0);
+        await this.ctx.sessions.tryRender(interaction, async () => {
+          const pi = await this.ctx.stripe.getPaymentIntent(session.paymentIntentId!);
+          if (!PI_CANCELABLE.has(pi.status)) {
+            await this.renderPiDetail(interaction, token, page, `⚠️ \`${pi.id}\` is **${pi.status}** — no longer cancelable.`);
+            return;
+          }
+          const embed = new EmbedBuilder()
+            .setTitle("Cancel PaymentIntent")
+            .setColor(COLORS.danger)
+            .setDescription(
+              `⚠️ Cancel \`${pi.id}\` (**${this.ctx.stripe.formatAmount(pi.amount, pi.currency)}**, ` +
+                `status **${pi.status}**)?\nThe attempt is closed for good — the customer can no longer ` +
+                "complete it (e.g. a pending 3DS challenge stops working). No money has moved on this intent."
+            );
+          await interaction.editReply({
+            embeds: [embed],
+            components: [
+              buttonRow(
+                btn(`billadmin_pi_cancelx:${token}:${page}`, "Cancel PaymentIntent", ButtonStyle.Danger),
+                btn(`billadmin_pi_det:${token}:${page}`, "◀ Back", ButtonStyle.Secondary)
+              ),
+            ],
+          });
+        });
+      },
+    },
+    {
+      kind: "button",
+      id: "billadmin_pi_cancelx:",
+      match: "prefix",
+      handler: async (interaction) => {
+        const [, token, pageStr] = interaction.customId.split(":");
+        const page = Math.max(0, Number.parseInt(pageStr, 10) || 0);
+        await this.executePiCancel(interaction, token, page);
       },
     },
     {
@@ -323,7 +472,8 @@ export class ChargesHub {
       .setFooter({
         text: "risk_score requires Radar for Fraud Teams · EFW match covers the 100 most recent warnings · Search data can lag ~1 min",
       });
-    await interaction.editReply({ embeds: [embed], components: [backRow("billadmin_hub:charges")] });
+    session.originHub ??= "charges";
+    await interaction.editReply({ embeds: [embed], components: [backRow(`billadmin_nav_back:${token}`)] });
   }
 
   // ---- refund flow ----
@@ -527,9 +677,109 @@ export class ChargesHub {
           btn(`billadmin_ch_refund:${token}:${page}`, "↩️ Refund…", ButtonStyle.Danger, charge.refunded || remaining <= 0),
           btn("billadmin_hub:invoices", "View invoice", ButtonStyle.Secondary, !invoiceId),
           btn(`billadmin_c360_refresh:${token}`, "👤 360", ButtonStyle.Secondary, !session.customerId),
-          btn(`billadmin_page:${token}:${page}`, "◀ Back", ButtonStyle.Secondary)
+          btn(`billadmin_nav_back:${token}`, "◀ Back", ButtonStyle.Secondary)
         ),
       ],
+    });
+  }
+
+  // ---- PaymentIntent detail (chargeless attempts from the merged list) ----
+
+  private async renderPiDetail(
+    interaction: RenderInteraction,
+    token: string,
+    page: number,
+    notice?: string
+  ): Promise<void> {
+    const session = this.ctx.sessions.get(token);
+    if (!session?.paymentIntentId) return;
+
+    const pi = await this.ctx.stripe.getPaymentIntent(session.paymentIntentId);
+    const err = pi.last_payment_error;
+    const errText = err
+      ? [
+          err.code ? `code \`${err.code}\`` : null,
+          err.decline_code ? `decline \`${err.decline_code}\`` : null,
+          err.message?.slice(0, 300) ?? null,
+        ]
+          .filter(Boolean)
+          .join(" · ")
+      : "—";
+
+    // payment_method is unexpanded (a string) on retrieve; the failed attempt's
+    // full PaymentMethod object often survives on last_payment_error instead.
+    let pmText = "—";
+    const pmRef = pi.payment_method ?? err?.payment_method ?? null;
+    if (pmRef && typeof pmRef !== "string") {
+      pmText = pmRef.card ? `${pmRef.card.brand} •••• ${pmRef.card.last4}` : pmRef.type;
+    } else if (typeof pmRef === "string") {
+      pmText = `\`${pmRef}\``;
+    }
+
+    const invoiceId = piInvoiceId(pi);
+    const cancelable = PI_CANCELABLE.has(pi.status);
+
+    const embed = new EmbedBuilder()
+      .setTitle(`⛔ Payment attempt — \`${pi.id}\``)
+      .setColor(pi.status === "canceled" ? COLORS.neutral : COLORS.warn)
+      .addFields(
+        { name: "Amount", value: `**${this.ctx.stripe.formatAmount(pi.amount, pi.currency)}**`, inline: true },
+        { name: "Status", value: pi.status, inline: true },
+        { name: "Created", value: `<t:${pi.created}:D>`, inline: true },
+        { name: "Last payment error", value: errText.slice(0, 1024), inline: false },
+        { name: "Cancellation reason", value: pi.cancellation_reason ?? "—", inline: true },
+        { name: "Payment method", value: pmText.slice(0, 1024), inline: true },
+        { name: "Invoice", value: invoiceId ? `\`${invoiceId}\`` : "—", inline: true }
+      );
+    if (notice) embed.setDescription(notice.slice(0, 4096));
+
+    await interaction.editReply({
+      embeds: [embed],
+      components: [
+        buttonRow(
+          btn(`billadmin_pi_cancel:${token}:${page}`, "🚫 Cancel PI", ButtonStyle.Danger, !cancelable),
+          btn(`billadmin_c360_refresh:${token}`, "👤 360", ButtonStyle.Secondary, !session.customerId),
+          btn(`billadmin_nav_back:${token}`, "◀ Back", ButtonStyle.Secondary)
+        ),
+      ],
+    });
+  }
+
+  private async executePiCancel(interaction: ButtonInteraction, token: string, page: number): Promise<void> {
+    const session = await this.ctx.sessions.getOwnedSession(token, interaction);
+    if (!session?.paymentIntentId) return;
+    await interaction.deferUpdate();
+    await this.ctx.sessions.tryRender(interaction, async () => {
+      let pi: Stripe.PaymentIntent;
+      try {
+        pi = await this.ctx.stripe.cancelPaymentIntent(
+          session.paymentIntentId!,
+          `billadmin-picancel-${interaction.id}`
+        );
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        this.ctx.audit.log(interaction, {
+          action: "Cancel PaymentIntent",
+          targetCustomerId: session.customerId,
+          objectId: session.paymentIntentId,
+          outcome: `Failed — ${msg.slice(0, 500)}`,
+          severity: "danger",
+        });
+        await this.renderPiDetail(interaction, token, page, `⚠️ Cancel failed: ${msg.slice(0, 300)}`);
+        return;
+      }
+
+      // The cached chargeless-PI rows now show a stale status — refetch next render.
+      chargelessPiCache.delete(session);
+      this.ctx.audit.log(interaction, {
+        action: "Cancel PaymentIntent",
+        targetCustomerId: session.customerId,
+        objectId: pi.id,
+        amountText: this.ctx.stripe.formatAmount(pi.amount, pi.currency),
+        outcome: `Canceled (was an incomplete attempt — no money had moved)`,
+        severity: "warn",
+      });
+      await this.renderPiDetail(interaction, token, page, `🚫 \`${pi.id}\` canceled.`);
     });
   }
 

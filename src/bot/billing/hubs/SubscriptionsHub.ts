@@ -5,6 +5,7 @@ import {
   ModalBuilder,
   TextInputBuilder,
   StringSelectMenuBuilder,
+  type ButtonInteraction,
   type MessageActionRowComponentBuilder,
   type ModalSubmitInteraction,
 } from "discord.js";
@@ -23,7 +24,7 @@ import {
   subPlanLabel,
   textInput,
 } from "../ui";
-import type { BillAdminSession, Panel, RenderInteraction, RouteEntry } from "../types";
+import { pushNav, type BillAdminSession, type Panel, type RenderInteraction, type RouteEntry } from "../types";
 import type { HubContext } from "./HubContext";
 
 // Plain-language descriptions of Stripe's three pause_collection behaviors.
@@ -211,20 +212,7 @@ export class SubscriptionsHub {
       kind: "button",
       id: "billadmin_plansettings",
       match: "prefix",
-      handler: async (interaction) => {
-        const force = interaction.customId.endsWith(":refresh");
-        await interaction.deferUpdate();
-        await this.ctx.sessions.tryRender(interaction, async () => {
-          const stale = force || this.ctx.priceBook.isPlanUsageStale();
-          if (stale) {
-            await interaction.editReply({
-              embeds: [makeEmbed("⏳ Counting active subscriptions per plan — this can take a moment…", COLORS.neutral)],
-              components: [],
-            });
-          }
-          await this.renderPlanSettings(interaction, undefined, force);
-        });
-      },
+      handler: (interaction) => this.openPlanSettings(interaction, interaction.customId.endsWith(":refresh")),
     },
     {
       kind: "button",
@@ -553,6 +541,11 @@ export class SubscriptionsHub {
         const session = await this.ctx.sessions.getOwnedSession(token, interaction);
         if (!session?.customerId) return;
         await interaction.deferUpdate();
+        // Entered from the Customer-360 panel (and from the discount/change-plan
+        // pick panels, which share the same resolved customer) — Back from the
+        // sub list / detail returns to the 360 view. pushNav is a no-op when
+        // this route is re-invoked as a nav-back target itself.
+        pushNav(session, `billadmin_c360_refresh:${token}`);
         await this.ctx.sessions.tryRender(interaction, async () => {
           const subs = (await this.ctx.stripe.listSubscriptions(session.customerId!)).filter(
             (s) => s.status !== "canceled"
@@ -584,6 +577,9 @@ export class SubscriptionsHub {
         const session = await this.ctx.sessions.getOwnedSession(token, interaction);
         if (!session) return;
         await interaction.deferUpdate();
+        // The pick select only exists on the sub-pick panel — the detail's Back
+        // returns to it (billadmin_sub_list re-renders the pick panel).
+        pushNav(session, `billadmin_sub_list:${token}`);
         await this.ctx.sessions.tryRender(interaction, async () => {
           session.subscriptionId = value;
           await this.renderSubDetail(interaction, token);
@@ -1475,7 +1471,7 @@ export class SubscriptionsHub {
         embeds: [
           makeEmbed(
             limited
-              ? "No other plans are allowed — adjust 🔧 Plan Settings in the Subscriptions hub."
+              ? "No other plans are allowed — adjust the Plan Allowlist in /config → Billing."
               : "No other active recurring prices exist in this Stripe account.",
             COLORS.warn
           ),
@@ -1503,7 +1499,7 @@ export class SubscriptionsHub {
         `\`${sub.id}\` is currently on **${session.planFrom}**.` +
           (sub.items.data.length > 1 ? "\n⚠️ Multi-item subscription — only the first item's plan is changed." : "") +
           "\nPick the new plan:" +
-          (limited ? "\n-# Plans limited by 🔧 Plan Settings" : "")
+          (limited ? "\n-# Plans limited by the Plan Allowlist (/config → Billing)" : "")
       );
     await interaction.editReply({
       embeds: [embed],
@@ -1662,7 +1658,7 @@ export class SubscriptionsHub {
         embeds: [
           makeEmbed(
             limited
-              ? "No plans are allowed — adjust 🔧 Plan Settings in the Subscriptions hub."
+              ? "No plans are allowed — adjust the Plan Allowlist in /config → Billing."
               : "No active recurring prices exist in this Stripe account.",
             COLORS.warn
           ),
@@ -1687,7 +1683,7 @@ export class SubscriptionsHub {
       .setColor(COLORS.brand)
       .setDescription(
         `New subscription for \`${customer.id}\`${customer.email ? ` (${customer.email})` : ""}. Pick the plan:` +
-          (limited ? "\n-# Plans limited by 🔧 Plan Settings" : "")
+          (limited ? "\n-# Plans limited by the Plan Allowlist (/config → Billing)" : "")
       );
     await interaction.editReply({
       embeds: [embed],
@@ -1797,6 +1793,23 @@ export class SubscriptionsHub {
 
   // ---- plan settings (allowlist + usage debug) ----
 
+  // Entry point for the plan-allowlist panel. Reached from /config → Billing →
+  // "Plan Allowlist" (via the BillingAdmin facade) and from this hub's own
+  // billadmin_plansettings routes (Recount button, allowlist select re-render).
+  async openPlanSettings(interaction: ButtonInteraction, force = false): Promise<void> {
+    await interaction.deferUpdate();
+    await this.ctx.sessions.tryRender(interaction, async () => {
+      const stale = force || this.ctx.priceBook.isPlanUsageStale();
+      if (stale) {
+        await interaction.editReply({
+          embeds: [makeEmbed("⏳ Counting active subscriptions per plan — this can take a moment…", COLORS.neutral)],
+          components: [],
+        });
+      }
+      await this.renderPlanSettings(interaction, undefined, force);
+    });
+  }
+
   private filterAllowedPrices(prices: Stripe.Price[]): { offered: Stripe.Price[]; limited: boolean } {
     const allowed = this.ctx.settingsStore.allowedPriceIds();
     if (allowed.length === 0) return { offered: prices, limited: false };
@@ -1871,7 +1884,9 @@ export class SubscriptionsHub {
     components.push(
       buttonRow(
         btn("billadmin_plansettings:refresh", "🔄 Recount", ButtonStyle.Secondary),
-        btn("billadmin_hub:subs", "◀ Back", ButtonStyle.Secondary)
+        // Plan settings now live in /config → Billing — Back returns there
+        // (config_billing is DiscordBot's /config Billing-panel route).
+        btn("config_billing", "◀ Back", ButtonStyle.Secondary)
       )
     );
     await interaction.editReply({ embeds: [embed], components });
@@ -1994,7 +2009,7 @@ export class SubscriptionsHub {
     await this.ctx.sessions.tryRender(interaction, async () => {
       if (target.startsWith("sub_")) {
         const sub = await this.ctx.stripe.getSubscription(target);
-        const token = this.ctx.sessions.newSession(interaction, { subscriptionId: sub.id });
+        const token = this.ctx.sessions.newSession(interaction, { subscriptionId: sub.id, originHub: "subs" });
         await this.renderSubDetail(interaction, token);
         return;
       }
@@ -2007,11 +2022,15 @@ export class SubscriptionsHub {
         return;
       }
       if (subs.length === 1) {
-        const token = this.ctx.sessions.newSession(interaction, { customerId: target, subscriptionId: subs[0].id });
+        const token = this.ctx.sessions.newSession(interaction, {
+          customerId: target,
+          subscriptionId: subs[0].id,
+          originHub: "subs",
+        });
         await this.renderSubDetail(interaction, token);
         return;
       }
-      const token = this.ctx.sessions.newSession(interaction, { customerId: target });
+      const token = this.ctx.sessions.newSession(interaction, { customerId: target, originHub: "subs" });
       const priceMap = await this.ctx.priceBook.labelMap();
       await interaction.editReply(this.buildSubPickPanel(token, subs, priceMap));
     });
@@ -2030,7 +2049,7 @@ export class SubscriptionsHub {
       );
     return {
       embeds: [makeEmbed(`${subs.length} subscriptions — pick one to manage.`, COLORS.brand)],
-      components: [selectRow(select), backRow("billadmin_hub:subs")],
+      components: [selectRow(select), backRow(`billadmin_nav_back:${token}`)],
     };
   }
 
@@ -2107,7 +2126,7 @@ export class SubscriptionsHub {
         embeds: [
           makeEmbed(
             limited
-              ? "No other plans are allowed — adjust 🔧 Plan Settings in the Subscriptions hub."
+              ? "No other plans are allowed — adjust the Plan Allowlist in /config → Billing."
               : "No other active recurring prices exist in this Stripe account.",
             COLORS.warn
           ),
@@ -2134,7 +2153,7 @@ export class SubscriptionsHub {
       .setDescription(
         `\`${sub.id}\` stays on **${priceLabel(this.ctx.stripe, current ?? item.price)}** until ` +
           `<t:${item.current_period_end}:D>, then switches to the plan you pick:` +
-          (limited ? "\n-# Plans limited by 🔧 Plan Settings" : "")
+          (limited ? "\n-# Plans limited by the Plan Allowlist (/config → Billing)" : "")
       );
     await interaction.editReply({
       embeds: [embed],
@@ -2145,6 +2164,8 @@ export class SubscriptionsHub {
   private async renderSubDetail(interaction: RenderInteraction, token: string): Promise<void> {
     const session = this.ctx.sessions.get(token);
     if (!session?.subscriptionId) return;
+    // Empty-nav-stack fallback for this panel's Back button.
+    session.originHub ??= "subs";
     const [sub, priceMap] = await Promise.all([
       this.ctx.stripe.getSubscription(session.subscriptionId),
       this.ctx.priceBook.labelMap(),
@@ -2228,7 +2249,7 @@ export class SubscriptionsHub {
         buttonRow(
           btn(`billadmin_sub_cancel:${token}`, "Cancel…", ButtonStyle.Danger, dead),
           btn(`billadmin_sub_view:${token}`, "🔄 Refresh", ButtonStyle.Secondary),
-          btn("billadmin_hub:subs", "◀ Back", ButtonStyle.Secondary)
+          btn(`billadmin_nav_back:${token}`, "◀ Back", ButtonStyle.Secondary)
         ),
       ],
     });
