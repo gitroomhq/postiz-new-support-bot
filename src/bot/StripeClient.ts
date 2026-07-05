@@ -16,6 +16,33 @@ interface ChargeWithInvoice extends Stripe.Charge {
   invoice?: string | { id: string } | null;
 }
 
+// Thrown when the undocumented ad-hoc Sigma query endpoint is not exposed on
+// this account (404 / "Unrecognized request URL" / permission errors) so the
+// UI can explain instead of showing a raw API error.
+export class SigmaAdhocUnavailableError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "SigmaAdhocUnavailableError";
+  }
+}
+
+// Loosely typed on purpose: the ad-hoc endpoint is not in the public SDK, so
+// the shape is parsed defensively and the raw payload is kept for display.
+export interface SigmaAdhocQuery {
+  id: string;
+  status: string;
+  file?: { id?: string } | string | null;
+  error?: unknown;
+  raw: unknown;
+}
+
+export interface DownloadedFile {
+  filename: string;
+  contentType: string | null;
+  body: Buffer;
+  truncated: boolean;
+}
+
 export class StripeClient {
   private stripe: Stripe;
 
@@ -819,6 +846,126 @@ export class StripeClient {
       },
       idempotencyKey ? { idempotencyKey } : undefined
     );
+  }
+
+  // ---- Billing admin panel (/billing) Sigma analytics ----
+
+  // Runs of queries scheduled in the Stripe Dashboard → Sigma. Data lags live
+  // by several hours (see data_load_time on each run).
+  async listSigmaScheduledQueryRuns(
+    limit = 25,
+    startingAfter?: string
+  ): Promise<Stripe.ApiList<Stripe.Sigma.ScheduledQueryRun>> {
+    return this.stripe.sigma.scheduledQueryRuns.list({
+      limit,
+      ...(startingAfter ? { starting_after: startingAfter } : {}),
+    });
+  }
+
+  async getSigmaScheduledQueryRun(id: string): Promise<Stripe.Sigma.ScheduledQueryRun> {
+    return this.stripe.sigma.scheduledQueryRuns.retrieve(id);
+  }
+
+  // Downloads a Stripe-hosted file (e.g. a Sigma result CSV): resolves the
+  // files.stripe.com URL via the API, then fetches it with the secret key.
+  // Reads at most maxBytes and flags truncation instead of buffering huge files.
+  async downloadFileContents(fileId: string, maxBytes = 2_000_000): Promise<DownloadedFile> {
+    const file = await this.stripe.files.retrieve(fileId);
+    if (!file.url) throw new Error(`Stripe file ${fileId} has no download URL.`);
+
+    const res = await fetch(file.url, {
+      headers: { Authorization: `Bearer ${this.config.stripe.secretKey}` },
+    });
+    if (!res.ok) {
+      throw new Error(`Stripe file download failed with status ${res.status} for ${fileId}.`);
+    }
+
+    const chunks: Buffer[] = [];
+    let total = 0;
+    let truncated = false;
+    if (res.body) {
+      const reader = res.body.getReader();
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const chunk = Buffer.from(value);
+        if (total + chunk.length >= maxBytes) {
+          chunks.push(chunk.subarray(0, maxBytes - total));
+          total = maxBytes;
+          truncated = true;
+          await reader.cancel().catch(() => undefined);
+          break;
+        }
+        chunks.push(chunk);
+        total += chunk.length;
+      }
+    } else {
+      const buf = Buffer.from(await res.arrayBuffer());
+      truncated = buf.length > maxBytes;
+      chunks.push(truncated ? buf.subarray(0, maxBytes) : buf);
+    }
+
+    return {
+      filename: file.filename ?? `${fileId}.csv`,
+      contentType: res.headers.get("content-type"),
+      body: Buffer.concat(chunks),
+      truncated,
+    };
+  }
+
+  // PROBE: ad-hoc Sigma queries are NOT part of the public SDK — this hits the
+  // raw endpoint and throws SigmaAdhocUnavailableError when the account/API
+  // doesn't expose it, so the UI can explain instead of erroring cryptically.
+  async runSigmaQueryAdhoc(sql: string): Promise<SigmaAdhocQuery> {
+    const res = await fetch("https://api.stripe.com/v1/sigma/queries", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${this.config.stripe.secretKey}`,
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      body: "sql=" + encodeURIComponent(sql),
+    });
+    return this.parseSigmaAdhocResponse(res, await res.text());
+  }
+
+  // Polling counterpart for runSigmaQueryAdhoc (GET same base + /{id}).
+  async getSigmaAdhocQuery(id: string): Promise<SigmaAdhocQuery> {
+    const res = await fetch(`https://api.stripe.com/v1/sigma/queries/${encodeURIComponent(id)}`, {
+      headers: { Authorization: `Bearer ${this.config.stripe.secretKey}` },
+    });
+    return this.parseSigmaAdhocResponse(res, await res.text());
+  }
+
+  private parseSigmaAdhocResponse(res: { ok: boolean; status: number }, text: string): SigmaAdhocQuery {
+    let raw: unknown = null;
+    try {
+      raw = JSON.parse(text);
+    } catch {
+      raw = text;
+    }
+
+    if (!res.ok) {
+      const err = (raw as { error?: { message?: string; type?: string; code?: string } } | null)?.error;
+      const message = err?.message ?? `HTTP ${res.status}`;
+      const unavailable =
+        res.status === 404 ||
+        res.status === 401 ||
+        res.status === 403 ||
+        /unrecognized request url/i.test(message) ||
+        /permission|does not have access/i.test(message);
+      if (unavailable) throw new SigmaAdhocUnavailableError(message);
+      throw new Error(`Sigma ad-hoc query failed (${res.status}): ${message.slice(0, 500)}`);
+    }
+
+    // Unknown shape — parse defensively and keep the raw payload for display.
+    const obj = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
+    return {
+      id: typeof obj.id === "string" ? obj.id : "",
+      status: typeof obj.status === "string" ? obj.status : "unknown",
+      file: (obj.file as SigmaAdhocQuery["file"]) ?? null,
+      error: obj.error,
+      raw,
+    };
   }
 
   // Currencies Stripe treats as zero-decimal: the minor unit IS the major unit.
