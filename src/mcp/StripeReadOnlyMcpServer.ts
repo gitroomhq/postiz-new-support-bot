@@ -11,26 +11,51 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z, ZodRawShape } from "zod";
 import { StripeClient } from "../bot/StripeClient";
 import { BotConfig } from "../config";
+import { Logger } from "../util/logger";
+
+// stream: "stderr" — every level must stay off the stdout protocol channel.
+const mcpLog = new Logger("mcp:stripe", {}, { stream: "stderr" });
 
 const secretKey = process.env.STRIPE_SECRET_KEY;
 if (!secretKey) {
-  console.error("StripeReadOnlyMcpServer: STRIPE_SECRET_KEY missing");
+  mcpLog.error("STRIPE_SECRET_KEY missing");
   process.exit(1);
 }
 
 const sentryDsn = process.env.SENTRY_DSN;
 if (sentryDsn) {
   try {
-    Sentry.init({ dsn: sentryDsn, tracesSampleRate: 0 });
+    // dsn / environment / release / debug / tracesSampleRate AND the parent
+    // trace (SENTRY_TRACE / SENTRY_BAGGAGE) are all consumed from env by the
+    // SDK — set by DiscordBot.buildAiRunConfig. The process is spawned with
+    // `--require @sentry/node/preload`, so Stripe's HTTPS calls get spans.
+    Sentry.init({ serverName: "stripe-readonly-mcp", enableLogs: true });
   } catch (e) {
-    console.error("StripeReadOnlyMcpServer: Sentry init failed", e);
+    mcpLog.error("Sentry init failed", e);
   }
+}
+
+const recordAiContent = process.env.SENTRY_AI_RECORD_CONTENT === "1";
+
+// Flush buffered events before the CLI reaps the process at run end.
+for (const signal of ["SIGINT", "SIGTERM"] as const) {
+  process.on(signal, () => {
+    void Sentry.close(1000)
+      .catch(() => {})
+      .finally(() => process.exit(0));
+  });
 }
 
 // StripeClient only reads config.stripe.* — a minimal config is sufficient.
 const stripe = new StripeClient({ stripe: { secretKey } } as unknown as BotConfig);
 
-const server = new McpServer({ name: "stripe-readonly", version: "1.0.0" });
+// The wrapper emits one MCP-convention span per tool call/protocol event.
+// Tool inputs are Stripe ids (safe); outputs carry customer PII, so they are
+// only recorded when the /config AI-content toggle is on.
+const server = Sentry.wrapMcpServerWithSentry(new McpServer({ name: "stripe-readonly", version: "1.0.0" }), {
+  recordInputs: true,
+  recordOutputs: recordAiContent,
+});
 
 function readTool<Shape extends ZodRawShape>(
   name: string,
@@ -54,15 +79,9 @@ function readTool<Shape extends ZodRawShape>(
         return { content: [{ type: "text" as const, text: JSON.stringify(value, null, 2) }] };
       } catch (e) {
         const message = e instanceof Error ? e.message : String(e);
-        console.error(`StripeReadOnlyMcpServer: ${name} failed: ${message}`);
-        if (sentryDsn) {
-          Sentry.withScope((scope) => {
-            scope.setTag("mcp_server", "stripe-readonly");
-            scope.setContext("mcp_tool", { tool: name, args });
-            if (e instanceof Error) Sentry.captureException(e);
-            else Sentry.captureMessage(`${name} failed: ${message}`, "error");
-          });
-        }
+        // Logger.error captures the exception (tool name in the log context);
+        // the Sentry MCP wrapper additionally marks the tool span as failed.
+        mcpLog.error("tool failed", e, { "mcp.tool": name });
         return { content: [{ type: "text" as const, text: `Error: ${message}` }], isError: true };
       }
     }) as unknown as ToolCallback<Shape>
@@ -149,7 +168,7 @@ readTool(
 server
   .connect(new StdioServerTransport())
   .catch(async (e) => {
-    console.error("StripeReadOnlyMcpServer: failed to start", e);
+    mcpLog.error("failed to start", e);
     if (sentryDsn) {
       Sentry.captureException(e);
       await Sentry.flush(2000).catch(() => {});

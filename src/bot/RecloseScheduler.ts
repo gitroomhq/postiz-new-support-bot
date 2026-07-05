@@ -1,6 +1,10 @@
 import { Client, ThreadChannel } from "discord.js";
 import { TicketStore, TicketWithTag } from "./TicketStore";
 import { AuditLogger } from "./AuditLogger";
+import { log } from "../util/logger";
+import { withTickSpan, wasCaptured } from "../util/instrument";
+
+const schedLog = log.child("scheduler:reclose");
 
 // Posting in a closed (locked + archived) thread un-archives it. Instead of slamming it
 // shut mid-conversation, the message handler stamps recloseAt = last message + 30m — every
@@ -20,7 +24,9 @@ export class RecloseScheduler {
 
   start(): void {
     this.timer = setInterval(() => {
-      this.tick().catch((err) => console.error("Reclose scheduler error:", err));
+      this.tick().catch((err) => {
+        if (!wasCaptured(err)) schedLog.error("tick failed", err);
+      });
     }, CHECK_INTERVAL_MS);
   }
 
@@ -31,13 +37,17 @@ export class RecloseScheduler {
 
   async tick(): Promise<void> {
     const due = await this.ticketStore.listRecloseDue(new Date());
-    for (const ticket of due) {
-      try {
-        await this.processTicket(ticket);
-      } catch (err) {
-        console.error(`Re-close failed for thread ${ticket.threadId}:`, err);
+    if (due.length === 0) return;
+    // Span only ticks that actually have work — this polls every minute.
+    await withTickSpan("reclose", async () => {
+      for (const ticket of due) {
+        try {
+          await this.processTicket(ticket);
+        } catch (err) {
+          schedLog.error("re-close failed", err, { "ticket.thread_id": ticket.threadId });
+        }
       }
-    }
+    });
   }
 
   private async processTicket(ticket: TicketWithTag): Promise<void> {

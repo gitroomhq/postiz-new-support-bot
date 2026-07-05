@@ -71,7 +71,24 @@ import { IntercomInboxApp } from "../intercom/IntercomInboxApp";
 import { BillingAdmin } from "./BillingAdmin";
 import { TICKET_ATTR_PRIORITY, TICKET_ATTR_CSAT, TICKET_ATTR_THREAD } from "../intercom/IntercomOutboxScheduler";
 import { IntercomMode, IntercomRegion } from "../config/SettingsStore";
-import { initSentry, log } from "../util/logger";
+import {
+  log,
+  appRelease,
+  sentryActive,
+  reconfigureSentry,
+  sendSentryTestEvent,
+  sentrySubprocessEnv,
+  SentryReconfigureResult,
+} from "../util/logger";
+import {
+  withDiscordSpan,
+  DiscordSpanCtx,
+  normalizeCustomId,
+  safe,
+  wasCaptured,
+  setAiRecordContent,
+  metricCount,
+} from "../util/instrument";
 
 type TicketSearchFilters = {
   categoryId?: string;
@@ -107,6 +124,8 @@ export class DiscordBot {
   private aiRunsInFlight = new Set<string>();
 
   private aiLog = log.child("ai-command");
+
+  private discordLog = log.child("discord");
 
   constructor(
     private config: BotConfig,
@@ -148,25 +167,39 @@ export class DiscordBot {
 
   private setupEventHandlers(): void {
     this.client.once("ready", () => {
-      console.log(`Bot logged in as ${this.client.user?.tag}`);
+      this.discordLog.info("bot ready", { "bot.tag": this.client.user?.tag ?? "" });
     });
 
     this.client.on("interactionCreate", (interaction) => {
-      this.handleInteraction(interaction).catch(console.error);
+      this.handleInteraction(interaction).catch((e) => this.reportHandlerError("interactionCreate", e));
     });
 
     // Reconcile ticket status with actions taken outside the bot's own UI.
     this.client.on("guildMemberRemove", (member) => {
-      this.handleMemberLeave(member).catch(console.error);
+      this.handleMemberLeave(member).catch((e) => this.reportHandlerError("guildMemberRemove", e));
     });
 
     this.client.on("messageCreate", (message) => {
-      this.handleMessage(message).catch(console.error);
+      this.handleMessage(message).catch((e) => this.reportHandlerError("messageCreate", e));
     });
 
     this.client.on("threadUpdate", (oldThread, newThread) => {
-      this.handleThreadUpdate(oldThread, newThread).catch(console.error);
+      this.handleThreadUpdate(oldThread, newThread).catch((e) => this.reportHandlerError("threadUpdate", e));
     });
+  }
+
+  // Outermost error boundary for Discord gateway handlers. Errors thrown inside
+  // a withDiscordSpan wrapper were already captured there with full interaction
+  // context — only log those; capture everything else.
+  private reportHandlerError(event: string, e: unknown): void {
+    if (wasCaptured(e)) {
+      this.discordLog.warn("handler failed (captured in span)", {
+        "discord.event": event,
+        "error.message": e instanceof Error ? e.message : String(e),
+      });
+    } else {
+      this.discordLog.error("handler crashed", e, { "discord.event": event });
+    }
   }
 
   // A member left the guild: close out every open ticket they own.
@@ -175,6 +208,24 @@ export class DiscordBot {
     if (!closingTag) return;
 
     const tickets = await this.ticketStore.listOpenByCustomerId(member.id);
+    if (tickets.length === 0) return;
+    await withDiscordSpan(
+      {
+        op: "discord.event",
+        name: "member.leave_cleanup",
+        userId: member.id,
+        guildId: member.guild?.id,
+        attributes: { "tickets.count": tickets.length },
+      },
+      () => this.closeTicketsForLeaver(member, tickets, closingTag)
+    );
+  }
+
+  private async closeTicketsForLeaver(
+    member: GuildMember | PartialGuildMember,
+    tickets: TicketWithTag[],
+    closingTag: StatusTag
+  ): Promise<void> {
     for (const ticket of tickets) {
       const channel = await this.client.channels.fetch(ticket.threadId).catch(() => null);
       if (channel?.isThread()) {
@@ -186,9 +237,11 @@ export class DiscordBot {
         // Thread is gone/unreachable — still reconcile the DB. This path bypasses
         // StatusService, so the Intercom push needs its own hook.
         await this.ticketStore.close(ticket.threadId).catch(() => {});
-        void this.intercomSync
-          .onStatusChanged(ticket.threadId, ticket.statusTag ?? null, closingTag, "System (member left)")
-          .catch((e) => console.error("Intercom status push failed:", e));
+        safe(
+          this.intercomSync.onStatusChanged(ticket.threadId, ticket.statusTag ?? null, closingTag, "System (member left)"),
+          "intercom-sync",
+          { "ticket.thread_id": ticket.threadId, "sync.event": "status_changed" }
+        );
       }
     }
   }
@@ -236,6 +289,8 @@ export class DiscordBot {
   // Human messages in tracked ticket threads drive two things:
   // 1. the first support reply stamps firstResponseAt (response-time metrics),
   // 2. a customer reply to a Resolved ticket reopens it to the initial status.
+  // Guards stay unspanned so ordinary server chatter costs nothing; only
+  // messages that belong to a tracked ticket become transactions.
   private async handleMessage(message: Message): Promise<void> {
     if (message.author.bot) return;
     if (!message.channel.isThread()) return;
@@ -243,14 +298,30 @@ export class DiscordBot {
     const ticket = await this.ticketStore.getByThreadId(message.channelId);
     if (!ticket) return;
 
+    await withDiscordSpan(
+      {
+        op: "discord.message",
+        name: "ticket.message",
+        userId: message.author.id,
+        username: message.author.username,
+        guildId: message.guildId,
+        channelId: message.channelId,
+        attributes: { "ticket.thread_id": ticket.threadId },
+      },
+      () => this.processTicketMessage(message, ticket)
+    );
+  }
+
+  private async processTicketMessage(message: Message, ticket: TicketWithTag): Promise<void> {
     // Mirror every human message to Intercom (before the early returns below —
     // chatter in closed tickets must mirror too). Fire-and-forget: an Intercom
     // problem never touches the Discord flow.
     const member = message.member ?? (await message.guild?.members.fetch(message.author.id).catch(() => null)) ?? null;
     const isStaff = !!member && this.isStaffMember(member);
-    void this.intercomSync
-      .onHumanMessage(ticket, this.toBridgeMessage(message, member), isStaff)
-      .catch((e) => console.error("Intercom message push failed:", e));
+    safe(this.intercomSync.onHumanMessage(ticket, this.toBridgeMessage(message, member), isStaff), "intercom-sync", {
+      "ticket.thread_id": ticket.threadId,
+      "sync.event": "human_message",
+    });
 
     // First support reply on an open ticket. Only support/admin members count, so
     // another invited human (or the customer) can't skew the metric.
@@ -259,6 +330,12 @@ export class DiscordBot {
       if (isSupport && member) {
         try {
           await this.ticketStore.setFirstResponse(ticket.threadId, message.createdAt);
+          // First-response time is a support SLA metric spanning hours — it has
+          // no span equivalent, so the wide event carries the measurement.
+          log.child("ticket").info("ticket.first_response", {
+            "ticket.thread_id": ticket.threadId,
+            "ticket.first_response_ms": message.createdAt.getTime() - ticket.createdAt.getTime(),
+          });
           void this.audit.log({
             title: "💬 First response",
             severity: "success",
@@ -274,7 +351,7 @@ export class DiscordBot {
             ],
           });
         } catch (e) {
-          console.error("firstResponse stamp failed:", e);
+          log.child("ticket").error("first_response stamp failed", e, { "ticket.thread_id": ticket.threadId });
         }
       }
     }
@@ -344,49 +421,107 @@ export class DiscordBot {
     // the bot's own edits re-fire this event already at the target status — skip them.
     if (ticket.statusTagId === target.id) return;
 
-    // Only act on actions a human performed. The audit log lets us ignore the bot's own
-    // edits and Discord's inactivity auto-archive (which writes no audit entry).
-    try {
-      const logs = await newThread.guild.fetchAuditLogs({
-        type: AuditLogEvent.ThreadUpdate,
-        limit: 5,
-      });
-      const entry = logs.entries.find((e) => e.target?.id === newThread.id);
-      if (!entry) return; // auto-archive / no record → not a manual action
-      if (entry.executorId === this.client.user?.id) return; // the bot itself
-    } catch (error) {
-      // Missing "View Audit Log" permission (or transient failure): skip rather than
-      // misfire on inactivity auto-archives.
-      console.warn("threadUpdate: could not read audit log, skipping status sync:", error);
-      return;
-    }
+    await withDiscordSpan(
+      {
+        op: "discord.event",
+        name: "thread.manual_close",
+        guildId: newThread.guildId,
+        channelId: newThread.id,
+        attributes: { "ticket.thread_id": ticket.threadId },
+      },
+      async () => {
+        // Only act on actions a human performed. The audit log lets us ignore the bot's own
+        // edits and Discord's inactivity auto-archive (which writes no audit entry).
+        try {
+          const logs = await newThread.guild.fetchAuditLogs({
+            type: AuditLogEvent.ThreadUpdate,
+            limit: 5,
+          });
+          const entry = logs.entries.find((e) => e.target?.id === newThread.id);
+          if (!entry) return; // auto-archive / no record → not a manual action
+          if (entry.executorId === this.client.user?.id) return; // the bot itself
+        } catch (error) {
+          // Missing "View Audit Log" permission (or transient failure): skip rather than
+          // misfire on inactivity auto-archives.
+          this.discordLog.warn("threadUpdate: could not read audit log, skipping status sync", {
+            "ticket.thread_id": ticket.threadId,
+            "error.message": error instanceof Error ? error.message : String(error),
+          });
+          return;
+        }
 
-    await this.statusService.applyStatus(newThread, ticket, target, {
-      actorName: "Manual thread action",
-    });
+        await this.statusService.applyStatus(newThread, ticket, target, {
+          actorName: "Manual thread action",
+        });
+      }
+    );
+  }
+
+  // Root span + isolation scope per interaction: every command, button, select
+  // and modal becomes a transaction carrying the acting Discord user, with all
+  // downstream work (prisma, fetch, gen_ai, Stripe MCP) nested underneath.
+  private interactionSpanCtx(interaction: Interaction): DiscordSpanCtx {
+    const base = {
+      userId: interaction.user?.id,
+      username: interaction.user?.username,
+      guildId: interaction.guildId,
+      channelId: interaction.channelId,
+    };
+    if (interaction.isChatInputCommand()) {
+      const sub = interaction.options.getSubcommand(false);
+      return {
+        ...base,
+        op: "discord.command",
+        name: `/${interaction.commandName}${sub ? ` ${sub}` : ""}`,
+        attributes: { "discord.command": interaction.commandName, ...(sub ? { "discord.subcommand": sub } : {}) },
+      };
+    }
+    if (interaction.isAutocomplete()) {
+      return { ...base, op: "discord.autocomplete", name: `autocomplete /${interaction.commandName}` };
+    }
+    if (interaction.isButton()) {
+      const id = normalizeCustomId(interaction.customId);
+      return { ...base, op: "discord.button", name: `button ${id}`, attributes: { "discord.custom_id": id } };
+    }
+    if (interaction.isModalSubmit()) {
+      const id = normalizeCustomId(interaction.customId);
+      return { ...base, op: "discord.modal", name: `modal ${id}`, attributes: { "discord.custom_id": id } };
+    }
+    if (interaction.isAnySelectMenu()) {
+      const id = normalizeCustomId(interaction.customId);
+      return {
+        ...base,
+        op: "discord.select",
+        name: `select ${id}`,
+        attributes: { "discord.custom_id": id, "discord.values_count": interaction.values?.length ?? 0 },
+      };
+    }
+    return { ...base, op: "discord.event", name: "interaction other" };
   }
 
   private async handleInteraction(interaction: Interaction): Promise<void> {
-    if (interaction.isChatInputCommand()) {
-      await this.handleCommand(interaction);
-    } else if (interaction.isAutocomplete()) {
-      await this.handleAutocomplete(interaction);
-    } else if (interaction.isButton()) {
-      await this.handleButton(interaction);
-    } else if (interaction.isStringSelectMenu()) {
-      await this.handleSelectMenu(interaction);
-    } else if (interaction.isRoleSelectMenu()) {
-      await this.handleRoleSelect(interaction);
-    } else if (interaction.isChannelSelectMenu()) {
-      await this.handleChannelSelect(interaction);
-    } else if (interaction.isUserSelectMenu()) {
-      // Only /billing uses user-select menus so far.
-      if (interaction.customId.startsWith("billadmin_")) {
-        await this.billingAdmin.handleUserSelect(interaction);
+    await withDiscordSpan(this.interactionSpanCtx(interaction), async () => {
+      if (interaction.isChatInputCommand()) {
+        await this.handleCommand(interaction);
+      } else if (interaction.isAutocomplete()) {
+        await this.handleAutocomplete(interaction);
+      } else if (interaction.isButton()) {
+        await this.handleButton(interaction);
+      } else if (interaction.isStringSelectMenu()) {
+        await this.handleSelectMenu(interaction);
+      } else if (interaction.isRoleSelectMenu()) {
+        await this.handleRoleSelect(interaction);
+      } else if (interaction.isChannelSelectMenu()) {
+        await this.handleChannelSelect(interaction);
+      } else if (interaction.isUserSelectMenu()) {
+        // Only /billing uses user-select menus so far.
+        if (interaction.customId.startsWith("billadmin_")) {
+          await this.billingAdmin.handleUserSelect(interaction);
+        }
+      } else if (interaction.isModalSubmit()) {
+        await this.handleModal(interaction);
       }
-    } else if (interaction.isModalSubmit()) {
-      await this.handleModal(interaction);
-    }
+    });
   }
 
   private async handleCommand(interaction: ChatInputCommandInteraction): Promise<void> {
@@ -763,7 +898,7 @@ export class DiscordBot {
       const { embed, components } = await this.reportService.build({ since: null });
       await interaction.editReply({ embeds: [embed], components });
     } catch (error) {
-      console.error("report command failed:", error);
+      this.discordLog.error("report command failed", error);
       await interaction.editReply({ embeds: [makeEmbed("Couldn't build the status report.", COLORS.danger)] });
     }
   }
@@ -784,7 +919,7 @@ export class DiscordBot {
             : await this.reportService.buildAgeBreakdownEmbed();
       await interaction.editReply({ embeds: [embed] });
     } catch (error) {
-      console.error("report drill-down failed:", error);
+      this.discordLog.error("report drill-down failed", error, { "discord.custom_id": interaction.customId });
       await interaction.editReply({ embeds: [makeEmbed("Couldn't load that breakdown.", COLORS.danger)] });
     }
   }
@@ -1216,6 +1351,14 @@ export class DiscordBot {
           priorityTagId: initialPriority?.id ?? null,
           question: question ?? null,
         });
+        log.child("ticket").info("ticket.created", {
+          "ticket.thread_id": thread.id,
+          "ticket.category": category.id,
+          "ticket.customer_id": customerId,
+          "ticket.has_question": !!question,
+          "ticket.ai_solve_enabled": this.settingsStore.aiSolveEnabled(),
+        });
+        metricCount("tickets.created", 1, { category: category.id });
         void this.audit.log({
           title: "🎫 Ticket opened",
           severity: "success",
@@ -1227,14 +1370,16 @@ export class DiscordBot {
             ...(question ? [{ name: "Question", value: question }] : []),
           ],
         });
-        void this.intercomSync
-          .onTicketCreated(thread.id, category.label, question ?? null)
-          .catch((e) => console.error("Intercom ticket push failed:", e));
+        safe(this.intercomSync.onTicketCreated(thread.id, category.label, question ?? null), "intercom-sync", {
+          "ticket.thread_id": thread.id,
+          "sync.event": "ticket_created",
+        });
       },
       onAiAnswer: async (thread, finalText) => {
-        void this.intercomSync
-          .onAiAnswer(thread.id, finalText)
-          .catch((e) => console.error("Intercom AI answer push failed:", e));
+        safe(this.intercomSync.onAiAnswer(thread.id, finalText), "intercom-sync", {
+          "ticket.thread_id": thread.id,
+          "sync.event": "ai_answer",
+        });
       },
     };
   }
@@ -1375,7 +1520,9 @@ export class DiscordBot {
     }
 
     const responder = (prompt: string, onUpdate?: (messages: string[]) => void) =>
-      this.claudeRunner.run(prompt, onUpdate);
+      this.claudeRunner.run(prompt, onUpdate, {
+        telemetry: { agentName: `support-${category.id}`, kind: "customer_qa" },
+      });
 
     await category.handleModalSubmit(interaction, responder, threadsChannel, this.buildTicketContext(category), {
       postizUserId: session.postizUserId,
@@ -1439,6 +1586,11 @@ export class DiscordBot {
         this.settingsStore.githubRepo()
       );
 
+      log.child("github").info("github.issue.created", {
+        "ticket.thread_id": interaction.channel?.isThread() ? interaction.channelId : "",
+        "issue.label": issueLabel,
+        "issue.url": issueUrl,
+      });
       void this.audit.log({
         title: "🐙 GitHub issue created",
         actor: interaction.user.displayName,
@@ -1467,7 +1619,10 @@ export class DiscordBot {
 
       await interaction.editReply({ embeds: [embed] });
     } catch (error) {
-      console.error("GitHub issue creation error:", error);
+      log.child("github").error("issue creation failed", error, {
+        "ticket.thread_id": interaction.channel?.isThread() ? interaction.channelId : "",
+        "issue.label": issueLabel,
+      });
       await interaction.editReply({ embeds: [makeEmbed("Failed to create the GitHub issue. Please try again later.", COLORS.danger)] });
     }
   }
@@ -1501,13 +1656,18 @@ export class DiscordBot {
     // Record after the ack. A dismissed modal still keeps the rating; only the first
     // rating ever wins (recordCsat guards on csatScore null).
     const recorded = await this.ticketStore.recordCsat(threadId, score).catch((e) => {
-      console.error("CSAT record failed:", e);
+      log.child("ticket").error("csat record failed", e, { "ticket.thread_id": threadId });
       return false;
     });
     if (recorded) {
-      void this.intercomSync
-        .onCsat(threadId, score)
-        .catch((e) => console.error("Intercom CSAT push failed:", e));
+      log.child("ticket").info("csat.recorded", {
+        "ticket.thread_id": threadId,
+        "csat.score": score,
+      });
+      safe(this.intercomSync.onCsat(threadId, score), "intercom-sync", {
+        "ticket.thread_id": threadId,
+        "sync.event": "csat",
+      });
       void this.audit.log({
         title: "⭐ CSAT rating",
         severity: score >= 4 ? "success" : score === 3 ? "warn" : "danger",
@@ -1544,9 +1704,10 @@ export class DiscordBot {
         await interaction.reply({ embeds: [makeEmbed("You've already left feedback for this ticket — thank you!", COLORS.warn)], flags: 64 });
         return;
       }
-      void this.intercomSync
-        .onCsat(threadId, ticket.csatScore, comment)
-        .catch((e) => console.error("Intercom CSAT push failed:", e));
+      safe(this.intercomSync.onCsat(threadId, ticket.csatScore, comment), "intercom-sync", {
+        "ticket.thread_id": threadId,
+        "sync.event": "csat_comment",
+      });
       void this.audit.log({
         title: "💬 CSAT comment",
         actor: interaction.user.displayName,
@@ -1663,10 +1824,15 @@ export class DiscordBot {
       mcpServers.stripe = {
         type: "stdio",
         command: process.execPath, // node binary — no PATH dependency
-        args: [this.claudeRunner.stripeServerPath()],
+        // Preload registers the Sentry http require-hooks before the server
+        // module loads, so its Stripe API calls become child spans.
+        args: ["--require", "@sentry/node/preload", this.claudeRunner.stripeServerPath()],
         env: {
           STRIPE_SECRET_KEY: this.config.stripe.secretKey,
-          SENTRY_DSN: this.settingsStore.sentryDsn() ?? "",
+          // DSN/environment/release/rates plus the currently-active trace
+          // (SENTRY_TRACE/SENTRY_BAGGAGE) — the child SDK consumes all of
+          // these from env, joining its spans into this interaction's trace.
+          ...sentrySubprocessEnv(this.settingsStore.sentryConfig()),
         },
       };
       extraAllowedTools.push(...DiscordBot.STRIPE_MCP_TOOLS);
@@ -1801,14 +1967,20 @@ export class DiscordBot {
       return result.join("\n\n").trim();
     } catch (error) {
       if (error instanceof ClaudeApiLimitError) {
-        this.aiLog.warn("run hit API limit", { sub, threadId: interaction.channelId });
+        // The runner already reported the limit hit (fingerprinted warning +
+        // metric); this is just the command-level trace in the log stream.
+        this.aiLog.warn("run hit API limit", { "ai.sub": sub, "ticket.thread_id": interaction.channelId ?? "" });
         await interaction
           .editReply({
             embeds: [makeEmbed("AI is temporarily unavailable (API usage limit). Try again later.", COLORS.warn)],
           })
           .catch(() => {});
       } else {
-        this.aiLog.error("run failed", error, { sub, threadId: interaction.channelId, userId: interaction.user.id });
+        this.aiLog.error("run failed", error, {
+          "ai.sub": sub,
+          "ticket.thread_id": interaction.channelId ?? "",
+          "discord.user_id": interaction.user.id,
+        });
         await interaction
           .editReply({ embeds: [makeEmbed("The AI run failed — check the logs.", COLORS.danger)] })
           .catch(() => {});
@@ -1904,7 +2076,13 @@ export class DiscordBot {
           admin,
           session?.accessToken ?? null
         );
-        runOptions = { promptPrefix: null, extraAllowedTools, mcpConfig, timeoutMs: 300_000 };
+        runOptions = {
+          promptPrefix: null,
+          extraAllowedTools,
+          mcpConfig,
+          timeoutMs: 300_000,
+          telemetry: { agentName: `ai-${sub}`, kind: "staff_command" },
+        };
         if (sub === "ask") {
           const question = interaction.options.getString("question", true);
           title = "🤖 AI Answer";
@@ -1914,22 +2092,31 @@ export class DiscordBot {
           prompt = buildCausePrompt(contextBlock, tools);
         }
         this.aiLog.info("run started", {
-          sub,
-          threadId: thread.id,
-          userId: interaction.user.id,
-          stripeTools: tools.stripe,
-          postizTools: tools.postiz,
+          "ai.sub": sub,
+          "ticket.thread_id": thread.id,
+          "discord.user_id": interaction.user.id,
+          "tools.stripe": tools.stripe,
+          "tools.postiz": tools.postiz,
+          "tools.web": tools.web,
         });
       } else if (sub === "draft") {
         title = "🤖 Draft Reply";
         prompt = buildDraftPrompt(contextBlock, interaction.options.getString("instructions"));
-        runOptions = { promptPrefix: null };
-        this.aiLog.info("run started", { sub, threadId: thread.id, userId: interaction.user.id });
+        runOptions = { promptPrefix: null, telemetry: { agentName: "ai-draft", kind: "staff_command" } };
+        this.aiLog.info("run started", {
+          "ai.sub": sub,
+          "ticket.thread_id": thread.id,
+          "discord.user_id": interaction.user.id,
+        });
       } else {
         title = "🤖 Ticket Summary";
         prompt = buildSummarizePrompt(contextBlock);
-        runOptions = { promptPrefix: null };
-        this.aiLog.info("run started", { sub, threadId: thread.id, userId: interaction.user.id });
+        runOptions = { promptPrefix: null, telemetry: { agentName: "ai-summarize", kind: "staff_command" } };
+        this.aiLog.info("run started", {
+          "ai.sub": sub,
+          "ticket.thread_id": thread.id,
+          "discord.user_id": interaction.user.id,
+        });
       }
 
       const text = await this.streamAiRun(interaction, sub, title, prompt, runOptions);
@@ -1958,7 +2145,9 @@ export class DiscordBot {
       }
 
       const durationSec = Math.round((Date.now() - startedAt) / 1000);
-      this.aiLog.info("run completed", { sub, threadId: thread.id, durationSec });
+      // Command-boundary wide event; token/cost detail lives in the runner's
+      // ai.run.completed event and the gen_ai spans.
+      this.aiLog.info("run completed", { "ai.sub": sub, "ticket.thread_id": thread.id });
       void this.audit.log({
         title: `🤖 /ai ${sub} used`,
         severity: "neutral",
@@ -1968,7 +2157,11 @@ export class DiscordBot {
         fields: [{ name: "Duration", value: `${durationSec}s`, inline: true }],
       });
     } catch (error) {
-      this.aiLog.error("command failed", error, { sub, threadId: thread.id, userId: interaction.user.id });
+      this.aiLog.error("command failed", error, {
+        "ai.sub": sub,
+        "ticket.thread_id": thread.id,
+        "discord.user_id": interaction.user.id,
+      });
       await interaction
         .editReply({ embeds: [makeEmbed("Something went wrong — check the logs.", COLORS.danger)] })
         .catch(() => {});
@@ -2257,7 +2450,10 @@ export class DiscordBot {
         components: [],
       });
     } catch (error) {
-      console.error("status set apply failed:", error);
+      this.discordLog.error("status set apply failed", error, {
+        "ticket.thread_id": thread.id,
+        "status.tag_id": tag.id,
+      });
       await interaction.editReply({
         embeds: [makeEmbed("Something went wrong applying that status.", COLORS.danger)],
         components: [],
@@ -2302,7 +2498,10 @@ export class DiscordBot {
         components: [],
       });
     } catch (error) {
-      console.error("priority set apply failed:", error);
+      this.discordLog.error("priority set apply failed", error, {
+        "ticket.thread_id": thread.id,
+        "priority.tag_id": priority.id,
+      });
       await interaction.editReply({
         embeds: [makeEmbed("Something went wrong applying that priority.", COLORS.danger)],
         components: [],
@@ -2445,7 +2644,11 @@ export class DiscordBot {
           name: "Integrations",
           value: [
             `Intercom: ${s.intercomMode() === "none" ? "off" : `${s.intercomMode()}${s.intercomConfigured() ? "" : " ⚠️ not configured"}`}`,
-            `Sentry: ${s.sentryDsn() ? "on" : "off"}`,
+            `Sentry: ${
+              s.sentryDsn()
+                ? `${sentryActive() ? "on" : "configured ⚠️ restart pending"} · traces ${s.sentryTracesSampleRate()} · logs ${s.sentryLogsEnabled() ? "on" : "off"}`
+                : "off"
+            }`,
           ].join("\n"),
           inline: false,
         }
@@ -2457,10 +2660,10 @@ export class DiscordBot {
       new ButtonBuilder().setCustomId("config_workflow").setLabel("Workflow").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("config_reporting").setLabel("Reporting & Audit").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("config_intercom").setLabel("Intercom").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("config_sentry").setLabel("Sentry").setStyle(ButtonStyle.Primary),
     ];
     const actions = [
       new ButtonBuilder().setCustomId("config_reverify").setLabel("Re-Verify").setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId("config_sentry_dsn").setLabel("Sentry DSN").setStyle(ButtonStyle.Secondary),
     ];
     if (!s.backfillDone()) {
       actions.push(
@@ -2728,6 +2931,93 @@ export class DiscordBot {
     );
 
     return { embeds: [embed], components: [modeButtons, setupButtons, actionButtons, extraButtons] };
+  }
+
+  private buildSentryPanel() {
+    const s = this.settingsStore;
+    const mask = (value: string | null) => (value ? `••••${value.slice(-8)}` : "_not set_");
+    const dsn = s.sentryDsn();
+    const statusLine = !dsn
+      ? "**off** — no DSN configured"
+      : sentryActive()
+        ? "**live** — errors, traces, logs, metrics and profiles are being sent"
+        : "**configured, not active** ⚠️ — restart the bot to apply";
+
+    const embed = new EmbedBuilder()
+      .setTitle("Sentry Observability")
+      .setColor(0x5865f2)
+      .setDescription(
+        [
+          `**Status:** ${statusLine}`,
+          "",
+          `**DSN:** ${mask(dsn)}`,
+          `**Environment:** \`${s.sentryEnvironment()}\` · **Release:** \`${appRelease()}\``,
+          `**Traces sample rate:** ${s.sentryTracesSampleRate()} · **Profiles sample rate:** ${s.sentryProfilesSampleRate()}`,
+          `**Logs:** ${s.sentryLogsEnabled() ? "on" : "off"} · **Debug:** ${s.sentryDebug() ? "on" : "off"} · **Default PII:** ${s.sentrySendDefaultPii() ? "on" : "off"}`,
+          `**AI content capture:** ${s.sentryAiRecordContent() ? "on — prompts/responses/tool I/O recorded on AI spans" : "off — AI metadata only (tokens, cost, tools)"}`,
+          "",
+          "First-time enable and rate/environment/logs/PII/AI changes apply live. Changing an **active DSN**, toggling **debug**, and first-enabling **console capture** or **profiling** need a restart.",
+          "Traces 0 = keep instrumentation but send nothing; fully off = clear the DSN + restart.",
+        ].join("\n")
+      );
+
+    const setupButtons = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId("config_sentry_dsn").setLabel("Set DSN").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("config_sentry_options").setLabel("Rates & Environment").setStyle(ButtonStyle.Primary)
+    );
+
+    const toggleButtons = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId("config_sentry_toggle_logs")
+        .setLabel(`Logs: ${s.sentryLogsEnabled() ? "on" : "off"}`)
+        .setStyle(s.sentryLogsEnabled() ? ButtonStyle.Success : ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId("config_sentry_toggle_debug")
+        .setLabel(`Debug: ${s.sentryDebug() ? "on" : "off"}`)
+        .setStyle(s.sentryDebug() ? ButtonStyle.Success : ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId("config_sentry_toggle_pii")
+        .setLabel(`Default PII: ${s.sentrySendDefaultPii() ? "on" : "off"}`)
+        .setStyle(s.sentrySendDefaultPii() ? ButtonStyle.Success : ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId("config_sentry_toggle_ai")
+        .setLabel(`AI content: ${s.sentryAiRecordContent() ? "on" : "off"}`)
+        .setStyle(s.sentryAiRecordContent() ? ButtonStyle.Success : ButtonStyle.Secondary)
+    );
+
+    const actionButtons = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId("config_sentry_test")
+        .setLabel("Send test event")
+        .setStyle(ButtonStyle.Primary)
+        .setDisabled(!sentryActive()),
+      new ButtonBuilder().setCustomId("config_back_main").setLabel("Back").setStyle(ButtonStyle.Secondary)
+    );
+
+    return { embeds: [embed], components: [setupButtons, toggleButtons, actionButtons] };
+  }
+
+  // Applies the current settings to the running SDK and renders the outcome
+  // for the /config reply (which knobs are live vs. waiting on a restart).
+  private async applySentrySettings(): Promise<{ result: SentryReconfigureResult; note: string | null }> {
+    const result = await reconfigureSentry(this.settingsStore.sentryConfig());
+    switch (result.status) {
+      case "started":
+        return { result, note: "Sentry is now **live** (errors, traces, logs, metrics). Use *Send test event* to verify." };
+      case "stopped":
+        return { result, note: "Sentry **disabled** — event delivery stopped. Restart to drop residual instrumentation." };
+      case "restart-required":
+        return { result, note: "⚠️ Saved, but switching the active DSN needs a **bot restart** (traces can't be re-pointed at runtime)." };
+      case "updated":
+        return {
+          result,
+          note: result.restartNeeded.length
+            ? `Applied live, except: ${result.restartNeeded.join(", ")} — those need a **restart**.`
+            : null,
+        };
+      case "disabled":
+        return { result, note: null };
+    }
   }
 
   // All Intercom-panel string selects: admin picker + the two two-step mapping flows.
@@ -3309,7 +3599,7 @@ export class DiscordBot {
       // Turning the bridge on backfills every existing ticket (open + closed);
       // already-bridged tickets are skipped, so repeat switches are harmless.
       if (before === "none" && mode !== "none") {
-        void this.runIntercomBackfill(interaction).catch((e) => console.error("Intercom backfill failed:", e));
+        safe(this.runIntercomBackfill(interaction), "discord:backfill", { "backfill.trigger": "mode_switch" });
       }
       return;
     }
@@ -3421,6 +3711,11 @@ export class DiscordBot {
       return;
     }
 
+    if (id === "config_sentry") {
+      await interaction.update(this.buildSentryPanel());
+      return;
+    }
+
     if (id === "config_sentry_dsn") {
       const modal = new ModalBuilder().setCustomId("config_sentry_dsn_modal").setTitle("Sentry DSN");
       modal.addComponents(
@@ -3434,6 +3729,85 @@ export class DiscordBot {
         )
       );
       await interaction.showModal(modal);
+      return;
+    }
+
+    if (id === "config_sentry_options") {
+      const modal = new ModalBuilder().setCustomId("config_sentry_options_modal").setTitle("Sentry Rates & Environment");
+      modal.addComponents(
+        new ActionRowBuilder<TextInputBuilder>().addComponents(
+          new TextInputBuilder()
+            .setCustomId("environment")
+            .setLabel("Environment name")
+            .setStyle(TextInputStyle.Short)
+            .setRequired(true)
+            .setValue(this.settingsStore.sentryEnvironment())
+        ),
+        new ActionRowBuilder<TextInputBuilder>().addComponents(
+          new TextInputBuilder()
+            .setCustomId("traces_rate")
+            .setLabel("Traces sample rate (0.0 – 1.0)")
+            .setStyle(TextInputStyle.Short)
+            .setRequired(true)
+            .setValue(String(this.settingsStore.sentryTracesSampleRate()))
+        ),
+        new ActionRowBuilder<TextInputBuilder>().addComponents(
+          new TextInputBuilder()
+            .setCustomId("profiles_rate")
+            .setLabel("Profiles sample rate (0.0 – 1.0)")
+            .setStyle(TextInputStyle.Short)
+            .setRequired(true)
+            .setValue(String(this.settingsStore.sentryProfilesSampleRate()))
+        )
+      );
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (
+      id === "config_sentry_toggle_logs" ||
+      id === "config_sentry_toggle_debug" ||
+      id === "config_sentry_toggle_pii" ||
+      id === "config_sentry_toggle_ai"
+    ) {
+      const s = this.settingsStore;
+      let change: string;
+      if (id === "config_sentry_toggle_logs") {
+        await s.updateSentry({ sentryLogsEnabled: !s.sentryLogsEnabled() });
+        change = `Sentry logs → ${s.sentryLogsEnabled() ? "on" : "off"}`;
+      } else if (id === "config_sentry_toggle_debug") {
+        await s.updateSentry({ sentryDebug: !s.sentryDebug() });
+        change = `Sentry debug → ${s.sentryDebug() ? "on" : "off"}`;
+      } else if (id === "config_sentry_toggle_pii") {
+        await s.updateSentry({ sentrySendDefaultPii: !s.sentrySendDefaultPii() });
+        change = `Sentry default PII → ${s.sentrySendDefaultPii() ? "on" : "off"}`;
+      } else {
+        await s.updateSentry({ sentryAiRecordContent: !s.sentryAiRecordContent() });
+        setAiRecordContent(s.sentryAiRecordContent());
+        change = `Sentry AI content capture → ${s.sentryAiRecordContent() ? "on" : "off"}`;
+      }
+      const { note } = await this.applySentrySettings();
+      this.auditConfig(interaction, change);
+      await interaction.update(this.buildSentryPanel());
+      if (note) await interaction.followUp({ embeds: [makeEmbed(note, COLORS.brand)], flags: 64 });
+      return;
+    }
+
+    if (id === "config_sentry_test") {
+      await interaction.deferReply({ flags: 64 });
+      const res = await sendSentryTestEvent("config_test_button");
+      await interaction.editReply({
+        embeds: [
+          makeEmbed(
+            !res
+              ? "Sentry is not active in this process. Set a DSN (first-time enable is live), or restart if you changed an existing one."
+              : res.flushed
+                ? `✅ Test event delivered — id \`${res.eventId}\`. It shows up in Sentry → Issues as an *info* message within seconds.`
+                : `⚠️ Test event queued (id \`${res.eventId}\`) but the flush timed out — check the DSN and outbound network.`,
+            !res ? COLORS.warn : res.flushed ? COLORS.success : COLORS.danger
+          ),
+        ],
+      });
       return;
     }
 
@@ -3983,19 +4357,46 @@ export class DiscordBot {
 
     if (interaction.customId === "config_sentry_dsn_modal") {
       const dsn = interaction.fields.getTextInputValue("dsn").trim();
-      await this.settingsStore.updateSentryDsn(dsn || null);
-      if (dsn) initSentry(dsn);
+      await this.settingsStore.updateSentry({ sentryDsn: dsn || null });
+      const { result, note } = await this.applySentrySettings();
       // Deliberately no DSN value in the audit line.
       this.auditConfig(interaction, `Sentry DSN ${dsn ? "set" : "cleared"}`);
       await interaction.reply({
         embeds: [
           makeEmbed(
-            dsn
-              ? "Sentry DSN saved. Error capture is active (a restart is only needed to *change* an already-active DSN)."
-              : "Sentry DSN cleared — error capture stops after the next restart.",
-            COLORS.success
+            note ??
+              (result.status === "disabled" ? "Sentry stays off (no DSN)." : "Sentry settings saved."),
+            result.status === "restart-required" ? COLORS.warn : COLORS.success
           ),
         ],
+        flags: 64,
+      });
+      return;
+    }
+
+    if (interaction.customId === "config_sentry_options_modal") {
+      const environment = interaction.fields.getTextInputValue("environment").trim();
+      const tracesRaw = interaction.fields.getTextInputValue("traces_rate").trim();
+      const profilesRaw = interaction.fields.getTextInputValue("profiles_rate").trim();
+      const traces = Number.parseFloat(tracesRaw);
+      const profiles = Number.parseFloat(profilesRaw);
+      const validRate = (n: number) => Number.isFinite(n) && n >= 0 && n <= 1;
+      if (!environment || !validRate(traces) || !validRate(profiles)) {
+        await interaction.reply({
+          embeds: [makeEmbed("Invalid values — environment must be non-empty and both rates between 0.0 and 1.0.", COLORS.danger)],
+          flags: 64,
+        });
+        return;
+      }
+      await this.settingsStore.updateSentry({
+        sentryEnvironment: environment,
+        sentryTracesSampleRate: traces,
+        sentryProfilesSampleRate: profiles,
+      });
+      const { note } = await this.applySentrySettings();
+      this.auditConfig(interaction, `Sentry options → env \`${environment}\`, traces ${traces}, profiles ${profiles}`);
+      await interaction.reply({
+        embeds: [makeEmbed(note ?? `Sentry options saved — environment \`${environment}\`, traces ${traces}, profiles ${profiles}.`, COLORS.success)],
         flags: 64,
       });
       return;
@@ -4456,7 +4857,7 @@ export class DiscordBot {
       await this.settingsStore.markBackfillDone();
       await interaction.editReply({ embeds: [makeEmbed(`Backfill complete. Tracked ${created} existing ticket(s).`, COLORS.success)] });
     } catch (error) {
-      console.error("Backfill error:", error);
+      log.child("discord:backfill").error("ticket backfill failed", error);
       await interaction.editReply({ embeds: [makeEmbed("Backfill failed; you can try again from /config.", COLORS.danger)] });
     }
   }
@@ -4519,7 +4920,7 @@ export class DiscordBot {
         fields: [{ name: "Result", value: summary }],
       });
     } catch (error) {
-      console.error("Intercom backfill error:", error);
+      log.child("discord:backfill").error("intercom backfill failed", error);
       await report("Intercom backfill failed — check the logs; you can safely run it again from /config → Intercom.", COLORS.danger);
     }
   }
@@ -4596,7 +4997,7 @@ export class DiscordBot {
         fields: [{ name: "Result", value: summary.slice(0, 1024) }],
       });
     } catch (error) {
-      console.error("Intercom wipe error:", error);
+      log.child("discord:intercom-wipe").error("wipe failed", error);
       await report(
         "Intercom wipe failed — check the logs. Local state may already be cleared; re-running the wipe only affects objects that still have links, so remaining Intercom objects must be removed by hand.",
         COLORS.danger
@@ -4671,7 +5072,9 @@ export class DiscordBot {
           if (!ticket.closed) {
             await this.ticketStore
               .reconcile(ticket.threadId, { closed: true, closedAt: ticket.createdAt })
-              .catch((e) => console.error(`reverify: reconcile failed for ${ticket.threadId}:`, e));
+              .catch((e) =>
+                log.child("discord:reverify").error("reconcile failed", e, { "ticket.thread_id": ticket.threadId })
+              );
             fixedClosed++;
           }
           continue;
@@ -4718,7 +5121,9 @@ export class DiscordBot {
 
         await this.ticketStore
           .reconcile(ticket.threadId, changes)
-          .catch((e) => console.error(`reverify: reconcile failed for ${ticket.threadId}:`, e));
+          .catch((e) =>
+            log.child("discord:reverify").error("reconcile failed", e, { "ticket.thread_id": ticket.threadId })
+          );
       }
 
       const summary = new EmbedBuilder()
@@ -4738,7 +5143,7 @@ export class DiscordBot {
 
       await interaction.editReply({ embeds: [summary] });
     } catch (error) {
-      console.error("Re-Verify failed:", error);
+      log.child("discord:reverify").error("re-verify failed", error);
       await interaction.editReply({
         embeds: [makeEmbed("Re-Verify failed; you can try again from /config.", COLORS.danger)],
       });
@@ -5095,7 +5500,7 @@ export class DiscordBot {
       body: commands,
     });
 
-    console.log("Slash commands registered");
+    this.discordLog.info("slash commands registered", { "commands.count": commands.length });
   }
 
   async start(): Promise<void> {

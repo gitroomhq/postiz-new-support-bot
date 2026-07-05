@@ -1,6 +1,7 @@
 import { Client, EmbedBuilder } from "discord.js";
 import { SettingsStore } from "../config/SettingsStore";
 import { COLORS } from "../util/embeds";
+import { log } from "../util/logger";
 
 export type AuditSeverity = "info" | "success" | "warn" | "danger" | "neutral";
 
@@ -65,7 +66,7 @@ export class AuditLogger {
 
       await channel.send({ embeds: [embed] });
     } catch (e) {
-      console.error("Audit log failed:", e);
+      log.child("audit").error("discord audit post failed", e, { "audit.title": event.title });
     }
   }
 }

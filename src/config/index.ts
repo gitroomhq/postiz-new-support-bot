@@ -1,3 +1,5 @@
+import { log } from "../util/logger";
+
 export interface BotConfig {
   discord: {
     token: string;
@@ -41,7 +43,8 @@ export function loadConfig(): BotConfig {
   const optional = (key: string, fallback = ""): string => {
     const value = process.env[key];
     if (!value) {
-      console.warn(`Config: optional environment variable ${key} is not set`);
+      // Boot-time, pre-Sentry: this reaches stderr only, which is fine.
+      log.child("config").warn("optional environment variable not set", { "config.key": key });
       return fallback;
     }
     return value;

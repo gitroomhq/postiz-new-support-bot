@@ -23,6 +23,10 @@ import { StatusService } from "../bot/StatusService";
 import { TicketStore } from "../bot/TicketStore";
 import { AuditLogger } from "../bot/AuditLogger";
 import { EscalationTierStore } from "../config/EscalationTierStore";
+import { log } from "../util/logger";
+import { metricCount, metricDistribution } from "../util/instrument";
+
+const billingLog = log.child("billing");
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -207,7 +211,7 @@ export class BillingCategory extends BaseCategory {
 
       await thread.send({ embeds: [invoiceEmbed], components: [row] });
     } catch (error) {
-      console.error("Stripe error:", error);
+      billingLog.error("billing lookup failed", error, { "discord.user_id": interaction.user.id });
       await interaction.editReply({
         embeds: [makeEmbed("Something went wrong while looking up your billing information. Please try again later.", COLORS.danger)],
       });
@@ -234,7 +238,10 @@ export class BillingCategory extends BaseCategory {
     try {
       await this.stripeClient.applyDiscountCoupon(subscriptionId, `discount-${chargeId}`);
     } catch (error) {
-      console.error("Stripe discount error:", error);
+      billingLog.error("discount apply failed", error, {
+        "stripe.charge_id": chargeId,
+        "stripe.subscription_id": subscriptionId,
+      });
       // Release the lock so the customer can retry; the idempotency key makes a
       // succeeded-at-Stripe retry safe.
       await this.sessionStore.releaseBillingAction(chargeId).catch(() => {});
@@ -243,6 +250,12 @@ export class BillingCategory extends BaseCategory {
       });
       return;
     }
+
+    billingLog.info("billing.discount.applied", {
+      "stripe.charge_id": chargeId,
+      "stripe.subscription_id": subscriptionId,
+      "discord.user_id": interaction.user.id,
+    });
 
     await this.disableButtons(interaction);
 
@@ -306,7 +319,7 @@ export class BillingCategory extends BaseCategory {
     try {
       charge = await this.stripeClient.getChargeAmount(chargeId);
     } catch (error) {
-      console.error("Stripe charge lookup error:", error);
+      billingLog.error("charge lookup failed", error, { "stripe.charge_id": chargeId });
       await interaction.editReply({
         embeds: [makeEmbed("Something went wrong while looking up your charge. Please try again later.", COLORS.danger)],
       });
@@ -324,6 +337,14 @@ export class BillingCategory extends BaseCategory {
     // Guardrails: on breach, no Stripe call and no lock row — a human takes over.
     const breach = await this.checkRefundGuardrails(interaction, charge);
     if (breach) {
+      billingLog.warn("billing.refund.blocked", {
+        "stripe.charge_id": chargeId,
+        "refund.reason": breach,
+        "refund.amount": charge.amount,
+        "refund.currency": charge.currency,
+        "discord.user_id": interaction.user.id,
+      });
+      metricCount("billing.refunds", 1, { outcome: "blocked" });
       await this.convertToManualReview(interaction, breach, charge, chargeId, subscriptionId);
       return;
     }
@@ -343,7 +364,8 @@ export class BillingCategory extends BaseCategory {
     try {
       refund = await this.stripeClient.refundCharge(chargeId, `refund-${chargeId}`);
     } catch (error) {
-      console.error("Stripe refund error:", error);
+      billingLog.error("refund failed", error, { "stripe.charge_id": chargeId });
+      metricCount("billing.refunds", 1, { outcome: "failed" });
       // Release the lock so the customer can retry; the idempotency key makes a
       // succeeded-at-Stripe retry return the original refund instead of a second one.
       await this.sessionStore.releaseBillingAction(chargeId).catch(() => {});
@@ -368,9 +390,25 @@ export class BillingCategory extends BaseCategory {
         }
       }
     } catch (error) {
-      console.error("Stripe subscription cancel error:", error);
+      // Money moved but the cancel didn't — error level: staff must follow up.
+      billingLog.error("subscription cancel failed after refund", error, {
+        "stripe.charge_id": chargeId,
+        "stripe.subscription_id": subscriptionId || "",
+      });
       cancelFailed = true;
     }
+
+    billingLog.info("billing.refund.processed", {
+      "stripe.charge_id": chargeId,
+      "stripe.refund_id": refund.refundId,
+      "refund.amount": refund.amount,
+      "refund.currency": refund.currency,
+      "stripe.subscription_id": cancelledSubscriptionId ?? "",
+      "refund.cancel_failed": cancelFailed,
+      "discord.user_id": interaction.user.id,
+    });
+    metricCount("billing.refunds", 1, { outcome: "processed" });
+    metricDistribution("billing.refund_amount", refund.amount, { currency: refund.currency });
 
     const amount = this.stripeClient.formatAmount(refund.amount, refund.currency);
 
@@ -483,7 +521,7 @@ export class BillingCategory extends BaseCategory {
           currency: charge.currency,
           reason,
         })
-        .catch((e) => console.error("Pending charge review persist failed:", e));
+        .catch((e) => billingLog.error("pending charge review persist failed", e, { "stripe.charge_id": chargeId }));
     }
 
     const pingRoleId = await this.staffPingRoleFor(thread?.id ?? null);
@@ -550,7 +588,9 @@ export class BillingCategory extends BaseCategory {
         });
       }
     } catch (error) {
-      console.error("Billing audit notification failed:", error);
+      billingLog.warn("billing audit notification failed", {
+        "error.message": error instanceof Error ? error.message : String(error),
+      });
     } finally {
       // Mirror into the general audit trail, unless both settings point at the
       // same channel (the billing embed above already landed there).
@@ -633,7 +673,7 @@ export class BillingCategory extends BaseCategory {
     try {
       charge = await this.stripeClient.getChargeAmount(review.chargeId);
     } catch (error) {
-      console.error("Stripe charge lookup error:", error);
+      billingLog.error("charge lookup failed", error, { "stripe.charge_id": review.chargeId });
       await interaction.editReply({ embeds: [makeEmbed("Couldn't look up the charge on Stripe. Please try again later.", COLORS.danger)] });
       return;
     }
@@ -655,7 +695,8 @@ export class BillingCategory extends BaseCategory {
     try {
       refund = await this.stripeClient.refundCharge(review.chargeId, `refund-${review.chargeId}`);
     } catch (error) {
-      console.error("Stripe refund error:", error);
+      billingLog.error("refund failed", error, { "stripe.charge_id": review.chargeId });
+      metricCount("billing.refunds", 1, { outcome: "failed" });
       await this.sessionStore.releaseBillingAction(review.chargeId).catch(() => {});
       await interaction.editReply({ embeds: [makeEmbed("Failed to process the refund. Please try again or handle it in the Stripe dashboard.", COLORS.danger)] });
       return;
@@ -675,9 +716,24 @@ export class BillingCategory extends BaseCategory {
         }
       }
     } catch (error) {
-      console.error("Stripe subscription cancel error:", error);
+      billingLog.error("subscription cancel failed after refund", error, {
+        "stripe.charge_id": review.chargeId,
+        "stripe.subscription_id": review.subscriptionId ?? "",
+      });
       cancelFailed = true;
     }
+
+    billingLog.info("billing.refund.processed", {
+      "stripe.charge_id": review.chargeId,
+      "stripe.refund_id": refund.refundId,
+      "refund.amount": refund.amount,
+      "refund.currency": refund.currency,
+      "stripe.subscription_id": cancelledSubscriptionId ?? "",
+      "refund.cancel_failed": cancelFailed,
+      "refund.approved_by": member.id,
+    });
+    metricCount("billing.refunds", 1, { outcome: "processed" });
+    metricDistribution("billing.refund_amount", refund.amount, { currency: refund.currency });
 
     await this.sessionStore.resolvePendingChargeReview(thread.id, "APPROVED", member.id);
 

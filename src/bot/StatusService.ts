@@ -6,6 +6,10 @@ import { SettingsStore } from "../config/SettingsStore";
 import { IntercomSyncService } from "../intercom/IntercomSyncService";
 import { embed, COLORS } from "../util/embeds";
 import { applyTitleEmojis } from "../util/threadTitle";
+import { log } from "../util/logger";
+import { safe, metricCount } from "../util/instrument";
+
+const statusLog = log.child("status");
 
 export const RESOLVED_EMOJI = "✅";
 
@@ -94,9 +98,11 @@ export class StatusService {
 
     await this.ticketStore.setPriority(ticket.threadId, priority.id);
 
-    void this.intercomSync
-      .onPriorityChanged(ticket.threadId, prevPriority ?? null, priority, options.actorName)
-      .catch((e) => console.error("Intercom priority push failed:", e));
+    safe(
+      this.intercomSync.onPriorityChanged(ticket.threadId, prevPriority ?? null, priority, options.actorName),
+      "intercom-sync",
+      { "ticket.thread_id": ticket.threadId, "sync.event": "priority_changed" }
+    );
 
     void this.ticketStore
       .addTagChange({
@@ -109,7 +115,7 @@ export class StatusService {
         actorId: options.actorId ?? null,
         actorName: options.actorName,
       })
-      .catch((e) => console.error("Failed to record priority change:", e));
+      .catch((e) => statusLog.error("priority change record failed", e, { "ticket.thread_id": ticket.threadId }));
 
     const prevText = prevPriority ? `${prevPriority.emoji} ${prevPriority.label}` : "—";
     void this.audit.log({
@@ -153,9 +159,26 @@ export class StatusService {
     // Covers every status path: /status, feedback buttons, reminder auto-closes,
     // member-leave, manual lock/archive, Intercom-initiated changes (converges —
     // the executor's lastSynced* guards make the echo push a no-op).
-    void this.intercomSync
-      .onStatusChanged(ticket.threadId, ticket.statusTag ?? null, tag, options.actorName)
-      .catch((e) => console.error("Intercom status push failed:", e));
+    safe(
+      this.intercomSync.onStatusChanged(ticket.threadId, ticket.statusTag ?? null, tag, options.actorName),
+      "intercom-sync",
+      { "ticket.thread_id": ticket.threadId, "sync.event": "status_changed" }
+    );
+
+    // Boundary wide event for every status transition (doubles as the
+    // ticket-closed signal via ticket.closes_thread / ticket.resolved).
+    statusLog.info("ticket.status_changed", {
+      "ticket.thread_id": ticket.threadId,
+      "status.from": ticket.statusTag?.label ?? "",
+      "status.to": tag.label,
+      "status.actor": options.actorName,
+      "ticket.closes_thread": tag.closesThread,
+      "ticket.resolved": isResolved,
+      "ticket.reopened": !isDone && wasInactive,
+    });
+    if (isDone) {
+      metricCount("tickets.closed", 1, { via: options.actorName === "Automatic" ? "automatic" : "manual" });
+    }
 
     // Per-ticket history backing /status history — recorded for silent changes too,
     // same philosophy as the audit channel: the record is complete, silent only
@@ -171,7 +194,7 @@ export class StatusService {
         actorId: options.actorId ?? null,
         actorName: options.actorName,
       })
-      .catch((e) => console.error("Failed to record status change:", e));
+      .catch((e) => statusLog.error("status change record failed", e, { "ticket.thread_id": ticket.threadId }));
 
     // Audit trail — runs even for silent changes (bulk reassignment, member-left
     // closes): the channel is the complete record, silent only mutes the thread.
@@ -213,7 +236,9 @@ export class StatusService {
       // One-time satisfaction prompt. Must run BEFORE the lock/archive below so the
       // in-thread fallback (customer has DMs closed) can still post its message.
       if (ticket.customerId && !ticket.csatPromptedAt) {
-        await this.sendCsatPrompt(thread, ticket).catch((e) => console.error("CSAT prompt failed:", e));
+        await this.sendCsatPrompt(thread, ticket).catch((e) =>
+          statusLog.error("csat prompt failed", e, { "ticket.thread_id": ticket.threadId })
+        );
       }
     }
 

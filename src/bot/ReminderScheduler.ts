@@ -6,6 +6,10 @@ import { TicketStore, TicketWithTag } from "./TicketStore";
 import { StatusService, RESOLVED_EMOJI } from "./StatusService";
 import { AuditLogger } from "./AuditLogger";
 import { embed, COLORS } from "../util/embeds";
+import { log } from "../util/logger";
+import { withTickSpan, wasCaptured } from "../util/instrument";
+
+const schedLog = log.child("scheduler:reminder");
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const CHECK_INTERVAL_MS = 30 * 60 * 1000;
@@ -27,7 +31,9 @@ export class ReminderScheduler {
 
   start(): void {
     this.timer = setInterval(() => {
-      this.tick().catch((err) => console.error("Reminder scheduler error:", err));
+      withTickSpan("reminder", () => this.tick()).catch((err) => {
+        if (!wasCaptured(err)) schedLog.error("tick failed", err);
+      });
     }, CHECK_INTERVAL_MS);
   }
 
@@ -42,7 +48,7 @@ export class ReminderScheduler {
       try {
         await this.processTicket(ticket);
       } catch (err) {
-        console.error(`Reminder check failed for thread ${ticket.threadId}:`, err);
+        schedLog.error("reminder check failed", err, { "ticket.thread_id": ticket.threadId });
       }
     }
     await this.processResolvedAutoClose();
@@ -61,7 +67,7 @@ export class ReminderScheduler {
       try {
         await this.processResolvedTicket(ticket, closingTag, days);
       } catch (err) {
-        console.error(`Resolved auto-close failed for thread ${ticket.threadId}:`, err);
+        schedLog.error("resolved auto-close failed", err, { "ticket.thread_id": ticket.threadId });
       }
     }
   }
@@ -151,6 +157,11 @@ export class ReminderScheduler {
     }
 
     await this.ticketStore.recordReminder(ticket.threadId);
+    schedLog.info("reminder.sent", {
+      "ticket.thread_id": ticket.threadId,
+      "reminder.target": target.toLowerCase(),
+      "reminder.round": ticket.reminderCount + 1,
+    });
     void this.audit.log({
       title: "⏰ Reminder sent",
       severity: "warn",

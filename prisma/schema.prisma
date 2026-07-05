@@ -99,6 +99,14 @@ model BotSettings {
   intercomSnoozeStatusTagId String?
   // Sentry DSN (set via /config; deploy has no .env access). Null = Sentry disabled.
   sentryDsn             String?
+  // Sentry observability knobs (all edited via /config → Sentry).
+  sentryEnvironment        String  @default("production")
+  sentryTracesSampleRate   Float   @default(1.0)
+  sentryProfilesSampleRate Float   @default(1.0)  // needs the optional native @sentry/profiling-node addon
+  sentryLogsEnabled        Boolean @default(true) // Sentry Logs product + console.* capture
+  sentryDebug              Boolean @default(false) // SDK debug to stdout; restart to apply
+  sentrySendDefaultPii     Boolean @default(false)
+  sentryAiRecordContent    Boolean @default(true) // AI prompts/responses/tool I/O on gen_ai spans
   updatedAt           DateTime  @updatedAt
 
   @@map("bot_settings")

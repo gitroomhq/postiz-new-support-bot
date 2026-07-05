@@ -30,7 +30,10 @@ import { IntercomOutboxScheduler } from "./intercom/IntercomOutboxScheduler";
 import { IntercomWebhookHandler } from "./intercom/IntercomWebhookHandler";
 import { IntercomInboxScheduler } from "./intercom/IntercomInboxScheduler";
 import { IntercomInboxApp } from "./intercom/IntercomInboxApp";
-import { initSentry } from "./util/logger";
+import { initSentry, shutdownSentry, captureFatal, log } from "./util/logger";
+import { setAiRecordContent, withTickSpan } from "./util/instrument";
+
+const bootLog = log.child("bootstrap");
 
 async function main() {
   const config = loadConfig();
@@ -41,23 +44,26 @@ async function main() {
   const adapter = new PrismaPg({ connectionString: process.env.DATABASE_URL });
   const prisma = new PrismaClient({ adapter });
   await prisma.$connect();
-  console.log("Connected to database");
+  bootLog.info("database connected");
 
   await ensureSchema(prisma);
-  console.log("Schema ensured");
+  bootLog.info("schema ensured");
 
   const sessionStore = new SessionStore(prisma);
   const settingsStore = new SettingsStore(prisma);
   await settingsStore.load();
-  // DSN lives in BotSettings (the deploy has no editable .env), so Sentry can
-  // only come up after settings load. Everything before this logs to stdout.
-  initSentry(settingsStore.sentryDsn());
+  // DSN + knobs live in BotSettings (the deploy has no editable .env), so
+  // Sentry can only come up after settings load. Auto-instrumentation still
+  // works because `--require @sentry/node/preload` registered the require
+  // hooks before any module loaded. Everything before this logs to stdout.
+  initSentry(settingsStore.sentryConfig());
+  setAiRecordContent(settingsStore.sentryAiRecordContent());
   const cannedStore = new CannedResponseStore(prisma);
   await cannedStore.load();
   const tierStore = new EscalationTierStore(prisma);
   await tierStore.load();
   if (await tierStore.seedFromLegacySupportRole(settingsStore.supportRoleId())) {
-    console.log("Seeded escalation tier 1 from legacy support role");
+    bootLog.info("seeded escalation tier 1 from legacy support role");
   }
   const ticketStore = new TicketStore(prisma);
   const auditLogger = new AuditLogger(settingsStore);
@@ -161,11 +167,15 @@ async function main() {
   intercomInboxScheduler.start();
 
   // Clean expired pending auths every 5 minutes
-  setInterval(() => sessionStore.cleanExpiredPending(), 5 * 60 * 1000);
+  setInterval(() => {
+    withTickSpan("clean-pending-auths", () => sessionStore.cleanExpiredPending()).catch((e) =>
+      log.child("scheduler:clean-pending").error("tick failed", e)
+    );
+  }, 5 * 60 * 1000);
 
   // Graceful shutdown
   const shutdown = async () => {
-    console.log("Shutting down...");
+    bootLog.info("shutting down");
     reminderScheduler.stop();
     statusReportScheduler.stop();
     recloseScheduler.stop();
@@ -173,6 +183,8 @@ async function main() {
     intercomInboxScheduler.stop();
     bot.client.destroy();
     await prisma.$disconnect();
+    // Flush buffered events/spans/logs before the process dies.
+    await shutdownSentry(2000);
     process.exit(0);
   };
 
@@ -180,7 +192,10 @@ async function main() {
   process.on("SIGTERM", shutdown);
 }
 
-main().catch((err) => {
-  console.error("Fatal error:", err);
+main().catch(async (err) => {
+  // Raw stderr (not console.*): the console bridge would double-capture, and
+  // captureFatal below already reports + flushes the exception when Sentry is up.
+  process.stderr.write(`Fatal error: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}\n`);
+  await captureFatal(err);
   process.exit(1);
 });

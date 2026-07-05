@@ -1,3 +1,4 @@
+import * as Sentry from "@sentry/node";
 import { IntercomLink, IntercomOutboxEvent } from "../generated/prisma/client";
 import { TicketStore } from "../bot/TicketStore";
 import { AuditLogger } from "../bot/AuditLogger";
@@ -6,6 +7,8 @@ import { IntercomClient, IntercomHttpError } from "./IntercomClient";
 import { IntercomStore } from "./IntercomStore";
 import { IntercomSyncService, externalIdFor } from "./IntercomSyncService";
 import { bodyHash, renderDiscordMarkdownToHtml } from "./renderDiscordMarkdown";
+import { log } from "../util/logger";
+import { withTickSpan, wasCaptured, metricCount, metricGauge, SPAN_STATUS_ERROR } from "../util/instrument";
 import {
   CsatPayload,
   EnsurePayload,
@@ -49,6 +52,8 @@ export class IntercomOutboxScheduler {
   private lastEchoCleanupAt = 0;
   private contactAttrsEnsured = false;
   private discordTagId: string | null = null;
+  private schedLog = log.child("intercom:outbox");
+  private lastDepthGaugeAt = 0;
 
   constructor(
     private client: IntercomClient,
@@ -61,7 +66,9 @@ export class IntercomOutboxScheduler {
 
   start(): void {
     this.timer = setInterval(() => {
-      this.tick().catch((err) => console.error("Intercom outbox scheduler error:", err));
+      this.tick().catch((err) => {
+        if (!wasCaptured(err)) this.schedLog.error("tick failed", err);
+      });
     }, CHECK_INTERVAL_MS);
   }
 
@@ -84,23 +91,55 @@ export class IntercomOutboxScheduler {
         await this.store.cleanupEchoParts(new Date(Date.now() - ECHO_RETENTION_MS)).catch(() => {});
         await this.store.cleanupPendingPosts(new Date(Date.now() - PENDING_POST_RETENTION_MS)).catch(() => {});
       }
-      const due = await this.store.listDueHeads(BATCH_LIMIT);
-      for (const event of due) {
-        await this.processEvent(event);
-        await sleep(CALL_SPACING_MS);
+      // Queue depth gauge at most once a minute — this polls every 5 seconds.
+      if (Date.now() - this.lastDepthGaugeAt > 60_000) {
+        this.lastDepthGaugeAt = Date.now();
+        const counts = await this.store.counts().catch(() => null);
+        if (counts) {
+          metricGauge("intercom.outbox.queue_depth", counts.pending);
+          metricGauge("intercom.outbox.dead_letters", counts.dead);
+        }
       }
+      const due = await this.store.listDueHeads(BATCH_LIMIT);
+      if (due.length === 0) return;
+      // Span only ticks with actual work (a 5s poller would otherwise emit
+      // ~17k empty transactions per day).
+      await withTickSpan("intercom-outbox", async () => {
+        Sentry.getActiveSpan()?.setAttribute("queue.batch_size", due.length);
+        for (const event of due) {
+          await this.processEvent(event);
+          await sleep(CALL_SPACING_MS);
+        }
+      });
     } finally {
       this.draining = false;
     }
   }
 
   private async processEvent(event: IntercomOutboxEvent): Promise<void> {
-    try {
-      await this.execute(event);
-      await this.store.markSuccess(event.id);
-    } catch (e) {
-      await this.handleFailure(event, e);
-    }
+    // One child span per queue event; the Intercom fetches nest underneath.
+    await Sentry.startSpan(
+      {
+        name: `outbox.${event.type}`,
+        op: "queue.process",
+        attributes: {
+          "queue.event_id": event.id,
+          "queue.event_type": event.type,
+          "ticket.thread_id": event.ticketThreadId,
+          "queue.attempts": event.attempts,
+        },
+      },
+      async (span) => {
+        try {
+          await this.execute(event);
+          await this.store.markSuccess(event.id);
+          metricCount("intercom.outbox.processed", 1, { type: event.type, outcome: "ok" });
+        } catch (e) {
+          span.setStatus({ code: SPAN_STATUS_ERROR, message: "processing_failed" });
+          await this.handleFailure(event, e);
+        }
+      }
+    );
   }
 
   private async handleFailure(event: IntercomOutboxEvent, error: unknown): Promise<void> {
@@ -124,7 +163,7 @@ export class IntercomOutboxScheduler {
             await this.ensureBridge(event.ticketThreadId, payload);
           }
         } catch (healError) {
-          console.error(`Intercom 404 self-heal failed for ${event.ticketThreadId}:`, healError);
+          this.schedLog.error("404 self-heal failed", healError, { "ticket.thread_id": event.ticketThreadId });
         }
         await this.retryOrDie(event, `404 — remote object recreated, retrying: ${message}`);
         return;
@@ -139,6 +178,15 @@ export class IntercomOutboxScheduler {
 
     if (!transient) {
       await this.store.markDead(event.id, message);
+      this.schedLog.warn("intercom.outbox.dead_letter", {
+        "queue.event_id": event.id,
+        "queue.event_type": event.type,
+        "ticket.thread_id": event.ticketThreadId,
+        "queue.attempts": event.attempts,
+        "error.message": message.slice(0, 512),
+        "queue.reason": "permanent_error",
+      });
+      metricCount("intercom.outbox.processed", 1, { type: event.type, outcome: "dead" });
       void this.audit.log({
         title: "🌉 Intercom push failed",
         severity: "warn",
@@ -161,6 +209,15 @@ export class IntercomOutboxScheduler {
     const attempts = event.attempts + 1;
     if (attempts >= MAX_ATTEMPTS) {
       await this.store.markDead(event.id, message);
+      this.schedLog.warn("intercom.outbox.dead_letter", {
+        "queue.event_id": event.id,
+        "queue.event_type": event.type,
+        "ticket.thread_id": event.ticketThreadId,
+        "queue.attempts": attempts,
+        "error.message": message.slice(0, 512),
+        "queue.reason": "max_attempts",
+      });
+      metricCount("intercom.outbox.processed", 1, { type: event.type, outcome: "dead" });
       void this.audit.log({
         title: "🌉 Intercom push dead-lettered",
         severity: "warn",
@@ -176,6 +233,7 @@ export class IntercomOutboxScheduler {
     }
     const backoff = retryAfterMs ?? Math.min(5000 * 2 ** attempts, MAX_BACKOFF_MS);
     await this.store.markRetry(event.id, attempts, new Date(Date.now() + backoff), message);
+    metricCount("intercom.outbox.processed", 1, { type: event.type, outcome: "retry" });
   }
 
   // ---- Author resolution ----
@@ -273,7 +331,11 @@ export class IntercomOutboxScheduler {
         payload.threadUrl ? `<a href="${payload.threadUrl}">Open Discord thread</a>` : `Thread: ${threadId}`,
       ].filter(Boolean);
       await this.postAdminNote(threadId, link.conversationId, `<p>${contextLines.join("<br>")}</p>`, undefined, true).catch(
-        (e) => console.warn(`Intercom: context note for ${threadId} failed:`, e instanceof Error ? e.message : e)
+        (e) =>
+          this.schedLog.warn("context note failed", {
+            "ticket.thread_id": threadId,
+            "error.message": e instanceof Error ? e.message : String(e),
+          })
       );
     }
 
@@ -353,7 +415,10 @@ export class IntercomOutboxScheduler {
       await this.withAuthor((a) => this.client.tagConversation(conversationId, tagId, a));
     } catch (e) {
       this.discordTagId = null; // stale cache (tag deleted in Intercom) — recreate next time
-      console.warn(`Intercom: tagging conversation ${conversationId} failed:`, e instanceof Error ? e.message : e);
+      this.schedLog.warn("conversation tagging failed", {
+        "intercom.conversation_id": conversationId,
+        "error.message": e instanceof Error ? e.message : String(e),
+      });
     }
     try {
       await this.client.setConversationAttributes(conversationId, {
@@ -362,7 +427,10 @@ export class IntercomOutboxScheduler {
       });
     } catch (e) {
       if (!(e instanceof IntercomHttpError && (e.status === 400 || e.status === 422))) {
-        console.warn(`Intercom: conversation attributes for ${conversationId} failed:`, e instanceof Error ? e.message : e);
+        this.schedLog.warn("conversation attributes failed", {
+          "intercom.conversation_id": conversationId,
+          "error.message": e instanceof Error ? e.message : String(e),
+        });
       }
     }
   }

@@ -4,6 +4,9 @@ import { SettingsStore } from "../config/SettingsStore";
 import { SessionStore } from "../auth/SessionStore";
 import { IntercomStore } from "./IntercomStore";
 import { EnsurePayload, MessageAttachmentRef, OutboxEventType, OutboxPayload } from "./types";
+import { log } from "../util/logger";
+
+const syncLog = log.child("intercom:sync");
 
 // A Discord message reduced to what the bridge needs (live mirror and backfill
 // both map to this, so the composition logic stays free of discord.js types).
@@ -312,7 +315,7 @@ export class IntercomSyncService {
     const previous = this.chains.get(threadId) ?? Promise.resolve();
     const next = previous
       .then(task)
-      .catch((e) => console.error(`Intercom enqueue failed for ${threadId}:`, e));
+      .catch((e) => syncLog.error("enqueue failed", e, { "ticket.thread_id": threadId }));
     this.chains.set(threadId, next);
     void next.finally(() => {
       if (this.chains.get(threadId) === next) this.chains.delete(threadId);

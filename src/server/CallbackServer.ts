@@ -1,7 +1,12 @@
 import express, { type Express, type Request } from "express";
+import * as Sentry from "@sentry/node";
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { BotConfig } from "../config";
 import { OAuthManager } from "../auth/OAuthManager";
+import { log } from "../util/logger";
+import { metricCount } from "../util/instrument";
+
+const httpLog = log.child("http");
 
 // Inbound Intercom webhook wiring. The client secret lives in BotSettings
 // (editable via /config), so it's read per request through the getter.
@@ -57,6 +62,7 @@ export class CallbackServer {
         );
 
         res.send("Successfully authenticated! You can close this window and return to Discord.");
+        httpLog.info("oauth.callback.completed", { "discord.user_id": discordUserId });
 
         try {
           if (this.onAuthSuccess) {
@@ -66,7 +72,7 @@ export class CallbackServer {
           // Interaction token may have expired — that's fine, they'll see it works when they click Start Here again
         }
       } catch (err) {
-        console.error("OAuth callback error:", err);
+        httpLog.error("oauth callback failed", err);
         res.status(500).send("Authentication failed. Please try again.");
       }
     });
@@ -99,15 +105,20 @@ export class CallbackServer {
         const secret = this.intercomWebhook?.getClientSecret();
         const signature = req.header("x-hub-signature");
         const raw = (req as RawBodyRequest).rawBody;
+        const topic = typeof (req.body as { topic?: unknown })?.topic === "string" ? (req.body as { topic: string }).topic : "unknown";
         if (!this.intercomWebhook || !secret || !signature || !raw || !signatureMatches(raw, secret, signature)) {
+          metricCount("intercom.webhooks", 1, { topic, accepted: false });
           res.status(403).send("Forbidden");
           return;
         }
         try {
-          await this.intercomWebhook.accept(req.body);
+          const accepted = await this.intercomWebhook.accept(req.body);
+          httpLog.info("intercom.webhook.received", { "webhook.topic": topic, "webhook.accepted": accepted });
+          metricCount("intercom.webhooks", 1, { topic, accepted: true });
           res.status(200).send("ok");
         } catch (e) {
-          console.error("Intercom webhook accept failed:", e);
+          httpLog.error("intercom webhook enqueue failed", e, { "webhook.topic": topic });
+          metricCount("intercom.webhooks", 1, { topic, accepted: false });
           res.status(500).send("queueing failed");
         }
       }
@@ -141,17 +152,22 @@ export class CallbackServer {
             const canvas = await this.intercomCanvas[kind](req.body);
             res.json(canvas);
           } catch (e) {
-            console.error(`Intercom canvas ${kind} failed:`, e);
+            httpLog.error("intercom canvas request failed", e, { "canvas.kind": kind });
             res.status(500).json({});
           }
         }
       );
     }
+
+    // Last middleware: reports unhandled route errors to Sentry (Express 5
+    // forwards rejected async handlers here automatically). The route-level
+    // try/catches above still own the HTTP response shape.
+    Sentry.setupExpressErrorHandler(this.app);
   }
 
   start(): void {
     this.app.listen(this.config.server.port, () => {
-      console.log(`OAuth callback server listening on port ${this.config.server.port}`);
+      httpLog.info("callback server listening", { "server.port": this.config.server.port });
     });
   }
 }

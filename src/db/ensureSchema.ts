@@ -313,6 +313,14 @@ const STATEMENTS: string[] = [
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "intercomSnoozeStatusTagId" TEXT`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "sentryDsn" TEXT`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "aiCommandsEnabled" BOOLEAN NOT NULL DEFAULT true`,
+  // Sentry observability knobs (paired with /config → Sentry panel).
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "sentryEnvironment" TEXT NOT NULL DEFAULT 'production'`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "sentryTracesSampleRate" DOUBLE PRECISION NOT NULL DEFAULT 1.0`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "sentryProfilesSampleRate" DOUBLE PRECISION NOT NULL DEFAULT 1.0`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "sentryLogsEnabled" BOOLEAN NOT NULL DEFAULT true`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "sentryDebug" BOOLEAN NOT NULL DEFAULT false`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "sentrySendDefaultPii" BOOLEAN NOT NULL DEFAULT false`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "sentryAiRecordContent" BOOLEAN NOT NULL DEFAULT true`,
 ];
 
 export async function ensureSchema(prisma: PrismaClient): Promise<void> {

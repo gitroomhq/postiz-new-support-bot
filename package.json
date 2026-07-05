@@ -5,8 +5,8 @@
   "main": "dist/index.js",
   "scripts": {
     "build": "prisma generate && tsc",
-    "start": "node dist/index.js",
-    "dev": "prisma generate && ts-node src/index.ts",
+    "start": "SENTRY_PRELOAD_INTEGRATIONS=Http,Express,Postgres node --require @sentry/node/preload dist/index.js",
+    "dev": "prisma generate && SENTRY_PRELOAD_INTEGRATIONS=Http,Express,Postgres ts-node -r @sentry/node/preload src/index.ts",
     "db:migrate": "prisma migrate dev",
     "db:push": "prisma db push",
     "postinstall": "rm -rf search && mkdir search && cd search && git clone https://github.com/gitroomhq/postiz-app && git clone https://github.com/gitroomhq/postiz-docs"
@@ -19,7 +19,8 @@
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@prisma/adapter-pg": "^7.5.0",
     "@prisma/client": "^7.5.0",
-    "@sentry/node": "^10.63.0",
+    "@sentry/node": "10.63.0",
+    "@sentry/profiling-node": "10.63.0",
     "discord.js": "^14.25.1",
     "dotenv": "^17.3.1",
     "express": "^5.2.1",
@@ -32,5 +33,10 @@
     "prisma": "^7.5.0",
     "ts-node": "^10.9.2",
     "typescript": "^5.9.3"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "@sentry/profiling-node"
+    ]
   }
 }

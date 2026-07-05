@@ -1,4 +1,5 @@
 import { Prisma, PrismaClient, BotSettings, StatusTag, PriorityTag } from "../generated/prisma/client";
+import type { SentryRuntimeConfig } from "../util/logger";
 
 export type ReminderTarget = "SUPPORT" | "CUSTOMER";
 
@@ -326,15 +327,67 @@ export class SettingsStore {
     return this.settings.intercomSnoozeStatusTagId;
   }
 
-  // Sentry DSN (null = disabled). DB-only: the deploy has no editable .env.
+  // Sentry DSN (null = disabled). DB-first with env fallback: the deploy has no
+  // editable .env. `||` not `??` — an empty string stored in the DB must fall
+  // through to the env var instead of silently disabling Sentry.
   sentryDsn(): string | null {
-    return this.settings.sentryDsn ?? process.env.SENTRY_DSN ?? null;
+    return this.settings.sentryDsn?.trim() || process.env.SENTRY_DSN?.trim() || null;
   }
 
-  async updateSentryDsn(dsn: string | null): Promise<void> {
+  sentryEnvironment(): string {
+    return this.settings.sentryEnvironment;
+  }
+
+  sentryTracesSampleRate(): number {
+    return this.settings.sentryTracesSampleRate;
+  }
+
+  sentryProfilesSampleRate(): number {
+    return this.settings.sentryProfilesSampleRate;
+  }
+
+  sentryLogsEnabled(): boolean {
+    return this.settings.sentryLogsEnabled;
+  }
+
+  sentryDebug(): boolean {
+    return this.settings.sentryDebug;
+  }
+
+  sentrySendDefaultPii(): boolean {
+    return this.settings.sentrySendDefaultPii;
+  }
+
+  sentryAiRecordContent(): boolean {
+    return this.settings.sentryAiRecordContent;
+  }
+
+  sentryConfig(): SentryRuntimeConfig {
+    return {
+      dsn: this.sentryDsn(),
+      environment: this.sentryEnvironment(),
+      tracesSampleRate: this.sentryTracesSampleRate(),
+      profilesSampleRate: this.sentryProfilesSampleRate(),
+      logsEnabled: this.sentryLogsEnabled(),
+      debug: this.sentryDebug(),
+      sendDefaultPii: this.sentrySendDefaultPii(),
+      aiRecordContent: this.sentryAiRecordContent(),
+    };
+  }
+
+  async updateSentry(data: {
+    sentryDsn?: string | null;
+    sentryEnvironment?: string;
+    sentryTracesSampleRate?: number;
+    sentryProfilesSampleRate?: number;
+    sentryLogsEnabled?: boolean;
+    sentryDebug?: boolean;
+    sentrySendDefaultPii?: boolean;
+    sentryAiRecordContent?: boolean;
+  }): Promise<void> {
     this.settings = await this.prisma.botSettings.update({
       where: { id: "global" },
-      data: { sentryDsn: dsn },
+      data,
     });
   }
 
