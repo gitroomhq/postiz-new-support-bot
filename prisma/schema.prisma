@@ -94,6 +94,10 @@ model BotSettings {
   intercomOperatorAdminId String?                // auto-detected Operator/Fin; null = rejected/not found
   intercomTicketTypeMap Json?                    // { "<categoryId>"|"_default": "<ticketTypeId>" }
   intercomTeamId        String?                  // team the bridge assigns new conversations/tickets to (null = unassigned)
+  // Status tag applied in Discord when an agent snoozes the conversation in Intercom.
+  intercomSnoozeStatusTagId String?
+  // Sentry DSN (set via /config; deploy has no .env access). Null = Sentry disabled.
+  sentryDsn             String?
   updatedAt           DateTime  @updatedAt
 
   @@map("bot_settings")
@@ -233,6 +237,8 @@ model IntercomLink {
   agentWarnedAt     DateTime? // push mode: one-time "replies don't reach the customer" note
   lastSyncedStateId String? // last ticket_state_id the bridge pushed (echo damper)
   lastSyncedOpen    String? // "open" | "closed" — conversation open/close parity damper
+  // Last-seen Intercom tag name set (JSON string[]) — inbound tag-diff damper.
+  lastTagsJson      Json?
   createdAt         DateTime  @default(now())
 
   @@map("intercom_links")
@@ -263,7 +269,7 @@ model IntercomOutboxEvent {
 // either the bridge's own echo or a duplicate delivery, and gets dropped.
 model IntercomEchoPart {
   id             String   @id @default(cuid())
-  kind           String // "c" = conversation part, "t" = ticket part
+  kind           String // "c" = conversation part, "t" = ticket part, "r" = relay body-hash dedup
   partId         String
   ticketThreadId String
   createdAt      DateTime @default(now())
@@ -271,4 +277,38 @@ model IntercomEchoPart {
   @@unique([kind, partId])
   @@index([createdAt])
   @@map("intercom_echo_parts")
+}
+
+// Durable inbound webhook queue: the HTTP route only inserts a row and 200s;
+// IntercomInboxScheduler processes rows in seq order with retry/dead-letter.
+// deliveryId dedupes Intercom's single redelivery attempt.
+model IntercomInboxEvent {
+  id            String   @id @default(cuid())
+  seq           Int      @unique @default(autoincrement())
+  deliveryId    String?  @unique
+  topic         String
+  payload       Json
+  status        String   @default("PENDING") // PENDING | DEAD
+  attempts      Int      @default(0)
+  nextAttemptAt DateTime @default(now())
+  lastError     String?
+  receivedAt    DateTime @default(now())
+
+  @@index([status, nextAttemptAt])
+  @@map("intercom_inbox")
+}
+
+// Reserve→call→confirm echo records: the outbox writes a row (normalized body
+// hash) BEFORE posting to Intercom and deletes it after recording the created
+// part id in the echo ledger. The webhook handler treats a matching row as
+// "this part is our own in-flight post" — replaces the old fixed-sleep race.
+model IntercomPendingPost {
+  id             String   @id @default(cuid())
+  ticketThreadId String
+  kind           String // "c" | "t"
+  bodyHash       String // sha256 of whitespace-collapsed plain text of the sent body
+  createdAt      DateTime @default(now())
+
+  @@index([ticketThreadId, bodyHash])
+  @@map("intercom_pending_posts")
 }

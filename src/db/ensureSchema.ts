@@ -282,6 +282,36 @@ const STATEMENTS: string[] = [
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "intercomTicketTypeMap" JSONB`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "intercomTeamId" TEXT`,
   `ALTER TABLE "status_tags" ADD COLUMN IF NOT EXISTS "intercomTicketStateId" TEXT`,
+  // Intercom bridge overhaul: durable inbound webhook queue, reserve→confirm
+  // echo records, inbound tag-diff damper, snooze tag + Sentry DSN settings.
+  `CREATE TABLE IF NOT EXISTS "intercom_inbox" (
+    "id" TEXT NOT NULL,
+    "seq" SERIAL,
+    "deliveryId" TEXT,
+    "topic" TEXT NOT NULL,
+    "payload" JSONB NOT NULL,
+    "status" TEXT NOT NULL DEFAULT 'PENDING',
+    "attempts" INTEGER NOT NULL DEFAULT 0,
+    "nextAttemptAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "lastError" TEXT,
+    "receivedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT "intercom_inbox_pkey" PRIMARY KEY ("id")
+  )`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS "intercom_inbox_seq_key" ON "intercom_inbox"("seq")`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS "intercom_inbox_deliveryId_key" ON "intercom_inbox"("deliveryId")`,
+  `CREATE INDEX IF NOT EXISTS "intercom_inbox_status_nextAttemptAt_idx" ON "intercom_inbox"("status", "nextAttemptAt")`,
+  `CREATE TABLE IF NOT EXISTS "intercom_pending_posts" (
+    "id" TEXT NOT NULL,
+    "ticketThreadId" TEXT NOT NULL,
+    "kind" TEXT NOT NULL,
+    "bodyHash" TEXT NOT NULL,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT "intercom_pending_posts_pkey" PRIMARY KEY ("id")
+  )`,
+  `CREATE INDEX IF NOT EXISTS "intercom_pending_posts_ticketThreadId_bodyHash_idx" ON "intercom_pending_posts"("ticketThreadId", "bodyHash")`,
+  `ALTER TABLE "intercom_links" ADD COLUMN IF NOT EXISTS "lastTagsJson" JSONB`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "intercomSnoozeStatusTagId" TEXT`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "sentryDsn" TEXT`,
 ];
 
 export async function ensureSchema(prisma: PrismaClient): Promise<void> {

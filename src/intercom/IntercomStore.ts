@@ -1,5 +1,11 @@
-import { PrismaClient, IntercomLink, IntercomOutboxEvent } from "../generated/prisma/client";
+import { PrismaClient, IntercomLink, IntercomOutboxEvent, IntercomInboxEvent } from "../generated/prisma/client";
 import { OutboxEventType, OutboxPayload } from "./types";
+
+// Relay body-hash dedup rides the echo-part table under this kind (partId =
+// "<threadId>:<bodyHash>"). Fresh window: same body seen twice within it is a
+// cross-topic duplicate.
+const RELAY_KIND = "r";
+const RELAY_FRESH_MS = 2 * 60 * 1000;
 
 // Persistence for the Intercom bridge: thread↔conversation/ticket links, the
 // durable outbox, and the echo-part ledger. Events are executed in per-ticket
@@ -117,11 +123,141 @@ export class IntercomStore {
     }
   }
 
+  // Rolls back a claimPart (used when the webhook handler defers a decision —
+  // the retry must be able to claim the part again).
+  async releaseClaim(kind: "c" | "t", partId: string): Promise<void> {
+    await this.prisma.intercomEchoPart.deleteMany({ where: { kind, partId } });
+  }
+
   async cleanupEchoParts(olderThan: Date): Promise<number> {
     const result = await this.prisma.intercomEchoPart.deleteMany({
       where: { createdAt: { lt: olderThan } },
     });
     return result.count;
+  }
+
+  // Cross-topic relay dedup (replaces the old in-memory map — survives
+  // restarts). true = first sighting within the fresh window, relay it.
+  async claimRelay(ticketThreadId: string, bodyHashHex: string): Promise<boolean> {
+    const partId = `${ticketThreadId}:${bodyHashHex}`;
+    try {
+      await this.prisma.intercomEchoPart.create({ data: { kind: RELAY_KIND, partId, ticketThreadId } });
+      return true;
+    } catch (e) {
+      if ((e as { code?: string }).code !== "P2002") throw e;
+      const existing = await this.prisma.intercomEchoPart.findUnique({
+        where: { kind_partId: { kind: RELAY_KIND, partId } },
+      });
+      if (existing && Date.now() - existing.createdAt.getTime() < RELAY_FRESH_MS) return false;
+      await this.prisma.intercomEchoPart.updateMany({
+        where: { kind: RELAY_KIND, partId },
+        data: { createdAt: new Date() },
+      });
+      return true;
+    }
+  }
+
+  // ---- Pending posts (reserve → call → confirm echo handshake) ----
+  // Written BEFORE the bridge posts to Intercom; deleted once the created
+  // part id is in the echo ledger. The webhook handler treats a body-hash
+  // match as "our own in-flight post".
+
+  async reservePendingPost(ticketThreadId: string, kind: "c" | "t", bodyHashHex: string): Promise<string> {
+    const row = await this.prisma.intercomPendingPost.create({
+      data: { ticketThreadId, kind, bodyHash: bodyHashHex },
+    });
+    return row.id;
+  }
+
+  async deletePendingPost(id: string): Promise<void> {
+    await this.prisma.intercomPendingPost.deleteMany({ where: { id } });
+  }
+
+  // Atomically consume a matching reservation (any kind — a ticket reply can
+  // surface on the conversation topic). true = this part is the bridge's own.
+  async matchAndDeletePendingPost(ticketThreadId: string, bodyHashHex: string): Promise<boolean> {
+    const result = await this.prisma.intercomPendingPost.deleteMany({
+      where: { ticketThreadId, bodyHash: bodyHashHex },
+    });
+    return result.count > 0;
+  }
+
+  async hasPendingPosts(ticketThreadId: string): Promise<boolean> {
+    return (await this.prisma.intercomPendingPost.count({ where: { ticketThreadId } })) > 0;
+  }
+
+  // Crash leftovers (reserved, process died before confirm/delete).
+  async cleanupPendingPosts(olderThan: Date): Promise<number> {
+    const result = await this.prisma.intercomPendingPost.deleteMany({
+      where: { createdAt: { lt: olderThan } },
+    });
+    return result.count;
+  }
+
+  // ---- Inbound inbox (durable webhook queue) ----
+
+  // false = duplicate delivery (same notification event id) — already queued.
+  async acceptInbound(deliveryId: string | null, topic: string, payload: object): Promise<boolean> {
+    try {
+      await this.prisma.intercomInboxEvent.create({
+        data: { deliveryId: deliveryId || null, topic, payload },
+      });
+      return true;
+    } catch (e) {
+      if ((e as { code?: string }).code === "P2002") return false;
+      throw e;
+    }
+  }
+
+  async listDueInbound(limit: number): Promise<IntercomInboxEvent[]> {
+    return this.prisma.intercomInboxEvent.findMany({
+      where: { status: "PENDING", nextAttemptAt: { lte: new Date() } },
+      orderBy: { seq: "asc" },
+      take: limit,
+    });
+  }
+
+  async deleteInbound(id: string): Promise<void> {
+    await this.prisma.intercomInboxEvent.deleteMany({ where: { id } });
+  }
+
+  async markInboundRetry(id: string, attempts: number, nextAttemptAt: Date, lastError: string): Promise<void> {
+    await this.prisma.intercomInboxEvent.updateMany({
+      where: { id },
+      data: { attempts, nextAttemptAt, lastError: lastError.slice(0, 1000) },
+    });
+  }
+
+  async markInboundDead(id: string, lastError: string): Promise<void> {
+    await this.prisma.intercomInboxEvent.updateMany({
+      where: { id },
+      data: { status: "DEAD", lastError: lastError.slice(0, 1000) },
+    });
+  }
+
+  async retryDeadInbound(): Promise<number> {
+    const result = await this.prisma.intercomInboxEvent.updateMany({
+      where: { status: "DEAD" },
+      data: { status: "PENDING", attempts: 0, nextAttemptAt: new Date() },
+    });
+    return result.count;
+  }
+
+  async inboundCounts(): Promise<{ pending: number; dead: number }> {
+    const [pending, dead] = await Promise.all([
+      this.prisma.intercomInboxEvent.count({ where: { status: "PENDING" } }),
+      this.prisma.intercomInboxEvent.count({ where: { status: "DEAD" } }),
+    ]);
+    return { pending, dead };
+  }
+
+  // ---- Inbound tag-diff damper ----
+
+  async setLastTags(ticketThreadId: string, tags: string[]): Promise<void> {
+    await this.prisma.intercomLink.updateMany({
+      where: { ticketThreadId },
+      data: { lastTagsJson: tags },
+    });
   }
 
   // ---- Outbox ----
@@ -143,6 +279,15 @@ export class IntercomStore {
   async hasPendingEnsure(ticketThreadId: string): Promise<boolean> {
     const count = await this.prisma.intercomOutboxEvent.count({
       where: { ticketThreadId, type: "ensure", status: "PENDING" },
+    });
+    return count > 0;
+  }
+
+  // Queued content-producing events for this thread (message/note) — the
+  // webhook handler defers echo decisions while any are in flight.
+  async hasPendingOutboundContent(ticketThreadId: string): Promise<boolean> {
+    const count = await this.prisma.intercomOutboxEvent.count({
+      where: { ticketThreadId, type: { in: ["message", "note", "ensure"] }, status: "PENDING" },
     });
     return count > 0;
   }
@@ -211,6 +356,8 @@ export class IntercomStore {
       this.prisma.intercomLink.deleteMany(),
       this.prisma.intercomOutboxEvent.deleteMany(),
       this.prisma.intercomEchoPart.deleteMany(),
+      this.prisma.intercomInboxEvent.deleteMany(),
+      this.prisma.intercomPendingPost.deleteMany(),
     ]);
     return { links: links.count, events: events.count, parts: parts.count };
   }

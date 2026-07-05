@@ -316,6 +316,24 @@ export class SettingsStore {
     return Boolean(this.intercomAccessToken() && this.intercomAuthorAdminId() && this.intercomTicketTypeIdFor(null));
   }
 
+  // Status tag applied in Discord when an agent snoozes the conversation in
+  // Intercom. Null = snooze events are ignored.
+  intercomSnoozeStatusTagId(): string | null {
+    return this.settings.intercomSnoozeStatusTagId;
+  }
+
+  // Sentry DSN (null = disabled). DB-only: the deploy has no editable .env.
+  sentryDsn(): string | null {
+    return this.settings.sentryDsn ?? process.env.SENTRY_DSN ?? null;
+  }
+
+  async updateSentryDsn(dsn: string | null): Promise<void> {
+    this.settings = await this.prisma.botSettings.update({
+      where: { id: "global" },
+      data: { sentryDsn: dsn },
+    });
+  }
+
   async updateIntercom(data: {
     intercomMode?: IntercomMode;
     intercomRegion?: IntercomRegion;
@@ -325,6 +343,7 @@ export class SettingsStore {
     intercomOperatorAdminId?: string | null;
     intercomTicketTypeMap?: Record<string, string> | null;
     intercomTeamId?: string | null;
+    intercomSnoozeStatusTagId?: string | null;
   }): Promise<void> {
     const { intercomTicketTypeMap, ...rest } = data;
     this.settings = await this.prisma.botSettings.update({

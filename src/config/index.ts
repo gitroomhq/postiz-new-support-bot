@@ -26,13 +26,25 @@ export interface BotConfig {
 }
 
 export function loadConfig(): BotConfig {
+  // Hard requirements: the bot cannot run at all without these, so fail at
+  // boot with a clear message instead of a cryptic error at first use.
   const required = (key: string): string => {
     const value = process.env[key];
-    return value!;
-    // if (!value) {
-    //   throw new Error(`Missing required environment variable: ${key}`);
-    // }
-    // return value;
+    if (!value) {
+      throw new Error(`Missing required environment variable: ${key}`);
+    }
+    return value;
+  };
+
+  // Everything else degrades gracefully (feature disabled / DB-seeded later);
+  // warn once at boot so a misconfiguration is still visible.
+  const optional = (key: string, fallback = ""): string => {
+    const value = process.env[key];
+    if (!value) {
+      console.warn(`Config: optional environment variable ${key} is not set`);
+      return fallback;
+    }
+    return value;
   };
 
   return {
@@ -41,26 +53,26 @@ export function loadConfig(): BotConfig {
       clientId: required("DISCORD_CLIENT_ID"),
       // threadsChannelId / supportRoleId are deprecated here: they only seed the
       // DB on first run (see SettingsStore). Runtime reads come from /config.
-      threadsChannelId: required("DISCORD_THREADS_CHANNEL_ID"),
-      supportRoleId: required("DISCORD_SUPPORT_ROLE_ID"),
+      threadsChannelId: optional("DISCORD_THREADS_CHANNEL_ID"),
+      supportRoleId: optional("DISCORD_SUPPORT_ROLE_ID"),
     },
     postiz: {
-      frontendUrl: required("POSTIZ_FRONTEND_URL"),
-      apiUrl: required("POSTIZ_API_URL"),
-      clientId: required("POSTIZ_CLIENT_ID"),
-      clientSecret: required("POSTIZ_CLIENT_SECRET"),
+      frontendUrl: optional("POSTIZ_FRONTEND_URL"),
+      apiUrl: optional("POSTIZ_API_URL"),
+      clientId: optional("POSTIZ_CLIENT_ID"),
+      clientSecret: optional("POSTIZ_CLIENT_SECRET"),
     },
     github: {
-      token: required("GH_BOT_TOKEN"),
-      repo: required("GH_BOT_REPO"),
+      token: optional("GH_BOT_TOKEN"),
+      repo: optional("GH_BOT_REPO"),
     },
     stripe: {
       secretKey: required("STRIPE_SECRET_KEY"),
-      discountCouponId: required("STRIPE_DISCOUNT_COUPON_ID"),
+      discountCouponId: optional("STRIPE_DISCOUNT_COUPON_ID"),
     },
     server: {
       port: parseInt(process.env.SERVER_PORT || "3000", 10),
-      callbackUrl: required("POSTIZ_CALLBACK_URL"),
+      callbackUrl: optional("POSTIZ_CALLBACK_URL"),
     },
   };
 }

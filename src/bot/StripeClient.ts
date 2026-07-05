@@ -10,6 +10,12 @@ export interface SubscriptionInvoice {
   created: Date;
 }
 
+// Basil (SDK v20) dropped `invoice` from the Stripe.Charge type, but the field is
+// still returned on the wire for subscription charges — narrow instead of `as any`.
+interface ChargeWithInvoice extends Stripe.Charge {
+  invoice?: string | { id: string } | null;
+}
+
 export class StripeClient {
   private stripe: Stripe;
 
@@ -29,7 +35,7 @@ export class StripeClient {
 
     const succeededCharge = charges.data.find(
       (c) => c.status === "succeeded" && !c.refunded && c.amount > 0
-    ) as any;
+    ) as ChargeWithInvoice | undefined;
 
     if (!succeededCharge) return null;
 
@@ -40,7 +46,7 @@ export class StripeClient {
       const invoiceId = typeof chargeInvoice === "string" ? chargeInvoice : chargeInvoice.id;
 
       try {
-        const invoice = await this.stripe.invoices.retrieve(invoiceId) as any;
+        const invoice = await this.stripe.invoices.retrieve(invoiceId);
         const subDetails = invoice.parent?.subscription_details;
         if (subDetails?.subscription) {
           subscriptionId = typeof subDetails.subscription === "string"
@@ -78,23 +84,28 @@ export class StripeClient {
     return { amount: charge.amount, currency: charge.currency, refunded: charge.refunded };
   }
 
-  async cancelSubscription(subscriptionIdOrCustomerId: string): Promise<void> {
-    // If it looks like a subscription ID, cancel directly
-    if (subscriptionIdOrCustomerId.startsWith("sub_")) {
-      await this.stripe.subscriptions.cancel(subscriptionIdOrCustomerId);
-      return;
+  async cancelSubscription(subscriptionId: string): Promise<void> {
+    if (!subscriptionId.startsWith("sub_")) {
+      throw new Error("cancelSubscription requires a subscription id (sub_...)");
     }
+    await this.stripe.subscriptions.cancel(subscriptionId);
+  }
 
-    // Otherwise treat as customer ID — find and cancel their active subscription
+  // Cancels the customer's most recently created non-canceled subscription and
+  // names it, so callers can audit exactly which subscription was cancelled.
+  async cancelNewestActiveSubscription(customerId: string): Promise<{ subscriptionId: string } | null> {
     const subscriptions = await this.stripe.subscriptions.list({
-      customer: subscriptionIdOrCustomerId,
+      customer: customerId,
       status: "all",
     });
 
-    const active = subscriptions.data.find((s) => s.status !== "canceled");
-    if (active) {
-      await this.stripe.subscriptions.cancel(active.id);
-    }
+    const newest = subscriptions.data
+      .filter((s) => s.status !== "canceled")
+      .sort((a, b) => b.created - a.created)[0];
+    if (!newest) return null;
+
+    await this.stripe.subscriptions.cancel(newest.id);
+    return { subscriptionId: newest.id };
   }
 
   async refundCharge(chargeId: string, idempotencyKey?: string): Promise<{ refundId: string; amount: number; currency: string }> {
@@ -259,6 +270,8 @@ export class StripeClient {
 
   // Plan change on one subscription item. Discounts: undefined = keep existing
   // (Stripe's default on price changes), "clear" = remove all, coupon id = replace.
+  // prorationDate pins prorations to the same timestamp a preview used, so the
+  // committed invoice matches the previewed one exactly.
   async changeSubscriptionPlan(
     params: {
       subscriptionId: string;
@@ -266,6 +279,7 @@ export class StripeClient {
       priceId: string;
       prorationBehavior: "create_prorations" | "none";
       discounts?: "clear" | string;
+      prorationDate?: number;
     },
     idempotencyKey: string
   ): Promise<Stripe.Subscription> {
@@ -274,6 +288,9 @@ export class StripeClient {
       {
         items: [{ id: params.itemId, price: params.priceId }],
         proration_behavior: params.prorationBehavior,
+        ...(params.prorationDate && params.prorationBehavior === "create_prorations"
+          ? { proration_date: params.prorationDate }
+          : {}),
         ...(params.discounts === "clear"
           ? { discounts: "" }
           : params.discounts
@@ -454,6 +471,352 @@ export class StripeClient {
 
   async removeTaxId(customerId: string, taxIdId: string): Promise<void> {
     await this.stripe.customers.deleteTaxId(customerId, taxIdId);
+  }
+
+  // ---- Billing admin panel (/billing) invoice, balance & schedule reads ----
+
+  async getInvoice(invoiceId: string): Promise<Stripe.Invoice> {
+    return this.stripe.invoices.retrieve(invoiceId);
+  }
+
+  async listInvoicesByStatus(
+    customerId: string,
+    status: Stripe.Invoice.Status | undefined,
+    limit = 10,
+    startingAfter?: string
+  ): Promise<Stripe.ApiList<Stripe.Invoice>> {
+    return this.stripe.invoices.list({
+      customer: customerId,
+      ...(status ? { status } : {}),
+      limit,
+      ...(startingAfter ? { starting_after: startingAfter } : {}),
+    });
+  }
+
+  // All payment method types — listCustomerCards only covers cards.
+  async listAllPaymentMethods(customerId: string): Promise<Stripe.PaymentMethod[]> {
+    const res = await this.stripe.paymentMethods.list({ customer: customerId, limit: 100 });
+    return res.data;
+  }
+
+  async listBalanceTransactions(
+    customerId: string,
+    limit = 10,
+    startingAfter?: string
+  ): Promise<Stripe.ApiList<Stripe.CustomerBalanceTransaction>> {
+    return this.stripe.customers.listBalanceTransactions(customerId, {
+      limit,
+      ...(startingAfter ? { starting_after: startingAfter } : {}),
+    });
+  }
+
+  // Upcoming-invoice preview of a plan change. Callers pass the same prorationDate
+  // to changeSubscriptionPlan so the committed prorations match this preview.
+  async previewPlanChange(params: {
+    customerId: string;
+    subscriptionId: string;
+    itemId: string;
+    priceId: string;
+    prorationDate: number;
+  }): Promise<Stripe.Invoice> {
+    return this.stripe.invoices.createPreview({
+      customer: params.customerId,
+      subscription: params.subscriptionId,
+      subscription_details: {
+        items: [{ id: params.itemId, price: params.priceId }],
+        proration_behavior: "create_prorations",
+        proration_date: params.prorationDate,
+      },
+    });
+  }
+
+  async previewCreditNote(params: {
+    invoiceId: string;
+    amountMinor?: number;
+    refundAmountMinor?: number;
+    creditAmountMinor?: number;
+    outOfBandAmountMinor?: number;
+  }): Promise<Stripe.CreditNote> {
+    return this.stripe.creditNotes.preview({
+      invoice: params.invoiceId,
+      ...(params.amountMinor != null ? { amount: params.amountMinor } : {}),
+      ...(params.refundAmountMinor != null ? { refund_amount: params.refundAmountMinor } : {}),
+      ...(params.creditAmountMinor != null ? { credit_amount: params.creditAmountMinor } : {}),
+      ...(params.outOfBandAmountMinor != null ? { out_of_band_amount: params.outOfBandAmountMinor } : {}),
+    });
+  }
+
+  async getSubscriptionSchedule(scheduleId: string): Promise<Stripe.SubscriptionSchedule> {
+    return this.stripe.subscriptionSchedules.retrieve(scheduleId);
+  }
+
+  async listPendingInvoiceItems(customerId: string): Promise<Stripe.InvoiceItem[]> {
+    const res = await this.stripe.invoiceItems.list({ customer: customerId, pending: true, limit: 25 });
+    return res.data;
+  }
+
+  // ---- Billing admin panel (/billing) subscription writes ----
+
+  async pauseSubscription(
+    subscriptionId: string,
+    behavior: "keep_as_draft" | "mark_uncollectible" | "void",
+    idempotencyKey?: string
+  ): Promise<Stripe.Subscription> {
+    return this.stripe.subscriptions.update(
+      subscriptionId,
+      { pause_collection: { behavior } },
+      idempotencyKey ? { idempotencyKey } : undefined
+    );
+  }
+
+  // pause_collection is Emptyable in v20 — empty string clears the pause.
+  async resumeSubscription(subscriptionId: string, idempotencyKey?: string): Promise<Stripe.Subscription> {
+    return this.stripe.subscriptions.update(
+      subscriptionId,
+      { pause_collection: "" },
+      idempotencyKey ? { idempotencyKey } : undefined
+    );
+  }
+
+  async setTrialEnd(
+    subscriptionId: string,
+    trialEnd: number | "now",
+    idempotencyKey?: string
+  ): Promise<Stripe.Subscription> {
+    return this.stripe.subscriptions.update(
+      subscriptionId,
+      { trial_end: trialEnd, proration_behavior: "none" },
+      idempotencyKey ? { idempotencyKey } : undefined
+    );
+  }
+
+  async setSubscriptionQuantity(
+    subscriptionId: string,
+    itemId: string,
+    quantity: number,
+    prorationBehavior: "create_prorations" | "none",
+    idempotencyKey?: string
+  ): Promise<Stripe.Subscription> {
+    return this.stripe.subscriptions.update(
+      subscriptionId,
+      { items: [{ id: itemId, quantity }], proration_behavior: prorationBehavior },
+      idempotencyKey ? { idempotencyKey } : undefined
+    );
+  }
+
+  async createScheduleFromSubscription(
+    subscriptionId: string,
+    idempotencyKey?: string
+  ): Promise<Stripe.SubscriptionSchedule> {
+    return this.stripe.subscriptionSchedules.create(
+      { from_subscription: subscriptionId },
+      idempotencyKey ? { idempotencyKey } : undefined
+    );
+  }
+
+  // Keeps the current phase as-is and appends a phase that switches to newPriceId
+  // at the current period end; end_behavior "release" hands the subscription back
+  // afterwards instead of keeping it schedule-managed forever.
+  async scheduleNextPhasePlan(
+    scheduleId: string,
+    newPriceId: string,
+    idempotencyKey?: string
+  ): Promise<Stripe.SubscriptionSchedule> {
+    const schedule = await this.stripe.subscriptionSchedules.retrieve(scheduleId);
+    const current = schedule.phases[0];
+    // The update API only accepts param-shaped phases, so rebuild phase 0 from the
+    // response's items/start_date/end_date and drop response-only fields.
+    const currentPhase: Stripe.SubscriptionScheduleUpdateParams.Phase = {
+      items: current.items.map((item) => ({
+        price: typeof item.price === "string" ? item.price : item.price.id,
+        ...(item.quantity != null ? { quantity: item.quantity } : {}),
+      })),
+      start_date: current.start_date,
+      end_date: current.end_date,
+    };
+    return this.stripe.subscriptionSchedules.update(
+      scheduleId,
+      {
+        end_behavior: "release",
+        phases: [currentPhase, { items: [{ price: newPriceId }] }],
+      },
+      idempotencyKey ? { idempotencyKey } : undefined
+    );
+  }
+
+  async releaseSchedule(scheduleId: string, idempotencyKey?: string): Promise<Stripe.SubscriptionSchedule> {
+    return this.stripe.subscriptionSchedules.release(
+      scheduleId,
+      {},
+      idempotencyKey ? { idempotencyKey } : undefined
+    );
+  }
+
+  // ---- Billing admin panel (/billing) invoice, credit & payment writes ----
+
+  // pending_invoice_items_behavior MUST stay "exclude": ad-hoc invoices must never
+  // sweep in unrelated pending items — items are attached explicitly via
+  // createInvoiceItem with the invoice id.
+  async createDraftInvoice(
+    params: {
+      customerId: string;
+      collectionMethod: "charge_automatically" | "send_invoice";
+      daysUntilDue?: number;
+    },
+    idempotencyKey?: string
+  ): Promise<Stripe.Invoice> {
+    return this.stripe.invoices.create(
+      {
+        customer: params.customerId,
+        auto_advance: false,
+        pending_invoice_items_behavior: "exclude",
+        collection_method: params.collectionMethod,
+        ...(params.collectionMethod === "send_invoice"
+          ? { days_until_due: params.daysUntilDue ?? 7 }
+          : {}),
+      },
+      idempotencyKey ? { idempotencyKey } : undefined
+    );
+  }
+
+  async createInvoiceItem(
+    params: {
+      customerId: string;
+      invoiceId: string;
+      amountMinor: number;
+      currency: string;
+      description: string;
+    },
+    idempotencyKey?: string
+  ): Promise<Stripe.InvoiceItem> {
+    return this.stripe.invoiceItems.create(
+      {
+        customer: params.customerId,
+        invoice: params.invoiceId,
+        amount: params.amountMinor,
+        currency: params.currency,
+        description: params.description,
+      },
+      idempotencyKey ? { idempotencyKey } : undefined
+    );
+  }
+
+  async updateInvoiceCollection(
+    invoiceId: string,
+    collectionMethod: "charge_automatically" | "send_invoice",
+    daysUntilDue?: number,
+    idempotencyKey?: string
+  ): Promise<Stripe.Invoice> {
+    return this.stripe.invoices.update(
+      invoiceId,
+      {
+        collection_method: collectionMethod,
+        ...(collectionMethod === "send_invoice" ? { days_until_due: daysUntilDue ?? 7 } : {}),
+      },
+      idempotencyKey ? { idempotencyKey } : undefined
+    );
+  }
+
+  // auto_advance stays off: finalizing must not let Stripe auto-collect later —
+  // collection happens explicitly via sendInvoice/payInvoice.
+  async finalizeInvoice(invoiceId: string, idempotencyKey?: string): Promise<Stripe.Invoice> {
+    return this.stripe.invoices.finalizeInvoice(
+      invoiceId,
+      { auto_advance: false },
+      idempotencyKey ? { idempotencyKey } : undefined
+    );
+  }
+
+  async sendInvoice(invoiceId: string, idempotencyKey?: string): Promise<Stripe.Invoice> {
+    return this.stripe.invoices.sendInvoice(invoiceId, {}, idempotencyKey ? { idempotencyKey } : undefined);
+  }
+
+  async payInvoice(invoiceId: string, idempotencyKey?: string): Promise<Stripe.Invoice> {
+    return this.stripe.invoices.pay(invoiceId, {}, idempotencyKey ? { idempotencyKey } : undefined);
+  }
+
+  async voidInvoice(invoiceId: string, idempotencyKey?: string): Promise<Stripe.Invoice> {
+    return this.stripe.invoices.voidInvoice(invoiceId, {}, idempotencyKey ? { idempotencyKey } : undefined);
+  }
+
+  async markInvoiceUncollectible(invoiceId: string, idempotencyKey?: string): Promise<Stripe.Invoice> {
+    return this.stripe.invoices.markUncollectible(invoiceId, {}, idempotencyKey ? { idempotencyKey } : undefined);
+  }
+
+  async deleteDraftInvoice(invoiceId: string, idempotencyKey?: string): Promise<void> {
+    await this.stripe.invoices.del(invoiceId, {}, idempotencyKey ? { idempotencyKey } : undefined);
+  }
+
+  // mode picks which Stripe amount field carries amountMinor: "refund" refunds the
+  // payment, "credit" credits the customer balance, "out_of_band" records an
+  // off-Stripe credit. Omitted amountMinor lets Stripe determine the amount.
+  async createCreditNote(
+    params: {
+      invoiceId: string;
+      amountMinor?: number;
+      mode: "refund" | "credit" | "out_of_band";
+      memo?: string;
+      reason?: Stripe.CreditNoteCreateParams.Reason;
+    },
+    idempotencyKey?: string
+  ): Promise<Stripe.CreditNote> {
+    return this.stripe.creditNotes.create(
+      {
+        invoice: params.invoiceId,
+        ...(params.amountMinor != null
+          ? params.mode === "refund"
+            ? { refund_amount: params.amountMinor }
+            : params.mode === "credit"
+              ? { credit_amount: params.amountMinor }
+              : { out_of_band_amount: params.amountMinor }
+          : {}),
+        ...(params.memo ? { memo: params.memo } : {}),
+        ...(params.reason ? { reason: params.reason } : {}),
+      },
+      idempotencyKey ? { idempotencyKey } : undefined
+    );
+  }
+
+  // Stripe sign convention: NEGATIVE amount = credit (reduces what the customer
+  // owes next invoice), POSITIVE = debit. Callers pass the signed amount.
+  async adjustCustomerBalance(
+    customerId: string,
+    amountMinor: number,
+    currency: string,
+    description: string,
+    idempotencyKey?: string
+  ): Promise<Stripe.CustomerBalanceTransaction> {
+    return this.stripe.customers.createBalanceTransaction(
+      customerId,
+      { amount: amountMinor, currency, description },
+      idempotencyKey ? { idempotencyKey } : undefined
+    );
+  }
+
+  // off_session + confirm: charges the saved payment method immediately and errors
+  // visibly (no customer-present flow) if the charge can't be completed.
+  async createManualPaymentIntent(
+    params: {
+      customerId: string;
+      amountMinor: number;
+      currency: string;
+      paymentMethodId?: string;
+      description?: string;
+    },
+    idempotencyKey?: string
+  ): Promise<Stripe.PaymentIntent> {
+    return this.stripe.paymentIntents.create(
+      {
+        customer: params.customerId,
+        amount: params.amountMinor,
+        currency: params.currency,
+        ...(params.paymentMethodId ? { payment_method: params.paymentMethodId } : {}),
+        off_session: true,
+        confirm: true,
+        ...(params.description ? { description: params.description } : {}),
+      },
+      idempotencyKey ? { idempotencyKey } : undefined
+    );
   }
 
   // Currencies Stripe treats as zero-decimal: the minor unit IS the major unit.

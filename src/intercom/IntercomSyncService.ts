@@ -1,4 +1,4 @@
-import { PriorityTag, StatusTag, TicketNote, TicketTagChange } from "../generated/prisma/client";
+import { PriorityTag, StatusTag } from "../generated/prisma/client";
 import { TicketStore, TicketWithTag } from "../bot/TicketStore";
 import { SettingsStore } from "../config/SettingsStore";
 import { SessionStore } from "../auth/SessionStore";
@@ -27,6 +27,12 @@ export class IntercomSyncService {
   // Per-thread promise chains so concurrent hooks enqueue in call order (the
   // outbox seq must match event order — same pattern as StatusService.chains).
   private chains = new Map<string, Promise<void>>();
+  // Resolves a category id to its human label ("billing" → "💳 Billing").
+  // Bound from index.ts once the CategoryRegistry exists.
+  private categoryLabelResolver: (id: string | null) => string | null = (id) => id;
+  // Builds https://discord.com/channels/{guildId}/{threadId}; bound lazily
+  // (the guild id is only known once the Discord client is ready).
+  private threadUrlBuilder: (threadId: string) => string | null = () => null;
 
   constructor(
     private settingsStore: SettingsStore,
@@ -34,6 +40,14 @@ export class IntercomSyncService {
     private sessionStore: SessionStore,
     private ticketStore: TicketStore
   ) {}
+
+  setCategoryLabelResolver(resolver: (id: string | null) => string | null): void {
+    this.categoryLabelResolver = resolver;
+  }
+
+  setThreadUrlBuilder(builder: (threadId: string) => string | null): void {
+    this.threadUrlBuilder = builder;
+  }
 
   enabled(): boolean {
     return this.settingsStore.intercomMode() !== "none" && this.settingsStore.intercomConfigured();
@@ -43,20 +57,14 @@ export class IntercomSyncService {
   // All hooks are threadId-based and refetch the ticket row themselves: they run
   // as `void` side-effects after the DB write, so the refetched state is current.
 
-  async onTicketCreated(threadId: string, categoryLabel: string | null, question: string | null): Promise<void> {
+  // The customer's question becomes the conversation's opening message (the
+  // ensure event carries it) — no separate message enqueue, no duplicate.
+  async onTicketCreated(threadId: string, categoryLabel: string | null, _question: string | null): Promise<void> {
     if (!this.enabled()) return;
     const ticket = await this.ticketStore.getByThreadId(threadId);
     if (!ticket) return;
     await this.chained(ticket.threadId, async () => {
       await this.ensureLink(ticket, categoryLabel);
-      if (question) {
-        await this.store.enqueue(ticket.threadId, "message", {
-          direction: "incoming",
-          content: question,
-          externalCreatedAtIso: ticket.createdAt.toISOString(),
-          attachmentMode: "urls",
-        });
-      }
     });
   }
 
@@ -104,7 +112,6 @@ export class IntercomSyncService {
         actorName,
         closed: toTag.closesThread,
         resolved,
-        note: true,
       });
     });
   }
@@ -124,22 +131,14 @@ export class IntercomSyncService {
         priorityLabel: `${toTag.emoji} ${toTag.label}`,
         fromLabel: fromTag ? `${fromTag.emoji} ${fromTag.label}` : null,
         actorName,
-        note: true,
       });
     });
   }
 
-  async onNoteAdded(threadId: string, authorName: string, text: string): Promise<void> {
-    if (!this.enabled()) return;
-    const ticket = await this.ticketStore.getByThreadId(threadId);
-    if (!ticket) return;
-    await this.chained(ticket.threadId, async () => {
-      await this.ensureLink(ticket);
-      await this.store.enqueue(ticket.threadId, "note", {
-        content: `📝 Staff note by ${authorName}:\n${text}`,
-      });
-    });
-  }
+  // Discord staff notes are NOT mirrored to Intercom (messages-only mirroring;
+  // agents working Intercom-first read their own notes there). The inverse —
+  // Intercom notes → TicketNote rows — lives in IntercomWebhookHandler and
+  // must never re-enter the bridge.
 
   async onCsat(threadId: string, score: number, comment?: string | null): Promise<void> {
     if (!this.enabled()) return;
@@ -164,11 +163,12 @@ export class IntercomSyncService {
   // Enqueues a full historical replay for one ticket in a single transaction
   // (all-or-nothing, so re-runs can key off hasLinkOrPendingEnsure). Returns the
   // number of events enqueued, or null when the ticket is already bridged.
+  // Messages-only mirroring: the transcript replays messages; status/priority/
+  // CSAT land as ticket state + attributes, never as notes. Timestamps come
+  // from the native created_at backdating — no text prefixes.
   async backfillTicket(
     ticket: TicketWithTag,
-    messages: BridgeSourceMessage[] | null, // null = thread no longer exists
-    notes: TicketNote[],
-    tagChanges: TicketTagChange[]
+    messages: BridgeSourceMessage[] | null // null = thread no longer exists
   ): Promise<number | null> {
     if (await this.store.hasLinkOrPendingEnsure(ticket.threadId)) return null;
 
@@ -176,76 +176,32 @@ export class IntercomSyncService {
     const add = (type: OutboxEventType, payload: OutboxPayload) =>
       events.push({ ticketThreadId: ticket.threadId, type, payload });
 
-    add("ensure", this.buildEnsurePayload(ticket, categoryLabelOf(ticket)));
-
-    // One chronological stream: messages + staff notes + status/priority history.
-    type Entry = { at: Date; type: OutboxEventType; payload: OutboxPayload };
-    const entries: Entry[] = [];
+    add("ensure", { ...this.buildEnsurePayload(ticket, categoryLabelOf(ticket, this.categoryLabelResolver)), questionAsOpening: false });
 
     if (messages === null) {
-      entries.push({
-        at: ticket.createdAt,
-        type: "note",
-        payload: { content: "Discord thread no longer exists; transcript unavailable." },
-      });
+      add("note", { content: "Discord thread no longer exists; transcript unavailable." });
       if (ticket.question) {
-        entries.push({
-          at: ticket.createdAt,
-          type: "message",
-          payload: {
-            direction: "incoming",
-            content: `${formatTimestamp(ticket.createdAt)} ${ticket.question}`,
-            externalCreatedAtIso: ticket.createdAt.toISOString(),
-            attachmentMode: "links",
-          },
+        add("message", {
+          direction: "incoming",
+          content: ticket.question,
+          externalCreatedAtIso: ticket.createdAt.toISOString(),
+          attachmentMode: "links",
         });
       }
     } else {
       for (const message of messages) {
         const composed = this.composeMessage(ticket, message, !message.authorIsBot && message.authorId !== ticket.customerId);
         if (!composed) continue;
-        entries.push({
-          at: message.createdAt,
-          type: "message",
-          payload: {
-            ...composed,
-            content: `${formatTimestamp(message.createdAt)} ${composed.content}`,
-            // Backfilled Discord CDN links are signed and likely expired —
-            // never hand them to attachment_urls, only as text.
-            attachmentMode: "links",
-          },
+        add("message", {
+          ...composed,
+          // Backfilled Discord CDN links are signed and likely expired —
+          // never hand them to attachment_urls, only as text.
+          attachmentMode: "links",
         });
       }
     }
 
-    for (const note of notes) {
-      entries.push({
-        at: note.createdAt,
-        type: "note",
-        payload: {
-          content: `${formatTimestamp(note.createdAt)} 📝 Staff note by ${note.authorName}:\n${note.text}`,
-          externalCreatedAtIso: note.createdAt.toISOString(),
-        },
-      });
-    }
-
-    for (const change of tagChanges) {
-      const kind = change.kind === "PRIORITY" ? "Priority" : "Status";
-      const from = change.fromLabel ? `${change.fromEmoji ?? ""} ${change.fromLabel}`.trim() : "—";
-      entries.push({
-        at: change.createdAt,
-        type: "note",
-        payload: {
-          content: `${formatTimestamp(change.createdAt)} ${kind}: ${from} → ${change.toEmoji} ${change.toLabel} — by ${change.actorName}`,
-          externalCreatedAtIso: change.createdAt.toISOString(),
-        },
-      });
-    }
-
-    entries.sort((a, b) => a.at.getTime() - b.at.getTime());
-    for (const entry of entries) add(entry.type, entry.payload);
-
-    // Tail: final state. History notes above already narrate transitions, so note:false.
+    // Tail: final state + attributes (no transcript notes).
     const tag = ticket.statusTag;
     if (tag) {
       add("status", {
@@ -254,7 +210,6 @@ export class IntercomSyncService {
         actorName: "Backfill",
         closed: tag.closesThread,
         resolved: tag.closesThread || isResolvedTag(tag),
-        note: false,
       });
     }
     const priorityTag = ticket.priorityTagId ? this.settingsStore.priorityById(ticket.priorityTagId) : undefined;
@@ -262,7 +217,6 @@ export class IntercomSyncService {
       add("priority", {
         priorityLabel: `${priorityTag.emoji} ${priorityTag.label}`,
         actorName: "Backfill",
-        note: false,
       });
     }
     if (ticket.csatScore != null) {
@@ -277,7 +231,7 @@ export class IntercomSyncService {
 
   // Also used by the outbox executor's 404 self-heal to rebuild the remote objects.
   async buildEnsurePayloadWithSession(ticket: TicketWithTag): Promise<EnsurePayload> {
-    const payload = this.buildEnsurePayload(ticket, categoryLabelOf(ticket));
+    const payload = this.buildEnsurePayload(ticket, categoryLabelOf(ticket, this.categoryLabelResolver));
     if (ticket.customerId) {
       const session = await this.sessionStore.getSession(ticket.customerId).catch(() => null);
       payload.postizUserId = session?.postizUserId ?? null;
@@ -295,6 +249,8 @@ export class IntercomSyncService {
       categoryId: ticket.categoryId,
       categoryLabel,
       question: ticket.question ?? null,
+      questionAsOpening: true,
+      threadUrl: this.threadUrlBuilder(ticket.threadId),
       statusTagId: tag?.id ?? null,
       statusLabel: tag ? `${tag.emoji} ${tag.label}` : "Open",
       closed: ticket.closed && (tag?.closesThread ?? true),
@@ -306,7 +262,7 @@ export class IntercomSyncService {
 
   private async ensureLink(ticket: TicketWithTag, categoryLabel?: string | null): Promise<void> {
     if (await this.store.hasLinkOrPendingEnsure(ticket.threadId)) return;
-    const payload = this.buildEnsurePayload(ticket, categoryLabel ?? categoryLabelOf(ticket));
+    const payload = this.buildEnsurePayload(ticket, categoryLabel ?? categoryLabelOf(ticket, this.categoryLabelResolver));
     if (ticket.customerId) {
       const session = await this.sessionStore.getSession(ticket.customerId).catch(() => null);
       payload.postizUserId = session?.postizUserId ?? null;
@@ -374,11 +330,6 @@ export function externalIdFor(payload: EnsurePayload, threadId: string): string 
   return `discord-thread:${threadId}`;
 }
 
-export function formatTimestamp(date: Date): string {
-  const pad = (n: number) => String(n).padStart(2, "0");
-  return `[${date.getUTCFullYear()}-${pad(date.getUTCMonth() + 1)}-${pad(date.getUTCDate())} ${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())} UTC]`;
-}
-
 // The Resolved tag is identified by convention (✅, matching RESOLVED_EMOJI in
 // StatusService) — resolved tickets close the Intercom conversation without the
 // Discord thread being locked.
@@ -386,6 +337,6 @@ function isResolvedTag(tag: StatusTag): boolean {
   return tag.emoji === "✅";
 }
 
-function categoryLabelOf(ticket: TicketWithTag): string | null {
-  return ticket.categoryId ?? null;
+function categoryLabelOf(ticket: TicketWithTag, resolve: (id: string | null) => string | null): string | null {
+  return resolve(ticket.categoryId ?? null);
 }

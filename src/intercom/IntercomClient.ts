@@ -1,4 +1,5 @@
 import { SettingsStore } from "../config/SettingsStore";
+import { bodyHash } from "./renderDiscordMarkdown";
 import { IntercomAdmin, IntercomTicketState, IntercomTicketType } from "./types";
 
 // Thrown for non-2xx responses so the outbox scheduler can classify transient
@@ -236,14 +237,20 @@ export class IntercomClient {
     );
   }
 
-  // Admin comment or note. Returns the id of the just-created part (newest part
-  // authored by the given admin) so the caller can record it in the echo ledger.
+  // Admin comment or note. Returns the id of the just-created part so the
+  // caller can record it in the echo ledger. Resolution: newest part authored
+  // by this admin whose normalized body matches what we sent (per-ticket FIFO
+  // means the bridge never has two in-flight posts per conversation, so
+  // ambiguity only arises with a same-admin human — the body match resolves
+  // it); falls back to the newest same-author part.
   async replyAsAdmin(
     conversationId: string,
     input: { adminId: string; body: string; note?: boolean; createdAtIso?: string; attachmentUrls?: string[] }
   ): Promise<{ partId: string | null }> {
     const data = await this.json<{
-      conversation_parts?: { conversation_parts?: Array<{ id?: string | number; author?: { id?: string | number } }> };
+      conversation_parts?: {
+        conversation_parts?: Array<{ id?: string | number; body?: string | null; author?: { id?: string | number } }>;
+      };
     }>(
       `/conversations/${encodeURIComponent(conversationId)}/reply`,
       "POST",
@@ -258,6 +265,13 @@ export class IntercomClient {
       "admin reply"
     );
     const parts = data.conversation_parts?.conversation_parts ?? [];
+    const sentHash = bodyHash(input.body);
+    for (let i = parts.length - 1; i >= 0; i--) {
+      const part = parts[i];
+      if (part.id != null && String(part.author?.id ?? "") === input.adminId && bodyHash(part.body ?? "") === sentHash) {
+        return { partId: String(part.id) };
+      }
+    }
     for (let i = parts.length - 1; i >= 0; i--) {
       const part = parts[i];
       if (part.id != null && String(part.author?.id ?? "") === input.adminId) {

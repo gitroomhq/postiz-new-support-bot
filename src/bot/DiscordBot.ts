@@ -58,9 +58,11 @@ import { IntercomSyncService, BridgeSourceMessage } from "../intercom/IntercomSy
 import { IntercomStore } from "../intercom/IntercomStore";
 import { IntercomClient, IntercomHttpError } from "../intercom/IntercomClient";
 import { IntercomWebhookHandler } from "../intercom/IntercomWebhookHandler";
+import { IntercomInboxApp } from "../intercom/IntercomInboxApp";
 import { BillingAdmin } from "./BillingAdmin";
 import { TICKET_ATTR_PRIORITY, TICKET_ATTR_CSAT, TICKET_ATTR_THREAD } from "../intercom/IntercomOutboxScheduler";
 import { IntercomMode, IntercomRegion } from "../config/SettingsStore";
+import { initSentry } from "../util/logger";
 
 type TicketSearchFilters = {
   categoryId?: string;
@@ -103,7 +105,8 @@ export class DiscordBot {
     private intercomStore: IntercomStore,
     private intercomClient: IntercomClient,
     private intercomWebhook: IntercomWebhookHandler,
-    private billingAdmin: BillingAdmin
+    private billingAdmin: BillingAdmin,
+    private intercomInboxApp?: IntercomInboxApp
   ) {
     this.client = new Client({
       // MessageContent is privileged (enable it in the Dev Portal too) — without it
@@ -170,18 +173,35 @@ export class DiscordBot {
 
   // Reduces a discord.js message to the bridge shape (also used by the backfill
   // walker). Embed-only messages (historical AI answers, the "Your question"
-  // embed) are flattened to text so they don't mirror as blanks.
+  // embed) are flattened to text so they don't mirror as blanks. Mentions are
+  // resolved to real names HERE — the renderer downstream only has generic
+  // fallbacks (@user/@role/#channel).
   private toBridgeMessage(message: Message, member: GuildMember | null): BridgeSourceMessage {
     const embedText = message.embeds
       .map((e) => [e.title, e.description].filter(Boolean).join("\n"))
       .filter(Boolean)
       .join("\n\n");
+    let content = message.content || embedText || "";
+    content = content
+      .replace(/<@!?(\d+)>/g, (m, id) => {
+        const user = message.mentions.users.get(id);
+        const mentionedMember = message.mentions.members?.get(id);
+        return user ? `@${mentionedMember?.displayName ?? user.displayName ?? user.username}` : m;
+      })
+      .replace(/<@&(\d+)>/g, (m, id) => {
+        const role = message.mentions.roles.get(id);
+        return role ? `@${role.name}` : m;
+      })
+      .replace(/<#(\d+)>/g, (m, id) => {
+        const channel = message.mentions.channels.get(id);
+        return channel && "name" in channel && channel.name ? `#${channel.name}` : m;
+      });
     return {
       discordMessageId: message.id,
       authorId: message.author.id,
       authorName: member?.displayName ?? message.author.displayName ?? message.author.username,
       authorIsBot: message.author.bot,
-      content: message.content || embedText || "",
+      content,
       attachments: message.attachments.map((a) => ({
         url: a.url,
         filename: a.name ?? "attachment",
@@ -415,10 +435,8 @@ export class DiscordBot {
         await interaction.reply({ embeds: [makeEmbed("Note text is required.", COLORS.warn)], flags: 64 });
         return;
       }
+      // Staff notes are Discord-only (messages-only Intercom mirroring).
       await this.ticketStore.addNote(thread.id, member.id, member.displayName, text);
-      void this.intercomSync
-        .onNoteAdded(thread.id, member.displayName, text)
-        .catch((e) => console.error("Intercom note push failed:", e));
       void this.audit.log({
         title: "📝 Note added",
         actor: member.displayName,
@@ -1963,7 +1981,10 @@ export class DiscordBot {
         },
         {
           name: "Integrations",
-          value: `Intercom: ${s.intercomMode() === "none" ? "off" : `${s.intercomMode()}${s.intercomConfigured() ? "" : " ⚠️ not configured"}`}`,
+          value: [
+            `Intercom: ${s.intercomMode() === "none" ? "off" : `${s.intercomMode()}${s.intercomConfigured() ? "" : " ⚠️ not configured"}`}`,
+            `Sentry: ${s.sentryDsn() ? "on" : "off"}`,
+          ].join("\n"),
           inline: false,
         }
       );
@@ -1977,6 +1998,7 @@ export class DiscordBot {
     ];
     const actions = [
       new ButtonBuilder().setCustomId("config_reverify").setLabel("Re-Verify").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("config_sentry_dsn").setLabel("Sentry DSN").setStyle(ButtonStyle.Secondary),
     ];
     if (!s.backfillDone()) {
       actions.push(
@@ -2130,10 +2152,11 @@ export class DiscordBot {
   private async buildIntercomPanel() {
     const s = this.settingsStore;
     const mode = s.intercomMode();
-    const [links, totalTickets, outbox] = await Promise.all([
+    const [links, totalTickets, outbox, inbox] = await Promise.all([
       this.intercomStore.countLinks().catch(() => 0),
       this.ticketStore.getAllWithTag().then((t) => t.length).catch(() => 0),
       this.intercomStore.counts().catch(() => ({ pending: 0, dead: 0 })),
+      this.intercomStore.inboundCounts().catch(() => ({ pending: 0, dead: 0 })),
     ]);
 
     const mask = (value: string | null) => (value ? `••••${value.slice(-4)}` : "_not set_");
@@ -2175,10 +2198,18 @@ export class DiscordBot {
           `**Team routing:** ${s.intercomTeamId() ? `team \`${s.intercomTeamId()}\`` : "_unassigned_"}`,
           "",
           `**Bridged tickets:** ${links}/${totalTickets}`,
-          `**Outbox:** ${outbox.pending} pending · ${outbox.dead} failed`,
+          `**Outbox:** ${outbox.pending} pending · ${outbox.dead} failed — **Inbox:** ${inbox.pending} pending · ${inbox.dead} failed`,
+          `**Snooze tag:** ${
+            s.intercomSnoozeStatusTagId()
+              ? (() => {
+                  const t = s.tagById(s.intercomSnoozeStatusTagId()!);
+                  return t ? `${t.emoji} ${t.label}` : "_deleted tag — re-pick_";
+                })()
+              : "_not set — Intercom snooze is ignored_"
+          }`,
           "",
           s.intercomClientSecret()
-            ? "Webhook endpoint: `POST <public-url>/intercom/webhook` (signed via X-Hub-Signature). Topics: conversation.admin.replied / noted / closed / opened, conversation.operator.replied, ticket.state.updated, ticket.admin.replied."
+            ? "Webhook endpoint: `POST <public-url>/intercom/webhook` (signed via X-Hub-Signature). Topics: conversation.admin.replied / noted / closed / opened / snoozed / unsnoozed, conversation.operator.replied, ticket.state.updated, ticket.admin.replied (+ ticket.note.created if offered). Canvas inbox app: `POST <public-url>/intercom/inbox-app/initialize` + `/submit`."
             : "_No client secret set — the inbound webhook stays disabled (needed for bi mode and the push-mode agent warning)._",
           "",
           "Modes apply to tickets created inside Discord only; Intercom-native conversations are never touched.",
@@ -2218,9 +2249,9 @@ export class DiscordBot {
       new ButtonBuilder().setCustomId("config_intercom_backfill").setLabel("Backfill tickets").setStyle(ButtonStyle.Secondary),
       new ButtonBuilder()
         .setCustomId("config_intercom_retry_dead")
-        .setLabel(`Retry failed (${outbox.dead})`)
+        .setLabel(`Retry failed (${outbox.dead + inbox.dead})`)
         .setStyle(ButtonStyle.Secondary)
-        .setDisabled(outbox.dead === 0),
+        .setDisabled(outbox.dead === 0 && inbox.dead === 0),
       new ButtonBuilder()
         .setCustomId("config_intercom_region")
         .setLabel(`Region: ${s.intercomRegion().toUpperCase()}`)
@@ -2228,7 +2259,11 @@ export class DiscordBot {
       new ButtonBuilder().setCustomId("config_back_main").setLabel("Back").setStyle(ButtonStyle.Secondary)
     );
 
-    return { embeds: [embed], components: [modeButtons, setupButtons, actionButtons] };
+    const extraButtons = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId("config_intercom_snooze").setLabel("Snooze Tag").setStyle(ButtonStyle.Primary)
+    );
+
+    return { embeds: [embed], components: [modeButtons, setupButtons, actionButtons, extraButtons] };
   }
 
   // All Intercom-panel string selects: admin picker + the two two-step mapping flows.
@@ -2251,6 +2286,15 @@ export class DiscordBot {
       const teamId = value === "__none__" ? null : value;
       await this.settingsStore.updateIntercom({ intercomTeamId: teamId });
       this.auditConfig(interaction, `Intercom team routing → ${teamId ?? "unassigned"}`);
+      await interaction.update(await this.buildIntercomPanel());
+      return;
+    }
+
+    if (id === "config_intercom_snooze_pick") {
+      const tagId = value === "__none__" ? null : value;
+      await this.settingsStore.updateIntercom({ intercomSnoozeStatusTagId: tagId });
+      const tag = tagId ? this.settingsStore.tagById(tagId) : undefined;
+      this.auditConfig(interaction, `Intercom snooze tag → ${tag ? `${tag.emoji} ${tag.label}` : "none"}`);
       await interaction.update(await this.buildIntercomPanel());
       return;
     }
@@ -2840,8 +2884,73 @@ export class DiscordBot {
 
     if (id === "config_intercom_retry_dead") {
       const requeued = await this.intercomStore.retryDead();
-      this.auditConfig(interaction, `Intercom outbox → requeued ${requeued} failed event(s)`);
+      const requeuedInbound = await this.intercomStore.retryDeadInbound();
+      this.auditConfig(
+        interaction,
+        `Intercom queues → requeued ${requeued} outbound + ${requeuedInbound} inbound failed event(s)`
+      );
       await interaction.update(await this.buildIntercomPanel());
+      return;
+    }
+
+    if (id === "config_intercom_snooze") {
+      const tags = this.settingsStore.tags();
+      const current = this.settingsStore.intercomSnoozeStatusTagId();
+      const options = [
+        { label: "None (ignore Intercom snooze)", value: "__none__", default: !current },
+        ...tags.slice(0, 24).map((t) => {
+          const warnings = [
+            t.reminderEnabled ? "⚠️ has reminders" : null,
+            t.closesThread ? "⚠️ closes thread" : null,
+            t.intercomTicketStateId ? "⚠️ mapped to an Intercom state" : null,
+          ]
+            .filter(Boolean)
+            .join(", ");
+          return {
+            label: `${t.emoji} ${t.label}`.slice(0, 100),
+            value: t.id,
+            description: (warnings || "good fit").slice(0, 100),
+            default: t.id === current,
+          };
+        }),
+      ];
+      const row = new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
+        new StringSelectMenuBuilder().setCustomId("config_intercom_snooze_pick").setPlaceholder("Status tag applied on Intercom snooze").addOptions(options)
+      );
+      await interaction.update({
+        embeds: [
+          makeEmbed(
+            [
+              "Pick the status tag applied in Discord when an agent **snoozes** the conversation in Intercom. Unsnooze restores the previous tag.",
+              "",
+              "The tag should have **no reminders**, **not close the thread**, and **no Intercom state mapping** (a '💤 Snoozed' tag works well — create one under /config → Tags if needed).",
+            ].join("\n"),
+            COLORS.neutral
+          ),
+        ],
+        components: [
+          row,
+          new ActionRowBuilder<ButtonBuilder>().addComponents(
+            new ButtonBuilder().setCustomId("config_intercom").setLabel("Back").setStyle(ButtonStyle.Secondary)
+          ),
+        ],
+      });
+      return;
+    }
+
+    if (id === "config_sentry_dsn") {
+      const modal = new ModalBuilder().setCustomId("config_sentry_dsn_modal").setTitle("Sentry DSN");
+      modal.addComponents(
+        new ActionRowBuilder<TextInputBuilder>().addComponents(
+          new TextInputBuilder()
+            .setCustomId("dsn")
+            .setLabel("DSN (blank = disable Sentry)")
+            .setStyle(TextInputStyle.Short)
+            .setRequired(false)
+            .setValue(this.settingsStore.sentryDsn() ?? "")
+        )
+      );
+      await interaction.showModal(modal);
       return;
     }
 
@@ -3389,6 +3498,26 @@ export class DiscordBot {
       return;
     }
 
+    if (interaction.customId === "config_sentry_dsn_modal") {
+      const dsn = interaction.fields.getTextInputValue("dsn").trim();
+      await this.settingsStore.updateSentryDsn(dsn || null);
+      if (dsn) initSentry(dsn);
+      // Deliberately no DSN value in the audit line.
+      this.auditConfig(interaction, `Sentry DSN ${dsn ? "set" : "cleared"}`);
+      await interaction.reply({
+        embeds: [
+          makeEmbed(
+            dsn
+              ? "Sentry DSN saved. Error capture is active (a restart is only needed to *change* an already-active DSN)."
+              : "Sentry DSN cleared — error capture stops after the next restart.",
+            COLORS.success
+          ),
+        ],
+        flags: 64,
+      });
+      return;
+    }
+
     if (interaction.customId === "config_intercom_secrets_modal") {
       const accessToken = interaction.fields.getTextInputValue("access_token").trim();
       const clientSecret = interaction.fields.getTextInputValue("client_secret").trim();
@@ -3883,12 +4012,9 @@ export class DiscordBot {
         const channel = await this.client.channels.fetch(ticket.threadId).catch(() => null);
         const thread = channel?.isThread() ? (channel as ThreadChannel) : null;
         const messages = thread ? await this.fetchAllThreadMessages(thread) : null;
-        const [notes, tagChanges] = await Promise.all([
-          this.ticketStore.listAllNotes(ticket.threadId),
-          this.ticketStore.listAllTagChanges(ticket.threadId),
-        ]);
 
-        const count = await this.intercomSync.backfillTicket(ticket, messages, notes, tagChanges);
+        // Messages-only mirroring: notes/status history stay in Discord.
+        const count = await this.intercomSync.backfillTicket(ticket, messages);
         if (count != null) {
           enqueuedTickets++;
           enqueuedEvents += count;
@@ -4475,8 +4601,15 @@ export class DiscordBot {
       {
         // Secret is read per request: it lives in BotSettings and can change live.
         getClientSecret: () => this.settingsStore.intercomClientSecret(),
-        handle: (body) => this.intercomWebhook.handle(body),
-      }
+        accept: (body) => this.intercomWebhook.accept(body),
+      },
+      this.intercomInboxApp
+        ? {
+            getClientSecret: () => this.settingsStore.intercomClientSecret(),
+            initialize: (body) => this.intercomInboxApp!.initialize(body),
+            submit: (body) => this.intercomInboxApp!.submit(body),
+          }
+        : undefined
     );
     callbackServer.start();
   }

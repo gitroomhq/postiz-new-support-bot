@@ -22,6 +22,12 @@ export interface EnsurePayload {
   categoryId: string | null; // ticket-type map key ("howto" | "bugs" | "billing")
   categoryLabel?: string | null;
   question?: string | null; // _default_description_ of the converted ticket
+  // true (live tickets): the rendered question doubles as the conversation's
+  // opening message. false (backfill): the transcript replay carries the
+  // content, so the opening message is a generic import header.
+  questionAsOpening?: boolean;
+  // https://discord.com/channels/{guildId}/{threadId} — context note + canvas.
+  threadUrl?: string | null;
   statusTagId: string | null; // initial ticket state resolved at execute time
   statusLabel: string;
   closed: boolean;
@@ -53,6 +59,9 @@ export interface NotePayload {
   externalCreatedAtIso?: string;
 }
 
+// Messages-only mirroring: status/priority events update the ticket object
+// (state / attributes) but never post transcript notes. Old queued payloads
+// may still carry a legacy `note` field — executors ignore it.
 export interface StatusPayload {
   // Mapping to an Intercom ticket state is resolved at execute time (the
   // /config mapping can change while the event is queued).
@@ -62,15 +71,12 @@ export interface StatusPayload {
   actorName: string;
   closed: boolean;
   resolved: boolean;
-  // false when the transition is already covered elsewhere (e.g. backfill history notes)
-  note: boolean;
 }
 
 export interface PriorityPayload {
   priorityLabel: string; // verbatim "🟧 High"
   fromLabel?: string | null;
   actorName: string;
-  note: boolean;
 }
 
 export interface CsatPayload {
@@ -131,6 +137,8 @@ export interface IntercomConversationItem {
   type?: string;
   id?: string | number;
   conversation_parts?: { conversation_parts?: IntercomWebhookPart[] };
+  snoozed_until?: number | null;
+  tags?: { tags?: Array<{ id?: string | number; name?: string | null }> };
 }
 
 // data.item for ticket.* topics.
@@ -143,6 +151,7 @@ export interface IntercomTicketItem {
 
 export interface IntercomWebhookEvent {
   type?: string; // "notification_event"
+  id?: string; // notification event id — inbox dedup key for Intercom's retry
   topic?: string;
   data?: { item?: IntercomConversationItem | IntercomTicketItem };
 }

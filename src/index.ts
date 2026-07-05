@@ -28,11 +28,17 @@ import { IntercomStore } from "./intercom/IntercomStore";
 import { IntercomSyncService } from "./intercom/IntercomSyncService";
 import { IntercomOutboxScheduler } from "./intercom/IntercomOutboxScheduler";
 import { IntercomWebhookHandler } from "./intercom/IntercomWebhookHandler";
+import { IntercomInboxScheduler } from "./intercom/IntercomInboxScheduler";
+import { IntercomInboxApp } from "./intercom/IntercomInboxApp";
+import { initSentry } from "./util/logger";
 
 async function main() {
   const config = loadConfig();
+  if (!process.env.DATABASE_URL) {
+    throw new Error("Missing required environment variable: DATABASE_URL");
+  }
 
-  const adapter = new PrismaPg({ connectionString: process.env.DATABASE_URL! });
+  const adapter = new PrismaPg({ connectionString: process.env.DATABASE_URL });
   const prisma = new PrismaClient({ adapter });
   await prisma.$connect();
   console.log("Connected to database");
@@ -43,6 +49,9 @@ async function main() {
   const sessionStore = new SessionStore(prisma);
   const settingsStore = new SettingsStore(prisma);
   await settingsStore.load();
+  // DSN lives in BotSettings (the deploy has no editable .env), so Sentry can
+  // only come up after settings load. Everything before this logs to stdout.
+  initSentry(settingsStore.sentryDsn());
   const cannedStore = new CannedResponseStore(prisma);
   await cannedStore.load();
   const tierStore = new EscalationTierStore(prisma);
@@ -56,18 +65,42 @@ async function main() {
   const intercomClient = new IntercomClient(settingsStore);
   const intercomSync = new IntercomSyncService(settingsStore, intercomStore, sessionStore, ticketStore);
   const statusService = new StatusService(ticketStore, auditLogger, settingsStore, intercomSync);
-  const intercomWebhookHandler = new IntercomWebhookHandler(settingsStore, ticketStore, statusService, intercomStore, intercomSync);
+  const intercomWebhookHandler = new IntercomWebhookHandler(
+    settingsStore,
+    ticketStore,
+    statusService,
+    intercomStore,
+    intercomSync,
+    auditLogger
+  );
   const oauthManager = new OAuthManager(config, sessionStore);
   const apiClient = new PostizApiClient(config);
   const claudeRunner = new ClaudeCodeRunner(process.cwd());
   const githubClient = new GitHubClient(config);
   const stripeClient = new StripeClient(config);
-  const billingAdmin = new BillingAdmin(config, stripeClient, sessionStore, settingsStore);
+  const billingAdmin = new BillingAdmin(config, stripeClient, sessionStore, settingsStore, auditLogger);
 
   const categoryRegistry = new CategoryRegistry()
     .register(new HowToCategory())
     .register(new BugsCategory())
     .register(new BillingCategory(stripeClient, sessionStore, settingsStore, statusService, ticketStore, auditLogger, tierStore));
+
+  // The bridge resolves category ids to their human labels via the registry
+  // ("billing" → "💳 Billing" instead of the raw id in Intercom).
+  const categoryLabelResolver = (id: string | null): string | null => {
+    if (!id) return null;
+    return categoryRegistry.getAll().find((c) => c.id === id)?.label ?? id;
+  };
+  intercomSync.setCategoryLabelResolver(categoryLabelResolver);
+
+  const intercomInboxApp = new IntercomInboxApp(
+    settingsStore,
+    intercomStore,
+    ticketStore,
+    sessionStore,
+    stripeClient,
+    categoryLabelResolver
+  );
 
   const reportService = new StatusReportService(settingsStore, ticketStore, categoryRegistry);
 
@@ -90,11 +123,19 @@ async function main() {
     intercomStore,
     intercomClient,
     intercomWebhookHandler,
-    billingAdmin
+    billingAdmin,
+    intercomInboxApp
   );
   // The client exists as soon as the constructor ran; nothing fires before login.
   auditLogger.bindClient(bot.client);
   intercomWebhookHandler.bindClient(bot.client);
+  intercomInboxApp.bindClient(bot.client);
+  // Thread URLs need the guild id, only known once the client is ready —
+  // resolved lazily per call.
+  intercomSync.setThreadUrlBuilder((threadId) => {
+    const guild = bot.client.guilds.cache.first();
+    return guild ? `https://discord.com/channels/${guild.id}/${threadId}` : null;
+  });
   await bot.start();
 
   const reminderScheduler = new ReminderScheduler(bot.client, settingsStore, ticketStore, statusService, auditLogger, tierStore);
@@ -116,6 +157,9 @@ async function main() {
   );
   intercomOutboxScheduler.start();
 
+  const intercomInboxScheduler = new IntercomInboxScheduler(intercomStore, intercomWebhookHandler, auditLogger);
+  intercomInboxScheduler.start();
+
   // Clean expired pending auths every 5 minutes
   setInterval(() => sessionStore.cleanExpiredPending(), 5 * 60 * 1000);
 
@@ -126,6 +170,7 @@ async function main() {
     statusReportScheduler.stop();
     recloseScheduler.stop();
     intercomOutboxScheduler.stop();
+    intercomInboxScheduler.stop();
     bot.client.destroy();
     await prisma.$disconnect();
     process.exit(0);

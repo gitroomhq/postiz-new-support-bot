@@ -355,11 +355,17 @@ export class BillingCategory extends BaseCategory {
 
     // Money has moved: from here on the lock stays no matter what.
     let cancelFailed = false;
+    let cancelledSubscriptionId: string | null = null;
     try {
-      const session = await this.sessionStore.getSession(interaction.user.id);
-      const cancelTarget = subscriptionId || session?.stripeCustomerId;
-      if (cancelTarget) {
-        await this.stripeClient.cancelSubscription(cancelTarget);
+      if (subscriptionId) {
+        await this.stripeClient.cancelSubscription(subscriptionId);
+        cancelledSubscriptionId = subscriptionId;
+      } else {
+        const session = await this.sessionStore.getSession(interaction.user.id);
+        if (session?.stripeCustomerId) {
+          const cancelled = await this.stripeClient.cancelNewestActiveSubscription(session.stripeCustomerId);
+          cancelledSubscriptionId = cancelled?.subscriptionId ?? null;
+        }
       }
     } catch (error) {
       console.error("Stripe subscription cancel error:", error);
@@ -388,7 +394,9 @@ export class BillingCategory extends BaseCategory {
       action: "Refund",
       outcome: cancelFailed
         ? "⚠️ Refund processed, but subscription cancellation FAILED — manual action needed"
-        : "Refund processed, subscription cancelled",
+        : cancelledSubscriptionId
+          ? `Refund processed, subscription \`${cancelledSubscriptionId}\` cancelled`
+          : "Refund processed, subscription cancelled",
       amountText: amount,
       chargeId,
       customerId: interaction.user.id,
@@ -654,11 +662,17 @@ export class BillingCategory extends BaseCategory {
     }
 
     let cancelFailed = false;
+    let cancelledSubscriptionId: string | null = null;
     try {
-      const session = await this.sessionStore.getSession(review.customerId);
-      const cancelTarget = review.subscriptionId || session?.stripeCustomerId;
-      if (cancelTarget) {
-        await this.stripeClient.cancelSubscription(cancelTarget);
+      if (review.subscriptionId) {
+        await this.stripeClient.cancelSubscription(review.subscriptionId);
+        cancelledSubscriptionId = review.subscriptionId;
+      } else {
+        const session = await this.sessionStore.getSession(review.customerId);
+        if (session?.stripeCustomerId) {
+          const cancelled = await this.stripeClient.cancelNewestActiveSubscription(session.stripeCustomerId);
+          cancelledSubscriptionId = cancelled?.subscriptionId ?? null;
+        }
       }
     } catch (error) {
       console.error("Stripe subscription cancel error:", error);
@@ -686,7 +700,13 @@ export class BillingCategory extends BaseCategory {
 
     await this.notifyBillingAudit(interaction, {
       action: "Refund (manual approval)",
-      outcome: `Approved by ${member.displayName}${cancelFailed ? " — ⚠️ subscription cancellation FAILED, manual action needed" : ", subscription cancelled"}`,
+      outcome: `Approved by ${member.displayName}${
+        cancelFailed
+          ? " — ⚠️ subscription cancellation FAILED, manual action needed"
+          : cancelledSubscriptionId
+            ? `, subscription \`${cancelledSubscriptionId}\` cancelled`
+            : ", subscription cancelled"
+      }`,
       amountText: amount,
       chargeId: review.chargeId,
       customerId: review.customerId,

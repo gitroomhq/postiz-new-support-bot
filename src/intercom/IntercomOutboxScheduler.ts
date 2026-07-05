@@ -4,7 +4,8 @@ import { AuditLogger } from "../bot/AuditLogger";
 import { SettingsStore } from "../config/SettingsStore";
 import { IntercomClient, IntercomHttpError } from "./IntercomClient";
 import { IntercomStore } from "./IntercomStore";
-import { IntercomSyncService, externalIdFor, formatTimestamp } from "./IntercomSyncService";
+import { IntercomSyncService, externalIdFor } from "./IntercomSyncService";
+import { bodyHash, renderDiscordMarkdownToHtml } from "./renderDiscordMarkdown";
 import {
   CsatPayload,
   EnsurePayload,
@@ -22,6 +23,8 @@ const MAX_BACKOFF_MS = 15 * 60 * 1000;
 // Echo-part rows only matter while a webhook for them can still arrive.
 const ECHO_RETENTION_MS = 14 * 24 * 60 * 60 * 1000;
 const ECHO_CLEANUP_INTERVAL_MS = 60 * 60 * 1000;
+// Pending-post reservations are crash leftovers after this long.
+const PENDING_POST_RETENTION_MS = 60 * 60 * 1000;
 // Intercom accepts at most 10 attachment URLs per message.
 const MAX_ATTACHMENT_URLS = 10;
 
@@ -79,6 +82,7 @@ export class IntercomOutboxScheduler {
       if (Date.now() - this.lastEchoCleanupAt > ECHO_CLEANUP_INTERVAL_MS) {
         this.lastEchoCleanupAt = Date.now();
         await this.store.cleanupEchoParts(new Date(Date.now() - ECHO_RETENTION_MS)).catch(() => {});
+        await this.store.cleanupPendingPosts(new Date(Date.now() - PENDING_POST_RETENTION_MS)).catch(() => {});
       }
       const due = await this.store.listDueHeads(BATCH_LIMIT);
       for (const event of due) {
@@ -239,18 +243,39 @@ export class IntercomOutboxScheduler {
   // re-run ("Retry failed" on a dead ensure) completes whatever is missing.
   private async ensureBridge(threadId: string, payload: EnsurePayload): Promise<void> {
     let link = await this.store.getLink(threadId);
+    let created = false;
 
     if (!link) {
       const externalId = externalIdFor(payload, threadId);
       const contactId = await this.resolveContact(externalId, payload);
-      const header =
-        `🎫 Discord ticket${payload.categoryLabel ? ` (${payload.categoryLabel})` : ""}` +
-        ` — opened ${formatTimestamp(new Date(payload.createdAtIso))} — thread ${threadId}`;
-      const conversationId = await this.client.createConversation(contactId, header, payload.createdAtIso);
+      // Live tickets: the customer's rendered question IS the opening message
+      // (native created_at carries the timestamp — no text prefixes). Backfill:
+      // a generic import header; the transcript replay supplies the content.
+      const opening =
+        payload.questionAsOpening !== false && payload.question?.trim()
+          ? renderDiscordMarkdownToHtml(payload.question)
+          : `🎫 Discord ticket${payload.categoryLabel ? ` (${payload.categoryLabel})` : ""} — transcript imported from Discord`;
+      const conversationId = await this.client.createConversation(contactId, opening, payload.createdAtIso);
       link = await this.store.createLink(threadId, contactId, externalId, conversationId);
+      created = true;
     }
 
     const ticketId = link.ticketId ?? (await this.attachTicket(threadId, link.conversationId, link.contactId, payload));
+
+    // One static context card as an internal note on first creation. Live data
+    // (plan, charges) comes from the Canvas Kit inbox app, not from sync.
+    if (created) {
+      const contextLines = [
+        `<b>Discord ticket</b>`,
+        payload.customerDisplayName ? `Customer: ${escapeHtmlText(payload.customerDisplayName)}` : null,
+        payload.categoryLabel ? `Category: ${escapeHtmlText(payload.categoryLabel)}` : null,
+        payload.postizUserId ? `Postiz user: ${escapeHtmlText(payload.postizUserId)}` : null,
+        payload.threadUrl ? `<a href="${payload.threadUrl}">Open Discord thread</a>` : `Thread: ${threadId}`,
+      ].filter(Boolean);
+      await this.postAdminNote(threadId, link.conversationId, `<p>${contextLines.join("<br>")}</p>`, undefined, true).catch(
+        (e) => console.warn(`Intercom: context note for ${threadId} failed:`, e instanceof Error ? e.message : e)
+      );
+    }
 
     // Ticket attributes; the definitions may not exist yet ("/config → Ensure
     // Attributes" or a one-time manual creation fixes that) — degrade.
@@ -459,11 +484,27 @@ export class IntercomOutboxScheduler {
     return link2;
   }
 
-  private async postAdminNote(threadId: string, conversationId: string, body: string, createdAtIso?: string): Promise<void> {
-    const { partId } = await this.withAuthor((a) =>
-      this.client.replyAsAdmin(conversationId, { adminId: a, body, note: true, createdAtIso })
-    );
-    if (partId) await this.store.recordEchoPart("c", partId, threadId);
+  // Reserve → call → confirm: the pending-post row is written BEFORE the API
+  // call so a webhook that beats the confirm still recognizes the part as our
+  // own (body-hash match) — replaces the old fixed-sleep race. On failure the
+  // reservation is released; a retry re-reserves.
+  private async postAdminNote(
+    threadId: string,
+    conversationId: string,
+    body: string,
+    createdAtIso?: string,
+    alreadyHtml = false
+  ): Promise<void> {
+    const html = alreadyHtml ? body : renderDiscordMarkdownToHtml(body);
+    const pendingId = await this.store.reservePendingPost(threadId, "c", bodyHash(html));
+    try {
+      const { partId } = await this.withAuthor((a) =>
+        this.client.replyAsAdmin(conversationId, { adminId: a, body: html, note: true, createdAtIso })
+      );
+      if (partId) await this.store.recordEchoPart("c", partId, threadId);
+    } finally {
+      await this.store.deletePendingPost(pendingId).catch(() => {});
+    }
   }
 
   // Image URLs (Intercom documents attachment_urls as image URLs, ≤10) go as
@@ -482,20 +523,28 @@ export class IntercomOutboxScheduler {
     return { urls, lines: lineList.length > 0 ? `\n${lineList.join("\n")}` : "" };
   }
 
+  // Payloads stay plain Discord markdown in the DB; rendering to Intercom HTML
+  // happens here at the choke point, so queued events survive renderer changes.
   private async executeMessage(threadId: string, payload: MessagePayload): Promise<void> {
     const link = await this.requireLink(threadId);
     const { urls, lines } = this.splitAttachments(payload);
-    const body = `${payload.content}${lines}`;
+    const body = renderDiscordMarkdownToHtml(`${payload.content}${lines}`);
 
     const send = async (attachmentUrls: string[], finalBody: string): Promise<void> => {
       if (payload.direction === "incoming") {
+        // Contact-authored parts are never relayed back (the webhook handler
+        // only processes admin/bot authors) — no echo bookkeeping needed.
         await this.client.replyAsContact(link.conversationId, {
           intercomUserId: link.contactId,
           body: finalBody,
           createdAtIso: payload.externalCreatedAtIso,
           attachmentUrls,
         });
-      } else {
+        return;
+      }
+      // Outgoing (admin-authored): reserve → call → confirm, see postAdminNote.
+      const pendingId = await this.store.reservePendingPost(threadId, "c", bodyHash(finalBody));
+      try {
         const { partId } = await this.withAuthor((a) =>
           this.client.replyAsAdmin(link.conversationId, {
             adminId: a,
@@ -505,6 +554,8 @@ export class IntercomOutboxScheduler {
           })
         );
         if (partId) await this.store.recordEchoPart("c", partId, threadId);
+      } finally {
+        await this.store.deletePendingPost(pendingId).catch(() => {});
       }
     };
 
@@ -513,7 +564,7 @@ export class IntercomOutboxScheduler {
     } catch (e) {
       // attachment_urls rejected (non-image, dead link, …) → fold into the body.
       if (urls.length > 0 && e instanceof IntercomHttpError && (e.status === 400 || e.status === 422)) {
-        const folded = `${body}\n${urls.map((u) => `📎 ${u}`).join("\n")}`;
+        const folded = `${body}<p>${urls.map((u) => `📎 <a href="${u}">${u}</a>`).join("<br>")}</p>`;
         await send([], folded);
         return;
       }
@@ -548,19 +599,12 @@ export class IntercomOutboxScheduler {
     }
 
     // Conversation open/close parity (closing statuses close the conversation),
-    // same damper pattern via lastSyncedOpen.
+    // same damper pattern via lastSyncedOpen. Messages-only mirroring: no
+    // transition note — the ticket state itself is the record.
     const target: "open" | "closed" = payload.closed || payload.resolved ? "closed" : "open";
     if (link.lastSyncedOpen !== target) {
       await this.withAuthor((a) => this.client.setConversationOpen(link.conversationId, target === "open", a));
       await this.store.setLastSyncedOpen(threadId, target);
-    }
-
-    if (payload.note) {
-      await this.postAdminNote(
-        threadId,
-        link.conversationId,
-        `Status: ${payload.fromLabel ?? "—"} → ${payload.statusLabel} — by ${payload.actorName}`
-      );
     }
   }
 
@@ -572,19 +616,13 @@ export class IntercomOutboxScheduler {
           this.client.updateTicket(link.ticketId!, { attributes: { [TICKET_ATTR_PRIORITY]: payload.priorityLabel }, adminId: a })
         );
       } catch (e) {
-        // Attribute definition missing → the narration note below still records it.
+        // Attribute definition missing — degrade (messages-only mirroring, no note).
         if (!(e instanceof IntercomHttpError && (e.status === 400 || e.status === 422))) throw e;
       }
     }
-    if (payload.note) {
-      await this.postAdminNote(
-        threadId,
-        link.conversationId,
-        `Priority: ${payload.fromLabel ?? "—"} → ${payload.priorityLabel} — by ${payload.actorName}`
-      );
-    }
   }
 
+  // CSAT lands as a ticket attribute only (messages-only mirroring).
   private async executeCsat(threadId: string, payload: CsatPayload): Promise<void> {
     const link = await this.requireLink(threadId);
     if (link.ticketId) {
@@ -596,11 +634,6 @@ export class IntercomOutboxScheduler {
         if (!(e instanceof IntercomHttpError && (e.status === 400 || e.status === 422))) throw e;
       }
     }
-    await this.postAdminNote(
-      threadId,
-      link.conversationId,
-      `⭐ CSAT: ${payload.score}/5${payload.comment ? `\n${payload.comment}` : ""}`
-    );
   }
 }
 
@@ -612,6 +645,10 @@ function isPermanent4xx(e: unknown): boolean {
 // for the bridge that outcome IS the desired end state.
 function isSameStateError(e: unknown): boolean {
   return e instanceof IntercomHttpError && e.status === 400 && /same state/i.test(e.message);
+}
+
+function escapeHtmlText(text: string): string {
+  return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
 
 function isImageUrl(url: string): boolean {
