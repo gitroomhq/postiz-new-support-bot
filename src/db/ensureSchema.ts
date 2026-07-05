@@ -312,6 +312,7 @@ const STATEMENTS: string[] = [
   `ALTER TABLE "intercom_links" ADD COLUMN IF NOT EXISTS "lastTagsJson" JSONB`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "intercomSnoozeStatusTagId" TEXT`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "sentryDsn" TEXT`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "aiCommandsEnabled" BOOLEAN NOT NULL DEFAULT true`,
 ];
 
 export async function ensureSchema(prisma: PrismaClient): Promise<void> {

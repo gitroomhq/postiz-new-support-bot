@@ -43,10 +43,19 @@ import { EscalationTierStore } from "../config/EscalationTierStore";
 import { SessionStore } from "../auth/SessionStore";
 import { OAuthManager } from "../auth/OAuthManager";
 import { PostizApiClient } from "./PostizApiClient";
-import { ClaudeCodeRunner } from "./ClaudeCodeRunner";
+import { ClaudeCodeRunner, ClaudeRunOptions, ClaudeApiLimitError } from "./ClaudeCodeRunner";
+import {
+  AiTicketContext,
+  AiToolAvailability,
+  buildTicketContextBlock,
+  buildSummarizePrompt,
+  buildAskPrompt,
+  buildCausePrompt,
+  buildDraftPrompt,
+} from "./aiPrompts";
 import { GitHubClient } from "./GitHubClient";
 import { CategoryRegistry } from "./CategoryRegistry";
-import { TicketStore, ReconcileChanges } from "./TicketStore";
+import { TicketStore, ReconcileChanges, TicketWithTag } from "./TicketStore";
 import { StatusService, RESOLVED_EMOJI } from "./StatusService";
 import { RECLOSE_DELAY_MS } from "./RecloseScheduler";
 import { AuditLogger } from "./AuditLogger";
@@ -62,7 +71,7 @@ import { IntercomInboxApp } from "../intercom/IntercomInboxApp";
 import { BillingAdmin } from "./BillingAdmin";
 import { TICKET_ATTR_PRIORITY, TICKET_ATTR_CSAT, TICKET_ATTR_THREAD } from "../intercom/IntercomOutboxScheduler";
 import { IntercomMode, IntercomRegion } from "../config/SettingsStore";
-import { initSentry } from "../util/logger";
+import { initSentry, log } from "../util/logger";
 
 type TicketSearchFilters = {
   categoryId?: string;
@@ -85,6 +94,19 @@ export class DiscordBot {
     string,
     { filters: TicketSearchFilters; ownerUserId: string; createdAt: number }
   >();
+
+  // /ai draft results awaiting the "Post to thread" decision, keyed by the
+  // originating interaction id (embedded in the button customIds). In-memory
+  // only — a restart invalidates drafts, handled via the "expired" path.
+  private aiDraftSessions = new Map<
+    string,
+    { text: string; ownerUserId: string; threadId: string; createdAt: number }
+  >();
+
+  // One concurrent /ai run per user — each run is a Claude Code subprocess.
+  private aiRunsInFlight = new Set<string>();
+
+  private aiLog = log.child("ai-command");
 
   constructor(
     private config: BotConfig,
@@ -390,6 +412,8 @@ export class DiscordBot {
       await this.handleChargeCommand(interaction);
     } else if (interaction.commandName === "billing") {
       await this.billingAdmin.handleCommand(interaction);
+    } else if (interaction.commandName === "ai") {
+      await this.handleAiCommand(interaction);
     }
   }
 
@@ -1016,6 +1040,11 @@ export class DiscordBot {
       return;
     }
 
+    if (interaction.customId.startsWith("ai_draft_")) {
+      await this.handleAiDraftButton(interaction);
+      return;
+    }
+
     if (
       interaction.customId === "report_overdue" ||
       interaction.customId === "report_age" ||
@@ -1590,6 +1619,438 @@ export class DiscordBot {
     }
   }
 
+  // ---- /ai: staff AI assistant on a ticket (summarize | ask | cause | draft) ----
+  // Always ephemeral — Stripe/analysis output must never reach the customer.
+  // Independent of the auto-answer toggle (aiSolveEnabled vs aiCommandsEnabled).
+
+  // Read-only tool allowlists, passed explicitly (never a wildcard) so a new
+  // tool on either server side can't silently become available to the model.
+  private static readonly STRIPE_MCP_TOOLS = [
+    "get_customer",
+    "find_customers_by_email",
+    "list_subscriptions",
+    "get_subscription",
+    "list_invoices",
+    "list_charges",
+    "get_charge",
+    "list_payment_intents",
+    "get_dispute_for_charge",
+    "list_customer_cards",
+    "list_tax_ids",
+  ].map((name) => `mcp__stripe__${name}`);
+
+  // Postiz's hosted MCP exposes the Mastra agent tools; only these three are
+  // annotated readOnlyHint with no third-party side effects (schedulePostTool,
+  // triggerTool, generate image/video are write or open-world — never allowed).
+  private static readonly POSTIZ_MCP_TOOLS = [
+    "integrationList",
+    "integrationSchema",
+    "generateVideoOptions",
+  ].map((name) => `mcp__postiz__${name}`);
+
+  private buildAiRunConfig(
+    web: boolean,
+    admin: boolean,
+    postizToken: string | null
+  ): { mcpConfig: Record<string, unknown> | null; extraAllowedTools: string[]; tools: AiToolAvailability } {
+    const extraAllowedTools: string[] = [];
+    const mcpServers: Record<string, unknown> = {};
+
+    if (web) extraAllowedTools.push("WebSearch", "WebFetch");
+
+    const stripe = admin && !!this.config.stripe.secretKey;
+    if (stripe) {
+      mcpServers.stripe = {
+        type: "stdio",
+        command: process.execPath, // node binary — no PATH dependency
+        args: [this.claudeRunner.stripeServerPath()],
+        env: {
+          STRIPE_SECRET_KEY: this.config.stripe.secretKey,
+          SENTRY_DSN: this.settingsStore.sentryDsn() ?? "",
+        },
+      };
+      extraAllowedTools.push(...DiscordBot.STRIPE_MCP_TOOLS);
+    }
+
+    // The customer's own pos_ OAuth token scopes the hosted Postiz MCP to
+    // their organization; read-only via the tool allowlist above.
+    const postiz = !!postizToken && !!this.config.postiz.apiUrl;
+    if (postiz) {
+      mcpServers.postiz = {
+        type: "http",
+        url: `${this.config.postiz.apiUrl}/mcp`,
+        headers: { Authorization: `Bearer ${postizToken}` },
+      };
+      extraAllowedTools.push(...DiscordBot.POSTIZ_MCP_TOOLS);
+    }
+
+    return {
+      mcpConfig: Object.keys(mcpServers).length > 0 ? { mcpServers } : null,
+      extraAllowedTools,
+      tools: { web, stripe, postiz },
+    };
+  }
+
+  private async gatherAiTicketContext(
+    thread: ThreadChannel,
+    ticket: TicketWithTag,
+    options: { stripeCustomerId: string | null; postizUserId: string | null }
+  ): Promise<AiTicketContext> {
+    const [messages, notes, changes] = await Promise.all([
+      this.fetchAllThreadMessages(thread),
+      this.ticketStore.listAllNotes(thread.id),
+      this.ticketStore.listAllTagChanges(thread.id),
+    ]);
+
+    return {
+      categoryLabel: this.categoryRegistry.getAll().find((c) => c.id === ticket.categoryId)?.label ?? null,
+      statusLabel: ticket.statusTag?.label ?? null,
+      priorityLabel: ticket.priorityTagId
+        ? (this.settingsStore.priorityById(ticket.priorityTagId)?.label ?? null)
+        : null,
+      tierLabel: this.tierStore.byId(ticket.escalationTierId)?.name ?? null,
+      customerDisplayName: ticket.customerDisplayName,
+      createdAt: ticket.createdAt,
+      closed: ticket.closed,
+      question: ticket.question,
+      transcript: messages.map((m) => ({
+        timestamp: m.createdAt,
+        role: (m.authorId === ticket.customerId ? "Customer" : m.authorIsBot ? "Bot" : "Staff") as
+          | "Customer"
+          | "Staff"
+          | "Bot",
+        authorName: m.authorName,
+        content:
+          m.content +
+          (m.attachments.length > 0
+            ? ` ${m.attachments.map((a) => `[attachment: ${a.filename}]`).join(" ")}`
+            : ""),
+      })),
+      notes: notes.map((n) => ({ authorName: n.authorName, content: n.text, createdAt: n.createdAt })),
+      history: changes.map((c) => ({
+        kind: c.kind,
+        fromLabel: c.fromLabel,
+        toLabel: c.toLabel,
+        actorName: c.actorName,
+        createdAt: c.createdAt,
+      })),
+      stripeCustomerId: options.stripeCustomerId,
+      postizUserId: options.postizUserId,
+    };
+  }
+
+  // Splits AI output into embed-sized chunks, preferring paragraph boundaries.
+  private chunkAiText(text: string, chunkSize = 4000): string[] {
+    const chunks: string[] = [];
+    let rest = text.trim();
+    while (rest.length > chunkSize) {
+      let cut = rest.lastIndexOf("\n\n", chunkSize);
+      if (cut < chunkSize / 2) cut = rest.lastIndexOf("\n", chunkSize);
+      if (cut < chunkSize / 2) cut = chunkSize;
+      chunks.push(rest.slice(0, cut).trim());
+      rest = rest.slice(cut).trim();
+    }
+    if (rest.length > 0) chunks.push(rest);
+    return chunks;
+  }
+
+  // Streams a Claude run into the deferred ephemeral reply (throttled +
+  // serialized edits — concurrent editReply calls resolve out of order).
+  // Returns the final text, or null after an error (already shown to staff).
+  private async streamAiRun(
+    interaction: ChatInputCommandInteraction,
+    sub: string,
+    title: string,
+    prompt: string,
+    options: ClaudeRunOptions
+  ): Promise<string | null> {
+    let lastEdit = 0;
+    let editInFlight = false;
+
+    const flush = async (text: string) => {
+      if (editInFlight) return;
+      editInFlight = true;
+      try {
+        const tail = text.length > 3800 ? `…${text.slice(-3800)}` : text;
+        await interaction.editReply({
+          embeds: [
+            new EmbedBuilder()
+              .setTitle(title)
+              .setDescription(`${tail}\n\n⏳ *Generating…*`)
+              .setColor(COLORS.brand),
+          ],
+        });
+      } catch {
+        // Ephemeral edit failures are non-fatal; the final edit will retry.
+      } finally {
+        editInFlight = false;
+      }
+    };
+
+    try {
+      const result = await this.claudeRunner.run(
+        prompt,
+        (messages) => {
+          const now = Date.now();
+          if (now - lastEdit < 2000) return;
+          lastEdit = now;
+          void flush(messages.join("\n\n"));
+        },
+        options
+      );
+      return result.join("\n\n").trim();
+    } catch (error) {
+      if (error instanceof ClaudeApiLimitError) {
+        this.aiLog.warn("run hit API limit", { sub, threadId: interaction.channelId });
+        await interaction
+          .editReply({
+            embeds: [makeEmbed("AI is temporarily unavailable (API usage limit). Try again later.", COLORS.warn)],
+          })
+          .catch(() => {});
+      } else {
+        this.aiLog.error("run failed", error, { sub, threadId: interaction.channelId, userId: interaction.user.id });
+        await interaction
+          .editReply({ embeds: [makeEmbed("The AI run failed — check the logs.", COLORS.danger)] })
+          .catch(() => {});
+      }
+      return null;
+    }
+  }
+
+  // Final result: first chunk replaces the streaming reply, remaining chunks go
+  // out as ephemeral follow-ups (each message has its own 6000-char embed budget).
+  private async sendAiResult(
+    interaction: ChatInputCommandInteraction,
+    title: string,
+    text: string,
+    components?: ActionRowBuilder<ButtonBuilder>[]
+  ): Promise<void> {
+    const chunks = this.chunkAiText(text);
+    const footer = { text: "Staff-only — not visible to the customer" };
+    const embeds = chunks.map((chunk, i) => {
+      const e = new EmbedBuilder().setDescription(chunk).setColor(COLORS.brand);
+      if (i === 0) e.setTitle(title);
+      if (i === chunks.length - 1) e.setFooter(footer);
+      return e;
+    });
+
+    await interaction.editReply({
+      embeds: [embeds[0]],
+      components: chunks.length === 1 ? (components ?? []) : [],
+    });
+    for (let i = 1; i < embeds.length; i++) {
+      await interaction.followUp({
+        embeds: [embeds[i]],
+        components: i === embeds.length - 1 ? (components ?? []) : [],
+        flags: 64,
+      });
+    }
+  }
+
+  private async handleAiCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+    const member = await this.requireSupportOrAdmin(interaction);
+    if (!member) return;
+
+    if (!this.settingsStore.aiCommandsEnabled()) {
+      await interaction.reply({
+        embeds: [makeEmbed("AI commands are disabled (/config → General Settings).", COLORS.warn)],
+        flags: 64,
+      });
+      return;
+    }
+
+    const thread = await this.resolveTicketThread(interaction);
+    if (!thread) return;
+    const ticket = await this.ticketStore.getByThreadId(thread.id);
+    if (!ticket) {
+      await interaction.reply({ embeds: [makeEmbed("This thread isn't a tracked support ticket.", COLORS.warn)], flags: 64 });
+      return;
+    }
+
+    if (this.aiRunsInFlight.has(interaction.user.id)) {
+      await interaction.reply({
+        embeds: [makeEmbed("You already have an /ai run in progress — wait for it to finish.", COLORS.warn)],
+        flags: 64,
+      });
+      return;
+    }
+
+    const sub = interaction.options.getSubcommand();
+    await interaction.deferReply({ flags: 64 });
+    this.aiRunsInFlight.add(interaction.user.id);
+    const startedAt = Date.now();
+
+    try {
+      const admin = this.isAdmin(interaction);
+      const session = ticket.customerId
+        ? await this.sessionStore.getSession(ticket.customerId).catch(() => null)
+        : null;
+
+      const context = await this.gatherAiTicketContext(thread, ticket, {
+        // The Stripe hint only goes into the prompt when the Stripe tools are
+        // actually attached (admin invoker) — staff runs never mention it.
+        stripeCustomerId: admin ? (session?.stripeCustomerId ?? null) : null,
+        postizUserId: session?.postizUserId ?? null,
+      });
+      const contextBlock = buildTicketContextBlock(context);
+
+      let title: string;
+      let prompt: string;
+      let runOptions: ClaudeRunOptions;
+
+      if (sub === "ask" || sub === "cause") {
+        const { mcpConfig, extraAllowedTools, tools } = this.buildAiRunConfig(
+          true,
+          admin,
+          session?.accessToken ?? null
+        );
+        runOptions = { promptPrefix: null, extraAllowedTools, mcpConfig, timeoutMs: 300_000 };
+        if (sub === "ask") {
+          const question = interaction.options.getString("question", true);
+          title = "🤖 AI Answer";
+          prompt = buildAskPrompt(contextBlock, question, tools);
+        } else {
+          title = "🤖 Root Cause Analysis";
+          prompt = buildCausePrompt(contextBlock, tools);
+        }
+        this.aiLog.info("run started", {
+          sub,
+          threadId: thread.id,
+          userId: interaction.user.id,
+          stripeTools: tools.stripe,
+          postizTools: tools.postiz,
+        });
+      } else if (sub === "draft") {
+        title = "🤖 Draft Reply";
+        prompt = buildDraftPrompt(contextBlock, interaction.options.getString("instructions"));
+        runOptions = { promptPrefix: null };
+        this.aiLog.info("run started", { sub, threadId: thread.id, userId: interaction.user.id });
+      } else {
+        title = "🤖 Ticket Summary";
+        prompt = buildSummarizePrompt(contextBlock);
+        runOptions = { promptPrefix: null };
+        this.aiLog.info("run started", { sub, threadId: thread.id, userId: interaction.user.id });
+      }
+
+      const text = await this.streamAiRun(interaction, sub, title, prompt, runOptions);
+      if (text === null) return;
+      if (text.length === 0) {
+        await interaction.editReply({ embeds: [makeEmbed("The AI returned an empty answer.", COLORS.warn)] });
+        return;
+      }
+
+      if (sub === "draft") {
+        const token = interaction.id;
+        this.pruneAiDraftSessions();
+        this.aiDraftSessions.set(token, {
+          text,
+          ownerUserId: interaction.user.id,
+          threadId: thread.id,
+          createdAt: Date.now(),
+        });
+        const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+          new ButtonBuilder().setCustomId(`ai_draft_post:${token}`).setLabel("Post to thread").setStyle(ButtonStyle.Success),
+          new ButtonBuilder().setCustomId(`ai_draft_discard:${token}`).setLabel("Discard").setStyle(ButtonStyle.Secondary)
+        );
+        await this.sendAiResult(interaction, title, text, [row]);
+      } else {
+        await this.sendAiResult(interaction, title, text);
+      }
+
+      const durationSec = Math.round((Date.now() - startedAt) / 1000);
+      this.aiLog.info("run completed", { sub, threadId: thread.id, durationSec });
+      void this.audit.log({
+        title: `🤖 /ai ${sub} used`,
+        severity: "neutral",
+        actor: member.displayName,
+        actorIconUrl: member.displayAvatarURL(),
+        threadId: thread.id,
+        fields: [{ name: "Duration", value: `${durationSec}s`, inline: true }],
+      });
+    } catch (error) {
+      this.aiLog.error("command failed", error, { sub, threadId: thread.id, userId: interaction.user.id });
+      await interaction
+        .editReply({ embeds: [makeEmbed("Something went wrong — check the logs.", COLORS.danger)] })
+        .catch(() => {});
+    } finally {
+      this.aiRunsInFlight.delete(interaction.user.id);
+    }
+  }
+
+  private pruneAiDraftSessions(): void {
+    const cutoff = Date.now() - 60 * 60 * 1000;
+    for (const [token, session] of this.aiDraftSessions) {
+      if (session.createdAt < cutoff) this.aiDraftSessions.delete(token);
+    }
+  }
+
+  private async handleAiDraftButton(interaction: ButtonInteraction): Promise<void> {
+    const [action, token] = interaction.customId.split(":");
+    const draft = token ? this.aiDraftSessions.get(token) : undefined;
+    if (!draft) {
+      await interaction.update({
+        embeds: [makeEmbed("This draft has expired — run `/ai draft` again.", COLORS.warn)],
+        components: [],
+      });
+      return;
+    }
+
+    // The draft message is ephemeral, so only the owner can normally see the
+    // buttons — this is defense in depth.
+    if (draft.ownerUserId !== interaction.user.id) {
+      await interaction.reply({
+        embeds: [makeEmbed("Only the staff member who generated this draft can use it.", COLORS.danger)],
+        flags: 64,
+      });
+      return;
+    }
+
+    if (action === "ai_draft_discard") {
+      this.aiDraftSessions.delete(token);
+      await interaction.update({ embeds: [makeEmbed("Draft discarded.", COLORS.neutral)], components: [] });
+      return;
+    }
+
+    const member = await this.fetchMember(interaction);
+    if (!member || !this.isStaffMember(member)) {
+      await interaction.reply({ embeds: [makeEmbed("You don't have permission to do that.", COLORS.danger)], flags: 64 });
+      return;
+    }
+
+    const channel = await this.client.channels.fetch(draft.threadId).catch(() => null);
+    if (!channel?.isThread()) {
+      this.aiDraftSessions.delete(token);
+      await interaction.update({
+        embeds: [makeEmbed("The ticket thread no longer exists.", COLORS.danger)],
+        components: [],
+      });
+      return;
+    }
+    const thread = channel as ThreadChannel;
+
+    // Same shape as /canned use: customer-visible embed attributed to the staff member.
+    const embed = new EmbedBuilder()
+      .setDescription(draft.text.slice(0, 4096))
+      .setColor(COLORS.brand)
+      .setAuthor({ name: `Sent by ${member.displayName}`, iconURL: member.displayAvatarURL() });
+    await thread.send({ embeds: [embed] });
+    this.aiDraftSessions.delete(token);
+
+    // Mirror into Intercom like the auto-answer path does.
+    void this.intercomSync.onAiAnswer(thread.id, draft.text).catch((error) => {
+      this.aiLog.error("draft Intercom mirror failed", error, { threadId: thread.id });
+    });
+
+    await interaction.update({ embeds: [makeEmbed("Draft posted to the thread.", COLORS.success)], components: [] });
+    void this.audit.log({
+      title: "🤖 AI draft posted",
+      severity: "neutral",
+      actor: member.displayName,
+      actorIconUrl: member.displayAvatarURL(),
+      threadId: thread.id,
+    });
+  }
+
   // ---- Permission helpers ----
 
   private async fetchMember(interaction: Interaction): Promise<GuildMember | null> {
@@ -1946,6 +2407,7 @@ export class DiscordBot {
           value: [
             `Threads channel: ${s.threadsChannelId() ? `<#${s.threadsChannelId()}>` : "_not set_"}`,
             `AI solve: ${s.aiSolveEnabled() ? "on" : "off"}`,
+            `AI commands: ${s.aiCommandsEnabled() ? "on" : "off"}`,
             `GitHub repo: ${s.githubRepo() ? `\`${s.githubRepo()}\`` : "_not set_"}`,
             `Ticket limits: ${s.maxOpenTicketsPerUser() > 0 ? `max ${s.maxOpenTicketsPerUser()} open` : "no cap"} · ${s.ticketCooldownMinutes() > 0 ? `${s.ticketCooldownMinutes()}m cooldown` : "no cooldown"}`,
           ].join("\n"),
@@ -2481,6 +2943,7 @@ export class DiscordBot {
         [
           `**Threads channel:** ${s.threadsChannelId() ? `<#${s.threadsChannelId()}>` : "_not set_"}`,
           `**AI solve:** ${s.aiSolveEnabled() ? "on" : "off"}`,
+          `**AI commands (/ai):** ${s.aiCommandsEnabled() ? "on" : "off"}`,
           `**GitHub repo:** ${s.githubRepo() ? `\`${s.githubRepo()}\`` : "_not set_"}`,
           `**Ticket limits:** ${s.maxOpenTicketsPerUser() > 0 ? `max ${s.maxOpenTicketsPerUser()} open` : "no cap"} · ${s.ticketCooldownMinutes() > 0 ? `${s.ticketCooldownMinutes()}m cooldown` : "no cooldown"}`,
           "",
@@ -2499,6 +2962,10 @@ export class DiscordBot {
         .setCustomId("config_toggle_ai")
         .setLabel(`AI solve: ${s.aiSolveEnabled() ? "on" : "off"}`)
         .setStyle(s.aiSolveEnabled() ? ButtonStyle.Success : ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId("config_toggle_ai_cmds")
+        .setLabel(`AI commands: ${s.aiCommandsEnabled() ? "on" : "off"}`)
+        .setStyle(s.aiCommandsEnabled() ? ButtonStyle.Success : ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId("config_set_repo").setLabel("Set GitHub Repo").setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId("config_limits").setLabel("Ticket Limits").setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId("config_back_main").setLabel("Back").setStyle(ButtonStyle.Secondary)
@@ -2782,6 +3249,13 @@ export class DiscordBot {
     if (id === "config_toggle_ai") {
       await this.settingsStore.updateGeneral({ aiSolveEnabled: !this.settingsStore.aiSolveEnabled() });
       this.auditConfig(interaction, `AI solve → ${this.settingsStore.aiSolveEnabled() ? "on" : "off"}`);
+      await interaction.update(this.buildGeneralPanel());
+      return;
+    }
+
+    if (id === "config_toggle_ai_cmds") {
+      await this.settingsStore.updateGeneral({ aiCommandsEnabled: !this.settingsStore.aiCommandsEnabled() });
+      this.auditConfig(interaction, `AI commands (/ai) → ${this.settingsStore.aiCommandsEnabled() ? "on" : "off"}`);
       await interaction.update(this.buildGeneralPanel());
       return;
     }
@@ -4568,6 +5042,50 @@ export class DiscordBot {
             name: "opened_before",
             description: "Only tickets opened on/before this date (YYYY-MM-DD)",
             required: false,
+          },
+        ],
+      },
+      {
+        name: "ai",
+        description: "AI ticket assistant (support/admin only)",
+        options: [
+          {
+            type: 1, // SUB_COMMAND
+            name: "summarize",
+            description: "Summarize this ticket: problems, what happened, current state, next steps",
+          },
+          {
+            type: 1, // SUB_COMMAND
+            name: "ask",
+            description: "Ask the AI a free-form question about this ticket",
+            options: [
+              {
+                type: 3, // STRING
+                name: "question",
+                description: "What do you want to know?",
+                required: true,
+                max_length: 1000,
+              },
+            ],
+          },
+          {
+            type: 1, // SUB_COMMAND
+            name: "cause",
+            description: "Root-cause analysis of this ticket (repo + web research)",
+          },
+          {
+            type: 1, // SUB_COMMAND
+            name: "draft",
+            description: "Draft a customer-facing reply (you review before posting)",
+            options: [
+              {
+                type: 3, // STRING
+                name: "instructions",
+                description: "Optional guidance for the draft (tone, content, decisions)",
+                required: false,
+                max_length: 1000,
+              },
+            ],
           },
         ],
       },

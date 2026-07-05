@@ -25,19 +25,49 @@ function isApiLimitError(text: string): boolean {
   );
 }
 
+const LEGACY_SUPPORT_PREFIX =
+  "We need support for Postiz cloud version only (not self-hosted), Don't modify any code, don't be technical about the answer, just write a final answer in the end, and try to output the reference of line and file in github in the end: ";
+
+export interface ClaudeRunOptions {
+  /** Appended to the base allowed tools (Read, Glob, Grep). */
+  extraAllowedTools?: string[];
+  /** Passed as `--mcp-config <json> --strict-mcp-config` when set. */
+  mcpConfig?: Record<string, unknown> | null;
+  /** null = send prompt verbatim; undefined = legacy support prefix. */
+  promptPrefix?: string | null;
+  timeoutMs?: number;
+}
+
 export class ClaudeCodeRunner {
   private searchDir: string;
+  private baseDir: string;
 
   constructor(baseDir: string) {
+    this.baseDir = baseDir;
     this.searchDir = path.resolve(baseDir, "search");
   }
 
-  async run(prompt: string, onUpdate?: (messages: string[]) => void): Promise<string[]> {
+  /**
+   * Path to the compiled Stripe read-only MCP server. Always resolves into
+   * dist/ (not src/) because the Claude CLI spawns it with plain node —
+   * in ts-node dev mode this requires a prior `pnpm build`.
+   */
+  stripeServerPath(): string {
+    return path.resolve(this.baseDir, "dist/mcp/StripeReadOnlyMcpServer.js");
+  }
+
+  async run(
+    prompt: string,
+    onUpdate?: (messages: string[]) => void,
+    options: ClaudeRunOptions = {}
+  ): Promise<string[]> {
     return new Promise((resolve, reject) => {
+      const prefix = options.promptPrefix === undefined ? LEGACY_SUPPORT_PREFIX : (options.promptPrefix ?? "");
+      const allowedTools = ["Read", "Glob", "Grep", ...(options.extraAllowedTools ?? [])];
       const args = [
         "-p",
-        "We need support for Postiz cloud version only (not self-hosted), Don't modify any code, don't be technical about the answer, just write a final answer in the end, and try to output the reference of line and file in github in the end: " + prompt,
-        "--allowedTools", "Read", "Glob", "Grep",
+        prefix + prompt,
+        "--allowedTools", ...allowedTools,
         "--permission-mode", "bypassPermissions",
         "--model", "sonnet",
         "--no-session-persistence",
@@ -46,13 +76,18 @@ export class ClaudeCodeRunner {
         "--verbose",
         "--include-partial-messages",
       ];
+      if (options.mcpConfig) {
+        // --strict-mcp-config: cwd is search/ with two cloned third-party
+        // repos — never pick up an .mcp.json from them.
+        args.push("--mcp-config", JSON.stringify(options.mcpConfig), "--strict-mcp-config");
+      }
 
       const claudeBin = path.resolve(__dirname, "../../node_modules/.bin/claude");
 
       const child = spawn(claudeBin, args, {
         cwd: this.searchDir,
         stdio: ["pipe", "pipe", "pipe"],
-        timeout: 120_000,
+        timeout: options.timeoutMs ?? 120_000,
         env: {
           ...process.env,
           ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY,

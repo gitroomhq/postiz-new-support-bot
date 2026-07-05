@@ -139,6 +139,10 @@ export class SettingsStore {
     return this.settings.aiSolveEnabled;
   }
 
+  aiCommandsEnabled(): boolean {
+    return this.settings.aiCommandsEnabled;
+  }
+
   backfillDone(): boolean {
     return this.settings.backfillDone;
   }
@@ -368,6 +372,7 @@ export class SettingsStore {
     supportRoleId?: string | null;
     githubRepo?: string | null;
     aiSolveEnabled?: boolean;
+    aiCommandsEnabled?: boolean;
     maxOpenTicketsPerUser?: number;
     ticketCooldownMinutes?: number;
     auditLogChannelId?: string | null;

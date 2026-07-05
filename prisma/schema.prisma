@@ -64,6 +64,7 @@ model BotSettings {
   supportRoleId       String?
   githubRepo          String?
   aiSolveEnabled      Boolean   @default(true)
+  aiCommandsEnabled   Boolean   @default(true)
   backfillDone        Boolean   @default(false)
   reportChannelId     String?
   reportEnabled       Boolean   @default(false)
