@@ -95,7 +95,89 @@ export class TargetResolver {
         );
       },
     },
+    // Customer-360 view buttons: re-run a target action on the already-resolved
+    // customer in the token session (e.g. billadmin_c360_go:cards:<token>).
+    {
+      kind: "button",
+      id: "billadmin_c360_go:",
+      match: "prefix",
+      handler: async (interaction) => {
+        const [, action, token] = interaction.customId.split(":");
+        if (!isTargetAction(action)) return;
+        const session = await this.ctx.sessions.getOwnedSession(token, interaction);
+        if (!session?.customerId) return;
+        await interaction.deferUpdate();
+        await this.ctx.sessions.tryRender(interaction, () => this.runTargetAction(interaction, token, action));
+      },
+    },
+    // Customer-360 "Action…" select: dispatches into the existing flows with
+    // session.customerId already resolved — no second target prompt.
+    {
+      kind: "select",
+      id: "billadmin_c360_act:",
+      match: "prefix",
+      handler: (interaction) => this.handleC360Action(interaction),
+    },
   ];
+
+  private async handleC360Action(interaction: StringSelectMenuInteraction): Promise<void> {
+    const token = interaction.customId.split(":")[1];
+    const choice = interaction.values[0];
+    const session = await this.ctx.sessions.getOwnedSession(token, interaction);
+    if (!session?.customerId) return;
+
+    // Payments-hub flows keep private per-token flow state, but their entry
+    // routes (billadmin_pay_bal_show / billadmin_pay_charge_amt) only need
+    // session.customerId — bridge into them instead of re-implementing.
+    if (choice === "bal" || choice === "charge") {
+      await interaction.update(this.buildPayBridgePanel(token, session.customerId, choice));
+      return;
+    }
+
+    await interaction.deferUpdate();
+    await this.ctx.sessions.tryRender(interaction, async () => {
+      if (choice === "link") {
+        if (session.targetDiscordUserId) {
+          await interaction.editReply(await this.handlers.buildLinkPanel(token));
+        } else {
+          await interaction.editReply(
+            this.buildTargetPanel(
+              "link",
+              "No Discord user is linked to this Stripe customer yet — pick the user to link.",
+              "customers"
+            )
+          );
+        }
+        return;
+      }
+      if (isTargetAction(choice)) await this.runTargetAction(interaction, token, choice);
+    });
+  }
+
+  private buildPayBridgePanel(token: string, customerId: string, op: "bal" | "charge"): Panel {
+    const isBal = op === "bal";
+    const embed = new EmbedBuilder()
+      .setTitle(`${isBal ? "Adjust balance" : "Charge card now"} — \`${customerId}\``)
+      .setColor(isBal ? COLORS.brand : COLORS.warn)
+      .setDescription(
+        isBal
+          ? "Grant a credit or add a debit on this customer's Stripe balance (negative = credit, applied to " +
+              "future invoices).\nThe customer is already selected — continue into the Payments flow below."
+          : "⚡ Creates an **off-session** charge on a saved card — no 3DS/authentication step is possible; if " +
+              "the bank requires it the charge fails.\nThe customer is already selected — enter the amount to continue."
+      );
+    return {
+      embeds: [embed],
+      components: [
+        buttonRow(
+          isBal
+            ? btn(`billadmin_pay_bal_show:${token}`, "Open balance panel", ButtonStyle.Primary)
+            : btn(`billadmin_pay_charge_amt:${token}`, "Enter amount…", ButtonStyle.Primary),
+          btn(`billadmin_c360_refresh:${token}`, "◀ Back", ButtonStyle.Secondary)
+        ),
+      ],
+    };
+  }
 
   // Runs a customer-scoped action once session.customerId is resolved.
   // The interaction must already be deferred; callers wrap this in tryRender.

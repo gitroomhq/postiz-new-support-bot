@@ -212,6 +212,8 @@ export function buildRootPanel(config: BotConfig): Panel {
         "💰 **Charges** — charge & invoice history, disputes & fraud, refunds",
         "🔄 **Subscriptions** — view, create, change plan, apply discount, cancel",
         "🎟️ **Promos** — promo codes & coupons",
+        "🧾 **Invoices** — invoice list & detail, one-off invoices, credit notes",
+        "💸 **Payments** — payment methods, account credits/debits, balance history, manual charges",
       ].join("\n")
     )
     .setFooter({
@@ -227,6 +229,10 @@ export function buildRootPanel(config: BotConfig): Panel {
         btn("billadmin_hub:charges", "💰 Charges", ButtonStyle.Primary),
         btn("billadmin_hub:subs", "🔄 Subscriptions", ButtonStyle.Primary),
         btn("billadmin_open:promo", "🎟️ Promos", ButtonStyle.Primary)
+      ),
+      buttonRow(
+        btn("billadmin_hub:invoices", "🧾 Invoices", ButtonStyle.Primary),
+        btn("billadmin_hub:pay", "💸 Payments", ButtonStyle.Primary)
       ),
     ],
   };
@@ -327,7 +333,10 @@ export function buildHubPanel(area: string, config: BotConfig): Panel {
     return {
       embeds: [embed],
       components: [
-        buttonRow(btn("billadmin_open:createsub", "Create Subscription", ButtonStyle.Success)),
+        buttonRow(
+          btn("billadmin_open:createsub", "Create Subscription", ButtonStyle.Success),
+          btn("billadmin_sub_manage_entry", "🛠 Manage Subscription", ButtonStyle.Primary)
+        ),
         buttonRow(
           btn("billadmin_open:changeplan", "Change Plan", ButtonStyle.Primary),
           btn("billadmin_open:discount", "Apply Discount", ButtonStyle.Primary)

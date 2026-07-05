@@ -67,6 +67,15 @@ export interface BillAdminSession {
     phone: string;
     description: string;
     address: Stripe.Address | null;
+    businessName: string;
+    individualName: string;
+    shipping: Stripe.Customer.Shipping | null;
+    invoicePrefix: string;
+    nextInvoiceSequence: number | null;
+    invoiceFooter: string;
+    invoiceCustomFields: { name: string; value: string }[];
+    amountTaxDisplay: string;
+    metadata: Record<string, string>;
   };
 }
 

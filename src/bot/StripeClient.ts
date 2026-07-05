@@ -476,7 +476,9 @@ export class StripeClient {
   // ---- Billing admin panel (/billing) invoice, balance & schedule reads ----
 
   async getInvoice(invoiceId: string): Promise<Stripe.Invoice> {
-    return this.stripe.invoices.retrieve(invoiceId);
+    // payments is expandable-only on Basil invoices — without it the invoice
+    // carries no charge/payment-intent reference at all.
+    return this.stripe.invoices.retrieve(invoiceId, { expand: ["payments"] });
   }
 
   async listInvoicesByStatus(
