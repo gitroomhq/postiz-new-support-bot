@@ -43,6 +43,9 @@ export interface BillAdminSession {
   fingerprint?: string;
   chargeId?: string;
   refundAmountMinor?: number | null; // null = full remaining amount
+  // Where the refund result panel's Back returns — the panel the refund was
+  // launched from (charge detail when opened there, else the Charges hub).
+  refundReturn?: string;
   subscriptionId?: string;
   paymentIntentId?: string;
   // Origin-aware Back navigation: a stack of re-renderable button custom-ids

@@ -504,7 +504,7 @@ export class CustomersHub {
       components: [
         buttonRow(
           btn(`billadmin_goto:charges:${token}`, "Charges", ButtonStyle.Primary),
-          btn("billadmin_hub:invoices", "Invoices", ButtonStyle.Primary),
+          btn(`billadmin_goto:invoices:${token}`, "Invoices", ButtonStyle.Primary),
           btn(`billadmin_sub_list:${token}`, "Subscriptions", ButtonStyle.Primary, subscriptions.length === 0),
           btn(`billadmin_c360_go:cards:${token}`, "Cards", ButtonStyle.Primary),
           btn(`billadmin_goto:fraud:${token}`, "Fraud", ButtonStyle.Primary)

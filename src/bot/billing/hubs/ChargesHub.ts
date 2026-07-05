@@ -578,6 +578,10 @@ export class ChargesHub {
       }
     }
     session.subscriptionId = subscriptionId ?? undefined;
+    // Land the refund result back on wherever the flow was launched from (the
+    // charge detail when opened there, the Charges hub for the id-modal flow),
+    // instead of always dumping to the hub top menu.
+    session.refundReturn = cancelTarget;
 
     const notes = [
       charge.disputed
@@ -864,7 +868,7 @@ export class ChargesHub {
             COLORS.success
           ),
         ],
-        components: [backRow("billadmin_hub:charges")],
+        components: [backRow(session.refundReturn ?? "billadmin_hub:charges")],
       });
     });
   }

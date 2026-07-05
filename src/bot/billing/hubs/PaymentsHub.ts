@@ -14,7 +14,7 @@ import {
 import type Stripe from "stripe";
 import { StripeClient } from "../../StripeClient";
 import { embed as makeEmbed, COLORS } from "../../../util/embeds";
-import { backRow, btn, buttonRow, selectRow, textInput } from "../ui";
+import { afterActionBack, backRow, btn, buttonRow, selectRow, textInput } from "../ui";
 import type { Panel, RenderInteraction, RouteEntry } from "../types";
 import type { HubContext } from "./HubContext";
 
@@ -1001,7 +1001,7 @@ export class PaymentsHub {
             COLORS.success
           ),
         ],
-        components: [backRow("billadmin_hub:pay")],
+        components: [backRow(afterActionBack(session, token, "pay"))],
       });
     });
   }

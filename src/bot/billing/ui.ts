@@ -13,7 +13,7 @@ import type Stripe from "stripe";
 import type { BotConfig } from "../../config";
 import { StripeClient } from "../StripeClient";
 import { embed as makeEmbed, COLORS } from "../../util/embeds";
-import { TARGET_ACTIONS, type Panel, type TargetAction } from "./types";
+import { TARGET_ACTIONS, type BillAdminSession, type Panel, type TargetAction } from "./types";
 
 // Pure UI helpers shared by the billing admin facade and its hubs. Everything
 // here is stateless — formatting, row/button builders and the two navigation
@@ -35,6 +35,17 @@ export function selectRow(
 
 export function backRow(target = "billadmin_root"): ActionRowBuilder<MessageActionRowComponentBuilder> {
   return buttonRow(btn(target, "◀ Back", ButtonStyle.Secondary));
+}
+
+// Back target for a terminal-action RESULT panel (refund done, sub cancelled,
+// invoice voided…). Walks the nav stack back to the panel the action was
+// launched from, so the admin stays in the customer/detail context instead of
+// being dumped at the hub top menu. Setting originHub guarantees the empty-stack
+// fallback lands on the flow's hub (not the root panel) for actions entered
+// straight from a hub modal. Pass the hub area this flow belongs to as fallback.
+export function afterActionBack(session: BillAdminSession, token: string, hubFallback: string): string {
+  session.originHub ??= hubFallback;
+  return `billadmin_nav_back:${token}`;
 }
 
 export function promoBackRow(): ActionRowBuilder<MessageActionRowComponentBuilder> {

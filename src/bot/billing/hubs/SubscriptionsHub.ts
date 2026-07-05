@@ -12,6 +12,7 @@ import {
 import type Stripe from "stripe";
 import { embed as makeEmbed, COLORS } from "../../../util/embeds";
 import {
+  afterActionBack,
   backRow,
   btn,
   buttonRow,
@@ -72,7 +73,8 @@ export class SubscriptionsHub {
       id: "billadmin_cancelsub_exec:",
       match: "prefix",
       handler: async (interaction) => {
-        const session = await this.ctx.sessions.getOwnedSession(interaction.customId.split(":")[1], interaction);
+        const token = interaction.customId.split(":")[1];
+        const session = await this.ctx.sessions.getOwnedSession(token, interaction);
         if (!session?.subscriptionId) return;
         await interaction.deferUpdate();
         await this.ctx.sessions.tryRender(interaction, async () => {
@@ -90,7 +92,7 @@ export class SubscriptionsHub {
                 COLORS.success
               ),
             ],
-            components: [backRow("billadmin_hub:subs")],
+            components: [backRow(afterActionBack(session, token, "subs"))],
           });
         });
       },
@@ -100,7 +102,8 @@ export class SubscriptionsHub {
       id: "billadmin_cancelsub_softexec:",
       match: "prefix",
       handler: async (interaction) => {
-        const session = await this.ctx.sessions.getOwnedSession(interaction.customId.split(":")[1], interaction);
+        const token = interaction.customId.split(":")[1];
+        const session = await this.ctx.sessions.getOwnedSession(token, interaction);
         if (!session?.subscriptionId) return;
         await interaction.deferUpdate();
         await this.ctx.sessions.tryRender(interaction, async () => {
@@ -118,7 +121,7 @@ export class SubscriptionsHub {
                 COLORS.success
               ),
             ],
-            components: [backRow("billadmin_hub:subs")],
+            components: [backRow(afterActionBack(session, token, "subs"))],
           });
         });
       },
@@ -128,7 +131,8 @@ export class SubscriptionsHub {
       id: "billadmin_discount_exec:",
       match: "prefix",
       handler: async (interaction) => {
-        const session = await this.ctx.sessions.getOwnedSession(interaction.customId.split(":")[1], interaction);
+        const token = interaction.customId.split(":")[1];
+        const session = await this.ctx.sessions.getOwnedSession(token, interaction);
         if (!session?.subscriptionId) return;
         await interaction.deferUpdate();
         await this.ctx.sessions.tryRender(interaction, async () => {
@@ -147,7 +151,7 @@ export class SubscriptionsHub {
                 COLORS.success
               ),
             ],
-            components: [backRow("billadmin_hub:subs")],
+            components: [backRow(afterActionBack(session, token, "subs"))],
           });
         });
       },
@@ -278,7 +282,7 @@ export class SubscriptionsHub {
                 COLORS.success
               ),
             ],
-            components: [backRow("billadmin_hub:subs")],
+            components: [backRow(afterActionBack(session, token, "subs"))],
           });
         });
       },
@@ -325,7 +329,7 @@ export class SubscriptionsHub {
                 COLORS.success
               ),
             ],
-            components: [backRow("billadmin_hub:subs")],
+            components: [backRow(afterActionBack(session, token, "subs"))],
           });
         });
       },

@@ -134,15 +134,18 @@ export class TargetResolver {
     // routes (billadmin_pay_bal_show / billadmin_pay_charge_amt) only need
     // session.customerId — bridge into them instead of re-implementing.
     if (choice === "bal" || choice === "charge") {
+      // Record the 360 view so the Payments result panel returns here.
+      pushNav(session, `billadmin_c360_refresh:${token}`);
       await interaction.update(this.buildPayBridgePanel(token, session.customerId, choice));
       return;
     }
 
     await interaction.deferUpdate();
-    // Only editcust lands on a panel whose Back walks the nav stack — the other
-    // choices open flows with their own explicit cancels/returns (rule: confirm
-    // and modal flows keep their explicit returns).
-    if (choice === "editcust") pushNav(session, `billadmin_c360_refresh:${token}`);
+    // Record the 360 view on the nav stack so each action's result panel (and its
+    // Back) returns here instead of dumping to a hub top menu. Covers editcust,
+    // discount, changeplan, createsub and delcust — every target action reachable
+    // from this select.
+    if (isTargetAction(choice)) pushNav(session, `billadmin_c360_refresh:${token}`);
     await this.ctx.sessions.tryRender(interaction, async () => {
       if (choice === "link") {
         if (session.targetDiscordUserId) {
