@@ -299,6 +299,12 @@ export class BillingAdmin {
       case "cardsbylast4":
         await interaction.showModal(this.cards.buildLast4Modal());
         return;
+      case "findamount":
+        await interaction.showModal(this.cards.buildFindAmountModal());
+        return;
+      case "findname":
+        await interaction.showModal(this.cards.buildFindNameModal());
+        return;
       case "refund":
         await interaction.showModal(this.charges.buildRefundModal());
         return;

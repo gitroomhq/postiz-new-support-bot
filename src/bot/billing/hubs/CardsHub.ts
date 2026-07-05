@@ -8,7 +8,9 @@ import {
   type MessageActionRowComponentBuilder,
   type ModalSubmitInteraction,
 } from "discord.js";
+import type Stripe from "stripe";
 import { embed as makeEmbed, COLORS } from "../../../util/embeds";
+import { StripeClient } from "../../StripeClient";
 import { backRow, btn, buttonRow, selectRow, textInput } from "../ui";
 import { FINGERPRINT_RE, type RenderInteraction, type RouteEntry } from "../types";
 import type { HubContext } from "./HubContext";
@@ -121,6 +123,18 @@ export class CardsHub {
       match: "exact",
       handler: (interaction) => this.handleLast4Modal(interaction),
     },
+    {
+      kind: "modal",
+      id: "billadmin_findamt_modal",
+      match: "exact",
+      handler: (interaction) => this.handleFindAmountModal(interaction),
+    },
+    {
+      kind: "modal",
+      id: "billadmin_findname_modal",
+      match: "exact",
+      handler: (interaction) => this.handleFindNameModal(interaction),
+    },
   ];
 
   buildFingerprintModal(action: string): ModalBuilder {
@@ -156,6 +170,176 @@ export class CardsHub {
           })
         )
       );
+  }
+
+  buildFindAmountModal(): ModalBuilder {
+    return new ModalBuilder()
+      .setCustomId("billadmin_findamt_modal")
+      .setTitle("Find payments by amount")
+      .addComponents(
+        new ActionRowBuilder<TextInputBuilder>().addComponents(
+          textInput("amount", "Amount (e.g. 25.39)", { required: true, placeholder: "25.39" })
+        ),
+        new ActionRowBuilder<TextInputBuilder>().addComponents(
+          textInput("currency", "Currency (optional, e.g. eur)", {
+            required: false,
+            placeholder: "eur — narrows results",
+            maxLength: 3,
+          })
+        )
+      );
+  }
+
+  buildFindNameModal(): ModalBuilder {
+    return new ModalBuilder()
+      .setCustomId("billadmin_findname_modal")
+      .setTitle("Find customer by name / email")
+      .addComponents(
+        new ActionRowBuilder<TextInputBuilder>().addComponents(
+          textInput("term", "Name or email (partial is fine)", {
+            required: true,
+            placeholder: "True Brew Birdie / jan@example.com",
+          })
+        )
+      );
+  }
+
+  // ---- account-wide "find when card lookups come up empty" flows ----
+
+  // Amount search hits PaymentIntents, so it surfaces DECLINED / blocked attempts
+  // (issuer-refused renewals) that never became a charge — exactly what the
+  // last4/charge searches cannot see.
+  private async handleFindAmountModal(interaction: ModalSubmitInteraction): Promise<void> {
+    const amountRaw = interaction.fields.getTextInputValue("amount").trim();
+    const currencyRaw = interaction.fields.getTextInputValue("currency").trim().toLowerCase();
+    if (!/^\d+(\.\d{1,2})?$/.test(amountRaw)) {
+      await interaction.reply({ embeds: [makeEmbed("Enter an amount like `25.39`.", COLORS.danger)], flags: 64 });
+      return;
+    }
+    if (currencyRaw && !/^[a-z]{3}$/.test(currencyRaw)) {
+      await interaction.reply({
+        embeds: [makeEmbed("Currency must be a 3-letter code (eur, usd, …) or left blank.", COLORS.danger)],
+        flags: 64,
+      });
+      return;
+    }
+    const zeroDecimal = currencyRaw ? StripeClient.isZeroDecimal(currencyRaw) : false;
+    const amountMinor = zeroDecimal ? Math.round(Number(amountRaw)) : Math.round(Number(amountRaw) * 100);
+    const label = `${amountRaw}${currencyRaw ? ` ${currencyRaw.toUpperCase()}` : ""}`;
+
+    await this.ctx.sessions.ackModal(interaction);
+    await this.ctx.sessions.tryRender(interaction, async () => {
+      const { paymentIntents, nextPage } = await this.ctx.stripe.searchPaymentIntentsByAmount(
+        amountMinor,
+        currencyRaw || undefined,
+        50
+      );
+      if (paymentIntents.length === 0) {
+        await interaction.editReply({
+          embeds: [
+            makeEmbed(
+              `No payment attempts found for **${label}** (this includes declined ones).\n\n` +
+                "If the customer is sure of the amount, it may be on a **different Stripe account** or a " +
+                "different currency — try leaving the currency blank, or search by name instead.",
+              COLORS.neutral
+            ),
+          ],
+          components: [backRow("billadmin_hub:cards")],
+        });
+        return;
+      }
+      await this.renderPaymentMatches(interaction, paymentIntents, nextPage, label);
+    });
+  }
+
+  private async renderPaymentMatches(
+    interaction: ModalSubmitInteraction,
+    pis: Stripe.PaymentIntent[],
+    nextPage: string | null,
+    label: string
+  ): Promise<void> {
+    const custIds: string[] = [];
+    const lines = pis.map((pi) => {
+      const charge = pi.latest_charge && typeof pi.latest_charge !== "string" ? pi.latest_charge : null;
+      const card = charge?.payment_method_details?.card;
+      const cusId = typeof pi.customer === "string" ? pi.customer : pi.customer?.id ?? null;
+      if (cusId && !custIds.includes(cusId)) custIds.push(cusId);
+      const icon = pi.status === "succeeded" ? "✅" : "⛔";
+      const email = charge?.billing_details?.email ?? charge?.receipt_email ?? pi.receipt_email ?? null;
+      const reason = pi.last_payment_error?.message ?? charge?.outcome?.seller_message ?? charge?.failure_message ?? null;
+      return (
+        `${icon} **${this.ctx.stripe.formatAmount(pi.amount, pi.currency)}** · ${pi.status} · <t:${pi.created}:R>\n` +
+        `${cusId ? `\`${cusId}\`` : "no customer"}${email ? ` · ${email}` : ""}` +
+        `${card ? ` · ${card.brand} •••• ${card.last4}` : ""}` +
+        `${reason ? `\n↳ ${reason}` : ""}`
+      );
+    });
+
+    const embed = new EmbedBuilder()
+      .setTitle(`Payment attempts — ${label}`)
+      .setColor(COLORS.brand)
+      .setDescription(lines.join("\n\n").slice(0, 4096))
+      .setFooter({
+        text:
+          `${pis.length} attempt(s)${nextPage ? " — more exist" : ""} · ⛔ = declined/incomplete · ` +
+          "pick a customer to open their overview · Search data can lag ~1 min",
+      });
+
+    const components = [];
+    if (custIds.length > 0) {
+      const token = this.ctx.sessions.newSession(interaction, { pendingAction: "overview", originHub: "cards" });
+      const select = new StringSelectMenuBuilder()
+        .setCustomId(`billadmin_cuspick:${token}`)
+        .setPlaceholder("Open a customer's overview…")
+        .addOptions(custIds.slice(0, 25).map((id) => ({ label: id, description: "open overview", value: id })));
+      components.push(selectRow(select));
+    }
+    components.push(backRow("billadmin_hub:cards"));
+    await interaction.editReply({ embeds: [embed], components });
+  }
+
+  private async handleFindNameModal(interaction: ModalSubmitInteraction): Promise<void> {
+    // Strip quotes/backslashes: term is interpolated into the Stripe search query.
+    const term = interaction.fields.getTextInputValue("term").replace(/["\\]/g, "").trim();
+    if (term.length < 2) {
+      await interaction.reply({
+        embeds: [makeEmbed("Enter at least 2 characters (name or email) to search.", COLORS.danger)],
+        flags: 64,
+      });
+      return;
+    }
+
+    await this.ctx.sessions.ackModal(interaction);
+    await this.ctx.sessions.tryRender(interaction, async () => {
+      const customers = await this.ctx.stripe.searchCustomersByTerm(term, 20);
+      if (customers.length === 0) {
+        await interaction.editReply({
+          embeds: [makeEmbed(`No Stripe customers matched \`${term}\` (name or email).`, COLORS.neutral)],
+          components: [backRow("billadmin_hub:cards")],
+        });
+        return;
+      }
+      const token = this.ctx.sessions.newSession(interaction, { pendingAction: "overview", originHub: "cards" });
+      const lines = customers.map((c) => `\`${c.id}\` · ${c.name ?? "no name"} · ${c.email ?? "no email"}`);
+      const embed = new EmbedBuilder()
+        .setTitle(`Customers matching "${term}"`)
+        .setColor(COLORS.brand)
+        .setDescription(lines.join("\n").slice(0, 4096))
+        .setFooter({
+          text: `${customers.length} match(es) · pick one to open their overview · Search data can lag ~1 min`,
+        });
+      const select = new StringSelectMenuBuilder()
+        .setCustomId(`billadmin_cuspick:${token}`)
+        .setPlaceholder("Open a customer's overview…")
+        .addOptions(
+          customers.slice(0, 25).map((c) => ({
+            label: (c.email ?? c.id).slice(0, 100),
+            description: `${c.name ?? "no name"} · ${c.id}`.slice(0, 100),
+            value: c.id,
+          }))
+        );
+      await interaction.editReply({ embeds: [embed], components: [selectRow(select), backRow("billadmin_hub:cards")] });
+    });
   }
 
   // ---- fingerprint-driven flows (users by card, charges by card) ----
@@ -203,8 +387,21 @@ export class CardsHub {
       const { charges, nextPage } = await this.ctx.stripe.searchChargesByCardLast4(last4, brand || undefined, 100);
       if (charges.length === 0) {
         await interaction.editReply({
-          embeds: [makeEmbed(`No charges found for cards ending \`${last4}\`${brand ? ` (${brand})` : ""}.`, COLORS.neutral)],
-          components: [backRow("billadmin_hub:cards")],
+          embeds: [
+            makeEmbed(
+              `No **settled charges** found for cards ending \`${last4}\`${brand ? ` (${brand})` : ""}.\n\n` +
+                "⚠️ This searches charges only. A **declined or bank-blocked** payment never becomes a charge, so it " +
+                "won't show here even though the customer sees it on their statement. Use **Find by Amount** to catch " +
+                "those declined attempts.",
+              COLORS.neutral
+            ),
+          ],
+          components: [
+            buttonRow(
+              btn("billadmin_open:findamount", "🔎 Find by Amount", ButtonStyle.Primary),
+              btn("billadmin_hub:cards", "◀ Back", ButtonStyle.Secondary)
+            ),
+          ],
         });
         return;
       }

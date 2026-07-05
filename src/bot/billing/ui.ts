@@ -249,6 +249,8 @@ export function buildHubPanel(area: string, config: BotConfig): Panel {
       .setDescription(
         [
           "**Read** — a user's cards, or hunt cards account-wide by fingerprint / last 4.",
+          "**Find** — locate a customer or a **declined / bank-blocked** payment by amount or name when card and",
+          "last-4 lookups come up empty (a refused payment never becomes a charge, so it won't show in the searches above).",
           "**Update / Delete** — open *User's Cards* and pick a saved card to set it as default or detach it.",
         ].join("\n")
       );
@@ -260,6 +262,10 @@ export function buildHubPanel(area: string, config: BotConfig): Panel {
           btn("billadmin_open:usersbycard", "Users by Card", ButtonStyle.Primary),
           btn("billadmin_open:chargesbycard", "Charges by Card", ButtonStyle.Primary),
           btn("billadmin_open:cardsbylast4", "Cards by Last 4", ButtonStyle.Primary)
+        ),
+        buttonRow(
+          btn("billadmin_open:findamount", "🔎 Find by Amount", ButtonStyle.Secondary),
+          btn("billadmin_open:findname", "🔎 Find by Name / Email", ButtonStyle.Secondary)
         ),
         backRow(),
       ],

@@ -174,6 +174,44 @@ export class StripeClient {
     return { charges: res.data, nextPage: res.next_page ?? null };
   }
 
+  // Account-wide search over PaymentIntents by exact amount (minor units) and
+  // optional currency. Unlike charges.search, this reaches DECLINED / incomplete
+  // attempts that never produced a Charge — issuer-blocked or failed renewals the
+  // last4/charge searches are structurally blind to. latest_charge is expanded so
+  // callers can read the card + decline reason off the failed charge when present.
+  // amountMinor is interpolated into the query, so callers must pass a number.
+  async searchPaymentIntentsByAmount(
+    amountMinor: number,
+    currency: string | undefined,
+    limit = 50,
+    page?: string
+  ): Promise<{ paymentIntents: Stripe.PaymentIntent[]; nextPage: string | null }> {
+    const query = `amount:${amountMinor}` + (currency ? ` AND currency:"${currency}"` : "");
+    const res = await this.stripe.paymentIntents.search({
+      query,
+      limit,
+      expand: ["data.latest_charge"],
+      ...(page ? { page } : {}),
+    });
+    return { paymentIntents: res.data, nextPage: res.next_page ?? null };
+  }
+
+  // Fuzzy customer lookup by name OR email substring (Search API's ~ operator) —
+  // the exact-match customers.list({ email }) can't do partial or company-name
+  // hits (Postiz stores the org name as the Stripe customer name). term is
+  // interpolated into the query string, so callers must strip quotes/backslashes.
+  async searchCustomersByTerm(term: string, limit = 20): Promise<Stripe.Customer[]> {
+    // Strip quotes/backslashes here too (not just at the callers): this method is
+    // reachable from the read-only MCP server, where the term is model-supplied.
+    const safe = term.replace(/["\\]/g, "").trim();
+    if (safe.length < 2) return [];
+    const res = await this.stripe.customers.search({
+      query: `name~"${safe}" OR email~"${safe}"`,
+      limit,
+    });
+    return res.data;
+  }
+
   async getCustomer(customerId: string): Promise<Stripe.Customer | null> {
     const customer = await this.stripe.customers.retrieve(customerId);
     return customer.deleted ? null : (customer as Stripe.Customer);

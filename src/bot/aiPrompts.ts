@@ -131,6 +131,13 @@ function toolNotes(tools: AiToolAvailability): string {
     notes.push(
       "You have read-only Stripe tools (mcp__stripe__*) to inspect the customer's billing: customer, subscriptions, invoices, charges, payment intents, disputes, cards, tax ids."
     );
+    notes.push(
+      "When a customer id / exact email isn't known, or a card/last4/charge lookup comes up empty, SEARCH account-wide: " +
+        "search_customers (partial name/email — Postiz stores the org name as the customer name), " +
+        "search_payment_intents_by_amount (finds DECLINED / bank-blocked attempts that never became a charge — the " +
+        "usual reason a 'charge' is invisible), and search_charges_by_last4 / _card_fingerprint. A refused payment is " +
+        "not a charge, so a subscription can still be live (past_due) even when charge lookups return nothing."
+    );
   }
   if (tools.postiz) {
     notes.push(

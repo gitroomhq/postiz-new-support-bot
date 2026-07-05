@@ -103,6 +103,15 @@ readTool(
 );
 
 readTool(
+  "search_customers",
+  "Search customers account-wide by PARTIAL name or email (substring). Use when you only have a person's name " +
+    "or company and no cus_ id — Postiz stores the org name as the Stripe customer name, so a company like " +
+    "'True Brew Birdie' is findable here. Broader than find_customers_by_email, which needs the exact address.",
+  { term: z.string().min(2) },
+  ({ term }) => stripe.searchCustomersByTerm(term, 20)
+);
+
+readTool(
   "list_subscriptions",
   "List all subscriptions (any status) of a customer.",
   { customerId: z.string() },
@@ -142,6 +151,58 @@ readTool(
   "List PaymentIntents of a customer — includes declined/abandoned attempts that never became charges.",
   { customerId: z.string(), limit: z.number().int().min(1).max(100).optional() },
   ({ customerId, limit }) => stripe.listPaymentIntents(customerId, limit ?? 100)
+);
+
+readTool(
+  "search_payment_intents_by_amount",
+  "Search ALL payment attempts account-wide by amount — INCLUDING declined, bank-blocked or abandoned ones " +
+    "that never became a charge (e.g. a subscription renewal the customer's bank refused). Use this to locate a " +
+    "payment when a card/last4/charge search finds nothing but the customer sees it on their statement. `amount` " +
+    "is in major units (e.g. 25.39); `currency` (e.g. eur) is optional and narrows results. Returns each " +
+    "PaymentIntent's customer id, status, and — when a failed charge exists — the card brand/last4 and decline reason.",
+  { amount: z.number().positive(), currency: z.string().regex(/^[A-Za-z]{3}$/).optional() },
+  async ({ amount, currency }) => {
+    const cur = currency?.toLowerCase();
+    const amountMinor = cur && StripeClient.isZeroDecimal(cur) ? Math.round(amount) : Math.round(amount * 100);
+    const { paymentIntents, nextPage } = await stripe.searchPaymentIntentsByAmount(amountMinor, cur, 25);
+    return {
+      nextPage,
+      count: paymentIntents.length,
+      paymentIntents: paymentIntents.map((pi) => {
+        const charge = pi.latest_charge && typeof pi.latest_charge !== "string" ? pi.latest_charge : null;
+        const card = charge?.payment_method_details?.card;
+        return {
+          id: pi.id,
+          status: pi.status,
+          amount: pi.amount,
+          currency: pi.currency,
+          created: pi.created,
+          customer: typeof pi.customer === "string" ? pi.customer : pi.customer?.id ?? null,
+          email: charge?.billing_details?.email ?? charge?.receipt_email ?? pi.receipt_email ?? null,
+          card: card ? { brand: card.brand, last4: card.last4 } : null,
+          declineReason:
+            pi.last_payment_error?.message ?? charge?.outcome?.seller_message ?? charge?.failure_message ?? null,
+        };
+      }),
+    };
+  }
+);
+
+readTool(
+  "search_charges_by_last4",
+  "Search SETTLED charges account-wide by card last 4 digits (optional brand: visa/mastercard/amex). Only " +
+    "succeeded/settled charges are indexed — a declined or blocked payment never becomes a charge, so for those " +
+    "use search_payment_intents_by_amount instead.",
+  { last4: z.string().regex(/^\d{4}$/), brand: z.string().regex(/^[A-Za-z]+$/).optional() },
+  async ({ last4, brand }) => (await stripe.searchChargesByCardLast4(last4, brand?.toLowerCase(), 100)).charges
+);
+
+readTool(
+  "search_charges_by_card_fingerprint",
+  "Search charges account-wide by Stripe card fingerprint (exact) — every charge made with the same physical " +
+    "card, across all customers.",
+  { fingerprint: z.string().regex(/^[A-Za-z0-9]{8,64}$/) },
+  async ({ fingerprint }) => (await stripe.searchChargesByCardFingerprint(fingerprint, 100)).charges
 );
 
 readTool(
