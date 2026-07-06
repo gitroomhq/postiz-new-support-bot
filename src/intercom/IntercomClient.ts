@@ -179,6 +179,14 @@ export class IntercomClient {
     return { id: String(data.id) };
   }
 
+  // Intercom's "delete contact" only ARCHIVES; find/search are blind to
+  // archived records, so a re-created contact 409s ("...archived contact...
+  // id=X"). Reactivating by id lets the contact author conversations again.
+  // Idempotent for retries — unarchiving a live contact returns it, not an error.
+  async unarchiveContact(contactId: string): Promise<void> {
+    await this.json(`/contacts/${encodeURIComponent(contactId)}/unarchive`, "POST", undefined, "contact unarchive");
+  }
+
   // Contact custom attributes must be predefined in the workspace; this creates
   // the definition (idempotence handled by the caller treating "exists" as ok).
   async createContactAttribute(name: string, description: string): Promise<void> {
@@ -310,14 +318,23 @@ export class IntercomClient {
     );
   }
 
-  // Manage endpoint: route the conversation to a team inbox.
+  // Manage endpoint: route the conversation to a team inbox. Posting an
+  // assignment part that re-routes to the team it is already on is rejected
+  // with 422 "already assigned to the specified assignee" — but that IS the
+  // desired end state (idempotent re-run of the creation-time assignment), so
+  // it's swallowed as success rather than surfaced as a failure.
   async assignConversationToTeam(conversationId: string, teamId: string, adminId: string): Promise<void> {
-    await this.json(
-      `/conversations/${encodeURIComponent(conversationId)}/parts`,
-      "POST",
-      { message_type: "assignment", type: "team", admin_id: adminId, assignee_id: teamId },
-      "conversation assignment"
-    );
+    try {
+      await this.json(
+        `/conversations/${encodeURIComponent(conversationId)}/parts`,
+        "POST",
+        { message_type: "assignment", type: "team", admin_id: adminId, assignee_id: teamId },
+        "conversation assignment"
+      );
+    } catch (e) {
+      if (e instanceof IntercomHttpError && e.status === 422 && /already assigned/i.test(e.message)) return;
+      throw e;
+    }
   }
 
   // Manage endpoint: close/open the conversation (admin-authored part).

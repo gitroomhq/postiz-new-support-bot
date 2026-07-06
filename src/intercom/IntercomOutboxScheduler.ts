@@ -452,7 +452,17 @@ export class IntercomOutboxScheduler {
       return created.id;
     } catch (e) {
       if (e instanceof IntercomHttpError && (e.status === 400 || e.status === 409 || e.status === 422)) {
-        // Either a create race (contact exists) or a custom-attribute problem.
+        // An Intercom "delete contact" (e.g. the /config wipe) only ARCHIVES
+        // the record, and find/search are blind to archived contacts — so a
+        // re-run 409s with the archived id in the body. Unarchive and reuse it
+        // rather than dead-lettering every backfilled ticket.
+        const archivedId = archivedContactId(e);
+        if (archivedId) {
+          await this.client.unarchiveContact(archivedId);
+          return archivedId;
+        }
+        // Otherwise: a create race (contact now exists) or a custom-attribute
+        // problem — search, then retry the create without custom attributes.
         const found = await this.client.searchContactByExternalId(externalId);
         if (found) return found.id;
         const created = await this.client.createContact({ externalId, name });
@@ -713,6 +723,14 @@ function isPermanent4xx(e: unknown): boolean {
 // for the bridge that outcome IS the desired end state.
 function isSameStateError(e: unknown): boolean {
   return e instanceof IntercomHttpError && e.status === 400 && /same state/i.test(e.message);
+}
+
+// The create-contact 409 for an archived record embeds its id, e.g. "An
+// archived contact matching those details already exists with id=abc123".
+function archivedContactId(e: unknown): string | null {
+  if (!(e instanceof IntercomHttpError)) return null;
+  const m = /archived contact.*?id=(\w+)/i.exec(e.message);
+  return m ? m[1] : null;
 }
 
 function escapeHtmlText(text: string): string {
