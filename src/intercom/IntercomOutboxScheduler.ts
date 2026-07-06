@@ -5,7 +5,7 @@ import { AuditLogger } from "../bot/AuditLogger";
 import { SettingsStore } from "../config/SettingsStore";
 import { IntercomClient, IntercomHttpError } from "./IntercomClient";
 import { IntercomStore } from "./IntercomStore";
-import { IntercomSyncService, externalIdFor } from "./IntercomSyncService";
+import { IntercomSyncService, externalIdCandidates } from "./IntercomSyncService";
 import { bodyHash, renderDiscordMarkdownToHtml } from "./renderDiscordMarkdown";
 import { log } from "../util/logger";
 import { withTickSpan, wasCaptured, metricCount, metricGauge, SPAN_STATUS_ERROR } from "../util/instrument";
@@ -304,8 +304,7 @@ export class IntercomOutboxScheduler {
     let created = false;
 
     if (!link) {
-      const externalId = externalIdFor(payload, threadId);
-      const contactId = await this.resolveContact(externalId, payload);
+      const { contactId, externalId } = await this.resolveContact(externalIdCandidates(payload, threadId), payload);
       // Live tickets: the customer's rendered question IS the opening message
       // (native created_at carries the timestamp — no text prefixes). Backfill:
       // a generic import header; the transcript replay supplies the content.
@@ -435,40 +434,83 @@ export class IntercomOutboxScheduler {
     }
   }
 
-  // find → create (with contact attributes) → conflict/attr fallbacks.
-  private async resolveContact(externalId: string, payload: EnsurePayload): Promise<string> {
+  // Resolve the contact for a ticket, cascading down the external_id candidates
+  // (canonical Postiz id → discord:{userId} → thread-scoped). Returns the id
+  // that actually worked so the caller records it on the link.
+  private async resolveContact(
+    candidates: string[],
+    payload: EnsurePayload
+  ): Promise<{ contactId: string; externalId: string }> {
     await this.ensureContactAttributeDefinitions();
 
-    const existing = await this.client.findContactByExternalId(externalId);
-    if (existing) return existing.id;
+    // Reuse an existing contact under ANY candidate namespace first. This keeps
+    // a post-wipe fallback contact (minted under discord:{id} while the Postiz
+    // id sat in the deletion grace) authoritative: once the canonical id frees
+    // up, later tickets still find and reuse it here instead of duplicating.
+    for (const externalId of candidates) {
+      const existing = await this.client.findContactByExternalId(externalId);
+      if (existing) return { contactId: existing.id, externalId };
+    }
 
-    const name = payload.customerDisplayName || `Discord user ${payload.customerId ?? externalId}`;
+    const name = payload.customerDisplayName || `Discord user ${payload.customerId ?? candidates[0]}`;
     const customAttributes: Record<string, unknown> = {
       ...(payload.customerId ? { discord_user_id: payload.customerId } : {}),
       ...(payload.stripeCustomerId ? { stripe_customer_id: payload.stripeCustomerId } : {}),
     };
+
+    // Create under the first candidate that isn't locked. A blocked id 409s with
+    // the conflicting record's id in the body; if it's merely archived we
+    // unarchive and reuse it, but if it's mid-permanent-deletion (a prior wipe's
+    // DELETE — "not restorable") we can neither reuse nor recreate under it for
+    // ~7 days, so we fall through to the next namespace.
+    for (let i = 0; i < candidates.length; i++) {
+      const externalId = candidates[i];
+      // Custom attributes only on the canonical attempt — a fallback create must
+      // not be derailed by a missing attribute definition.
+      const contactId = await this.resolveContactForId(externalId, name, i === 0 ? customAttributes : undefined);
+      if (contactId) return { contactId, externalId };
+      this.schedLog.warn("intercom external_id locked in deletion grace, trying fallback namespace", {
+        "intercom.external_id": externalId,
+      });
+    }
+
+    // Every candidate is in the grace window (all namespaces wiped within 7 days
+    // — practically impossible given the unique thread-scoped tail).
+    throw new IntercomHttpError(422, "Intercom contact resolve: all external_id candidates are in the deletion grace window");
+  }
+
+  // Get the contact id for one exact external_id, or null when that id is
+  // unusable because a prior wipe left it mid-permanent-deletion (caller then
+  // tries the next namespace). Throws on any other failure.
+  private async resolveContactForId(
+    externalId: string,
+    name: string,
+    customAttributes: Record<string, unknown> | undefined
+  ): Promise<string | null> {
     try {
       const created = await this.client.createContact({ externalId, name, customAttributes });
       return created.id;
     } catch (e) {
-      if (e instanceof IntercomHttpError && (e.status === 400 || e.status === 409 || e.status === 422)) {
-        // An Intercom "delete contact" (e.g. the /config wipe) only ARCHIVES
-        // the record, and find/search are blind to archived contacts — so a
-        // re-run 409s with the archived id in the body. Unarchive and reuse it
-        // rather than dead-lettering every backfilled ticket.
-        const archivedId = archivedContactId(e);
-        if (archivedId) {
+      if (!(e instanceof IntercomHttpError && (e.status === 400 || e.status === 409 || e.status === 422))) throw e;
+
+      // Conflict with an archived/deleting record whose id is in the 409 body.
+      const archivedId = archivedContactId(e);
+      if (archivedId) {
+        try {
           await this.client.unarchiveContact(archivedId);
-          return archivedId;
+          return archivedId; // was merely archived → reactivated, reuse.
+        } catch (unarchiveErr) {
+          if (isContactNotRestorable(unarchiveErr)) return null; // permanent-deletion grace → next namespace.
+          throw unarchiveErr;
         }
-        // Otherwise: a create race (contact now exists) or a custom-attribute
-        // problem — search, then retry the create without custom attributes.
-        const found = await this.client.searchContactByExternalId(externalId);
-        if (found) return found.id;
-        const created = await this.client.createContact({ externalId, name });
-        return created.id;
       }
-      throw e;
+
+      // A create race (contact now exists) or a custom-attribute rejection —
+      // search, then retry the create once without custom attributes.
+      const found = await this.client.searchContactByExternalId(externalId);
+      if (found) return found.id;
+      const created = await this.client.createContact({ externalId, name });
+      return created.id;
     }
   }
 
@@ -731,6 +773,13 @@ function archivedContactId(e: unknown): string | null {
   if (!(e instanceof IntercomHttpError)) return null;
   const m = /archived contact.*?id=(\w+)/i.exec(e.message);
   return m ? m[1] : null;
+}
+
+// Unarchive rejects a contact already inside Intercom's permanent-deletion grace
+// ("...marked for permanent deletion and is not restorable") — its external_id
+// stays locked for ~7 days, so the resolver must fall through to another id.
+function isContactNotRestorable(e: unknown): boolean {
+  return e instanceof IntercomHttpError && /(not restorable|permanent deletion)/i.test(e.message);
 }
 
 function escapeHtmlText(text: string): string {

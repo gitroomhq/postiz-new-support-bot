@@ -324,13 +324,22 @@ export class IntercomSyncService {
   }
 }
 
-// external_id derivation: Postiz user id when the opener's session carried one
-// (ticket creation requires OAuth, so this is the overwhelmingly common case),
-// discord:{userId} otherwise, thread-scoped as the last resort.
+// external_id derivation, most-canonical first: Postiz user id when the opener's
+// session carried one (ticket creation requires OAuth, so this is the
+// overwhelmingly common case), then discord:{userId}, then a thread-scoped last
+// resort. The contact resolver cascades down this list when a higher id is
+// unusable (e.g. locked inside a prior wipe's 7-day permanent-deletion grace) —
+// the thread-scoped tail is unique per ticket, so it is effectively always free.
+export function externalIdCandidates(payload: EnsurePayload, threadId: string): string[] {
+  const ids: string[] = [];
+  if (payload.postizUserId) ids.push(payload.postizUserId);
+  if (payload.customerId) ids.push(`discord:${payload.customerId}`);
+  ids.push(`discord-thread:${threadId}`);
+  return ids;
+}
+
 export function externalIdFor(payload: EnsurePayload, threadId: string): string {
-  if (payload.postizUserId) return payload.postizUserId;
-  if (payload.customerId) return `discord:${payload.customerId}`;
-  return `discord-thread:${threadId}`;
+  return externalIdCandidates(payload, threadId)[0];
 }
 
 // The Resolved tag is identified by convention (✅, matching RESOLVED_EMOJI in

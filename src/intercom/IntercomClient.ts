@@ -432,7 +432,12 @@ export class IntercomClient {
   }
 
   // ---- Deletion (the /config "Wipe Intercom data" button) ----
-  // All three are permanent and irreversible on Intercom's side.
+  // Conversations and tickets are hard-deleted — they aren't keyed by
+  // external_id, so they recreate cleanly on the next backfill. Contacts are
+  // ARCHIVED, not deleted: DELETE /contacts is a *permanent* delete with a
+  // 7-day grace during which the external_id can't be reused, which would block
+  // the very next backfill. Archiving is reversible (see unarchiveContact), so a
+  // re-backfill reuses the same contact via the create-409 → unarchive path.
 
   async deleteConversation(conversationId: string): Promise<void> {
     await this.json(`/conversations/${encodeURIComponent(conversationId)}`, "DELETE", undefined, "conversation delete");
@@ -442,8 +447,8 @@ export class IntercomClient {
     await this.json(`/tickets/${encodeURIComponent(ticketId)}`, "DELETE", undefined, "ticket delete");
   }
 
-  async deleteContact(contactId: string): Promise<void> {
-    await this.json(`/contacts/${encodeURIComponent(contactId)}`, "DELETE", undefined, "contact delete");
+  async archiveContact(contactId: string): Promise<void> {
+    await this.json(`/contacts/${encodeURIComponent(contactId)}/archive`, "POST", undefined, "contact archive");
   }
 
   // ---- Workspace metadata (/config pickers + attribute bootstrap) ----

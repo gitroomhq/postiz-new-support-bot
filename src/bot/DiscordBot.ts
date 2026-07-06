@@ -3831,7 +3831,7 @@ export class DiscordBot {
         embeds: [
           makeEmbed(
             [
-              `⚠️ This **permanently deletes from Intercom**: **${links.length}** conversation(s), **${tickets}** converted ticket(s) and **${contacts}** bridge-created contact(s). Intercom cannot restore them.`,
+              `⚠️ From Intercom this **permanently deletes** **${links.length}** conversation(s) and **${tickets}** converted ticket(s), and **archives** **${contacts}** bridge-created contact(s) (archiving keeps their external_ids reusable — a permanent contact delete would lock them for 7 days and block re-backfilling).`,
               "",
               "The bot's local bridge state (links + queued events + echo ledger) is wiped too, so a later **Backfill** can rebuild everything cleanly.",
               "Only bridge-created objects are touched — Intercom-native conversations/contacts and all Discord threads stay untouched.",
@@ -4929,8 +4929,11 @@ export class DiscordBot {
     }
   }
 
-  // Remote wipe: permanently deletes every bridge-created object from Intercom
-  // (tickets → conversations → contacts) and clears the local bridge state.
+  // Remote wipe: hard-deletes bridge-created tickets and conversations, and
+  // ARCHIVES contacts (Intercom's DELETE /contacts is a permanent delete that
+  // locks the external_id for a 7-day grace — that would block the next
+  // backfill; archiving stays reusable, unarchived on re-backfill). Clears the
+  // local bridge state too.
   // Local state goes FIRST so the outbox drainer can't race the wipe (an
   // in-flight event would otherwise 404-self-heal and recreate objects).
   // Failures are collected and reported, never fatal — leftovers can be
@@ -4977,9 +4980,10 @@ export class DiscordBot {
       }
 
       // Contacts last (deduped — one contact can own several conversations).
+      // Archived, not deleted, so their external_ids stay reusable next backfill.
       for (const contactId of [...new Set(links.map((l) => l.contactId))]) {
         try {
-          await this.intercomClient.deleteContact(contactId);
+          await this.intercomClient.archiveContact(contactId);
           contacts++;
         } catch (e) {
           if (!isGone(e)) failures.push(`contact ${contactId}`);
@@ -4988,7 +4992,7 @@ export class DiscordBot {
       }
 
       const summary = [
-        `Intercom wipe done: deleted **${tickets}** ticket(s), **${conversations}** conversation(s), **${contacts}** contact(s); local state cleared (${local.links} links, ${local.events} queued events).`,
+        `Intercom wipe done: deleted **${tickets}** ticket(s), **${conversations}** conversation(s); archived **${contacts}** contact(s); local state cleared (${local.links} links, ${local.events} queued events).`,
         ...(failures.length > 0
           ? [`⚠️ ${failures.length} deletion(s) failed — remove these in Intercom by hand: ${failures.slice(0, 10).join(", ")}${failures.length > 10 ? ", …" : ""}`]
           : []),
