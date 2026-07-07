@@ -1,6 +1,9 @@
 // Prompt builders for the /ai staff command. Pure functions — no Discord or
 // DB access — so the giant DiscordBot class only assembles the inputs.
 
+import type { PostizAccountSnapshot } from "./PostizClient";
+import type { SentryIssue } from "./SentryClient";
+
 export interface AiTranscriptLine {
   timestamp: Date;
   role: "Customer" | "Staff" | "Bot";
@@ -22,6 +25,16 @@ export interface AiHistoryLine {
   createdAt: Date;
 }
 
+export interface AiSubscriptionSummary {
+  status: string;
+  plan: string | null;
+  interval: string | null;
+  /** Pre-formatted, e.g. "$29.00 / month". */
+  amount: string | null;
+  currentPeriodEnd: string | null;
+  cancelAtPeriodEnd: boolean;
+}
+
 export interface AiTicketContext {
   categoryLabel: string | null;
   statusLabel: string | null;
@@ -34,6 +47,12 @@ export interface AiTicketContext {
   transcript: AiTranscriptLine[];
   notes: AiNoteLine[];
   history: AiHistoryLine[];
+  /** Live Postiz account snapshot (best-effort; null when unavailable/disabled). */
+  postizAccount?: PostizAccountSnapshot | null;
+  /** Admin-only Stripe subscription summary (null when none / non-admin invoker). */
+  subscription?: AiSubscriptionSummary | null;
+  /** Heuristically-correlated Sentry issues (null when read access not configured). */
+  relatedSentryIssues?: SentryIssue[] | null;
   /** Only set when the Stripe MCP server is attached (admin invoker). */
   stripeCustomerId?: string | null;
   postizUserId?: string | null;
@@ -43,12 +62,18 @@ export interface AiToolAvailability {
   web: boolean;
   stripe: boolean;
   postiz: boolean;
+  sentry: boolean;
 }
 
 // The prompt travels as a single argv element (Linux MAX_ARG_STRLEN is
 // 128 KiB) — keep the whole context block comfortably under that.
 const TRANSCRIPT_CHAR_BUDGET = 60_000;
 const TRANSCRIPT_HEAD_BUDGET = 10_000;
+// The live-account block is small metadata, not free text — keep it tight so it
+// never crowds the transcript or the 128 KiB argv.
+const POSTIZ_FACTS_BUDGET = 4_000;
+const MAX_ERROR_POSTS = 12;
+const SENTRY_FACTS_BUDGET = 6_000;
 
 function renderTranscript(lines: AiTranscriptLine[]): string {
   const rendered = lines.map(
@@ -79,6 +104,78 @@ function renderTranscript(lines: AiTranscriptLine[]): string {
   return [...head, `[... ${truncated} messages truncated ...]`, ...tail].join("\n");
 }
 
+// Renders the customer's live Postiz account: channel health (a disabled channel
+// is the most common "posts aren't going out" cause) and recent post failures.
+function renderPostizAccount(acct: PostizAccountSnapshot): string {
+  const lines: string[] = [];
+  const disabled = acct.channels.filter((c) => c.disabled);
+  const active = acct.channels.filter((c) => !c.disabled);
+  lines.push(
+    `- Connected channels: ${acct.channels.length}${disabled.length ? ` (${disabled.length} DISABLED)` : ""}`
+  );
+  if (disabled.length > 0) {
+    lines.push(
+      `- ⚠️ Disabled / needs reconnect: ${disabled.map((c) => `${c.name} (${c.provider})`).join(", ")}`
+    );
+  }
+  if (active.length > 0) {
+    lines.push(`- Active: ${active.map((c) => `${c.name} (${c.provider})`).join(", ")}`);
+  }
+
+  if (acct.posts.length > 0) {
+    const counts: Record<string, number> = {};
+    for (const p of acct.posts) counts[p.state] = (counts[p.state] ?? 0) + 1;
+    const summary = Object.entries(counts)
+      .map(([state, n]) => `${n} ${state.toLowerCase()}`)
+      .join(", ");
+    lines.push(`- Posts (last ~30d): ${summary}`);
+    const errors = acct.posts
+      .filter((p) => p.state === "ERROR")
+      .sort((a, b) => (a.publishDate < b.publishDate ? 1 : -1))
+      .slice(0, MAX_ERROR_POSTS);
+    if (errors.length > 0) {
+      lines.push("- Recent failed posts:");
+      for (const e of errors) {
+        lines.push(
+          `  - [${e.publishDate}] ${e.provider ?? "?"}${e.channelName ? ` "${e.channelName}"` : ""} (post ${e.id})`
+        );
+      }
+    }
+  } else {
+    lines.push("- No scheduled/published posts in the last ~30 days.");
+  }
+
+  const out = lines.join("\n");
+  return out.length > POSTIZ_FACTS_BUDGET
+    ? `${out.slice(0, POSTIZ_FACTS_BUDGET)}\n[... account snapshot truncated ...]`
+    : out;
+}
+
+function renderSentryIssues(issues: SentryIssue[]): string {
+  const lines = ["_Heuristic matches (ticket keywords) — confirm relevance before relying on them._"];
+  for (const i of issues) {
+    const meta = [`events: ${i.count}`, `users: ${i.userCount}`];
+    if (i.lastSeen) meta.push(`last seen ${i.lastSeen}`);
+    lines.push(
+      `- [${i.shortId}] ${i.title}${i.culprit ? ` — culprit: ${i.culprit}` : ""} (${meta.join(", ")})` +
+        (i.permalink ? `\n  ${i.permalink}` : "")
+    );
+  }
+  const out = lines.join("\n");
+  return out.length > SENTRY_FACTS_BUDGET
+    ? `${out.slice(0, SENTRY_FACTS_BUDGET)}\n[... Sentry list truncated ...]`
+    : out;
+}
+
+function renderSubscription(sub: AiSubscriptionSummary): string {
+  const bits = [`- Status: ${sub.status}`];
+  if (sub.plan) bits.push(`- Plan: ${sub.plan}`);
+  if (sub.amount) bits.push(`- Amount: ${sub.amount}`);
+  if (sub.currentPeriodEnd) bits.push(`- Current period ends: ${sub.currentPeriodEnd}`);
+  if (sub.cancelAtPeriodEnd) bits.push("- Set to cancel at period end.");
+  return bits.join("\n");
+}
+
 export function buildTicketContextBlock(ctx: AiTicketContext): string {
   const parts: string[] = [];
   parts.push("## Ticket metadata");
@@ -97,6 +194,21 @@ export function buildTicketContextBlock(ctx: AiTicketContext): string {
 
   parts.push("\n## Original question");
   parts.push(ctx.question?.trim() || "(not recorded)");
+
+  if (ctx.postizAccount) {
+    parts.push("\n## Postiz account (live)");
+    parts.push(renderPostizAccount(ctx.postizAccount));
+  }
+
+  if (ctx.subscription) {
+    parts.push("\n## Subscription (Stripe)");
+    parts.push(renderSubscription(ctx.subscription));
+  }
+
+  if (ctx.relatedSentryIssues && ctx.relatedSentryIssues.length > 0) {
+    parts.push("\n## Related Sentry issues");
+    parts.push(renderSentryIssues(ctx.relatedSentryIssues));
+  }
 
   parts.push("\n## Full conversation transcript");
   parts.push(ctx.transcript.length > 0 ? renderTranscript(ctx.transcript) : "(no messages)");
@@ -144,6 +256,11 @@ function toolNotes(tools: AiToolAvailability): string {
       "You have read-only Postiz tools for this customer's own account (mcp__postiz__*): list their connected channels/integrations and platform schemas."
     );
   }
+  if (tools.sentry) {
+    notes.push(
+      "You have read-only Sentry tools (mcp__sentry__*) for the Postiz product's error tracking: search/list issues and events, get issue details and tag values, inspect traces. Use them to confirm or extend the related Sentry issues listed above — treat matches as leads to verify, not proof, and prefer the customer's specific error over generic ones."
+    );
+  }
   return notes.map((n) => `- ${n}`).join("\n");
 }
 
@@ -174,6 +291,7 @@ export function buildAskPrompt(
 
 A staff member has a question about the following support ticket. Answer it as precisely as possible.
 ${toolNotes(tools)}
+Prefer the context already assembled below (transcript, live Postiz account snapshot, subscription/billing facts, related Sentry issues); only search the Postiz source or docs when the answer isn't already there.
 Ground every claim in the ticket, the code/docs, or tool results — say clearly when you cannot verify something.
 
 Staff question: ${question}
@@ -186,7 +304,7 @@ export function buildCausePrompt(contextBlock: string, tools: AiToolAvailability
 
 Perform a root-cause analysis of the following support ticket.
 ${toolNotes(tools)}
-Investigate properly: trace the reported behavior through the Postiz source code, check the docs, and verify with the available tools where useful. Cite file paths and line numbers for code evidence.
+Start from the context already gathered below — the transcript, the live Postiz account snapshot (connected channels + their status, recent failed posts), any subscription/billing facts, and related Sentry issues. Lean on those first; only trace through the Postiz source code and docs to confirm or fill what the context doesn't answer, then cite file paths and line numbers for that code evidence.
 End your answer with exactly these markdown sections:
 **Most likely root cause**
 **Evidence** — what supports this conclusion (code references, ticket facts, tool results).

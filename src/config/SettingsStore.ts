@@ -7,6 +7,15 @@ export type ReminderTarget = "SUPPORT" | "CUSTOMER";
 export type IntercomMode = "none" | "push" | "bi";
 export type IntercomRegion = "us" | "eu" | "au";
 
+// `--effort` levels accepted by the Claude CLI. Stored free-text in BotSettings
+// but coerced on read so a bad /config value can never break the spawn.
+export type AiEffort = "low" | "medium" | "high" | "max";
+const AI_EFFORT_LEVELS: readonly AiEffort[] = ["low", "medium", "high", "max"];
+export function coerceEffort(v: string | null | undefined, fallback: AiEffort): AiEffort {
+  const s = (v ?? "").trim().toLowerCase();
+  return (AI_EFFORT_LEVELS as readonly string[]).includes(s) ? (s as AiEffort) : fallback;
+}
+
 // Totals stored after each scheduled report so the next one can show trend deltas.
 export type ReportSnapshot = {
   openTotal: number;
@@ -159,6 +168,30 @@ export class SettingsStore {
   // Cheaper model for the tool-less /ai summarize|draft runs.
   aiModelLight(): string {
     return this.settings.aiModelLight;
+  }
+
+  // /ai ask|cause bounding levers (the pinned CLI has no --max-turns). Effort
+  // caps exploration depth; the budget is a hard per-run USD stop (also bounds
+  // worst-case latency). ask is lighter than cause by default.
+  aiEffortAsk(): AiEffort {
+    return coerceEffort(this.settings.aiEffortAsk, "medium");
+  }
+
+  aiEffortCause(): AiEffort {
+    return coerceEffort(this.settings.aiEffortCause, "high");
+  }
+
+  aiMaxBudgetUsdAsk(): number {
+    return this.settings.aiMaxBudgetUsdAsk;
+  }
+
+  aiMaxBudgetUsdCause(): number {
+    return this.settings.aiMaxBudgetUsdCause;
+  }
+
+  // Kill-switch for the live Postiz account pre-fetch in /ai ask|cause.
+  aiPostizPrefetchEnabled(): boolean {
+    return this.settings.aiPostizPrefetchEnabled;
   }
 
   kbRefreshEnabled(): boolean {
@@ -437,6 +470,39 @@ export class SettingsStore {
     return this.settings.sentryAiRecordContent;
   }
 
+  // Sentry READ access (separate from the write-only DSN). Token decrypted on read.
+  sentryReadEnabled(): boolean {
+    return this.settings.sentryReadEnabled;
+  }
+
+  sentryReadToken(): string | null {
+    const raw = this.settings.sentryReadToken;
+    return raw != null ? decryptSecret(raw) : null;
+  }
+
+  sentryOrgSlug(): string | null {
+    return this.settings.sentryOrgSlug?.trim() || null;
+  }
+
+  sentryProjectSlug(): string | null {
+    return this.settings.sentryProjectSlug?.trim() || null;
+  }
+
+  // Data region of the read org — org tokens don't auto-route to EU (de.sentry.io).
+  sentryReadRegion(): "us" | "eu" {
+    return this.settings.sentryReadRegion === "eu" ? "eu" : "us";
+  }
+
+  // True only when read correlation is on AND fully credentialed.
+  sentryReadConfigured(): boolean {
+    return (
+      this.sentryReadEnabled() &&
+      !!this.sentryReadToken() &&
+      !!this.sentryOrgSlug() &&
+      !!this.sentryProjectSlug()
+    );
+  }
+
   sentryConfig(): SentryRuntimeConfig {
     return {
       dsn: this.sentryDsn(),
@@ -463,6 +529,27 @@ export class SettingsStore {
     this.settings = await this.prisma.botSettings.update({
       where: { id: "global" },
       data,
+    });
+  }
+
+  // Sentry READ credentials. The token is encrypted at rest; pass a field as
+  // undefined to leave it unchanged, null/"" to clear it.
+  async updateSentryRead(data: {
+    sentryReadEnabled?: boolean;
+    sentryReadToken?: string | null;
+    sentryOrgSlug?: string | null;
+    sentryProjectSlug?: string | null;
+    sentryReadRegion?: string;
+  }): Promise<void> {
+    const { sentryReadToken, ...rest } = data;
+    this.settings = await this.prisma.botSettings.update({
+      where: { id: "global" },
+      data: {
+        ...rest,
+        ...(sentryReadToken !== undefined
+          ? { sentryReadToken: sentryReadToken ? encryptSecret(sentryReadToken) : sentryReadToken }
+          : {}),
+      },
     });
   }
 
@@ -510,6 +597,11 @@ export class SettingsStore {
     aiCommandsEnabled?: boolean;
     aiModel?: string;
     aiModelLight?: string;
+    aiEffortAsk?: string;
+    aiEffortCause?: string;
+    aiMaxBudgetUsdAsk?: number;
+    aiMaxBudgetUsdCause?: number;
+    aiPostizPrefetchEnabled?: boolean;
     maxOpenTicketsPerUser?: number;
     ticketCooldownMinutes?: number;
     auditLogChannelId?: string | null;

@@ -43,8 +43,13 @@ import { EscalationTierStore } from "../config/EscalationTierStore";
 import { SessionStore } from "../auth/SessionStore";
 import { OAuthManager } from "../auth/OAuthManager";
 import { ClaudeCodeRunner, ClaudeRunOptions, ClaudeApiLimitError } from "./ClaudeCodeRunner";
+import Stripe from "stripe";
+import { PostizClient } from "./PostizClient";
+import { StripeClient } from "./StripeClient";
+import { SentryClient } from "./SentryClient";
 import {
   AiTicketContext,
+  AiSubscriptionSummary,
   AiToolAvailability,
   buildTicketContextBlock,
   buildSummarizePrompt,
@@ -1873,10 +1878,31 @@ export class DiscordBot {
     "generateVideoOptions",
   ].map((name) => `mcp__postiz__${name}`);
 
+  // Sentry's hosted MCP (mcp.sentry.dev) read-only tools, curated for support
+  // triage. Deliberately EXCLUDES every write tool (create_*/update_*) and
+  // analyze_issue_with_seer (triggers a paid Seer run). Explicit list, never a
+  // wildcard — a new server-side tool can't silently become callable.
+  private static readonly SENTRY_MCP_TOOLS = [
+    "whoami",
+    "find_organizations",
+    "find_projects",
+    "find_releases",
+    "list_issues",
+    "get_issue_details",
+    "get_issue_tag_values",
+    "list_issue_events",
+    "list_events",
+    "search_issues",
+    "search_events",
+    "search_issue_events",
+    "get_trace_details",
+  ].map((name) => `mcp__sentry__${name}`);
+
   private buildAiRunConfig(
     web: boolean,
     admin: boolean,
-    postizToken: string | null
+    postizToken: string | null,
+    sentryMcp = false
   ): { mcpConfig: Record<string, unknown> | null; extraAllowedTools: string[]; tools: AiToolAvailability } {
     const extraAllowedTools: string[] = [];
     const mcpServers: Record<string, unknown> = {};
@@ -1914,23 +1940,68 @@ export class DiscordBot {
       extraAllowedTools.push(...DiscordBot.POSTIZ_MCP_TOOLS);
     }
 
+    // Sentry read-only MCP for deep error investigation (cause only, when read
+    // access is configured). The hosted endpoint uses Sentry's custom
+    // `Sentry-Bearer` scheme — plain `Bearer` is reserved for MCP OAuth tokens.
+    const sentry = sentryMcp && this.settingsStore.sentryReadConfigured();
+    if (sentry) {
+      const token = this.settingsStore.sentryReadToken();
+      if (token) {
+        mcpServers.sentry = {
+          type: "http",
+          url: "https://mcp.sentry.dev/mcp",
+          headers: { Authorization: `Sentry-Bearer ${token}` },
+        };
+        extraAllowedTools.push(...DiscordBot.SENTRY_MCP_TOOLS);
+      }
+    }
+
     return {
       mcpConfig: Object.keys(mcpServers).length > 0 ? { mcpServers } : null,
       extraAllowedTools,
-      tools: { web, stripe, postiz },
+      tools: { web, stripe, postiz, sentry },
     };
   }
 
   private async gatherAiTicketContext(
     thread: ThreadChannel,
     ticket: TicketWithTag,
-    options: { stripeCustomerId: string | null; postizUserId: string | null }
+    options: { stripeCustomerId: string | null; postizUserId: string | null; postizToken: string | null }
   ): Promise<AiTicketContext> {
-    const [messages, notes, changes] = await Promise.all([
-      this.fetchAllThreadMessages(thread),
-      this.ticketStore.listAllNotes(thread.id),
-      this.ticketStore.listAllTagChanges(thread.id),
-    ]);
+    // Pre-fetch the customer's live Postiz account alongside the thread reads —
+    // one cheap parallel HTTP call that replaces the integrationList MCP turn and
+    // adds post-failure data the MCP can't return. Best-effort: never blocks/throws.
+    const postizClient = new PostizClient(this.config);
+    const wantPostiz = !!options.postizToken && this.settingsStore.aiPostizPrefetchEnabled();
+    // Admin-only: the caller sets stripeCustomerId only for admin invokers, so
+    // gating on it here preserves the "staff runs get no Stripe data" invariant.
+    const wantSub = !!options.stripeCustomerId && !!this.config.stripe.secretKey;
+    const wantSentry = this.settingsStore.sentryReadConfigured();
+    const [messages, notes, changes, postizAccount, subscription, relatedSentryIssues] =
+      await Promise.all([
+        this.fetchAllThreadMessages(thread),
+        this.ticketStore.listAllNotes(thread.id),
+        this.ticketStore.listAllTagChanges(thread.id),
+        wantPostiz
+          ? postizClient.fetchAccountSnapshot(options.postizToken as string).catch(() => null)
+          : Promise.resolve(null),
+        wantSub
+          ? new StripeClient(this.config)
+              .listSubscriptions(options.stripeCustomerId as string)
+              .then((subs) => this.summarizeSubscription(subs))
+              .catch(() => null)
+          : Promise.resolve(null),
+        wantSentry
+          ? new SentryClient({
+              token: this.settingsStore.sentryReadToken() as string,
+              orgSlug: this.settingsStore.sentryOrgSlug() as string,
+              projectSlug: this.settingsStore.sentryProjectSlug() as string,
+              region: this.settingsStore.sentryReadRegion(),
+            })
+              .findIssues(this.buildSentryQuery(ticket.question))
+              .catch(() => null)
+          : Promise.resolve(null),
+      ]);
 
     return {
       categoryLabel: this.categoryRegistry.getAll().find((c) => c.id === ticket.categoryId)?.label ?? null,
@@ -1964,8 +2035,68 @@ export class DiscordBot {
         actorName: c.actorName,
         createdAt: c.createdAt,
       })),
+      postizAccount,
+      subscription,
+      relatedSentryIssues,
       stripeCustomerId: options.stripeCustomerId,
       postizUserId: options.postizUserId,
+    };
+  }
+
+  // Builds a heuristic Sentry search from the ticket's opening question — a few
+  // significant keywords, always scoped to unresolved issues. Falls back to all
+  // recent unresolved (top by frequency) when the question yields no usable terms.
+  private static readonly SENTRY_STOPWORDS = new Set([
+    "the", "and", "for", "with", "that", "this", "have", "from", "your", "when", "what",
+    "cant", "cannot", "dont", "isnt", "wont", "doesnt", "about", "there", "their", "would",
+    "could", "should", "please", "help", "issue", "problem", "postiz", "account", "working",
+    "work", "tried", "still", "getting", "error", "errors", "again", "just", "some", "them",
+  ]);
+
+  private buildSentryQuery(question: string | null): string {
+    const terms = (question ?? "")
+      .toLowerCase()
+      .replace(/[^a-z0-9 ]+/g, " ")
+      .split(/\s+/)
+      .filter((w) => w.length >= 4 && !DiscordBot.SENTRY_STOPWORDS.has(w));
+    const unique = [...new Set(terms)].slice(0, 6);
+    return unique.length > 0 ? `is:unresolved ${unique.join(" ")}` : "is:unresolved";
+  }
+
+  // Reduces the customer's Stripe subscriptions to a one-line context summary.
+  // Admin-only path (gated by the caller). Defensive about Basil (SDK v20) field
+  // moves — current_period_end migrated onto subscription items.
+  private summarizeSubscription(subs: Stripe.Subscription[]): AiSubscriptionSummary | null {
+    if (subs.length === 0) return null;
+    const rank = (s: string): number =>
+      s === "active" || s === "trialing" ? 0 : s === "past_due" ? 1 : 2;
+    const sub = [...subs].sort((a, b) => rank(a.status) - rank(b.status))[0];
+    const price = sub.items?.data?.[0]?.price;
+    const product = price?.product;
+    const plan =
+      price?.nickname ||
+      (product && typeof product !== "string" && !(product as Stripe.DeletedProduct).deleted
+        ? (product as Stripe.Product).name
+        : null);
+    const interval = price?.recurring?.interval ?? null;
+    const amount =
+      price?.unit_amount != null
+        ? `$${(price.unit_amount / 100).toFixed(2)} ${(price.currency ?? "").toUpperCase()}${
+            interval ? ` / ${interval}` : ""
+          }`.trim()
+        : null;
+    const rawEnd =
+      (sub as unknown as { current_period_end?: number }).current_period_end ??
+      (sub.items?.data?.[0] as unknown as { current_period_end?: number } | undefined)
+        ?.current_period_end ??
+      null;
+    return {
+      status: sub.status,
+      plan,
+      interval,
+      amount,
+      currentPeriodEnd: typeof rawEnd === "number" ? new Date(rawEnd * 1000).toISOString() : null,
+      cancelAtPeriodEnd: Boolean(sub.cancel_at_period_end),
     };
   }
 
@@ -2127,6 +2258,8 @@ export class DiscordBot {
         // actually attached (admin invoker) — staff runs never mention it.
         stripeCustomerId: admin ? (session?.stripeCustomerId ?? null) : null,
         postizUserId: session?.postizUserId ?? null,
+        // Customer's own pos_ token scopes the pre-fetch to their org (all staff).
+        postizToken: session?.accessToken ?? null,
       });
       const contextBlock = buildTicketContextBlock(context);
 
@@ -2135,17 +2268,32 @@ export class DiscordBot {
       let runOptions: ClaudeRunOptions;
 
       if (sub === "ask" || sub === "cause") {
+        // Postiz MCP is intentionally NOT attached: its only account-specific tool
+        // (integrationList) is replaced by the pre-fetched account snapshot above,
+        // so we drop it to save a cold MCP start + an exploratory turn. Stripe MCP
+        // (admin) still attaches — hence null here, not the customer token. The
+        // Sentry read MCP is attached for `cause` only (deep investigation), gated
+        // on read access being configured.
         const { mcpConfig, extraAllowedTools, tools } = this.buildAiRunConfig(
           true,
           admin,
-          session?.accessToken ?? null
+          null,
+          sub === "cause"
         );
+        const isCause = sub === "cause";
         runOptions = {
           promptPrefix: null,
           extraAllowedTools,
           mcpConfig,
           timeoutMs: 300_000,
           model: this.settingsStore.aiModel(),
+          // No --max-turns in this CLI; bound the run with effort + a hard USD cap.
+          // Safe to cap because the pre-fetched account/Sentry context (below)
+          // removes most of the exploratory digging these runs used to do.
+          effort: isCause ? this.settingsStore.aiEffortCause() : this.settingsStore.aiEffortAsk(),
+          maxBudgetUsd: isCause
+            ? this.settingsStore.aiMaxBudgetUsdCause()
+            : this.settingsStore.aiMaxBudgetUsdAsk(),
           telemetry: { agentName: `ai-${sub}`, kind: "staff_command" },
         };
         if (sub === "ask") {
@@ -3059,6 +3207,7 @@ export class DiscordBot {
         [
           `**Main model:** \`${s.aiModel()}\` — customer answers, \`/ai ask\` & \`/ai cause\``,
           `**Light model:** \`${s.aiModelLight()}\` — the tool-less \`/ai summarize\` & \`/ai draft\``,
+          `**Speed limits:** ask → effort \`${s.aiEffortAsk()}\`, ≤ $${s.aiMaxBudgetUsdAsk()}/run · cause → effort \`${s.aiEffortCause()}\`, ≤ $${s.aiMaxBudgetUsdCause()}/run`,
           "",
           `**Knowledge-base auto-refresh:** ${s.kbRefreshEnabled() ? `on — every ${s.kbRefreshIntervalHours()}h` : "off"}`,
           `**Last refresh:** ${last ? `<t:${Math.floor(last.getTime() / 1000)}:R>` : "_never_"}`,
@@ -3068,7 +3217,12 @@ export class DiscordBot {
       );
 
     const modelRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
-      new ButtonBuilder().setCustomId("config_ai_model").setLabel("Set Models").setStyle(ButtonStyle.Primary)
+      new ButtonBuilder().setCustomId("config_ai_model").setLabel("Set Models").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("config_ai_perf").setLabel("Speed Limits").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId("config_toggle_postiz_prefetch")
+        .setLabel(`Postiz prefetch: ${s.aiPostizPrefetchEnabled() ? "on" : "off"}`)
+        .setStyle(s.aiPostizPrefetchEnabled() ? ButtonStyle.Success : ButtonStyle.Secondary)
     );
     const kbRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder()
@@ -3107,6 +3261,13 @@ export class DiscordBot {
           `**Traces sample rate:** ${s.sentryTracesSampleRate()} · **Profiles sample rate:** ${s.sentryProfilesSampleRate()}`,
           `**Logs:** ${s.sentryLogsEnabled() ? "on" : "off"} · **Debug:** ${s.sentryDebug() ? "on" : "off"} · **Default PII:** ${s.sentrySendDefaultPii() ? "on" : "off"}`,
           `**AI content capture:** ${s.sentryAiRecordContent() ? "on — prompts/responses/tool I/O recorded on AI spans" : "off — AI metadata only (tokens, cost, tools)"}`,
+          `**Read access (/ai error correlation):** ${
+            s.sentryReadConfigured()
+              ? `on — org \`${s.sentryOrgSlug()}\`, project \`${s.sentryProjectSlug()}\` (${s.sentryReadRegion().toUpperCase()})`
+              : s.sentryReadEnabled()
+                ? "on but incomplete ⚠️ — set token + org + project"
+                : "off"
+          }`,
           "",
           "First-time enable and rate/environment/logs/PII/AI changes apply live. Changing an **active DSN**, toggling **debug**, and first-enabling **console capture** or **profiling** need a restart.",
           "Traces 0 = keep instrumentation but send nothing; fully off = clear the DSN + restart.",
@@ -3137,6 +3298,17 @@ export class DiscordBot {
         .setStyle(s.sentryAiRecordContent() ? ButtonStyle.Success : ButtonStyle.Secondary)
     );
 
+    const readButtons = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId("config_sentry_read")
+        .setLabel("Set Read Access")
+        .setStyle(ButtonStyle.Primary),
+      new ButtonBuilder()
+        .setCustomId("config_sentry_toggle_read")
+        .setLabel(`Read: ${s.sentryReadEnabled() ? "on" : "off"}`)
+        .setStyle(s.sentryReadEnabled() ? ButtonStyle.Success : ButtonStyle.Secondary)
+    );
+
     const actionButtons = new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder()
         .setCustomId("config_sentry_test")
@@ -3146,7 +3318,7 @@ export class DiscordBot {
       new ButtonBuilder().setCustomId("config_back_main").setLabel("Back").setStyle(ButtonStyle.Secondary)
     );
 
-    return { embeds: [embed], components: [setupButtons, toggleButtons, actionButtons] };
+    return { embeds: [embed], components: [setupButtons, toggleButtons, readButtons, actionButtons] };
   }
 
   // Applies the current settings to the running SDK and renders the outcome
@@ -3714,6 +3886,18 @@ export class DiscordBot {
       return;
     }
 
+    if (id === "config_toggle_postiz_prefetch") {
+      await this.settingsStore.updateGeneral({
+        aiPostizPrefetchEnabled: !this.settingsStore.aiPostizPrefetchEnabled(),
+      });
+      this.auditConfig(
+        interaction,
+        `Postiz account pre-fetch → ${this.settingsStore.aiPostizPrefetchEnabled() ? "on" : "off"}`
+      );
+      await interaction.update(this.buildAiPanel());
+      return;
+    }
+
     if (id === "config_kb_refresh_now") {
       // git pull can take a moment — defer, then report the outcome ephemerally.
       await interaction.deferReply({ flags: 64 });
@@ -3950,6 +4134,59 @@ export class DiscordBot {
         )
       );
       await interaction.showModal(modal);
+      return;
+    }
+
+    if (id === "config_sentry_read") {
+      const s = this.settingsStore;
+      const modal = new ModalBuilder().setCustomId("config_sentry_read_modal").setTitle("Sentry Read Access");
+      modal.addComponents(
+        new ActionRowBuilder<TextInputBuilder>().addComponents(
+          new TextInputBuilder()
+            .setCustomId("token")
+            .setLabel("Auth token (blank = keep current)")
+            .setStyle(TextInputStyle.Short)
+            .setRequired(false)
+            .setPlaceholder(s.sentryReadToken() ? "•••• stored (leave blank to keep)" : "event:read, project:read")
+        ),
+        new ActionRowBuilder<TextInputBuilder>().addComponents(
+          new TextInputBuilder()
+            .setCustomId("org")
+            .setLabel("Organization slug")
+            .setStyle(TextInputStyle.Short)
+            .setRequired(false)
+            .setValue(s.sentryOrgSlug() ?? "")
+        ),
+        new ActionRowBuilder<TextInputBuilder>().addComponents(
+          new TextInputBuilder()
+            .setCustomId("project")
+            .setLabel("Project slug")
+            .setStyle(TextInputStyle.Short)
+            .setRequired(false)
+            .setValue(s.sentryProjectSlug() ?? "")
+        ),
+        new ActionRowBuilder<TextInputBuilder>().addComponents(
+          new TextInputBuilder()
+            .setCustomId("region")
+            .setLabel("Data region: us or eu")
+            .setStyle(TextInputStyle.Short)
+            .setRequired(true)
+            .setValue(s.sentryReadRegion())
+        )
+      );
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (id === "config_sentry_toggle_read") {
+      await this.settingsStore.updateSentryRead({
+        sentryReadEnabled: !this.settingsStore.sentryReadEnabled(),
+      });
+      this.auditConfig(
+        interaction,
+        `Sentry read access → ${this.settingsStore.sentryReadEnabled() ? "on" : "off"}`
+      );
+      await interaction.update(this.buildSentryPanel());
       return;
     }
 
@@ -4373,6 +4610,43 @@ export class DiscordBot {
       return;
     }
 
+    if (id === "config_ai_perf") {
+      const s = this.settingsStore;
+      const modal = new ModalBuilder().setCustomId("config_ai_perf_modal").setTitle("AI Speed Limits");
+      const effortAsk = new TextInputBuilder()
+        .setCustomId("effort_ask")
+        .setLabel("ask effort (low/medium/high/max)")
+        .setStyle(TextInputStyle.Short)
+        .setRequired(true)
+        .setValue(s.aiEffortAsk());
+      const effortCause = new TextInputBuilder()
+        .setCustomId("effort_cause")
+        .setLabel("cause effort (low/medium/high/max)")
+        .setStyle(TextInputStyle.Short)
+        .setRequired(true)
+        .setValue(s.aiEffortCause());
+      const budgetAsk = new TextInputBuilder()
+        .setCustomId("budget_ask")
+        .setLabel("ask budget (USD per run)")
+        .setStyle(TextInputStyle.Short)
+        .setRequired(true)
+        .setValue(String(s.aiMaxBudgetUsdAsk()));
+      const budgetCause = new TextInputBuilder()
+        .setCustomId("budget_cause")
+        .setLabel("cause budget (USD per run)")
+        .setStyle(TextInputStyle.Short)
+        .setRequired(true)
+        .setValue(String(s.aiMaxBudgetUsdCause()));
+      modal.addComponents(
+        new ActionRowBuilder<TextInputBuilder>().addComponents(effortAsk),
+        new ActionRowBuilder<TextInputBuilder>().addComponents(effortCause),
+        new ActionRowBuilder<TextInputBuilder>().addComponents(budgetAsk),
+        new ActionRowBuilder<TextInputBuilder>().addComponents(budgetCause)
+      );
+      await interaction.showModal(modal);
+      return;
+    }
+
     if (id === "config_kb_interval") {
       const modal = new ModalBuilder().setCustomId("config_kb_interval_modal").setTitle("KB Refresh Interval");
       const input = new TextInputBuilder()
@@ -4638,6 +4912,44 @@ export class DiscordBot {
       return;
     }
 
+    if (interaction.customId === "config_sentry_read_modal") {
+      const token = interaction.fields.getTextInputValue("token").trim();
+      const org = interaction.fields.getTextInputValue("org").trim();
+      const project = interaction.fields.getTextInputValue("project").trim();
+      const region = interaction.fields.getTextInputValue("region").trim().toLowerCase();
+      if (region !== "us" && region !== "eu") {
+        await interaction.reply({
+          embeds: [makeEmbed("Data region must be `us` or `eu`.", COLORS.danger)],
+          flags: 64,
+        });
+        return;
+      }
+      await this.settingsStore.updateSentryRead({
+        sentryOrgSlug: org || null,
+        sentryProjectSlug: project || null,
+        sentryReadRegion: region,
+        // Blank token = leave the stored (encrypted) one unchanged.
+        ...(token ? { sentryReadToken: token } : {}),
+      });
+      // Deliberately no token value in the audit line.
+      this.auditConfig(
+        interaction,
+        `Sentry read creds updated (org ${org || "—"}, project ${project || "—"}, region ${region}${token ? ", token set" : ""})`
+      );
+      await interaction.reply({
+        embeds: [
+          makeEmbed(
+            this.settingsStore.sentryReadConfigured()
+              ? "Sentry read access saved — configured and on."
+              : "Sentry read access saved — still incomplete (need token + org + project, and Read toggled on).",
+            COLORS.success
+          ),
+        ],
+        flags: 64,
+      });
+      return;
+    }
+
     if (interaction.customId === "config_sentry_options_modal") {
       const environment = interaction.fields.getTextInputValue("environment").trim();
       const tracesRaw = interaction.fields.getTextInputValue("traces_rate").trim();
@@ -4889,6 +5201,49 @@ export class DiscordBot {
       await interaction.reply({
         embeds: [
           makeEmbed(`AI models updated — main \`${model}\`, light \`${modelLight}\`. Applies to the next run.`, COLORS.success),
+        ],
+        flags: 64,
+      });
+      return;
+    }
+
+    if (interaction.customId === "config_ai_perf_modal") {
+      const effortAsk = interaction.fields.getTextInputValue("effort_ask").trim().toLowerCase();
+      const effortCause = interaction.fields.getTextInputValue("effort_cause").trim().toLowerCase();
+      const budgetAsk = Number(interaction.fields.getTextInputValue("budget_ask").trim());
+      const budgetCause = Number(interaction.fields.getTextInputValue("budget_cause").trim());
+      const validEfforts = ["low", "medium", "high", "max"];
+      if (!validEfforts.includes(effortAsk) || !validEfforts.includes(effortCause)) {
+        await interaction.reply({
+          embeds: [makeEmbed("Effort must be one of: low, medium, high, max.", COLORS.danger)],
+          flags: 64,
+        });
+        return;
+      }
+      const okBudget = (n: number) => Number.isFinite(n) && n >= 0.05 && n <= 50;
+      if (!okBudget(budgetAsk) || !okBudget(budgetCause)) {
+        await interaction.reply({
+          embeds: [makeEmbed("Budget must be a number between 0.05 and 50 (USD per run).", COLORS.danger)],
+          flags: 64,
+        });
+        return;
+      }
+      await this.settingsStore.updateGeneral({
+        aiEffortAsk: effortAsk,
+        aiEffortCause: effortCause,
+        aiMaxBudgetUsdAsk: budgetAsk,
+        aiMaxBudgetUsdCause: budgetCause,
+      });
+      this.auditConfig(
+        interaction,
+        `AI speed limits → ask ${effortAsk}/$${budgetAsk}, cause ${effortCause}/$${budgetCause}`
+      );
+      await interaction.reply({
+        embeds: [
+          makeEmbed(
+            `AI speed limits updated — ask: effort \`${effortAsk}\`, ≤ $${budgetAsk}/run; cause: effort \`${effortCause}\`, ≤ $${budgetCause}/run. Applies to the next run.`,
+            COLORS.success
+          ),
         ],
         flags: 64,
       });

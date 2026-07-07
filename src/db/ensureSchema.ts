@@ -325,9 +325,22 @@ const STATEMENTS: string[] = [
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "sentryDebug" BOOLEAN NOT NULL DEFAULT false`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "sentrySendDefaultPii" BOOLEAN NOT NULL DEFAULT false`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "sentryAiRecordContent" BOOLEAN NOT NULL DEFAULT true`,
+  // Sentry READ access for /ai error correlation (token encrypted at rest).
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "sentryReadEnabled" BOOLEAN NOT NULL DEFAULT false`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "sentryReadToken" TEXT`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "sentryOrgSlug" TEXT`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "sentryProjectSlug" TEXT`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "sentryReadRegion" TEXT NOT NULL DEFAULT 'us'`,
   // AI models + knowledge-base auto-refresh (paired with /config → AI & Knowledge).
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "aiModel" TEXT NOT NULL DEFAULT 'sonnet'`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "aiModelLight" TEXT NOT NULL DEFAULT 'haiku'`,
+  // /ai ask|cause bounding levers (no --max-turns in the pinned CLI).
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "aiEffortAsk" TEXT NOT NULL DEFAULT 'medium'`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "aiEffortCause" TEXT NOT NULL DEFAULT 'high'`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "aiMaxBudgetUsdAsk" DOUBLE PRECISION NOT NULL DEFAULT 1.0`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "aiMaxBudgetUsdCause" DOUBLE PRECISION NOT NULL DEFAULT 3.0`,
+  // Pre-fetch the customer's live Postiz account into /ai context (prod kill-switch).
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "aiPostizPrefetchEnabled" BOOLEAN NOT NULL DEFAULT true`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "kbRefreshEnabled" BOOLEAN NOT NULL DEFAULT true`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "kbRefreshIntervalHours" INTEGER NOT NULL DEFAULT 6`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "kbLastRefreshAt" TIMESTAMP(3)`,

@@ -55,6 +55,13 @@ export interface ClaudeRunOptions {
   timeoutMs?: number;
   /** Model alias/id passed to `--model` (default "sonnet"). */
   model?: string;
+  /**
+   * Passed as `--effort <level>`. Bounds how deeply the model explores per run —
+   * the CLI 2.1.81 has no `--max-turns`, so this + maxBudgetUsd are the caps.
+   */
+  effort?: "low" | "medium" | "high" | "max";
+  /** Passed as `--max-budget-usd <amount>` — a hard per-run spend (and thus latency) cap. */
+  maxBudgetUsd?: number;
   /** Labels the run's gen_ai spans/metrics. */
   telemetry?: ClaudeRunTelemetry;
 }
@@ -136,6 +143,12 @@ export class ClaudeCodeRunner {
             "--verbose",
             "--include-partial-messages",
           ];
+          // Bounding levers (no `--max-turns` in this CLI). Safe to cap because
+          // ask/cause pre-load the account/Sentry context they'd otherwise dig for.
+          if (options.effort) args.push("--effort", options.effort);
+          if (options.maxBudgetUsd !== undefined) {
+            args.push("--max-budget-usd", String(options.maxBudgetUsd));
+          }
           if (options.mcpConfig) {
             // --strict-mcp-config: cwd is search/ with two cloned third-party
             // repos — never pick up an .mcp.json from them.
@@ -147,7 +160,9 @@ export class ClaudeCodeRunner {
           const child = spawn(claudeBin, args, {
             cwd: this.searchDir,
             stdio: ["pipe", "pipe", "pipe"],
-            timeout: options.timeoutMs ?? 120_000,
+            // NB: no built-in `timeout` here — Node fires a single SIGTERM with no
+            // escalation, which a wedged CLI can ignore. We arm an explicit
+            // SIGTERM→SIGKILL timer below (see killTimer) so runs can't overrun.
             env: {
               ...process.env,
               ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY,
@@ -164,6 +179,8 @@ export class ClaudeCodeRunner {
           let stderr = "";
           let buffer = "";
           let apiLimitDetected = false;
+          let timedOut = false;
+          let killTimer: ReturnType<typeof setTimeout> | null = null;
 
           // gen_ai child spans. stdout "data" callbacks do not run inside the
           // agent span's async context, so children are created with an
@@ -207,6 +224,10 @@ export class ClaudeCodeRunner {
           const finalize = (outcome: RunOutcome) => {
             if (finalized) return;
             finalized = true;
+            if (killTimer) {
+              clearTimeout(killTimer);
+              killTimer = null;
+            }
             for (const [, entry] of toolSpans) {
               entry.span.setStatus({ code: SPAN_STATUS_ERROR, message: "aborted" });
               entry.span.end();
@@ -272,6 +293,27 @@ export class ClaudeCodeRunner {
               "millisecond"
             );
           };
+
+          // Explicit run timeout: SIGTERM (lets claude tear down its MCP children),
+          // then SIGKILL after a grace period as a backstop. Cleared by finalize()
+          // on normal exit. Mirrors the API-limit kill escalation below.
+          const timeoutMs = options.timeoutMs ?? 120_000;
+          killTimer = setTimeout(() => {
+            timedOut = true;
+            claudeLog.warn("run timed out — terminating", {
+              "ai.agent": agentName,
+              "timeout_ms": timeoutMs,
+            });
+            try {
+              if (!child.killed) child.kill("SIGTERM");
+            } catch {}
+            setTimeout(() => {
+              try {
+                if (!child.killed) child.kill("SIGKILL");
+              } catch {}
+            }, 2_000).unref?.();
+          }, timeoutMs);
+          killTimer.unref?.();
 
           const reportApiLimit = () => {
             // One grouped warning issue for every limit hit instead of noise.
@@ -610,6 +652,17 @@ export class ClaudeCodeRunner {
               finalize("api_limit");
               reportApiLimit();
               reject(new ClaudeApiLimitError(errorText));
+              return;
+            }
+
+            if (timedOut) {
+              claudeLog.error("run timed out", undefined, {
+                "ai.agent": agentName,
+                "timeout_ms": options.timeoutMs ?? 120_000,
+                "process.signal": signal ?? "",
+              });
+              finalize("error");
+              reject(new Error("Claude Code run timed out"));
               return;
             }
 
