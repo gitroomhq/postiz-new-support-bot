@@ -748,6 +748,8 @@ export class DiscordBot {
     const sub = interaction.options.getSubcommand();
     if (sub === "add") {
       await this.handleCannedAdd(interaction);
+    } else if (sub === "view") {
+      await this.handleCannedView(interaction, member);
     } else if (sub === "delete") {
       await this.handleCannedDelete(interaction, member);
     } else {
@@ -861,6 +863,49 @@ export class DiscordBot {
       threadId: channel.id,
       fields: [{ name: "Name", value: `\`${canned.name}\``, inline: true }],
     });
+  }
+
+  // Preview privately (ephemeral) — unlike /canned use, this never posts to the
+  // ticket and works anywhere. With no name it lists everything the member can see.
+  private async handleCannedView(interaction: ChatInputCommandInteraction, member: GuildMember): Promise<void> {
+    const name = interaction.options.getString("name");
+    if (!name) {
+      const all = this.cannedStore.listFor(member.id);
+      if (all.length === 0) {
+        await interaction.reply({
+          embeds: [makeEmbed("No canned responses yet. Create one with `/canned add`.", COLORS.warn)],
+          flags: 64,
+        });
+        return;
+      }
+      const list = all
+        .map((c) => `• \`${c.name}\`${c.ownerId ? " (only you)" : ""}`)
+        .join("\n")
+        .slice(0, 4096);
+      const embed = new EmbedBuilder()
+        .setTitle("Canned responses")
+        .setDescription(list)
+        .setColor(COLORS.brand)
+        .setFooter({ text: "Preview one with /canned view name:… · post it with /canned use" });
+      await interaction.reply({ embeds: [embed], flags: 64 });
+      return;
+    }
+
+    const canned = this.cannedStore.resolve(name, member.id);
+    if (!canned) {
+      await interaction.reply({
+        embeds: [makeEmbed(`No canned response named \`${name}\`. Create one with \`/canned add\`.`, COLORS.warn)],
+        flags: 64,
+      });
+      return;
+    }
+
+    const embed = new EmbedBuilder()
+      .setTitle(`\`${canned.name}\`${canned.ownerId ? " (only you)" : ""}`)
+      .setDescription(canned.content.slice(0, 4096))
+      .setColor(COLORS.brand)
+      .setFooter({ text: `Post it in a ticket with /canned use ${canned.name}` });
+    await interaction.reply({ embeds: [embed], flags: 64 });
   }
 
   private async handleCannedDelete(interaction: ChatInputCommandInteraction, member: GuildMember): Promise<void> {
@@ -5619,6 +5664,20 @@ export class DiscordBot {
                 name: "name",
                 description: "Template name",
                 required: true,
+                autocomplete: true,
+              },
+            ],
+          },
+          {
+            type: 1, // SUB_COMMAND
+            name: "view",
+            description: "Privately preview a canned response, or list them all",
+            options: [
+              {
+                type: 3, // STRING
+                name: "name",
+                description: "Template to preview (omit to list all available)",
+                required: false,
                 autocomplete: true,
               },
             ],
