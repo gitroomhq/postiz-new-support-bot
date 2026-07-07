@@ -249,7 +249,7 @@ export class SubscriptionsHub {
         const session = await this.ctx.sessions.getOwnedSession(token, interaction);
         if (!session?.customerId || !session.newPriceId) return;
         await interaction.deferUpdate();
-        await this.ctx.sessions.tryRender(interaction, async () => {
+        await this.ctx.sessions.runExclusive(token, interaction, async () => {
           const choice = session.discountChoice ?? "keep";
           const isPromo = choice.startsWith("pc:");
           const noDiscount = choice === "keep" || choice === "remove";

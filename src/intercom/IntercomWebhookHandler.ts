@@ -158,7 +158,8 @@ export class IntercomWebhookHandler {
       // Layer 3 — bounded defer: outbound content still queued for this thread
       // could produce this exact part. claimPart above already succeeded, so
       // roll the claim back before deferring — the retry must be able to claim
-      // again.
+      // again. `attempt` here is the echo-defer count (tracked separately from
+      // real-failure attempts), so deferral can't exhaust the retry budget.
       if (attempt < MAX_DEFER_ATTEMPTS && (await this.hasPendingOutboundContent(threadId))) {
         await this.releaseClaim(kind, String(part.id));
         throw new DeferEchoError();

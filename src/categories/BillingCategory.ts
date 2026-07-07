@@ -196,13 +196,13 @@ export class BillingCategory extends BaseCategory {
         .setColor(0x5865f2);
 
       const acceptButton = new ButtonBuilder()
-        .setCustomId(`billing_accept_discount:${interaction.user.id}:${invoice.subscriptionId}:${invoice.chargeId}`)
+        .setCustomId(`bill_disc_ok:${interaction.user.id}:${invoice.subscriptionId}:${invoice.chargeId}`)
         .setLabel("Yes, 50% off next month")
         .setEmoji("✅")
         .setStyle(ButtonStyle.Success);
 
       const declineButton = new ButtonBuilder()
-        .setCustomId(`billing_decline_discount:${interaction.user.id}:${invoice.chargeId}:${invoice.subscriptionId}`)
+        .setCustomId(`bill_disc_no:${interaction.user.id}:${invoice.chargeId}:${invoice.subscriptionId}`)
         .setLabel("No thanks, refund & cancel")
         .setEmoji("💰")
         .setStyle(ButtonStyle.Danger);
@@ -285,12 +285,12 @@ export class BillingCategory extends BaseCategory {
     await this.disableButtons(interaction);
 
     const confirmButton = new ButtonBuilder()
-      .setCustomId(`billing_confirm_refund:${interaction.user.id}:${chargeId}:${subscriptionId}`)
+      .setCustomId(`bill_ref_ok:${interaction.user.id}:${chargeId}:${subscriptionId}`)
       .setLabel("Yes, process my refund and cancel my subscription")
       .setStyle(ButtonStyle.Danger);
 
     const cancelButton = new ButtonBuilder()
-      .setCustomId(`billing_cancel_refund:${interaction.user.id}`)
+      .setCustomId(`bill_ref_no:${interaction.user.id}`)
       .setLabel("Cancel")
       .setStyle(ButtonStyle.Secondary);
 
@@ -385,8 +385,14 @@ export class BillingCategory extends BaseCategory {
       } else {
         const session = await this.sessionStore.getSession(interaction.user.id);
         if (session?.stripeCustomerId) {
-          const cancelled = await this.stripeClient.cancelNewestActiveSubscription(session.stripeCustomerId);
-          cancelledSubscriptionId = cancelled?.subscriptionId ?? null;
+          const cancelled = await this.stripeClient.cancelSoleActiveSubscription(session.stripeCustomerId);
+          if (cancelled && "ambiguous" in cancelled) {
+            // The charge couldn't be tied to a subscription and the customer has
+            // several active — don't guess which to cancel; hand off to staff.
+            cancelFailed = true;
+          } else {
+            cancelledSubscriptionId = cancelled?.subscriptionId ?? null;
+          }
         }
       }
     } catch (error) {
@@ -711,8 +717,14 @@ export class BillingCategory extends BaseCategory {
       } else {
         const session = await this.sessionStore.getSession(review.customerId);
         if (session?.stripeCustomerId) {
-          const cancelled = await this.stripeClient.cancelNewestActiveSubscription(session.stripeCustomerId);
-          cancelledSubscriptionId = cancelled?.subscriptionId ?? null;
+          const cancelled = await this.stripeClient.cancelSoleActiveSubscription(session.stripeCustomerId);
+          if (cancelled && "ambiguous" in cancelled) {
+            // The charge couldn't be tied to a subscription and the customer has
+            // several active — don't guess which to cancel; hand off to staff.
+            cancelFailed = true;
+          } else {
+            cancelledSubscriptionId = cancelled?.subscriptionId ?? null;
+          }
         }
       }
     } catch (error) {
@@ -848,7 +860,7 @@ export class BillingCategory extends BaseCategory {
         .setCustomId("refund_done")
         .setLabel(
           label ??
-            (interaction.customId.startsWith("billing_confirm_refund:") ? "Refund & Cancellation Processed" : "Cancelled")
+            (interaction.customId.startsWith("bill_ref_ok:") ? "Refund & Cancellation Processed" : "Cancelled")
         )
         .setStyle(ButtonStyle.Secondary)
         .setDisabled(true)

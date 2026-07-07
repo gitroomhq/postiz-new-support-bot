@@ -110,7 +110,7 @@ export class SessionStore {
   // Atomically claims a charge for a billing action. The unique index on stripeInvoiceId
   // is the lock: whichever concurrent confirm inserts first wins, the loser gets false.
   // Claim BEFORE calling Stripe; release on Stripe failure so the user can retry.
-  async claimBillingAction(discordUserId: string, chargeId: string, action: "refund" | "discount"): Promise<boolean> {
+  async claimBillingAction(discordUserId: string, chargeId: string, action: "refund" | "discount" | "admin_refund"): Promise<boolean> {
     try {
       await this.prisma.billingAction.create({
         data: { discordUserId, stripeInvoiceId: chargeId, action },
@@ -126,7 +126,9 @@ export class SessionStore {
     await this.prisma.billingAction.deleteMany({ where: { stripeInvoiceId: chargeId } });
   }
 
-  // Refunds executed in the trailing window, across all users (velocity guardrail).
+  // Self-service refunds in the trailing window, across all users (velocity
+  // guardrail). Admin refunds are tagged "admin_refund" and deliberately excluded
+  // so staff actions don't push unrelated customers into manual review.
   async countRefundsSince(since: Date): Promise<number> {
     return this.prisma.billingAction.count({
       where: { action: "refund", createdAt: { gte: since } },

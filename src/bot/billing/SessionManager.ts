@@ -10,6 +10,11 @@ const logger = new Logger("billing-admin");
 // TTL is sliding: every owned access refreshes the timestamp.
 export class SessionManager {
   private sessions = new Map<string, BillAdminSession>();
+  // Panel-session tokens whose money-moving confirm handler is currently in
+  // flight. A human double-click arrives as a *second* interaction (new id →
+  // new Stripe idempotency key), so the per-click keys can't dedupe it — this
+  // serializes writes per panel so only the first click executes.
+  private inFlight = new Set<string>();
 
   get(token: string): BillAdminSession | undefined {
     return this.sessions.get(token);
@@ -73,6 +78,20 @@ export class SessionManager {
       await interaction
         .editReply({ embeds: [stripeErrorEmbed(error)], components: [backRow()] })
         .catch(() => undefined);
+    }
+  }
+
+  // tryRender for money-moving handlers: refuses to run a second write for the
+  // same panel session while one is still in flight. The duplicate click was
+  // already deferUpdate-acked by the caller, so dropping it silently shows no
+  // error and the in-flight call renders the result for everyone.
+  async runExclusive(token: string, interaction: RenderInteraction, work: () => Promise<void>): Promise<void> {
+    if (this.inFlight.has(token)) return;
+    this.inFlight.add(token);
+    try {
+      await this.tryRender(interaction, work);
+    } finally {
+      this.inFlight.delete(token);
     }
   }
 }

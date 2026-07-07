@@ -1100,7 +1100,7 @@ export class InvoicesHub {
     const state = this.getState(token);
     if (!session || !state.invoiceId || state.cnAmountMinor == null || !state.cnMode) return;
     await interaction.deferUpdate();
-    await this.ctx.sessions.tryRender(interaction, async () => {
+    await this.ctx.sessions.runExclusive(token, interaction, async () => {
       const amountText = state.cnCurrency ? this.fmt(state.cnAmountMinor!, state.cnCurrency) : String(state.cnAmountMinor);
       try {
         const cn = await this.ctx.stripe.createCreditNote(

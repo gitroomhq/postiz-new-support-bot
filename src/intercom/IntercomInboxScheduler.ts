@@ -74,14 +74,17 @@ export class IntercomInboxScheduler {
       },
       async (span) => {
         try {
-          await this.handler.process(event.topic, event.payload, event.attempts);
+          // The handler's echo-defer bound is measured by deferAttempts, NOT the
+          // real-failure `attempts` counter — otherwise heavy deferral would eat
+          // the retry budget and dead-letter a legit reply on its first real error.
+          await this.handler.process(event.topic, event.payload, event.deferAttempts);
           await this.store.deleteInbound(event.id);
           metricCount("intercom.inbox.processed", 1, { topic: event.topic, outcome: "ok" });
         } catch (e) {
           if (e instanceof DeferEchoError) {
-            await this.store.markInboundRetry(
+            await this.store.markInboundDefer(
               event.id,
-              event.attempts + 1,
+              event.deferAttempts + 1,
               new Date(Date.now() + DEFER_BACKOFF_MS),
               e.message
             );

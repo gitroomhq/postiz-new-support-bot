@@ -298,7 +298,8 @@ model IntercomInboxEvent {
   topic         String
   payload       Json
   status        String   @default("PENDING") // PENDING | DEAD
-  attempts      Int      @default(0)
+  attempts      Int      @default(0) // real processing failures (dead-letters at MAX_ATTEMPTS)
+  deferAttempts Int      @default(0) // echo-suppression defers (bounded by MAX_DEFER_ATTEMPTS); kept separate so heavy deferral doesn't burn the retry budget
   nextAttemptAt DateTime @default(now())
   lastError     String?
   receivedAt    DateTime @default(now())

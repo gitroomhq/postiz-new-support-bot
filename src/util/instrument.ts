@@ -10,7 +10,7 @@ export const SPAN_STATUS_OK = 1 as const;
 export const SPAN_STATUS_ERROR = 2 as const;
 
 // Every dynamic customId in the codebase is "prefix:arg1:arg2..." (e.g.
-// "csat:5", "create_issue:123", "billing_accept_discount:ch_..."); static ids
+// "csat:5", "create_issue:123", "bill_disc_ok:123:sub_...:ch_..."); static ids
 // have no colon. Keeping only the prefix bounds span-name cardinality.
 export function normalizeCustomId(customId: string): string {
   return customId.split(":")[0];
@@ -41,7 +41,7 @@ export interface DiscordSpanCtx {
     | "discord.autocomplete"
     | "discord.message"
     | "discord.event";
-  name: string; // e.g. "/ai ask", "button billing_confirm_refund"
+  name: string; // e.g. "/ai ask", "button bill_ref_ok"
   userId?: string;
   username?: string;
   guildId?: string | null;

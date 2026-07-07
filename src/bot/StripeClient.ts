@@ -33,10 +33,15 @@ export class StripeClient {
       created: { gte: oneMonthAgo },
     });
 
-    // amount > 100 skips the $1 card-verification charges Postiz creates —
-    // they aren't subscription charges and must never be offered for refund.
+    // Skip the ~$1 card-verification charges Postiz creates — they aren't
+    // subscription charges and must never be offered for refund. The threshold is
+    // per-currency: zero-decimal currencies (JPY/KRW…) have no minor units, so a
+    // flat "100 = $1" would wrongly discard real small charges there.
     const succeededCharge = charges.data.find(
-      (c) => c.status === "succeeded" && !c.refunded && c.amount > 100
+      (c) =>
+        c.status === "succeeded" &&
+        !c.refunded &&
+        c.amount > (StripeClient.isZeroDecimal(c.currency) ? 1 : 100)
     ) as ChargeWithInvoice | undefined;
 
     if (!succeededCharge) return null;
@@ -93,21 +98,26 @@ export class StripeClient {
     await this.stripe.subscriptions.cancel(subscriptionId);
   }
 
-  // Cancels the customer's most recently created non-canceled subscription and
-  // names it, so callers can audit exactly which subscription was cancelled.
-  async cancelNewestActiveSubscription(customerId: string): Promise<{ subscriptionId: string } | null> {
+  // Cancels the customer's SOLE active subscription. Used only when a refund's
+  // charge couldn't be tied to a specific subscription; in that case cancelling
+  // "the newest" is a guess that can kill an unrelated (e.g. just-upgraded) plan.
+  // Returns { ambiguous: true } when the customer has more than one active
+  // subscription so the caller can hand off to staff instead of guessing wrong,
+  // or null when there is nothing to cancel.
+  async cancelSoleActiveSubscription(
+    customerId: string
+  ): Promise<{ subscriptionId: string } | { ambiguous: true } | null> {
     const subscriptions = await this.stripe.subscriptions.list({
       customer: customerId,
       status: "all",
     });
 
-    const newest = subscriptions.data
-      .filter((s) => s.status !== "canceled")
-      .sort((a, b) => b.created - a.created)[0];
-    if (!newest) return null;
+    const active = subscriptions.data.filter((s) => s.status !== "canceled");
+    if (active.length === 0) return null;
+    if (active.length > 1) return { ambiguous: true };
 
-    await this.stripe.subscriptions.cancel(newest.id);
-    return { subscriptionId: newest.id };
+    await this.stripe.subscriptions.cancel(active[0].id);
+    return { subscriptionId: active[0].id };
   }
 
   async refundCharge(chargeId: string, idempotencyKey?: string): Promise<{ refundId: string; amount: number; currency: string }> {

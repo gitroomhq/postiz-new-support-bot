@@ -1234,10 +1234,10 @@ export class DiscordBot {
     }
 
     if (
-      interaction.customId.startsWith("billing_accept_discount:") ||
-      interaction.customId.startsWith("billing_decline_discount:") ||
-      interaction.customId.startsWith("billing_confirm_refund:") ||
-      interaction.customId.startsWith("billing_cancel_refund:")
+      interaction.customId.startsWith("bill_disc_ok:") ||
+      interaction.customId.startsWith("bill_disc_no:") ||
+      interaction.customId.startsWith("bill_ref_ok:") ||
+      interaction.customId.startsWith("bill_ref_no:")
     ) {
       const allowedUserId = interaction.customId.split(":")[1];
       if (interaction.user.id !== allowedUserId) {
@@ -1245,11 +1245,11 @@ export class DiscordBot {
         return;
       }
       const billing = this.getBillingCategory();
-      if (interaction.customId.startsWith("billing_accept_discount:")) {
+      if (interaction.customId.startsWith("bill_disc_ok:")) {
         await billing.handleAcceptDiscount(interaction);
-      } else if (interaction.customId.startsWith("billing_decline_discount:")) {
+      } else if (interaction.customId.startsWith("bill_disc_no:")) {
         await billing.handleDeclineDiscount(interaction);
-      } else if (interaction.customId.startsWith("billing_confirm_refund:")) {
+      } else if (interaction.customId.startsWith("bill_ref_ok:")) {
         await billing.handleConfirmRefund(interaction);
       } else {
         await billing.handleCancelRefund(interaction);

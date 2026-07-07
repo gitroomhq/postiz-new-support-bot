@@ -252,8 +252,12 @@ export class IntercomOutboxScheduler {
     try {
       return await fn(primary);
     } catch (e) {
+      // Only permission-shaped statuses count as authorship rejection. 422 is a
+      // generic validation error (bad state transition, etc.) — treating it as
+      // "Operator can't author" could permanently disable the Operator on a
+      // coincidental fallback success.
       const rejectable =
-        e instanceof IntercomHttpError && (e.status === 403 || e.status === 404 || e.status === 422);
+        e instanceof IntercomHttpError && (e.status === 403 || e.status === 404);
       if (!rejectable || !operator || !fallback || operator === fallback || primary !== operator) throw e;
       const result = await fn(fallback); // a failure here propagates — the admin wasn't the problem
       await this.settingsStore.updateIntercom({ intercomOperatorAdminId: null });

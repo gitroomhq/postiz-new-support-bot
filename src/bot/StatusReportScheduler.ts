@@ -14,6 +14,10 @@ const CHECK_INTERVAL_MS = 60 * 1000;
 
 export class StatusReportScheduler {
   private timer: NodeJS.Timeout | null = null;
+  // Guards against a publish outlasting the 60s tick: a second tick could pass
+  // the shouldPublish gate before recordReportRun persists and double-post. (The
+  // Intercom schedulers use the same draining pattern.)
+  private publishing = false;
 
   constructor(
     private client: Client,
@@ -55,22 +59,28 @@ export class StatusReportScheduler {
         ? this.isDueForScheduledTime(lastRunAt, scheduledHour, scheduledMinute)
         : this.isDueForInterval(lastRunAt);
     if (!shouldPublish) return;
+    if (this.publishing) return; // a previous publish is still running — don't double-post
 
-    // Span only the rare publish, not the cheap once-a-minute due check.
-    await withTickSpan("status-report", async () => {
-      const channel = await this.client.channels.fetch(channelId).catch(() => null);
-      if (!(channel instanceof TextChannel)) {
-        schedLog.warn("report channel unusable", { "report.channel_id": channelId });
-        return;
-      }
+    this.publishing = true;
+    try {
+      // Span only the rare publish, not the cheap once-a-minute due check.
+      await withTickSpan("status-report", async () => {
+        const channel = await this.client.channels.fetch(channelId).catch(() => null);
+        if (!(channel instanceof TextChannel)) {
+          schedLog.warn("report channel unusable", { "report.channel_id": channelId });
+          return;
+        }
 
-      // Build first (deltas compare against the stored snapshot), then post and persist the
-      // new snapshot + run time so restarts don't double-post.
-      const { embed, components, snapshot } = await this.reportService.build({ since: lastRunAt });
-      await channel.send({ embeds: [embed], components });
-      await this.settings.recordReportRun(snapshot);
-      schedLog.info("report.published", { "report.channel_id": channelId });
-    });
+        // Build first (deltas compare against the stored snapshot), then post and persist the
+        // new snapshot + run time so restarts don't double-post.
+        const { embed, components, snapshot } = await this.reportService.build({ since: lastRunAt });
+        await channel.send({ embeds: [embed], components });
+        await this.settings.recordReportRun(snapshot);
+        schedLog.info("report.published", { "report.channel_id": channelId });
+      });
+    } finally {
+      this.publishing = false;
+    }
   }
  
   private isDueForInterval(lastRunAt: Date | null): boolean {

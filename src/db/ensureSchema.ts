@@ -292,11 +292,15 @@ const STATEMENTS: string[] = [
     "payload" JSONB NOT NULL,
     "status" TEXT NOT NULL DEFAULT 'PENDING',
     "attempts" INTEGER NOT NULL DEFAULT 0,
+    "deferAttempts" INTEGER NOT NULL DEFAULT 0,
     "nextAttemptAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "lastError" TEXT,
     "receivedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT "intercom_inbox_pkey" PRIMARY KEY ("id")
   )`,
+  // Existing installs: echo-defers used to share the `attempts` counter, so a
+  // heavily-deferred part could dead-letter on its first real failure. Split them.
+  `ALTER TABLE "intercom_inbox" ADD COLUMN IF NOT EXISTS "deferAttempts" INTEGER NOT NULL DEFAULT 0`,
   `CREATE UNIQUE INDEX IF NOT EXISTS "intercom_inbox_seq_key" ON "intercom_inbox"("seq")`,
   `CREATE UNIQUE INDEX IF NOT EXISTS "intercom_inbox_deliveryId_key" ON "intercom_inbox"("deliveryId")`,
   `CREATE INDEX IF NOT EXISTS "intercom_inbox_status_nextAttemptAt_idx" ON "intercom_inbox"("status", "nextAttemptAt")`,

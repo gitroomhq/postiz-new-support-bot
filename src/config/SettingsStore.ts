@@ -73,12 +73,17 @@ export class SettingsStore {
   async load(): Promise<void> {
     let settings = await this.prisma.botSettings.findUnique({ where: { id: "global" } });
     if (!settings) {
+      // intercomRegion is NOT NULL DEFAULT 'us', so the getter's `?? process.env`
+      // fallback is dead — an env-only EU/AU deploy would silently stay on 'us'.
+      // Seed it here on first run (the documented env path) instead.
+      const seedRegion = process.env.INTERCOM_REGION;
       settings = await this.prisma.botSettings.create({
         data: {
           id: "global",
           threadsChannelId: process.env.DISCORD_THREADS_CHANNEL_ID || null,
           supportRoleId: process.env.DISCORD_SUPPORT_ROLE_ID || null,
           githubRepo: process.env.GH_BOT_REPO || null,
+          ...(seedRegion === "eu" || seedRegion === "au" ? { intercomRegion: seedRegion } : {}),
         },
       });
     }
@@ -274,7 +279,9 @@ export class SettingsStore {
   }
 
   intercomRegion(): IntercomRegion {
-    const region = this.settings.intercomRegion ?? process.env.INTERCOM_REGION;
+    // Env is seeded into the row on first run (see load()); the column is NOT
+    // NULL, so read it directly rather than a fallback that can never fire.
+    const region = this.settings.intercomRegion;
     return region === "eu" || region === "au" ? region : "us";
   }
 

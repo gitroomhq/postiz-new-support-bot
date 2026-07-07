@@ -228,6 +228,16 @@ export class IntercomStore {
     });
   }
 
+  // An echo-defer is not a failure: it advances its OWN counter (bounded by
+  // MAX_DEFER_ATTEMPTS) and leaves `attempts` — the real-failure retry budget —
+  // untouched, so a heavily-deferred part still gets full retries afterwards.
+  async markInboundDefer(id: string, deferAttempts: number, nextAttemptAt: Date, lastError: string): Promise<void> {
+    await this.prisma.intercomInboxEvent.updateMany({
+      where: { id },
+      data: { deferAttempts, nextAttemptAt, lastError: lastError.slice(0, 1000) },
+    });
+  }
+
   async markInboundDead(id: string, lastError: string): Promise<void> {
     await this.prisma.intercomInboxEvent.updateMany({
       where: { id },

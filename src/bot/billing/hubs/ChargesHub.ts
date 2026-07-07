@@ -791,13 +791,15 @@ export class ChargesHub {
     const session = await this.ctx.sessions.getOwnedSession(token, interaction);
     if (!session?.chargeId) return;
     await interaction.deferUpdate();
-    await this.ctx.sessions.tryRender(interaction, async () => {
+    await this.ctx.sessions.runExclusive(token, interaction, async () => {
       // Best-effort claim of the self-service billing-action lock, so the
       // customer's own refund flow sees this charge as handled. An existing
       // claim never blocks an admin (admin override) — it is only surfaced.
+      // Tagged "admin_refund" (not "refund") so it still locks the charge but is
+      // NOT counted by the self-service refund velocity guardrail.
       let lockNote = "";
       try {
-        const claimed = await this.ctx.sessionStore.claimBillingAction(interaction.user.id, session.chargeId!, "refund");
+        const claimed = await this.ctx.sessionStore.claimBillingAction(interaction.user.id, session.chargeId!, "admin_refund");
         if (!claimed) lockNote = "\nℹ️ a billing action already existed for this charge";
       } catch (error) {
         logger.warn("claimBillingAction failed — proceeding (admin override)", {

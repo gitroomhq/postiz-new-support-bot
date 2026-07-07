@@ -651,7 +651,7 @@ export class PaymentsHub {
     const flow = this.flows.get(token);
     if (!session?.customerId || flow?.signedMinor == null || !flow.currency || !flow.description) return;
     await interaction.deferUpdate();
-    await this.ctx.sessions.tryRender(interaction, async () => {
+    await this.ctx.sessions.runExclusive(token, interaction, async () => {
       const kind = flow.kind ?? "credit";
       const fmt = this.ctx.stripe.formatAmount(flow.amountMinor ?? Math.abs(flow.signedMinor!), flow.currency!);
       const actionName = kind === "credit" ? "Adjust balance — grant credit" : "Adjust balance — add debit";
@@ -935,7 +935,7 @@ export class PaymentsHub {
     const flow = this.flows.get(token);
     if (!session?.customerId || !session.paymentMethodId || flow?.amountMinor == null || !flow.currency) return;
     await interaction.deferUpdate();
-    await this.ctx.sessions.tryRender(interaction, async () => {
+    await this.ctx.sessions.runExclusive(token, interaction, async () => {
       const fmt = this.ctx.stripe.formatAmount(flow.amountMinor!, flow.currency!);
 
       let pi: Stripe.PaymentIntent;
