@@ -267,22 +267,43 @@ export abstract class BaseCategory {
         await thread.send({ embeds: [makeEmbed("Did this answer help you?", this.getColor())], components: [row] });
       }
     } catch (error) {
-      if (error instanceof ClaudeApiLimitError) {
-        const unavailableMsg = "The automated AI response is currently not available, please wait on a support member to assist you.";
-        const unavailableEmbed = makeEmbed(unavailableMsg, COLORS.warn);
-        if (thinkingMsg) {
-          // Overwrite the message that may already contain partial API error text
-          await thinkingMsg.edit({ content: "", embeds: [unavailableEmbed] }).catch(() => {});
-        } else if (thread) {
-          await thread.send({ embeds: [unavailableEmbed] }).catch(() => {});
-        } else {
-          await interaction.editReply({ embeds: [unavailableEmbed] });
-        }
-      } else {
-        await interaction.editReply({
-          embeds: [makeEmbed("Something went wrong while processing your request. Please try again later.", COLORS.danger)],
-        });
+      const isLimit = error instanceof ClaudeApiLimitError;
+      const publicMsg = isLimit
+        ? "The automated AI response is currently not available — a support member will assist you shortly."
+        : "Something went wrong while generating an answer — a support member will take a look shortly.";
+      const publicEmbed = makeEmbed(publicMsg, COLORS.warn);
+
+      // Repair the public thread: the "Thinking (that might take a while)..."
+      // placeholder must never be left hanging. Overwrite it (it may already
+      // hold partial API-error text) or post fresh if it was never sent. This
+      // now runs for ANY failure, not just API limits — previously a generic
+      // error only touched the ephemeral reply and left the thread stuck.
+      if (thinkingMsg) {
+        await thinkingMsg.edit({ content: "", embeds: [publicEmbed] }).catch(() => {});
+      } else if (thread) {
+        await thread.send({ embeds: [publicEmbed] }).catch(() => {});
       }
+
+      // Ping staff in-thread so a human picks the ticket up (both failure paths).
+      if (thread && ctx.staffPingRoleId) {
+        await thread
+          .send({
+            content: `<@&${ctx.staffPingRoleId}>`,
+            embeds: [makeEmbed("This ticket needs a human — the automated answer failed.", COLORS.warn)],
+            allowedMentions: { roles: [ctx.staffPingRoleId] },
+          })
+          .catch(() => {});
+      }
+
+      // Update the ephemeral reply. When the thread exists the failure is already
+      // surfaced there; otherwise this is the only thing the user sees.
+      const ephemeralEmbed = thread
+        ? makeEmbed(
+            `Your support thread ${thread} was created, but the automated answer failed — a support member will help you there shortly.`,
+            COLORS.warn
+          )
+        : makeEmbed("Something went wrong while processing your request. Please try again later.", COLORS.danger);
+      await interaction.editReply({ embeds: [ephemeralEmbed] }).catch(() => {});
     }
   }
 

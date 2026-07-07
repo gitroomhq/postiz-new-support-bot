@@ -63,7 +63,13 @@ export class BillingCategory extends BaseCategory {
   }
 
   protected buildPrompt(userInput: string): string {
-    return `The user has a billing question about Postiz: "${userInput}". Provide helpful information about billing, subscriptions, and payments. If the issue requires manual intervention, let them know to contact support directly.`;
+    return (
+      `The user has a billing question about Postiz: "${userInput}". ` +
+      `Provide helpful general information about billing, subscriptions, and payments. ` +
+      `Do NOT promise or imply refunds, credits, discounts, cancellations, plan changes, or timelines — ` +
+      `those require a human support member and the account's actual billing state, which you cannot see. ` +
+      `If the request needs any of those, or other manual intervention, tell the user a support member will follow up here.`
+    );
   }
 
   protected getColor(): number {
@@ -475,6 +481,19 @@ export class BillingCategory extends BaseCategory {
       const count = await this.sessionStore.countRefundsSince(new Date(Date.now() - DAY_MS));
       if (count >= maxPer24h) {
         return `Self-service refund velocity limit reached (${count} refund(s) in the last 24h, limit ${maxPer24h}).`;
+      }
+    }
+
+    // Per-user cap, applied alongside the global one so a single abuser can't
+    // exhaust the global budget for everyone else.
+    const maxPer24hPerUser = this.settingsStore.refundMaxPer24hPerUser();
+    if (maxPer24hPerUser != null) {
+      const userCount = await this.sessionStore.countRefundsSinceForUser(
+        interaction.user.id,
+        new Date(Date.now() - DAY_MS)
+      );
+      if (userCount >= maxPer24hPerUser) {
+        return `Per-user refund velocity limit reached (${userCount} refund(s) by you in the last 24h, limit ${maxPer24hPerUser}).`;
       }
     }
 

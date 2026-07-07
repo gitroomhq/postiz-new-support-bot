@@ -1,5 +1,6 @@
 import { Prisma, PrismaClient, BotSettings, StatusTag, PriorityTag } from "../generated/prisma/client";
 import type { SentryRuntimeConfig } from "../util/logger";
+import { decryptSecret, encryptSecret } from "../util/crypto";
 
 export type ReminderTarget = "SUPPORT" | "CUSTOMER";
 
@@ -149,6 +150,29 @@ export class SettingsStore {
     return this.settings.aiCommandsEnabled;
   }
 
+  // Main model for customer answers + /ai ask|cause. Free-text (a new model id
+  // works without a code change); defaults to the "sonnet" alias.
+  aiModel(): string {
+    return this.settings.aiModel;
+  }
+
+  // Cheaper model for the tool-less /ai summarize|draft runs.
+  aiModelLight(): string {
+    return this.settings.aiModelLight;
+  }
+
+  kbRefreshEnabled(): boolean {
+    return this.settings.kbRefreshEnabled;
+  }
+
+  kbRefreshIntervalHours(): number {
+    return this.settings.kbRefreshIntervalHours;
+  }
+
+  kbLastRefreshAt(): Date | null {
+    return this.settings.kbLastRefreshAt;
+  }
+
   backfillDone(): boolean {
     return this.settings.backfillDone;
   }
@@ -213,6 +237,11 @@ export class SettingsStore {
 
   refundMaxPer24h(): number | null {
     return this.settings.refundMaxPer24h;
+  }
+
+  // Per-user 24h cap (null = disabled), applied alongside the global refundMaxPer24h.
+  refundMaxPer24hPerUser(): number | null {
+    return this.settings.refundMaxPer24hPerUser;
   }
 
   refundMinMemberAgeDays(): number | null {
@@ -285,12 +314,17 @@ export class SettingsStore {
     return region === "eu" || region === "au" ? region : "us";
   }
 
+  // DB value is encrypted at rest (see updateIntercom); decrypt it. The env
+  // fallback is never enc-wrapped, so it passes through plainly. A decrypt
+  // failure (rotated key source) yields null → falls back to env, then null.
   intercomAccessToken(): string | null {
-    return this.settings.intercomAccessToken ?? process.env.INTERCOM_ACCESS_TOKEN ?? null;
+    const raw = this.settings.intercomAccessToken;
+    return (raw != null ? decryptSecret(raw) : null) ?? process.env.INTERCOM_ACCESS_TOKEN ?? null;
   }
 
   intercomClientSecret(): string | null {
-    return this.settings.intercomClientSecret ?? process.env.INTERCOM_CLIENT_SECRET ?? null;
+    const raw = this.settings.intercomClientSecret;
+    return (raw != null ? decryptSecret(raw) : null) ?? process.env.INTERCOM_CLIENT_SECRET ?? null;
   }
 
   intercomAdminId(): string | null {
@@ -332,6 +366,40 @@ export class SettingsStore {
   // Intercom. Null = snooze events are ignored.
   intercomSnoozeStatusTagId(): string | null {
     return this.settings.intercomSnoozeStatusTagId;
+  }
+
+  // ---- Stripe webhook ingestion (dispute + early-fraud alerts) ----
+
+  stripeWebhookEnabled(): boolean {
+    return this.settings.stripeWebhookEnabled;
+  }
+
+  stripeWebhookEndpointId(): string | null {
+    return this.settings.stripeWebhookEndpointId;
+  }
+
+  // Signing secret (whsec_…), encrypted at rest (see updateStripeWebhook).
+  stripeWebhookSecret(): string | null {
+    const raw = this.settings.stripeWebhookSecret;
+    return raw != null ? decryptSecret(raw) : null;
+  }
+
+  // The configured public origin (raw, for /config display).
+  publicBaseUrl(): string | null {
+    return this.settings.publicBaseUrl;
+  }
+
+  // Public origin for programmatic webhook registration: the configured value,
+  // else the origin of POSTIZ_CALLBACK_URL (the one externally-reachable URL the
+  // deploy already provides). null = unknown → registration is skipped.
+  resolvedPublicBaseUrl(): string | null {
+    const v = this.settings.publicBaseUrl?.trim();
+    if (v) return v.replace(/\/+$/, "");
+    try {
+      return new URL(process.env.POSTIZ_CALLBACK_URL ?? "").origin;
+    } catch {
+      return null;
+    }
   }
 
   // Sentry DSN (null = disabled). DB-first with env fallback: the deploy has no
@@ -409,11 +477,18 @@ export class SettingsStore {
     intercomTeamId?: string | null;
     intercomSnoozeStatusTagId?: string | null;
   }): Promise<void> {
-    const { intercomTicketTypeMap, ...rest } = data;
+    const { intercomTicketTypeMap, intercomAccessToken, intercomClientSecret, ...rest } = data;
     this.settings = await this.prisma.botSettings.update({
       where: { id: "global" },
       data: {
         ...rest,
+        // Secrets are encrypted at rest; an empty string / null clears them.
+        ...(intercomAccessToken !== undefined
+          ? { intercomAccessToken: intercomAccessToken ? encryptSecret(intercomAccessToken) : intercomAccessToken }
+          : {}),
+        ...(intercomClientSecret !== undefined
+          ? { intercomClientSecret: intercomClientSecret ? encryptSecret(intercomClientSecret) : intercomClientSecret }
+          : {}),
         // Nullable JSON columns need the DbNull sentinel instead of null.
         ...(intercomTicketTypeMap !== undefined
           ? { intercomTicketTypeMap: intercomTicketTypeMap ?? Prisma.DbNull }
@@ -433,6 +508,8 @@ export class SettingsStore {
     githubRepo?: string | null;
     aiSolveEnabled?: boolean;
     aiCommandsEnabled?: boolean;
+    aiModel?: string;
+    aiModelLight?: string;
     maxOpenTicketsPerUser?: number;
     ticketCooldownMinutes?: number;
     auditLogChannelId?: string | null;
@@ -445,9 +522,41 @@ export class SettingsStore {
     refundMaxAmount?: number | null;
     refundMaxAmountCurrency?: string;
     refundMaxPer24h?: number | null;
+    refundMaxPer24hPerUser?: number | null;
     refundMinMemberAgeDays?: number | null;
   }): Promise<void> {
     this.settings = await this.prisma.botSettings.update({ where: { id: "global" }, data });
+  }
+
+  async updateKnowledge(data: { kbRefreshEnabled?: boolean; kbRefreshIntervalHours?: number }): Promise<void> {
+    this.settings = await this.prisma.botSettings.update({ where: { id: "global" }, data });
+  }
+
+  async recordKbRefresh(): Promise<void> {
+    this.settings = await this.prisma.botSettings.update({
+      where: { id: "global" },
+      data: { kbLastRefreshAt: new Date() },
+    });
+  }
+
+  // The signing secret is encrypted at rest; other fields pass through. Pass a
+  // field as undefined to leave it unchanged (null clears it).
+  async updateStripeWebhook(data: {
+    stripeWebhookEnabled?: boolean;
+    stripeWebhookEndpointId?: string | null;
+    stripeWebhookSecret?: string | null;
+    publicBaseUrl?: string | null;
+  }): Promise<void> {
+    const { stripeWebhookSecret, ...rest } = data;
+    this.settings = await this.prisma.botSettings.update({
+      where: { id: "global" },
+      data: {
+        ...rest,
+        ...(stripeWebhookSecret !== undefined
+          ? { stripeWebhookSecret: stripeWebhookSecret ? encryptSecret(stripeWebhookSecret) : stripeWebhookSecret }
+          : {}),
+      },
+    });
   }
 
   async updateAllowedPriceIds(priceIds: string[]): Promise<void> {

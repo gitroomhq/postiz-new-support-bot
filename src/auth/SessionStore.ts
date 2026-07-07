@@ -1,20 +1,30 @@
 import { PrismaClient } from "../generated/prisma/client";
+import { decryptSecret, encryptSecret } from "../util/crypto";
 
 export class SessionStore {
   constructor(private prisma: PrismaClient) {}
 
+  // Access tokens are encrypted at rest. Every row leaving the store is decrypted
+  // here so callers keep seeing plaintext; legacy plaintext rows pass through
+  // unchanged (and get re-encrypted on the next setSession).
+  private decryptRow<T extends { accessToken: string }>(row: T): T {
+    return { ...row, accessToken: decryptSecret(row.accessToken) ?? "" };
+  }
+
   async setSession(discordUserId: string, accessToken: string, postizUserId?: string, stripeCustomerId?: string): Promise<void> {
+    const enc = encryptSecret(accessToken);
     await this.prisma.userSession.upsert({
       where: { discordUserId },
-      update: { accessToken, postizUserId, stripeCustomerId, authenticatedAt: new Date() },
-      create: { discordUserId, accessToken, postizUserId, stripeCustomerId },
+      update: { accessToken: enc, postizUserId, stripeCustomerId, authenticatedAt: new Date() },
+      create: { discordUserId, accessToken: enc, postizUserId, stripeCustomerId },
     });
   }
 
   async getSession(discordUserId: string) {
-    return this.prisma.userSession.findUnique({
+    const row = await this.prisma.userSession.findUnique({
       where: { discordUserId },
     });
+    return row ? this.decryptRow(row) : row;
   }
 
   // Reverse lookups for /search-tickets. postizUserId/stripeCustomerId are not @unique,
@@ -58,9 +68,10 @@ export class SessionStore {
   // Batch-resolve sessions for display (Postiz/Stripe id columns) on a page of results.
   async listByDiscordIds(discordUserIds: string[]) {
     if (discordUserIds.length === 0) return [];
-    return this.prisma.userSession.findMany({
+    const rows = await this.prisma.userSession.findMany({
       where: { discordUserId: { in: discordUserIds } },
     });
+    return rows.map((r) => this.decryptRow(r));
   }
 
   async removeSession(discordUserId: string): Promise<void> {
@@ -135,6 +146,15 @@ export class SessionStore {
     });
   }
 
+  // Same trailing-window count but scoped to one Discord user (per-user velocity
+  // cap, applied alongside the global one). BillingAction already stores
+  // discordUserId, and admin_refund stays excluded via the action filter.
+  async countRefundsSinceForUser(discordUserId: string, since: Date): Promise<number> {
+    return this.prisma.billingAction.count({
+      where: { action: "refund", discordUserId, createdAt: { gte: since } },
+    });
+  }
+
   // ---- Blocked-charge manual reviews (staff /charge approve|deny) ----
 
   // A retried self-service refund can trip a guardrail again in the same thread;
@@ -181,5 +201,26 @@ export class SessionStore {
     await this.prisma.pendingAuth.deleteMany({
       where: { createdAt: { lt: cutoff } },
     });
+  }
+
+  // ---- Stripe webhook event dedup ----
+
+  // Claims a Stripe event id (the PK). Returns false if already seen (Stripe
+  // redelivers on non-2xx and occasionally at-least-once). Mirrors the Intercom
+  // inbox's P2002-as-duplicate pattern.
+  async claimStripeEvent(eventId: string, type: string): Promise<boolean> {
+    try {
+      await this.prisma.stripeWebhookEvent.create({ data: { id: eventId, type } });
+      return true;
+    } catch (error) {
+      if ((error as { code?: string }).code === "P2002") return false;
+      throw error;
+    }
+  }
+
+  // Prune old dedup rows so the ledger doesn't grow unbounded.
+  async cleanOldStripeEvents(maxAgeMs: number = 30 * 24 * 60 * 60 * 1000): Promise<void> {
+    const cutoff = new Date(Date.now() - maxAgeMs);
+    await this.prisma.stripeWebhookEvent.deleteMany({ where: { createdAt: { lt: cutoff } } });
   }
 }

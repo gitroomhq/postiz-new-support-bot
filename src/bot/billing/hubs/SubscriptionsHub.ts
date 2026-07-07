@@ -133,26 +133,114 @@ export class SubscriptionsHub {
       handler: async (interaction) => {
         const token = interaction.customId.split(":")[1];
         const session = await this.ctx.sessions.getOwnedSession(token, interaction);
-        if (!session?.subscriptionId) return;
+        if (!session?.subscriptionId || !session.couponId) return;
+        const couponId = session.couponId;
         await interaction.deferUpdate();
         await this.ctx.sessions.tryRender(interaction, async () => {
-          await this.ctx.stripe.applyDiscountCoupon(session.subscriptionId!, `billadmin-discount-${interaction.id}`);
+          await this.ctx.stripe.applyDiscountCoupon(session.subscriptionId!, couponId, `billadmin-discount-${interaction.id}`);
           this.ctx.audit.log(interaction, {
             action: "Apply discount coupon",
             targetCustomerId: session.customerId,
             objectId: session.subscriptionId,
-            outcome: `Coupon \`${this.ctx.config.stripe.discountCouponId}\` applied`,
+            outcome: `Coupon \`${couponId}\` applied`,
             severity: "info",
           });
           await interaction.editReply({
             embeds: [
-              makeEmbed(
-                `💸 Coupon \`${this.ctx.config.stripe.discountCouponId}\` applied to \`${session.subscriptionId}\`.`,
-                COLORS.success
-              ),
+              makeEmbed(`💸 Coupon \`${couponId}\` applied to \`${session.subscriptionId}\`.`, COLORS.success),
             ],
             components: [backRow(afterActionBack(session, token, "subs"))],
           });
+        });
+      },
+    },
+    {
+      kind: "select",
+      id: "billadmin_discountpick:",
+      match: "prefix",
+      handler: async (interaction) => {
+        const token = interaction.customId.split(":")[1];
+        const session = await this.ctx.sessions.getOwnedSession(token, interaction);
+        if (!session?.subscriptionId) return;
+        session.couponId = interaction.values[0];
+        await interaction.deferUpdate();
+        await this.ctx.sessions.tryRender(interaction, async () => {
+          const [sub, priceMap] = await Promise.all([
+            this.ctx.stripe.getSubscription(session.subscriptionId!),
+            this.ctx.priceBook.labelMap(),
+          ]);
+          await interaction.editReply(
+            this.buildDiscountConfirmPanel(
+              sub,
+              token,
+              subPlanLabel(this.ctx.stripe, sub, priceMap),
+              session.couponId!,
+              session.discountBackId ?? "billadmin_hub:subs"
+            )
+          );
+        });
+      },
+    },
+    {
+      kind: "button",
+      id: "billadmin_discount_enter:",
+      match: "prefix",
+      handler: async (interaction) => {
+        const token = interaction.customId.split(":")[1];
+        const session = await this.ctx.sessions.getOwnedSession(token, interaction);
+        if (!session?.subscriptionId) return;
+        const modal = new ModalBuilder()
+          .setCustomId(`billadmin_discount_enter_modal:${token}`)
+          .setTitle("Apply a coupon")
+          .addComponents(
+            new ActionRowBuilder<TextInputBuilder>().addComponents(
+              textInput("coupon", "Coupon ID", {
+                required: true,
+                placeholder: "e.g. SUMMER25 or the coupon id",
+                value: this.ctx.config.stripe.discountCouponId || "",
+              })
+            )
+          );
+        await interaction.showModal(modal);
+      },
+    },
+    {
+      kind: "modal",
+      id: "billadmin_discount_enter_modal:",
+      match: "prefix",
+      handler: async (interaction) => {
+        const token = interaction.customId.split(":")[1];
+        const session = await this.ctx.sessions.getOwnedSession(token, interaction);
+        if (!session?.subscriptionId) return;
+        const couponId = interaction.fields.getTextInputValue("coupon").trim();
+        await this.ctx.sessions.ackModal(interaction);
+        await this.ctx.sessions.tryRender(interaction, async () => {
+          const back = session.discountBackId ?? "billadmin_hub:subs";
+          let coupon: Stripe.Coupon;
+          try {
+            coupon = await this.ctx.stripe.getCoupon(couponId);
+          } catch {
+            await interaction.editReply({
+              embeds: [makeEmbed(`No coupon matching \`${couponId}\`. Check the id and try again.`, COLORS.danger)],
+              components: [backRow(back)],
+            });
+            return;
+          }
+          if (!coupon.valid) {
+            await interaction.editReply({
+              embeds: [makeEmbed(`Coupon \`${coupon.id}\` is not valid (expired or fully redeemed).`, COLORS.danger)],
+              components: [backRow(back)],
+            });
+            return;
+          }
+          session.couponId = coupon.id;
+          const [sub, priceMap] = await Promise.all([
+            this.ctx.stripe.getSubscription(session.subscriptionId!),
+            this.ctx.priceBook.labelMap(),
+          ]);
+          await interaction.editReply(
+            this.buildDiscountConfirmPanel(sub, token, subPlanLabel(this.ctx.stripe, sub, priceMap), coupon.id, back)
+          );
         });
       },
     },
@@ -374,8 +462,7 @@ export class SubscriptionsHub {
           if (session.pendingSubAction === "changeplan") {
             await this.showPlanPicker(interaction, token, sub);
           } else {
-            const priceMap = await this.ctx.priceBook.labelMap();
-            await interaction.editReply(this.buildDiscountConfirmPanel(sub, token, subPlanLabel(this.ctx.stripe, sub, priceMap)));
+            await interaction.editReply(await this.buildDiscountCouponPicker(sub, token, session, "billadmin_hub:subs"));
           }
         });
       },
@@ -622,24 +709,9 @@ export class SubscriptionsHub {
         if (!session?.subscriptionId) return;
         await interaction.deferUpdate();
         await this.ctx.sessions.tryRender(interaction, async () => {
-          if (!this.ctx.config.stripe.discountCouponId) {
-            await interaction.editReply({
-              embeds: [makeEmbed("No discount coupon configured (STRIPE_DISCOUNT_COUPON_ID).", COLORS.danger)],
-              components: [backRow(`billadmin_sub_view:${token}`)],
-            });
-            return;
-          }
-          const [sub, priceMap] = await Promise.all([
-            this.ctx.stripe.getSubscription(session.subscriptionId!),
-            this.ctx.priceBook.labelMap(),
-          ]);
+          const sub = await this.ctx.stripe.getSubscription(session.subscriptionId!);
           await interaction.editReply(
-            this.buildDiscountConfirmPanel(
-              sub,
-              token,
-              subPlanLabel(this.ctx.stripe, sub, priceMap),
-              `billadmin_sub_view:${token}`
-            )
+            await this.buildDiscountCouponPicker(sub, token, session, `billadmin_sub_view:${token}`)
           );
         });
       },
@@ -1319,14 +1391,6 @@ export class SubscriptionsHub {
     const session = this.ctx.sessions.get(token);
     if (!session?.customerId) return;
 
-    if (!this.ctx.config.stripe.discountCouponId) {
-      await interaction.editReply({
-        embeds: [makeEmbed("No discount coupon configured (STRIPE_DISCOUNT_COUPON_ID).", COLORS.danger)],
-        components: [backRow("billadmin_hub:subs")],
-      });
-      return;
-    }
-
     const [subscriptions, priceMap] = await Promise.all([
       this.ctx.stripe.listSubscriptions(session.customerId),
       this.ctx.priceBook.labelMap(),
@@ -1340,10 +1404,7 @@ export class SubscriptionsHub {
       return;
     }
     if (candidates.length === 1) {
-      session.subscriptionId = candidates[0].id;
-      await interaction.editReply(
-        this.buildDiscountConfirmPanel(candidates[0], token, subPlanLabel(this.ctx.stripe, candidates[0], priceMap))
-      );
+      await interaction.editReply(await this.buildDiscountCouponPicker(candidates[0], token, session, "billadmin_hub:subs"));
       return;
     }
 
@@ -1370,10 +1431,65 @@ export class SubscriptionsHub {
     });
   }
 
+  // Coupon picker: choose which existing Stripe coupon to apply, or type a coupon
+  // id/code. Replaces the old behaviour of forcing the single env-configured
+  // STRIPE_DISCOUNT_COUPON_ID. Records the Back target on the session so the
+  // confirm step (reached via the pick/enter handlers) can return to it.
+  private async buildDiscountCouponPicker(
+    sub: Stripe.Subscription,
+    token: string,
+    session: BillAdminSession,
+    backId: string
+  ): Promise<Panel> {
+    session.subscriptionId = sub.id;
+    session.discountBackId = backId;
+    const coupons = await this.ctx.stripe.listCoupons(25);
+    const configured = this.ctx.config.stripe.discountCouponId;
+
+    const enterBtn = btn(`billadmin_discount_enter:${token}`, "Enter coupon ID", ButtonStyle.Secondary);
+    const cancelBtn = btn(backId, "Cancel", ButtonStyle.Secondary);
+
+    if (coupons.length === 0) {
+      return {
+        embeds: [
+          makeEmbed(
+            `No coupons exist yet — create one under 🎟️ Promos, or **Enter coupon ID** to type one.\nApplying to \`${sub.id}\`.`,
+            COLORS.warn
+          ),
+        ],
+        components: [buttonRow(enterBtn, cancelBtn)],
+      };
+    }
+
+    const select = new StringSelectMenuBuilder()
+      .setCustomId(`billadmin_discountpick:${token}`)
+      .setPlaceholder("Pick a coupon to apply")
+      .addOptions(
+        coupons.slice(0, 25).map((c) => ({
+          label: `${c.id}${c.name ? ` (${c.name})` : ""}`.slice(0, 100),
+          description: couponDesc(this.ctx.stripe, c).slice(0, 100),
+          value: c.id,
+          default: !!configured && c.id === configured,
+        }))
+      );
+    return {
+      embeds: [
+        makeEmbed(
+          `Pick the coupon to apply to \`${sub.id}\`` +
+            (configured ? ` (default \`${configured}\`)` : "") +
+            ", or **Enter coupon ID** to type another.",
+          COLORS.brand
+        ),
+      ],
+      components: [selectRow(select), buttonRow(enterBtn, cancelBtn)],
+    };
+  }
+
   private buildDiscountConfirmPanel(
     sub: Stripe.Subscription,
     token: string,
     planLabel: string,
+    couponId: string,
     backId = "billadmin_hub:subs"
   ): Panel {
     const existing = (sub.discounts ?? [])
@@ -1386,7 +1502,7 @@ export class SubscriptionsHub {
         { name: "Plan", value: planLabel, inline: true },
         { name: "Subscription", value: `\`${sub.id}\``, inline: true },
         { name: "Status", value: sub.status, inline: true },
-        { name: "Coupon", value: `\`${this.ctx.config.stripe.discountCouponId}\``, inline: true }
+        { name: "Coupon", value: `\`${couponId}\``, inline: true }
       )
       .setDescription(
         existing.length

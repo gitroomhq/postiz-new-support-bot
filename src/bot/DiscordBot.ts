@@ -42,7 +42,6 @@ import { applyTitleEmojis } from "../util/threadTitle";
 import { EscalationTierStore } from "../config/EscalationTierStore";
 import { SessionStore } from "../auth/SessionStore";
 import { OAuthManager } from "../auth/OAuthManager";
-import { PostizApiClient } from "./PostizApiClient";
 import { ClaudeCodeRunner, ClaudeRunOptions, ClaudeApiLimitError } from "./ClaudeCodeRunner";
 import {
   AiTicketContext,
@@ -60,6 +59,8 @@ import { StatusService, RESOLVED_EMOJI } from "./StatusService";
 import { RECLOSE_DELAY_MS } from "./RecloseScheduler";
 import { AuditLogger } from "./AuditLogger";
 import { StatusReportService } from "./StatusReportService";
+import { KnowledgeBaseScheduler } from "./KnowledgeBaseScheduler";
+import { StripeWebhookHandler } from "./StripeWebhookHandler";
 import { CallbackServer } from "../server/CallbackServer";
 import { BillingCategory } from "../categories/BillingCategory";
 import { BaseCategory, TicketContext } from "../categories/BaseCategory";
@@ -134,7 +135,6 @@ export class DiscordBot {
     private statusService: StatusService,
     private sessionStore: SessionStore,
     private oauthManager: OAuthManager,
-    private apiClient: PostizApiClient,
     private claudeRunner: ClaudeCodeRunner,
     private githubClient: GitHubClient,
     private categoryRegistry: CategoryRegistry,
@@ -147,6 +147,8 @@ export class DiscordBot {
     private intercomClient: IntercomClient,
     private intercomWebhook: IntercomWebhookHandler,
     private billingAdmin: BillingAdmin,
+    private kbScheduler: KnowledgeBaseScheduler,
+    private stripeWebhook: StripeWebhookHandler,
     private intercomInboxApp?: IntercomInboxApp
   ) {
     this.client = new Client({
@@ -1376,6 +1378,8 @@ export class DiscordBot {
         });
       },
       onAiAnswer: async (thread, finalText) => {
+        // Persist the verbatim answer so a filed GitHub issue is just Q + A.
+        void this.ticketStore.setAiAnswer(thread.id, finalText).catch(() => {});
         safe(this.intercomSync.onAiAnswer(thread.id, finalText), "intercom-sync", {
           "ticket.thread_id": thread.id,
           "sync.event": "ai_answer",
@@ -1521,6 +1525,7 @@ export class DiscordBot {
 
     const responder = (prompt: string, onUpdate?: (messages: string[]) => void) =>
       this.claudeRunner.run(prompt, onUpdate, {
+        model: this.settingsStore.aiModel(),
         telemetry: { agentName: `support-${category.id}`, kind: "customer_qa" },
       });
 
@@ -1549,18 +1554,28 @@ export class DiscordBot {
         return;
       }
 
-      const messages = await thread.messages.fetch({ limit: 10 });
-      const questionMsg = messages.reverse().find(
-        (m) => m.embeds.length > 0 && m.embeds[0].title === "Your question"
-      );
-
-      const userQuestion = questionMsg?.embeds[0].description || "Issue from Discord";
-
-      const responseTexts = messages
-        .filter((m) => m.embeds.length > 0 && m.embeds[0].title !== "Your question")
-        .map((m) => m.embeds[0].description)
-        .filter(Boolean)
-        .join("\n\n");
+      // Prefer the DB-stored verbatim question + AI answer (Q + A only — nothing
+      // else from the thread, so no incidental customer PII lands in the public
+      // repo). Fall back to scanning embeds for tickets created before those
+      // columns existed.
+      const ticket = await this.ticketStore.getByThreadId(thread.id).catch(() => null);
+      let userQuestion = ticket?.question ?? "";
+      let aiAnswer = ticket?.aiAnswer ?? "";
+      if (!userQuestion || !aiAnswer) {
+        const messages = await thread.messages.fetch({ limit: 10 });
+        const ordered = [...messages.values()].reverse();
+        if (!userQuestion) {
+          const q = ordered.find((m) => m.embeds.length > 0 && m.embeds[0].title === "Your question");
+          userQuestion = q?.embeds[0].description || "Issue from Discord";
+        }
+        if (!aiAnswer) {
+          aiAnswer = ordered
+            .filter((m) => m.embeds.length > 0 && m.embeds[0].title !== "Your question")
+            .map((m) => m.embeds[0].description)
+            .filter(Boolean)
+            .join("\n\n");
+        }
+      }
 
       const isBug = issueLabel === "bug";
       const heading = isBug ? "Bug Report" : "Feature Request";
@@ -1571,9 +1586,9 @@ export class DiscordBot {
         ``,
         `**User report:** ${userQuestion}`,
         ``,
-        `## Context from support bot`,
+        `## AI answer`,
         ``,
-        responseTexts || "No additional context.",
+        aiAnswer || "No AI answer was recorded.",
         ``,
         `---`,
         `*Created from Discord support bot by <@${interaction.user.id}>*`,
@@ -2085,6 +2100,7 @@ export class DiscordBot {
           extraAllowedTools,
           mcpConfig,
           timeoutMs: 300_000,
+          model: this.settingsStore.aiModel(),
           telemetry: { agentName: `ai-${sub}`, kind: "staff_command" },
         };
         if (sub === "ask") {
@@ -2106,7 +2122,11 @@ export class DiscordBot {
       } else if (sub === "draft") {
         title = "🤖 Draft Reply";
         prompt = buildDraftPrompt(contextBlock, interaction.options.getString("instructions"));
-        runOptions = { promptPrefix: null, telemetry: { agentName: "ai-draft", kind: "staff_command" } };
+        runOptions = {
+          promptPrefix: null,
+          model: this.settingsStore.aiModelLight(),
+          telemetry: { agentName: "ai-draft", kind: "staff_command" },
+        };
         this.aiLog.info("run started", {
           "ai.sub": sub,
           "ticket.thread_id": thread.id,
@@ -2115,7 +2135,11 @@ export class DiscordBot {
       } else {
         title = "🤖 Ticket Summary";
         prompt = buildSummarizePrompt(contextBlock);
-        runOptions = { promptPrefix: null, telemetry: { agentName: "ai-summarize", kind: "staff_command" } };
+        runOptions = {
+          promptPrefix: null,
+          model: this.settingsStore.aiModelLight(),
+          telemetry: { agentName: "ai-summarize", kind: "staff_command" },
+        };
         this.aiLog.info("run started", {
           "ai.sub": sub,
           "ticket.thread_id": thread.id,
@@ -2655,6 +2679,14 @@ export class DiscordBot {
             }`,
           ].join("\n"),
           inline: false,
+        },
+        {
+          name: "AI & Knowledge",
+          value: [
+            `Model: \`${s.aiModel()}\` · light \`${s.aiModelLight()}\``,
+            `KB refresh: ${s.kbRefreshEnabled() ? `every ${s.kbRefreshIntervalHours()}h` : "off"}${s.kbLastRefreshAt() ? ` · last <t:${Math.floor(s.kbLastRefreshAt()!.getTime() / 1000)}:R>` : ""}`,
+          ].join("\n"),
+          inline: false,
         }
       );
 
@@ -2667,6 +2699,7 @@ export class DiscordBot {
       new ButtonBuilder().setCustomId("config_sentry").setLabel("Sentry").setStyle(ButtonStyle.Primary),
     ];
     const actions = [
+      new ButtonBuilder().setCustomId("config_ai").setLabel("AI & Knowledge").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("config_reverify").setLabel("Re-Verify").setStyle(ButtonStyle.Secondary),
     ];
     if (!s.backfillDone()) {
@@ -2763,6 +2796,7 @@ export class DiscordBot {
               : "_no limit_"
           }`,
           `**Max refunds per 24h (all users):** ${s.refundMaxPer24h() ?? "_no limit_"}`,
+          `**Max refunds per 24h (per user):** ${s.refundMaxPer24hPerUser() ?? "_no limit_"}`,
           `**Min server membership age:** ${s.refundMinMemberAgeDays() != null ? `${s.refundMinMemberAgeDays()} day(s)` : "_no minimum_"}`,
           `**Plan allowlist:** ${s.allowedPriceIds().length ? `${s.allowedPriceIds().length} plan(s) offered in /billing pickers` : "_all active plans offered_"}`,
           "",
@@ -2779,6 +2813,7 @@ export class DiscordBot {
     const buttons = new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder().setCustomId("config_billing_limits").setLabel("Set Limits").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("config_billing_plans").setLabel("Plan Allowlist").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("config_stripe_webhook").setLabel("Webhooks").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("config_billing_clear_channel").setLabel("Clear Channel").setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId("config_reporting").setLabel("Back").setStyle(ButtonStyle.Secondary)
     );
@@ -2787,6 +2822,38 @@ export class DiscordBot {
       embeds: [embed],
       components: [new ActionRowBuilder<ChannelSelectMenuBuilder>().addComponents(channelSelect), buttons],
     };
+  }
+
+  private buildStripeWebhookPanel() {
+    const s = this.settingsStore;
+    const base = s.resolvedPublicBaseUrl();
+    const embed = new EmbedBuilder()
+      .setTitle("Stripe Webhooks")
+      .setColor(0x5865f2)
+      .setDescription(
+        [
+          `**Status:** ${s.stripeWebhookEnabled() ? "on" : "off"}`,
+          `**Endpoint URL:** ${base ? `\`${base}/stripe/webhook\`` : "⚠️ _no public URL — set one below_"}`,
+          `**Registered endpoint:** ${s.stripeWebhookEndpointId() ? `\`${s.stripeWebhookEndpointId()}\`` : "_none_"}`,
+          `**Signing secret:** ${s.stripeWebhookSecret() ? "stored ✅" : "_not set_"}`,
+          "",
+          "Alerts for **disputes** and **early-fraud warnings** post to the billing audit channel (or the audit log). The endpoint is registered automatically via the Stripe API — no dashboard needed.",
+          "The signing secret is returned only once at creation; use **Rotate Secret** if it is ever lost.",
+        ].join("\n")
+      );
+    const row1 = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId("config_stripe_webhook_toggle")
+        .setLabel(`Enabled: ${s.stripeWebhookEnabled() ? "on" : "off"}`)
+        .setStyle(s.stripeWebhookEnabled() ? ButtonStyle.Success : ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("config_stripe_webhook_register").setLabel("Register / Reconcile").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("config_stripe_webhook_rotate").setLabel("Rotate Secret").setStyle(ButtonStyle.Danger)
+    );
+    const row2 = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId("config_stripe_webhook_url").setLabel("Set Public URL").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("config_billing").setLabel("Back").setStyle(ButtonStyle.Secondary)
+    );
+    return { embeds: [embed], components: [row1, row2] };
   }
 
   private buildAuditPanel() {
@@ -2935,6 +3002,42 @@ export class DiscordBot {
     );
 
     return { embeds: [embed], components: [modeButtons, setupButtons, actionButtons, extraButtons] };
+  }
+
+  private buildAiPanel() {
+    const s = this.settingsStore;
+    const last = s.kbLastRefreshAt();
+    const embed = new EmbedBuilder()
+      .setTitle("AI & Knowledge")
+      .setColor(0x5865f2)
+      .setDescription(
+        [
+          `**Main model:** \`${s.aiModel()}\` — customer answers, \`/ai ask\` & \`/ai cause\``,
+          `**Light model:** \`${s.aiModelLight()}\` — the tool-less \`/ai summarize\` & \`/ai draft\``,
+          "",
+          `**Knowledge-base auto-refresh:** ${s.kbRefreshEnabled() ? `on — every ${s.kbRefreshIntervalHours()}h` : "off"}`,
+          `**Last refresh:** ${last ? `<t:${Math.floor(last.getTime() / 1000)}:R>` : "_never_"}`,
+          "",
+          "The AI answers by searching the cloned Postiz source + docs in `search/`; the refresh git-pulls them so answers track upstream. Models are free-text — any Claude alias/id the CLI accepts works.",
+        ].join("\n")
+      );
+
+    const modelRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId("config_ai_model").setLabel("Set Models").setStyle(ButtonStyle.Primary)
+    );
+    const kbRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId("config_toggle_kb")
+        .setLabel(`Auto-refresh: ${s.kbRefreshEnabled() ? "on" : "off"}`)
+        .setStyle(s.kbRefreshEnabled() ? ButtonStyle.Success : ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("config_kb_interval").setLabel("Refresh Interval").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("config_kb_refresh_now").setLabel("Refresh Now").setStyle(ButtonStyle.Secondary)
+    );
+    const navRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId("config_back_main").setLabel("Back").setStyle(ButtonStyle.Secondary)
+    );
+
+    return { embeds: [embed], components: [modelRow, kbRow, navRow] };
   }
 
   private buildSentryPanel() {
@@ -3554,6 +3657,36 @@ export class DiscordBot {
       return;
     }
 
+    if (id === "config_ai") {
+      await interaction.update(this.buildAiPanel());
+      return;
+    }
+
+    if (id === "config_toggle_kb") {
+      await this.settingsStore.updateKnowledge({ kbRefreshEnabled: !this.settingsStore.kbRefreshEnabled() });
+      this.auditConfig(interaction, `KB auto-refresh → ${this.settingsStore.kbRefreshEnabled() ? "on" : "off"}`);
+      await interaction.update(this.buildAiPanel());
+      return;
+    }
+
+    if (id === "config_kb_refresh_now") {
+      // git pull can take a moment — defer, then report the outcome ephemerally.
+      await interaction.deferReply({ flags: 64 });
+      const { ok, failed } = await this.kbScheduler.refreshNow();
+      this.auditConfig(interaction, `KB manual refresh → ${ok} ok, ${failed} failed`);
+      await interaction.editReply({
+        embeds: [
+          makeEmbed(
+            failed === 0
+              ? `Knowledge base refreshed (${ok} repo(s) updated).`
+              : `Knowledge base refresh: ${ok} updated, ${failed} failed — see logs. Answers continue on the last good checkout.`,
+            failed === 0 ? COLORS.success : COLORS.warn
+          ),
+        ],
+      });
+      return;
+    }
+
     if (id === "config_backfill") {
       await this.handleBackfill(interaction);
       return;
@@ -3571,6 +3704,45 @@ export class DiscordBot {
 
     if (id === "config_billing") {
       await interaction.update(this.buildBillingPanel());
+      return;
+    }
+
+    if (id === "config_stripe_webhook") {
+      await interaction.update(this.buildStripeWebhookPanel());
+      return;
+    }
+
+    if (id === "config_stripe_webhook_toggle") {
+      await interaction.deferUpdate();
+      const turningOn = !this.settingsStore.stripeWebhookEnabled();
+      await this.settingsStore.updateStripeWebhook({ stripeWebhookEnabled: turningOn });
+      // Register on enable; tear the endpoint down on disable.
+      const result = turningOn ? await this.stripeWebhook.ensureEndpoint() : (await this.stripeWebhook.disableEndpoint(), null);
+      this.auditConfig(interaction, `Stripe webhooks → ${turningOn ? `on (${result?.status})` : "off"}`);
+      await interaction.editReply(this.buildStripeWebhookPanel());
+      return;
+    }
+
+    if (id === "config_stripe_webhook_register" || id === "config_stripe_webhook_rotate") {
+      await interaction.deferUpdate();
+      const rotate = id === "config_stripe_webhook_rotate";
+      const result = await this.stripeWebhook.ensureEndpoint(rotate);
+      this.auditConfig(interaction, `Stripe webhook ${rotate ? "rotate" : "register"} → ${result.status}`);
+      await interaction.editReply(this.buildStripeWebhookPanel());
+      return;
+    }
+
+    if (id === "config_stripe_webhook_url") {
+      const modal = new ModalBuilder().setCustomId("config_stripe_webhook_url_modal").setTitle("Public Base URL");
+      const input = new TextInputBuilder()
+        .setCustomId("url")
+        .setLabel("Public origin (blank = use callback URL)")
+        .setStyle(TextInputStyle.Short)
+        .setRequired(false)
+        .setPlaceholder("https://bot.example.com")
+        .setValue(this.settingsStore.publicBaseUrl() ?? "");
+      modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(input));
+      await interaction.showModal(modal);
       return;
     }
 
@@ -4068,16 +4240,24 @@ export class DiscordBot {
         .setStyle(TextInputStyle.Short)
         .setRequired(false)
         .setValue(s.refundMaxPer24h() != null ? String(s.refundMaxPer24h()) : "");
+      const velocityUser = new TextInputBuilder()
+        .setCustomId("velocity_user")
+        .setLabel("Max refunds/24h per user (blank = off)")
+        .setStyle(TextInputStyle.Short)
+        .setRequired(false)
+        .setValue(s.refundMaxPer24hPerUser() != null ? String(s.refundMaxPer24hPerUser()) : "");
       const memberAge = new TextInputBuilder()
         .setCustomId("member_age")
         .setLabel("Min membership age, days (blank = off)")
         .setStyle(TextInputStyle.Short)
         .setRequired(false)
         .setValue(s.refundMinMemberAgeDays() != null ? String(s.refundMinMemberAgeDays()) : "");
+      // 5 inputs = Discord's per-modal ceiling; no further guardrail can be added here.
       modal.addComponents(
         new ActionRowBuilder<TextInputBuilder>().addComponents(amount),
         new ActionRowBuilder<TextInputBuilder>().addComponents(currency),
         new ActionRowBuilder<TextInputBuilder>().addComponents(velocity),
+        new ActionRowBuilder<TextInputBuilder>().addComponents(velocityUser),
         new ActionRowBuilder<TextInputBuilder>().addComponents(memberAge)
       );
       await interaction.showModal(modal);
@@ -4121,6 +4301,41 @@ export class DiscordBot {
         .setStyle(TextInputStyle.Short)
         .setRequired(true)
         .setValue(this.settingsStore.reportTimezone());
+      modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(input));
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (id === "config_ai_model") {
+      const modal = new ModalBuilder().setCustomId("config_ai_model_modal").setTitle("AI Models");
+      const main = new TextInputBuilder()
+        .setCustomId("model")
+        .setLabel("Main model (customer + /ai ask/cause)")
+        .setStyle(TextInputStyle.Short)
+        .setRequired(true)
+        .setValue(this.settingsStore.aiModel());
+      const light = new TextInputBuilder()
+        .setCustomId("model_light")
+        .setLabel("Light model (/ai summarize + draft)")
+        .setStyle(TextInputStyle.Short)
+        .setRequired(true)
+        .setValue(this.settingsStore.aiModelLight());
+      modal.addComponents(
+        new ActionRowBuilder<TextInputBuilder>().addComponents(main),
+        new ActionRowBuilder<TextInputBuilder>().addComponents(light)
+      );
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (id === "config_kb_interval") {
+      const modal = new ModalBuilder().setCustomId("config_kb_interval_modal").setTitle("KB Refresh Interval");
+      const input = new TextInputBuilder()
+        .setCustomId("hours")
+        .setLabel("Hours between refreshes (1-168)")
+        .setStyle(TextInputStyle.Short)
+        .setRequired(true)
+        .setValue(String(this.settingsStore.kbRefreshIntervalHours()));
       modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(input));
       await interaction.showModal(modal);
       return;
@@ -4530,6 +4745,7 @@ export class DiscordBot {
       const amountRaw = interaction.fields.getTextInputValue("amount").trim();
       const currencyRaw = interaction.fields.getTextInputValue("currency").trim().toLowerCase();
       const velocityRaw = interaction.fields.getTextInputValue("velocity").trim();
+      const velocityUserRaw = interaction.fields.getTextInputValue("velocity_user").trim();
       const memberAgeRaw = interaction.fields.getTextInputValue("member_age").trim();
 
       // Whole currency units, stored in minor units (cents).
@@ -4547,6 +4763,11 @@ export class DiscordBot {
         await interaction.reply({ embeds: [makeEmbed("Max refunds per 24h must be a positive whole number (or blank to disable).", COLORS.danger)], flags: 64 });
         return;
       }
+      const velocityUserNum = velocityUserRaw ? Number(velocityUserRaw) : null;
+      if (velocityUserRaw && (!Number.isInteger(velocityUserNum!) || velocityUserNum! < 1)) {
+        await interaction.reply({ embeds: [makeEmbed("Max refunds per 24h per user must be a positive whole number (or blank to disable).", COLORS.danger)], flags: 64 });
+        return;
+      }
       const memberAgeNum = memberAgeRaw ? Number(memberAgeRaw) : null;
       if (memberAgeRaw && (!Number.isInteger(memberAgeNum!) || memberAgeNum! < 1 || memberAgeNum! > 3650)) {
         await interaction.reply({ embeds: [makeEmbed("Min membership age must be 1-3650 days (or blank to disable).", COLORS.danger)], flags: 64 });
@@ -4557,10 +4778,39 @@ export class DiscordBot {
         refundMaxAmount: amountNum != null ? Math.round(amountNum * 100) : null,
         ...(currencyRaw ? { refundMaxAmountCurrency: currencyRaw } : {}),
         refundMaxPer24h: velocityNum,
+        refundMaxPer24hPerUser: velocityUserNum,
         refundMinMemberAgeDays: memberAgeNum,
       });
       this.auditConfig(interaction, "Refund guardrails updated");
       await interaction.reply({ embeds: [makeEmbed("Refund guardrails updated.", COLORS.success)], flags: 64 });
+      return;
+    }
+
+    if (interaction.customId === "config_stripe_webhook_url_modal") {
+      const raw = interaction.fields.getTextInputValue("url").trim();
+      let origin: string | null = null;
+      if (raw) {
+        try {
+          origin = new URL(raw).origin;
+        } catch {
+          await interaction.reply({
+            embeds: [makeEmbed("Enter a valid URL like `https://bot.example.com`, or leave blank.", COLORS.danger)],
+            flags: 64,
+          });
+          return;
+        }
+      }
+      await interaction.deferReply({ flags: 64 });
+      await this.settingsStore.updateStripeWebhook({ publicBaseUrl: origin });
+      this.auditConfig(interaction, `Stripe webhook public URL → ${origin ?? "callback-url fallback"}`);
+      if (this.settingsStore.stripeWebhookEnabled()) {
+        await this.stripeWebhook.ensureEndpoint().catch(() => {});
+      }
+      await interaction.editReply({
+        embeds: [
+          makeEmbed(`Public URL ${origin ? `set to \`${origin}\`` : "cleared (using callback URL)"}.`, COLORS.success),
+        ],
+      });
       return;
     }
 
@@ -4579,6 +4829,40 @@ export class DiscordBot {
       await this.tierStore.rename(tier.id, name);
       this.auditConfig(interaction, `Escalation tier renamed → ${tier.name} → ${name}`);
       await interaction.reply({ embeds: [makeEmbed(`Tier renamed to **${name}**.`, COLORS.success)], flags: 64 });
+      return;
+    }
+
+    if (interaction.customId === "config_ai_model_modal") {
+      const model = interaction.fields.getTextInputValue("model").trim();
+      const modelLight = interaction.fields.getTextInputValue("model_light").trim();
+      if (!model || !modelLight) {
+        await interaction.reply({ embeds: [makeEmbed("Both model names are required.", COLORS.danger)], flags: 64 });
+        return;
+      }
+      await this.settingsStore.updateGeneral({ aiModel: model, aiModelLight: modelLight });
+      this.auditConfig(interaction, `AI models → main \`${model}\`, light \`${modelLight}\``);
+      await interaction.reply({
+        embeds: [
+          makeEmbed(`AI models updated — main \`${model}\`, light \`${modelLight}\`. Applies to the next run.`, COLORS.success),
+        ],
+        flags: 64,
+      });
+      return;
+    }
+
+    if (interaction.customId === "config_kb_interval_modal") {
+      const hoursRaw = interaction.fields.getTextInputValue("hours").trim();
+      const hours = /^\d+$/.test(hoursRaw) ? Number(hoursRaw) : NaN;
+      if (!Number.isInteger(hours) || hours < 1 || hours > 168) {
+        await interaction.reply({ embeds: [makeEmbed("Enter a valid number of hours (1-168).", COLORS.danger)], flags: 64 });
+        return;
+      }
+      await this.settingsStore.updateKnowledge({ kbRefreshIntervalHours: hours });
+      this.auditConfig(interaction, `KB refresh interval → ${hours}h`);
+      await interaction.reply({
+        embeds: [makeEmbed(`Knowledge base will refresh every ${hours}h.`, COLORS.success)],
+        flags: 64,
+      });
       return;
     }
 
@@ -5549,7 +5833,12 @@ export class DiscordBot {
             initialize: (body) => this.intercomInboxApp!.initialize(body),
             submit: (body) => this.intercomInboxApp!.submit(body),
           }
-        : undefined
+        : undefined,
+      {
+        getSecret: () => this.stripeWebhook.getSecret(),
+        constructEvent: (raw, sig, secret) => this.stripeWebhook.constructEvent(raw, sig, secret),
+        handle: (event) => this.stripeWebhook.handle(event),
+      }
     );
     callbackServer.start();
   }

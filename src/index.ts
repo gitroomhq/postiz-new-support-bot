@@ -7,10 +7,10 @@ import { CannedResponseStore } from "./config/CannedResponseStore";
 import { EscalationTierStore } from "./config/EscalationTierStore";
 import { SessionStore } from "./auth/SessionStore";
 import { OAuthManager } from "./auth/OAuthManager";
-import { PostizApiClient } from "./bot/PostizApiClient";
 import { ClaudeCodeRunner } from "./bot/ClaudeCodeRunner";
 import { GitHubClient } from "./bot/GitHubClient";
 import { StripeClient } from "./bot/StripeClient";
+import { StripeWebhookHandler } from "./bot/StripeWebhookHandler";
 import { BillingAdmin } from "./bot/BillingAdmin";
 import { CategoryRegistry } from "./bot/CategoryRegistry";
 import { TicketStore } from "./bot/TicketStore";
@@ -20,8 +20,10 @@ import { ReminderScheduler } from "./bot/ReminderScheduler";
 import { RecloseScheduler } from "./bot/RecloseScheduler";
 import { StatusReportService } from "./bot/StatusReportService";
 import { StatusReportScheduler } from "./bot/StatusReportScheduler";
+import { KnowledgeBaseScheduler } from "./bot/KnowledgeBaseScheduler";
 import { DiscordBot } from "./bot/DiscordBot";
 import { ensureSchema } from "./db/ensureSchema";
+import { verifySchema } from "./db/verifySchema";
 import { HowToCategory, BugsCategory, BillingCategory } from "./categories";
 import { IntercomClient } from "./intercom/IntercomClient";
 import { IntercomStore } from "./intercom/IntercomStore";
@@ -58,6 +60,17 @@ async function main() {
   // hooks before any module loaded. Everything before this logs to stdout.
   initSentry(settingsStore.sentryConfig());
   setAiRecordContent(settingsStore.sentryAiRecordContent());
+  // Warn (or throw under SCHEMA_DRIFT_STRICT) if ensureSchema fell out of sync
+  // with schema.prisma. Placed after initSentry so the warning reaches Sentry.
+  // Strict (dev/CI, via an env var prod can't set) fails loudly; otherwise it
+  // only logs so it can never brick a deploy.
+  const schemaStrict = process.env.SCHEMA_DRIFT_STRICT === "1";
+  try {
+    await verifySchema(prisma, { strict: schemaStrict });
+  } catch (e) {
+    if (schemaStrict) throw e;
+    bootLog.error("schema verification failed", e);
+  }
   const cannedStore = new CannedResponseStore(prisma);
   await cannedStore.load();
   const tierStore = new EscalationTierStore(prisma);
@@ -80,10 +93,11 @@ async function main() {
     auditLogger
   );
   const oauthManager = new OAuthManager(config, sessionStore);
-  const apiClient = new PostizApiClient(config);
   const claudeRunner = new ClaudeCodeRunner(process.cwd());
+  const kbScheduler = new KnowledgeBaseScheduler(settingsStore, process.cwd());
   const githubClient = new GitHubClient(config);
   const stripeClient = new StripeClient(config);
+  const stripeWebhookHandler = new StripeWebhookHandler(settingsStore, sessionStore, stripeClient);
   const billingAdmin = new BillingAdmin(config, stripeClient, sessionStore, settingsStore, auditLogger);
 
   const categoryRegistry = new CategoryRegistry()
@@ -117,7 +131,6 @@ async function main() {
     statusService,
     sessionStore,
     oauthManager,
-    apiClient,
     claudeRunner,
     githubClient,
     categoryRegistry,
@@ -130,12 +143,15 @@ async function main() {
     intercomClient,
     intercomWebhookHandler,
     billingAdmin,
+    kbScheduler,
+    stripeWebhookHandler,
     intercomInboxApp
   );
   // The client exists as soon as the constructor ran; nothing fires before login.
   auditLogger.bindClient(bot.client);
   intercomWebhookHandler.bindClient(bot.client);
   intercomInboxApp.bindClient(bot.client);
+  stripeWebhookHandler.bindClient(bot.client);
   // Thread URLs need the guild id, only known once the client is ready —
   // resolved lazily per call.
   intercomSync.setThreadUrlBuilder((threadId) => {
@@ -143,6 +159,10 @@ async function main() {
     return guild ? `https://discord.com/channels/${guild.id}/${threadId}` : null;
   });
   await bot.start();
+
+  // The callback server is listening now (bot.start() started it), so the Stripe
+  // endpoint can point at a reachable URL. Idempotent + non-fatal.
+  stripeWebhookHandler.ensureEndpoint().catch((e) => bootLog.error("stripe webhook registration failed", e));
 
   const reminderScheduler = new ReminderScheduler(bot.client, settingsStore, ticketStore, statusService, auditLogger, tierStore);
   reminderScheduler.start();
@@ -152,6 +172,9 @@ async function main() {
 
   const recloseScheduler = new RecloseScheduler(bot.client, ticketStore, auditLogger);
   recloseScheduler.start();
+
+  // Periodically git-pull the cloned Postiz source/docs so AI answers track upstream.
+  kbScheduler.start();
 
   const intercomOutboxScheduler = new IntercomOutboxScheduler(
     intercomClient,
@@ -166,10 +189,13 @@ async function main() {
   const intercomInboxScheduler = new IntercomInboxScheduler(intercomStore, intercomWebhookHandler, auditLogger);
   intercomInboxScheduler.start();
 
-  // Clean expired pending auths every 5 minutes
+  // Clean expired pending auths + old Stripe webhook dedup rows every 5 minutes.
   setInterval(() => {
     withTickSpan("clean-pending-auths", () => sessionStore.cleanExpiredPending()).catch((e) =>
       log.child("scheduler:clean-pending").error("tick failed", e)
+    );
+    withTickSpan("clean-stripe-events", () => sessionStore.cleanOldStripeEvents()).catch((e) =>
+      log.child("scheduler:clean-stripe-events").error("tick failed", e)
     );
   }, 5 * 60 * 1000);
 
@@ -179,6 +205,7 @@ async function main() {
     reminderScheduler.stop();
     statusReportScheduler.stop();
     recloseScheduler.stop();
+    kbScheduler.stop();
     intercomOutboxScheduler.stop();
     intercomInboxScheduler.stop();
     bot.client.destroy();

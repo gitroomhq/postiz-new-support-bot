@@ -107,6 +107,24 @@ model BotSettings {
   sentryDebug              Boolean @default(false) // SDK debug to stdout; restart to apply
   sentrySendDefaultPii     Boolean @default(false)
   sentryAiRecordContent    Boolean @default(true) // AI prompts/responses/tool I/O on gen_ai spans
+  // AI models (edited via /config → AI & Knowledge). Free-text so new model ids
+  // work without a code change. Light model runs the tool-less /ai summarize|draft.
+  aiModel               String  @default("sonnet")
+  aiModelLight          String  @default("haiku")
+  // Knowledge-base auto-refresh: git pull the cloned Postiz source/docs on a timer.
+  kbRefreshEnabled       Boolean   @default(true)
+  kbRefreshIntervalHours Int       @default(6)
+  kbLastRefreshAt        DateTime?
+  // Per-user self-service refund velocity cap (the existing refundMaxPer24h is global).
+  refundMaxPer24hPerUser Int?
+  // Stripe webhook ingestion (disputes + early-fraud alerts). The endpoint is
+  // registered programmatically; the signing secret is stored encrypted at rest.
+  stripeWebhookEnabled    Boolean @default(false)
+  stripeWebhookEndpointId String?
+  stripeWebhookSecret     String? // whsec_… — encrypted (see src/util/crypto.ts)
+  // Bot's public origin for programmatic webhook registration; falls back to
+  // new URL(POSTIZ_CALLBACK_URL).origin when unset.
+  publicBaseUrl           String?
   updatedAt           DateTime  @updatedAt
 
   @@map("bot_settings")
@@ -167,6 +185,9 @@ model Ticket {
   // Stamped (last message + 30m) whenever someone writes in an already-closed ticket.
   recloseAt           DateTime?
   question            String?
+  // Verbatim final AI answer, persisted so a filed GitHub issue is just question +
+  // answer (not a brittle re-scan of the last few thread messages).
+  aiAnswer            String?
   firstResponseAt     DateTime?
   csatScore           Int?
   csatComment         String?
@@ -306,6 +327,18 @@ model IntercomInboxEvent {
 
   @@index([status, nextAttemptAt])
   @@map("intercom_inbox")
+}
+
+// Dedup ledger for incoming Stripe webhook events (Stripe redelivers on non-2xx
+// and occasionally at-least-once). The event id is globally unique, so it is the
+// primary key — an insert conflict means "already handled → drop".
+model StripeWebhookEvent {
+  id        String   @id // Stripe event id (evt_…)
+  type      String
+  createdAt DateTime @default(now())
+
+  @@index([createdAt])
+  @@map("stripe_webhook_events")
 }
 
 // Reserve→call→confirm echo records: the outbox writes a row (normalized body

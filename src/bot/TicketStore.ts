@@ -153,6 +153,12 @@ export class TicketStore {
     });
   }
 
+  // Persist the verbatim final AI answer so a filed GitHub issue is just the
+  // question + answer (no brittle re-scan of thread embeds).
+  async setAiAnswer(threadId: string, aiAnswer: string): Promise<void> {
+    await this.prisma.ticket.update({ where: { threadId }, data: { aiAnswer } });
+  }
+
   async close(threadId: string): Promise<void> {
     await this.prisma.ticket.update({ where: { threadId }, data: { closed: true, closedAt: new Date() } });
   }

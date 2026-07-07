@@ -77,12 +77,57 @@ export class StripeClient {
     };
   }
 
-  async applyDiscountCoupon(subscriptionId: string, idempotencyKey?: string): Promise<void> {
+  async applyDiscountCoupon(subscriptionId: string, couponId: string, idempotencyKey?: string): Promise<void> {
     await this.stripe.subscriptions.update(
       subscriptionId,
-      { discounts: [{ coupon: this.config.stripe.discountCouponId }] },
+      { discounts: [{ coupon: couponId }] },
       idempotencyKey ? { idempotencyKey } : undefined
     );
+  }
+
+  // ---- Webhook endpoints (programmatic registration; no dashboard access) ----
+
+  async listWebhookEndpoints(limit = 100): Promise<Stripe.WebhookEndpoint[]> {
+    const res = await this.stripe.webhookEndpoints.list({ limit });
+    return res.data;
+  }
+
+  // The signing secret is returned ONLY here, at creation time — capture and
+  // persist it. The URL-derived idempotency key stops a boot race across
+  // instances from creating two endpoints for the same URL.
+  async createWebhookEndpoint(
+    url: string,
+    events: Stripe.WebhookEndpointCreateParams.EnabledEvent[],
+    idempotencyKey: string
+  ): Promise<{ id: string; secret: string | null }> {
+    const ep = await this.stripe.webhookEndpoints.create(
+      { url, enabled_events: events, description: "Postiz support bot" },
+      { idempotencyKey }
+    );
+    return { id: ep.id, secret: ep.secret ?? null };
+  }
+
+  // NOTE: update never returns the secret — the existing one keeps working.
+  async updateWebhookEndpoint(
+    id: string,
+    params: Stripe.WebhookEndpointUpdateParams
+  ): Promise<Stripe.WebhookEndpoint> {
+    return this.stripe.webhookEndpoints.update(id, params);
+  }
+
+  async deleteWebhookEndpoint(id: string): Promise<void> {
+    await this.stripe.webhookEndpoints.del(id);
+  }
+
+  // Kept here so the `Stripe` import/instance stays encapsulated in this class.
+  constructWebhookEvent(rawBody: Buffer, signature: string, secret: string): Stripe.Event {
+    return this.stripe.webhooks.constructEvent(rawBody, signature, secret);
+  }
+
+  // Customer behind a charge (for webhook alerts → linked Discord user lookup).
+  async getChargeCustomerId(chargeId: string): Promise<string | null> {
+    const charge = await this.stripe.charges.retrieve(chargeId);
+    return typeof charge.customer === "string" ? charge.customer : (charge.customer?.id ?? null);
   }
 
   // Fresh charge state for the refund guardrails (amount cap + already-refunded check).

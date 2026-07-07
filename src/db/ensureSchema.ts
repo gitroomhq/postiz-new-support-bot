@@ -325,6 +325,29 @@ const STATEMENTS: string[] = [
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "sentryDebug" BOOLEAN NOT NULL DEFAULT false`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "sentrySendDefaultPii" BOOLEAN NOT NULL DEFAULT false`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "sentryAiRecordContent" BOOLEAN NOT NULL DEFAULT true`,
+  // AI models + knowledge-base auto-refresh (paired with /config → AI & Knowledge).
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "aiModel" TEXT NOT NULL DEFAULT 'sonnet'`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "aiModelLight" TEXT NOT NULL DEFAULT 'haiku'`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "kbRefreshEnabled" BOOLEAN NOT NULL DEFAULT true`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "kbRefreshIntervalHours" INTEGER NOT NULL DEFAULT 6`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "kbLastRefreshAt" TIMESTAMP(3)`,
+  // Per-user refund velocity cap (the global cap already exists as refundMaxPer24h).
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "refundMaxPer24hPerUser" INTEGER`,
+  // Stripe webhook ingestion (disputes + early-fraud). Secret stored encrypted.
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "stripeWebhookEnabled" BOOLEAN NOT NULL DEFAULT false`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "stripeWebhookEndpointId" TEXT`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "stripeWebhookSecret" TEXT`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "publicBaseUrl" TEXT`,
+  // Verbatim final AI answer, persisted for GitHub-issue bodies.
+  `ALTER TABLE "tickets" ADD COLUMN IF NOT EXISTS "aiAnswer" TEXT`,
+  // Stripe webhook event dedup ledger (id = Stripe evt_… id, globally unique).
+  `CREATE TABLE IF NOT EXISTS "stripe_webhook_events" (
+    "id" TEXT NOT NULL,
+    "type" TEXT NOT NULL,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT "stripe_webhook_events_pkey" PRIMARY KEY ("id")
+  )`,
+  `CREATE INDEX IF NOT EXISTS "stripe_webhook_events_createdAt_idx" ON "stripe_webhook_events"("createdAt")`,
 ];
 
 export async function ensureSchema(prisma: PrismaClient): Promise<void> {

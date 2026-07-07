@@ -9,7 +9,7 @@
     "dev": "prisma generate && SENTRY_PRELOAD_INTEGRATIONS=Http,Express,Postgres ts-node -r @sentry/node/preload src/index.ts",
     "db:migrate": "prisma migrate dev",
     "db:push": "prisma db push",
-    "postinstall": "rm -rf search && mkdir search && cd search && git clone https://github.com/gitroomhq/postiz-app && git clone https://github.com/gitroomhq/postiz-docs"
+    "postinstall": "rm -rf search && mkdir search && cd search && git clone --depth 1 https://github.com/gitroomhq/postiz-app && git clone --depth 1 https://github.com/gitroomhq/postiz-docs"
   },
   "keywords": [],
   "author": "",

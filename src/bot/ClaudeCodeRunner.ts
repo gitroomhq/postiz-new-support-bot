@@ -53,6 +53,8 @@ export interface ClaudeRunOptions {
   /** null = send prompt verbatim; undefined = legacy support prefix. */
   promptPrefix?: string | null;
   timeoutMs?: number;
+  /** Model alias/id passed to `--model` (default "sonnet"). */
+  model?: string;
   /** Labels the run's gen_ai spans/metrics. */
   telemetry?: ClaudeRunTelemetry;
 }
@@ -100,12 +102,13 @@ export class ClaudeCodeRunner {
     const agentName = options.telemetry?.agentName ?? "claude-code";
     const kind: string = options.telemetry?.kind ?? "unspecified";
     const prefix = options.promptPrefix === undefined ? LEGACY_SUPPORT_PREFIX : (options.promptPrefix ?? "");
+    const model = options.model ?? "sonnet";
 
     const agentAttributes: Record<string, string | number | boolean> = {
       "gen_ai.operation.name": "invoke_agent",
       "gen_ai.system": "anthropic",
       "gen_ai.agent.name": agentName,
-      "gen_ai.request.model": "sonnet",
+      "gen_ai.request.model": model,
       "gen_ai.response.streaming": true,
     };
     if (aiRecordContentEnabled()) {
@@ -126,7 +129,7 @@ export class ClaudeCodeRunner {
             prefix + prompt,
             "--allowedTools", ...allowedTools,
             "--permission-mode", "bypassPermissions",
-            "--model", "sonnet",
+            "--model", model,
             "--no-session-persistence",
             "--bare",
             "--output-format", "stream-json",
@@ -169,7 +172,7 @@ export class ClaudeCodeRunner {
           const toolSpans = new Map<string, { span: Sentry.Span; name: string }>(); // tool_use id → span
           let toolCallCount = 0;
           let toolErrorCount = 0;
-          let modelName = "sonnet";
+          let modelName = model;
           let sessionId: string | undefined;
           let stats: ResultStats = {};
           const startedAt = Date.now();
@@ -321,10 +324,12 @@ export class ClaudeCodeRunner {
 
             for (const line of lines) {
               if (!line.trim()) continue;
-              // Check raw line for API limit signatures — catches event types
-              // we don't specifically handle (system, result, etc.) and raw
-              // non-JSON error prints alike.
-              if (detectApiLimit(line)) continue;
+              // NOTE: we deliberately do NOT scan raw stdout text for API-limit
+              // phrases — the assistant's own answer (e.g. a billing reply that
+              // says "credit balance"/"usage limit") would trip a false positive
+              // and get killed mid-stream. API limits are detected only from
+              // trusted structured signals: the terminal `result` error event
+              // below, and stderr + a non-zero exit (see the stderr/close paths).
               try {
                 const event = JSON.parse(line);
 
@@ -418,7 +423,6 @@ export class ClaudeCodeRunner {
                     const msg = messages.get(currentMsgId);
                     if (msg) {
                       msg.text += streamEvent.delta.text;
-                      detectApiLimit(msg.text);
                       emitUpdate();
                     }
                   }
@@ -506,7 +510,6 @@ export class ClaudeCodeRunner {
                     }
                     const joined = textParts.join("");
                     messages.set(msgId, { id: msgId, text: joined });
-                    detectApiLimit(joined);
                     emitUpdate();
                   }
                 }
@@ -564,9 +567,22 @@ export class ClaudeCodeRunner {
                   if (aiRecordContentEnabled() && typeof event.result === "string" && event.result) {
                     agentSpan.setAttribute("gen_ai.response.text", truncateForAttr(event.result));
                   }
+
+                  // Trusted API-limit signal: only an ERROR terminal result
+                  // counts. A normal answer (is_error:false, subtype "success")
+                  // that happens to mention "credit balance"/"usage limit" — very
+                  // common for a billing bot — must not trip this.
+                  const resultIsError =
+                    event.is_error === true ||
+                    (typeof event.subtype === "string" && event.subtype !== "success");
+                  const resultText = typeof event.result === "string" ? event.result : "";
+                  if (resultIsError && isApiLimitError(`${resultText} ${event.subtype ?? ""}`)) {
+                    apiLimitDetected = true;
+                  }
                 }
               } catch {
-                // Non-JSON line — already checked via detectApiLimit above.
+                // Non-JSON line — ignored. A genuine error surfaces on stderr and
+                // via a non-zero exit, which the close handler classifies.
               }
             }
           });
@@ -618,15 +634,6 @@ export class ClaudeCodeRunner {
             const allMessages = messageOrder
               .map((id) => messages.get(id)!.text)
               .filter((t) => t.length > 0);
-
-            // API limit errors can surface as streamed content on stdout (not stderr)
-            const combinedText = allMessages.join("\n");
-            if (isApiLimitError(combinedText)) {
-              finalize("api_limit");
-              reportApiLimit();
-              reject(new ClaudeApiLimitError(combinedText));
-              return;
-            }
 
             if (allMessages.length === 0) {
               finalize("empty");

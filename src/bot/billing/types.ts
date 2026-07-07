@@ -72,6 +72,9 @@ export interface BillAdminSession {
   promoCodeId?: string;
   paymentMethodId?: string;
   couponId?: string;
+  // Where the discount confirm panel's Back/Cancel returns (varies by entry point:
+  // the subs hub vs. an individual subscription view).
+  discountBackId?: string;
   custSnapshot?: {
     name: string;
     email: string;

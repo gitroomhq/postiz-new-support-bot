@@ -1,6 +1,7 @@
 import express, { type Express, type Request } from "express";
 import * as Sentry from "@sentry/node";
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
+import type Stripe from "stripe";
 import { BotConfig } from "../config";
 import { OAuthManager } from "../auth/OAuthManager";
 import { log } from "../util/logger";
@@ -25,6 +26,15 @@ export interface IntercomCanvasRoute {
   submit: (body: unknown) => Promise<object>;
 }
 
+// Inbound Stripe webhook. constructEvent needs the RAW body (captured via the
+// express.json verify hook, same as Intercom). The signing secret lives in
+// BotSettings (set at programmatic registration), so it's read per request.
+export interface StripeWebhookRoute {
+  getSecret: () => string | null;
+  constructEvent: (raw: Buffer, signature: string, secret: string) => Stripe.Event;
+  handle: (event: Stripe.Event) => Promise<void>;
+}
+
 type RawBodyRequest = Request & { rawBody?: Buffer };
 
 export class CallbackServer {
@@ -35,7 +45,8 @@ export class CallbackServer {
     private oauthManager: OAuthManager,
     private onAuthSuccess?: (discordUserId: string, interactionToken: string | null) => Promise<void>,
     private intercomWebhook?: IntercomWebhookRoute,
-    private intercomCanvas?: IntercomCanvasRoute
+    private intercomCanvas?: IntercomCanvasRoute,
+    private stripeWebhook?: StripeWebhookRoute
   ) {
     this.app = express();
     this.setupRoutes();
@@ -158,6 +169,47 @@ export class CallbackServer {
         }
       );
     }
+
+    // Stripe webhook. Stripe signs with `Stripe-Signature` over the RAW body;
+    // constructEvent verifies it with the endpoint's signing secret. We 200 fast
+    // and process best-effort so a slow handler can't make Stripe retry (the
+    // event-id dedup ledger also drops any redelivery). Raw body via the same
+    // verify hook the Intercom route uses.
+    this.app.head("/stripe/webhook", (_req, res) => {
+      res.sendStatus(200);
+    });
+    this.app.post(
+      "/stripe/webhook",
+      express.json({
+        limit: "1mb",
+        verify: (req, _res, buf) => {
+          (req as RawBodyRequest).rawBody = buf;
+        },
+      }),
+      async (req, res) => {
+        const secret = this.stripeWebhook?.getSecret();
+        const signature = req.header("stripe-signature");
+        const raw = (req as RawBodyRequest).rawBody;
+        if (!this.stripeWebhook || !secret || !signature || !raw) {
+          res.status(400).send("Bad Request");
+          return;
+        }
+        let event: Stripe.Event;
+        try {
+          event = this.stripeWebhook.constructEvent(raw, signature, secret);
+        } catch {
+          metricCount("stripe.webhooks", 1, { accepted: false });
+          res.status(400).send("Invalid signature");
+          return;
+        }
+        metricCount("stripe.webhooks", 1, { accepted: true });
+        res.status(200).send("ok");
+        // Fire-and-forget; the handler swallows its own errors.
+        void this.stripeWebhook.handle(event).catch((e) =>
+          httpLog.error("stripe webhook handle failed", e, { "stripe.event_type": event.type })
+        );
+      }
+    );
 
     // Last middleware: reports unhandled route errors to Sentry (Express 5
     // forwards rejected async handlers here automatically). The route-level
