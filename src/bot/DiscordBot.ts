@@ -544,6 +544,8 @@ export class DiscordBot {
       await this.handlePriorityCommand(interaction);
     } else if (interaction.commandName === "report") {
       await this.handleReportCommand(interaction);
+    } else if (interaction.commandName === "fix-closed-tags") {
+      await this.handleFixClosedTagsCommand(interaction);
     } else if (interaction.commandName === "search-tickets") {
       await this.handleSearchTicketsCommand(interaction);
     } else if (interaction.commandName === "note") {
@@ -573,6 +575,50 @@ export class DiscordBot {
     } else {
       await billing.denyBlockedCharge(interaction, member);
     }
+  }
+
+  // ---- /fix-closed-tags: one-time reconciliation of closed-but-mistagged tickets ----
+
+  // Tickets closed without landing on a done-tag used to inflate the report's tag-derived
+  // "Open" headline (the count now reads the `closed` boolean, but the tickets still carry a
+  // stale status tag). This moves them onto the Closed tag so their status matches reality.
+  private async handleFixClosedTagsCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+    const member = await this.requireSupportOrAdmin(interaction);
+    if (!member) return;
+
+    const closingTag = this.settingsStore.closingTag();
+    if (!closingTag) {
+      await interaction.reply({
+        embeds: [
+          makeEmbed(
+            "No Closed tag is configured (no status tag closes the thread). Set one in /config → Status Tags first.",
+            COLORS.warn
+          ),
+        ],
+        flags: 64,
+      });
+      return;
+    }
+
+    await interaction.deferReply({ flags: 64 });
+
+    const doneTagIds = this.settingsStore
+      .tags()
+      .filter((t) => t.closesThread || t.emoji === RESOLVED_EMOJI)
+      .map((t) => t.id);
+
+    const count = await this.ticketStore.reTagClosedToClosing(closingTag.id, doneTagIds);
+
+    await interaction.editReply({
+      embeds: [
+        makeEmbed(
+          count === 0
+            ? "Nothing to fix — every closed ticket already carries a done status tag. ✅"
+            : `Moved **${count}** closed ticket(s) onto ${closingTag.emoji} ${closingTag.label}. The report's Open count will match the age breakdown now.`,
+          COLORS.success
+        ),
+      ],
+    });
   }
 
   // ---- /note: staff-only notes on a ticket (always ephemeral — the customer is in the thread) ----
@@ -5956,6 +6002,11 @@ export class DiscordBot {
       {
         name: "report",
         description: "Show a support status report (support/admin only)",
+      },
+      {
+        name: "fix-closed-tags",
+        description: "One-time fix: put closed-but-mistagged tickets on the Closed tag (admin only)",
+        default_member_permissions: "8", // ADMINISTRATOR
       },
       {
         name: "note",

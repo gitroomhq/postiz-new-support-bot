@@ -4,7 +4,6 @@ import { SettingsStore, ReportSnapshot } from "../config/SettingsStore";
 import { TicketStore, TicketWithTag } from "./TicketStore";
 import { CategoryRegistry } from "./CategoryRegistry";
 import { COLORS } from "../util/embeds";
-import { RESOLVED_EMOJI } from "./StatusService";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -33,9 +32,6 @@ export class StatusReportService {
     const windowStart = options.since ?? new Date(now.getTime() - DAY_MS);
 
     const tags = this.settings.tags();
-    const doneTagIds = new Set(
-      tags.filter((t) => t.closesThread || t.emoji === RESOLVED_EMOJI).map((t) => t.id)
-    );
 
     const overdueCutoff = new Date(now.getTime() - this.settings.overdueThresholdDays() * DAY_MS);
 
@@ -57,8 +53,11 @@ export class StatusReportService {
 
     for (const row of breakdown) {
       total += row.count;
-      const isDone = row.statusTagId != null && doneTagIds.has(row.statusTagId);
-      if (isDone) {
+      // `closed` is the single source of truth for open/done — same criterion as the age
+      // breakdown, overdue count and every other metric. A ticket that was closed without
+      // landing on a done-tag still counts as done here, so this total can't drift above
+      // the drill-down lists.
+      if (row.closed) {
         doneTotal += row.count;
       } else {
         openTotal += row.count;

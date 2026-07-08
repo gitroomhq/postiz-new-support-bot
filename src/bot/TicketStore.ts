@@ -252,20 +252,39 @@ export class TicketStore {
 
   // ---- Aggregates for the status report ----
 
-  // Ticket counts grouped by current status tag AND category, in one pass. The report
-  // classifies each statusTagId as open/done and derives every breakdown from this.
+  // Ticket counts grouped by current status tag, category AND closed-state, in one pass.
+  // The report treats the `closed` boolean as the source of truth for open/done (matching
+  // every other metric) and derives every breakdown from this.
   async statusCategoryBreakdown(): Promise<
-    { statusTagId: string | null; categoryId: string | null; count: number }[]
+    { statusTagId: string | null; categoryId: string | null; closed: boolean; count: number }[]
   > {
     const rows = await this.prisma.ticket.groupBy({
-      by: ["statusTagId", "categoryId"],
+      by: ["statusTagId", "categoryId", "closed"],
       _count: { _all: true },
     });
     return rows.map((r) => ({
       statusTagId: r.statusTagId,
       categoryId: r.categoryId,
+      closed: r.closed,
       count: r._count._all,
     }));
+  }
+
+  // One-time repair for tickets that were closed (`closed = true`) without ever landing on
+  // a done-tag — they used to inflate the report's tag-derived "Open" headline. Moves every
+  // such ticket onto the canonical Closed tag so its status matches its state. `doneTagIds`
+  // (tags with closesThread, plus ✅ Resolved) are left untouched. The explicit null branch
+  // is required because `NOT IN (...)` never matches a NULL statusTagId in SQL. Returns the
+  // number of tickets changed. closed/closedAt are left alone (they're already closed).
+  async reTagClosedToClosing(closingTagId: string, doneTagIds: string[]): Promise<number> {
+    const result = await this.prisma.ticket.updateMany({
+      where: {
+        closed: true,
+        OR: [{ statusTagId: null }, { statusTagId: { notIn: doneTagIds } }],
+      },
+      data: { statusTagId: closingTagId },
+    });
+    return result.count;
   }
 
   async countOpenedSince(since: Date): Promise<number> {
