@@ -270,23 +270,6 @@ export class TicketStore {
     }));
   }
 
-  // One-time repair for tickets that were closed (`closed = true`) without ever landing on
-  // a done-tag — they used to inflate the report's tag-derived "Open" headline. Moves every
-  // such ticket onto the canonical Closed tag so its status matches its state. `doneTagIds`
-  // (tags with closesThread, plus ✅ Resolved) are left untouched. The explicit null branch
-  // is required because `NOT IN (...)` never matches a NULL statusTagId in SQL. Returns the
-  // number of tickets changed. closed/closedAt are left alone (they're already closed).
-  async reTagClosedToClosing(closingTagId: string, doneTagIds: string[]): Promise<number> {
-    const result = await this.prisma.ticket.updateMany({
-      where: {
-        closed: true,
-        OR: [{ statusTagId: null }, { statusTagId: { notIn: doneTagIds } }],
-      },
-      data: { statusTagId: closingTagId },
-    });
-    return result.count;
-  }
-
   async countOpenedSince(since: Date): Promise<number> {
     return this.prisma.ticket.count({ where: { createdAt: { gte: since } } });
   }
