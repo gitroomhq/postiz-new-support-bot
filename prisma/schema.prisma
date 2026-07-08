@@ -158,6 +158,10 @@ model StatusTag {
   reminderTarget  String   @default("SUPPORT")
   autoCloseAfter  Int?
   sortOrder       Int      @default(0)
+  // When a customer replies to a Waiting-for-Customer ticket, it moves to the tag
+  // flagged here (at most one) instead of reverting to its previous status. Unset
+  // on every tag → fall back to the previous-status behaviour.
+  isCustomerReplyTarget Boolean @default(false)
   // Intercom ticket state this tag maps to (set via /config → Intercom → States).
   intercomTicketStateId String?
   tickets         Ticket[]

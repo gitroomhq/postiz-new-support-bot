@@ -35,13 +35,16 @@ export interface TagInput {
   reminderDays?: number;
   reminderTarget?: ReminderTarget;
   autoCloseAfter?: number | null;
+  // When set, a customer replying to a Waiting-for-Customer ticket moves it here
+  // instead of reverting to its previous status. At most one tag holds this.
+  isCustomerReplyTarget?: boolean;
 }
 
 const DEFAULT_TAGS: TagInput[] = [
   { emoji: "🟢", label: "Open", isInitial: true, reminderEnabled: true, reminderDays: 3, reminderTarget: "SUPPORT" },
   { emoji: "🟡", label: "Ongoing", reminderEnabled: true, reminderDays: 3, reminderTarget: "SUPPORT" },
   { emoji: "🟠", label: "Waiting for Customer", reminderEnabled: true, reminderDays: 3, reminderTarget: "CUSTOMER", autoCloseAfter: 3 },
-  { emoji: "🔵", label: "Waiting for Developer", reminderEnabled: true, reminderDays: 5, reminderTarget: "SUPPORT" },
+  { emoji: "🔵", label: "Waiting for Developer", reminderEnabled: true, reminderDays: 5, reminderTarget: "SUPPORT", isCustomerReplyTarget: true },
   { emoji: "🟣", label: "Testing", reminderEnabled: true, reminderDays: 5, reminderTarget: "SUPPORT" },
   // autoCloseAfter on Resolved is read as DAYS of customer silence before the ticket
   // is auto-closed (locked); on reminder tags it counts reminder rounds instead.
@@ -110,6 +113,7 @@ export class SettingsStore {
           reminderDays: t.reminderDays ?? 3,
           reminderTarget: t.reminderTarget ?? "SUPPORT",
           autoCloseAfter: t.autoCloseAfter ?? null,
+          isCustomerReplyTarget: t.isCustomerReplyTarget ?? false,
           sortOrder: i,
         })),
       });
@@ -309,6 +313,12 @@ export class SettingsStore {
 
   initialTag(): StatusTag | undefined {
     return this.tagList.find((t) => t.isInitial);
+  }
+
+  // The tag a customer reply to a Waiting-for-Customer ticket lands on (at most
+  // one). Undefined → callers fall back to the previous-status behaviour.
+  customerReplyTarget(): StatusTag | undefined {
+    return this.tagList.find((t) => t.isCustomerReplyTarget);
   }
 
   closingTag(): StatusTag | undefined {
@@ -712,6 +722,9 @@ export class SettingsStore {
       if (input.isInitial) {
         await tx.statusTag.updateMany({ data: { isInitial: false } });
       }
+      if (input.isCustomerReplyTarget) {
+        await tx.statusTag.updateMany({ data: { isCustomerReplyTarget: false } });
+      }
       return tx.statusTag.create({
         data: {
           emoji: input.emoji.trim(),
@@ -722,6 +735,7 @@ export class SettingsStore {
           reminderDays: input.reminderDays ?? 3,
           reminderTarget: input.reminderTarget ?? "SUPPORT",
           autoCloseAfter: input.autoCloseAfter ?? null,
+          isCustomerReplyTarget: input.isCustomerReplyTarget ?? false,
           sortOrder: nextOrder,
         },
       });
@@ -744,6 +758,9 @@ export class SettingsStore {
       if (input.isInitial) {
         await tx.statusTag.updateMany({ where: { id: { not: id } }, data: { isInitial: false } });
       }
+      if (input.isCustomerReplyTarget) {
+        await tx.statusTag.updateMany({ where: { id: { not: id } }, data: { isCustomerReplyTarget: false } });
+      }
       return tx.statusTag.update({
         where: { id },
         data: {
@@ -755,6 +772,7 @@ export class SettingsStore {
           ...(input.reminderDays !== undefined ? { reminderDays: input.reminderDays } : {}),
           ...(input.reminderTarget !== undefined ? { reminderTarget: input.reminderTarget } : {}),
           ...(input.autoCloseAfter !== undefined ? { autoCloseAfter: input.autoCloseAfter } : {}),
+          ...(input.isCustomerReplyTarget !== undefined ? { isCustomerReplyTarget: input.isCustomerReplyTarget } : {}),
         },
       });
     });
@@ -873,5 +891,35 @@ export class SettingsStore {
 
     await this.refreshPriorities();
     return { reassignedThreadIds: affected.map((t) => t.threadId), initial };
+  }
+
+  // Moves a status tag one slot up/down in the display order. Renumbers the whole
+  // list to a contiguous 0..n-1 sortOrder so a move is reliable even if existing
+  // values were duplicated or sparse. No-op when already at the requested edge.
+  async moveTag(id: string, direction: "up" | "down"): Promise<void> {
+    const order = [...this.tagList]; // already sorted by sortOrder asc
+    const idx = order.findIndex((t) => t.id === id);
+    if (idx === -1) throw new Error("Tag not found.");
+    const swapIdx = direction === "up" ? idx - 1 : idx + 1;
+    if (swapIdx < 0 || swapIdx >= order.length) return;
+    [order[idx], order[swapIdx]] = [order[swapIdx], order[idx]];
+    await this.prisma.$transaction(
+      order.map((t, i) => this.prisma.statusTag.update({ where: { id: t.id }, data: { sortOrder: i } }))
+    );
+    await this.refreshTags();
+  }
+
+  // Priority-axis mirror of moveTag.
+  async movePriority(id: string, direction: "up" | "down"): Promise<void> {
+    const order = [...this.priorityList]; // already sorted by sortOrder asc
+    const idx = order.findIndex((p) => p.id === id);
+    if (idx === -1) throw new Error("Priority not found.");
+    const swapIdx = direction === "up" ? idx - 1 : idx + 1;
+    if (swapIdx < 0 || swapIdx >= order.length) return;
+    [order[idx], order[swapIdx]] = [order[swapIdx], order[idx]];
+    await this.prisma.$transaction(
+      order.map((p, i) => this.prisma.priorityTag.update({ where: { id: p.id }, data: { sortOrder: i } }))
+    );
+    await this.refreshPriorities();
   }
 }

@@ -62,6 +62,7 @@ const STATEMENTS: string[] = [
     "reminderTarget" TEXT NOT NULL DEFAULT 'SUPPORT',
     "autoCloseAfter" INTEGER,
     "sortOrder" INTEGER NOT NULL DEFAULT 0,
+    "isCustomerReplyTarget" BOOLEAN NOT NULL DEFAULT false,
     CONSTRAINT "status_tags_pkey" PRIMARY KEY ("id")
   )`,
   `CREATE TABLE IF NOT EXISTS "tickets" (
@@ -282,6 +283,21 @@ const STATEMENTS: string[] = [
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "intercomTicketTypeMap" JSONB`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "intercomTeamId" TEXT`,
   `ALTER TABLE "status_tags" ADD COLUMN IF NOT EXISTS "intercomTicketStateId" TEXT`,
+  // Customer-reply target flag. Added + backfilled together in a single guarded
+  // block so it runs exactly once — on the boot that first introduces the column.
+  // Existing installs adopt the documented default ("Waiting for Developer"); a
+  // later operator toggle (including clearing it) is never re-applied on reboot.
+  `DO $$
+  BEGIN
+    IF NOT EXISTS (
+      SELECT 1 FROM information_schema.columns
+      WHERE table_schema = current_schema() AND table_name = 'status_tags'
+        AND column_name = 'isCustomerReplyTarget'
+    ) THEN
+      ALTER TABLE "status_tags" ADD COLUMN "isCustomerReplyTarget" BOOLEAN NOT NULL DEFAULT false;
+      UPDATE "status_tags" SET "isCustomerReplyTarget" = true WHERE "label" = 'Waiting for Developer';
+    END IF;
+  END $$;`,
   // Intercom bridge overhaul: durable inbound webhook queue, reserve→confirm
   // echo records, inbound tag-diff damper, snooze tag + Sentry DSN settings.
   `CREATE TABLE IF NOT EXISTS "intercom_inbox" (

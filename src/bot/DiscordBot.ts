@@ -371,10 +371,11 @@ export class DiscordBot {
       return;
     }
 
-    // The customer answered a Waiting-for-Customer ticket: put it back to the status it
-    // had before, so it re-enters the team's active queue instead of idling until a
-    // reminder fires. Falls back to the initial status when the previous one is unknown
-    // or unusable (deleted, closes the thread, resolved, or itself waiting-on-customer).
+    // The customer answered a Waiting-for-Customer ticket: move it back into the team's
+    // active queue instead of idling until a reminder fires. Preferred destination is
+    // the configured customer-reply target tag (default "Waiting for Developer", set via
+    // /config → Tags); when none is configured (or it's unusable) fall back to the status
+    // the ticket had before, and finally to the initial status.
     if (
       !ticket.closed &&
       ticket.statusTag?.reminderTarget === "CUSTOMER" &&
@@ -382,10 +383,11 @@ export class DiscordBot {
       ticket.statusTag.emoji !== RESOLVED_EMOJI &&
       message.author.id === ticket.customerId
     ) {
+      const usable = (t: StatusTag | undefined): t is StatusTag =>
+        !!t && !t.closesThread && t.emoji !== RESOLVED_EMOJI && t.reminderTarget !== "CUSTOMER";
+      const replyTarget = this.settingsStore.customerReplyTarget();
       const prevTag = ticket.prevStatusTagId ? this.settingsStore.tagById(ticket.prevStatusTagId) : undefined;
-      const usablePrev =
-        prevTag && !prevTag.closesThread && prevTag.emoji !== RESOLVED_EMOJI && prevTag.reminderTarget !== "CUSTOMER";
-      const target = usablePrev ? prevTag : this.settingsStore.initialTag();
+      const target = usable(replyTarget) ? replyTarget : usable(prevTag) ? prevTag : this.settingsStore.initialTag();
       if (target && target.id !== ticket.statusTagId) {
         await this.statusService.applyStatus(message.channel as ThreadChannel, ticket, target, {
           actorName: "Customer reply",
@@ -3644,7 +3646,13 @@ export class DiscordBot {
         tags.length
           ? tags
               .map((t) => {
-                const flags = [t.isInitial ? "initial" : null, t.closesThread ? "closes" : null].filter(Boolean).join(", ");
+                const flags = [
+                  t.isInitial ? "initial" : null,
+                  t.closesThread ? "closes" : null,
+                  t.isCustomerReplyTarget ? "reply target" : null,
+                ]
+                  .filter(Boolean)
+                  .join(", ");
                 const reminder = t.reminderEnabled ? `${t.reminderDays}d → ${t.reminderTarget.toLowerCase()}` : "no reminders";
                 return `${t.emoji} **${t.label}** — ${reminder}${flags ? ` (${flags})` : ""}`;
               })
@@ -3671,6 +3679,11 @@ export class DiscordBot {
   }
 
   private buildTagEditPanel(tag: StatusTag) {
+    const tags = this.settingsStore.tags();
+    const idx = tags.findIndex((t) => t.id === tag.id);
+    const atTop = idx <= 0;
+    const atBottom = idx === -1 || idx >= tags.length - 1;
+
     const embed = new EmbedBuilder()
       .setTitle(`Edit ${tag.emoji} ${tag.label}`)
       .setColor(0x5865f2)
@@ -3686,6 +3699,7 @@ export class DiscordBot {
                 ? `${tag.autoCloseAfter} day(s) of customer silence`
                 : `${tag.autoCloseAfter} customer reminder(s)`
           }`,
+          `**Customer-reply target:** ${tag.isCustomerReplyTarget ? "yes — a customer reply to a Waiting-for-Customer ticket lands here" : "no"}`,
         ].join("\n")
       );
 
@@ -3696,7 +3710,16 @@ export class DiscordBot {
         .setStyle(tag.isInitial ? ButtonStyle.Success : ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId(`config_tag_toggle_closes:${tag.id}`).setLabel("Toggle Closes").setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId(`config_tag_toggle_reminder:${tag.id}`).setLabel("Toggle Reminder").setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId(`config_tag_target:${tag.id}`).setLabel(`Target: ${tag.reminderTarget.toLowerCase()}`).setStyle(ButtonStyle.Secondary)
+      new ButtonBuilder().setCustomId(`config_tag_target:${tag.id}`).setLabel(`Target: ${tag.reminderTarget.toLowerCase()}`).setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId(`config_tag_toggle_reply_target:${tag.id}`)
+        .setLabel(tag.isCustomerReplyTarget ? "Reply target ✓" : "Set reply target")
+        .setStyle(tag.isCustomerReplyTarget ? ButtonStyle.Success : ButtonStyle.Secondary)
+    );
+
+    const reorder = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId(`config_tag_move_up:${tag.id}`).setLabel("Move Up").setEmoji("⬆️").setStyle(ButtonStyle.Secondary).setDisabled(atTop),
+      new ButtonBuilder().setCustomId(`config_tag_move_down:${tag.id}`).setLabel("Move Down").setEmoji("⬇️").setStyle(ButtonStyle.Secondary).setDisabled(atBottom)
     );
 
     const actions = new ActionRowBuilder<ButtonBuilder>().addComponents(
@@ -3705,7 +3728,7 @@ export class DiscordBot {
       new ButtonBuilder().setCustomId("config_tags").setLabel("Back").setStyle(ButtonStyle.Secondary)
     );
 
-    return { embeds: [embed], components: [toggles, actions] };
+    return { embeds: [embed], components: [toggles, reorder, actions] };
   }
 
   private buildPrioritiesPanel() {
@@ -3739,10 +3762,20 @@ export class DiscordBot {
   }
 
   private buildPriorityEditPanel(priority: PriorityTag) {
+    const priorities = this.settingsStore.priorities();
+    const idx = priorities.findIndex((p) => p.id === priority.id);
+    const atTop = idx <= 0;
+    const atBottom = idx === -1 || idx >= priorities.length - 1;
+
     const embed = new EmbedBuilder()
       .setTitle(`Edit ${priority.emoji} ${priority.label}`)
       .setColor(0x5865f2)
       .setDescription(`**Initial:** ${priority.isInitial ? "yes" : "no"}`);
+
+    const reorder = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId(`config_priority_move_up:${priority.id}`).setLabel("Move Up").setEmoji("⬆️").setStyle(ButtonStyle.Secondary).setDisabled(atTop),
+      new ButtonBuilder().setCustomId(`config_priority_move_down:${priority.id}`).setLabel("Move Down").setEmoji("⬇️").setStyle(ButtonStyle.Secondary).setDisabled(atBottom)
+    );
 
     const actions = new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder()
@@ -3754,7 +3787,7 @@ export class DiscordBot {
       new ButtonBuilder().setCustomId("config_priorities").setLabel("Back").setStyle(ButtonStyle.Secondary)
     );
 
-    return { embeds: [embed], components: [actions] };
+    return { embeds: [embed], components: [reorder, actions] };
   }
 
   private buildPriorityModal(priority?: PriorityTag): ModalBuilder {
@@ -4791,6 +4824,14 @@ export class DiscordBot {
         await this.handlePriorityDelete(interaction, priority.id);
         return;
       }
+      if (priorityAction === "config_priority_move_up" || priorityAction === "config_priority_move_down") {
+        const dir = priorityAction === "config_priority_move_up" ? "up" : "down";
+        await this.settingsStore.movePriority(priority.id, dir);
+        this.auditConfig(interaction, `Priority ${priority.emoji} ${priority.label} → moved ${dir}`);
+        const updated = this.settingsStore.priorityById(priority.id);
+        await interaction.update(updated ? this.buildPriorityEditPanel(updated) : this.buildPrioritiesPanel());
+        return;
+      }
       return;
     }
 
@@ -4815,6 +4856,14 @@ export class DiscordBot {
       const next: ReminderTarget = tag.reminderTarget === "CUSTOMER" ? "SUPPORT" : "CUSTOMER";
       await this.settingsStore.editTag(tag.id, { reminderTarget: next });
       this.auditConfig(interaction, `Status tag ${tag.emoji} ${tag.label} → reminder target: ${next.toLowerCase()}`);
+    } else if (action === "config_tag_toggle_reply_target") {
+      const next = !tag.isCustomerReplyTarget;
+      await this.settingsStore.editTag(tag.id, { isCustomerReplyTarget: next });
+      this.auditConfig(interaction, `Status tag ${tag.emoji} ${tag.label} → customer-reply target: ${next ? "on" : "off"}`);
+    } else if (action === "config_tag_move_up" || action === "config_tag_move_down") {
+      const dir = action === "config_tag_move_up" ? "up" : "down";
+      await this.settingsStore.moveTag(tag.id, dir);
+      this.auditConfig(interaction, `Status tag ${tag.emoji} ${tag.label} → moved ${dir}`);
     } else if (action === "config_tag_edit_basic") {
       await interaction.showModal(this.buildTagModal(tag));
       return;

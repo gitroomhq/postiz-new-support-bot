@@ -35,7 +35,7 @@ const EXPECTED_COLUMNS: Record<string, string[]> = {
   ],
   status_tags: [
     "id", "emoji", "label", "isInitial", "closesThread", "reminderEnabled", "reminderDays", "reminderTarget",
-    "autoCloseAfter", "sortOrder", "intercomTicketStateId",
+    "autoCloseAfter", "sortOrder", "isCustomerReplyTarget", "intercomTicketStateId",
   ],
   priority_tags: ["id", "emoji", "label", "isInitial", "sortOrder"],
   tickets: [
