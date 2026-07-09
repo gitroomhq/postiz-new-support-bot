@@ -33,6 +33,7 @@ import { SubscriptionsHub } from "./billing/hubs/SubscriptionsHub";
 import { PromosHub } from "./billing/hubs/PromosHub";
 import { InvoicesHub } from "./billing/hubs/InvoicesHub";
 import { PaymentsHub } from "./billing/hubs/PaymentsHub";
+import { BusinessHub } from "./billing/hubs/BusinessHub";
 
 type Handler<I> = (interaction: I) => Promise<void>;
 
@@ -76,6 +77,7 @@ export class BillingAdmin {
   private promos: PromosHub;
   private invoices: InvoicesHub;
   private payments: PaymentsHub;
+  private business: BusinessHub;
 
   private buttonRoutes = new RouteTable<ButtonInteraction>();
   private selectRoutes = new RouteTable<StringSelectMenuInteraction>();
@@ -109,6 +111,7 @@ export class BillingAdmin {
     this.promos = new PromosHub(ctx);
     this.invoices = new InvoicesHub(ctx);
     this.payments = new PaymentsHub(ctx);
+    this.business = new BusinessHub(ctx);
 
     // The resolver dispatches a resolved customer to the owning hub's renderer.
     this.targets.bindHandlers({
@@ -133,6 +136,7 @@ export class BillingAdmin {
       this.promos,
       this.invoices,
       this.payments,
+      this.business,
       { routes: this.facadeRoutes() },
     ];
     for (const source of sources) {

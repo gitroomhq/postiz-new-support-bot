@@ -17,7 +17,10 @@ import type { HubContext } from "./HubContext";
 import { renderListPage } from "./ChargesHub";
 
 // Cards hub: card lookups (per user, by fingerprint, by last 4) and saved
-// payment-method management (set default / detach).
+// payment-method management (set default / detach). Also home of the two
+// account-wide find flows, which are ENTERED from other hubs since the nav
+// reorg: Find by Amount from 💰 Payments, Find by Name/Email from 👤 Customers
+// (their Back targets point there accordingly).
 export class CardsHub {
   constructor(private ctx: HubContext) {}
 
@@ -244,7 +247,7 @@ export class CardsHub {
               COLORS.neutral
             ),
           ],
-          components: [backRow("billadmin_hub:cards")],
+          components: [backRow("billadmin_hub:pay")],
         });
         return;
       }
@@ -287,14 +290,14 @@ export class CardsHub {
 
     const components = [];
     if (custIds.length > 0) {
-      const token = this.ctx.sessions.newSession(interaction, { pendingAction: "overview", originHub: "cards" });
+      const token = this.ctx.sessions.newSession(interaction, { pendingAction: "overview", originHub: "pay" });
       const select = new StringSelectMenuBuilder()
         .setCustomId(`billadmin_cuspick:${token}`)
         .setPlaceholder("Open a customer's overview…")
         .addOptions(custIds.slice(0, 25).map((id) => ({ label: id, description: "open overview", value: id })));
       components.push(selectRow(select));
     }
-    components.push(backRow("billadmin_hub:cards"));
+    components.push(backRow("billadmin_hub:pay"));
     await interaction.editReply({ embeds: [embed], components });
   }
 
@@ -315,11 +318,11 @@ export class CardsHub {
       if (customers.length === 0) {
         await interaction.editReply({
           embeds: [makeEmbed(`No Stripe customers matched \`${term}\` (name or email).`, COLORS.neutral)],
-          components: [backRow("billadmin_hub:cards")],
+          components: [backRow("billadmin_hub:customers")],
         });
         return;
       }
-      const token = this.ctx.sessions.newSession(interaction, { pendingAction: "overview", originHub: "cards" });
+      const token = this.ctx.sessions.newSession(interaction, { pendingAction: "overview", originHub: "customers" });
       const lines = customers.map((c) => `\`${c.id}\` · ${c.name ?? "no name"} · ${c.email ?? "no email"}`);
       const embed = new EmbedBuilder()
         .setTitle(`Customers matching "${term}"`)
@@ -338,7 +341,7 @@ export class CardsHub {
             value: c.id,
           }))
         );
-      await interaction.editReply({ embeds: [embed], components: [selectRow(select), backRow("billadmin_hub:cards")] });
+      await interaction.editReply({ embeds: [embed], components: [selectRow(select), backRow("billadmin_hub:customers")] });
     });
   }
 

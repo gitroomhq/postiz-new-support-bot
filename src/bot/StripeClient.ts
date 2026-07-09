@@ -442,6 +442,18 @@ export class StripeClient {
     return res.data;
   }
 
+  // Our OWN platform account (no id = the account the secret key belongs to).
+  async getAccount(): Promise<Stripe.Account> {
+    return this.stripe.accounts.retrieve();
+  }
+
+  // Account-level tax IDs (the VAT etc. displayed on our invoices) — distinct
+  // from customer tax IDs and from the write-only onboarding company tax_id.
+  async listAccountTaxIds(): Promise<Stripe.TaxId[]> {
+    const res = await this.stripe.taxIds.list({ limit: 100 });
+    return res.data;
+  }
+
   // ---- Billing admin panel (/billing) writes ----
 
   // Omitted amount = Stripe refunds the full remaining un-refunded amount.

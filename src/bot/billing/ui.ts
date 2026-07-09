@@ -189,8 +189,9 @@ export function hubFor(action: TargetAction | "link"): string {
   switch (action) {
     case "cards":
       return "billadmin_hub:cards";
-    case "charges":
     case "invoices":
+      return "billadmin_hub:invoices";
+    case "charges":
     case "fraud":
       return "billadmin_hub:charges";
     case "discount":
@@ -203,8 +204,10 @@ export function hubFor(action: TargetAction | "link"): string {
 }
 
 // Prefer the hub the flow actually came from over the action's default hub.
+// "root" is the root panel itself (the featured 🔍 Find Customer button).
 export function hubBack(action: TargetAction | "link", origin?: string): string {
-  return origin && ["cards", "customers", "charges", "subs"].includes(origin)
+  if (origin === "root") return "billadmin_root";
+  return origin && ["cards", "customers", "charges", "subs", "pay", "invoices"].includes(origin)
     ? `billadmin_hub:${origin}`
     : hubFor(action);
 }
@@ -218,13 +221,15 @@ export function buildRootPanel(config: BotConfig): Panel {
     .setColor(COLORS.brand)
     .setDescription(
       [
-        "💳 **Cards** — lookups by user, fingerprint or last 4 · set default · detach",
-        "👤 **Customers** — overview, email lookup, create, edit (VAT/address), link, delete",
-        "💰 **Charges** — charge & invoice history, disputes & fraud, refunds",
-        "🔄 **Subscriptions** — view, create, change plan, apply discount, cancel",
-        "🎟️ **Promos** — promo codes & coupons",
-        "🧾 **Invoices** — invoice list & detail, one-off invoices, credit notes",
-        "💸 **Payments** — payment methods, account credits/debits, balance history, manual charges",
+        "🔍 **Find Customer** — the main entry: resolves a Discord user / email / cus_ / Postiz ID to the",
+        "**Customer 360**, which links to their cards, charges, invoices, subscriptions, fraud signals and all actions.",
+        "",
+        "👤 **Customers** — search by name/email, create, edit (VAT/address), link, delete",
+        "🔄 **Subscriptions** — create, or manage one (plan, discount, trial, pause, cancel)",
+        "💰 **Payments** — charges, refunds, disputes & fraud, balance credits, manual charges",
+        "🧾 **Invoices** — per-customer & open invoices, one-off invoices, credit notes",
+        "💳 **Cards** — card hunts by fingerprint / last 4 · set default · detach",
+        "🎟️ **Promos** — promo codes & coupons · 🏢 **Business** — our own company data (name, address, VAT)",
       ].join("\n")
     )
     .setFooter({
@@ -234,16 +239,17 @@ export function buildRootPanel(config: BotConfig): Panel {
   return {
     embeds: [embed],
     components: [
+      buttonRow(btn("billadmin_open:overview:root", "🔍 Find Customer", ButtonStyle.Success)),
       buttonRow(
-        btn("billadmin_hub:cards", "💳 Cards", ButtonStyle.Primary),
         btn("billadmin_hub:customers", "👤 Customers", ButtonStyle.Primary),
-        btn("billadmin_hub:charges", "💰 Charges", ButtonStyle.Primary),
         btn("billadmin_hub:subs", "🔄 Subscriptions", ButtonStyle.Primary),
-        btn("billadmin_open:promo", "🎟️ Promos", ButtonStyle.Primary)
+        btn("billadmin_hub:pay", "💰 Payments", ButtonStyle.Primary),
+        btn("billadmin_hub:invoices", "🧾 Invoices", ButtonStyle.Primary),
+        btn("billadmin_hub:cards", "💳 Cards", ButtonStyle.Primary)
       ),
       buttonRow(
-        btn("billadmin_hub:invoices", "🧾 Invoices", ButtonStyle.Primary),
-        btn("billadmin_hub:pay", "💸 Payments", ButtonStyle.Primary)
+        btn("billadmin_open:promo", "🎟️ Promos", ButtonStyle.Secondary),
+        btn("billadmin_hub:business", "🏢 Business", ButtonStyle.Secondary)
       ),
     ],
   };
@@ -260,9 +266,10 @@ export function buildHubPanel(area: string, config: BotConfig): Panel {
       .setDescription(
         [
           "**Read** — a user's cards, or hunt cards account-wide by fingerprint / last 4.",
-          "**Find** — locate a customer or a **declined / bank-blocked** payment by amount or name when card and",
-          "last-4 lookups come up empty (a refused payment never becomes a charge, so it won't show in the searches above).",
           "**Update / Delete** — open *User's Cards* and pick a saved card to set it as default or detach it.",
+          "",
+          "Looking for a **declined / bank-blocked** payment? Those never become a charge — use",
+          "💰 Payments → *Find by Amount*. Customer search by name/email lives under 👤 Customers.",
         ].join("\n")
       );
     return {
@@ -274,10 +281,6 @@ export function buildHubPanel(area: string, config: BotConfig): Panel {
           btn("billadmin_open:chargesbycard", "Charges by Card", ButtonStyle.Primary),
           btn("billadmin_open:cardsbylast4", "Cards by Last 4", ButtonStyle.Primary)
         ),
-        buttonRow(
-          btn("billadmin_open:findamount", "🔎 Find by Amount", ButtonStyle.Secondary),
-          btn("billadmin_open:findname", "🔎 Find by Name / Email", ButtonStyle.Secondary)
-        ),
         backRow(),
       ],
     };
@@ -288,7 +291,8 @@ export function buildHubPanel(area: string, config: BotConfig): Panel {
       .setColor(COLORS.brand)
       .setDescription(
         [
-          "**Read** — full overview: pick a Discord user, or enter a cus_ ID / **email** / Postiz ID manually.",
+          "**Read** — full overview (360): pick a Discord user, or enter a cus_ ID / **email** / Postiz ID manually,",
+          "or **search** account-wide by partial name / email.",
           "**Create** — a bare Stripe customer.",
           "**Update** — details, address, VAT/tax IDs · link/unlink the Discord ↔ Stripe mapping.",
           "**Delete** — permanently remove a customer (cancels their subscriptions).",
@@ -297,7 +301,10 @@ export function buildHubPanel(area: string, config: BotConfig): Panel {
     return {
       embeds: [embed],
       components: [
-        buttonRow(btn("billadmin_open:overview", "Overview", ButtonStyle.Primary)),
+        buttonRow(
+          btn("billadmin_open:overview", "Overview", ButtonStyle.Primary),
+          btn("billadmin_open:findname", "🔎 Search by Name / Email", ButtonStyle.Primary)
+        ),
         buttonRow(
           btn("billadmin_open:createcust", "Create", ButtonStyle.Success),
           btn("billadmin_open:editcust", "Edit", ButtonStyle.Primary),
@@ -310,14 +317,21 @@ export function buildHubPanel(area: string, config: BotConfig): Panel {
       ],
     };
   }
-  if (area === "charges") {
+  // One merged money hub: the old 💰 Charges and 💸 Payments panels showed
+  // overlapping tools from two entry points. Both ids render the same panel so
+  // every historical Back target (billadmin_hub:charges / :pay) still works.
+  if (area === "charges" || area === "pay") {
     const embed = new EmbedBuilder()
-      .setTitle("💰 Charges")
+      .setTitle("💰 Payments")
       .setColor(COLORS.brand)
       .setDescription(
         [
-          "**Read** — a user's charge and invoice history, plus disputes & fraud signals.",
+          "**Read** — a user's charge history · disputes & fraud signals · customer balance history.",
+          "**Find by Amount** — account-wide payment attempts **including declined / bank-blocked** ones",
+          "(those never become a charge, so they only show up here).",
+          "**Adjust Balance** — grant an account credit or add a debit; applied to future invoices.",
           "**Refund** — full or partial refund of a charge, optionally cancelling the subscription.",
+          "**Charge Card Now** — charge a saved card immediately, off-session (no 3DS possible).",
         ].join("\n")
       );
     return {
@@ -325,11 +339,14 @@ export function buildHubPanel(area: string, config: BotConfig): Panel {
       components: [
         buttonRow(
           btn("billadmin_open:charges", "Charges for User", ButtonStyle.Primary),
-          btn("billadmin_open:invoices", "Invoices", ButtonStyle.Primary),
-          btn("billadmin_open:fraud", "Disputes & Fraud", ButtonStyle.Primary)
+          btn("billadmin_open:fraud", "Disputes & Fraud", ButtonStyle.Primary),
+          btn("billadmin_pay_open:hist", "Balance History", ButtonStyle.Primary),
+          btn("billadmin_open:findamount", "🔎 Find by Amount", ButtonStyle.Primary)
         ),
         buttonRow(
           btn("billadmin_open:refund", "Refund a Charge", ButtonStyle.Danger),
+          btn("billadmin_pay_open:bal", "Adjust Balance", ButtonStyle.Secondary),
+          btn("billadmin_pay_open:charge", "Charge Card Now", ButtonStyle.Danger),
           btn("billadmin_root", "◀ Back", ButtonStyle.Secondary)
         ),
       ],
@@ -341,10 +358,10 @@ export function buildHubPanel(area: string, config: BotConfig): Panel {
       .setColor(COLORS.brand)
       .setDescription(
         [
-          "**Read** — subscriptions (with their plans) are listed under 👤 Customers → *Overview*.",
           "**Create** — start a new subscription: plan, optional coupon & trial, charge now or email an invoice.",
-          "**Update** — change plan (keep / remove / swap the discount along the way) · apply the configured discount coupon.",
-          "**Delete** — cancel now, or at the end of the current period.",
+          "**Manage** — everything on an existing subscription lives in one place: change plan, quantity,",
+          "trial, pause/resume, schedule, apply/remove discount, cancel.",
+          "**Cancel by ID** — the quick path when you already have the `sub_…` id (e.g. from a webhook).",
         ].join("\n")
       );
     return {
@@ -355,11 +372,7 @@ export function buildHubPanel(area: string, config: BotConfig): Panel {
           btn("billadmin_sub_manage_entry", "🛠 Manage Subscription", ButtonStyle.Primary)
         ),
         buttonRow(
-          btn("billadmin_open:changeplan", "Change Plan", ButtonStyle.Primary),
-          btn("billadmin_open:discount", "Apply Discount", ButtonStyle.Primary)
-        ),
-        buttonRow(
-          btn("billadmin_open:cancelsub", "Cancel Subscription", ButtonStyle.Danger),
+          btn("billadmin_open:cancelsub", "Cancel by Sub ID…", ButtonStyle.Danger),
           btn("billadmin_root", "◀ Back", ButtonStyle.Secondary)
         ),
       ],

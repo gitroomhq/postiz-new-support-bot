@@ -18,17 +18,18 @@ import { afterActionBack, backRow, btn, buttonRow, selectRow, textInput } from "
 import type { Panel, RenderInteraction, RouteEntry } from "../types";
 import type { HubContext } from "./HubContext";
 
-// Payments & Credits hub: saved payment methods (read-only view + deep-link to
-// the Cards hub for management), customer balance adjustments (credits/debits),
-// balance history, and manual off-session charges.
+// Payments flows: customer balance adjustments (credits/debits), balance
+// history, manual off-session charges, and the legacy payment-methods view
+// (the "pm" op has no hub button anymore — the 360 and 💳 Cards cover it —
+// but its routes stay registered so stale panels keep working).
 //
-// Self-contained by design: it registers `billadmin_hub:pay` as an EXACT button
-// route (exact routes win over the facade's `billadmin_hub:` prefix route, which
-// would otherwise fall through buildHubPanel to the root panel), and it carries
-// its own target-resolution flow (user pick / cus_ / email / Postiz id) because
-// TargetResolver's TARGET_ACTIONS list is a shared file. Payments-specific flow
-// state lives in a hub-private side map keyed by the shared session token, since
-// BillAdminSession (types.ts) is shared too.
+// The hub PANEL itself lives in ui.ts buildHubPanel: the old 💰 Charges and
+// 💸 Payments panels were merged into one "💰 Payments" panel, rendered for
+// both billadmin_hub:charges and billadmin_hub:pay by the facade's prefix
+// route. This hub keeps its own target-resolution flow (user pick / cus_ /
+// email / Postiz id) because TargetResolver's TARGET_ACTIONS list is a shared
+// file. Payments-specific flow state lives in a hub-private side map keyed by
+// the shared session token, since BillAdminSession (types.ts) is shared too.
 
 type PayOp = "pm" | "bal" | "hist" | "charge";
 
@@ -69,16 +70,9 @@ export class PaymentsHub {
   constructor(private ctx: HubContext) {}
 
   readonly routes: RouteEntry[] = [
-    // Exact hub navigation — beats the facade's `billadmin_hub:` prefix route.
-    {
-      kind: "button",
-      id: "billadmin_hub:pay",
-      match: "exact",
-      handler: async (interaction) => {
-        await interaction.update(this.buildPanel());
-      },
-    },
     // Hub panel buttons → target-resolution panel for the chosen operation.
+    // (billadmin_hub:pay itself is served by the facade's prefix route via
+    // buildHubPanel, which renders the merged 💰 Payments panel.)
     {
       kind: "button",
       id: "billadmin_pay_open:",
@@ -219,34 +213,6 @@ export class PaymentsHub {
       handler: (interaction) => this.executeCharge(interaction, interaction.customId.split(":")[1]),
     },
   ];
-
-  // ---- hub panel ----
-
-  buildPanel(): Panel {
-    const embed = new EmbedBuilder()
-      .setTitle("💸 Payments & Credits")
-      .setColor(COLORS.brand)
-      .setDescription(
-        [
-          "**Payment Methods** — all saved payment methods of a customer (manage them in 💳 Cards).",
-          "**Adjust Balance** — grant an account credit or add a debit; applied automatically to future invoices.",
-          "**Balance History** — every credit/debit ever applied to the customer balance.",
-          "**Charge Card Now** — charge a saved card immediately, off-session (no 3DS possible).",
-        ].join("\n")
-      );
-    return {
-      embeds: [embed],
-      components: [
-        buttonRow(
-          btn("billadmin_pay_open:pm", "Payment Methods", ButtonStyle.Primary),
-          btn("billadmin_pay_open:bal", "Adjust Balance", ButtonStyle.Primary),
-          btn("billadmin_pay_open:hist", "Balance History", ButtonStyle.Primary),
-          btn("billadmin_pay_open:charge", "Charge Card Now", ButtonStyle.Danger)
-        ),
-        buttonRow(btn("billadmin_root", "◀ Back to /billing root", ButtonStyle.Secondary)),
-      ],
-    };
-  }
 
   // ---- self-contained target resolution (mirrors TargetResolver's flow) ----
 
