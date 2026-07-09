@@ -177,13 +177,13 @@ export async function renderListPage(
     components.push(selectRow(pick));
   }
   const navButtons = [
-    btn(`billadmin_page:${token}:${page - 1}`, "◀ Prev", ButtonStyle.Secondary, page <= 0),
-    btn(`billadmin_page:${token}:${page + 1}`, "Next ▶", ButtonStyle.Secondary, !hasNext),
+    btn(`billadmin_page:${token}:${page - 1}`, "Prev", ButtonStyle.Secondary, page <= 0),
+    btn(`billadmin_page:${token}:${page + 1}`, "Next", ButtonStyle.Secondary, !hasNext),
   ];
   // Customer-scoped lists get a jump back to the Customer-360 panel; the
   // fingerprint view is account-wide, so there is no single customer to show.
   if (session.view !== "fpcharges" && session.customerId) {
-    navButtons.push(btn(`billadmin_c360_refresh:${token}`, "👤 360", ButtonStyle.Secondary));
+    navButtons.push(btn(`billadmin_c360_refresh:${token}`, "Customer 360", ButtonStyle.Secondary));
   }
   navButtons.push(btn(`billadmin_nav_back:${token}`, "Back", ButtonStyle.Secondary));
   components.push(buttonRow(...navButtons));
@@ -301,7 +301,7 @@ export class ChargesHub {
             components: [
               buttonRow(
                 btn(`billadmin_pi_cancelx:${token}:${page}`, "Cancel PaymentIntent", ButtonStyle.Danger),
-                btn(`billadmin_pi_det:${token}:${page}`, "◀ Back", ButtonStyle.Secondary)
+                btn(`billadmin_pi_det:${token}:${page}`, "Back", ButtonStyle.Secondary)
               ),
             ],
           });
@@ -678,10 +678,10 @@ export class ChargesHub {
       embeds: [embed],
       components: [
         buttonRow(
-          btn(`billadmin_ch_refund:${token}:${page}`, "↩️ Refund…", ButtonStyle.Danger, charge.refunded || remaining <= 0),
+          btn(`billadmin_ch_refund:${token}:${page}`, "Refund…", ButtonStyle.Danger, charge.refunded || remaining <= 0),
           btn("billadmin_hub:invoices", "View invoice", ButtonStyle.Secondary, !invoiceId),
-          btn(`billadmin_c360_refresh:${token}`, "👤 360", ButtonStyle.Secondary, !session.customerId),
-          btn(`billadmin_nav_back:${token}`, "◀ Back", ButtonStyle.Secondary)
+          btn(`billadmin_c360_refresh:${token}`, "Customer 360", ButtonStyle.Secondary, !session.customerId),
+          btn(`billadmin_nav_back:${token}`, "Back", ButtonStyle.Secondary)
         ),
       ],
     });
@@ -741,9 +741,9 @@ export class ChargesHub {
       embeds: [embed],
       components: [
         buttonRow(
-          btn(`billadmin_pi_cancel:${token}:${page}`, "🚫 Cancel PI", ButtonStyle.Danger, !cancelable),
-          btn(`billadmin_c360_refresh:${token}`, "👤 360", ButtonStyle.Secondary, !session.customerId),
-          btn(`billadmin_nav_back:${token}`, "◀ Back", ButtonStyle.Secondary)
+          btn(`billadmin_pi_cancel:${token}:${page}`, "Cancel PI", ButtonStyle.Danger, !cancelable),
+          btn(`billadmin_c360_refresh:${token}`, "Customer 360", ButtonStyle.Secondary, !session.customerId),
+          btn(`billadmin_nav_back:${token}`, "Back", ButtonStyle.Secondary)
         ),
       ],
     });

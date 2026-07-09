@@ -34,7 +34,7 @@ export function selectRow(
 }
 
 export function backRow(target = "billadmin_root"): ActionRowBuilder<MessageActionRowComponentBuilder> {
-  return buttonRow(btn(target, "◀ Back", ButtonStyle.Secondary));
+  return buttonRow(btn(target, "Back", ButtonStyle.Secondary));
 }
 
 // Back target for a terminal-action RESULT panel (refund done, sub cancelled,
@@ -49,7 +49,7 @@ export function afterActionBack(session: BillAdminSession, token: string, hubFal
 }
 
 export function promoBackRow(): ActionRowBuilder<MessageActionRowComponentBuilder> {
-  return buttonRow(btn("billadmin_open:promo", "◀ Back", ButtonStyle.Secondary));
+  return buttonRow(btn("billadmin_open:promo", "Back", ButtonStyle.Secondary));
 }
 
 export function textInput(
@@ -239,17 +239,17 @@ export function buildRootPanel(config: BotConfig): Panel {
   return {
     embeds: [embed],
     components: [
-      buttonRow(btn("billadmin_open:overview:root", "🔍 Find Customer", ButtonStyle.Success)),
+      buttonRow(btn("billadmin_open:overview:root", "Find Customer", ButtonStyle.Success)),
       buttonRow(
-        btn("billadmin_hub:customers", "👤 Customers", ButtonStyle.Primary),
-        btn("billadmin_hub:subs", "🔄 Subscriptions", ButtonStyle.Primary),
-        btn("billadmin_hub:pay", "💰 Payments", ButtonStyle.Primary),
-        btn("billadmin_hub:invoices", "🧾 Invoices", ButtonStyle.Primary),
-        btn("billadmin_hub:cards", "💳 Cards", ButtonStyle.Primary)
+        btn("billadmin_hub:customers", "Customers", ButtonStyle.Primary),
+        btn("billadmin_hub:subs", "Subscriptions", ButtonStyle.Primary),
+        btn("billadmin_hub:pay", "Payments", ButtonStyle.Primary),
+        btn("billadmin_hub:invoices", "Invoices", ButtonStyle.Primary),
+        btn("billadmin_hub:cards", "Cards", ButtonStyle.Primary)
       ),
       buttonRow(
-        btn("billadmin_open:promo", "🎟️ Promos", ButtonStyle.Secondary),
-        btn("billadmin_hub:business", "🏢 Business", ButtonStyle.Secondary)
+        btn("billadmin_open:promo", "Promos", ButtonStyle.Secondary),
+        btn("billadmin_hub:business", "Business", ButtonStyle.Secondary)
       ),
     ],
   };
@@ -261,7 +261,7 @@ export function buildRootPanel(config: BotConfig): Panel {
 export function buildHubPanel(area: string, config: BotConfig): Panel {
   if (area === "cards") {
     const embed = new EmbedBuilder()
-      .setTitle("💳 Cards")
+      .setTitle("Cards")
       .setColor(COLORS.brand)
       .setDescription(
         [
@@ -287,7 +287,7 @@ export function buildHubPanel(area: string, config: BotConfig): Panel {
   }
   if (area === "customers") {
     const embed = new EmbedBuilder()
-      .setTitle("👤 Customers")
+      .setTitle("Customers")
       .setColor(COLORS.brand)
       .setDescription(
         [
@@ -303,7 +303,7 @@ export function buildHubPanel(area: string, config: BotConfig): Panel {
       components: [
         buttonRow(
           btn("billadmin_open:overview", "Overview", ButtonStyle.Primary),
-          btn("billadmin_open:findname", "🔎 Search by Name / Email", ButtonStyle.Primary)
+          btn("billadmin_open:findname", "Search by Name / Email", ButtonStyle.Primary)
         ),
         buttonRow(
           btn("billadmin_open:createcust", "Create", ButtonStyle.Success),
@@ -312,7 +312,7 @@ export function buildHubPanel(area: string, config: BotConfig): Panel {
         ),
         buttonRow(
           btn("billadmin_open:delcust", "Delete Customer", ButtonStyle.Danger),
-          btn("billadmin_root", "◀ Back", ButtonStyle.Secondary)
+          btn("billadmin_root", "Back", ButtonStyle.Secondary)
         ),
       ],
     };
@@ -322,7 +322,7 @@ export function buildHubPanel(area: string, config: BotConfig): Panel {
   // every historical Back target (billadmin_hub:charges / :pay) still works.
   if (area === "charges" || area === "pay") {
     const embed = new EmbedBuilder()
-      .setTitle("💰 Payments")
+      .setTitle("Payments")
       .setColor(COLORS.brand)
       .setDescription(
         [
@@ -341,20 +341,20 @@ export function buildHubPanel(area: string, config: BotConfig): Panel {
           btn("billadmin_open:charges", "Charges for User", ButtonStyle.Primary),
           btn("billadmin_open:fraud", "Disputes & Fraud", ButtonStyle.Primary),
           btn("billadmin_pay_open:hist", "Balance History", ButtonStyle.Primary),
-          btn("billadmin_open:findamount", "🔎 Find by Amount", ButtonStyle.Primary)
+          btn("billadmin_open:findamount", "Find by Amount", ButtonStyle.Primary)
         ),
         buttonRow(
           btn("billadmin_open:refund", "Refund a Charge", ButtonStyle.Danger),
           btn("billadmin_pay_open:bal", "Adjust Balance", ButtonStyle.Secondary),
           btn("billadmin_pay_open:charge", "Charge Card Now", ButtonStyle.Danger),
-          btn("billadmin_root", "◀ Back", ButtonStyle.Secondary)
+          btn("billadmin_root", "Back", ButtonStyle.Secondary)
         ),
       ],
     };
   }
   if (area === "subs") {
     const embed = new EmbedBuilder()
-      .setTitle("🔄 Subscriptions")
+      .setTitle("Subscriptions")
       .setColor(COLORS.brand)
       .setDescription(
         [
@@ -369,11 +369,11 @@ export function buildHubPanel(area: string, config: BotConfig): Panel {
       components: [
         buttonRow(
           btn("billadmin_open:createsub", "Create Subscription", ButtonStyle.Success),
-          btn("billadmin_sub_manage_entry", "🛠 Manage Subscription", ButtonStyle.Primary)
+          btn("billadmin_sub_manage_entry", "Manage Subscription", ButtonStyle.Primary)
         ),
         buttonRow(
           btn("billadmin_open:cancelsub", "Cancel by Sub ID…", ButtonStyle.Danger),
-          btn("billadmin_root", "◀ Back", ButtonStyle.Secondary)
+          btn("billadmin_root", "Back", ButtonStyle.Secondary)
         ),
       ],
     };

@@ -82,8 +82,8 @@ export class BusinessHub {
       embeds: [embed],
       components: [
         buttonRow(
-          btn("billadmin_hub:business", "🔄 Refresh", ButtonStyle.Secondary),
-          btn("billadmin_root", "◀ Back", ButtonStyle.Secondary)
+          btn("billadmin_hub:business", "Refresh", ButtonStyle.Secondary),
+          btn("billadmin_root", "Back", ButtonStyle.Secondary)
         ),
       ],
     };

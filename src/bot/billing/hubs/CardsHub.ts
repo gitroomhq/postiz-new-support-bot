@@ -401,8 +401,8 @@ export class CardsHub {
           ],
           components: [
             buttonRow(
-              btn("billadmin_open:findamount", "🔎 Find by Amount", ButtonStyle.Primary),
-              btn("billadmin_hub:cards", "◀ Back", ButtonStyle.Secondary)
+              btn("billadmin_open:findamount", "Find by Amount", ButtonStyle.Primary),
+              btn("billadmin_hub:cards", "Back", ButtonStyle.Secondary)
             ),
           ],
         });

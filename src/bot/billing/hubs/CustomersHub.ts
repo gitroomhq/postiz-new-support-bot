@@ -511,8 +511,8 @@ export class CustomersHub {
         ),
         selectRow(actionSelect),
         buttonRow(
-          btn(`billadmin_c360_refresh:${token}`, "🔄 Refresh", ButtonStyle.Secondary),
-          btn(`billadmin_nav_back:${token}`, "◀ Back", ButtonStyle.Secondary)
+          btn(`billadmin_c360_refresh:${token}`, "Refresh", ButtonStyle.Secondary),
+          btn(`billadmin_nav_back:${token}`, "Back", ButtonStyle.Secondary)
         ),
       ],
     });
@@ -705,7 +705,7 @@ export class CustomersHub {
           btn(`billadmin_taxid_add:${token}`, "Add tax ID", ButtonStyle.Primary),
           btn(`billadmin_taxid_remove:${token}`, "Remove tax ID", ButtonStyle.Secondary, taxIds.length === 0),
           btn(`billadmin_cust_delete:${token}`, "Delete customer", ButtonStyle.Danger),
-          btn(`billadmin_nav_back:${token}`, "◀ Back", ButtonStyle.Secondary)
+          btn(`billadmin_nav_back:${token}`, "Back", ButtonStyle.Secondary)
         ),
       ],
     });
@@ -751,7 +751,7 @@ export class CustomersHub {
       embeds: [makeEmbed(`Removing a tax ID from \`${session.customerId}\` — pick one:`, COLORS.warn)],
       components: [
         selectRow(select),
-        buttonRow(btn(`billadmin_editcust_show:${token}`, "◀ Back", ButtonStyle.Secondary)),
+        buttonRow(btn(`billadmin_editcust_show:${token}`, "Back", ButtonStyle.Secondary)),
       ],
     });
   }
@@ -850,7 +850,7 @@ export class CustomersHub {
               components: [
                 buttonRow(
                   btn(`billadmin_cust_state_open:${token}`, "Set state/province…", ButtonStyle.Primary),
-                  btn(`billadmin_editcust_show:${token}`, "◀ Back", ButtonStyle.Secondary)
+                  btn(`billadmin_editcust_show:${token}`, "Back", ButtonStyle.Secondary)
                 ),
               ],
             });
@@ -1230,7 +1230,7 @@ export class CustomersHub {
           buttonRow(
             btn(`billadmin_edit_address:${token}`, "Set address…", ButtonStyle.Primary),
             btn(`billadmin_editcust_show:${token}`, "Edit customer", ButtonStyle.Secondary),
-            btn("billadmin_hub:customers", "◀ Back", ButtonStyle.Secondary)
+            btn("billadmin_hub:customers", "Back", ButtonStyle.Secondary)
           ),
         ],
       });

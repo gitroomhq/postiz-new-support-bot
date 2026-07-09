@@ -24,7 +24,7 @@ import type { HubContext } from "./HubContext";
 // but its routes stay registered so stale panels keep working).
 //
 // The hub PANEL itself lives in ui.ts buildHubPanel: the old 💰 Charges and
-// 💸 Payments panels were merged into one "💰 Payments" panel, rendered for
+// 💸 Payments panels were merged into one "Payments" panel, rendered for
 // both billadmin_hub:charges and billadmin_hub:pay by the facade's prefix
 // route. This hub keeps its own target-resolution flow (user pick / cus_ /
 // email / Postiz id) because TargetResolver's TARGET_ACTIONS list is a shared
@@ -237,7 +237,7 @@ export class PaymentsHub {
         selectRow(userSelect),
         buttonRow(
           btn(`billadmin_pay_manual:${op}`, "Enter cus_ / email / Postiz ID", ButtonStyle.Secondary),
-          btn("billadmin_hub:pay", "◀ Back", ButtonStyle.Secondary)
+          btn("billadmin_hub:pay", "Back", ButtonStyle.Secondary)
         ),
       ],
     };
@@ -444,7 +444,7 @@ export class PaymentsHub {
         buttonRow(
           // Existing CardsHub route — the shared session token carries customerId.
           btn(`billadmin_cards_show:${token}`, "Manage in Cards hub", ButtonStyle.Primary),
-          btn("billadmin_hub:pay", "◀ Back", ButtonStyle.Secondary)
+          btn("billadmin_hub:pay", "Back", ButtonStyle.Secondary)
         ),
       ],
     });
@@ -497,7 +497,7 @@ export class PaymentsHub {
         buttonRow(
           btn(`billadmin_pay_baladj:${token}:credit`, "Grant credit", ButtonStyle.Success),
           btn(`billadmin_pay_baladj:${token}:debit`, "Add debit", ButtonStyle.Danger),
-          btn("billadmin_hub:pay", "◀ Back", ButtonStyle.Secondary)
+          btn("billadmin_hub:pay", "Back", ButtonStyle.Secondary)
         ),
       ],
     });
@@ -565,7 +565,7 @@ export class PaymentsHub {
               COLORS.danger
             ),
           ],
-          components: [buttonRow(btn(`billadmin_pay_bal_show:${token}`, "◀ Back", ButtonStyle.Secondary))],
+          components: [buttonRow(btn(`billadmin_pay_bal_show:${token}`, "Back", ButtonStyle.Secondary))],
         });
         return;
       }
@@ -644,7 +644,7 @@ export class PaymentsHub {
           embeds: [makeEmbed(`Balance adjustment failed: ${msg.slice(0, 500)}`, COLORS.danger)],
           components: [
             buttonRow(
-              btn(`billadmin_pay_bal_show:${token}`, "◀ Back to balance", ButtonStyle.Secondary),
+              btn(`billadmin_pay_bal_show:${token}`, "Back to balance", ButtonStyle.Secondary),
               btn("billadmin_hub:pay", "Payments hub", ButtonStyle.Secondary)
             ),
           ],
@@ -700,8 +700,8 @@ export class PaymentsHub {
       embeds: [embed],
       components: [
         buttonRow(
-          btn(`billadmin_pay_histpage:${token}:${page - 1}`, "◀ Prev", ButtonStyle.Secondary, page <= 0),
-          btn(`billadmin_pay_histpage:${token}:${page + 1}`, "Next ▶", ButtonStyle.Secondary, !res.has_more),
+          btn(`billadmin_pay_histpage:${token}:${page - 1}`, "Prev", ButtonStyle.Secondary, page <= 0),
+          btn(`billadmin_pay_histpage:${token}:${page + 1}`, "Next", ButtonStyle.Secondary, !res.has_more),
           btn("billadmin_hub:pay", "Back", ButtonStyle.Secondary)
         ),
       ],
@@ -743,7 +743,7 @@ export class PaymentsHub {
       components: [
         buttonRow(
           btn(`billadmin_pay_charge_amt:${token}`, "Enter amount", ButtonStyle.Primary),
-          btn("billadmin_hub:pay", "◀ Back", ButtonStyle.Secondary)
+          btn("billadmin_hub:pay", "Back", ButtonStyle.Secondary)
         ),
       ],
     });
@@ -888,7 +888,7 @@ export class PaymentsHub {
         components: [
           buttonRow(
             btn(`billadmin_pay_charge_exec:${token}`, "Charge now", ButtonStyle.Danger),
-            btn(`billadmin_pay_charge_pms:${token}`, "◀ Back", ButtonStyle.Secondary),
+            btn(`billadmin_pay_charge_pms:${token}`, "Back", ButtonStyle.Secondary),
             btn("billadmin_hub:pay", "Cancel", ButtonStyle.Secondary)
           ),
         ],
@@ -943,7 +943,7 @@ export class PaymentsHub {
           components: [
             buttonRow(
               btn(`billadmin_pay_charge_pms:${token}`, "Try another card", ButtonStyle.Primary),
-              btn("billadmin_hub:pay", "◀ Back", ButtonStyle.Secondary)
+              btn("billadmin_hub:pay", "Back", ButtonStyle.Secondary)
             ),
           ],
         });

@@ -794,7 +794,7 @@ export class SubscriptionsHub {
           components: [
             buttonRow(
               btn(`billadmin_sub_pausex:${token}:${behavior}`, "Pause collection", ButtonStyle.Danger),
-              btn(`billadmin_sub_pause:${token}`, "◀ Back", ButtonStyle.Secondary)
+              btn(`billadmin_sub_pause:${token}`, "Back", ButtonStyle.Secondary)
             ),
           ],
         });
@@ -845,7 +845,7 @@ export class SubscriptionsHub {
           components: [
             buttonRow(
               btn(`billadmin_sub_resumex:${token}`, "Resume collection", ButtonStyle.Primary),
-              btn(`billadmin_sub_view:${token}`, "◀ Back", ButtonStyle.Secondary)
+              btn(`billadmin_sub_view:${token}`, "Back", ButtonStyle.Secondary)
             ),
           ],
         });
@@ -908,7 +908,7 @@ export class SubscriptionsHub {
               buttonRow(
                 btn(`billadmin_sub_trialset:${token}`, "Set / extend trial…", ButtonStyle.Primary),
                 btn(`billadmin_sub_trialnow:${token}`, "End trial now", ButtonStyle.Danger, sub.status !== "trialing"),
-                btn(`billadmin_sub_view:${token}`, "◀ Back", ButtonStyle.Secondary)
+                btn(`billadmin_sub_view:${token}`, "Back", ButtonStyle.Secondary)
               ),
             ],
           });
@@ -965,7 +965,7 @@ export class SubscriptionsHub {
           components: [
             buttonRow(
               btn(`billadmin_sub_trialx:${token}`, "Set trial end", ButtonStyle.Primary),
-              btn(`billadmin_sub_trial:${token}`, "◀ Back", ButtonStyle.Secondary)
+              btn(`billadmin_sub_trial:${token}`, "Back", ButtonStyle.Secondary)
             ),
           ],
         });
@@ -1018,7 +1018,7 @@ export class SubscriptionsHub {
           components: [
             buttonRow(
               btn(`billadmin_sub_trialnowx:${token}`, "End trial now", ButtonStyle.Danger),
-              btn(`billadmin_sub_trial:${token}`, "◀ Back", ButtonStyle.Secondary)
+              btn(`billadmin_sub_trial:${token}`, "Back", ButtonStyle.Secondary)
             ),
           ],
         });
@@ -1114,7 +1114,7 @@ export class SubscriptionsHub {
               buttonRow(
                 btn(`billadmin_sub_qtyx:${token}:prorate`, "Update (prorate)", ButtonStyle.Danger),
                 btn(`billadmin_sub_qtyx:${token}:none`, "Update (no proration)", ButtonStyle.Danger),
-                btn(`billadmin_sub_view:${token}`, "◀ Back", ButtonStyle.Secondary)
+                btn(`billadmin_sub_view:${token}`, "Back", ButtonStyle.Secondary)
               ),
             ],
           });
@@ -1204,7 +1204,7 @@ export class SubscriptionsHub {
               buttonRow(
                 btn(`billadmin_sub_schedplan:${token}`, "Replace next phase", ButtonStyle.Primary),
                 btn(`billadmin_sub_schedrel:${token}`, "Release schedule", ButtonStyle.Danger),
-                btn(`billadmin_sub_view:${token}`, "◀ Back", ButtonStyle.Secondary)
+                btn(`billadmin_sub_view:${token}`, "Back", ButtonStyle.Secondary)
               ),
             ],
           });
@@ -1256,7 +1256,7 @@ export class SubscriptionsHub {
             components: [
               buttonRow(
                 btn(`billadmin_sub_schedx:${token}`, "Schedule change", ButtonStyle.Primary),
-                btn(`billadmin_sub_view:${token}`, "◀ Back", ButtonStyle.Secondary)
+                btn(`billadmin_sub_view:${token}`, "Back", ButtonStyle.Secondary)
               ),
             ],
           });
@@ -1340,7 +1340,7 @@ export class SubscriptionsHub {
             components: [
               buttonRow(
                 btn(`billadmin_sub_schedrelx:${token}`, "Release schedule", ButtonStyle.Danger),
-                btn(`billadmin_sub_view:${token}`, "◀ Back", ButtonStyle.Secondary)
+                btn(`billadmin_sub_view:${token}`, "Back", ButtonStyle.Secondary)
               ),
             ],
           });
@@ -1424,8 +1424,8 @@ export class SubscriptionsHub {
       components: [
         selectRow(select),
         buttonRow(
-          btn(`billadmin_sub_list:${token}`, "🛠 Manage a subscription", ButtonStyle.Secondary),
-          btn("billadmin_hub:subs", "◀ Back", ButtonStyle.Secondary)
+          btn(`billadmin_sub_list:${token}`, "Manage a subscription", ButtonStyle.Secondary),
+          btn("billadmin_hub:subs", "Back", ButtonStyle.Secondary)
         ),
       ],
     });
@@ -1557,8 +1557,8 @@ export class SubscriptionsHub {
       components: [
         selectRow(select),
         buttonRow(
-          btn(`billadmin_sub_list:${token}`, "🛠 Manage a subscription", ButtonStyle.Secondary),
-          btn("billadmin_hub:subs", "◀ Back", ButtonStyle.Secondary)
+          btn(`billadmin_sub_list:${token}`, "Manage a subscription", ButtonStyle.Secondary),
+          btn("billadmin_hub:subs", "Back", ButtonStyle.Secondary)
         ),
       ],
     });
@@ -1626,8 +1626,8 @@ export class SubscriptionsHub {
       components: [
         selectRow(select),
         buttonRow(
-          btn(`billadmin_sub_view:${token}`, "🛠 Manage this subscription", ButtonStyle.Secondary),
-          btn("billadmin_hub:subs", "◀ Back", ButtonStyle.Secondary)
+          btn(`billadmin_sub_view:${token}`, "Manage this subscription", ButtonStyle.Secondary),
+          btn("billadmin_hub:subs", "Back", ButtonStyle.Secondary)
         ),
       ],
     });
@@ -2003,10 +2003,10 @@ export class SubscriptionsHub {
     }
     components.push(
       buttonRow(
-        btn("billadmin_plansettings:refresh", "🔄 Recount", ButtonStyle.Secondary),
+        btn("billadmin_plansettings:refresh", "Recount", ButtonStyle.Secondary),
         // Plan settings now live in /config → Billing — Back returns there
         // (config_billing is DiscordBot's /config Billing-panel route).
-        btn("config_billing", "◀ Back", ButtonStyle.Secondary)
+        btn("config_billing", "Back", ButtonStyle.Secondary)
       )
     );
     await interaction.editReply({ embeds: [embed], components });
@@ -2091,7 +2091,7 @@ export class SubscriptionsHub {
       btn(`billadmin_cancelsub_exec:${token}`, "Cancel now", ButtonStyle.Danger),
       btn(`billadmin_cancelsub_softexec:${token}`, "Cancel at period end", ButtonStyle.Primary),
     ];
-    if (showManage) buttons.push(btn(`billadmin_sub_view:${token}`, "🛠 Manage", ButtonStyle.Secondary));
+    if (showManage) buttons.push(btn(`billadmin_sub_view:${token}`, "Manage", ButtonStyle.Secondary));
     buttons.push(btn(backId, "Back", ButtonStyle.Secondary));
     return { embeds: [embed], components: [buttonRow(...buttons)] };
   }
@@ -2100,8 +2100,8 @@ export class SubscriptionsHub {
 
   private subDetailBackRow(token: string): ActionRowBuilder<MessageActionRowComponentBuilder> {
     return buttonRow(
-      btn(`billadmin_sub_view:${token}`, "🛠 Back to subscription", ButtonStyle.Secondary),
-      btn("billadmin_hub:subs", "◀ Subscriptions", ButtonStyle.Secondary)
+      btn(`billadmin_sub_view:${token}`, "Back to subscription", ButtonStyle.Secondary),
+      btn("billadmin_hub:subs", "Subscriptions", ButtonStyle.Secondary)
     );
   }
 
@@ -2361,15 +2361,15 @@ export class SubscriptionsHub {
         ),
         buttonRow(
           paused
-            ? btn(`billadmin_sub_resume:${token}`, "▶ Resume", ButtonStyle.Success, dead)
-            : btn(`billadmin_sub_pause:${token}`, "⏸ Pause ▸", ButtonStyle.Secondary, dead),
-          btn(`billadmin_sub_sched:${token}`, scheduleId ? "Schedule ▸" : "Schedule change", ButtonStyle.Secondary, dead),
+            ? btn(`billadmin_sub_resume:${token}`, "Resume", ButtonStyle.Success, dead)
+            : btn(`billadmin_sub_pause:${token}`, "Pause…", ButtonStyle.Secondary, dead),
+          btn(`billadmin_sub_sched:${token}`, scheduleId ? "Schedule…" : "Schedule change", ButtonStyle.Secondary, dead),
           btn(`billadmin_sub_discount:${token}`, "Apply discount", ButtonStyle.Secondary, dead)
         ),
         buttonRow(
           btn(`billadmin_sub_cancel:${token}`, "Cancel…", ButtonStyle.Danger, dead),
-          btn(`billadmin_sub_view:${token}`, "🔄 Refresh", ButtonStyle.Secondary),
-          btn(`billadmin_nav_back:${token}`, "◀ Back", ButtonStyle.Secondary)
+          btn(`billadmin_sub_view:${token}`, "Refresh", ButtonStyle.Secondary),
+          btn(`billadmin_nav_back:${token}`, "Back", ButtonStyle.Secondary)
         ),
       ],
     });

@@ -498,7 +498,7 @@ export class InvoicesHub {
 
   buildPanel(): Panel {
     const embed = new EmbedBuilder()
-      .setTitle("🧾 Invoices")
+      .setTitle("Invoices")
       .setColor(COLORS.brand)
       .setDescription(
         [
@@ -544,7 +544,7 @@ export class InvoicesHub {
         selectRow(userSelect),
         buttonRow(
           btn(`billadmin_inv_manual:${mode}`, "Enter cus_ / email / Postiz ID", ButtonStyle.Secondary),
-          btn("billadmin_hub:invoices", "◀ Back", ButtonStyle.Secondary)
+          btn("billadmin_hub:invoices", "Back", ButtonStyle.Secondary)
         ),
       ],
     };
@@ -714,8 +714,8 @@ export class InvoicesHub {
     }
     components.push(
       buttonRow(
-        btn(`billadmin_inv_page:${token}:${page - 1}`, "◀ Prev", ButtonStyle.Secondary, page <= 0),
-        btn(`billadmin_inv_page:${token}:${page + 1}`, "Next ▶", ButtonStyle.Secondary, !res.has_more),
+        btn(`billadmin_inv_page:${token}:${page - 1}`, "Prev", ButtonStyle.Secondary, page <= 0),
+        btn(`billadmin_inv_page:${token}:${page + 1}`, "Next", ButtonStyle.Secondary, !res.has_more),
         btn(`billadmin_nav_back:${token}`, "Back", ButtonStyle.Secondary)
       )
     );
@@ -778,7 +778,7 @@ export class InvoicesHub {
 
   // Status-contextual action rows for the detail panel.
   private detailRows(status: Stripe.Invoice.Status | null, token: string): Panel["components"] {
-    const back = btn(`billadmin_nav_back:${token}`, "◀ Back", ButtonStyle.Secondary);
+    const back = btn(`billadmin_nav_back:${token}`, "Back", ButtonStyle.Secondary);
     switch (status) {
       case "draft":
         return [
@@ -919,7 +919,7 @@ export class InvoicesHub {
         components: [
           returnTo === "hub"
             ? backRow("billadmin_hub:invoices")
-            : buttonRow(btn(`billadmin_inv_list:${token}`, "◀ Back to invoices", ButtonStyle.Secondary)),
+            : buttonRow(btn(`billadmin_inv_list:${token}`, "Back to invoices", ButtonStyle.Secondary)),
         ],
       });
     });
@@ -1161,7 +1161,7 @@ export class InvoicesHub {
       components: [
         buttonRow(
           btn(`billadmin_inv_item:${token}`, "Add first item…", ButtonStyle.Success),
-          btn("billadmin_hub:invoices", "◀ Back", ButtonStyle.Secondary)
+          btn("billadmin_hub:invoices", "Back", ButtonStyle.Secondary)
         ),
       ],
     };
@@ -1276,7 +1276,7 @@ export class InvoicesHub {
         ),
         buttonRow(
           btn(`billadmin_inv_dr_disc:${token}`, "Discard draft", ButtonStyle.Danger),
-          btn("billadmin_hub:invoices", "◀ Back", ButtonStyle.Secondary)
+          btn("billadmin_hub:invoices", "Back", ButtonStyle.Secondary)
         ),
       ],
     });

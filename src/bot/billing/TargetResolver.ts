@@ -184,7 +184,7 @@ export class TargetResolver {
           isBal
             ? btn(`billadmin_pay_bal_show:${token}`, "Open balance panel", ButtonStyle.Primary)
             : btn(`billadmin_pay_charge_amt:${token}`, "Enter amount…", ButtonStyle.Primary),
-          btn(`billadmin_c360_refresh:${token}`, "◀ Back", ButtonStyle.Secondary)
+          btn(`billadmin_c360_refresh:${token}`, "Back", ButtonStyle.Secondary)
         ),
       ],
     };
@@ -399,7 +399,7 @@ export class TargetResolver {
     if (action !== "link") {
       buttons.push(btn(`billadmin_manual:${action}${suffix}`, "Enter cus_ / email / Postiz ID", ButtonStyle.Secondary));
     }
-    buttons.push(btn(hubBack(action, origin), "◀ Back", ButtonStyle.Secondary));
+    buttons.push(btn(hubBack(action, origin), "Back", ButtonStyle.Secondary));
 
     return {
       embeds: [embed],
