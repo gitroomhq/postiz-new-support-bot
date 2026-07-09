@@ -3,6 +3,7 @@ import { StatusTag } from "../generated/prisma/client";
 import { SettingsStore, ReportSnapshot } from "../config/SettingsStore";
 import { TicketStore, TicketWithTag } from "./TicketStore";
 import { CategoryRegistry } from "./CategoryRegistry";
+import { TicketScoreStore } from "../scoring/TicketScoreStore";
 import { COLORS } from "../util/embeds";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -10,6 +11,9 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 // Ratings shown per page in the Feedback drill-down. Kept small so the compact list
 // (one line + optional comment blockquote per item) stays within the 1024-char embed field cap.
 const FEEDBACK_PAGE_SIZE = 5;
+
+// Tickets per page in the AI Quality drill-down (worst-scored first).
+const AI_QUALITY_PAGE_SIZE = 5;
 
 export interface BuildReportOptions {
   // Window start for the opened/closed activity counts. null → trailing 24h (manual checks).
@@ -28,7 +32,8 @@ export class StatusReportService {
   constructor(
     private settings: SettingsStore,
     private ticketStore: TicketStore,
-    private categoryRegistry: CategoryRegistry
+    private categoryRegistry: CategoryRegistry,
+    private scoreStore?: TicketScoreStore
   ) {}
 
   async build(options: BuildReportOptions): Promise<BuiltReport> {
@@ -39,15 +44,18 @@ export class StatusReportService {
 
     const overdueCutoff = new Date(now.getTime() - this.settings.overdueThresholdDays() * DAY_MS);
 
-    const [breakdown, opened, closed, overdueTotal, medians, awaitingFirstResponse, csat] = await Promise.all([
-      this.ticketStore.statusCategoryBreakdown(),
-      this.ticketStore.countOpenedSince(windowStart),
-      this.ticketStore.countClosedSince(windowStart),
-      this.ticketStore.countOverdue(overdueCutoff),
-      this.ticketStore.responseTimeMedians(windowStart),
-      this.ticketStore.countAwaitingFirstResponse(),
-      this.ticketStore.csatStats(),
-    ]);
+    const [breakdown, opened, closed, overdueTotal, medians, awaitingFirstResponse, csat, aiWindow, aiAllTime] =
+      await Promise.all([
+        this.ticketStore.statusCategoryBreakdown(),
+        this.ticketStore.countOpenedSince(windowStart),
+        this.ticketStore.countClosedSince(windowStart),
+        this.ticketStore.countOverdue(overdueCutoff),
+        this.ticketStore.responseTimeMedians(windowStart),
+        this.ticketStore.countAwaitingFirstResponse(),
+        this.ticketStore.csatStats(),
+        this.scoreStore ? this.scoreStore.aggregateStats(windowStart).catch(() => null) : Promise.resolve(null),
+        this.scoreStore ? this.scoreStore.aggregateStats().catch(() => null) : Promise.resolve(null),
+      ]);
 
     let openTotal = 0;
     let doneTotal = 0;
@@ -143,6 +151,22 @@ export class StatusReportService {
       )
       .setFooter({ text: this.formatTimestamp(now) });
 
+    // AI quality (from the automated ticket scoring): window stats + all-time
+    // averages. Omitted entirely until at least one ticket has been scored.
+    if (aiAllTime && aiAllTime.scoredCount > 0) {
+      const windowLine =
+        aiWindow && aiWindow.scoredCount > 0
+          ? `${windowLabel}: CX **${aiWindow.avgCx!.toFixed(1)}**/10 · ` +
+            `resolved **${aiWindow.resolved}** / workaround **${aiWindow.workaround}** / unresolved **${aiWindow.unresolved}** · ` +
+            `FCR **${Math.round((aiWindow.fcrCount / aiWindow.scoredCount) * 100)}%** (${aiWindow.scoredCount} scored)`
+          : `${windowLabel}: _no tickets scored_`;
+      const allTimeLine =
+        `All-time: CX **${aiAllTime.avgCx!.toFixed(1)}**/10 · ` +
+        `agent tone **${aiAllTime.avgTone?.toFixed(1) ?? "—"}** / clarity **${aiAllTime.avgClarity?.toFixed(1) ?? "—"}** / correctness **${aiAllTime.avgCorrectness?.toFixed(1) ?? "—"}** · ` +
+        `${aiAllTime.scoredCount} scored`;
+      embed.addFields({ name: "AI quality", value: `${windowLine}\n${allTimeLine}`, inline: false });
+    }
+
     return { embed, components: [this.buildReportButtons()], snapshot };
   }
 
@@ -164,8 +188,96 @@ export class StatusReportService {
         .setCustomId("report_feedback")
         .setLabel("Feedback")
         .setEmoji("💬")
+        .setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId("report_ai")
+        .setLabel("AI Quality")
+        .setEmoji("🤖")
         .setStyle(ButtonStyle.Secondary)
     );
+  }
+
+  // Ephemeral drill-down for the "AI Quality" button: worst-scored tickets,
+  // paginated (report_ai:<page>), each row deep-linking to its thread.
+  async buildAiQualityEmbed(
+    page = 0
+  ): Promise<{ embed: EmbedBuilder; components: ActionRowBuilder<ButtonBuilder>[] }> {
+    if (!this.scoreStore) {
+      return {
+        embed: new EmbedBuilder()
+          .setTitle("🤖 AI Quality")
+          .setColor(COLORS.neutral)
+          .setDescription("Ticket scoring is not wired up."),
+        components: [],
+      };
+    }
+    const stats = await this.scoreStore.aggregateStats();
+    if (stats.scoredCount === 0) {
+      return {
+        embed: new EmbedBuilder()
+          .setTitle("🤖 AI Quality")
+          .setColor(COLORS.neutral)
+          .setDescription("No tickets scored yet. Enable scoring in /config → Analytics."),
+        components: [],
+      };
+    }
+
+    const totalPages = Math.max(1, Math.ceil(stats.scoredCount / AI_QUALITY_PAGE_SIZE));
+    const clampedPage = Math.min(Math.max(0, page), totalPages - 1);
+    const worst = await this.scoreStore.worstRecent(AI_QUALITY_PAGE_SIZE * (clampedPage + 1));
+    const pageItems = worst.slice(clampedPage * AI_QUALITY_PAGE_SIZE, (clampedPage + 1) * AI_QUALITY_PAGE_SIZE);
+
+    const lines = pageItems
+      .map((s) => {
+        const flags = [s.resolution ?? "—", s.fcr ? "FCR" : null, s.escalationNeeded ? "escalated" : null]
+          .filter(Boolean)
+          .join(" · ");
+        const summary = s.summary ? `\n> ${s.summary.replace(/\s+/g, " ").trim().slice(0, 140)}` : "";
+        return `**CX ${s.cxScore}/10** · <#${s.ticketThreadId}> · ${s.topic ?? "—"} · ${flags}${summary}`;
+      })
+      .join("\n\n");
+
+    const fcrPct = Math.round((stats.fcrCount / stats.scoredCount) * 100);
+    const embed = new EmbedBuilder()
+      .setTitle(`🤖 AI Quality — ${stats.scoredCount} ticket${stats.scoredCount === 1 ? "" : "s"} scored (all-time)`)
+      .setColor(COLORS.brand)
+      .addFields(
+        {
+          name: "Averages",
+          value:
+            `CX **${stats.avgCx!.toFixed(1)}**/10 · agent tone **${stats.avgTone?.toFixed(1) ?? "—"}** · ` +
+            `clarity **${stats.avgClarity?.toFixed(1) ?? "—"}** · correctness **${stats.avgCorrectness?.toFixed(1) ?? "—"}**`,
+          inline: false,
+        },
+        {
+          name: "Outcomes",
+          value:
+            `Resolved **${stats.resolved}** · workaround **${stats.workaround}** · unresolved **${stats.unresolved}** · ` +
+            `first-contact resolution **${fcrPct}%**`,
+          inline: false,
+        },
+        { name: "Lowest-scored tickets", value: (lines || "_none on this page_").slice(0, 1024), inline: false }
+      )
+      .setFooter({ text: `Page ${clampedPage + 1}/${totalPages} · worst first` });
+
+    const components =
+      totalPages > 1
+        ? [
+            new ActionRowBuilder<ButtonBuilder>().addComponents(
+              new ButtonBuilder()
+                .setCustomId(`report_ai:${clampedPage - 1}`)
+                .setLabel("◀ Prev")
+                .setStyle(ButtonStyle.Secondary)
+                .setDisabled(clampedPage <= 0),
+              new ButtonBuilder()
+                .setCustomId(`report_ai:${clampedPage + 1}`)
+                .setLabel("Next ▶")
+                .setStyle(ButtonStyle.Secondary)
+                .setDisabled(clampedPage >= totalPages - 1)
+            ),
+          ]
+        : [];
+    return { embed, components };
   }
 
   // Ephemeral drill-down for the "Feedback" button: all-time 1-5 star distribution

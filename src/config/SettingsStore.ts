@@ -1,5 +1,6 @@
 import { Prisma, PrismaClient, BotSettings, StatusTag, PriorityTag } from "../generated/prisma/client";
 import type { SentryRuntimeConfig } from "../util/logger";
+import type { InfluxRuntimeConfig } from "../metrics/InfluxWriter";
 import { decryptSecret, encryptSecret } from "../util/crypto";
 
 export type ReminderTarget = "SUPPORT" | "CUSTOMER";
@@ -511,6 +512,118 @@ export class SettingsStore {
       !!this.sentryOrgSlug() &&
       !!this.sentryProjectSlug()
     );
+  }
+
+  // ---- InfluxDB 2.x metrics export (paired with /config → Analytics) ----
+
+  influxEnabled(): boolean {
+    return this.settings.influxEnabled;
+  }
+
+  influxUrl(): string | null {
+    return this.settings.influxUrl?.trim() || null;
+  }
+
+  influxOrg(): string | null {
+    return this.settings.influxOrg?.trim() || null;
+  }
+
+  influxBucket(): string | null {
+    return this.settings.influxBucket?.trim() || null;
+  }
+
+  // Token is encrypted at rest. A decrypt failure (rotated key source) yields
+  // null → the exporter stays inactive and the panel asks for re-entry.
+  influxToken(): string | null {
+    const raw = this.settings.influxToken;
+    return raw != null ? decryptSecret(raw) : null;
+  }
+
+  // True when the DB has a token ciphertext but it can no longer be decrypted.
+  influxTokenUnreadable(): boolean {
+    return this.settings.influxToken != null && this.influxToken() == null;
+  }
+
+  influxConfig(): InfluxRuntimeConfig {
+    return {
+      enabled: this.influxEnabled(),
+      url: this.influxUrl(),
+      org: this.influxOrg(),
+      bucket: this.influxBucket(),
+      token: this.influxToken(),
+    };
+  }
+
+  // ---- AI ticket scoring (Batch API) ----
+
+  scoringEnabled(): boolean {
+    return this.settings.scoringEnabled;
+  }
+
+  scoringIntervalHours(): number {
+    return this.settings.scoringIntervalHours;
+  }
+
+  // Free-text like aiModel: a new Anthropic model id works without a code change.
+  scoringModel(): string {
+    return this.settings.scoringModel;
+  }
+
+  scoringMaxTicketsPerBatch(): number {
+    return this.settings.scoringMaxTicketsPerBatch;
+  }
+
+  scoringMaxBudgetUsdPerDay(): number {
+    return this.settings.scoringMaxBudgetUsdPerDay;
+  }
+
+  scoringLastRunAt(): Date | null {
+    return this.settings.scoringLastRunAt;
+  }
+
+  scoringBackfillPending(): boolean {
+    return this.settings.scoringBackfillPending;
+  }
+
+  // The Influx token is encrypted at rest; pass a field as undefined to leave it
+  // unchanged, null/"" to clear it.
+  async updateAnalytics(data: {
+    influxEnabled?: boolean;
+    influxUrl?: string | null;
+    influxOrg?: string | null;
+    influxBucket?: string | null;
+    influxToken?: string | null;
+    scoringEnabled?: boolean;
+    scoringIntervalHours?: number;
+    scoringModel?: string;
+    scoringMaxTicketsPerBatch?: number;
+    scoringMaxBudgetUsdPerDay?: number;
+    scoringBackfillPending?: boolean;
+  }): Promise<void> {
+    const { influxToken, ...rest } = data;
+    this.settings = await this.prisma.botSettings.update({
+      where: { id: "global" },
+      data: {
+        ...rest,
+        ...(influxToken !== undefined
+          ? { influxToken: influxToken ? encryptSecret(influxToken) : influxToken }
+          : {}),
+      },
+    });
+  }
+
+  async recordScoringRun(): Promise<void> {
+    this.settings = await this.prisma.botSettings.update({
+      where: { id: "global" },
+      data: { scoringLastRunAt: new Date() },
+    });
+  }
+
+  async setScoringBackfillPending(pending: boolean): Promise<void> {
+    this.settings = await this.prisma.botSettings.update({
+      where: { id: "global" },
+      data: { scoringBackfillPending: pending },
+    });
   }
 
   sentryConfig(): SentryRuntimeConfig {

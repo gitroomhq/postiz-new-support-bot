@@ -142,9 +142,109 @@ model BotSettings {
   // Bot's public origin for programmatic webhook registration; falls back to
   // new URL(POSTIZ_CALLBACK_URL).origin when unset.
   publicBaseUrl           String?
+  // InfluxDB 2.x metrics export (edited via /config → Analytics; no .env on deploy).
+  // Token is encrypted at rest (crypto.ts). Exporter is inactive until all four
+  // connection fields are set AND influxEnabled is true.
+  influxEnabled           Boolean @default(false)
+  influxUrl               String?
+  influxOrg               String?
+  influxBucket            String?
+  influxToken             String?
+  // AI ticket scoring (Batch API, cheap model). Interval default 6h = 4 batches/day;
+  // the Batch discount is identical at any cadence, so this is purely freshness.
+  scoringEnabled            Boolean   @default(false)
+  scoringIntervalHours      Int       @default(6)
+  scoringModel              String    @default("claude-haiku-4-5")
+  scoringMaxTicketsPerBatch Int       @default(200)
+  scoringMaxBudgetUsdPerDay Float     @default(5.0)
+  scoringLastRunAt          DateTime?
+  // One-time historical backfill flag: while true the scheduler keeps submitting
+  // oldest-first batches (one in flight) until no unscored closed tickets remain.
+  scoringBackfillPending    Boolean   @default(false)
   updatedAt           DateTime  @updatedAt
 
   @@map("bot_settings")
+}
+
+// One row per AI run — both interactive Claude Code CLI runs and Batch API scoring
+// runs (one aggregated row per batch). Feeds cost dashboards + the scoring budget cap.
+model AiRun {
+  id                  String   @id @default(cuid())
+  agentName           String   // "support-<category>", "ai-ask", "ticket-scoring", …
+  kind                String   // "customer_qa" | "staff_command" | "ticket_scoring"
+  source              String   @default("cli") // "cli" | "api" | "batch"
+  model               String
+  outcome             String   // "success" | "error" | "api_limit" | "empty" | "batch_ended"
+  sessionId           String?  // Claude Code session id (cli runs)
+  batchId             String?  // Anthropic msgbatch_… id (batch runs)
+  numTurns            Int?
+  durationMs          Int?
+  inputTokens         Int      @default(0)
+  outputTokens        Int      @default(0)
+  cacheReadTokens     Int      @default(0)
+  cacheCreationTokens Int      @default(0)
+  costUsd             Float    @default(0)
+  toolCalls           Int      @default(0)
+  toolErrors          Int      @default(0)
+  createdAt           DateTime @default(now())
+
+  @@index([createdAt])
+  @@index([kind, createdAt])
+  @@map("ai_runs")
+}
+
+// AI quality evaluation of a closed ticket (one row per ticket — the unique
+// ticketThreadId is the double-scoring guard). Reopened tickets get their row
+// deleted so the next batch after re-close re-scores the fuller transcript.
+model TicketScore {
+  id               String    @id @default(cuid())
+  ticketThreadId   String    @unique
+  status           String    @default("PENDING") // PENDING | SCORED | FAILED | SKIPPED
+  attempts         Int       @default(0)
+  batchId          String?   // Anthropic msgbatch_… holding/produced this score
+  model            String?
+  cxScore          Int?      // 1-10 predicted customer-experience score
+  sentimentStart   String?   // very_negative | negative | neutral | positive | very_positive
+  sentimentEnd     String?
+  agentTone        Int?      // 1-10, staff overall
+  agentClarity     Int?
+  agentCorrectness Int?
+  resolution       String?   // resolved | unresolved | workaround
+  fcr              Boolean?  // first-contact resolution
+  escalationNeeded Boolean?
+  topic            String?   // closed taxonomy (see scoringPrompt.ts)
+  rootCause        String?
+  summary          String?
+  staffScores      Json?     // [{ name, tone, clarity, correctness }]
+  inputTokens      Int?
+  outputTokens     Int?
+  costUsd          Float?
+  error            String?
+  scoredAt         DateTime?
+  createdAt        DateTime  @default(now())
+
+  @@index([status])
+  @@map("ticket_scores")
+}
+
+// One row per submitted Anthropic Message Batch. Persisting the batch id is what
+// makes polling restart-safe: the scheduler resumes any SUBMITTED batch on boot.
+model ScoringBatch {
+  id               String    @id @default(cuid())
+  anthropicBatchId String    @unique
+  status           String    @default("SUBMITTED") // SUBMITTED | ENDED | FAILED
+  purpose          String    // "interval" | "backfill" | (manual smoke tests bypass batches)
+  model            String
+  requestCount     Int
+  succeededCount   Int       @default(0)
+  erroredCount     Int       @default(0)
+  expiredCount     Int       @default(0)
+  costUsd          Float?
+  submittedAt      DateTime  @default(now())
+  endedAt          DateTime?
+
+  @@index([status])
+  @@map("scoring_batches")
 }
 
 model StatusTag {

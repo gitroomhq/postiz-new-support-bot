@@ -87,8 +87,11 @@ export function withDiscordSpan<T>(ctx: DiscordSpanCtx, fn: () => Promise<T>): P
 // only when there is actual work (high-frequency pollers would otherwise emit
 // thousands of empty transactions a day).
 export function withTickSpan<T>(slug: string, fn: () => Promise<T>): Promise<T> {
-  return Sentry.withIsolationScope(() =>
-    Sentry.startSpan(
+  return Sentry.withIsolationScope((scope) => {
+    // Synthetic user so background AI runs (scoring, scheduled work) show a
+    // non-empty user in Sentry's AI Conversations view.
+    scope.setUser({ id: "system", username: `scheduler:${slug}` });
+    return Sentry.startSpan(
       {
         name: `tick ${slug}`,
         op: "scheduler.tick",
@@ -105,8 +108,8 @@ export function withTickSpan<T>(slug: string, fn: () => Promise<T>): Promise<T> 
           throw e;
         }
       }
-    )
-  );
+    );
+  });
 }
 
 // Guard for fire-and-forget promises (replaces `void p.catch(console.error)`):

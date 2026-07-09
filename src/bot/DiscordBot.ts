@@ -95,6 +95,17 @@ import {
   setAiRecordContent,
   metricCount,
 } from "../util/instrument";
+import { PrismaClient } from "../generated/prisma/client";
+import { LightAiRunner } from "./LightAiRunner";
+import { TicketScoringService } from "../scoring/TicketScoringService";
+import { TicketScoreStore } from "../scoring/TicketScoreStore";
+import { reconfigureInflux, pingInflux, influxActive } from "../metrics/InfluxWriter";
+import {
+  exportTicketCreated,
+  exportFirstResponse,
+  exportCsat,
+  backfillTicketHistory,
+} from "../metrics/MetricsExporter";
 
 type TicketSearchFilters = {
   categoryId?: string;
@@ -154,7 +165,15 @@ export class DiscordBot {
     private billingAdmin: BillingAdmin,
     private kbScheduler: KnowledgeBaseScheduler,
     private stripeWebhook: StripeWebhookHandler,
-    private intercomInboxApp?: IntercomInboxApp
+    private intercomInboxApp?: IntercomInboxApp,
+    // Analytics/scoring collaborators (kept as one optional bundle so the long
+    // positional constructor stays manageable).
+    private analytics?: {
+      prisma: PrismaClient;
+      lightAiRunner: LightAiRunner;
+      scoringService: TicketScoringService;
+      scoreStore: TicketScoreStore;
+    }
   ) {
     this.client = new Client({
       // MessageContent is privileged (enable it in the Dev Portal too) — without it
@@ -342,6 +361,11 @@ export class DiscordBot {
           log.child("ticket").info("ticket.first_response", {
             "ticket.thread_id": ticket.threadId,
             "ticket.first_response_ms": message.createdAt.getTime() - ticket.createdAt.getTime(),
+          });
+          exportFirstResponse({
+            threadId: ticket.threadId,
+            category: ticket.categoryId,
+            seconds: (message.createdAt.getTime() - ticket.createdAt.getTime()) / 1000,
           });
           void this.audit.log({
             title: "💬 First response",
@@ -1028,17 +1052,19 @@ export class DiscordBot {
     const member = await this.requireSupportOrAdmin(interaction);
     if (!member) return;
 
-    // Feedback is paginated: the ephemeral pager encodes the page in the customId
-    // (report_feedback:<n>) and edits its own message in place; the initial bare
-    // report_feedback click on the public report opens a fresh ephemeral reply.
-    if (interaction.customId.startsWith("report_feedback")) {
+    // Feedback and AI Quality are paginated: the ephemeral pager encodes the page
+    // in the customId (report_feedback:<n> / report_ai:<n>) and edits its own
+    // message in place; the initial bare click opens a fresh ephemeral reply.
+    if (interaction.customId.startsWith("report_feedback") || interaction.customId.startsWith("report_ai")) {
       const parts = interaction.customId.split(":");
       const isPageNav = parts.length > 1;
       const page = isPageNav ? Math.max(0, Number.parseInt(parts[1] ?? "0", 10) || 0) : 0;
       if (isPageNav) await interaction.deferUpdate();
       else await interaction.deferReply({ flags: 64 });
       try {
-        const { embed, components } = await this.reportService.buildFeedbackEmbed(page);
+        const { embed, components } = interaction.customId.startsWith("report_ai")
+          ? await this.reportService.buildAiQualityEmbed(page)
+          : await this.reportService.buildFeedbackEmbed(page);
         await interaction.editReply({ embeds: [embed], components });
       } catch (error) {
         this.discordLog.error("report drill-down failed", error, { "discord.custom_id": interaction.customId });
@@ -1322,7 +1348,8 @@ export class DiscordBot {
     if (
       interaction.customId === "report_overdue" ||
       interaction.customId === "report_age" ||
-      interaction.customId.startsWith("report_feedback")
+      interaction.customId.startsWith("report_feedback") ||
+      interaction.customId.startsWith("report_ai")
     ) {
       await this.handleReportDrilldown(interaction);
       return;
@@ -1498,6 +1525,7 @@ export class DiscordBot {
           "ticket.ai_solve_enabled": this.settingsStore.aiSolveEnabled(),
         });
         metricCount("tickets.created", 1, { category: category.id });
+        exportTicketCreated({ threadId: thread.id, category: category.id });
         void this.audit.log({
           title: "🎫 Ticket opened",
           severity: "success",
@@ -1663,7 +1691,12 @@ export class DiscordBot {
     const responder = (prompt: string, onUpdate?: (messages: string[]) => void) =>
       this.claudeRunner.run(prompt, onUpdate, {
         model: this.settingsStore.aiModel(),
-        telemetry: { agentName: `support-${category.id}`, kind: "customer_qa" },
+        telemetry: {
+          agentName: `support-${category.id}`,
+          kind: "customer_qa",
+          userId: interaction.user.id,
+          username: interaction.user.displayName,
+        },
       });
 
     await category.handleModalSubmit(interaction, responder, threadsChannel, this.buildTicketContext(category), {
@@ -1816,6 +1849,8 @@ export class DiscordBot {
         "ticket.thread_id": threadId,
         "csat.score": score,
       });
+      const csatTicket = await this.ticketStore.getByThreadId(threadId).catch(() => null);
+      exportCsat({ threadId, category: csatTicket?.categoryId ?? null, score });
       safe(this.intercomSync.onCsat(threadId, score), "intercom-sync", {
         "ticket.thread_id": threadId,
         "sync.event": "csat",
@@ -2210,7 +2245,10 @@ export class DiscordBot {
     sub: string,
     title: string,
     prompt: string,
-    options: ClaudeRunOptions
+    options: ClaudeRunOptions,
+    // Tool-less runs (draft/summarize) go through the direct Messages API —
+    // no CLI overhead tokens, no process-spawn latency, same streaming UX.
+    useLightRunner = false
   ): Promise<string | null> {
     let lastEdit = 0;
     let editInFlight = false;
@@ -2236,16 +2274,20 @@ export class DiscordBot {
     };
 
     try {
-      const result = await this.claudeRunner.run(
-        prompt,
-        (messages) => {
-          const now = Date.now();
-          if (now - lastEdit < 2000) return;
-          lastEdit = now;
-          void flush(messages.join("\n\n"));
-        },
-        options
-      );
+      const onUpdate = (messages: string[]) => {
+        const now = Date.now();
+        if (now - lastEdit < 2000) return;
+        lastEdit = now;
+        void flush(messages.join("\n\n"));
+      };
+      const light = useLightRunner ? this.analytics?.lightAiRunner : undefined;
+      const result = light
+        ? await light.run(prompt, onUpdate, {
+            model: options.model ?? this.settingsStore.aiModelLight(),
+            telemetry: options.telemetry ?? { agentName: `ai-${sub}`, kind: "staff_command" },
+            timeoutMs: options.timeoutMs,
+          })
+        : await this.claudeRunner.run(prompt, onUpdate, options);
       return result.join("\n\n").trim();
     } catch (error) {
       if (error instanceof ClaudeApiLimitError) {
@@ -2301,6 +2343,100 @@ export class DiscordBot {
     }
   }
 
+  // Human-readable sentiment labels for /ai score and the report drill-down.
+  private static readonly SENTIMENT_LABELS: Record<string, string> = {
+    very_negative: "Very negative",
+    negative: "Negative",
+    neutral: "Neutral",
+    positive: "Positive",
+    very_positive: "Very positive",
+  };
+
+  // Ephemeral per-ticket score view (staff-only; gated by aiCommandsEnabled in
+  // the caller). Reads the persisted ticket_scores row — no AI call.
+  private async handleAiScore(interaction: ChatInputCommandInteraction): Promise<void> {
+    if (!this.analytics) {
+      await interaction.reply({ embeds: [makeEmbed("Ticket scoring is not wired up.", COLORS.warn)], flags: 64 });
+      return;
+    }
+    const threadId = interaction.options.getString("thread")?.trim() || interaction.channelId;
+    if (!threadId) {
+      await interaction.reply({ embeds: [makeEmbed("Run this inside a ticket thread or pass a thread id.", COLORS.warn)], flags: 64 });
+      return;
+    }
+    await interaction.deferReply({ flags: 64 });
+
+    const [score, ticket] = await Promise.all([
+      this.analytics.scoreStore.get(threadId),
+      this.ticketStore.getByThreadId(threadId).catch(() => null),
+    ]);
+    if (!ticket) {
+      await interaction.editReply({ embeds: [makeEmbed("That thread isn't a tracked support ticket.", COLORS.warn)] });
+      return;
+    }
+    if (!score || score.status === "PENDING") {
+      const state = !ticket.closed
+        ? "The ticket is still open — scoring runs after close."
+        : this.settingsStore.scoringEnabled()
+          ? "Not scored yet — it will be included in an upcoming scoring batch."
+          : "Scoring is disabled (/config → Analytics).";
+      await interaction.editReply({ embeds: [makeEmbed(`No score for <#${threadId}> yet. ${state}`, COLORS.brand)] });
+      return;
+    }
+    if (score.status === "SKIPPED") {
+      const reason = score.error === "too_short" ? "the conversation was too short to score" : (score.error ?? "skipped");
+      await interaction.editReply({ embeds: [makeEmbed(`<#${threadId}> was skipped by scoring (${reason}).`, COLORS.brand)] });
+      return;
+    }
+    if (score.status === "FAILED") {
+      await interaction.editReply({
+        embeds: [makeEmbed(`Scoring failed for <#${threadId}> (attempt ${score.attempts}/3): ${score.error ?? "unknown error"}`, COLORS.warn)],
+      });
+      return;
+    }
+
+    const s = (v: string | null) => (v ? (DiscordBot.SENTIMENT_LABELS[v] ?? v) : "—");
+    const staff = Array.isArray(score.staffScores)
+      ? (score.staffScores as Array<{ name: string; tone: number; clarity: number; correctness: number }>)
+      : [];
+    const scoreEmbed = new EmbedBuilder()
+      .setTitle("🤖 AI Ticket Score")
+      .setColor((score.cxScore ?? 0) >= 7 ? COLORS.success : (score.cxScore ?? 0) >= 4 ? COLORS.warn : COLORS.danger)
+      .setDescription(score.summary ?? null)
+      .addFields(
+        { name: "Ticket", value: `<#${threadId}>`, inline: true },
+        { name: "CX score", value: `${score.cxScore ?? "—"}/10`, inline: true },
+        { name: "Sentiment", value: `${s(score.sentimentStart)} → ${s(score.sentimentEnd)}`, inline: true },
+        {
+          name: "Resolution",
+          value: `${score.resolution ?? "—"}${score.fcr ? " · first-contact" : ""}${score.escalationNeeded ? " · escalated" : ""}`,
+          inline: true,
+        },
+        { name: "Topic", value: score.topic ?? "—", inline: true },
+        {
+          name: "Agent quality",
+          value: `Tone ${score.agentTone ?? "—"} · Clarity ${score.agentClarity ?? "—"} · Correctness ${score.agentCorrectness ?? "—"}`,
+          inline: true,
+        },
+        ...(score.rootCause ? [{ name: "Root cause", value: score.rootCause.slice(0, 1024) }] : []),
+        ...(staff.length > 0
+          ? [
+              {
+                name: "Per-staff",
+                value: staff
+                  .map((m) => `**${m.name}** — tone ${m.tone}, clarity ${m.clarity}, correctness ${m.correctness}`)
+                  .join("\n")
+                  .slice(0, 1024),
+              },
+            ]
+          : []),
+      )
+      .setFooter({
+        text: `Scored ${score.scoredAt ? score.scoredAt.toISOString().slice(0, 16).replace("T", " ") : "—"} · ${score.model ?? ""} · $${(score.costUsd ?? 0).toFixed(4)}`,
+      });
+    await interaction.editReply({ embeds: [scoreEmbed] });
+  }
+
   private async handleAiCommand(interaction: ChatInputCommandInteraction): Promise<void> {
     const member = await this.requireSupportOrAdmin(interaction);
     if (!member) return;
@@ -2310,6 +2446,12 @@ export class DiscordBot {
         embeds: [makeEmbed("AI commands are disabled (/config → General Settings).", COLORS.warn)],
         flags: 64,
       });
+      return;
+    }
+
+    // /ai score is a quick DB lookup, not an AI run — no mutex, no context build.
+    if (interaction.options.getSubcommand() === "score") {
+      await this.handleAiScore(interaction);
       return;
     }
 
@@ -2381,7 +2523,12 @@ export class DiscordBot {
           maxBudgetUsd: isCause
             ? this.settingsStore.aiMaxBudgetUsdCause()
             : this.settingsStore.aiMaxBudgetUsdAsk(),
-          telemetry: { agentName: `ai-${sub}`, kind: "staff_command" },
+          telemetry: {
+            agentName: `ai-${sub}`,
+            kind: "staff_command",
+            userId: interaction.user.id,
+            username: interaction.user.displayName,
+          },
         };
         if (sub === "ask") {
           const question = interaction.options.getString("question", true);
@@ -2405,7 +2552,12 @@ export class DiscordBot {
         runOptions = {
           promptPrefix: null,
           model: this.settingsStore.aiModelLight(),
-          telemetry: { agentName: "ai-draft", kind: "staff_command" },
+          telemetry: {
+            agentName: "ai-draft",
+            kind: "staff_command",
+            userId: interaction.user.id,
+            username: interaction.user.displayName,
+          },
         };
         this.aiLog.info("run started", {
           "ai.sub": sub,
@@ -2418,7 +2570,12 @@ export class DiscordBot {
         runOptions = {
           promptPrefix: null,
           model: this.settingsStore.aiModelLight(),
-          telemetry: { agentName: "ai-summarize", kind: "staff_command" },
+          telemetry: {
+            agentName: "ai-summarize",
+            kind: "staff_command",
+            userId: interaction.user.id,
+            username: interaction.user.displayName,
+          },
         };
         this.aiLog.info("run started", {
           "ai.sub": sub,
@@ -2427,7 +2584,9 @@ export class DiscordBot {
         });
       }
 
-      const text = await this.streamAiRun(interaction, sub, title, prompt, runOptions);
+      // draft/summarize are tool-less → direct Messages API when wired.
+      const useLight = sub === "draft" || sub === "summarize";
+      const text = await this.streamAiRun(interaction, sub, title, prompt, runOptions, useLight);
       if (text === null) return;
       if (text.length === 0) {
         await interaction.editReply({ embeds: [makeEmbed("The AI returned an empty answer.", COLORS.warn)] });
@@ -2957,6 +3116,9 @@ export class DiscordBot {
                 ? `${sentryActive() ? "on" : "configured ⚠️ restart pending"} · traces ${s.sentryTracesSampleRate()} · logs ${s.sentryLogsEnabled() ? "on" : "off"}`
                 : "off"
             }`,
+            `InfluxDB: ${influxActive() ? `on → \`${s.influxBucket()}\`` : s.influxEnabled() ? "enabled ⚠️ incomplete config" : "off"} · Scoring: ${
+              s.scoringEnabled() ? `every ${s.scoringIntervalHours()}h, \`${s.scoringModel()}\`` : "off"
+            }`,
           ].join("\n"),
           inline: false,
         },
@@ -2980,6 +3142,7 @@ export class DiscordBot {
     ];
     const actions = [
       new ButtonBuilder().setCustomId("config_ai").setLabel("AI & Knowledge").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("config_analytics").setLabel("Analytics").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("config_reverify").setLabel("Re-Verify").setStyle(ButtonStyle.Secondary),
     ];
     if (!s.backfillDone()) {
@@ -3406,6 +3569,90 @@ export class DiscordBot {
     );
 
     return { embeds: [embed], components: [setupButtons, toggleButtons, readButtons, actionButtons] };
+  }
+
+  // /config → Analytics: InfluxDB export + AI ticket scoring. Async because it
+  // shows live pipeline state (unscored count, in-flight batch).
+  private async buildAnalyticsPanel() {
+    const s = this.settingsStore;
+    const mask = (value: string | null) => (value ? `••••${value.slice(-6)}` : "_not set_");
+    const tokenLine = s.influxTokenUnreadable()
+      ? "⚠️ stored token can't be decrypted (key source rotated) — re-enter it"
+      : mask(s.influxToken());
+
+    const [unscored, pendingBatches] = this.analytics
+      ? await Promise.all([
+          this.analytics.scoreStore.countUnscoredClosed().catch(() => 0),
+          this.analytics.scoreStore.pendingBatches().catch(() => []),
+        ])
+      : [0, []];
+    const pending = pendingBatches[0];
+
+    const embed = new EmbedBuilder()
+      .setTitle("Analytics — InfluxDB & AI Scoring")
+      .setColor(0x5865f2)
+      .setDescription(
+        [
+          `**InfluxDB export:** ${
+            influxActive()
+              ? `**live** → \`${s.influxUrl()}\` org \`${s.influxOrg()}\` bucket \`${s.influxBucket()}\``
+              : s.influxEnabled()
+                ? "**enabled but inactive** ⚠️ — set url, org, bucket and token"
+                : "**off**"
+          }`,
+          `**Token:** ${tokenLine}`,
+          "",
+          `**AI ticket scoring:** ${
+            s.scoringEnabled()
+              ? `**on** — every ${s.scoringIntervalHours()}h (${Math.round(24 / Math.max(1, s.scoringIntervalHours()))} batches/day), model \`${s.scoringModel()}\``
+              : "**off**"
+          }`,
+          `**Limits:** max ${s.scoringMaxTicketsPerBatch()} tickets/batch · daily budget $${s.scoringMaxBudgetUsdPerDay().toFixed(2)}`,
+          `**Last batch:** ${s.scoringLastRunAt() ? `<t:${Math.floor(s.scoringLastRunAt()!.getTime() / 1000)}:R>` : "_never_"} · **Unscored closed tickets:** ${unscored}`,
+          `**In flight:** ${pending ? `\`${pending.anthropicBatchId}\` (${pending.requestCount} tickets, submitted <t:${Math.floor(pending.submittedAt.getTime() / 1000)}:R>)` : "_none_"}`,
+          `**Historical backfill:** ${s.scoringBackfillPending() ? "⏳ draining (one batch in flight at a time)" : "idle"}`,
+          "",
+          "Scoring uses the Anthropic **Batch API** (50% discount, results within ~1h) with a prompt-cached rubric — ≈$0.005/ticket. Influx settings apply live on save.",
+        ].join("\n")
+      );
+
+    const influxRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId("config_analytics_influx").setLabel("Influx Settings").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder()
+        .setCustomId("config_analytics_toggle_influx")
+        .setLabel(`Influx: ${s.influxEnabled() ? "on" : "off"}`)
+        .setStyle(s.influxEnabled() ? ButtonStyle.Success : ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId("config_analytics_test")
+        .setLabel("Send test point")
+        .setStyle(ButtonStyle.Primary)
+        .setDisabled(!influxActive())
+    );
+
+    const scoringRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId("config_analytics_toggle_scoring")
+        .setLabel(`Scoring: ${s.scoringEnabled() ? "on" : "off"}`)
+        .setStyle(s.scoringEnabled() ? ButtonStyle.Success : ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("config_analytics_scoring_opts").setLabel("Scoring Options").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("config_analytics_score_one").setLabel("Score one now").setStyle(ButtonStyle.Secondary)
+    );
+
+    const backfillRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId("config_analytics_backfill_influx")
+        .setLabel("Backfill history to Influx")
+        .setStyle(ButtonStyle.Secondary)
+        .setDisabled(!influxActive()),
+      new ButtonBuilder()
+        .setCustomId("config_analytics_backfill_scores")
+        .setLabel("Backfill scores (all closed tickets)")
+        .setStyle(ButtonStyle.Secondary)
+        .setDisabled(s.scoringBackfillPending()),
+      new ButtonBuilder().setCustomId("config_back_main").setLabel("Back").setStyle(ButtonStyle.Secondary)
+    );
+
+    return { embeds: [embed], components: [influxRow, scoringRow, backfillRow] };
   }
 
   // Applies the current settings to the running SDK and renders the outcome
@@ -4387,6 +4634,212 @@ export class DiscordBot {
       return;
     }
 
+    if (id === "config_analytics") {
+      await interaction.update(await this.buildAnalyticsPanel());
+      return;
+    }
+
+    if (id === "config_analytics_influx") {
+      const s = this.settingsStore;
+      const modal = new ModalBuilder().setCustomId("config_analytics_influx_modal").setTitle("InfluxDB 2.x Connection");
+      modal.addComponents(
+        new ActionRowBuilder<TextInputBuilder>().addComponents(
+          new TextInputBuilder()
+            .setCustomId("url")
+            .setLabel("URL (e.g. https://influx.example.com:8086)")
+            .setStyle(TextInputStyle.Short)
+            .setRequired(false)
+            .setValue(s.influxUrl() ?? "")
+        ),
+        new ActionRowBuilder<TextInputBuilder>().addComponents(
+          new TextInputBuilder()
+            .setCustomId("org")
+            .setLabel("Organization")
+            .setStyle(TextInputStyle.Short)
+            .setRequired(false)
+            .setValue(s.influxOrg() ?? "")
+        ),
+        new ActionRowBuilder<TextInputBuilder>().addComponents(
+          new TextInputBuilder()
+            .setCustomId("bucket")
+            .setLabel("Bucket")
+            .setStyle(TextInputStyle.Short)
+            .setRequired(false)
+            .setValue(s.influxBucket() ?? "")
+        ),
+        new ActionRowBuilder<TextInputBuilder>().addComponents(
+          new TextInputBuilder()
+            .setCustomId("token")
+            .setLabel("API token (blank = keep current)")
+            .setStyle(TextInputStyle.Short)
+            .setRequired(false)
+            .setPlaceholder(s.influxToken() ? "•••• stored (leave blank to keep)" : "write-scoped token for the bucket")
+        )
+      );
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (id === "config_analytics_toggle_influx") {
+      await this.settingsStore.updateAnalytics({ influxEnabled: !this.settingsStore.influxEnabled() });
+      await reconfigureInflux(this.settingsStore.influxConfig());
+      this.auditConfig(interaction, `Influx export → ${this.settingsStore.influxEnabled() ? "on" : "off"}`);
+      await interaction.update(await this.buildAnalyticsPanel());
+      return;
+    }
+
+    if (id === "config_analytics_test") {
+      await interaction.deferReply({ flags: 64 });
+      try {
+        await pingInflux();
+        await interaction.editReply({
+          embeds: [makeEmbed("✅ Test point written and flushed — check the `bot_health` measurement.", COLORS.success)],
+        });
+      } catch (error) {
+        await interaction.editReply({
+          embeds: [makeEmbed(`Test write failed: ${error instanceof Error ? error.message : String(error)}`, COLORS.danger)],
+        });
+      }
+      return;
+    }
+
+    if (id === "config_analytics_toggle_scoring") {
+      await this.settingsStore.updateAnalytics({ scoringEnabled: !this.settingsStore.scoringEnabled() });
+      this.auditConfig(interaction, `AI ticket scoring → ${this.settingsStore.scoringEnabled() ? "on" : "off"}`);
+      await interaction.update(await this.buildAnalyticsPanel());
+      return;
+    }
+
+    if (id === "config_analytics_scoring_opts") {
+      const s = this.settingsStore;
+      const modal = new ModalBuilder().setCustomId("config_analytics_scoring_modal").setTitle("AI Scoring Options");
+      modal.addComponents(
+        new ActionRowBuilder<TextInputBuilder>().addComponents(
+          new TextInputBuilder()
+            .setCustomId("interval")
+            .setLabel("Batch interval in hours (6 = 4x/day)")
+            .setStyle(TextInputStyle.Short)
+            .setRequired(true)
+            .setValue(String(s.scoringIntervalHours()))
+        ),
+        new ActionRowBuilder<TextInputBuilder>().addComponents(
+          new TextInputBuilder()
+            .setCustomId("model")
+            .setLabel("Model id (cheap model recommended)")
+            .setStyle(TextInputStyle.Short)
+            .setRequired(true)
+            .setValue(s.scoringModel())
+        ),
+        new ActionRowBuilder<TextInputBuilder>().addComponents(
+          new TextInputBuilder()
+            .setCustomId("max_batch")
+            .setLabel("Max tickets per batch")
+            .setStyle(TextInputStyle.Short)
+            .setRequired(true)
+            .setValue(String(s.scoringMaxTicketsPerBatch()))
+        ),
+        new ActionRowBuilder<TextInputBuilder>().addComponents(
+          new TextInputBuilder()
+            .setCustomId("budget")
+            .setLabel("Daily budget cap in USD")
+            .setStyle(TextInputStyle.Short)
+            .setRequired(true)
+            .setValue(String(s.scoringMaxBudgetUsdPerDay()))
+        )
+      );
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (id === "config_analytics_score_one") {
+      const modal = new ModalBuilder().setCustomId("config_analytics_score_one_modal").setTitle("Score One Ticket Now");
+      modal.addComponents(
+        new ActionRowBuilder<TextInputBuilder>().addComponents(
+          new TextInputBuilder()
+            .setCustomId("thread")
+            .setLabel("Thread id of a CLOSED ticket")
+            .setStyle(TextInputStyle.Short)
+            .setRequired(true)
+            .setPlaceholder("e.g. 1234567890123456789")
+        )
+      );
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (id === "config_analytics_backfill_influx") {
+      const confirm = new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder()
+          .setCustomId("config_analytics_backfill_influx_confirm")
+          .setLabel("Yes, export all history")
+          .setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId("config_analytics").setLabel("Cancel").setStyle(ButtonStyle.Secondary)
+      );
+      await interaction.update({
+        embeds: [
+          makeEmbed(
+            "This exports **every historical ticket** (created/closed/first-response/CSAT events at their original timestamps, plus the status-change history) from the database into InfluxDB. Re-running writes the same points again (Influx de-duplicates identical points, so it's safe). No AI cost.",
+            COLORS.brand
+          ),
+        ],
+        components: [confirm],
+      });
+      return;
+    }
+
+    if (id === "config_analytics_backfill_influx_confirm") {
+      await interaction.deferUpdate();
+      try {
+        const { tickets, points } = await backfillTicketHistory(this.analytics!.prisma);
+        this.auditConfig(interaction, `Influx history backfill → ${tickets} tickets, ${points} points`);
+        await interaction.editReply({
+          embeds: [makeEmbed(`✅ Backfilled **${tickets}** tickets (**${points}** points) into InfluxDB.`, COLORS.success)],
+          components: [],
+        });
+      } catch (error) {
+        await interaction.editReply({
+          embeds: [makeEmbed(`Backfill failed: ${error instanceof Error ? error.message : String(error)}`, COLORS.danger)],
+          components: [],
+        });
+      }
+      return;
+    }
+
+    if (id === "config_analytics_backfill_scores") {
+      const unscored = this.analytics ? await this.analytics.scoreStore.countUnscoredClosed().catch(() => 0) : 0;
+      const estimate = unscored * 0.005;
+      const confirm = new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder()
+          .setCustomId("config_analytics_backfill_scores_confirm")
+          .setLabel(`Yes, score ${unscored} tickets`)
+          .setStyle(ButtonStyle.Primary)
+          .setDisabled(unscored === 0),
+        new ButtonBuilder().setCustomId("config_analytics").setLabel("Cancel").setStyle(ButtonStyle.Secondary)
+      );
+      await interaction.update({
+        embeds: [
+          makeEmbed(
+            [
+              `This queues **${unscored}** unscored closed ticket(s) for AI scoring, drained oldest-first in batches of ${this.settingsStore.scoringMaxTicketsPerBatch()} (one batch in flight at a time).`,
+              "",
+              `Estimated total cost: **~$${estimate.toFixed(2)}** (Batch API, ≈$0.005/ticket). The daily budget cap ($${this.settingsStore.scoringMaxBudgetUsdPerDay().toFixed(2)}) still applies — a large backfill spreads across days.`,
+              "Scoring must be enabled for the drain to run.",
+            ].join("\n"),
+            COLORS.brand
+          ),
+        ],
+        components: [confirm],
+      });
+      return;
+    }
+
+    if (id === "config_analytics_backfill_scores_confirm") {
+      await this.settingsStore.setScoringBackfillPending(true);
+      this.auditConfig(interaction, "AI score backfill → queued (all unscored closed tickets)");
+      await interaction.update(await this.buildAnalyticsPanel());
+      return;
+    }
+
     if (id === "config_intercom_wipe") {
       const links = await this.intercomStore.listAllLinks();
       const contacts = new Set(links.map((l) => l.contactId)).size;
@@ -5109,6 +5562,114 @@ export class DiscordBot {
         embeds: [makeEmbed(note ?? `Sentry options saved — environment \`${environment}\`, traces ${traces}, profiles ${profiles}.`, COLORS.success)],
         flags: 64,
       });
+      return;
+    }
+
+    if (interaction.customId === "config_analytics_influx_modal") {
+      const url = interaction.fields.getTextInputValue("url").trim();
+      const org = interaction.fields.getTextInputValue("org").trim();
+      const bucket = interaction.fields.getTextInputValue("bucket").trim();
+      const token = interaction.fields.getTextInputValue("token").trim();
+      if (url && !/^https?:\/\//.test(url)) {
+        await interaction.reply({
+          embeds: [makeEmbed("The URL must start with `http://` or `https://`.", COLORS.danger)],
+          flags: 64,
+        });
+        return;
+      }
+      await this.settingsStore.updateAnalytics({
+        influxUrl: url || null,
+        influxOrg: org || null,
+        influxBucket: bucket || null,
+        // Blank token = leave the stored (encrypted) one unchanged.
+        ...(token ? { influxToken: token } : {}),
+      });
+      await reconfigureInflux(this.settingsStore.influxConfig());
+      // Deliberately no token value in the audit line.
+      this.auditConfig(
+        interaction,
+        `Influx connection updated (url ${url || "—"}, org ${org || "—"}, bucket ${bucket || "—"}${token ? ", token set" : ""})`
+      );
+      await interaction.reply({
+        embeds: [
+          makeEmbed(
+            influxActive()
+              ? "InfluxDB connection saved — exporter is **live**. Use *Send test point* to verify end-to-end."
+              : "InfluxDB connection saved — exporter still inactive (need url + org + bucket + token, and the Influx toggle on).",
+            influxActive() ? COLORS.success : COLORS.warn
+          ),
+        ],
+        flags: 64,
+      });
+      return;
+    }
+
+    if (interaction.customId === "config_analytics_scoring_modal") {
+      const interval = Number.parseInt(interaction.fields.getTextInputValue("interval").trim(), 10);
+      const model = interaction.fields.getTextInputValue("model").trim();
+      const maxBatch = Number.parseInt(interaction.fields.getTextInputValue("max_batch").trim(), 10);
+      const budget = Number.parseFloat(interaction.fields.getTextInputValue("budget").trim());
+      if (
+        !Number.isInteger(interval) || interval < 1 || interval > 168 ||
+        !model ||
+        !Number.isInteger(maxBatch) || maxBatch < 1 || maxBatch > 10_000 ||
+        !Number.isFinite(budget) || budget < 0
+      ) {
+        await interaction.reply({
+          embeds: [
+            makeEmbed(
+              "Invalid values — interval 1-168 hours, model non-empty, max tickets 1-10000, budget ≥ 0.",
+              COLORS.danger
+            ),
+          ],
+          flags: 64,
+        });
+        return;
+      }
+      await this.settingsStore.updateAnalytics({
+        scoringIntervalHours: interval,
+        scoringModel: model,
+        scoringMaxTicketsPerBatch: maxBatch,
+        scoringMaxBudgetUsdPerDay: budget,
+      });
+      this.auditConfig(
+        interaction,
+        `Scoring options → every ${interval}h, model \`${model}\`, ${maxBatch}/batch, $${budget}/day`
+      );
+      await interaction.reply({
+        embeds: [makeEmbed(`Scoring options saved — every ${interval}h on \`${model}\`, max ${maxBatch}/batch, $${budget.toFixed(2)}/day cap.`, COLORS.success)],
+        flags: 64,
+      });
+      return;
+    }
+
+    if (interaction.customId === "config_analytics_score_one_modal") {
+      const threadId = interaction.fields.getTextInputValue("thread").trim();
+      if (!this.analytics) {
+        await interaction.reply({ embeds: [makeEmbed("Scoring is not wired up.", COLORS.warn)], flags: 64 });
+        return;
+      }
+      await interaction.deferReply({ flags: 64 });
+      try {
+        const parsed = await this.analytics.scoringService.scoreOneNow(threadId);
+        this.auditConfig(interaction, `Manual score → <#${threadId}> (CX ${parsed.cx_score}/10)`);
+        await interaction.editReply({
+          embeds: [
+            makeEmbed(
+              [
+                `✅ Scored <#${threadId}> — CX **${parsed.cx_score}/10**, ${parsed.resolution}, topic ${parsed.topic}.`,
+                `Agent: tone ${parsed.agent_overall.tone} · clarity ${parsed.agent_overall.clarity} · correctness ${parsed.agent_overall.correctness}.`,
+                "Full breakdown: `/ai score` in the thread.",
+              ].join("\n"),
+              COLORS.success
+            ),
+          ],
+        });
+      } catch (error) {
+        await interaction.editReply({
+          embeds: [makeEmbed(`Scoring failed: ${error instanceof Error ? error.message : String(error)}`, COLORS.danger)],
+        });
+      }
       return;
     }
 
@@ -6345,6 +6906,20 @@ export class DiscordBot {
                 description: "Optional guidance for the draft (tone, content, decisions)",
                 required: false,
                 max_length: 1000,
+              },
+            ],
+          },
+          {
+            type: 1, // SUB_COMMAND
+            name: "score",
+            description: "Show the AI quality score of this ticket (CX, agent quality, resolution)",
+            options: [
+              {
+                type: 3, // STRING
+                name: "thread",
+                description: "Thread id of another ticket (default: the current thread)",
+                required: false,
+                max_length: 30,
               },
             ],
           },

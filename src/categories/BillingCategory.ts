@@ -25,6 +25,7 @@ import { AuditLogger } from "../bot/AuditLogger";
 import { EscalationTierStore } from "../config/EscalationTierStore";
 import { log } from "../util/logger";
 import { metricCount, metricDistribution } from "../util/instrument";
+import { exportBillingEvent } from "../metrics/MetricsExporter";
 
 const billingLog = log.child("billing");
 
@@ -262,6 +263,7 @@ export class BillingCategory extends BaseCategory {
       "stripe.subscription_id": subscriptionId,
       "discord.user_id": interaction.user.id,
     });
+    exportBillingEvent({ event: "discount", chargeId, threadId: interaction.channel?.isThread() ? interaction.channelId : null });
 
     await this.disableButtons(interaction);
 
@@ -421,6 +423,13 @@ export class BillingCategory extends BaseCategory {
     });
     metricCount("billing.refunds", 1, { outcome: "processed" });
     metricDistribution("billing.refund_amount", refund.amount, { currency: refund.currency });
+    exportBillingEvent({
+      event: "refund",
+      amountMinor: refund.amount,
+      currency: refund.currency,
+      chargeId,
+      threadId: interaction.channel?.isThread() ? interaction.channelId : null,
+    });
 
     const amount = this.stripeClient.formatAmount(refund.amount, refund.currency);
 
@@ -547,6 +556,13 @@ export class BillingCategory extends BaseCategory {
           reason,
         })
         .catch((e) => billingLog.error("pending charge review persist failed", e, { "stripe.charge_id": chargeId }));
+      exportBillingEvent({
+        event: "charge_review_created",
+        amountMinor: charge.amount,
+        currency: charge.currency,
+        chargeId,
+        threadId: thread.id,
+      });
     }
 
     const pingRoleId = await this.staffPingRoleFor(thread?.id ?? null);
@@ -765,6 +781,20 @@ export class BillingCategory extends BaseCategory {
     });
     metricCount("billing.refunds", 1, { outcome: "processed" });
     metricDistribution("billing.refund_amount", refund.amount, { currency: refund.currency });
+    exportBillingEvent({
+      event: "charge_review_approved",
+      amountMinor: refund.amount,
+      currency: refund.currency,
+      chargeId: review.chargeId,
+      threadId: thread.id,
+    });
+    exportBillingEvent({
+      event: "refund",
+      amountMinor: refund.amount,
+      currency: refund.currency,
+      chargeId: review.chargeId,
+      threadId: thread.id,
+    });
 
     await this.sessionStore.resolvePendingChargeReview(thread.id, "APPROVED", member.id);
 
@@ -822,6 +852,13 @@ export class BillingCategory extends BaseCategory {
 
     const reason = interaction.options.getString("reason")?.trim() || null;
     await this.sessionStore.resolvePendingChargeReview(thread.id, "DENIED", member.id);
+    exportBillingEvent({
+      event: "charge_review_denied",
+      amountMinor: review.amount,
+      currency: review.currency,
+      chargeId: review.chargeId,
+      threadId: thread.id,
+    });
 
     const amountText = this.stripeClient.formatAmount(review.amount, review.currency);
     // The thread stays open so the conversation can continue; staff close it via /status set.

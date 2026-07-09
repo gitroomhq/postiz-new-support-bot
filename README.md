@@ -5,7 +5,9 @@ A Discord-first customer support bot for [Postiz](https://github.com/gitroomhq/p
 ## How it works
 
 - **Discord** (`discord.js` v14): the whole UI. Customers open tickets from a panel; staff use slash commands (`/status`, `/priority`, `/note`, `/reminders`, `/escalate`, `/canned`, `/charge`, `/billing`, `/search-tickets`, `/ai`, `/report`, `/config`, `/setup`).
-- **AI answers** (`@anthropic-ai/claude-code` CLI): the bot spawns the `claude` CLI with its working directory set to `search/`, where the **Postiz source and docs are cloned** (`search/postiz-app`, `search/postiz-docs`). The model grounds answers by `Read`/`Glob`/`Grep`-ing that real code — there is no vector store. Models are configurable in `/config → AI & Knowledge` (a cheaper model is used for the tool-less `/ai summarize`/`draft`). A scheduler `git pull`s the clones periodically so answers track upstream. Staff `/ai` runs can additionally use a **read-only** Stripe MCP server and a customer-scoped read-only Postiz MCP.
+- **AI answers** (`@anthropic-ai/claude-code` CLI): the bot spawns the `claude` CLI with its working directory set to `search/`, where the **Postiz source and docs are cloned** (`search/postiz-app`, `search/postiz-docs`). The model grounds answers by `Read`/`Glob`/`Grep`-ing that real code — there is no vector store. Models are configurable in `/config → AI & Knowledge`. A scheduler `git pull`s the clones periodically so answers track upstream. Staff `/ai` runs can additionally use a **read-only** Stripe MCP server and a customer-scoped read-only Postiz MCP. The tool-less `/ai summarize`/`draft` run on a cheaper model **via the direct Messages API** (`src/bot/LightAiRunner.ts` — no CLI spawn overhead).
+- **AI ticket scoring** (`src/scoring/`): closed tickets are evaluated by a cheap model via the Anthropic **Message Batches API** (flat 50% discount + a prompt-cached rubric, ≈$0.005/ticket): CX score, customer sentiment, per-staff agent quality, resolution/FCR/escalation classification, and topic/root-cause tagging. Batches run on a `/config`-set interval (default every 6h); reopened tickets re-score after re-close; trivially short tickets are skipped. Surfaced via `/ai score`, an AI-quality section + drill-down in `/report`, and Grafana. Everything (enable, interval, model, batch size, daily budget cap, historical backfill) lives in `/config → Analytics`.
+- **InfluxDB export** (`src/metrics/`): optional InfluxDB 2.x exporter for *everything* — ticket lifecycle events, response times, CSAT, AI usage & cost per run (also persisted to the `ai_runs` table), AI quality scores, billing events (refunds/discounts/charge reviews/disputes/fraud warnings), Intercom queue depths and periodic backlog gauges. Connection (url/org/bucket/token — token encrypted at rest) is set in `/config → Analytics`, which also offers a one-time historical backfill. Five ready-made Grafana dashboards live in `grafana/dashboards/`.
 - **Intercom bridge** (`src/intercom/`): optional two-way sync (`none` / `push` / `bi`) of each Discord ticket to an Intercom conversation + customer ticket, with a durable outbox/inbox, echo-suppression, and a Canvas Kit inbox sidebar. HMAC-verified webhooks.
 - **Stripe** (`src/bot/StripeClient.ts`, `BillingAdmin`, `src/bot/billing/`): customer self-service "refund & cancel" with guardrails (amount cap, per-24h velocity global + per-user, min membership age), plus a large staff `/billing` admin console. Dispute / early-fraud-warning **webhooks** are registered programmatically (no dashboard access needed) and alert staff.
 - **Observability** (`@sentry/node`): errors, gen_ai spans, wide-event logs, and metrics. DSN and all knobs are set at runtime via `/config → Sentry`.
@@ -50,7 +52,10 @@ src/
 ├── categories/         # customer ticket categories (How-To, Bugs, Billing)
 ├── intercom/           # two-way Intercom bridge
 ├── mcp/                # read-only Stripe MCP server (spawned for /ai)
+├── metrics/            # InfluxDB writer + exporters + snapshot scheduler
+├── scoring/            # AI ticket scoring (Batch API pipeline + scheduler)
 ├── server/             # Express callback + webhook server
 ├── db/                 # ensureSchema + verifySchema
 └── util/               # embeds, logger (Sentry), crypto, instrument
+grafana/dashboards/     # 5 importable Grafana dashboards (InfluxDB 2.x / Flux)
 ```

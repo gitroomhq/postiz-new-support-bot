@@ -31,7 +31,10 @@ const EXPECTED_COLUMNS: Record<string, string[]> = {
     "aiModel", "aiModelLight",
     "aiEffortAsk", "aiEffortCause", "aiMaxBudgetUsdAsk", "aiMaxBudgetUsdCause", "aiPostizPrefetchEnabled",
     "kbRefreshEnabled", "kbRefreshIntervalHours", "kbLastRefreshAt", "refundMaxPer24hPerUser", "stripeWebhookEnabled",
-    "stripeWebhookEndpointId", "stripeWebhookSecret", "publicBaseUrl", "updatedAt",
+    "stripeWebhookEndpointId", "stripeWebhookSecret", "publicBaseUrl",
+    "influxEnabled", "influxUrl", "influxOrg", "influxBucket", "influxToken",
+    "scoringEnabled", "scoringIntervalHours", "scoringModel", "scoringMaxTicketsPerBatch",
+    "scoringMaxBudgetUsdPerDay", "scoringLastRunAt", "scoringBackfillPending", "updatedAt",
   ],
   status_tags: [
     "id", "emoji", "label", "isInitial", "closesThread", "reminderEnabled", "reminderDays", "reminderTarget",
@@ -64,6 +67,20 @@ const EXPECTED_COLUMNS: Record<string, string[]> = {
   ],
   intercom_pending_posts: ["id", "ticketThreadId", "kind", "bodyHash", "createdAt"],
   stripe_webhook_events: ["id", "type", "createdAt"],
+  ai_runs: [
+    "id", "agentName", "kind", "source", "model", "outcome", "sessionId", "batchId", "numTurns", "durationMs",
+    "inputTokens", "outputTokens", "cacheReadTokens", "cacheCreationTokens", "costUsd", "toolCalls", "toolErrors",
+    "createdAt",
+  ],
+  ticket_scores: [
+    "id", "ticketThreadId", "status", "attempts", "batchId", "model", "cxScore", "sentimentStart", "sentimentEnd",
+    "agentTone", "agentClarity", "agentCorrectness", "resolution", "fcr", "escalationNeeded", "topic", "rootCause",
+    "summary", "staffScores", "inputTokens", "outputTokens", "costUsd", "error", "scoredAt", "createdAt",
+  ],
+  scoring_batches: [
+    "id", "anthropicBatchId", "status", "purpose", "model", "requestCount", "succeededCount", "erroredCount",
+    "expiredCount", "costUsd", "submittedAt", "endedAt",
+  ],
 };
 
 export interface VerifySchemaOptions {

@@ -7,8 +7,11 @@ import {
   truncateForAttr,
   metricCount,
   metricDistribution,
+  safe,
   SPAN_STATUS_ERROR,
 } from "../util/instrument";
+import { AiRunStore } from "./AiRunStore";
+import { exportAiRun } from "../metrics/MetricsExporter";
 
 interface StreamMessage {
   id: string;
@@ -43,6 +46,13 @@ export interface ClaudeRunTelemetry {
   /** gen_ai.agent.name — e.g. "support-bugs", "ai-ask". */
   agentName: string;
   kind: "customer_qa" | "staff_command";
+  /**
+   * Discord user behind the run (customer for auto-answers, staff for /ai) —
+   * attached via Sentry.setUser so the AI Conversations view attributes the
+   * conversation to a person.
+   */
+  userId?: string;
+  username?: string;
 }
 
 export interface ClaudeRunOptions {
@@ -87,7 +97,7 @@ export class ClaudeCodeRunner {
   private searchDir: string;
   private baseDir: string;
 
-  constructor(baseDir: string) {
+  constructor(baseDir: string, private aiRunStore?: AiRunStore) {
     this.baseDir = baseDir;
     this.searchDir = path.resolve(baseDir, "search");
   }
@@ -122,6 +132,14 @@ export class ClaudeCodeRunner {
       agentAttributes["gen_ai.request.messages"] = truncateForAttr(
         JSON.stringify([{ role: "user", content: prefix + prompt }])
       );
+    }
+
+    // Captured before the run so the Sentry AI Conversations wiring (conversation
+    // id + user) lands on the scope of the calling context (withDiscordSpan /
+    // withTickSpan both create an isolation scope).
+    const isolationScope = Sentry.getIsolationScope();
+    if (options.telemetry?.userId) {
+      isolationScope.setUser({ id: options.telemetry.userId, username: options.telemetry.username });
     }
 
     // The whole CLI run is one gen_ai.invoke_agent span; it nests under the
@@ -212,6 +230,10 @@ export class ClaudeCodeRunner {
                   "gen_ai.system": "anthropic",
                   "gen_ai.request.model": modelName,
                   "gen_ai.agent.name": agentName,
+                  // Explicit conversation id: the default ConversationId
+                  // integration reads the scope at spanStart, but these spans are
+                  // born in stdout callbacks where the async context may be lost.
+                  ...(sessionId ? { "gen_ai.conversation.id": sessionId } : {}),
                 },
               });
               chatSpans.set(messageId, span);
@@ -244,7 +266,12 @@ export class ClaudeCodeRunner {
             if (stats.numTurns !== undefined) attrs["claude_code.num_turns"] = stats.numTurns;
             if (stats.durationApiMs !== undefined) attrs["claude_code.duration_api_ms"] = stats.durationApiMs;
             if (stats.webSearches !== undefined) attrs["claude_code.web_search_requests"] = stats.webSearches;
-            if (sessionId) attrs["claude_code.session_id"] = sessionId;
+            if (sessionId) {
+              attrs["claude_code.session_id"] = sessionId;
+              // Abort paths where init arrived but no chat span did still get
+              // the conversation id on the run span.
+              attrs["gen_ai.conversation.id"] = sessionId;
+            }
             if (stats.inputTokens !== undefined || stats.outputTokens !== undefined) {
               attrs["gen_ai.usage.input_tokens"] = stats.inputTokens ?? 0;
               attrs["gen_ai.usage.output_tokens"] = stats.outputTokens ?? 0;
@@ -292,6 +319,28 @@ export class ClaudeCodeRunner {
               { kind, outcome },
               "millisecond"
             );
+
+            // Durable per-run usage row (cost dashboards + budget caps) plus the
+            // Influx point. Both fire-and-forget: they must never fail the run.
+            const runRecord = {
+              agentName,
+              kind,
+              source: "cli",
+              model: modelName,
+              outcome,
+              sessionId: sessionId ?? null,
+              numTurns: stats.numTurns ?? null,
+              durationMs: stats.durationMs ?? Date.now() - startedAt,
+              inputTokens: stats.inputTokens ?? 0,
+              outputTokens: stats.outputTokens ?? 0,
+              cacheReadTokens: stats.cacheReadTokens ?? 0,
+              cacheCreationTokens: stats.cacheCreationTokens ?? 0,
+              costUsd: stats.costUsd ?? 0,
+              toolCalls: toolCallCount,
+              toolErrors: toolErrorCount,
+            };
+            if (this.aiRunStore) safe(this.aiRunStore.record(runRecord), "ai-run-store");
+            exportAiRun(runRecord);
           };
 
           // Explicit run timeout: SIGTERM (lets claude tear down its MCP children),
@@ -379,6 +428,14 @@ export class ClaudeCodeRunner {
                 if (event.type === "system" && event.subtype === "init") {
                   if (typeof event.model === "string" && event.model) modelName = event.model;
                   if (typeof event.session_id === "string") sessionId = event.session_id;
+                  // One Sentry "conversation" per AI run, keyed by the CLI session
+                  // id. Scope-level (feeds the default ConversationId integration
+                  // for spans that still see this context) + explicit attribute on
+                  // the already-open agent span (started before the id existed).
+                  if (sessionId) {
+                    isolationScope.setConversationId(sessionId);
+                    agentSpan.setAttribute("gen_ai.conversation.id", sessionId);
+                  }
                   agentSpan.setAttributes({
                     "gen_ai.request.model": modelName,
                     "gen_ai.response.model": modelName,
@@ -447,6 +504,7 @@ export class ClaudeCodeRunner {
                           "gen_ai.tool.call.id": String(block.id),
                           "gen_ai.tool.type": toolName.startsWith("mcp__") ? "mcp" : "function",
                           "gen_ai.agent.name": agentName,
+                          ...(sessionId ? { "gen_ai.conversation.id": sessionId } : {}),
                         },
                       }),
                       name: toolName,

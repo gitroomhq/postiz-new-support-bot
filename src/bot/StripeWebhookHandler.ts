@@ -6,6 +6,7 @@ import { StripeClient } from "./StripeClient";
 import { COLORS } from "../util/embeds";
 import { log } from "../util/logger";
 import { metricCount } from "../util/instrument";
+import { exportBillingEvent } from "../metrics/MetricsExporter";
 
 const hookLog = log.child("stripe-webhook");
 
@@ -118,6 +119,7 @@ export class StripeWebhookHandler {
 
   private async onDispute(dispute: Stripe.Dispute): Promise<void> {
     const chargeId = typeof dispute.charge === "string" ? dispute.charge : (dispute.charge?.id ?? null);
+    exportBillingEvent({ event: "dispute", amountMinor: dispute.amount, currency: dispute.currency, chargeId });
     const linked = chargeId ? await this.linkedCustomer(chargeId) : null;
     const embed = new EmbedBuilder()
       .setTitle("⚠️ Stripe dispute opened")
@@ -138,6 +140,7 @@ export class StripeWebhookHandler {
 
   private async onFraudWarning(efw: Stripe.Radar.EarlyFraudWarning): Promise<void> {
     const chargeId = typeof efw.charge === "string" ? efw.charge : (efw.charge?.id ?? null);
+    exportBillingEvent({ event: "fraud_warning", chargeId });
     const linked = chargeId ? await this.linkedCustomer(chargeId) : null;
     const embed = new EmbedBuilder()
       .setTitle("🚨 Stripe early fraud warning")

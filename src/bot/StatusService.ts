@@ -4,10 +4,12 @@ import { TicketStore } from "./TicketStore";
 import { AuditLogger } from "./AuditLogger";
 import { SettingsStore } from "../config/SettingsStore";
 import { IntercomSyncService } from "../intercom/IntercomSyncService";
+import { TicketScoreStore } from "../scoring/TicketScoreStore";
 import { embed, COLORS } from "../util/embeds";
 import { applyTitleEmojis } from "../util/threadTitle";
 import { log } from "../util/logger";
 import { safe, metricCount } from "../util/instrument";
+import { exportStatusChange, exportTicketClosed } from "../metrics/MetricsExporter";
 
 const statusLog = log.child("status");
 
@@ -23,6 +25,10 @@ export interface StatusTicket {
   closed?: boolean;
   statusTag?: { emoji: string; label: string } | null;
   priorityTagId?: string | null;
+  // Used by the metrics export (resolution time / category tag); callers pass
+  // full ticket rows, so these are type-only like the fields above.
+  createdAt?: Date;
+  categoryId?: string | null;
 }
 
 export interface ApplyStatusOptions {
@@ -40,7 +46,9 @@ export class StatusService {
     private ticketStore: TicketStore,
     private audit: AuditLogger,
     private settingsStore: SettingsStore,
-    private intercomSync: IntercomSyncService
+    private intercomSync: IntercomSyncService,
+    // Optional: reopening a scored ticket resets its AI score for re-scoring.
+    private scoreStore?: TicketScoreStore
   ) {}
 
   async applyStatus(
@@ -178,6 +186,29 @@ export class StatusService {
     });
     if (isDone) {
       metricCount("tickets.closed", 1, { via: options.actorName === "Automatic" ? "automatic" : "manual" });
+    }
+    const reopened = !isDone && wasInactive;
+    exportStatusChange({
+      threadId: ticket.threadId,
+      category: ticket.categoryId ?? null,
+      statusTo: tag.label,
+      reopened,
+    });
+    // ticket.closed reflects the state BEFORE this change, so a done→done
+    // transition (Resolved → Closed) exports only one close.
+    if (isDone && !ticket.closed) {
+      exportTicketClosed({
+        threadId: ticket.threadId,
+        category: ticket.categoryId ?? null,
+        resolutionSeconds: ticket.createdAt ? (Date.now() - ticket.createdAt.getTime()) / 1000 : null,
+      });
+    }
+    // Re-score on re-close: a reopened ticket's score is stale — drop it so the
+    // next scoring batch after the eventual re-close evaluates the full story.
+    if (reopened && this.scoreStore) {
+      safe(this.scoreStore.resetForRescore(ticket.threadId), "score-rescore", {
+        "ticket.thread_id": ticket.threadId,
+      });
     }
 
     // Per-ticket history backing /status history — recorded for silent changes too,

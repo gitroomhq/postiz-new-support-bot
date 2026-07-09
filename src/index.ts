@@ -34,6 +34,13 @@ import { IntercomInboxScheduler } from "./intercom/IntercomInboxScheduler";
 import { IntercomInboxApp } from "./intercom/IntercomInboxApp";
 import { initSentry, shutdownSentry, captureFatal, log } from "./util/logger";
 import { setAiRecordContent, withTickSpan } from "./util/instrument";
+import { initInflux, shutdownInflux } from "./metrics/InfluxWriter";
+import { SnapshotScheduler } from "./metrics/SnapshotScheduler";
+import { AiRunStore } from "./bot/AiRunStore";
+import { LightAiRunner } from "./bot/LightAiRunner";
+import { TicketScoreStore } from "./scoring/TicketScoreStore";
+import { TicketScoringService } from "./scoring/TicketScoringService";
+import { ScoringScheduler } from "./scoring/ScoringScheduler";
 
 const bootLog = log.child("bootstrap");
 
@@ -60,6 +67,9 @@ async function main() {
   // hooks before any module loaded. Everything before this logs to stdout.
   initSentry(settingsStore.sentryConfig());
   setAiRecordContent(settingsStore.sentryAiRecordContent());
+  // InfluxDB export follows the same DB-configured pattern; inert until the
+  // /config → Analytics connection is complete and enabled.
+  initInflux(settingsStore.influxConfig());
   // Warn (or throw under SCHEMA_DRIFT_STRICT) if ensureSchema fell out of sync
   // with schema.prisma. Placed after initSentry so the warning reaches Sentry.
   // Strict (dev/CI, via an env var prod can't set) fails loudly; otherwise it
@@ -83,7 +93,9 @@ async function main() {
   const intercomStore = new IntercomStore(prisma);
   const intercomClient = new IntercomClient(settingsStore);
   const intercomSync = new IntercomSyncService(settingsStore, intercomStore, sessionStore, ticketStore);
-  const statusService = new StatusService(ticketStore, auditLogger, settingsStore, intercomSync);
+  const aiRunStore = new AiRunStore(prisma);
+  const scoreStore = new TicketScoreStore(prisma);
+  const statusService = new StatusService(ticketStore, auditLogger, settingsStore, intercomSync, scoreStore);
   const intercomWebhookHandler = new IntercomWebhookHandler(
     settingsStore,
     ticketStore,
@@ -93,7 +105,9 @@ async function main() {
     auditLogger
   );
   const oauthManager = new OAuthManager(config, sessionStore);
-  const claudeRunner = new ClaudeCodeRunner(process.cwd());
+  const claudeRunner = new ClaudeCodeRunner(process.cwd(), aiRunStore);
+  const lightAiRunner = new LightAiRunner(aiRunStore);
+  const scoringService = new TicketScoringService(settingsStore, scoreStore, aiRunStore);
   const kbScheduler = new KnowledgeBaseScheduler(settingsStore, process.cwd());
   const githubClient = new GitHubClient(config);
   const stripeClient = new StripeClient(config);
@@ -122,7 +136,7 @@ async function main() {
     categoryLabelResolver
   );
 
-  const reportService = new StatusReportService(settingsStore, ticketStore, categoryRegistry);
+  const reportService = new StatusReportService(settingsStore, ticketStore, categoryRegistry, scoreStore);
 
   const bot = new DiscordBot(
     config,
@@ -145,13 +159,15 @@ async function main() {
     billingAdmin,
     kbScheduler,
     stripeWebhookHandler,
-    intercomInboxApp
+    intercomInboxApp,
+    { prisma, lightAiRunner, scoringService, scoreStore }
   );
   // The client exists as soon as the constructor ran; nothing fires before login.
   auditLogger.bindClient(bot.client);
   intercomWebhookHandler.bindClient(bot.client);
   intercomInboxApp.bindClient(bot.client);
   stripeWebhookHandler.bindClient(bot.client);
+  scoringService.bindClient(bot.client);
   // Thread URLs need the guild id, only known once the client is ready —
   // resolved lazily per call.
   intercomSync.setThreadUrlBuilder((threadId) => {
@@ -189,6 +205,15 @@ async function main() {
   const intercomInboxScheduler = new IntercomInboxScheduler(intercomStore, intercomWebhookHandler, auditLogger);
   intercomInboxScheduler.start();
 
+  // Batch AI scoring of closed tickets (polls in-flight batches every tick,
+  // resumes across restarts via the persisted batch ids).
+  const scoringScheduler = new ScoringScheduler(settingsStore, scoringService);
+  scoringScheduler.start();
+
+  // Periodic Influx gauge snapshots (open tickets, queues, bot_health).
+  const snapshotScheduler = new SnapshotScheduler(prisma, settingsStore, ticketStore, intercomStore);
+  snapshotScheduler.start();
+
   // Clean expired pending auths + old Stripe webhook dedup rows every 5 minutes.
   setInterval(() => {
     withTickSpan("clean-pending-auths", () => sessionStore.cleanExpiredPending()).catch((e) =>
@@ -208,7 +233,11 @@ async function main() {
     kbScheduler.stop();
     intercomOutboxScheduler.stop();
     intercomInboxScheduler.stop();
+    scoringScheduler.stop();
+    snapshotScheduler.stop();
     bot.client.destroy();
+    // Flush the buffered Influx points before the DB/Sentry teardown.
+    await shutdownInflux(2000);
     await prisma.$disconnect();
     // Flush buffered events/spans/logs before the process dies.
     await shutdownSentry(2000);

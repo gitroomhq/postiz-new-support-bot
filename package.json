@@ -16,6 +16,8 @@
   "license": "ISC",
   "dependencies": {
     "@anthropic-ai/claude-code": "^2.1.81",
+    "@anthropic-ai/sdk": "^0.110.0",
+    "@influxdata/influxdb-client": "^1.35.0",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@prisma/adapter-pg": "^7.5.0",
     "@prisma/client": "^7.5.0",
