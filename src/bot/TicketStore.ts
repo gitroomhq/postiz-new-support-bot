@@ -378,13 +378,27 @@ export class TicketStore {
     return { counts, rated, prompted, average: rated > 0 ? sum / rated : null };
   }
 
-  // Most recent rating comments for the Feedback drill-down.
-  async recentCsatComments(limit: number): Promise<{ csatScore: number | null; csatComment: string | null; csatRatedAt: Date | null }[]> {
+  // Most recent CSAT feedback (rated tickets, with or without a comment), newest first,
+  // for the paginated Feedback drill-down. Selects the thread + context so each row can
+  // deep-link to its ticket. The WHERE mirrors csatStats() so their totals stay in sync —
+  // change both together if the predicate ever moves.
+  async recentCsatFeedback(
+    limit: number,
+    offset: number
+  ): Promise<Pick<Ticket, "threadId" | "question" | "customerDisplayName" | "csatScore" | "csatComment" | "csatRatedAt">[]> {
     return this.prisma.ticket.findMany({
-      where: { csatComment: { not: null } },
+      where: { csatScore: { not: null } },
       orderBy: { csatRatedAt: "desc" },
+      skip: offset,
       take: limit,
-      select: { csatScore: true, csatComment: true, csatRatedAt: true },
+      select: {
+        threadId: true,
+        question: true,
+        customerDisplayName: true,
+        csatScore: true,
+        csatComment: true,
+        csatRatedAt: true,
+      },
     });
   }
 

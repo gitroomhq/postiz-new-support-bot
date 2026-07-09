@@ -963,14 +963,34 @@ export class DiscordBot {
     const member = await this.requireSupportOrAdmin(interaction);
     if (!member) return;
 
+    // Feedback is paginated: the ephemeral pager encodes the page in the customId
+    // (report_feedback:<n>) and edits its own message in place; the initial bare
+    // report_feedback click on the public report opens a fresh ephemeral reply.
+    if (interaction.customId.startsWith("report_feedback")) {
+      const parts = interaction.customId.split(":");
+      const isPageNav = parts.length > 1;
+      const page = isPageNav ? Math.max(0, Number.parseInt(parts[1] ?? "0", 10) || 0) : 0;
+      if (isPageNav) await interaction.deferUpdate();
+      else await interaction.deferReply({ flags: 64 });
+      try {
+        const { embed, components } = await this.reportService.buildFeedbackEmbed(page);
+        await interaction.editReply({ embeds: [embed], components });
+      } catch (error) {
+        this.discordLog.error("report drill-down failed", error, { "discord.custom_id": interaction.customId });
+        await interaction.editReply({
+          embeds: [makeEmbed("Couldn't load that breakdown.", COLORS.danger)],
+          components: [],
+        });
+      }
+      return;
+    }
+
     await interaction.deferReply({ flags: 64 });
     try {
       const embed =
         interaction.customId === "report_overdue"
           ? await this.reportService.buildOverdueEmbed()
-          : interaction.customId === "report_feedback"
-            ? await this.reportService.buildFeedbackEmbed()
-            : await this.reportService.buildAgeBreakdownEmbed();
+          : await this.reportService.buildAgeBreakdownEmbed();
       await interaction.editReply({ embeds: [embed] });
     } catch (error) {
       this.discordLog.error("report drill-down failed", error, { "discord.custom_id": interaction.customId });
@@ -1237,7 +1257,7 @@ export class DiscordBot {
     if (
       interaction.customId === "report_overdue" ||
       interaction.customId === "report_age" ||
-      interaction.customId === "report_feedback"
+      interaction.customId.startsWith("report_feedback")
     ) {
       await this.handleReportDrilldown(interaction);
       return;

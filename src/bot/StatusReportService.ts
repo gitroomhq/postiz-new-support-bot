@@ -7,6 +7,10 @@ import { COLORS } from "../util/embeds";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
+// Ratings shown per page in the Feedback drill-down. Kept small so the compact list
+// (one line + optional comment blockquote per item) stays within the 1024-char embed field cap.
+const FEEDBACK_PAGE_SIZE = 5;
+
 export interface BuildReportOptions {
   // Window start for the opened/closed activity counts. null → trailing 24h (manual checks).
   since: Date | null;
@@ -165,12 +169,16 @@ export class StatusReportService {
   }
 
   // Ephemeral drill-down for the "Feedback" button: all-time 1-5 star distribution
-  // (same bar style as the age breakdown), average, response rate, recent comments.
-  async buildFeedbackEmbed(): Promise<EmbedBuilder> {
+  // (same bar style as the age breakdown), average, response rate, and a paginated compact
+  // list of every rating — each row deep-links to its ticket. Returns the Prev/Next pager
+  // alongside the embed; the handler edits the ephemeral message in place on page clicks.
+  async buildFeedbackEmbed(
+    page = 0
+  ): Promise<{ embed: EmbedBuilder; components: ActionRowBuilder<ButtonBuilder>[] }> {
     const stats = await this.ticketStore.csatStats();
 
     if (stats.rated === 0) {
-      return new EmbedBuilder()
+      const embed = new EmbedBuilder()
         .setTitle("💬 Customer Feedback")
         .setColor(COLORS.neutral)
         .setDescription(
@@ -178,6 +186,7 @@ export class StatusReportService {
             ? `No ratings yet — ${stats.prompted} customer(s) have been asked so far.`
             : "No ratings yet. Customers get a rating prompt when their ticket is completed."
         );
+      return { embed, components: [] };
     }
 
     const barWidth = 12;
@@ -194,6 +203,34 @@ export class StatusReportService {
 
     const responseRate = stats.prompted > 0 ? Math.round((stats.rated / stats.prompted) * 100) : 0;
 
+    // Paginated compact list of every rating, newest first, each linking to its ticket.
+    const totalPages = Math.max(1, Math.ceil(stats.rated / FEEDBACK_PAGE_SIZE));
+    const clampedPage = Math.min(Math.max(0, page), totalPages - 1); // tolerate stale buttons
+    const items = await this.ticketStore.recentCsatFeedback(
+      FEEDBACK_PAGE_SIZE,
+      clampedPage * FEEDBACK_PAGE_SIZE
+    );
+
+    const clamp = (text: string, max: number): string => {
+      const t = text.replace(/\s+/g, " ").trim();
+      return t.length > max ? `${t.slice(0, max - 1).trimEnd()}…` : t;
+    };
+
+    const recent = items
+      .map((fb) => {
+        const score = Math.min(5, Math.max(1, fb.csatScore ?? 1));
+        const when = fb.csatRatedAt ? ` · <t:${Math.floor(fb.csatRatedAt.getTime() / 1000)}:R>` : "";
+        const header = `${"⭐".repeat(score)} <#${fb.threadId}>${when}`;
+        // Comment when present; otherwise the question in italic as context for what was rated.
+        const body = fb.csatComment
+          ? `\n> ${clamp(fb.csatComment, 150)}`
+          : fb.question
+            ? `\n> _${clamp(fb.question, 150)}_`
+            : "";
+        return `${header}${body}`;
+      })
+      .join("\n\n");
+
     const embed = new EmbedBuilder()
       .setTitle(`💬 Customer Feedback — ${stats.rated} rating${stats.rated === 1 ? "" : "s"} (all-time)`)
       .setColor(COLORS.brand)
@@ -203,21 +240,36 @@ export class StatusReportService {
           name: "Summary",
           value: `Average ⭐ **${stats.average!.toFixed(2)}**/5 · response rate **${responseRate}%** (${stats.rated}/${stats.prompted} asked)`,
           inline: false,
+        },
+        {
+          name: "Recent feedback",
+          value: (recent || "_No feedback on this page._").slice(0, 1024),
+          inline: false,
         }
       )
-      .setFooter({ text: this.formatTimestamp(new Date()) });
-
-    const comments = await this.ticketStore.recentCsatComments(3);
-    if (comments.length > 0) {
-      const lines = comments.map((c) => {
-        const text = (c.csatComment ?? "").replace(/\s+/g, " ").slice(0, 150);
-        const when = c.csatRatedAt ? ` — <t:${Math.floor(c.csatRatedAt.getTime() / 1000)}:R>` : "";
-        return `${c.csatScore ?? "?"} ⭐${when}\n> ${text}`;
+      .setFooter({
+        text: `Page ${clampedPage + 1}/${totalPages} · ${stats.rated} rating${stats.rated === 1 ? "" : "s"}`,
       });
-      embed.addFields({ name: "Recent comments", value: lines.join("\n").slice(0, 1024), inline: false });
-    }
 
-    return embed;
+    const components = totalPages > 1 ? [this.buildFeedbackPager(clampedPage, totalPages)] : [];
+    return { embed, components };
+  }
+
+  // Prev/Next row for the paginated Feedback drill-down. The page is encoded in the customId
+  // (report_feedback:<page>) so the handler stays stateless and recomputes live on each click.
+  private buildFeedbackPager(page: number, totalPages: number): ActionRowBuilder<ButtonBuilder> {
+    return new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`report_feedback:${page - 1}`)
+        .setLabel("◀ Prev")
+        .setStyle(ButtonStyle.Secondary)
+        .setDisabled(page <= 0),
+      new ButtonBuilder()
+        .setCustomId(`report_feedback:${page + 1}`)
+        .setLabel("Next ▶")
+        .setStyle(ButtonStyle.Secondary)
+        .setDisabled(page >= totalPages - 1)
+    );
   }
 
   // One list row for a ticket: current status, a clickable thread link, and relative age.
