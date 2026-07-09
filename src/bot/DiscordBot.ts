@@ -548,6 +548,8 @@ export class DiscordBot {
       await this.handleSearchTicketsCommand(interaction);
     } else if (interaction.commandName === "note") {
       await this.handleNoteCommand(interaction);
+    } else if (interaction.commandName === "reminders") {
+      await this.handleRemindersCommand(interaction);
     } else if (interaction.commandName === "escalate") {
       await this.handleEscalateCommand(interaction);
     } else if (interaction.commandName === "canned") {
@@ -632,6 +634,69 @@ export class DiscordBot {
       .setColor(COLORS.brand)
       .setDescription(lines.join("\n\n").slice(0, 4096));
     await interaction.reply({ embeds: [embed], flags: 64 });
+  }
+
+  // ---- /reminders: per-ticket pause of automatic reminders, auto-close and re-close ----
+  // The pause is temporary by design: any status change clears it (TicketStore.setStatus).
+
+  private async handleRemindersCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+    const member = await this.requireSupportOrAdmin(interaction);
+    if (!member) return;
+
+    const channel = interaction.channel ?? (await this.client.channels.fetch(interaction.channelId).catch(() => null));
+    if (!channel?.isThread()) {
+      await interaction.reply({ embeds: [makeEmbed("Use this inside a ticket thread.", COLORS.warn)], flags: 64 });
+      return;
+    }
+    const thread = channel as ThreadChannel;
+
+    let ticket = await this.ticketStore.getByThreadId(thread.id);
+    if (!ticket) {
+      ticket = await this.adoptThread(thread);
+      if (!ticket) {
+        await interaction.reply({ embeds: [makeEmbed("This thread isn't a tracked support ticket.", COLORS.warn)], flags: 64 });
+        return;
+      }
+    }
+
+    const paused = interaction.options.getSubcommand() === "off";
+    if (ticket.remindersPaused === paused) {
+      await interaction.reply({
+        embeds: [
+          makeEmbed(
+            paused
+              ? "Reminders and auto-close are already paused for this ticket."
+              : "Reminders and auto-close are already active for this ticket.",
+            COLORS.neutral
+          ),
+        ],
+        flags: 64,
+      });
+      return;
+    }
+
+    await this.ticketStore.setRemindersPaused(thread.id, paused);
+    void this.audit.log({
+      title: paused ? "🔕 Reminders paused" : "🔔 Reminders resumed",
+      severity: paused ? "warn" : "success",
+      actor: member.displayName,
+      actorIconUrl: member.displayAvatarURL(),
+      threadId: thread.id,
+      ...(paused
+        ? { fields: [{ name: "Resumes", value: "On the next status change or `/reminders on`", inline: true }] }
+        : {}),
+    });
+    await interaction.reply({
+      embeds: [
+        makeEmbed(
+          paused
+            ? "Reminders, auto-close and re-close are paused for this ticket. They resume automatically when the status changes (or via `/reminders on`)."
+            : "Reminders, auto-close and re-close are active again for this ticket.",
+          COLORS.success
+        ),
+      ],
+      flags: 64,
+    });
   }
 
   // ---- /escalate: move a ticket up/down the escalation-tier ladder ----
@@ -5999,6 +6064,22 @@ export class DiscordBot {
             type: 1, // SUB_COMMAND
             name: "list",
             description: "List the staff notes on this ticket",
+          },
+        ],
+      },
+      {
+        name: "reminders",
+        description: "Pause/resume automatic reminders & auto-close for this ticket (support/admin only)",
+        options: [
+          {
+            type: 1, // SUB_COMMAND
+            name: "off",
+            description: "Pause reminders & auto-close until the ticket's status changes",
+          },
+          {
+            type: 1, // SUB_COMMAND
+            name: "on",
+            description: "Resume reminders & auto-close for this ticket",
           },
         ],
       },

@@ -200,6 +200,9 @@ model Ticket {
   lastStatusChangeAt  DateTime   @default(now())
   lastReminderAt      DateTime?
   reminderCount       Int        @default(0)
+  // Set by /reminders off: suppresses reminders, auto-close and re-close for this
+  // ticket. Cleared automatically on every status change.
+  remindersPaused     Boolean    @default(false)
   closed              Boolean    @default(false)
   closedAt            DateTime?
   // When set, the re-close scheduler locks/archives the thread again at this time.

@@ -377,6 +377,9 @@ const STATEMENTS: string[] = [
     CONSTRAINT "stripe_webhook_events_pkey" PRIMARY KEY ("id")
   )`,
   `CREATE INDEX IF NOT EXISTS "stripe_webhook_events_createdAt_idx" ON "stripe_webhook_events"("createdAt")`,
+  // Per-ticket /reminders off pause (reminders, auto-close, re-close); cleared on
+  // every status change.
+  `ALTER TABLE "tickets" ADD COLUMN IF NOT EXISTS "remindersPaused" BOOLEAN NOT NULL DEFAULT false`,
 ];
 
 export async function ensureSchema(prisma: PrismaClient): Promise<void> {

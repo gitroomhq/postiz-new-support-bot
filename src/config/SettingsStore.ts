@@ -802,6 +802,7 @@ export class SettingsStore {
           lastStatusChangeAt: new Date(),
           lastReminderAt: null,
           reminderCount: 0,
+          remindersPaused: false,
           closed: false,
           closedAt: null,
         },

@@ -106,6 +106,8 @@ export class TicketStore {
         lastStatusChangeAt: new Date(),
         lastReminderAt: null,
         reminderCount: 0,
+        // A /reminders off pause only lasts until the next status change.
+        remindersPaused: false,
         closed: isDone,
         closedAt: isDone ? new Date() : null,
         // Any real status change supersedes a pending re-close: reopening cancels it,
@@ -128,9 +130,10 @@ export class TicketStore {
 
   // Closed tickets whose quiet period has elapsed. Guarded on closed + closesThread so a
   // ticket that was properly reopened (or whose tag changed) never re-locks by accident.
+  // A ticket paused via /reminders off never re-locks until its status changes.
   async listRecloseDue(now: Date): Promise<TicketWithTag[]> {
     return this.prisma.ticket.findMany({
-      where: { recloseAt: { lte: now }, closed: true, statusTag: { closesThread: true } },
+      where: { recloseAt: { lte: now }, closed: true, remindersPaused: false, statusTag: { closesThread: true } },
       include: { statusTag: true },
     });
   }
@@ -144,6 +147,12 @@ export class TicketStore {
   // closed state, or the re-close timer.
   async setPriority(threadId: string, priorityTagId: string): Promise<void> {
     await this.prisma.ticket.update({ where: { threadId }, data: { priorityTagId } });
+  }
+
+  // /reminders on|off. The pause suppresses reminders, auto-close and re-close for
+  // this ticket; setStatus() clears it on the next status change.
+  async setRemindersPaused(threadId: string, paused: boolean): Promise<void> {
+    await this.prisma.ticket.update({ where: { threadId }, data: { remindersPaused: paused } });
   }
 
   async recordReminder(threadId: string): Promise<void> {
@@ -160,7 +169,11 @@ export class TicketStore {
   }
 
   async close(threadId: string): Promise<void> {
-    await this.prisma.ticket.update({ where: { threadId }, data: { closed: true, closedAt: new Date() } });
+    // Closing is a status transition, so it also ends a /reminders off pause.
+    await this.prisma.ticket.update({
+      where: { threadId },
+      data: { closed: true, closedAt: new Date(), remindersPaused: false },
+    });
   }
 
   // A customer's still-open tickets (used to close them out when the member leaves).
@@ -171,20 +184,22 @@ export class TicketStore {
     });
   }
 
-  // Open tickets whose current status has reminders enabled.
+  // Open tickets whose current status has reminders enabled and that aren't
+  // paused via /reminders off.
   async listRemindable(): Promise<TicketWithTag[]> {
     return this.prisma.ticket.findMany({
-      where: { closed: false, statusTag: { reminderEnabled: true } },
+      where: { closed: false, remindersPaused: false, statusTag: { reminderEnabled: true } },
       include: { statusTag: true },
     });
   }
 
   // Tickets currently sitting in a given status tag. Used to auto-close Resolved
   // tickets after a quiet period (Resolved tickets carry closed=true, so we key off
-  // the status tag rather than the closed flag).
+  // the status tag rather than the closed flag). Tickets paused via /reminders off
+  // are excluded so they never auto-close.
   async listInStatus(statusTagId: string): Promise<TicketWithTag[]> {
     return this.prisma.ticket.findMany({
-      where: { statusTagId },
+      where: { statusTagId, remindersPaused: false },
       include: { statusTag: true },
     });
   }

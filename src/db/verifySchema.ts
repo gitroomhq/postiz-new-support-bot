@@ -40,7 +40,7 @@ const EXPECTED_COLUMNS: Record<string, string[]> = {
   priority_tags: ["id", "emoji", "label", "isInitial", "sortOrder"],
   tickets: [
     "id", "threadId", "channelId", "customerId", "customerDisplayName", "categoryId", "statusTagId", "prevStatusTagId",
-    "priorityTagId", "escalationTierId", "lastStatusChangeAt", "lastReminderAt", "reminderCount", "closed", "closedAt",
+    "priorityTagId", "escalationTierId", "lastStatusChangeAt", "lastReminderAt", "reminderCount", "remindersPaused", "closed", "closedAt",
     "recloseAt", "question", "aiAnswer", "firstResponseAt", "csatScore", "csatComment", "csatPromptedAt", "csatRatedAt",
     "createdAt",
   ],
