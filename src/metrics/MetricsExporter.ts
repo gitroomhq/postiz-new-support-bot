@@ -225,6 +225,13 @@ export function exportBotHealth(): void {
   writePoint("bot_health", {}, { up: 1 });
 }
 
+// Vault reachability gauge, written by the VaultService probe loop on every
+// tick plus immediately on up/down transitions (numbers become floats in
+// writePoint, keeping the bucket's fields float-typed).
+export function exportVaultHealth(up: boolean): void {
+  writePoint("vault_health", {}, { up: up ? 1 : 0 });
+}
+
 // One-time export of all historical tickets from Postgres, emitting points at
 // their HISTORICAL timestamps (createdAt/closedAt/firstResponseAt/csatRatedAt)
 // plus the status-change history from ticket_tag_changes. Triggered from

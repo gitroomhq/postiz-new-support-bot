@@ -1,30 +1,95 @@
 import { PrismaClient } from "../generated/prisma/client";
-import { decryptSecret, encryptSecret } from "../util/crypto";
+import { decryptSecret, encryptSecret, isTransitCiphertext } from "../util/crypto";
+import type { VaultService } from "../vault/VaultService";
 
 export class SessionStore {
+  // Plaintext token cache: keeps /ai working on cache hits through Vault
+  // outages (memory-only by design — lost on restart) and spares a Transit
+  // round-trip per run. Insertion-ordered Map → evict-oldest at the cap.
+  private static readonly TOKEN_CACHE_TTL_MS = 15 * 60_000;
+  private static readonly TOKEN_CACHE_MAX = 1000;
+  private tokenCache = new Map<string, { token: string; at: number }>();
+  private vault: VaultService | null = null;
+
   constructor(private prisma: PrismaClient) {}
 
-  // Access tokens are encrypted at rest. Every row leaving the store is decrypted
-  // here so callers keep seeing plaintext; legacy plaintext rows pass through
-  // unchanged (and get re-encrypted on the next setSession).
-  private decryptRow<T extends { accessToken: string }>(row: T): T {
-    return { ...row, accessToken: decryptSecret(row.accessToken) ?? "" };
+  // Late-bound: SessionStore is constructed before the VaultService (same
+  // idiom as SettingsStore.bindVault). Unbound = local-encryption behavior.
+  bindVault(vault: VaultService): void {
+    this.vault = vault;
+  }
+
+  // Rows leaving the store carry a REDACTED accessToken ("") — no row consumer
+  // uses it (they read postizUserId/stripeCustomerId), and running a Transit
+  // ciphertext through decryptSecret's legacy-plaintext passthrough would hand
+  // ciphertext out as if it were the token. The one plaintext consumer (/ai's
+  // Postiz pre-fetch) calls getAccessToken() instead.
+  private redactRow<T extends { accessToken: string }>(row: T): T {
+    return { ...row, accessToken: "" };
+  }
+
+  private cacheToken(discordUserId: string, token: string): void {
+    this.tokenCache.delete(discordUserId);
+    this.tokenCache.set(discordUserId, { token, at: Date.now() });
+    if (this.tokenCache.size > SessionStore.TOKEN_CACHE_MAX) {
+      const oldest = this.tokenCache.keys().next().value;
+      if (oldest !== undefined) this.tokenCache.delete(oldest);
+    }
+  }
+
+  // No arg = drop everything (used by the migrator after batch re-encryption).
+  invalidateTokenCache(discordUserId?: string): void {
+    if (discordUserId) this.tokenCache.delete(discordUserId);
+    else this.tokenCache.clear();
+  }
+
+  // On-demand plaintext token. Envelope discrimination: vault:v<N>: → Transit
+  // decrypt (null while Vault is down), enc:v1: → local decrypt, anything else
+  // → legacy plaintext passthrough. On a failed decrypt the stale cache entry
+  // is served instead — the row still exists, so it's the same token, and /ai
+  // keeps working through an outage for recently-active users.
+  async getAccessToken(discordUserId: string): Promise<string | null> {
+    const cached = this.tokenCache.get(discordUserId);
+    if (cached && Date.now() - cached.at < SessionStore.TOKEN_CACHE_TTL_MS) return cached.token;
+    const row = await this.prisma.userSession.findUnique({
+      where: { discordUserId },
+      select: { accessToken: true },
+    });
+    if (!row?.accessToken) {
+      this.tokenCache.delete(discordUserId);
+      return null;
+    }
+    const raw = row.accessToken;
+    const fresh = isTransitCiphertext(raw) ? ((await this.vault?.transitDecrypt(raw)) ?? null) : decryptSecret(raw);
+    if (fresh) {
+      this.cacheToken(discordUserId, fresh);
+      return fresh;
+    }
+    return cached?.token ?? null;
   }
 
   async setSession(discordUserId: string, accessToken: string, postizUserId?: string, stripeCustomerId?: string): Promise<void> {
-    const enc = encryptSecret(accessToken);
+    // Vault-first: Transit ciphertext when storage is active and Vault is up;
+    // local encryption otherwise — the OAuth callback must never fail because
+    // Vault is down (the upgrade job lifts fallback rows to Transit on
+    // recovery).
+    const vault = this.vault;
+    const enc =
+      (vault?.storageActive() && vault.state() === "up" ? await vault.transitEncrypt(accessToken) : null) ??
+      encryptSecret(accessToken);
     await this.prisma.userSession.upsert({
       where: { discordUserId },
       update: { accessToken: enc, postizUserId, stripeCustomerId, authenticatedAt: new Date() },
       create: { discordUserId, accessToken: enc, postizUserId, stripeCustomerId },
     });
+    this.cacheToken(discordUserId, accessToken);
   }
 
   async getSession(discordUserId: string) {
     const row = await this.prisma.userSession.findUnique({
       where: { discordUserId },
     });
-    return row ? this.decryptRow(row) : row;
+    return row ? this.redactRow(row) : row;
   }
 
   // Reverse lookups for /search-tickets. postizUserId/stripeCustomerId are not @unique,
@@ -71,13 +136,24 @@ export class SessionStore {
     const rows = await this.prisma.userSession.findMany({
       where: { discordUserId: { in: discordUserIds } },
     });
-    return rows.map((r) => this.decryptRow(r));
+    return rows.map((r) => this.redactRow(r));
   }
 
   async removeSession(discordUserId: string): Promise<void> {
     await this.prisma.userSession.deleteMany({
       where: { discordUserId },
     });
+    this.invalidateTokenCache(discordUserId);
+  }
+
+  // Envelope census for the /config Vault panel and migration reports.
+  async countTokensByEnvelope(): Promise<{ transit: number; local: number; legacy: number }> {
+    const [transit, local, total] = await Promise.all([
+      this.prisma.userSession.count({ where: { accessToken: { startsWith: "vault:" } } }),
+      this.prisma.userSession.count({ where: { accessToken: { startsWith: "enc:" } } }),
+      this.prisma.userSession.count(),
+    ]);
+    return { transit, local, legacy: total - transit - local };
   }
 
   async isAuthenticated(discordUserId: string): Promise<boolean> {

@@ -468,6 +468,17 @@ const STATEMENTS: string[] = [
   )`,
   `CREATE UNIQUE INDEX IF NOT EXISTS "scoring_batches_anthropicBatchId_key" ON "scoring_batches"("anthropicBatchId")`,
   `CREATE INDEX IF NOT EXISTS "scoring_batches_status_idx" ON "scoring_batches"("status")`,
+  // HashiCorp Vault connection (paired with /config → Vault). vaultToken is
+  // encrypted with the LOCAL crypto.ts key — the bootstrap credential Vault
+  // itself can't wrap. vaultMigratedAt = storage cutover (null = Postgres).
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "vaultEnabled" BOOLEAN NOT NULL DEFAULT false`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "vaultAddr" TEXT`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "vaultToken" TEXT`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "vaultKvMount" TEXT NOT NULL DEFAULT 'kv'`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "vaultKvBasePath" TEXT NOT NULL DEFAULT 'support-bot'`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "vaultTransitMount" TEXT NOT NULL DEFAULT 'transit'`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "vaultTransitKey" TEXT NOT NULL DEFAULT 'support-bot'`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "vaultMigratedAt" TIMESTAMP(3)`,
 ];
 
 export async function ensureSchema(prisma: PrismaClient): Promise<void> {

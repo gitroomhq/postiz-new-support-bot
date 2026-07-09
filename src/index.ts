@@ -33,8 +33,10 @@ import { IntercomWebhookHandler } from "./intercom/IntercomWebhookHandler";
 import { IntercomInboxScheduler } from "./intercom/IntercomInboxScheduler";
 import { IntercomInboxApp } from "./intercom/IntercomInboxApp";
 import { initSentry, shutdownSentry, captureFatal, log } from "./util/logger";
-import { setAiRecordContent, withTickSpan } from "./util/instrument";
-import { initInflux, shutdownInflux } from "./metrics/InfluxWriter";
+import { safe, setAiRecordContent, withTickSpan } from "./util/instrument";
+import { initInflux, reconfigureInflux, shutdownInflux } from "./metrics/InfluxWriter";
+import { VaultService } from "./vault/VaultService";
+import { VaultMigrator } from "./vault/VaultMigrator";
 import { SnapshotScheduler } from "./metrics/SnapshotScheduler";
 import { AiRunStore } from "./bot/AiRunStore";
 import { LightAiRunner } from "./bot/LightAiRunner";
@@ -67,6 +69,27 @@ async function main() {
   // hooks before any module loaded. Everything before this logs to stdout.
   initSentry(settingsStore.sentryConfig());
   setAiRecordContent(settingsStore.sentryAiRecordContent());
+  // Vault comes up between Sentry (whose DSN is deliberately plaintext in the
+  // DB, so error reporting never depends on Vault) and Influx (whose token may
+  // live in Vault KV). init() is a bounded warm-up: a down Vault delays boot
+  // by ≤5s and the bot starts degraded; the probe loop recovers it later.
+  // AuditLogger moves up here because VaultService posts transition embeds
+  // through it (it no-ops until the Discord client is bound below).
+  const auditLogger = new AuditLogger(settingsStore);
+  const vaultService = new VaultService(settingsStore, auditLogger);
+  settingsStore.bindVault(vaultService);
+  sessionStore.bindVault(vaultService);
+  await vaultService.init();
+  const vaultMigrator = new VaultMigrator(prisma, settingsStore, sessionStore, vaultService);
+  // On recovery: lift outage-fallback enc:v1 rows into Vault, then rebuild the
+  // Influx exporter (its token resolves again once the KV cache is warm).
+  vaultService.onRecovered(async () => {
+    await vaultMigrator.runUpgradeJob();
+  });
+  vaultService.onRecovered(() => reconfigureInflux(settingsStore.influxConfig()));
+  vaultService.start();
+  // Lift stragglers from a previous run (no-op when everything is clean).
+  safe(vaultMigrator.runUpgradeJob(), "vault:upgrade");
   // InfluxDB export follows the same DB-configured pattern; inert until the
   // /config → Analytics connection is complete and enabled.
   initInflux(settingsStore.influxConfig());
@@ -89,7 +112,6 @@ async function main() {
     bootLog.info("seeded escalation tier 1 from legacy support role");
   }
   const ticketStore = new TicketStore(prisma);
-  const auditLogger = new AuditLogger(settingsStore);
   const intercomStore = new IntercomStore(prisma);
   const intercomClient = new IntercomClient(settingsStore);
   const intercomSync = new IntercomSyncService(settingsStore, intercomStore, sessionStore, ticketStore);
@@ -160,7 +182,8 @@ async function main() {
     kbScheduler,
     stripeWebhookHandler,
     intercomInboxApp,
-    { prisma, lightAiRunner, scoringService, scoreStore }
+    { prisma, lightAiRunner, scoringService, scoreStore },
+    { service: vaultService, migrator: vaultMigrator }
   );
   // The client exists as soon as the constructor ran; nothing fires before login.
   auditLogger.bindClient(bot.client);
@@ -235,6 +258,7 @@ async function main() {
     intercomInboxScheduler.stop();
     scoringScheduler.stop();
     snapshotScheduler.stop();
+    vaultService.stop();
     bot.client.destroy();
     // Flush the buffered Influx points before the DB/Sentry teardown.
     await shutdownInflux(2000);

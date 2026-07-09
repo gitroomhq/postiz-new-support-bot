@@ -161,6 +161,20 @@ model BotSettings {
   // One-time historical backfill flag: while true the scheduler keeps submitting
   // oldest-first batches (one in flight) until no unscored closed tickets remain.
   scoringBackfillPending    Boolean   @default(false)
+  // HashiCorp Vault connection (edited via /config → Vault; no .env on deploy).
+  // vaultToken is encrypted at rest with the LOCAL crypto.ts key — it is the
+  // bootstrap credential, Vault can't wrap its own token. vaultMigratedAt is the
+  // storage cutover: null = secrets live in Postgres columns; set = the global
+  // secrets live in Vault KV (columns hold the vault:kv sentinel) and user
+  // tokens are Transit-encrypted.
+  vaultEnabled        Boolean   @default(false)
+  vaultAddr           String?
+  vaultToken          String?
+  vaultKvMount        String    @default("kv")
+  vaultKvBasePath     String    @default("support-bot")
+  vaultTransitMount   String    @default("transit")
+  vaultTransitKey     String    @default("support-bot")
+  vaultMigratedAt     DateTime?
   updatedAt           DateTime  @updatedAt
 
   @@map("bot_settings")

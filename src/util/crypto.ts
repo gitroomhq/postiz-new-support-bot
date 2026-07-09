@@ -60,11 +60,31 @@ export function encryptSecret(plaintext: string): string {
   return `${PREFIX}${iv.toString("base64")}:${tag.toString("base64")}:${ct.toString("base64")}`;
 }
 
+// ---- Vault envelope discrimination ----
+// Secret columns can hold three shapes now: `enc:v1:…` (local AES-GCM above), a
+// Vault Transit ciphertext (`vault:v<N>:…`, stored verbatim — N bumps when the
+// Transit key rotates, so the regex must not pin v1), or the KV sentinel below
+// meaning "the value lives in Vault KV, not in this column". decryptSecret keeps
+// its legacy-plaintext passthrough, so callers on Vault-capable columns MUST
+// check these prefixes first — otherwise a sentinel or Transit ciphertext would
+// be handed out as the secret itself.
+
+export const VAULT_KV_SENTINEL = "vault:kv";
+
+export function isVaultKvSentinel(value: string): boolean {
+  return value === VAULT_KV_SENTINEL;
+}
+
+export function isTransitCiphertext(value: string): boolean {
+  return /^vault:v\d+:/.test(value);
+}
+
 // Transparent decrypt. A non-`enc:` value is legacy plaintext and is returned
 // verbatim — this is the lazy migration: old rows keep working, and the next
 // write re-persists them encrypted. On any failure (tampering, or a rotated key
 // source) it logs and returns null so callers treat the secret as absent rather
-// than crashing.
+// than crashing. Vault-capable columns must check isVaultKvSentinel /
+// isTransitCiphertext BEFORE calling this (see the block above).
 export function decryptSecret(value: string): string | null {
   if (!isEncrypted(value)) return value;
   try {

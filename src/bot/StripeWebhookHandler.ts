@@ -57,7 +57,10 @@ export class StripeWebhookHandler {
     const url = `${base}/stripe/webhook`;
     const endpoints = await this.stripe.listWebhookEndpoints();
     const storedId = this.settings.stripeWebhookEndpointId();
-    const haveSecret = !!this.settings.stripeWebhookSecret();
+    // Raw-column check, NOT the resolved value: a secret held in Vault while
+    // Vault is unreachable must count as "have" — resolving to null here would
+    // recreate the endpoint (rotating the secret) on every boot of an outage.
+    const haveSecret = this.settings.stripeWebhookSecretConfigured();
 
     // A working, still-present endpoint whose secret we hold — keep it (just fix
     // the URL if the public base changed).

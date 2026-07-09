@@ -35,7 +35,7 @@ import {
 import { BotConfig } from "../config";
 import { embed as makeEmbed, COLORS } from "../util/embeds";
 import { formatDuration } from "../util/format";
-import { SettingsStore, isUnicodeEmoji, ReminderTarget } from "../config/SettingsStore";
+import { SettingsStore, isUnicodeEmoji, ReminderTarget, type GlobalSecretColumn, type SecretState } from "../config/SettingsStore";
 import { CannedResponseStore, normalizeName } from "../config/CannedResponseStore";
 import { EscalationTier, StatusTag, PriorityTag } from "../generated/prisma/client";
 import { applyTitleEmojis } from "../util/threadTitle";
@@ -106,6 +106,8 @@ import {
   exportCsat,
   backfillTicketHistory,
 } from "../metrics/MetricsExporter";
+import { VaultService, type VaultTestReport } from "../vault/VaultService";
+import { VaultMigrator, COLUMN_LABELS, type MigrateItemResult, type MigrateReport } from "../vault/VaultMigrator";
 
 type TicketSearchFilters = {
   categoryId?: string;
@@ -173,6 +175,11 @@ export class DiscordBot {
       lightAiRunner: LightAiRunner;
       scoringService: TicketScoringService;
       scoreStore: TicketScoreStore;
+    },
+    // Vault secret storage (drives /config → Vault: panel, test, migrations).
+    private vault?: {
+      service: VaultService;
+      migrator: VaultMigrator;
     }
   ) {
     this.client = new Client({
@@ -2487,8 +2494,12 @@ export class DiscordBot {
         // actually attached (admin invoker) — staff runs never mention it.
         stripeCustomerId: admin ? (session?.stripeCustomerId ?? null) : null,
         postizUserId: session?.postizUserId ?? null,
-        // Customer's own pos_ token scopes the pre-fetch to their org (all staff).
-        postizToken: session?.accessToken ?? null,
+        // Customer's own pos_ token scopes the pre-fetch to their org (all
+        // staff). On-demand decrypt: session rows carry a redacted token.
+        postizToken:
+          session && ticket.customerId
+            ? await this.sessionStore.getAccessToken(ticket.customerId).catch(() => null)
+            : null,
       });
       const contextBlock = buildTicketContextBlock(context);
 
@@ -3119,6 +3130,7 @@ export class DiscordBot {
             `InfluxDB: ${influxActive() ? `on → \`${s.influxBucket()}\`` : s.influxEnabled() ? "enabled ⚠️ incomplete config" : "off"} · Scoring: ${
               s.scoringEnabled() ? `every ${s.scoringIntervalHours()}h, \`${s.scoringModel()}\`` : "off"
             }`,
+            `Vault: ${this.vaultStatusLine()}`,
           ].join("\n"),
           inline: false,
         },
@@ -3143,6 +3155,7 @@ export class DiscordBot {
     const actions = [
       new ButtonBuilder().setCustomId("config_ai").setLabel("AI & Knowledge").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("config_analytics").setLabel("Analytics").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("config_vault").setLabel("Vault").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("config_reverify").setLabel("Re-Verify").setStyle(ButtonStyle.Secondary),
     ];
     if (!s.backfillDone()) {
@@ -3653,6 +3666,424 @@ export class DiscordBot {
     );
 
     return { embeds: [embed], components: [influxRow, scoringRow, backfillRow] };
+  }
+
+  // One-line Vault state for the main config panel's Integrations field.
+  private vaultStatusLine(): string {
+    const s = this.settingsStore;
+    const service = this.vault?.service;
+    if (!service || !s.vaultEnabled()) return "off";
+    switch (service.state()) {
+      case "denied":
+        return "on ⚠️ token rejected";
+      case "down":
+        return "on ⚠️ unreachable";
+      case "unconfigured":
+        return "enabled ⚠️ incomplete config";
+      default:
+        return s.vaultMigratedAt() ? "on → secrets in Vault" : "connected — not migrated";
+    }
+  }
+
+  // /config → Vault: connection, storage cutover state, per-secret placement,
+  // migrate/reverse actions. Async for the session-token envelope census.
+  private async buildVaultPanel() {
+    const s = this.settingsStore;
+    const service = this.vault?.service;
+    const mask = (value: string | null) => (value ? `••••${value.slice(-6)}` : "_not set_");
+
+    const stateLine = !service
+      ? "_unavailable in this deployment_"
+      : !s.vaultEnabled()
+        ? "**off**"
+        : service.state() === "up"
+          ? "**connected** ✅"
+          : service.state() === "denied"
+            ? "**token rejected (403)** ⚠️ — check the token/policy, probes keep retrying"
+            : service.state() === "down"
+              ? `**unreachable** ⚠️${service.downSince() ? ` since <t:${Math.floor(service.downSince()!.getTime() / 1000)}:R>` : ""} — serving cached secrets, retrying every 30s`
+              : "**enabled but incomplete** ⚠️ — set address + token";
+
+    const tokenLine = s.vaultTokenUnreadable()
+      ? "⚠️ stored token can't be decrypted (key source rotated) — re-enter it"
+      : mask(s.vaultToken());
+
+    const stateLabel: Record<SecretState, string> = {
+      none: "_not set_",
+      local: "local encryption",
+      "local-unreadable": "⚠️ local ciphertext unreadable — re-enter",
+      vault: "in Vault",
+      "vault-unreachable": "in Vault ⚠️ unreachable right now",
+    };
+    const secretLines = (Object.keys(COLUMN_LABELS) as GlobalSecretColumn[]).map(
+      (column) => `${COLUMN_LABELS[column]}: ${stateLabel[s.secretState(column)]}`
+    );
+
+    const tokens = await this.sessionStore.countTokensByEnvelope().catch(() => ({ transit: 0, local: 0, legacy: 0 }));
+    const migratedAt = s.vaultMigratedAt();
+    const cacheAge = service?.kvCacheAgeMs();
+
+    const embed = new EmbedBuilder()
+      .setTitle("Vault — Secret Storage")
+      .setColor(0x5865f2)
+      .setDescription(
+        [
+          `**Connection:** ${stateLine}`,
+          `**Address:** ${s.vaultAddr() ? `\`${s.vaultAddr()}\`` : "_not set_"} · **Token:** ${tokenLine}`,
+          `**Paths:** KV \`${s.vaultKvMount()}/${s.vaultKvBasePath()}\` · Transit \`${s.vaultTransitMount()}\` key \`${s.vaultTransitKey()}\``,
+          `**Probe:** ${service?.lastProbeAt() ? `<t:${Math.floor(service.lastProbeAt()!.getTime() / 1000)}:R>` : "_none yet_"} · **KV cache:** ${
+            cacheAge != null ? `warm (${Math.max(0, Math.round(cacheAge / 60_000))}m old)` : "cold"
+          }`,
+          "",
+          `**Storage:** ${
+            migratedAt
+              ? `**Vault** since <t:${Math.floor(migratedAt.getTime() / 1000)}:d> — globals in KV, user tokens on Transit`
+              : "**Postgres columns** (local encryption) — run *Migrate secrets to Vault* to cut over"
+          }`,
+          ...secretLines.map((l) => `> ${l}`),
+          `**User tokens:** ${tokens.transit} on Transit · ${tokens.local} local${tokens.legacy ? ` · ${tokens.legacy} legacy plaintext` : ""}`,
+          "",
+          "While Vault is down: reads come from the in-memory cache, new secrets fall back to local encryption and are upgraded automatically on recovery. A restart during an outage degrades vault-held secrets until Vault returns.",
+        ].join("\n")
+      );
+
+    const connRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId("config_vault_conn").setLabel("Connection").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("config_vault_paths").setLabel("Paths").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder()
+        .setCustomId("config_vault_toggle")
+        .setLabel(`Vault: ${s.vaultEnabled() ? "on" : "off"}`)
+        .setStyle(s.vaultEnabled() ? ButtonStyle.Success : ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId("config_vault_test")
+        .setLabel("Test Connection")
+        .setStyle(ButtonStyle.Primary)
+        .setDisabled(!service || !service.configured())
+    );
+
+    const migrateRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId("config_vault_migrate")
+        .setLabel("Migrate secrets to Vault")
+        .setStyle(ButtonStyle.Primary)
+        .setDisabled(!service || service.state() !== "up"),
+      new ButtonBuilder()
+        .setCustomId("config_vault_reverse")
+        .setLabel("Reverse migration")
+        .setStyle(ButtonStyle.Danger)
+        .setDisabled(!service || !service.storageActive() || service.state() !== "up"),
+      new ButtonBuilder().setCustomId("config_back_main").setLabel("Back").setStyle(ButtonStyle.Secondary)
+    );
+
+    return { embeds: [embed], components: [connRow, migrateRow] };
+  }
+
+  private buildVaultTestEmbed(report: VaultTestReport) {
+    const ttl = report.ttlSeconds;
+    const ttlLabel =
+      ttl == null ? "?" : ttl === 0 ? "no expiry" : ttl < 86_400 ? `${Math.max(1, Math.round(ttl / 3_600))}h` : `${Math.round(ttl / 86_400)}d`;
+    const lines = [
+      `**Health:** ${
+        report.healthOk
+          ? "✅ ok"
+          : `❌ ${report.healthError ?? (report.sealed ? "sealed" : !report.initialized ? "not initialized" : "unreachable")}`
+      }`,
+      `**Token:** ${
+        report.tokenOk
+          ? `✅ ok${report.displayName ? ` (\`${report.displayName}\`)` : ""} · policies: ${report.policies.join(", ") || "—"} · TTL: ${ttlLabel}`
+          : `❌ ${report.tokenError ?? "lookup failed"}`
+      }`,
+    ];
+    if (report.tokenOk) {
+      lines.push(
+        `**Transit round-trip:** ${report.transitOk ? "✅ ok" : `❌ ${report.transitError ?? "failed"}`}`,
+        `**KV entries:** ${
+          report.kvOk
+            ? `✅ readable — ${report.kvEntriesFound.length}/4 present${report.kvEntriesFound.length ? ` (${report.kvEntriesFound.join(", ")})` : ""}`
+            : `❌ ${report.kvError ?? "read failed"}`
+        }`
+      );
+      if (ttl != null && ttl > 0 && ttl < 7 * 86_400) {
+        lines.push("", "⚠️ The token has a finite TTL and will expire — create an orphan token without a TTL for unattended use.");
+      }
+    }
+    const allOk = report.healthOk && report.tokenOk && report.transitOk && report.kvOk;
+    return makeEmbed(lines.join("\n"), allOk ? COLORS.success : COLORS.warn);
+  }
+
+  private buildMigrateReportEmbed(title: string, report: MigrateReport) {
+    if (report.error) return makeEmbed(`**${title}** aborted: ${report.error}`, COLORS.danger);
+    const outcomeLabel: Record<MigrateItemResult["outcome"], string> = {
+      migrated: "✅ moved",
+      already: "✓ already done",
+      "skipped-empty": "— not set",
+      unreadable: "⚠️ unreadable — re-enter the value, then re-run",
+      failed: "❌ failed",
+    };
+    const lines = report.items.map((i) => `**${i.name}:** ${outcomeLabel[i.outcome]}${i.detail ? ` — ${i.detail}` : ""}`);
+    lines.push(
+      "",
+      `**User tokens:** ${report.sessions.converted} converted${
+        report.sessions.failed
+          ? ` · ${report.sessions.failed} failed (re-run later, or the affected users re-authenticate)`
+          : ""
+      }`
+    );
+    if (!report.ok) lines.push("", "Some items did not move — fix the cause and run the button again (already-moved items are skipped).");
+    return makeEmbed([`**${title}**`, "", ...lines].join("\n"), report.ok ? COLORS.success : COLORS.warn);
+  }
+
+  // All config_vault* buttons (delegated from handleConfigButton; admin was
+  // already re-checked there).
+  private async handleVaultConfigButton(interaction: ButtonInteraction, id: string): Promise<void> {
+    if (!this.vault) {
+      await interaction.reply({ embeds: [makeEmbed("Vault integration is not wired in this deployment.", COLORS.danger)], flags: 64 });
+      return;
+    }
+    const { service, migrator } = this.vault;
+    const s = this.settingsStore;
+
+    if (id === "config_vault") {
+      await interaction.update(await this.buildVaultPanel());
+      return;
+    }
+
+    if (id === "config_vault_conn") {
+      const modal = new ModalBuilder().setCustomId("config_vault_conn_modal").setTitle("Vault Connection");
+      modal.addComponents(
+        new ActionRowBuilder<TextInputBuilder>().addComponents(
+          new TextInputBuilder()
+            .setCustomId("addr")
+            .setLabel("Address (https://vault.example.com:8200)")
+            .setStyle(TextInputStyle.Short)
+            .setRequired(false)
+            .setValue(s.vaultAddr() ?? "")
+        ),
+        new ActionRowBuilder<TextInputBuilder>().addComponents(
+          new TextInputBuilder()
+            .setCustomId("token")
+            .setLabel("Token (blank = keep current)")
+            .setStyle(TextInputStyle.Short)
+            .setRequired(false)
+            .setPlaceholder(s.vaultToken() ? "•••• stored (leave blank to keep)" : "orphan token with the support-bot policy")
+        )
+      );
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (id === "config_vault_paths") {
+      const modal = new ModalBuilder().setCustomId("config_vault_paths_modal").setTitle("Vault Paths");
+      modal.addComponents(
+        new ActionRowBuilder<TextInputBuilder>().addComponents(
+          new TextInputBuilder()
+            .setCustomId("kv_mount")
+            .setLabel("KV v2 mount (blank = kv)")
+            .setStyle(TextInputStyle.Short)
+            .setRequired(false)
+            .setValue(s.vaultKvMount())
+        ),
+        new ActionRowBuilder<TextInputBuilder>().addComponents(
+          new TextInputBuilder()
+            .setCustomId("kv_base")
+            .setLabel("KV base path (blank = support-bot)")
+            .setStyle(TextInputStyle.Short)
+            .setRequired(false)
+            .setValue(s.vaultKvBasePath())
+        ),
+        new ActionRowBuilder<TextInputBuilder>().addComponents(
+          new TextInputBuilder()
+            .setCustomId("transit_mount")
+            .setLabel("Transit mount (blank = transit)")
+            .setStyle(TextInputStyle.Short)
+            .setRequired(false)
+            .setValue(s.vaultTransitMount())
+        ),
+        new ActionRowBuilder<TextInputBuilder>().addComponents(
+          new TextInputBuilder()
+            .setCustomId("transit_key")
+            .setLabel("Transit key name (blank = support-bot)")
+            .setStyle(TextInputStyle.Short)
+            .setRequired(false)
+            .setValue(s.vaultTransitKey())
+        )
+      );
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (id === "config_vault_toggle") {
+      const turningOff = s.vaultEnabled();
+      await s.updateVault({ vaultEnabled: !s.vaultEnabled() });
+      await service.reconfigure();
+      this.auditConfig(interaction, `Vault connection → ${s.vaultEnabled() ? "on" : "off"}`);
+      await interaction.update(await this.buildVaultPanel());
+      if (turningOff && s.vaultMigratedAt()) {
+        await interaction.followUp({
+          embeds: [
+            makeEmbed(
+              "⚠️ Secrets still live in Vault. While the connection is off they are unavailable and the affected features degrade. Re-enable Vault, or run **Reverse migration** (with Vault reachable) to move them back to local encryption.",
+              COLORS.warn
+            ),
+          ],
+          flags: 64,
+        });
+      }
+      return;
+    }
+
+    if (id === "config_vault_test") {
+      await interaction.deferReply({ flags: 64 });
+      const report = await service.testConnection();
+      await interaction.editReply({ embeds: [this.buildVaultTestEmbed(report)] });
+      return;
+    }
+
+    if (id === "config_vault_migrate") {
+      const tokens = await this.sessionStore.countTokensByEnvelope().catch(() => ({ transit: 0, local: 0, legacy: 0 }));
+      const pending = (Object.keys(COLUMN_LABELS) as GlobalSecretColumn[]).filter((c) => {
+        const st = s.secretState(c);
+        return st === "local" || st === "local-unreadable";
+      });
+      const confirm = new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder().setCustomId("config_vault_migrate_confirm").setLabel("Yes, migrate to Vault").setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId("config_vault").setLabel("Cancel").setStyle(ButtonStyle.Secondary)
+      );
+      await interaction.update({
+        embeds: [
+          makeEmbed(
+            [
+              "This moves the secret storage into Vault:",
+              `• **${pending.length}** global secret(s) → KV \`${s.vaultKvMount()}/${s.vaultKvBasePath()}/…\`${pending.length ? ` (${pending.map((c) => COLUMN_LABELS[c]).join(", ")})` : ""}`,
+              `• **${tokens.local + tokens.legacy}** user token(s) → Transit ciphertext (rows stay in Postgres)`,
+              "",
+              "Each value is verified with a read-back before the local copy is replaced. From then on, new secrets are written to Vault (with automatic local fallback while Vault is down). Re-run anytime — finished items are skipped.",
+            ].join("\n"),
+            COLORS.warn
+          ),
+        ],
+        components: [confirm],
+      });
+      return;
+    }
+
+    if (id === "config_vault_migrate_confirm") {
+      await interaction.deferUpdate();
+      const report = await migrator.migrate();
+      const moved = report.items.filter((i) => i.outcome === "migrated").length;
+      this.auditConfig(
+        interaction,
+        `Vault migration → ${moved} secret(s) moved, ${report.sessions.converted} user token(s) converted${report.ok ? "" : " (partial — re-run pending)"}`
+      );
+      await interaction.editReply(await this.buildVaultPanel());
+      await interaction.followUp({ embeds: [this.buildMigrateReportEmbed("Migration to Vault", report)], flags: 64 });
+      return;
+    }
+
+    if (id === "config_vault_reverse") {
+      const tokens = await this.sessionStore.countTokensByEnvelope().catch(() => ({ transit: 0, local: 0, legacy: 0 }));
+      const confirm = new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder().setCustomId("config_vault_reverse_confirm").setLabel("Yes, move back to local").setStyle(ButtonStyle.Danger),
+        new ButtonBuilder().setCustomId("config_vault").setLabel("Cancel").setStyle(ButtonStyle.Secondary)
+      );
+      await interaction.update({
+        embeds: [
+          makeEmbed(
+            [
+              "This pulls every secret OUT of Vault and back into locally-encrypted Postgres columns:",
+              `• global secrets → \`enc:v1\` columns · **${tokens.transit}** user token(s) → local ciphertext`,
+              "• on full success the KV entries are **deleted** and the Vault connection is turned **off**",
+              "",
+              "Use this to decommission Vault. Requires Vault to be reachable.",
+            ].join("\n"),
+            COLORS.danger
+          ),
+        ],
+        components: [confirm],
+      });
+      return;
+    }
+
+    if (id === "config_vault_reverse_confirm") {
+      await interaction.deferUpdate();
+      const report = await migrator.reverse();
+      const restored = report.items.filter((i) => i.outcome === "migrated").length;
+      this.auditConfig(
+        interaction,
+        `Vault reverse migration → ${restored} secret(s) restored, ${report.sessions.converted} user token(s) converted${report.ok ? ", Vault disabled" : " (partial — re-run pending)"}`
+      );
+      await interaction.editReply(await this.buildVaultPanel());
+      await interaction.followUp({ embeds: [this.buildMigrateReportEmbed("Reverse migration", report)], flags: 64 });
+      return;
+    }
+  }
+
+  // config_vault_conn_modal / config_vault_paths_modal submits (delegated from
+  // handleConfigModal; admin already re-checked there).
+  private async handleVaultConfigModal(interaction: ModalSubmitInteraction): Promise<void> {
+    if (!this.vault) {
+      await interaction.reply({ embeds: [makeEmbed("Vault integration is not wired in this deployment.", COLORS.danger)], flags: 64 });
+      return;
+    }
+    const s = this.settingsStore;
+
+    const replyWithState = async (prefix: string) => {
+      const state = this.vault!.service.state();
+      const note =
+        state === "up"
+          ? `${prefix} — Vault is **connected**.`
+          : state === "denied"
+            ? `${prefix}, but the token was **rejected (403)** — check the token/policy. Probes keep retrying.`
+            : state === "down"
+              ? `${prefix}, but Vault is **unreachable** — the probe loop retries every 30s.`
+              : `${prefix}. Turn the Vault toggle on to activate the connection.`;
+      await interaction.reply({ embeds: [makeEmbed(note, state === "up" ? COLORS.success : COLORS.warn)], flags: 64 });
+    };
+
+    if (interaction.customId === "config_vault_conn_modal") {
+      const addr = interaction.fields.getTextInputValue("addr").trim();
+      const token = interaction.fields.getTextInputValue("token").trim();
+      if (addr && !/^https?:\/\//.test(addr)) {
+        await interaction.reply({
+          embeds: [makeEmbed("The address must start with `http://` or `https://`.", COLORS.danger)],
+          flags: 64,
+        });
+        return;
+      }
+      await s.updateVault({
+        vaultAddr: addr || null,
+        // Blank token = leave the stored (encrypted) one unchanged.
+        ...(token ? { vaultToken: token } : {}),
+      });
+      await this.vault.service.reconfigure();
+      // The Influx token may be vault-held — a now-working connection revives it.
+      await reconfigureInflux(s.influxConfig());
+      // Deliberately no token value in the audit line.
+      this.auditConfig(interaction, `Vault connection updated (addr ${addr || "—"}${token ? ", token set" : ""})`);
+      await replyWithState("Vault connection saved");
+      return;
+    }
+
+    if (interaction.customId === "config_vault_paths_modal") {
+      const kvMount = interaction.fields.getTextInputValue("kv_mount").trim();
+      const kvBase = interaction.fields.getTextInputValue("kv_base").trim();
+      const transitMount = interaction.fields.getTextInputValue("transit_mount").trim();
+      const transitKey = interaction.fields.getTextInputValue("transit_key").trim();
+      await s.updateVault({
+        vaultKvMount: kvMount || "kv",
+        vaultKvBasePath: kvBase || "support-bot",
+        vaultTransitMount: transitMount || "transit",
+        vaultTransitKey: transitKey || "support-bot",
+      });
+      await this.vault.service.reconfigure();
+      await reconfigureInflux(s.influxConfig());
+      this.auditConfig(
+        interaction,
+        `Vault paths updated (kv ${s.vaultKvMount()}/${s.vaultKvBasePath()}, transit ${s.vaultTransitMount()}/${s.vaultTransitKey()})`
+      );
+      await replyWithState("Vault paths saved");
+      return;
+    }
   }
 
   // Applies the current settings to the running SDK and renders the outcome
@@ -4639,6 +5070,11 @@ export class DiscordBot {
       return;
     }
 
+    if (id.startsWith("config_vault")) {
+      await this.handleVaultConfigButton(interaction, id);
+      return;
+    }
+
     if (id === "config_analytics_influx") {
       const s = this.settingsStore;
       const modal = new ModalBuilder().setCustomId("config_analytics_influx_modal").setTitle("InfluxDB 2.x Connection");
@@ -5562,6 +5998,11 @@ export class DiscordBot {
         embeds: [makeEmbed(note ?? `Sentry options saved — environment \`${environment}\`, traces ${traces}, profiles ${profiles}.`, COLORS.success)],
         flags: 64,
       });
+      return;
+    }
+
+    if (interaction.customId.startsWith("config_vault_")) {
+      await this.handleVaultConfigModal(interaction);
       return;
     }
 

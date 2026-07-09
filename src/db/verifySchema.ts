@@ -34,7 +34,9 @@ const EXPECTED_COLUMNS: Record<string, string[]> = {
     "stripeWebhookEndpointId", "stripeWebhookSecret", "publicBaseUrl",
     "influxEnabled", "influxUrl", "influxOrg", "influxBucket", "influxToken",
     "scoringEnabled", "scoringIntervalHours", "scoringModel", "scoringMaxTicketsPerBatch",
-    "scoringMaxBudgetUsdPerDay", "scoringLastRunAt", "scoringBackfillPending", "updatedAt",
+    "scoringMaxBudgetUsdPerDay", "scoringLastRunAt", "scoringBackfillPending",
+    "vaultEnabled", "vaultAddr", "vaultToken", "vaultKvMount", "vaultKvBasePath",
+    "vaultTransitMount", "vaultTransitKey", "vaultMigratedAt", "updatedAt",
   ],
   status_tags: [
     "id", "emoji", "label", "isInitial", "closesThread", "reminderEnabled", "reminderDays", "reminderTarget",

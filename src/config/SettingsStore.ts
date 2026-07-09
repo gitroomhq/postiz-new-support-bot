@@ -1,7 +1,8 @@
 import { Prisma, PrismaClient, BotSettings, StatusTag, PriorityTag } from "../generated/prisma/client";
 import type { SentryRuntimeConfig } from "../util/logger";
 import type { InfluxRuntimeConfig } from "../metrics/InfluxWriter";
-import { decryptSecret, encryptSecret } from "../util/crypto";
+import { decryptSecret, encryptSecret, isVaultKvSentinel, VAULT_KV_SENTINEL } from "../util/crypto";
+import type { VaultIntegration, VaultRuntimeConfig, VaultService } from "../vault/VaultService";
 
 export type ReminderTarget = "SUPPORT" | "CUSTOMER";
 
@@ -68,6 +69,27 @@ const DEFAULT_PRIORITIES: PriorityInput[] = [
   { emoji: "🚨", label: "Critical" },
 ];
 
+// The five global secrets and their Vault KV home (one KV entry per
+// integration; field names live inside the entry). Shared by the read
+// resolver, the write router, the panel state helper and the migrator.
+export type GlobalSecretColumn =
+  | "intercomAccessToken"
+  | "intercomClientSecret"
+  | "stripeWebhookSecret"
+  | "sentryReadToken"
+  | "influxToken";
+
+export const GLOBAL_SECRETS: Record<GlobalSecretColumn, { integration: VaultIntegration; field: string }> = {
+  intercomAccessToken: { integration: "intercom", field: "accessToken" },
+  intercomClientSecret: { integration: "intercom", field: "clientSecret" },
+  stripeWebhookSecret: { integration: "stripe", field: "webhookSecret" },
+  sentryReadToken: { integration: "sentry", field: "readToken" },
+  influxToken: { integration: "influx", field: "token" },
+};
+
+// Panel-facing storage state of a global secret column.
+export type SecretState = "none" | "local" | "vault" | "vault-unreachable" | "local-unreadable";
+
 export function isUnicodeEmoji(input: string): boolean {
   const s = input.trim();
   if (!s) return false;
@@ -81,8 +103,84 @@ export class SettingsStore {
   private settings!: BotSettings;
   private tagList: StatusTag[] = [];
   private priorityList: PriorityTag[] = [];
+  private vault: VaultService | null = null;
 
   constructor(private prisma: PrismaClient) {}
+
+  // Late-bound (same idiom as AuditLogger.bindClient): SettingsStore is
+  // constructed before the VaultService that depends on it. Until bound,
+  // vault-held secrets resolve to null — identical to Vault-down degradation.
+  bindVault(vault: VaultService): void {
+    this.vault = vault;
+  }
+
+  // ---- Vault secret plumbing (the five GLOBAL_SECRETS columns) ----
+
+  // Read path. A column holds one of: null/"" (not set), the vault:kv sentinel
+  // (value lives in Vault KV → serve from the in-memory cache, null while the
+  // cache is cold), a local enc:v1 ciphertext, or legacy plaintext (both
+  // handled by decryptSecret).
+  private resolveSecret(raw: string | null, column: GlobalSecretColumn): string | null {
+    if (raw == null || raw === "") return raw;
+    if (isVaultKvSentinel(raw)) {
+      const { integration, field } = GLOBAL_SECRETS[column];
+      return this.vault?.getCachedKvField(integration, field) ?? null;
+    }
+    return decryptSecret(raw);
+  }
+
+  // Write path: vault-first with local fallback. Returns the value to store in
+  // the column — the sentinel after a successful KV write, or a local enc:v1
+  // ciphertext when Vault storage isn't active/reachable (the migrator's
+  // background job upgrades those on recovery). Clearing (null/"") clears the
+  // column and best-effort deletes the KV field; a delete missed while Vault
+  // is down is reconciled by the same job (null column + present KV field).
+  private async routeSecretWrite(column: GlobalSecretColumn, plaintext: string | null): Promise<string | null> {
+    const { integration, field } = GLOBAL_SECRETS[column];
+    const vault = this.vault;
+    const vaultActive = vault != null && vault.storageActive();
+    if (!plaintext) {
+      if (vaultActive && isVaultKvSentinel(this.settings[column] ?? "")) {
+        await vault.setKvFields(integration, { [field]: null });
+      }
+      // null → NULL, "" → "" — preserves the existing "empty string blocks the
+      // env fallback" semantics of the Intercom columns.
+      return plaintext;
+    }
+    if (vaultActive && vault.state() === "up") {
+      if (await vault.setKvFields(integration, { [field]: plaintext })) {
+        return VAULT_KV_SENTINEL;
+      }
+      // The failed write flipped the state to down — fall through to local.
+    }
+    return encryptSecret(plaintext);
+  }
+
+  // Storage state for the /config panels (three Vault-era states on top of the
+  // classic two): where does this secret live and is it readable right now?
+  secretState(column: GlobalSecretColumn): SecretState {
+    const raw = this.settings[column];
+    if (!raw) return "none";
+    if (isVaultKvSentinel(raw)) {
+      const { integration, field } = GLOBAL_SECRETS[column];
+      return this.vault?.getCachedKvField(integration, field) ? "vault" : "vault-unreachable";
+    }
+    return decryptSecret(raw) == null ? "local-unreadable" : "local";
+  }
+
+  // Migrator plumbing: raw column access bypassing resolve/encrypt. This is
+  // the ONLY legal way to write the vault:kv sentinel — encryptSecret would
+  // double-wrap it (it only skips enc:v1-prefixed values).
+  getSecretColumnRaw(column: GlobalSecretColumn): string | null {
+    return this.settings[column];
+  }
+
+  async setSecretColumnRaw(column: GlobalSecretColumn, raw: string | null): Promise<void> {
+    this.settings = await this.prisma.botSettings.update({
+      where: { id: "global" },
+      data: { [column]: raw },
+    });
+  }
 
   async load(): Promise<void> {
     let settings = await this.prisma.botSettings.findUnique({ where: { id: "global" } });
@@ -358,17 +456,16 @@ export class SettingsStore {
     return region === "eu" || region === "au" ? region : "us";
   }
 
-  // DB value is encrypted at rest (see updateIntercom); decrypt it. The env
+  // DB value is local-encrypted or vault-held (see resolveSecret). The env
   // fallback is never enc-wrapped, so it passes through plainly. A decrypt
-  // failure (rotated key source) yields null → falls back to env, then null.
+  // failure (rotated key source) or an unreachable Vault yields null → falls
+  // back to env, then null.
   intercomAccessToken(): string | null {
-    const raw = this.settings.intercomAccessToken;
-    return (raw != null ? decryptSecret(raw) : null) ?? process.env.INTERCOM_ACCESS_TOKEN ?? null;
+    return this.resolveSecret(this.settings.intercomAccessToken, "intercomAccessToken") ?? process.env.INTERCOM_ACCESS_TOKEN ?? null;
   }
 
   intercomClientSecret(): string | null {
-    const raw = this.settings.intercomClientSecret;
-    return (raw != null ? decryptSecret(raw) : null) ?? process.env.INTERCOM_CLIENT_SECRET ?? null;
+    return this.resolveSecret(this.settings.intercomClientSecret, "intercomClientSecret") ?? process.env.INTERCOM_CLIENT_SECRET ?? null;
   }
 
   intercomAdminId(): string | null {
@@ -422,10 +519,17 @@ export class SettingsStore {
     return this.settings.stripeWebhookEndpointId;
   }
 
-  // Signing secret (whsec_…), encrypted at rest (see updateStripeWebhook).
+  // Signing secret (whsec_…), local-encrypted or vault-held.
   stripeWebhookSecret(): string | null {
-    const raw = this.settings.stripeWebhookSecret;
-    return raw != null ? decryptSecret(raw) : null;
+    return this.resolveSecret(this.settings.stripeWebhookSecret, "stripeWebhookSecret");
+  }
+
+  // Configured-ness by the RAW column (a vault:kv sentinel counts): the boot
+  // reconciliation in StripeWebhookHandler.ensureEndpoint must not read "in
+  // Vault but Vault is down" as "no secret" — that would recreate the endpoint
+  // and rotate the signing secret on every boot during an outage.
+  stripeWebhookSecretConfigured(): boolean {
+    return !!this.settings.stripeWebhookSecret;
   }
 
   // The configured public origin (raw, for /config display).
@@ -487,8 +591,7 @@ export class SettingsStore {
   }
 
   sentryReadToken(): string | null {
-    const raw = this.settings.sentryReadToken;
-    return raw != null ? decryptSecret(raw) : null;
+    return this.resolveSecret(this.settings.sentryReadToken, "sentryReadToken");
   }
 
   sentryOrgSlug(): string | null {
@@ -532,16 +635,19 @@ export class SettingsStore {
     return this.settings.influxBucket?.trim() || null;
   }
 
-  // Token is encrypted at rest. A decrypt failure (rotated key source) yields
-  // null → the exporter stays inactive and the panel asks for re-entry.
+  // Token is local-encrypted or vault-held. Unreadable/unreachable yields
+  // null → the exporter stays inactive until the value is available again.
   influxToken(): string | null {
-    const raw = this.settings.influxToken;
-    return raw != null ? decryptSecret(raw) : null;
+    return this.resolveSecret(this.settings.influxToken, "influxToken");
   }
 
-  // True when the DB has a token ciphertext but it can no longer be decrypted.
+  // True only when the DB holds a LOCAL ciphertext that no longer decrypts
+  // (rotated key source) — the panel asks for re-entry. A vault:kv sentinel
+  // with Vault unreachable is a different state (secretState →
+  // "vault-unreachable"), not a re-enter situation.
   influxTokenUnreadable(): boolean {
-    return this.settings.influxToken != null && this.influxToken() == null;
+    const raw = this.settings.influxToken;
+    return !!raw && !isVaultKvSentinel(raw) && decryptSecret(raw) == null;
   }
 
   influxConfig(): InfluxRuntimeConfig {
@@ -551,6 +657,65 @@ export class SettingsStore {
       org: this.influxOrg(),
       bucket: this.influxBucket(),
       token: this.influxToken(),
+    };
+  }
+
+  // ---- HashiCorp Vault connection (paired with /config → Vault) ----
+  // Connection settings only; the secret routing itself lives in
+  // resolveSecret/routeSecretWrite above. The Vault token is the bootstrap
+  // credential and is always encrypted with the LOCAL key (crypto.ts) — Vault
+  // can't wrap its own token.
+
+  vaultEnabled(): boolean {
+    return this.settings.vaultEnabled;
+  }
+
+  vaultAddr(): string | null {
+    return this.settings.vaultAddr?.trim() || null;
+  }
+
+  vaultToken(): string | null {
+    const raw = this.settings.vaultToken;
+    return raw != null ? decryptSecret(raw) : null;
+  }
+
+  // Local ciphertext present but no longer decryptable (rotated key source) —
+  // the panel asks for re-entry.
+  vaultTokenUnreadable(): boolean {
+    return this.settings.vaultToken != null && this.vaultToken() == null;
+  }
+
+  vaultKvMount(): string {
+    return this.settings.vaultKvMount?.trim() || "kv";
+  }
+
+  vaultKvBasePath(): string {
+    return this.settings.vaultKvBasePath?.trim().replace(/^\/+|\/+$/g, "") || "support-bot";
+  }
+
+  vaultTransitMount(): string {
+    return this.settings.vaultTransitMount?.trim() || "transit";
+  }
+
+  vaultTransitKey(): string {
+    return this.settings.vaultTransitKey?.trim() || "support-bot";
+  }
+
+  // Storage cutover stamp: null = secrets live in Postgres columns; set = the
+  // globals live in KV and user tokens are Transit-encrypted.
+  vaultMigratedAt(): Date | null {
+    return this.settings.vaultMigratedAt;
+  }
+
+  vaultConfig(): VaultRuntimeConfig {
+    return {
+      enabled: this.vaultEnabled(),
+      addr: this.vaultAddr(),
+      token: this.vaultToken(),
+      kvMount: this.vaultKvMount(),
+      kvBasePath: this.vaultKvBasePath(),
+      transitMount: this.vaultTransitMount(),
+      transitKey: this.vaultTransitKey(),
     };
   }
 
@@ -605,9 +770,31 @@ export class SettingsStore {
       where: { id: "global" },
       data: {
         ...rest,
-        ...(influxToken !== undefined
-          ? { influxToken: influxToken ? encryptSecret(influxToken) : influxToken }
-          : {}),
+        ...(influxToken !== undefined ? { influxToken: await this.routeSecretWrite("influxToken", influxToken) } : {}),
+      },
+    });
+  }
+
+  // Vault connection settings. The token is encrypted at rest with the LOCAL
+  // key (bootstrap credential); pass a field as undefined to leave it
+  // unchanged, null/"" to clear it. Callers follow up with
+  // vaultService.reconfigure() so the live client matches.
+  async updateVault(data: {
+    vaultEnabled?: boolean;
+    vaultAddr?: string | null;
+    vaultToken?: string | null;
+    vaultKvMount?: string;
+    vaultKvBasePath?: string;
+    vaultTransitMount?: string;
+    vaultTransitKey?: string;
+    vaultMigratedAt?: Date | null;
+  }): Promise<void> {
+    const { vaultToken, ...rest } = data;
+    this.settings = await this.prisma.botSettings.update({
+      where: { id: "global" },
+      data: {
+        ...rest,
+        ...(vaultToken !== undefined ? { vaultToken: vaultToken ? encryptSecret(vaultToken) : vaultToken } : {}),
       },
     });
   }
@@ -670,7 +857,7 @@ export class SettingsStore {
       data: {
         ...rest,
         ...(sentryReadToken !== undefined
-          ? { sentryReadToken: sentryReadToken ? encryptSecret(sentryReadToken) : sentryReadToken }
+          ? { sentryReadToken: await this.routeSecretWrite("sentryReadToken", sentryReadToken) }
           : {}),
       },
     });
@@ -692,12 +879,13 @@ export class SettingsStore {
       where: { id: "global" },
       data: {
         ...rest,
-        // Secrets are encrypted at rest; an empty string / null clears them.
+        // Secrets route vault-first with local-encryption fallback; an empty
+        // string / null clears them.
         ...(intercomAccessToken !== undefined
-          ? { intercomAccessToken: intercomAccessToken ? encryptSecret(intercomAccessToken) : intercomAccessToken }
+          ? { intercomAccessToken: await this.routeSecretWrite("intercomAccessToken", intercomAccessToken) }
           : {}),
         ...(intercomClientSecret !== undefined
-          ? { intercomClientSecret: intercomClientSecret ? encryptSecret(intercomClientSecret) : intercomClientSecret }
+          ? { intercomClientSecret: await this.routeSecretWrite("intercomClientSecret", intercomClientSecret) }
           : {}),
         // Nullable JSON columns need the DbNull sentinel instead of null.
         ...(intercomTicketTypeMap !== undefined
@@ -754,8 +942,8 @@ export class SettingsStore {
     });
   }
 
-  // The signing secret is encrypted at rest; other fields pass through. Pass a
-  // field as undefined to leave it unchanged (null clears it).
+  // The signing secret routes vault-first with local fallback; other fields
+  // pass through. Pass a field as undefined to leave it unchanged (null clears it).
   async updateStripeWebhook(data: {
     stripeWebhookEnabled?: boolean;
     stripeWebhookEndpointId?: string | null;
@@ -768,7 +956,7 @@ export class SettingsStore {
       data: {
         ...rest,
         ...(stripeWebhookSecret !== undefined
-          ? { stripeWebhookSecret: stripeWebhookSecret ? encryptSecret(stripeWebhookSecret) : stripeWebhookSecret }
+          ? { stripeWebhookSecret: await this.routeSecretWrite("stripeWebhookSecret", stripeWebhookSecret) }
           : {}),
       },
     });
