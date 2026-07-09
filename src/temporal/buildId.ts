@@ -3,9 +3,12 @@ import * as path from "node:path";
 
 // The worker deployment build id AND the Sentry release, so a Temporal
 // deployment version maps 1:1 to Sentry issues. Resolution order:
-//   1. `git rev-parse --short=6 HEAD` — prod deploys from a git checkout
-//   2. GIT_SHA env (CI/deploy tooling fallback for .git-less hosts)
-//   3. package.json version (last resort; still unique enough to boot)
+//   1. `git rev-parse --short=6 HEAD` — when deployed from a git checkout
+//   2. dist/temporal/buildInfo.json — stamped by the build step, survives
+//      dist-only deploys without a .git directory
+//   3. GIT_SHA env (CI/deploy tooling fallback)
+//   4. package.json version (last resort; NOT unique per deploy — worker
+//      versioning degenerates when this is hit)
 // Resolved once, synchronously, at first use. Deliberately dependency-free
 // (no logger import): logger.ts calls this for the Sentry release.
 
@@ -29,7 +32,19 @@ export function resolveBuildId(): string {
       .trim();
     if (cached) return cached;
   } catch {
-    // fall through to env / package.json
+    // fall through to the build-time stamp / env / package.json
+  }
+  try {
+    // Written by dist/scripts/bundleWorkflows.js during `pnpm build`; lives
+    // next to this file in dist/temporal/.
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const info = require("./buildInfo.json") as { gitSha?: string };
+    if (info.gitSha) {
+      cached = info.gitSha;
+      return cached;
+    }
+  } catch {
+    // no stamp (ts-node dev before first build) — keep falling through
   }
   const envSha = (process.env.GIT_SHA ?? "").trim();
   if (envSha) {

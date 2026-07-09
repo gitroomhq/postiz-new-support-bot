@@ -1,5 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { execFileSync } from "node:child_process";
 import { bundleWorkflowCode } from "@temporalio/worker";
 
 // Build-time workflow bundling (runs as the last `pnpm build` step, against
@@ -19,6 +20,25 @@ async function main(): Promise<void> {
   });
   fs.writeFileSync(outPath, code);
   process.stdout.write(`workflow bundle written: ${path.relative(process.cwd(), outPath)} (${(code.length / 1024).toFixed(0)} KiB)\n`);
+
+  // Stamp the git SHA at BUILD time (the build always runs in the checkout,
+  // per README) so a dist-only deploy without .git still gets a real worker
+  // build id — buildId.ts reads this file as its second fallback.
+  try {
+    const sha = execFileSync("git", ["rev-parse", "--short=6", "HEAD"], {
+      cwd: path.join(__dirname, "..", ".."),
+      stdio: ["ignore", "pipe", "ignore"],
+    })
+      .toString()
+      .trim();
+    if (sha) {
+      const infoPath = path.join(__dirname, "..", "temporal", "buildInfo.json");
+      fs.writeFileSync(infoPath, JSON.stringify({ gitSha: sha }));
+      process.stdout.write(`build id stamped: ${sha}\n`);
+    }
+  } catch {
+    process.stdout.write("build id stamp skipped (no git available at build time)\n");
+  }
 }
 
 main().catch((err) => {
