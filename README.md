@@ -29,7 +29,7 @@ Almost everything is configured live through the admin-only **`/config`** panel 
 
 **Optional** (feature-gating, or first-boot seeds that `/config` then owns): `DISCORD_THREADS_CHANNEL_ID`, `DISCORD_SUPPORT_ROLE_ID`, `POSTIZ_FRONTEND_URL`, `POSTIZ_API_URL`, `POSTIZ_CLIENT_ID`, `POSTIZ_CLIENT_SECRET`, `POSTIZ_CALLBACK_URL`, `GH_BOT_TOKEN`, `GH_BOT_REPO`, `STRIPE_DISCOUNT_COUPON_ID`, `SERVER_PORT` (default 3000), `SENTRY_DSN`, `INTERCOM_*`, `SCHEMA_DRIFT_STRICT`.
 
-**Temporal** (all optional; the feature is gated by the `/config → Temporal` toggle): `TEMPORAL_ADDRESS` (`host:port` of the mTLS frontend), `TEMPORAL_NAMESPACE` (create it yourself on the server), `TEMPORAL_TASK_QUEUE` (default `support-bot`), `TEMPORAL_DEPLOYMENT_NAME` (default `support-bot`), `GIT_SHA` (build-id fallback for `.git`-less deploys).
+**Temporal**: the connection (address `host:port`, namespace, task queue, deployment name) is edited live via **`/config → Temporal → Connection`** and stored in `BotSettings` — no env access needed. The `TEMPORAL_*` env vars exist only as optional first-boot fallbacks (like `INTERCOM_*`); `GIT_SHA` is the build-id fallback for `.git`-less deploys.
 
 ### Temporal server prerequisites
 
@@ -37,7 +37,7 @@ Almost everything is configured live through the admin-only **`/config`** panel 
 - A dedicated namespace (retention ≥ 14 days recommended — ticket workflows stay open 14 days past close).
 - mTLS client cert/key (+ optional CA) — entered via `/config → Temporal → Certificates`, stored in **Vault KV** under `<kvBasePath>/temporal` (no local fallback; Vault must be up). Cert rotation needs a Temporal off/on toggle or a restart.
 - On every boot the worker registers its build (deployment `TEMPORAL_DEPLOYMENT_NAME`, build id = `git rev-parse --short=6 HEAD`) and **auto-promotes it to the deployment's Current Version**; re-deploying an older SHA re-promotes it (that's the rollback story). Workflows default to AUTO_UPGRADE.
-- Rollout: deploy with the toggle OFF (legacy schedulers unchanged) → enter certs → **Test Connection** → toggle ON → **Run Migration Import** → verify in the Temporal UI + audit channel. The toggle is the kill switch back to legacy at any time.
+- Rollout: deploy with the toggle OFF (legacy schedulers unchanged) → set address/namespace via **Connection** → enter certs via **Certificates** → **Test Connection** → toggle ON → **Run Migration Import** → verify in the Temporal UI + audit channel. The toggle is the kill switch back to legacy at any time.
 - `--worker-only` runs a process that only polls the task queue (logs into Discord for activities, no commands/HTTP) — the future split topology.
 
 > **Secrets at rest** (Postiz OAuth access tokens, Intercom credentials, the Stripe webhook signing secret) are encrypted with AES-256-GCM. The key is derived (HKDF) from `STRIPE_SECRET_KEY` + `DATABASE_URL` + `DISCORD_TOKEN`, so a database dump alone cannot decrypt them. Rotating any of those three orphans existing ciphertext (fail-soft: affected users re-auth / secrets are re-entered).

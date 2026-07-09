@@ -38,7 +38,8 @@ const EXPECTED_COLUMNS: Record<string, string[]> = {
     "scoringMaxBudgetUsdPerDay", "scoringLastRunAt", "scoringBackfillPending",
     "vaultEnabled", "vaultAddr", "vaultToken", "vaultKvMount", "vaultKvBasePath",
     "vaultTransitMount", "vaultTransitKey", "vaultMigratedAt",
-    "temporalEnabled", "temporalImportDoneAt", "updatedAt",
+    "temporalEnabled", "temporalAddress", "temporalNamespace", "temporalTaskQueue",
+    "temporalDeploymentName", "temporalImportDoneAt", "updatedAt",
   ],
   status_tags: [
     "id", "emoji", "label", "isInitial", "closesThread", "reminderEnabled", "reminderDays", "reminderTarget",

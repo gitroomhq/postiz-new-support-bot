@@ -98,10 +98,12 @@ async function main() {
   await vaultService.init();
   const vaultMigrator = new VaultMigrator(prisma, settingsStore, sessionStore, vaultService);
   // Temporal connection layer: certs come from the Vault KV cache (the
-  // "temporal" integration entry), address/namespace from env. init() is a
-  // bounded warm-up like Vault's — a down/unconfigured Temporal means the
-  // probe loop keeps trying, never a dead boot.
-  const temporalService = new TemporalService(settingsStore, vaultService, auditLogger, config.temporal);
+  // "temporal" integration entry), address/namespace from BotSettings via
+  // /config → Temporal → Connection (env vars are first-boot fallbacks only —
+  // the deploy has no .env access). init() is a bounded warm-up like Vault's —
+  // a down/unconfigured Temporal means the probe loop keeps trying, never a
+  // dead boot.
+  const temporalService = new TemporalService(settingsStore, vaultService, auditLogger);
   const temporalProducers = new TemporalProducers(temporalService, settingsStore);
   await temporalService.init();
   temporalService.start();

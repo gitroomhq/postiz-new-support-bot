@@ -1,7 +1,6 @@
 import * as Sentry from "@sentry/node";
 import { Client, Connection } from "@temporalio/client";
 import { WorkflowExecutionAlreadyStartedError } from "@temporalio/common";
-import type { BotConfig } from "../config";
 import type { SettingsStore } from "../config/SettingsStore";
 import type { AuditLogger } from "../bot/AuditLogger";
 import type { VaultService } from "../vault/VaultService";
@@ -19,7 +18,15 @@ const temporalLog = log.child("temporal");
 
 export type TemporalState = "unconfigured" | "up" | "down";
 
-export type TemporalEnvConfig = BotConfig["temporal"];
+// Connection values, resolved live from BotSettings (/config → Temporal →
+// Connection; TEMPORAL_* env vars are first-boot fallbacks only — the deploy
+// has no .env access).
+export interface TemporalEnvConfig {
+  address: string;
+  namespace: string;
+  taskQueue: string;
+  deploymentName: string;
+}
 
 const PROBE_INTERVAL_MS = 30_000;
 const FAILURE_LOG_INTERVAL_MS = 60_000;
@@ -88,8 +95,7 @@ export class TemporalService {
   constructor(
     private settings: SettingsStore,
     private vault: VaultService,
-    private audit: AuditLogger,
-    private cfg: TemporalEnvConfig
+    private audit: AuditLogger
   ) {}
 
   // ---- introspection (sync, for the /config panel and gates) ----
@@ -106,15 +112,23 @@ export class TemporalService {
     return this.downSinceMs ? new Date(this.downSinceMs) : null;
   }
 
+  // Resolved fresh on every read so /config edits apply without a restart
+  // (the running Client/worker still need reconfigure()/a toggle to pick a
+  // CHANGED address up — connections don't hot-swap).
   envConfig(): TemporalEnvConfig {
-    return this.cfg;
+    return {
+      address: this.settings.temporalAddress() ?? "",
+      namespace: this.settings.temporalNamespace() ?? "",
+      taskQueue: this.settings.temporalTaskQueue(),
+      deploymentName: this.settings.temporalDeploymentName(),
+    };
   }
 
   // Why the connection can't come up, independent of reachability. null = all
   // prerequisites present.
   configError(): string | null {
-    if (!this.cfg.address) return "TEMPORAL_ADDRESS is not set.";
-    if (!this.cfg.namespace) return "TEMPORAL_NAMESPACE is not set.";
+    if (!this.settings.temporalAddress()) return "Address not set (Connection in /config → Temporal).";
+    if (!this.settings.temporalNamespace()) return "Namespace not set (Connection in /config → Temporal).";
     if (!this.tlsMaterial()) {
       return this.vault.state() === "up"
         ? "mTLS client cert/key not found in Vault (enter them via Certificates)."
@@ -245,8 +259,9 @@ export class TemporalService {
     if (!this.connecting) {
       this.connecting = (async () => {
         const tls = this.tlsMaterial()!;
+        const cfg = this.envConfig();
         const conn = await Connection.connect({
-          address: this.cfg.address,
+          address: cfg.address,
           tls: {
             clientCertPair: {
               crt: Buffer.from(tls.clientCertPem),
@@ -257,7 +272,7 @@ export class TemporalService {
           connectTimeout: CONNECT_TIMEOUT,
         });
         this.conn = conn;
-        this.clientVal = new Client({ connection: conn, namespace: this.cfg.namespace });
+        this.clientVal = new Client({ connection: conn, namespace: cfg.namespace });
       })().finally(() => {
         this.connecting = null;
       });
@@ -469,7 +484,7 @@ export class TemporalService {
     switch (op.kind) {
       case "start":
         await client.workflow.start(op.workflowType!, {
-          taskQueue: this.cfg.taskQueue,
+          taskQueue: this.envConfig().taskQueue,
           workflowId: op.workflowId,
           args: op.args,
           ...(op.options ?? {}),
@@ -483,7 +498,7 @@ export class TemporalService {
       }
       case "signalWithStart":
         await client.workflow.signalWithStart(op.workflowType!, {
-          taskQueue: this.cfg.taskQueue,
+          taskQueue: this.envConfig().taskQueue,
           workflowId: op.workflowId,
           args: op.args,
           signal: op.signalName!,
@@ -530,15 +545,15 @@ export class TemporalService {
     }
     const svc = this.conn!.workflowService;
     try {
-      await svc.describeNamespace({ namespace: this.cfg.namespace });
+      await svc.describeNamespace({ namespace: this.envConfig().namespace });
       report.namespaceOk = true;
     } catch (e) {
       report.namespaceError = e instanceof Error ? e.message : String(e);
     }
     try {
       const desc = await svc.describeWorkerDeployment({
-        namespace: this.cfg.namespace,
-        deploymentName: this.cfg.deploymentName,
+        namespace: this.envConfig().namespace,
+        deploymentName: this.envConfig().deploymentName,
       });
       report.deploymentFound = true;
       report.currentVersion =
@@ -552,7 +567,7 @@ export class TemporalService {
     }
     try {
       const count = await svc.countWorkflowExecutions({
-        namespace: this.cfg.namespace,
+        namespace: this.envConfig().namespace,
         query: `ExecutionStatus="Running"`,
       });
       report.visibilityOk = true;

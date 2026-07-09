@@ -804,12 +804,31 @@ export class SettingsStore {
     });
   }
 
-  // ---- Temporal (kill switch; connection is env-only, certs live in Vault KV) ----
+  // ---- Temporal (edited via /config → Temporal; certs live in Vault KV) ----
 
   // OFF = the legacy in-process setInterval schedulers run; ON = they stay
   // stopped and the Temporal worker owns all background work.
   temporalEnabled(): boolean {
     return this.settings.temporalEnabled;
+  }
+
+  // Connection values live in BotSettings (the deploy has no .env access);
+  // the TEMPORAL_* env vars are first-boot fallbacks only, same pattern as
+  // the INTERCOM_* getters above.
+  temporalAddress(): string | null {
+    return this.settings.temporalAddress?.trim() || (process.env.TEMPORAL_ADDRESS ?? "").trim() || null;
+  }
+
+  temporalNamespace(): string | null {
+    return this.settings.temporalNamespace?.trim() || (process.env.TEMPORAL_NAMESPACE ?? "").trim() || null;
+  }
+
+  temporalTaskQueue(): string {
+    return this.settings.temporalTaskQueue?.trim() || (process.env.TEMPORAL_TASK_QUEUE ?? "").trim() || "support-bot";
+  }
+
+  temporalDeploymentName(): string {
+    return this.settings.temporalDeploymentName?.trim() || (process.env.TEMPORAL_DEPLOYMENT_NAME ?? "").trim() || "support-bot";
   }
 
   // Stamp of the one-time legacy-state import into workflows (open tickets,
@@ -818,7 +837,14 @@ export class SettingsStore {
     return this.settings.temporalImportDoneAt;
   }
 
-  async updateTemporal(data: { temporalEnabled?: boolean; temporalImportDoneAt?: Date | null }): Promise<void> {
+  async updateTemporal(data: {
+    temporalEnabled?: boolean;
+    temporalAddress?: string | null;
+    temporalNamespace?: string | null;
+    temporalTaskQueue?: string;
+    temporalDeploymentName?: string;
+    temporalImportDoneAt?: Date | null;
+  }): Promise<void> {
     this.settings = await this.prisma.botSettings.update({
       where: { id: "global" },
       data,

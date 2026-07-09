@@ -4012,19 +4012,22 @@ export class DiscordBot {
         .setCustomId("config_temporal_toggle")
         .setLabel(s.temporalEnabled() ? "Temporal: on" : "Temporal: off")
         .setStyle(s.temporalEnabled() ? ButtonStyle.Success : ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId("config_temporal_test").setLabel("Test Connection").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("config_temporal_conn").setLabel("Connection").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("config_temporal_certs").setLabel("Certificates").setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId("config_temporal_import").setLabel("Run Migration Import").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("config_temporal_test").setLabel("Test Connection").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("config_back_main").setLabel("Back").setStyle(ButtonStyle.Secondary)
     );
     const row2 = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId("config_temporal_import").setLabel("Run Migration Import").setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId("config_temporal_pause").setLabel("Pause Schedules").setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId("config_temporal_unpause").setLabel("Unpause Schedules").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("config_temporal_unpause").setLabel("Unpause Schedules").setStyle(ButtonStyle.Secondary)
+    );
+    const row3 = new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder().setCustomId("config_temporal_kb").setLabel("Refresh KB Now").setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId("config_temporal_score").setLabel("Run Scoring Now").setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId("config_temporal_report").setLabel("Run Report Now").setStyle(ButtonStyle.Secondary)
     );
-    return { embeds: [embed], components: [row1, row2] };
+    return { embeds: [embed], components: [row1, row2, row3] };
   }
 
   // All config_temporal* buttons (delegated from handleConfigButton; admin was
@@ -4049,7 +4052,7 @@ export class DiscordBot {
         await interaction.reply({
           embeds: [
             makeEmbed(
-              `Can't enable Temporal: ${ops.service.configError() ?? "not configured"}.\nSet TEMPORAL_ADDRESS/TEMPORAL_NAMESPACE (env) and enter the mTLS certs via **Certificates**.`,
+              `Can't enable Temporal: ${ops.service.configError() ?? "not configured"}.\nSet address + namespace via **Connection** and enter the mTLS certs via **Certificates**.`,
               COLORS.danger
             ),
           ],
@@ -4108,6 +4111,47 @@ export class DiscordBot {
           ),
         ],
       });
+      return;
+    }
+
+    if (id === "config_temporal_conn") {
+      const cfg = ops.service.envConfig();
+      const modal = new ModalBuilder().setCustomId("config_temporal_conn_modal").setTitle("Temporal Connection");
+      modal.addComponents(
+        new ActionRowBuilder<TextInputBuilder>().addComponents(
+          new TextInputBuilder()
+            .setCustomId("address")
+            .setLabel("Address (host:port of the mTLS frontend)")
+            .setStyle(TextInputStyle.Short)
+            .setRequired(false)
+            .setValue(cfg.address)
+        ),
+        new ActionRowBuilder<TextInputBuilder>().addComponents(
+          new TextInputBuilder()
+            .setCustomId("namespace")
+            .setLabel("Namespace")
+            .setStyle(TextInputStyle.Short)
+            .setRequired(false)
+            .setValue(cfg.namespace)
+        ),
+        new ActionRowBuilder<TextInputBuilder>().addComponents(
+          new TextInputBuilder()
+            .setCustomId("task_queue")
+            .setLabel("Task queue")
+            .setStyle(TextInputStyle.Short)
+            .setRequired(false)
+            .setValue(cfg.taskQueue)
+        ),
+        new ActionRowBuilder<TextInputBuilder>().addComponents(
+          new TextInputBuilder()
+            .setCustomId("deployment")
+            .setLabel("Deployment name (worker versioning)")
+            .setStyle(TextInputStyle.Short)
+            .setRequired(false)
+            .setValue(cfg.deploymentName)
+        )
+      );
+      await interaction.showModal(modal);
       return;
     }
 
@@ -6594,6 +6638,45 @@ export class DiscordBot {
 
     if (interaction.customId === "config_temporal_certs_modal") {
       await this.handleTemporalCertsModal(interaction);
+      return;
+    }
+
+    if (interaction.customId === "config_temporal_conn_modal") {
+      const address = interaction.fields.getTextInputValue("address").trim();
+      const namespace = interaction.fields.getTextInputValue("namespace").trim();
+      const taskQueue = interaction.fields.getTextInputValue("task_queue").trim() || "support-bot";
+      const deployment = interaction.fields.getTextInputValue("deployment").trim() || "support-bot";
+      if (address && !/^[\w.-]+:\d+$/.test(address)) {
+        await interaction.reply({
+          embeds: [makeEmbed("Address must be `host:port` (e.g. `10.0.0.5:7233`).", COLORS.danger)],
+          flags: 64,
+        });
+        return;
+      }
+      await interaction.deferReply({ flags: 64 });
+      await this.settingsStore.updateTemporal({
+        temporalAddress: address || null,
+        temporalNamespace: namespace || null,
+        temporalTaskQueue: taskQueue,
+        temporalDeploymentName: deployment,
+      });
+      await this.temporalOps?.service.reconfigure();
+      this.auditConfig(interaction, `Temporal connection → \`${address || "—"}\` / \`${namespace || "—"}\` (queue \`${taskQueue}\`)`);
+      await interaction.editReply({
+        embeds: [
+          makeEmbed(
+            [
+              `Connection saved — address \`${address || "—"}\`, namespace \`${namespace || "—"}\`, task queue \`${taskQueue}\`, deployment \`${deployment}\`.`,
+              this.settingsStore.temporalEnabled() && this.temporalOps?.workerManager.running()
+                ? "⚠️ The running worker keeps its old connection — toggle Temporal off/on to apply the change."
+                : "",
+            ]
+              .filter(Boolean)
+              .join("\n"),
+            COLORS.success
+          ),
+        ],
+      });
       return;
     }
 

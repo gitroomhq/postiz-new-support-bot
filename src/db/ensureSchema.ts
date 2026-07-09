@@ -499,10 +499,15 @@ const STATEMENTS: string[] = [
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "vaultTransitMount" TEXT NOT NULL DEFAULT 'transit'`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "vaultTransitKey" TEXT NOT NULL DEFAULT 'support-bot'`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "vaultMigratedAt" TIMESTAMP(3)`,
-  // Temporal migration kill switch + one-time import stamp (paired with
-  // /config → Temporal). Connection address/namespace are env-only; the mTLS
-  // client cert lives in Vault KV under the "temporal" integration entry.
+  // Temporal migration kill switch + connection + one-time import stamp
+  // (paired with /config → Temporal; TEMPORAL_* env vars are first-boot
+  // fallbacks only — the deploy has no .env access). The mTLS client cert
+  // lives in Vault KV under the "temporal" integration entry.
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "temporalEnabled" BOOLEAN NOT NULL DEFAULT false`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "temporalAddress" TEXT`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "temporalNamespace" TEXT`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "temporalTaskQueue" TEXT NOT NULL DEFAULT 'support-bot'`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "temporalDeploymentName" TEXT NOT NULL DEFAULT 'support-bot'`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "temporalImportDoneAt" TIMESTAMP(3)`,
 ];
 

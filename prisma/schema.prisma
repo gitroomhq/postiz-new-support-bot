@@ -179,10 +179,15 @@ model BotSettings {
   vaultMigratedAt     DateTime?
   // Temporal migration kill switch: OFF = the legacy in-process setInterval
   // schedulers run exactly as before; ON = they stay stopped and the Temporal
-  // worker owns all background work. Address/namespace come from env
-  // (TEMPORAL_*); the mTLS client cert lives in Vault KV ("temporal" entry).
-  // temporalImportDoneAt = the one-time state import into workflows completed.
-  temporalEnabled      Boolean   @default(false)
+  // worker owns all background work. Connection is edited via /config →
+  // Temporal → Connection (deploy has no .env access; TEMPORAL_* env vars are
+  // first-boot fallbacks only). The mTLS client cert lives in Vault KV
+  // ("temporal" entry). temporalImportDoneAt = one-time state import done.
+  temporalEnabled        Boolean   @default(false)
+  temporalAddress        String?   // "host:port" of the mTLS frontend
+  temporalNamespace      String?
+  temporalTaskQueue      String    @default("support-bot")
+  temporalDeploymentName String    @default("support-bot")
   temporalImportDoneAt DateTime?
   updatedAt           DateTime  @updatedAt
 
