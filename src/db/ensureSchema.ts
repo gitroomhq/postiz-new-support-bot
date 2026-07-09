@@ -357,6 +357,8 @@ const STATEMENTS: string[] = [
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "aiMaxBudgetUsdCause" DOUBLE PRECISION NOT NULL DEFAULT 3.0`,
   // Pre-fetch the customer's live Postiz account into /ai context (prod kill-switch).
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "aiPostizPrefetchEnabled" BOOLEAN NOT NULL DEFAULT true`,
+  // Feed earlier /ai run results on the same ticket back into new /ai runs.
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "aiPreviousRunsEnabled" BOOLEAN NOT NULL DEFAULT true`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "kbRefreshEnabled" BOOLEAN NOT NULL DEFAULT true`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "kbRefreshIntervalHours" INTEGER NOT NULL DEFAULT 6`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "kbLastRefreshAt" TIMESTAMP(3)`,
@@ -419,6 +421,21 @@ const STATEMENTS: string[] = [
   )`,
   `CREATE INDEX IF NOT EXISTS "ai_runs_createdAt_idx" ON "ai_runs"("createdAt")`,
   `CREATE INDEX IF NOT EXISTS "ai_runs_kind_createdAt_idx" ON "ai_runs"("kind", "createdAt")`,
+  // Result text of staff /ai runs, replayed as context into later runs on the
+  // same ticket (purged 3 days after ticket close).
+  `CREATE TABLE IF NOT EXISTS "ticket_ai_runs" (
+    "id" TEXT NOT NULL,
+    "ticketThreadId" TEXT NOT NULL,
+    "subcommand" TEXT NOT NULL,
+    "input" TEXT,
+    "result" TEXT NOT NULL,
+    "invokerId" TEXT NOT NULL,
+    "invokerName" TEXT NOT NULL,
+    "model" TEXT NOT NULL,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT "ticket_ai_runs_pkey" PRIMARY KEY ("id")
+  )`,
+  `CREATE INDEX IF NOT EXISTS "ticket_ai_runs_ticketThreadId_createdAt_idx" ON "ticket_ai_runs"("ticketThreadId", "createdAt")`,
   // AI quality score per closed ticket (unique ticketThreadId = double-scoring guard).
   `CREATE TABLE IF NOT EXISTS "ticket_scores" (
     "id" TEXT NOT NULL,

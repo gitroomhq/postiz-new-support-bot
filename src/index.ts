@@ -39,6 +39,7 @@ import { VaultService } from "./vault/VaultService";
 import { VaultMigrator } from "./vault/VaultMigrator";
 import { SnapshotScheduler } from "./metrics/SnapshotScheduler";
 import { AiRunStore } from "./bot/AiRunStore";
+import { TicketAiRunStore } from "./bot/TicketAiRunStore";
 import { LightAiRunner } from "./bot/LightAiRunner";
 import { TicketScoreStore } from "./scoring/TicketScoreStore";
 import { TicketScoringService } from "./scoring/TicketScoringService";
@@ -116,6 +117,7 @@ async function main() {
   const intercomClient = new IntercomClient(settingsStore);
   const intercomSync = new IntercomSyncService(settingsStore, intercomStore, sessionStore, ticketStore);
   const aiRunStore = new AiRunStore(prisma);
+  const ticketAiRunStore = new TicketAiRunStore(prisma);
   const scoreStore = new TicketScoreStore(prisma);
   const statusService = new StatusService(ticketStore, auditLogger, settingsStore, intercomSync, scoreStore);
   const intercomWebhookHandler = new IntercomWebhookHandler(
@@ -182,7 +184,7 @@ async function main() {
     kbScheduler,
     stripeWebhookHandler,
     intercomInboxApp,
-    { prisma, lightAiRunner, scoringService, scoreStore },
+    { prisma, lightAiRunner, scoringService, scoreStore, ticketAiRunStore },
     { service: vaultService, migrator: vaultMigrator }
   );
   // The client exists as soon as the constructor ran; nothing fires before login.
@@ -211,6 +213,13 @@ async function main() {
 
   const recloseScheduler = new RecloseScheduler(bot.client, ticketStore, auditLogger);
   recloseScheduler.start();
+
+  // /ai run history lives 3 days past ticket close (a reopen inside the window
+  // keeps it) — hourly sweep, plus one pass at boot to catch downtime.
+  const purgeAiRunHistory = () =>
+    ticketAiRunStore.purgeForClosedTickets().catch((e) => bootLog.error("ai run history purge failed", e));
+  void purgeAiRunHistory();
+  setInterval(purgeAiRunHistory, 60 * 60 * 1000);
 
   // Periodically git-pull the cloned Postiz source/docs so AI answers track upstream.
   kbScheduler.start();

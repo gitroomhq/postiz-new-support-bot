@@ -30,6 +30,7 @@ const EXPECTED_COLUMNS: Record<string, string[]> = {
     "sentryReadEnabled", "sentryReadToken", "sentryOrgSlug", "sentryProjectSlug", "sentryReadRegion",
     "aiModel", "aiModelLight",
     "aiEffortAsk", "aiEffortCause", "aiMaxBudgetUsdAsk", "aiMaxBudgetUsdCause", "aiPostizPrefetchEnabled",
+    "aiPreviousRunsEnabled",
     "kbRefreshEnabled", "kbRefreshIntervalHours", "kbLastRefreshAt", "refundMaxPer24hPerUser", "stripeWebhookEnabled",
     "stripeWebhookEndpointId", "stripeWebhookSecret", "publicBaseUrl",
     "influxEnabled", "influxUrl", "influxOrg", "influxBucket", "influxToken",
@@ -73,6 +74,9 @@ const EXPECTED_COLUMNS: Record<string, string[]> = {
     "id", "agentName", "kind", "source", "model", "outcome", "sessionId", "batchId", "numTurns", "durationMs",
     "inputTokens", "outputTokens", "cacheReadTokens", "cacheCreationTokens", "costUsd", "toolCalls", "toolErrors",
     "createdAt",
+  ],
+  ticket_ai_runs: [
+    "id", "ticketThreadId", "subcommand", "input", "result", "invokerId", "invokerName", "model", "createdAt",
   ],
   ticket_scores: [
     "id", "ticketThreadId", "status", "attempts", "batchId", "model", "cxScore", "sentimentStart", "sentimentEnd",

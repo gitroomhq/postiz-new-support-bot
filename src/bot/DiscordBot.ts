@@ -99,6 +99,7 @@ import { PrismaClient } from "../generated/prisma/client";
 import { LightAiRunner } from "./LightAiRunner";
 import { TicketScoringService } from "../scoring/TicketScoringService";
 import { TicketScoreStore } from "../scoring/TicketScoreStore";
+import { TicketAiRunStore } from "./TicketAiRunStore";
 import { reconfigureInflux, pingInflux, influxActive } from "../metrics/InfluxWriter";
 import {
   exportTicketCreated,
@@ -136,7 +137,9 @@ export class DiscordBot {
   // only — a restart invalidates drafts, handled via the "expired" path.
   private aiDraftSessions = new Map<
     string,
-    { text: string; ownerUserId: string; threadId: string; createdAt: number }
+    // runId: the ticket_ai_runs history row — deleted when the draft is posted
+    // (a posted draft lives in the transcript; keeping it would duplicate context).
+    { text: string; ownerUserId: string; threadId: string; createdAt: number; runId: string | null }
   >();
 
   // One concurrent /ai run per user — each run is a Claude Code subprocess.
@@ -175,6 +178,7 @@ export class DiscordBot {
       lightAiRunner: LightAiRunner;
       scoringService: TicketScoringService;
       scoreStore: TicketScoreStore;
+      ticketAiRunStore: TicketAiRunStore;
     },
     // Vault secret storage (drives /config → Vault: panel, test, migrations).
     private vault?: {
@@ -2106,7 +2110,8 @@ export class DiscordBot {
     // gating on it here preserves the "staff runs get no Stripe data" invariant.
     const wantSub = !!options.stripeCustomerId && !!this.config.stripe.secretKey;
     const wantSentry = this.settingsStore.sentryReadConfigured();
-    const [messages, notes, changes, postizAccount, subscription, relatedSentryIssues] =
+    const wantPrevRuns = this.settingsStore.aiPreviousRunsEnabled() && !!this.analytics;
+    const [messages, notes, changes, postizAccount, subscription, relatedSentryIssues, previousRuns] =
       await Promise.all([
         this.fetchAllThreadMessages(thread),
         this.ticketStore.listAllNotes(thread.id),
@@ -2129,6 +2134,9 @@ export class DiscordBot {
             })
               .findIssues(this.buildSentryQuery(ticket.question))
               .catch(() => null)
+          : Promise.resolve(null),
+        wantPrevRuns
+          ? this.analytics!.ticketAiRunStore.listRecent(thread.id, 5).catch(() => null)
           : Promise.resolve(null),
       ]);
 
@@ -2167,6 +2175,16 @@ export class DiscordBot {
       postizAccount,
       subscription,
       relatedSentryIssues,
+      // listRecent returns newest-first; the prompt renders chronologically.
+      previousRuns: previousRuns
+        ? [...previousRuns].reverse().map((r) => ({
+            subcommand: r.subcommand,
+            input: r.input ?? null,
+            result: r.result,
+            invokerName: r.invokerName,
+            createdAt: r.createdAt,
+          }))
+        : null,
       stripeCustomerId: options.stripeCustomerId,
       postizUserId: options.postizUserId,
     };
@@ -2604,6 +2622,34 @@ export class DiscordBot {
         return;
       }
 
+      // Persist the result so later /ai runs on this ticket see it as
+      // "Previous AI runs" context. Best-effort — never fails the command.
+      let historyRunId: string | null = null;
+      if (this.settingsStore.aiPreviousRunsEnabled() && this.analytics) {
+        historyRunId = await this.analytics.ticketAiRunStore
+          .record({
+            ticketThreadId: thread.id,
+            subcommand: sub,
+            input:
+              sub === "ask"
+                ? interaction.options.getString("question", true)
+                : sub === "draft"
+                  ? interaction.options.getString("instructions")
+                  : null,
+            result: text,
+            invokerId: interaction.user.id,
+            invokerName: interaction.user.displayName,
+            model: runOptions.model ?? this.settingsStore.aiModelLight(),
+          })
+          .catch((error) => {
+            this.aiLog.error("run history record failed", error, {
+              "ai.sub": sub,
+              "ticket.thread_id": thread.id,
+            });
+            return null;
+          });
+      }
+
       if (sub === "draft") {
         const token = interaction.id;
         this.pruneAiDraftSessions();
@@ -2612,6 +2658,7 @@ export class DiscordBot {
           ownerUserId: interaction.user.id,
           threadId: thread.id,
           createdAt: Date.now(),
+          runId: historyRunId,
         });
         const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
           new ButtonBuilder().setCustomId(`ai_draft_post:${token}`).setLabel("Post to thread").setStyle(ButtonStyle.Success),
@@ -2706,6 +2753,14 @@ export class DiscordBot {
       .setAuthor({ name: `Sent by ${member.displayName}`, iconURL: member.displayAvatarURL() });
     await thread.send({ embeds: [embed] });
     this.aiDraftSessions.delete(token);
+
+    // The posted draft now lives in the thread transcript — drop its history
+    // row so future /ai runs don't see it twice.
+    if (draft.runId) {
+      void this.analytics?.ticketAiRunStore.delete(draft.runId).catch((error) => {
+        this.aiLog.error("posted-draft history cleanup failed", error, { threadId: thread.id });
+      });
+    }
 
     // Mirror into Intercom like the auto-answer path does.
     void this.intercomSync.onAiAnswer(thread.id, draft.text).catch((error) => {
@@ -3471,6 +3526,7 @@ export class DiscordBot {
           `**Main model:** \`${s.aiModel()}\` — customer answers, \`/ai ask\` & \`/ai cause\``,
           `**Light model:** \`${s.aiModelLight()}\` — the tool-less \`/ai summarize\` & \`/ai draft\``,
           `**Speed limits:** ask → effort \`${s.aiEffortAsk()}\`, ≤ $${s.aiMaxBudgetUsdAsk()}/run · cause → effort \`${s.aiEffortCause()}\`, ≤ $${s.aiMaxBudgetUsdCause()}/run`,
+          `**Previous runs:** ${s.aiPreviousRunsEnabled() ? "replayed into new `/ai` runs on the same ticket (kept 3 days after close)" : "off"}`,
           "",
           `**Knowledge-base auto-refresh:** ${s.kbRefreshEnabled() ? `on — every ${s.kbRefreshIntervalHours()}h` : "off"}`,
           `**Last refresh:** ${last ? `<t:${Math.floor(last.getTime() / 1000)}:R>` : "_never_"}`,
@@ -3485,7 +3541,11 @@ export class DiscordBot {
       new ButtonBuilder()
         .setCustomId("config_toggle_postiz_prefetch")
         .setLabel(`Postiz prefetch: ${s.aiPostizPrefetchEnabled() ? "on" : "off"}`)
-        .setStyle(s.aiPostizPrefetchEnabled() ? ButtonStyle.Success : ButtonStyle.Secondary)
+        .setStyle(s.aiPostizPrefetchEnabled() ? ButtonStyle.Success : ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId("config_toggle_prev_runs")
+        .setLabel(`Previous runs: ${s.aiPreviousRunsEnabled() ? "on" : "off"}`)
+        .setStyle(s.aiPreviousRunsEnabled() ? ButtonStyle.Success : ButtonStyle.Secondary)
     );
     const kbRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder()
@@ -4689,6 +4749,18 @@ export class DiscordBot {
       this.auditConfig(
         interaction,
         `Postiz account pre-fetch → ${this.settingsStore.aiPostizPrefetchEnabled() ? "on" : "off"}`
+      );
+      await interaction.update(this.buildAiPanel());
+      return;
+    }
+
+    if (id === "config_toggle_prev_runs") {
+      await this.settingsStore.updateGeneral({
+        aiPreviousRunsEnabled: !this.settingsStore.aiPreviousRunsEnabled(),
+      });
+      this.auditConfig(
+        interaction,
+        `Previous /ai runs in context → ${this.settingsStore.aiPreviousRunsEnabled() ? "on" : "off"}`
       );
       await interaction.update(this.buildAiPanel());
       return;

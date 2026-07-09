@@ -297,6 +297,11 @@ export class SettingsStore {
     return this.settings.aiPostizPrefetchEnabled;
   }
 
+  // Feed earlier /ai run results on the same ticket back into new /ai runs.
+  aiPreviousRunsEnabled(): boolean {
+    return this.settings.aiPreviousRunsEnabled;
+  }
+
   kbRefreshEnabled(): boolean {
     return this.settings.kbRefreshEnabled;
   }
@@ -913,6 +918,7 @@ export class SettingsStore {
     aiMaxBudgetUsdAsk?: number;
     aiMaxBudgetUsdCause?: number;
     aiPostizPrefetchEnabled?: boolean;
+    aiPreviousRunsEnabled?: boolean;
     maxOpenTicketsPerUser?: number;
     ticketCooldownMinutes?: number;
     auditLogChannelId?: string | null;

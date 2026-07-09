@@ -128,6 +128,8 @@ model BotSettings {
   // Pre-fetch the ticket customer's live Postiz account (channels + recent posts)
   // into the /ai ask|cause context. Kill-switch for prod (no .env on deploy).
   aiPostizPrefetchEnabled Boolean @default(true)
+  // Feed earlier /ai run results on the same ticket back into new /ai runs.
+  aiPreviousRunsEnabled Boolean @default(true)
   // Knowledge-base auto-refresh: git pull the cloned Postiz source/docs on a timer.
   kbRefreshEnabled       Boolean   @default(true)
   kbRefreshIntervalHours Int       @default(6)
@@ -205,6 +207,25 @@ model AiRun {
   @@index([createdAt])
   @@index([kind, createdAt])
   @@map("ai_runs")
+}
+
+// Result text of a staff /ai run (ask|cause|draft|summarize), replayed as
+// "Previous AI runs" context into later runs on the same ticket. Posted drafts
+// are deleted (they land in the transcript); the rest is purged 3 days after
+// the ticket closes (a reopen within that window keeps the history).
+model TicketAiRun {
+  id             String   @id @default(cuid())
+  ticketThreadId String
+  subcommand     String   // "ask" | "cause" | "draft" | "summarize"
+  input          String?  // the ask question / draft instructions
+  result         String
+  invokerId      String
+  invokerName    String
+  model          String
+  createdAt      DateTime @default(now())
+
+  @@index([ticketThreadId, createdAt])
+  @@map("ticket_ai_runs")
 }
 
 // AI quality evaluation of a closed ticket (one row per ticket — the unique

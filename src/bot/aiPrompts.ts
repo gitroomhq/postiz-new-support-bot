@@ -25,6 +25,14 @@ export interface AiHistoryLine {
   createdAt: Date;
 }
 
+export interface AiPreviousRunLine {
+  subcommand: string; // "ask" | "cause" | "draft" | "summarize"
+  input: string | null; // the ask question / draft instructions
+  result: string;
+  invokerName: string;
+  createdAt: Date;
+}
+
 export interface AiSubscriptionSummary {
   status: string;
   plan: string | null;
@@ -53,6 +61,8 @@ export interface AiTicketContext {
   subscription?: AiSubscriptionSummary | null;
   /** Heuristically-correlated Sentry issues (null when read access not configured). */
   relatedSentryIssues?: SentryIssue[] | null;
+  /** Earlier /ai run results on this ticket, oldest first (null when disabled/none). */
+  previousRuns?: AiPreviousRunLine[] | null;
   /** Only set when the Stripe MCP server is attached (admin invoker). */
   stripeCustomerId?: string | null;
   postizUserId?: string | null;
@@ -74,6 +84,10 @@ const TRANSCRIPT_HEAD_BUDGET = 10_000;
 const POSTIZ_FACTS_BUDGET = 4_000;
 const MAX_ERROR_POSTS = 12;
 const SENTRY_FACTS_BUDGET = 6_000;
+// Previous /ai run results replayed into new runs — secondary context, so it
+// gets a hard cap well below the transcript's.
+const PREVIOUS_RUNS_BUDGET = 12_000;
+const PREVIOUS_RUN_RESULT_BUDGET = 2_500;
 
 function renderTranscript(lines: AiTranscriptLine[]): string {
   const rendered = lines.map(
@@ -167,6 +181,36 @@ function renderSentryIssues(issues: SentryIssue[]): string {
     : out;
 }
 
+// Chronological (oldest first, matching the transcript), newest runs win the
+// budget: we drop whole runs from the front when the section would overflow.
+function renderPreviousRuns(runs: AiPreviousRunLine[]): string {
+  const rendered = runs.map((r) => {
+    const result =
+      r.result.length > PREVIOUS_RUN_RESULT_BUDGET
+        ? `${r.result.slice(0, PREVIOUS_RUN_RESULT_BUDGET)}\n[... run output truncated ...]`
+        : r.result;
+    const header = `### [${r.createdAt.toISOString()}] /ai ${r.subcommand} by ${r.invokerName}`;
+    const input = r.input
+      ? `${r.subcommand === "ask" ? "Staff question" : "Staff instructions"}: ${r.input}\n`
+      : "";
+    return `${header}\n${input}${result}`;
+  });
+  const kept: string[] = [];
+  let len = 0;
+  for (let i = rendered.length - 1; i >= 0; i--) {
+    if (len + rendered[i].length > PREVIOUS_RUNS_BUDGET) break;
+    kept.unshift(rendered[i]);
+    len += rendered[i].length + 2;
+  }
+  const note =
+    "_Earlier /ai runs on this ticket (staff-only). They may predate newer messages — " +
+    "the transcript and live data above are authoritative. Build on them instead of redoing the same analysis._";
+  const dropped = rendered.length - kept.length;
+  return [note, ...(dropped > 0 ? [`[... ${dropped} older run(s) omitted ...]`] : []), ...kept].join(
+    "\n\n"
+  );
+}
+
 function renderSubscription(sub: AiSubscriptionSummary): string {
   const bits = [`- Status: ${sub.status}`];
   if (sub.plan) bits.push(`- Plan: ${sub.plan}`);
@@ -227,6 +271,11 @@ export function buildTicketContextBlock(ctx: AiTicketContext): string {
         `- [${h.createdAt.toISOString()}] ${h.kind}: ${h.fromLabel ?? "(none)"} → ${h.toLabel} (by ${h.actorName})`
       );
     }
+  }
+
+  if (ctx.previousRuns && ctx.previousRuns.length > 0) {
+    parts.push("\n## Previous AI runs on this ticket");
+    parts.push(renderPreviousRuns(ctx.previousRuns));
   }
 
   return parts.join("\n");
