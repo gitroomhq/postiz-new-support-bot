@@ -3968,7 +3968,9 @@ export class DiscordBot {
         `**Connection:** ${
           state === "up" ? "✅ up" : state === "down" ? `❌ down${svc.downSince() ? ` since ${rel(svc.downSince()!)}` : ""}` : `⚪ not configured${configError ? ` — ${configError}` : ""}`
         }`,
-        `**Address / namespace:** \`${cfg.address || "—"}\` · \`${cfg.namespace || "—"}\` · queue \`${cfg.taskQueue}\``
+        `**Address / namespace:** \`${cfg.address || "—"}\` · \`${cfg.namespace || "—"}\` · queue \`${cfg.taskQueue}\`${
+          cfg.tlsServerName ? ` · SNI \`${cfg.tlsServerName}\`` : ""
+        }`
       );
       const cert = svc.certInfo();
       lines.push(
@@ -4149,6 +4151,14 @@ export class DiscordBot {
             .setStyle(TextInputStyle.Short)
             .setRequired(false)
             .setValue(cfg.deploymentName)
+        ),
+        new ActionRowBuilder<TextInputBuilder>().addComponents(
+          new TextInputBuilder()
+            .setCustomId("tls_server_name")
+            .setLabel("TLS server name (SNI; when dialing by IP)")
+            .setStyle(TextInputStyle.Short)
+            .setRequired(false)
+            .setValue(cfg.tlsServerName ?? "")
         )
       );
       await interaction.showModal(modal);
@@ -6646,6 +6656,7 @@ export class DiscordBot {
       const namespace = interaction.fields.getTextInputValue("namespace").trim();
       const taskQueue = interaction.fields.getTextInputValue("task_queue").trim() || "support-bot";
       const deployment = interaction.fields.getTextInputValue("deployment").trim() || "support-bot";
+      const tlsServerName = interaction.fields.getTextInputValue("tls_server_name").trim();
       if (address && !/^[\w.-]+:\d+$/.test(address)) {
         await interaction.reply({
           embeds: [makeEmbed("Address must be `host:port` (e.g. `10.0.0.5:7233`).", COLORS.danger)],
@@ -6659,6 +6670,7 @@ export class DiscordBot {
         temporalNamespace: namespace || null,
         temporalTaskQueue: taskQueue,
         temporalDeploymentName: deployment,
+        temporalTlsServerName: tlsServerName || null,
       });
       await this.temporalOps?.service.reconfigure();
       this.auditConfig(interaction, `Temporal connection → \`${address || "—"}\` / \`${namespace || "—"}\` (queue \`${taskQueue}\`)`);
@@ -6666,7 +6678,7 @@ export class DiscordBot {
         embeds: [
           makeEmbed(
             [
-              `Connection saved — address \`${address || "—"}\`, namespace \`${namespace || "—"}\`, task queue \`${taskQueue}\`, deployment \`${deployment}\`.`,
+              `Connection saved — address \`${address || "—"}\`, namespace \`${namespace || "—"}\`, task queue \`${taskQueue}\`, deployment \`${deployment}\`${tlsServerName ? `, TLS server name \`${tlsServerName}\`` : ""}.`,
               this.settingsStore.temporalEnabled() && this.temporalOps?.workerManager.running()
                 ? "⚠️ The running worker keeps its old connection — toggle Temporal off/on to apply the change."
                 : "",

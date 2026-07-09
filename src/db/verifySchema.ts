@@ -39,7 +39,7 @@ const EXPECTED_COLUMNS: Record<string, string[]> = {
     "vaultEnabled", "vaultAddr", "vaultToken", "vaultKvMount", "vaultKvBasePath",
     "vaultTransitMount", "vaultTransitKey", "vaultMigratedAt",
     "temporalEnabled", "temporalAddress", "temporalNamespace", "temporalTaskQueue",
-    "temporalDeploymentName", "temporalImportDoneAt", "updatedAt",
+    "temporalDeploymentName", "temporalTlsServerName", "temporalImportDoneAt", "updatedAt",
   ],
   status_tags: [
     "id", "emoji", "label", "isInitial", "closesThread", "reminderEnabled", "reminderDays", "reminderTarget",

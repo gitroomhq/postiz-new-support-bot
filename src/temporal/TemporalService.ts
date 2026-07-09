@@ -26,6 +26,8 @@ export interface TemporalEnvConfig {
   namespace: string;
   taskQueue: string;
   deploymentName: string;
+  // TLS SNI / server-name override (dialing by IP with a hostname cert).
+  tlsServerName: string | null;
 }
 
 const PROBE_INTERVAL_MS = 30_000;
@@ -121,6 +123,7 @@ export class TemporalService {
       namespace: this.settings.temporalNamespace() ?? "",
       taskQueue: this.settings.temporalTaskQueue(),
       deploymentName: this.settings.temporalDeploymentName(),
+      tlsServerName: this.settings.temporalTlsServerName(),
     };
   }
 
@@ -268,6 +271,8 @@ export class TemporalService {
               key: Buffer.from(tls.clientKeyPem),
             },
             ...(tls.caPem ? { serverRootCACertificate: Buffer.from(tls.caPem) } : {}),
+            // SNI/cert-hostname override — needed when dialing by IP.
+            ...(cfg.tlsServerName ? { serverNameOverride: cfg.tlsServerName } : {}),
           },
           connectTimeout: CONNECT_TIMEOUT,
         });

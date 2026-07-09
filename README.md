@@ -29,7 +29,7 @@ Almost everything is configured live through the admin-only **`/config`** panel 
 
 **Optional** (feature-gating, or first-boot seeds that `/config` then owns): `DISCORD_THREADS_CHANNEL_ID`, `DISCORD_SUPPORT_ROLE_ID`, `POSTIZ_FRONTEND_URL`, `POSTIZ_API_URL`, `POSTIZ_CLIENT_ID`, `POSTIZ_CLIENT_SECRET`, `POSTIZ_CALLBACK_URL`, `GH_BOT_TOKEN`, `GH_BOT_REPO`, `STRIPE_DISCOUNT_COUPON_ID`, `SERVER_PORT` (default 3000), `SENTRY_DSN`, `INTERCOM_*`, `SCHEMA_DRIFT_STRICT`.
 
-**Temporal**: the connection (address `host:port`, namespace, task queue, deployment name) is edited live via **`/config → Temporal → Connection`** and stored in `BotSettings` — no env access needed. The `TEMPORAL_*` env vars exist only as optional first-boot fallbacks (like `INTERCOM_*`); `GIT_SHA` is the build-id fallback for `.git`-less deploys.
+**Temporal**: the connection (address `host:port`, namespace, task queue, deployment name, TLS server-name/SNI override for dialing by IP) is edited live via **`/config → Temporal → Connection`** and stored in `BotSettings` — no env access needed. The `TEMPORAL_*` env vars exist only as optional first-boot fallbacks (like `INTERCOM_*`); `GIT_SHA` is the build-id fallback for `.git`-less deploys.
 
 ### Temporal server prerequisites
 

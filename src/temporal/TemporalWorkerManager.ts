@@ -71,6 +71,8 @@ export class TemporalWorkerManager {
           key: Buffer.from(tls.clientKeyPem),
         },
         ...(tls.caPem ? { serverRootCACertificate: Buffer.from(tls.caPem) } : {}),
+        // SNI/cert-hostname override — needed when dialing by IP.
+        ...(cfg.tlsServerName ? { serverNameOverride: cfg.tlsServerName } : {}),
       },
     });
 

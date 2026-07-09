@@ -188,6 +188,9 @@ model BotSettings {
   temporalNamespace      String?
   temporalTaskQueue      String    @default("support-bot")
   temporalDeploymentName String    @default("support-bot")
+  // TLS SNI / server-name override — needed when dialing by IP while the
+  // server cert carries a hostname. Null = derive from the address.
+  temporalTlsServerName  String?
   temporalImportDoneAt DateTime?
   updatedAt           DateTime  @updatedAt
 

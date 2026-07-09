@@ -831,6 +831,12 @@ export class SettingsStore {
     return this.settings.temporalDeploymentName?.trim() || (process.env.TEMPORAL_DEPLOYMENT_NAME ?? "").trim() || "support-bot";
   }
 
+  // TLS SNI / server-name override for dialing by IP while the server cert
+  // carries a hostname. Null = let gRPC derive it from the address.
+  temporalTlsServerName(): string | null {
+    return this.settings.temporalTlsServerName?.trim() || (process.env.TEMPORAL_TLS_SERVER_NAME ?? "").trim() || null;
+  }
+
   // Stamp of the one-time legacy-state import into workflows (open tickets,
   // pending outbox/inbox rows). Null = never ran.
   temporalImportDoneAt(): Date | null {
@@ -843,6 +849,7 @@ export class SettingsStore {
     temporalNamespace?: string | null;
     temporalTaskQueue?: string;
     temporalDeploymentName?: string;
+    temporalTlsServerName?: string | null;
     temporalImportDoneAt?: Date | null;
   }): Promise<void> {
     this.settings = await this.prisma.botSettings.update({

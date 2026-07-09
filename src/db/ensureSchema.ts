@@ -508,6 +508,7 @@ const STATEMENTS: string[] = [
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "temporalNamespace" TEXT`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "temporalTaskQueue" TEXT NOT NULL DEFAULT 'support-bot'`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "temporalDeploymentName" TEXT NOT NULL DEFAULT 'support-bot'`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "temporalTlsServerName" TEXT`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "temporalImportDoneAt" TIMESTAMP(3)`,
 ];
 
