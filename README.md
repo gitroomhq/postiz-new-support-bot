@@ -10,7 +10,8 @@ A Discord-first customer support bot for [Postiz](https://github.com/gitroomhq/p
 - **InfluxDB export** (`src/metrics/`): optional InfluxDB 2.x exporter for *everything* — ticket lifecycle events, response times, CSAT, AI usage & cost per run (also persisted to the `ai_runs` table), AI quality scores, billing events (refunds/discounts/charge reviews/disputes/fraud warnings), Intercom queue depths and periodic backlog gauges. Connection (url/org/bucket/token — token encrypted at rest) is set in `/config → Analytics`, which also offers a one-time historical backfill. Five ready-made Grafana dashboards live in `grafana/dashboards/`.
 - **Intercom bridge** (`src/intercom/`): optional two-way sync (`none` / `push` / `bi`) of each Discord ticket to an Intercom conversation + customer ticket, with a durable outbox/inbox, echo-suppression, and a Canvas Kit inbox sidebar. HMAC-verified webhooks.
 - **Stripe** (`src/bot/StripeClient.ts`, `BillingAdmin`, `src/bot/billing/`): customer self-service "refund & cancel" with guardrails (amount cap, per-24h velocity global + per-user, min membership age), plus a large staff `/billing` admin console. Dispute / early-fraud-warning **webhooks** are registered programmatically (no dashboard access needed) and alert staff.
-- **Observability** (`@sentry/node`): errors, gen_ai spans, wide-event logs, and metrics. DSN and all knobs are set at runtime via `/config → Sentry`.
+- **Observability** (`@sentry/node`): errors, gen_ai spans, wide-event logs, and metrics. DSN and all knobs are set at runtime via `/config → Sentry`. The Sentry release is the 6-char git SHA — the same id as the Temporal worker deployment version.
+- **Temporal** (`src/temporal/`): all background work can run on a self-hosted [Temporal](https://temporal.io) server instead of the legacy in-process `setInterval` schedulers — long-lived per-ticket workflows (reminders, auto-close, re-close, the Intercom outbox pump), per-conversation inbound workflows, looping singletons (KB refresh, scoring, snapshots, cleanup), a Schedule for the status report, and short workflows per Stripe event / refund / AI run. Toggled live via `/config → Temporal` (kill switch `temporalEnabled`); the one-time **Run Migration Import** starts workflows for existing open tickets and replays pending queue rows.
 
 ## Data model
 
@@ -28,14 +29,27 @@ Almost everything is configured live through the admin-only **`/config`** panel 
 
 **Optional** (feature-gating, or first-boot seeds that `/config` then owns): `DISCORD_THREADS_CHANNEL_ID`, `DISCORD_SUPPORT_ROLE_ID`, `POSTIZ_FRONTEND_URL`, `POSTIZ_API_URL`, `POSTIZ_CLIENT_ID`, `POSTIZ_CLIENT_SECRET`, `POSTIZ_CALLBACK_URL`, `GH_BOT_TOKEN`, `GH_BOT_REPO`, `STRIPE_DISCOUNT_COUPON_ID`, `SERVER_PORT` (default 3000), `SENTRY_DSN`, `INTERCOM_*`, `SCHEMA_DRIFT_STRICT`.
 
+**Temporal** (all optional; the feature is gated by the `/config → Temporal` toggle): `TEMPORAL_ADDRESS` (`host:port` of the mTLS frontend), `TEMPORAL_NAMESPACE` (create it yourself on the server), `TEMPORAL_TASK_QUEUE` (default `support-bot`), `TEMPORAL_DEPLOYMENT_NAME` (default `support-bot`), `GIT_SHA` (build-id fallback for `.git`-less deploys).
+
+### Temporal server prerequisites
+
+- Self-hosted Temporal **≥ 1.28** with [Worker Deployment Versioning](https://docs.temporal.io/worker-deployments) enabled (dynamic config `system.enableDeploymentVersions: true`) and SQL visibility (for `CountWorkflowExecutions`).
+- A dedicated namespace (retention ≥ 14 days recommended — ticket workflows stay open 14 days past close).
+- mTLS client cert/key (+ optional CA) — entered via `/config → Temporal → Certificates`, stored in **Vault KV** under `<kvBasePath>/temporal` (no local fallback; Vault must be up). Cert rotation needs a Temporal off/on toggle or a restart.
+- On every boot the worker registers its build (deployment `TEMPORAL_DEPLOYMENT_NAME`, build id = `git rev-parse --short=6 HEAD`) and **auto-promotes it to the deployment's Current Version**; re-deploying an older SHA re-promotes it (that's the rollback story). Workflows default to AUTO_UPGRADE.
+- Rollout: deploy with the toggle OFF (legacy schedulers unchanged) → enter certs → **Test Connection** → toggle ON → **Run Migration Import** → verify in the Temporal UI + audit channel. The toggle is the kill switch back to legacy at any time.
+- `--worker-only` runs a process that only polls the task queue (logs into Discord for activities, no commands/HTTP) — the future split topology.
+
 > **Secrets at rest** (Postiz OAuth access tokens, Intercom credentials, the Stripe webhook signing secret) are encrypted with AES-256-GCM. The key is derived (HKDF) from `STRIPE_SECRET_KEY` + `DATABASE_URL` + `DISCORD_TOKEN`, so a database dump alone cannot decrypt them. Rotating any of those three orphans existing ciphertext (fail-soft: affected users re-auth / secrets are re-entered).
 
 ## Setup
 
 ```bash
 pnpm install          # postinstall shallow-clones postiz-app + postiz-docs into search/
-pnpm build            # prisma generate && tsc
+pnpm build            # prisma generate && tsc && workflow bundle (dist/temporal/workflow-bundle.js)
 pnpm start            # node (with Sentry preload) dist/index.js
+pnpm test             # unit tests (node:test)
+pnpm test:temporal    # opt-in Temporal time-skipping integration tests (downloads a test server binary)
 # dev: pnpm dev       # ts-node
 ```
 
@@ -55,6 +69,7 @@ src/
 ├── metrics/            # InfluxDB writer + exporters + snapshot scheduler
 ├── scoring/            # AI ticket scoring (Batch API pipeline + scheduler)
 ├── server/             # Express callback + webhook server
+├── temporal/           # Temporal platform (service/worker/producers) + workflows/ + activities/
 ├── db/                 # ensureSchema + verifySchema
 └── util/               # embeds, logger (Sentry), crypto, instrument
 grafana/dashboards/     # 5 importable Grafana dashboards (InfluxDB 2.x / Flux)

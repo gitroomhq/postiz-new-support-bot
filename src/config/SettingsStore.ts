@@ -804,6 +804,27 @@ export class SettingsStore {
     });
   }
 
+  // ---- Temporal (kill switch; connection is env-only, certs live in Vault KV) ----
+
+  // OFF = the legacy in-process setInterval schedulers run; ON = they stay
+  // stopped and the Temporal worker owns all background work.
+  temporalEnabled(): boolean {
+    return this.settings.temporalEnabled;
+  }
+
+  // Stamp of the one-time legacy-state import into workflows (open tickets,
+  // pending outbox/inbox rows). Null = never ran.
+  temporalImportDoneAt(): Date | null {
+    return this.settings.temporalImportDoneAt;
+  }
+
+  async updateTemporal(data: { temporalEnabled?: boolean; temporalImportDoneAt?: Date | null }): Promise<void> {
+    this.settings = await this.prisma.botSettings.update({
+      where: { id: "global" },
+      data,
+    });
+  }
+
   async recordScoringRun(): Promise<void> {
     this.settings = await this.prisma.botSettings.update({
       where: { id: "global" },

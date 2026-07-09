@@ -25,6 +25,14 @@ export interface BotConfig {
     port: number;
     callbackUrl: string;
   };
+  temporal: {
+    // "host:port" of the self-hosted Temporal frontend (mTLS). Empty = not
+    // configured; the /config → Temporal toggle refuses to switch on.
+    address: string;
+    namespace: string;
+    taskQueue: string;
+    deploymentName: string;
+  };
 }
 
 export function loadConfig(): BotConfig {
@@ -76,6 +84,16 @@ export function loadConfig(): BotConfig {
     server: {
       port: parseInt(process.env.SERVER_PORT || "3000", 10),
       callbackUrl: optional("POSTIZ_CALLBACK_URL"),
+    },
+    temporal: {
+      // Deliberately quiet when unset (no optional() warning): Temporal is an
+      // opt-in feature gated by the temporalEnabled DB toggle, and most deploys
+      // without it shouldn't warn on every boot. The mTLS client cert/key are
+      // NOT env — they live in Vault KV under the "temporal" integration.
+      address: (process.env.TEMPORAL_ADDRESS ?? "").trim(),
+      namespace: (process.env.TEMPORAL_NAMESPACE ?? "").trim(),
+      taskQueue: (process.env.TEMPORAL_TASK_QUEUE ?? "").trim() || "support-bot",
+      deploymentName: (process.env.TEMPORAL_DEPLOYMENT_NAME ?? "").trim() || "support-bot",
     },
   };
 }

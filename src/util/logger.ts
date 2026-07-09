@@ -36,14 +36,14 @@ let profilingAttached = false;
 // registration), so spans would flow into the dead client. Force a restart.
 let everClosed = false;
 
-// dist/util/logger.js → ../../package.json resolves to the repo root; same
-// depth applies under ts-node from src/util. require(), not import: rootDir
-// is ./src so tsc rejects JSON imports from outside it.
+// Release = the 6-char git SHA that also names the Temporal worker deployment
+// version, so Sentry issues map 1:1 to deployed builds. buildId.ts is
+// dependency-free (it must never import this module back).
 export function appRelease(): string {
   try {
     // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const pkg = require("../../package.json") as { name?: string; version?: string };
-    return `${pkg.name ?? "postiz-support-bot"}@${pkg.version ?? "0.0.0"}`;
+    const { resolveBuildId } = require("../temporal/buildId") as { resolveBuildId: () => string };
+    return `postiz-support-bot@${resolveBuildId()}`;
   } catch {
     return "postiz-support-bot@unknown";
   }

@@ -37,7 +37,8 @@ const EXPECTED_COLUMNS: Record<string, string[]> = {
     "scoringEnabled", "scoringIntervalHours", "scoringModel", "scoringMaxTicketsPerBatch",
     "scoringMaxBudgetUsdPerDay", "scoringLastRunAt", "scoringBackfillPending",
     "vaultEnabled", "vaultAddr", "vaultToken", "vaultKvMount", "vaultKvBasePath",
-    "vaultTransitMount", "vaultTransitKey", "vaultMigratedAt", "updatedAt",
+    "vaultTransitMount", "vaultTransitKey", "vaultMigratedAt",
+    "temporalEnabled", "temporalImportDoneAt", "updatedAt",
   ],
   status_tags: [
     "id", "emoji", "label", "isInitial", "closesThread", "reminderEnabled", "reminderDays", "reminderTarget",
@@ -81,7 +82,7 @@ const EXPECTED_COLUMNS: Record<string, string[]> = {
   ticket_scores: [
     "id", "ticketThreadId", "status", "attempts", "batchId", "model", "cxScore", "sentimentStart", "sentimentEnd",
     "agentTone", "agentClarity", "agentCorrectness", "resolution", "fcr", "escalationNeeded", "topic", "rootCause",
-    "summary", "staffScores", "inputTokens", "outputTokens", "costUsd", "error", "scoredAt", "createdAt",
+    "summary", "staffScores", "staffNames", "inputTokens", "outputTokens", "costUsd", "error", "scoredAt", "createdAt",
   ],
   scoring_batches: [
     "id", "anthropicBatchId", "status", "purpose", "model", "requestCount", "succeededCount", "erroredCount",

@@ -11,6 +11,7 @@ import {
   TicketScoreResultType,
   renderScoringUserMessage,
 } from "./scoringPrompt";
+import { reconcileStaffNames } from "./staffNames";
 import { exportAiRun, exportTicketScore } from "../metrics/MetricsExporter";
 import { log } from "../util/logger";
 import { metricCount } from "../util/instrument";
@@ -93,15 +94,18 @@ export class TicketScoringService {
 
   // Full thread transcript, oldest-first, rendered for the scoring prompt.
   // Returns null when the thread no longer exists. Works on archived threads.
+  // staffNames is the exact set of STAFF display names in the transcript —
+  // the allowlist the model's staff[] output is reconciled against later.
   private async fetchTranscript(
     ticket: Ticket
-  ): Promise<{ text: string; customerMessages: number } | null> {
+  ): Promise<{ text: string; customerMessages: number; staffNames: string[] } | null> {
     if (!this.client) throw new Error("Discord client not bound yet");
     const channel = await this.client.channels.fetch(ticket.threadId).catch(() => null);
     if (!channel || !channel.isThread()) return null;
     const thread = channel as ThreadChannel;
 
     const collected: Array<{ ts: Date; role: string; name: string; content: string }> = [];
+    const staffNames = new Set<string>();
     let customerMessages = 0;
     let before: string | undefined;
     for (;;) {
@@ -121,12 +125,9 @@ export class TicketScoringService {
         const content = `${message.content}${attachments}${embeds && !message.content ? embeds : ""}`.trim();
         if (!content) continue;
         if (role === "CUSTOMER") customerMessages++;
-        collected.push({
-          ts: message.createdAt,
-          role,
-          name: message.member?.displayName ?? message.author.displayName ?? message.author.username,
-          content,
-        });
+        const name = message.member?.displayName ?? message.author.displayName ?? message.author.username;
+        if (role === "STAFF") staffNames.add(name);
+        collected.push({ ts: message.createdAt, role, name, content });
       }
       before = batch.last()?.id;
       if (batch.size < 100) break;
@@ -152,7 +153,31 @@ export class TicketScoringService {
         "\n[... transcript truncated: middle portion removed ...]\n" +
         text.slice(text.length - tail);
     }
-    return { text, customerMessages };
+    return { text, customerMessages, staffNames: [...staffNames] };
+  }
+
+  // Snap the model's staff[] names to the transcript's real display names and
+  // drop invented ones — a single garbled name would otherwise live forever as
+  // a phantom staff tag in Influx. Mutates parsed in place so Postgres and
+  // Influx see the same reconciled list; the logs keep the raw model output.
+  private reconcileParsedStaff(threadId: string, parsed: TicketScoreResultType, known: string[] | null): void {
+    const { staff, snapped, dropped } = reconcileStaffNames(parsed.staff, known);
+    for (const s of snapped) {
+      scoreLog.warn("scoring.staff_name_snapped", {
+        "ticket.thread_id": threadId,
+        "scoring.staff_from": s.from,
+        "scoring.staff_to": s.to,
+      });
+    }
+    for (const name of dropped) {
+      scoreLog.warn("scoring.staff_name_dropped", {
+        "ticket.thread_id": threadId,
+        "scoring.staff_from": name,
+      });
+    }
+    if (snapped.length) metricCount("scoring.staff_names_snapped", snapped.length);
+    if (dropped.length) metricCount("scoring.staff_names_dropped", dropped.length);
+    parsed.staff = staff;
   }
 
   private buildRequestParams(ticket: Ticket, transcript: string): Anthropic.Messages.MessageCreateParamsNonStreaming {
@@ -228,6 +253,7 @@ export class TicketScoringService {
     }
 
     const requests: Anthropic.Messages.Batches.BatchCreateParams.Request[] = [];
+    const staffNamesByThread = new Map<string, string[]>();
     let skipped = 0;
     for (const ticket of tickets) {
       try {
@@ -242,6 +268,7 @@ export class TicketScoringService {
           skipped++;
           continue;
         }
+        staffNamesByThread.set(ticket.threadId, transcript.staffNames);
         requests.push({ custom_id: ticket.threadId, params: this.buildRequestParams(ticket, transcript.text) });
       } catch (err) {
         scoreLog.warn("scoring.transcript_failed", {
@@ -266,7 +293,7 @@ export class TicketScoringService {
       requestCount: requests.length,
     });
     await this.scoreStore.markPending(
-      requests.map((r) => r.custom_id),
+      requests.map((r) => ({ ticketThreadId: r.custom_id, staffNames: staffNamesByThread.get(r.custom_id) ?? [] })),
       batch.id,
       this.settings.scoringModel()
     );
@@ -308,6 +335,9 @@ export class TicketScoringService {
 
   private async processEndedBatch(anthropicBatchId: string, model: string): Promise<void> {
     const tickets = new Map<string, Ticket | null>();
+    // Staff-name snapshots persisted at submit time (map value null = row from
+    // before the snapshot existed → names pass through unvalidated).
+    const knownStaff = await this.scoreStore.staffNamesForBatch(anthropicBatchId);
     const totals: ResultUsage = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 };
     let succeeded = 0;
     let errored = 0;
@@ -336,6 +366,7 @@ export class TicketScoringService {
             .map((b) => b.text)
             .join("");
           const parsed = TicketScoreResult.parse(JSON.parse(text));
+          this.reconcileParsedStaff(threadId, parsed, knownStaff.get(threadId) ?? null);
           const costUsd = batchCostUsd(model, usage);
           await this.scoreStore.recordScored(
             threadId,
@@ -448,6 +479,7 @@ export class TicketScoringService {
       .map((b) => b.text)
       .join("");
     const parsed = TicketScoreResult.parse(JSON.parse(text));
+    this.reconcileParsedStaff(threadId, parsed, transcript.staffNames);
 
     const usage: ResultUsage = {
       inputTokens: response.usage.input_tokens ?? 0,
@@ -458,7 +490,7 @@ export class TicketScoringService {
     // Non-batch = 2x the batch rate.
     const costUsd = batchCostUsd(model, usage) * 2;
 
-    await this.scoreStore.markPending([threadId], "manual", model);
+    await this.scoreStore.markPending([{ ticketThreadId: threadId, staffNames: transcript.staffNames }], "manual", model);
     await this.scoreStore.recordScored(
       threadId,
       parsed,

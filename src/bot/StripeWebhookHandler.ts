@@ -7,6 +7,7 @@ import { COLORS } from "../util/embeds";
 import { log } from "../util/logger";
 import { metricCount } from "../util/instrument";
 import { exportBillingEvent } from "../metrics/MetricsExporter";
+import { TemporalBufferedError, type TemporalProducers } from "../temporal/producers";
 
 const hookLog = log.child("stripe-webhook");
 
@@ -102,7 +103,28 @@ export class StripeWebhookHandler {
 
   // Verified event → dedup → dispatch. Best-effort: a handler failure never
   // rethrows out of the HTTP route (we already 200'd).
+  // Temporal seam: when active, each verified event becomes a
+  // stripeEventWorkflow (workflowId = event id ⇒ server-side dedup on top of
+  // the claim below). A buffered start (Temporal down) throws
+  // TemporalBufferedError so the route answers 503 and Stripe redelivers.
+  private temporalProducers: TemporalProducers | null = null;
+
+  setTemporalProducers(producers: TemporalProducers): void {
+    this.temporalProducers = producers;
+  }
+
   async handle(event: Stripe.Event): Promise<void> {
+    if (this.temporalProducers?.enabled()) {
+      const r = await this.temporalProducers.stripeEvent(event.id, JSON.stringify(event));
+      if (!r.ok && r.buffered) throw new TemporalBufferedError("stripe event buffered — Stripe should redeliver");
+      return;
+    }
+    await this.handleDirect(event);
+  }
+
+  // The actual processing (dedup claim + dispute/fraud alerts) — the body of
+  // the Temporal handleStripeEvent activity and of the legacy path.
+  async handleDirect(event: Stripe.Event): Promise<void> {
     if (!this.settings.stripeWebhookEnabled()) return; // toggled off after an event was in flight
     if (!(await this.sessionStore.claimStripeEvent(event.id, event.type))) {
       metricCount("stripe.webhook_events", 1, { type: event.type, deduped: true });

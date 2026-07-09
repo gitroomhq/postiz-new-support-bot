@@ -6,6 +6,7 @@ import { BotConfig } from "../config";
 import { OAuthManager } from "../auth/OAuthManager";
 import { log } from "../util/logger";
 import { metricCount } from "../util/instrument";
+import { TemporalBufferedError } from "../temporal/producers";
 
 const httpLog = log.child("http");
 
@@ -203,11 +204,21 @@ export class CallbackServer {
           return;
         }
         metricCount("stripe.webhooks", 1, { accepted: true });
-        res.status(200).send("ok");
-        // Fire-and-forget; the handler swallows its own errors.
-        void this.stripeWebhook.handle(event).catch((e) =>
-          httpLog.error("stripe webhook handle failed", e, { "stripe.event_type": event.type })
-        );
+        // Awaited: the Temporal seam needs to answer 503 when it could only
+        // buffer the event (server unreachable) so Stripe redelivers. The
+        // legacy handler is quick (dedup claim + at most two embed sends) and
+        // still fits Stripe's ack window; its own errors stay swallowed → 200.
+        try {
+          await this.stripeWebhook.handle(event);
+          res.status(200).send("ok");
+        } catch (e) {
+          if (e instanceof TemporalBufferedError) {
+            res.status(503).send("retry later");
+            return;
+          }
+          httpLog.error("stripe webhook handle failed", e, { "stripe.event_type": event.type });
+          res.status(200).send("ok");
+        }
       }
     );
 

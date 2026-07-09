@@ -457,6 +457,7 @@ const STATEMENTS: string[] = [
     "rootCause" TEXT,
     "summary" TEXT,
     "staffScores" JSONB,
+    "staffNames" JSONB,
     "inputTokens" INTEGER,
     "outputTokens" INTEGER,
     "costUsd" DOUBLE PRECISION,
@@ -467,6 +468,8 @@ const STATEMENTS: string[] = [
   )`,
   `CREATE UNIQUE INDEX IF NOT EXISTS "ticket_scores_ticketThreadId_key" ON "ticket_scores"("ticketThreadId")`,
   `CREATE INDEX IF NOT EXISTS "ticket_scores_status_idx" ON "ticket_scores"("status")`,
+  // Transcript staff-name snapshot used to validate the model's staff[] names.
+  `ALTER TABLE "ticket_scores" ADD COLUMN IF NOT EXISTS "staffNames" JSONB`,
   // Submitted Anthropic Message Batches — persisted so polling survives restarts.
   `CREATE TABLE IF NOT EXISTS "scoring_batches" (
     "id" TEXT NOT NULL,
@@ -496,6 +499,11 @@ const STATEMENTS: string[] = [
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "vaultTransitMount" TEXT NOT NULL DEFAULT 'transit'`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "vaultTransitKey" TEXT NOT NULL DEFAULT 'support-bot'`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "vaultMigratedAt" TIMESTAMP(3)`,
+  // Temporal migration kill switch + one-time import stamp (paired with
+  // /config → Temporal). Connection address/namespace are env-only; the mTLS
+  // client cert lives in Vault KV under the "temporal" integration entry.
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "temporalEnabled" BOOLEAN NOT NULL DEFAULT false`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "temporalImportDoneAt" TIMESTAMP(3)`,
 ];
 
 export async function ensureSchema(prisma: PrismaClient): Promise<void> {

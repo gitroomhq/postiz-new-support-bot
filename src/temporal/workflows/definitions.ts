@@ -1,0 +1,45 @@
+import { defineQuery, defineSignal, defineUpdate } from "@temporalio/workflow";
+import {
+  SIG_HUMAN_MESSAGE,
+  SIG_INBOUND_EVENT,
+  SIG_INTERCOM_ENQUEUE,
+  SIG_KB_REFRESH_NOW,
+  SIG_NOOP,
+  SIG_REMINDERS_PAUSED,
+  SIG_REQUEST_STATUS_CHANGE,
+  SIG_SCORING_RUN_NOW,
+  SIG_TICKET_CREATED,
+  UPD_APPLY_PRIORITY,
+  UPD_APPLY_STATUS,
+  QRY_TICKET_STATE,
+  type ApplyStatusResult,
+  type HumanMessageSignal,
+  type IcEvent,
+  type IcEventType,
+  type InboundEventSignal,
+  type PriorityChangeRequest,
+  type RemindersPausedSignal,
+  type StatusChangeRequest,
+  type TicketCreatedSignal,
+  type TicketSnapshot,
+} from "../types";
+
+// Typed signal/update/query definitions. Names are shared string constants
+// (types.ts) so Node-side producers can signal without importing this module.
+
+export const ticketCreatedSignal = defineSignal<[TicketCreatedSignal]>(SIG_TICKET_CREATED);
+export const humanMessageSignal = defineSignal<[HumanMessageSignal]>(SIG_HUMAN_MESSAGE);
+export const intercomEnqueueSignal = defineSignal<[{ type: IcEventType; payload: unknown | null }]>(SIG_INTERCOM_ENQUEUE);
+export const remindersPausedSignal = defineSignal<[RemindersPausedSignal]>(SIG_REMINDERS_PAUSED);
+export const requestStatusChangeSignal = defineSignal<[StatusChangeRequest]>(SIG_REQUEST_STATUS_CHANGE);
+export const noopSignal = defineSignal(SIG_NOOP);
+export const inboundEventSignal = defineSignal<[InboundEventSignal]>(SIG_INBOUND_EVENT);
+export const kbRefreshNowSignal = defineSignal(SIG_KB_REFRESH_NOW);
+export const scoringRunNowSignal = defineSignal(SIG_SCORING_RUN_NOW);
+
+export const applyStatusUpdate = defineUpdate<ApplyStatusResult, [StatusChangeRequest]>(UPD_APPLY_STATUS);
+export const applyPriorityUpdate = defineUpdate<{ ok: boolean }, [PriorityChangeRequest]>(UPD_APPLY_PRIORITY);
+
+export const getStateQuery = defineQuery<{ snapshot: TicketSnapshot | null; outbox: IcEvent[]; outboxDepth: number }>(
+  QRY_TICKET_STATE
+);

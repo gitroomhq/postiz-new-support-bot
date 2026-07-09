@@ -107,7 +107,10 @@ import {
   exportCsat,
   backfillTicketHistory,
 } from "../metrics/MetricsExporter";
-import { VaultService, type VaultTestReport } from "../vault/VaultService";
+import { VaultService, VAULT_INTEGRATIONS, type VaultTestReport } from "../vault/VaultService";
+import type { TemporalOpsBinding, TemporalProducers } from "../temporal/producers";
+import type { AiRunInput, AutoAnswerInput } from "../temporal/types";
+import { validateCertPair } from "../temporal/certs";
 import { VaultMigrator, COLUMN_LABELS, type MigrateItemResult, type MigrateReport } from "../vault/VaultMigrator";
 
 type TicketSearchFilters = {
@@ -143,7 +146,18 @@ export class DiscordBot {
   >();
 
   // One concurrent /ai run per user — each run is a Claude Code subprocess.
+  // Legacy-path mutex only; under Temporal the workflow id ai-run-{userId}
+  // (REJECT-duplicate start) is the mutex.
   private aiRunsInFlight = new Set<string>();
+
+  // Temporal regime: live deferred interactions for in-flight /ai workflow
+  // runs, keyed by interaction id (the AiRunInput.runKey). Same-process only —
+  // a restart loses the ephemeral anyway (activity maximumAttempts is 1).
+  private aiInteractionRegistry = new Map<string, ChatInputCommandInteraction>();
+
+  // Bound late from index.ts (the Temporal stack is constructed after the bot).
+  private temporalProducers: TemporalProducers | null = null;
+  private temporalOps: TemporalOpsBinding | null = null;
 
   private aiLog = log.child("ai-command");
 
@@ -200,6 +214,14 @@ export class DiscordBot {
 
     this.rest = new REST({ version: "10" }).setToken(config.discord.token);
     this.setupEventHandlers();
+  }
+
+  // Wires the Temporal stack in after construction (index.ts builds it later)
+  // and fans the producers out to the seams that live behind this class.
+  bindTemporal(ops: TemporalOpsBinding): void {
+    this.temporalProducers = ops.producers;
+    this.temporalOps = ops;
+    this.getBillingCategory().setTemporalProducers(ops.producers);
   }
 
   private setupEventHandlers(): void {
@@ -359,6 +381,19 @@ export class DiscordBot {
       "ticket.thread_id": ticket.threadId,
       "sync.event": "human_message",
     });
+
+    // Temporal regime: nudge the ticket workflow (re-close deadline push,
+    // retention freshness). The DB stamps below stay — they are the
+    // rehydration source when a completed workflow restarts.
+    if (this.temporalProducers?.enabled()) {
+      void this.temporalProducers
+        .humanMessage(ticket.threadId, {
+          atMs: message.createdTimestamp,
+          isCustomer: message.author.id === ticket.customerId,
+          isStaff,
+        })
+        .catch(() => {});
+    }
 
     // First support reply on an open ticket. Only support/admin members count, so
     // another invited human (or the customer) can't skew the metric.
@@ -711,6 +746,11 @@ export class DiscordBot {
     }
 
     await this.ticketStore.setRemindersPaused(thread.id, paused);
+    // Temporal regime: the ticket workflow owns the reminder/auto-close/
+    // re-close timers — keep its in-memory pause flag in sync with the DB.
+    if (this.temporalProducers?.enabled()) {
+      void this.temporalProducers.remindersPaused(thread.id, paused).catch(() => {});
+    }
     void this.audit.log({
       title: paused ? "🔕 Reminders paused" : "🔔 Reminders resumed",
       severity: paused ? "warn" : "success",
@@ -1513,6 +1553,9 @@ export class DiscordBot {
     return {
       staffPingRoleId: this.tierStore.newTicketRoleId(this.settingsStore.supportRoleId()),
       aiSolveEnabled: this.settingsStore.aiSolveEnabled(),
+      // Temporal regime: the auto-answer runs in the ticket workflow's child,
+      // not inline in the modal handler.
+      deferAutoAnswer: this.temporalProducers?.enabled() ?? false,
       initialEmoji: initial?.emoji ?? "🟢",
       initialPriorityEmoji: initialPriority?.emoji ?? null,
       guardTicketCreate: (userId, guild) => this.ticketCreationBlockReason(userId, guild),
@@ -1548,10 +1591,25 @@ export class DiscordBot {
             ...(question ? [{ name: "Question", value: question }] : []),
           ],
         });
-        safe(this.intercomSync.onTicketCreated(thread.id, category.label, question ?? null), "intercom-sync", {
-          "ticket.thread_id": thread.id,
-          "sync.event": "ticket_created",
-        });
+        if (this.temporalProducers?.enabled()) {
+          // Temporal regime: one signal-with-start births the ticket workflow —
+          // it enqueues the Intercom ensure and runs the auto-answer child
+          // (deferAutoAnswer above stopped the inline AI path).
+          void this.temporalProducers
+            .ticketCreated(thread.id, {
+              categoryId: category.id,
+              question: question ?? null,
+              customerId,
+              displayName,
+              aiSolve: this.settingsStore.aiSolveEnabled(),
+            })
+            .catch(() => {});
+        } else {
+          safe(this.intercomSync.onTicketCreated(thread.id, category.label, question ?? null), "intercom-sync", {
+            "ticket.thread_id": thread.id,
+            "sync.event": "ticket_created",
+          });
+        }
       },
       onAiAnswer: async (thread, finalText) => {
         // Persist the verbatim answer so a filed GitHub issue is just Q + A.
@@ -2273,7 +2331,9 @@ export class DiscordBot {
     options: ClaudeRunOptions,
     // Tool-less runs (draft/summarize) go through the direct Messages API —
     // no CLI overhead tokens, no process-spawn latency, same streaming UX.
-    useLightRunner = false
+    useLightRunner = false,
+    // Temporal activity liveness: called on every stream update.
+    heartbeat?: () => void
   ): Promise<string | null> {
     let lastEdit = 0;
     let editInFlight = false;
@@ -2300,6 +2360,7 @@ export class DiscordBot {
 
     try {
       const onUpdate = (messages: string[]) => {
+        heartbeat?.();
         const now = Date.now();
         if (now - lastEdit < 2000) return;
         lastEdit = now;
@@ -2498,7 +2559,49 @@ export class DiscordBot {
 
     const sub = interaction.options.getSubcommand();
     await interaction.deferReply({ flags: 64 });
+
+    // Temporal regime: the run becomes an aiRunWorkflow (id ai-run-{userId} =
+    // the per-user mutex, crash-proof) whose single activity re-enters
+    // runAiSubcommand below through the interaction registry. Unavailable
+    // Temporal falls through to the in-process path.
+    if (this.temporalProducers?.enabled() && (sub === "ask" || sub === "cause" || sub === "draft" || sub === "summarize")) {
+      this.aiInteractionRegistry.set(interaction.id, interaction);
+      const started = await this.temporalProducers.startAiRun({
+        runKey: interaction.id,
+        sub,
+        threadId: thread.id,
+        userId: interaction.user.id,
+      });
+      if (started === "started") return; // the workflow's activity owns the reply now
+      this.aiInteractionRegistry.delete(interaction.id);
+      if (started === "already_running") {
+        await interaction.editReply({
+          embeds: [makeEmbed("You already have an /ai run in progress — wait for it to finish.", COLORS.warn)],
+        });
+        return;
+      }
+      // "unavailable" → legacy in-process run below.
+    }
+
     this.aiRunsInFlight.add(interaction.user.id);
+    try {
+      await this.runAiSubcommand(interaction, member, sub, thread, ticket);
+    } finally {
+      this.aiRunsInFlight.delete(interaction.user.id);
+    }
+  }
+
+  // The full /ai run body (context gather → CLI/Messages run → result +
+  // history + audit). Shared by the legacy path above and the Temporal
+  // runStaffAiCommand activity (which supplies a heartbeat callback).
+  private async runAiSubcommand(
+    interaction: ChatInputCommandInteraction,
+    member: GuildMember,
+    sub: string,
+    thread: ThreadChannel,
+    ticket: TicketWithTag,
+    heartbeat?: () => void
+  ): Promise<void> {
     const startedAt = Date.now();
 
     try {
@@ -2615,7 +2718,7 @@ export class DiscordBot {
 
       // draft/summarize are tool-less → direct Messages API when wired.
       const useLight = sub === "draft" || sub === "summarize";
-      const text = await this.streamAiRun(interaction, sub, title, prompt, runOptions, useLight);
+      const text = await this.streamAiRun(interaction, sub, title, prompt, runOptions, useLight, heartbeat);
       if (text === null) return;
       if (text.length === 0) {
         await interaction.editReply({ embeds: [makeEmbed("The AI returned an empty answer.", COLORS.warn)] });
@@ -2690,9 +2793,81 @@ export class DiscordBot {
       await interaction
         .editReply({ embeds: [makeEmbed("Something went wrong — check the logs.", COLORS.danger)] })
         .catch(() => {});
-    } finally {
-      this.aiRunsInFlight.delete(interaction.user.id);
     }
+  }
+
+  // ---- Temporal activity hooks (same-process worker; see src/temporal) ----
+
+  // aiRunWorkflow's single activity: re-enter the /ai body via the registered
+  // live interaction. A missing registry entry means the process restarted
+  // mid-run — the ephemeral is gone, nothing to resume (legacy parity).
+  async executeAiRunFromWorkflow(input: AiRunInput, heartbeat: () => void): Promise<void> {
+    const interaction = this.aiInteractionRegistry.get(input.runKey);
+    if (!interaction) {
+      this.aiLog.warn("ai run interaction missing (restart mid-run?)", { "ai.sub": input.sub });
+      return;
+    }
+    try {
+      const member = await this.fetchMember(interaction);
+      const channel = await this.client.channels.fetch(input.threadId).catch(() => null);
+      const ticket = await this.ticketStore.getByThreadId(input.threadId);
+      if (!member || !channel?.isThread() || !ticket) {
+        await interaction
+          .editReply({ embeds: [makeEmbed("The ticket thread is no longer available.", COLORS.warn)] })
+          .catch(() => {});
+        return;
+      }
+      await this.runAiSubcommand(interaction, member, input.sub, channel as ThreadChannel, ticket, heartbeat);
+    } finally {
+      this.aiInteractionRegistry.delete(input.runKey);
+    }
+  }
+
+  // autoAnswerWorkflow's activity: rebuild thread/responder/context and run
+  // the shared BaseCategory.deliverAutoAnswer (streamed first answer, feedback
+  // buttons, failure repair + staff ping all inside).
+  async runAutoAnswerForTicket(input: AutoAnswerInput, heartbeat: () => void): Promise<{ ok: boolean; apiLimit: boolean }> {
+    const category = this.categoryRegistry.getAll().find((c) => c.id === input.categoryId);
+    const channel = await this.client.channels.fetch(input.threadId).catch(() => null);
+    if (!category || !channel?.isThread()) return { ok: false, apiLimit: false };
+    const responder = (prompt: string, onUpdate?: (messages: string[]) => void) =>
+      this.claudeRunner.run(
+        prompt,
+        (messages) => {
+          heartbeat();
+          onUpdate?.(messages);
+        },
+        {
+          model: this.settingsStore.aiModel(),
+          telemetry: {
+            agentName: `support-${category.id}`,
+            kind: "customer_qa",
+            userId: input.customerId,
+            username: input.displayName,
+          },
+        }
+      );
+    return category.deliverAutoAnswer(
+      channel as ThreadChannel,
+      input.customerId,
+      input.question ?? "",
+      responder,
+      this.buildTicketContext(category)
+    );
+  }
+
+  // New-ticket staff ping — the non-AI creation path and the autoAnswer
+  // workflow's hard-failure fallback.
+  async pingStaffForNewTicketThread(threadId: string): Promise<void> {
+    const channel = await this.client.channels.fetch(threadId).catch(() => null);
+    if (!channel?.isThread()) return;
+    const roleId = this.tierStore.newTicketRoleId(this.settingsStore.supportRoleId());
+    if (!roleId) return;
+    await (channel as ThreadChannel).send({
+      content: `<@&${roleId}>`,
+      embeds: [makeEmbed("A new support ticket has been opened and needs attention.")],
+      allowedMentions: { roles: [roleId] },
+    });
   }
 
   private pruneAiDraftSessions(): void {
@@ -3186,6 +3361,15 @@ export class DiscordBot {
               s.scoringEnabled() ? `every ${s.scoringIntervalHours()}h, \`${s.scoringModel()}\`` : "off"
             }`,
             `Vault: ${this.vaultStatusLine()}`,
+            `Temporal: ${
+              s.temporalEnabled()
+                ? this.temporalOps?.service.state() === "up"
+                  ? "on · connected"
+                  : "on ⚠️ server unreachable"
+                : this.temporalOps?.service.configured()
+                  ? "configured · off"
+                  : "off"
+            }`,
           ].join("\n"),
           inline: false,
         },
@@ -3211,10 +3395,13 @@ export class DiscordBot {
       new ButtonBuilder().setCustomId("config_ai").setLabel("AI & Knowledge").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("config_analytics").setLabel("Analytics").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("config_vault").setLabel("Vault").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("config_temporal").setLabel("Temporal").setStyle(ButtonStyle.Primary),
+    ];
+    const utility = [
       new ButtonBuilder().setCustomId("config_reverify").setLabel("Re-Verify").setStyle(ButtonStyle.Secondary),
     ];
     if (!s.backfillDone()) {
-      actions.push(
+      utility.push(
         new ButtonBuilder().setCustomId("config_backfill").setLabel("Backfill existing tickets").setStyle(ButtonStyle.Secondary)
       );
     }
@@ -3224,6 +3411,7 @@ export class DiscordBot {
       components: [
         new ActionRowBuilder<ButtonBuilder>().addComponents(nav),
         new ActionRowBuilder<ButtonBuilder>().addComponents(actions),
+        new ActionRowBuilder<ButtonBuilder>().addComponents(utility),
       ],
     };
   }
@@ -3747,6 +3935,326 @@ export class DiscordBot {
 
   // /config → Vault: connection, storage cutover state, per-secret placement,
   // migrate/reverse actions. Async for the session-token envelope census.
+  // ---- /config → Temporal (connection status, kill switch, deployment
+  // version, schedules, migration import). The only ops window besides the
+  // Temporal Web UI — prod has no terminal. ----
+
+  // /config report edits must reach the Temporal "status-report" Schedule
+  // (spec + paused state) when that regime owns publishing.
+  private syncTemporalReportSchedule(): void {
+    if (this.temporalProducers?.enabled()) {
+      void this.temporalProducers.syncReportSchedule().catch((e) =>
+        this.discordLog.warn("status-report schedule sync failed", {
+          "error.message": e instanceof Error ? e.message : String(e),
+        })
+      );
+    }
+  }
+
+  private async buildTemporalPanel() {
+    const s = this.settingsStore;
+    const ops = this.temporalOps;
+    const lines: string[] = [];
+    const rel = (d: Date) => `<t:${Math.floor(d.getTime() / 1000)}:R>`;
+
+    if (!ops) {
+      lines.push("Temporal stack not wired (worker-only process?).");
+    } else {
+      const svc = ops.service;
+      const cfg = svc.envConfig();
+      const state = svc.state();
+      const configError = svc.configError();
+      lines.push(
+        `**Connection:** ${
+          state === "up" ? "✅ up" : state === "down" ? `❌ down${svc.downSince() ? ` since ${rel(svc.downSince()!)}` : ""}` : `⚪ not configured${configError ? ` — ${configError}` : ""}`
+        }`,
+        `**Address / namespace:** \`${cfg.address || "—"}\` · \`${cfg.namespace || "—"}\` · queue \`${cfg.taskQueue}\``
+      );
+      const cert = svc.certInfo();
+      lines.push(
+        `**Client cert:** ${
+          cert
+            ? `SHA-256 \`${cert.fingerprint256.replace(/:/g, "").slice(0, 16).toLowerCase()}…\` · expires ${rel(cert.notAfter)}${cert.daysLeft < 30 ? " ⚠️" : ""}`
+            : "_not entered (Certificates below, stored in Vault KV)_"
+        }`
+      );
+      const buf = svc.bufferStats();
+      lines.push(`**Retry buffer:** ${buf.size}/${buf.capacity} buffered · ${buf.droppedTotal} dropped`);
+      const v = ops.workerManager.deploymentVersion();
+      const promoted = ops.workerManager.promoted();
+      lines.push(
+        `**Worker:** ${ops.workerManager.running() ? "✅ polling" : "⏹️ stopped"} · build \`${v.buildId}\` (deployment \`${v.deploymentName}\`)${
+          promoted === true ? " · current" : promoted === false ? " · ⚠️ NOT promoted to current" : ""
+        }`,
+        `**Regime:** ${s.temporalEnabled() ? "Temporal owns background work" : "legacy in-process schedulers"}${
+          ops.legacyRunning() ? " · legacy timers running" : ""
+        }`,
+        `**Import:** ${s.temporalImportDoneAt() ? `done ${rel(s.temporalImportDoneAt()!)}` : "_never ran_"}`
+      );
+
+      // Live readouts, best-effort with a short budget — a down server must
+      // not wedge the panel.
+      try {
+        const report = await Promise.race([
+          svc.testConnection(),
+          new Promise<null>((r) => setTimeout(() => r(null), 3000)),
+        ]);
+        if (report?.visibilityOk) lines.push(`**Running workflows:** ${report.runningWorkflows}`);
+        if (report?.currentVersion) lines.push(`**Deployment current version:** \`${report.currentVersion}\``);
+      } catch {
+        // panel stays useful without live counts
+      }
+    }
+
+    const embed = new EmbedBuilder().setTitle("Temporal").setColor(0x5865f2).setDescription(lines.join("\n"));
+    const row1 = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId("config_temporal_toggle")
+        .setLabel(s.temporalEnabled() ? "Temporal: on" : "Temporal: off")
+        .setStyle(s.temporalEnabled() ? ButtonStyle.Success : ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("config_temporal_test").setLabel("Test Connection").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("config_temporal_certs").setLabel("Certificates").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("config_temporal_import").setLabel("Run Migration Import").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("config_back_main").setLabel("Back").setStyle(ButtonStyle.Secondary)
+    );
+    const row2 = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId("config_temporal_pause").setLabel("Pause Schedules").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("config_temporal_unpause").setLabel("Unpause Schedules").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("config_temporal_kb").setLabel("Refresh KB Now").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("config_temporal_score").setLabel("Run Scoring Now").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("config_temporal_report").setLabel("Run Report Now").setStyle(ButtonStyle.Secondary)
+    );
+    return { embeds: [embed], components: [row1, row2] };
+  }
+
+  // All config_temporal* buttons (delegated from handleConfigButton; admin was
+  // already re-checked there).
+  private async handleTemporalConfigButton(interaction: ButtonInteraction, id: string): Promise<void> {
+    const s = this.settingsStore;
+    const ops = this.temporalOps;
+    if (!ops) {
+      await interaction.reply({ embeds: [makeEmbed("Temporal stack is not wired in this process.", COLORS.warn)], flags: 64 });
+      return;
+    }
+
+    if (id === "config_temporal") {
+      await interaction.deferUpdate();
+      await interaction.editReply(await this.buildTemporalPanel());
+      return;
+    }
+
+    if (id === "config_temporal_toggle") {
+      const enabling = !s.temporalEnabled();
+      if (enabling && !ops.service.configured()) {
+        await interaction.reply({
+          embeds: [
+            makeEmbed(
+              `Can't enable Temporal: ${ops.service.configError() ?? "not configured"}.\nSet TEMPORAL_ADDRESS/TEMPORAL_NAMESPACE (env) and enter the mTLS certs via **Certificates**.`,
+              COLORS.danger
+            ),
+          ],
+          flags: 64,
+        });
+        return;
+      }
+      await interaction.deferUpdate();
+      await s.updateTemporal({ temporalEnabled: enabling });
+      try {
+        await ops.setEnabled(enabling);
+        this.auditConfig(interaction, `Temporal regime → ${enabling ? "on" : "off (legacy schedulers)"}`);
+      } catch (e) {
+        await s.updateTemporal({ temporalEnabled: !enabling });
+        await interaction.followUp({
+          embeds: [
+            makeEmbed(
+              `Switching failed — the toggle was rolled back: ${(e instanceof Error ? e.message : String(e)).slice(0, 500)}`,
+              COLORS.danger
+            ),
+          ],
+          flags: 64,
+        });
+      }
+      await interaction.editReply(await this.buildTemporalPanel());
+      if (enabling && s.temporalEnabled() && !s.temporalImportDoneAt()) {
+        await interaction.followUp({
+          embeds: [
+            makeEmbed(
+              "Temporal is on. Run **Run Migration Import** to start workflows for existing open tickets and replay pending Intercom queue rows.",
+              COLORS.warn
+            ),
+          ],
+          flags: 64,
+        });
+      }
+      return;
+    }
+
+    if (id === "config_temporal_test") {
+      await interaction.deferReply({ flags: 64 });
+      const r = await ops.service.testConnection();
+      const line = (label: string, ok: boolean, err?: string | null, extra?: string) =>
+        `**${label}:** ${ok ? `✅ ok${extra ? ` — ${extra}` : ""}` : `❌ ${err ?? "failed"}`}`;
+      await interaction.editReply({
+        embeds: [
+          makeEmbed(
+            [
+              line("Config", r.configured, r.configError),
+              line("gRPC health", r.healthOk, r.healthError),
+              line("Namespace", r.namespaceOk, r.namespaceError),
+              line("Deployment", r.deploymentFound, r.deploymentError ?? "not found yet (registers on first worker poll)", r.currentVersion ? `current \`${r.currentVersion}\`` : undefined),
+              line("Visibility", r.visibilityOk, r.visibilityError, r.runningWorkflows != null ? `${r.runningWorkflows} running` : undefined),
+            ].join("\n"),
+            r.configured && r.healthOk && r.namespaceOk ? COLORS.success : COLORS.warn
+          ),
+        ],
+      });
+      return;
+    }
+
+    if (id === "config_temporal_certs") {
+      // Never prefilled — cert/key material must not round-trip through Discord.
+      const modal = new ModalBuilder().setCustomId("config_temporal_certs_modal").setTitle("Temporal mTLS Certificates");
+      modal.addComponents(
+        new ActionRowBuilder<TextInputBuilder>().addComponents(
+          new TextInputBuilder().setCustomId("cert").setLabel("Client certificate (PEM)").setStyle(TextInputStyle.Paragraph).setRequired(true)
+        ),
+        new ActionRowBuilder<TextInputBuilder>().addComponents(
+          new TextInputBuilder().setCustomId("key").setLabel("Client private key (PEM)").setStyle(TextInputStyle.Paragraph).setRequired(true)
+        ),
+        new ActionRowBuilder<TextInputBuilder>().addComponents(
+          new TextInputBuilder().setCustomId("ca").setLabel("Server CA (PEM, optional)").setStyle(TextInputStyle.Paragraph).setRequired(false)
+        )
+      );
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (id === "config_temporal_import") {
+      await interaction.deferReply({ flags: 64 });
+      const r = await ops.producers.startMigrationImport();
+      await interaction.editReply({
+        embeds: [
+          makeEmbed(
+            r.ok
+              ? r.alreadyRunning
+                ? "A migration import is already running — check the audit channel for its summary."
+                : "Migration import started — a summary lands in the audit channel when it finishes."
+              : `Couldn't start the import: ${r.error ?? "Temporal unreachable"}.`,
+            r.ok ? COLORS.success : COLORS.danger
+          ),
+        ],
+      });
+      return;
+    }
+
+    if (id === "config_temporal_pause" || id === "config_temporal_unpause") {
+      await interaction.deferReply({ flags: 64 });
+      const pause = id === "config_temporal_pause";
+      const client = await ops.service.client();
+      if (!client) {
+        await interaction.editReply({ embeds: [makeEmbed("Temporal is unreachable.", COLORS.danger)] });
+        return;
+      }
+      let touched = 0;
+      try {
+        for await (const sched of client.schedule.list()) {
+          const handle = client.schedule.getHandle(sched.scheduleId);
+          if (pause) await handle.pause(`paused via /config by ${interaction.user.username}`);
+          else await handle.unpause(`unpaused via /config by ${interaction.user.username}`);
+          touched++;
+        }
+        this.auditConfig(interaction, `Temporal schedules → ${pause ? "paused" : "unpaused"} (${touched})`);
+        await interaction.editReply({
+          embeds: [makeEmbed(`${pause ? "Paused" : "Unpaused"} ${touched} schedule(s).`, COLORS.success)],
+        });
+      } catch (e) {
+        await interaction.editReply({
+          embeds: [makeEmbed(`Schedule update failed: ${(e instanceof Error ? e.message : String(e)).slice(0, 500)}`, COLORS.danger)],
+        });
+      }
+      return;
+    }
+
+    if (id === "config_temporal_kb" || id === "config_temporal_score" || id === "config_temporal_report") {
+      await interaction.deferReply({ flags: 64 });
+      const r =
+        id === "config_temporal_kb"
+          ? await ops.producers.kbRefreshNow()
+          : id === "config_temporal_score"
+            ? await ops.producers.scoringRunNow()
+            : await ops.producers.runReportNow();
+      const what = id === "config_temporal_kb" ? "KB refresh" : id === "config_temporal_score" ? "scoring run" : "status report";
+      await interaction.editReply({
+        embeds: [
+          makeEmbed(
+            r.ok ? `Triggered a ${what} via Temporal.` : `Couldn't trigger the ${what}: ${r.error ?? "Temporal unreachable"}.`,
+            r.ok ? COLORS.success : COLORS.danger
+          ),
+        ],
+      });
+      return;
+    }
+  }
+
+  // Certificates modal: validate before storing (Vault KV "temporal" entry);
+  // the reply shows fingerprint + expiry ONLY — never any PEM/key material.
+  private async handleTemporalCertsModal(interaction: ModalSubmitInteraction): Promise<void> {
+    if (!this.isAdmin(interaction)) {
+      await interaction.reply({ embeds: [makeEmbed("You don't have permission to do that.", COLORS.danger)], flags: 64 });
+      return;
+    }
+    const ops = this.temporalOps;
+    const vault = this.vault?.service;
+    if (!ops || !vault) {
+      await interaction.reply({ embeds: [makeEmbed("Temporal/Vault stack is not wired in this process.", COLORS.warn)], flags: 64 });
+      return;
+    }
+    await interaction.deferReply({ flags: 64 });
+    const cert = interaction.fields.getTextInputValue("cert").trim();
+    const key = interaction.fields.getTextInputValue("key").trim();
+    const ca = interaction.fields.getTextInputValue("ca").trim();
+    let info;
+    try {
+      info = validateCertPair(cert, key, ca || null);
+    } catch (e) {
+      await interaction.editReply({
+        embeds: [makeEmbed(e instanceof Error ? e.message : "Invalid certificate material.", COLORS.danger)],
+      });
+      return;
+    }
+    // Vault-only by design: no local-encryption fallback for mTLS material.
+    const ok = await vault.setKvFields("temporal", {
+      clientCertPem: cert,
+      clientKeyPem: key,
+      caPem: ca || null,
+    });
+    if (!ok) {
+      await interaction.editReply({
+        embeds: [
+          makeEmbed(
+            "Couldn't write to Vault — the certs are Vault-only (no local fallback). Bring Vault up (/config → Vault) and try again, or enter them directly in the Vault UI (picked up within 10 minutes).",
+            COLORS.danger
+          ),
+        ],
+      });
+      return;
+    }
+    await ops.service.reconfigure();
+    this.auditConfig(interaction, "Temporal mTLS certificates updated");
+    await interaction.editReply({
+      embeds: [
+        makeEmbed(
+          [
+            "Certificates stored in Vault KV (`temporal` entry).",
+            `Fingerprint: \`${info.fingerprint256.replace(/:/g, "").slice(0, 16).toLowerCase()}…\` · expires <t:${Math.floor(info.notAfter.getTime() / 1000)}:R>.`,
+            "Note: the running worker keeps its old connection — toggle Temporal off/on (or restart) to apply a rotation. Long CA chains that exceed the 4000-char modal limit go directly into the Vault UI.",
+          ].join("\n"),
+          COLORS.success
+        ),
+      ],
+    });
+  }
+
   private async buildVaultPanel() {
     const s = this.settingsStore;
     const service = this.vault?.service;
@@ -3859,7 +4367,7 @@ export class DiscordBot {
         `**Transit round-trip:** ${report.transitOk ? "✅ ok" : `❌ ${report.transitError ?? "failed"}`}`,
         `**KV entries:** ${
           report.kvOk
-            ? `✅ readable — ${report.kvEntriesFound.length}/4 present${report.kvEntriesFound.length ? ` (${report.kvEntriesFound.join(", ")})` : ""}`
+            ? `✅ readable — ${report.kvEntriesFound.length}/${VAULT_INTEGRATIONS.length} present${report.kvEntriesFound.length ? ` (${report.kvEntriesFound.join(", ")})` : ""}`
             : `❌ ${report.kvError ?? "read failed"}`
         }`
       );
@@ -5147,6 +5655,11 @@ export class DiscordBot {
       return;
     }
 
+    if (id.startsWith("config_temporal")) {
+      await this.handleTemporalConfigButton(interaction, id);
+      return;
+    }
+
     if (id === "config_analytics_influx") {
       const s = this.settingsStore;
       const modal = new ModalBuilder().setCustomId("config_analytics_influx_modal").setTitle("InfluxDB 2.x Connection");
@@ -5627,6 +6140,7 @@ export class DiscordBot {
 
     if (id === "config_report_toggle") {
       await this.settingsStore.updateReport({ reportEnabled: !this.settingsStore.reportEnabled() });
+      this.syncTemporalReportSchedule();
       this.auditConfig(interaction, `Status report → ${this.settingsStore.reportEnabled() ? "on" : "off"}`);
       await interaction.update(this.buildReportPanel());
       return;
@@ -6078,6 +6592,11 @@ export class DiscordBot {
       return;
     }
 
+    if (interaction.customId === "config_temporal_certs_modal") {
+      await this.handleTemporalCertsModal(interaction);
+      return;
+    }
+
     if (interaction.customId === "config_analytics_influx_modal") {
       const url = interaction.fields.getTextInputValue("url").trim();
       const org = interaction.fields.getTextInputValue("org").trim();
@@ -6260,6 +6779,7 @@ export class DiscordBot {
         return;
       }
       await this.settingsStore.updateReport({ reportHour: hour, reportMinute: minute });
+      this.syncTemporalReportSchedule();
       this.auditConfig(interaction, `Report time → ${this.formatReportTime(hour, minute)}`);
       await interaction.reply({
         embeds: [makeEmbed(`Status report will publish daily at ${this.formatReportTime(hour, minute)} (${this.settingsStore.reportTimezone()}).`, COLORS.success)],
@@ -6275,6 +6795,7 @@ export class DiscordBot {
         return;
       }
       await this.settingsStore.updateReport({ reportTimezone: tz });
+      this.syncTemporalReportSchedule();
       this.auditConfig(interaction, `Report timezone → ${tz}`);
       await interaction.reply({ embeds: [makeEmbed(`Report timezone set to ${tz}.`, COLORS.success)], flags: 64 });
       return;
@@ -6482,6 +7003,7 @@ export class DiscordBot {
         return;
       }
       await this.settingsStore.updateReport({ overdueThresholdDays: days });
+      this.syncTemporalReportSchedule();
       this.auditConfig(interaction, `Overdue threshold → ${days} day(s)`);
       await interaction.reply({
         embeds: [makeEmbed(`Tickets now count as overdue after ${days} day(s).`, COLORS.success)],
@@ -6684,6 +7206,7 @@ export class DiscordBot {
     }
     if (interaction.customId === "config_set_reportchannel") {
       await this.settingsStore.updateReport({ reportChannelId: interaction.values[0] });
+      this.syncTemporalReportSchedule();
       this.auditConfig(interaction, `Report channel → <#${interaction.values[0]}>`);
       await interaction.update(this.buildReportPanel());
       return;
@@ -7447,7 +7970,14 @@ export class DiscordBot {
     this.discordLog.info("slash commands registered", { "commands.count": commands.length });
   }
 
-  async start(): Promise<void> {
+  async start(options?: { workerOnly?: boolean }): Promise<void> {
+    // --worker-only: log in (Temporal activities need a live Discord client)
+    // but leave slash-command registration and the HTTP surface to the main
+    // bot process — this is the future split-deployment topology.
+    if (options?.workerOnly) {
+      await this.client.login(this.config.discord.token);
+      return;
+    }
     await this.registerCommands();
     await this.client.login(this.config.discord.token);
 

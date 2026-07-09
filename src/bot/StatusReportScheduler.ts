@@ -47,23 +47,33 @@ export class StatusReportScheduler {
   }
 
   async tick(): Promise<void> {
-    if (!this.settings.reportEnabled()) return;
+    await this.publishIfDue(false);
+  }
+
+  // Shared by the legacy 60s tick and the Temporal publishStatusReportWorkflow
+  // activity. force=true (the /config "Run Report Now" path) bypasses the
+  // due-check but still respects the enabled/channel gates and the in-flight
+  // guard. Returns whether a report actually went out.
+  async publishIfDue(force: boolean): Promise<{ published: boolean }> {
+    if (!this.settings.reportEnabled()) return { published: false };
     const channelId = this.settings.reportChannelId();
-    if (!channelId) return;
- 
+    if (!channelId) return { published: false };
+
     const lastRunAt = this.settings.reportLastRunAt();
     const scheduledHour = this.settings.reportHour();
     const scheduledMinute = this.settings.reportMinute();
     const shouldPublish =
-      scheduledHour != null && scheduledMinute != null
+      force ||
+      (scheduledHour != null && scheduledMinute != null
         ? this.isDueForScheduledTime(lastRunAt, scheduledHour, scheduledMinute)
-        : this.isDueForInterval(lastRunAt);
-    if (!shouldPublish) return;
-    if (this.publishing) return; // a previous publish is still running — don't double-post
+        : this.isDueForInterval(lastRunAt));
+    if (!shouldPublish) return { published: false };
+    if (this.publishing) return { published: false }; // a previous publish is still running — don't double-post
 
     this.publishing = true;
     try {
       // Span only the rare publish, not the cheap once-a-minute due check.
+      let published = false;
       await withTickSpan("status-report", async () => {
         const channel = await this.client.channels.fetch(channelId).catch(() => null);
         if (!(channel instanceof TextChannel)) {
@@ -77,7 +87,9 @@ export class StatusReportScheduler {
         await channel.send({ embeds: [embed], components });
         await this.settings.recordReportRun(snapshot);
         schedLog.info("report.published", { "report.channel_id": channelId });
+        published = true;
       });
+      return { published };
     } finally {
       this.publishing = false;
     }

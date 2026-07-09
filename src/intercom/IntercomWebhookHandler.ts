@@ -7,6 +7,7 @@ import { COLORS } from "../util/embeds";
 import { IntercomStore } from "./IntercomStore";
 import { IntercomSyncService } from "./IntercomSyncService";
 import { bodyHash } from "./renderDiscordMarkdown";
+import { TemporalBufferedError, type TemporalProducers } from "../temporal/producers";
 import {
   IntercomConversationItem,
   IntercomTicketItem,
@@ -54,12 +55,39 @@ export class IntercomWebhookHandler {
     this.client = client;
   }
 
+  // Temporal seam: when active, inbound events are signalled into the
+  // per-conversation intercomInboxWorkflow (dedup via its deliveryId ring)
+  // instead of the intercom_inbox table. A buffered signal (Temporal down)
+  // throws so the route answers 500 and Intercom's single retry redelivers.
+  private temporalProducers: TemporalProducers | null = null;
+
+  setTemporalProducers(producers: TemporalProducers): void {
+    this.temporalProducers = producers;
+  }
+
   // HTTP-route half: durably queue the event and return. Never relays inline.
   // Returns false for duplicate deliveries (same notification event id).
   async accept(body: unknown): Promise<boolean> {
     const event = body as IntercomWebhookEvent;
     const topic = event?.topic;
     if (!topic || topic === "ping") return true;
+    if (this.temporalProducers?.enabled()) {
+      // Per-item serialization key: conversation id for conversation.* topics,
+      // ticket id for ticket.* — handlers are convergent/damped, so distinct
+      // workflows per kind are fine (matches the legacy queue's guarantees).
+      const itemId = (event?.data?.item as { id?: unknown } | undefined)?.id;
+      const key = itemId != null ? String(itemId) : null;
+      if (!key) return true; // nothing to key on — same as an unknown topic: drop
+      const r = await this.temporalProducers.inboundIntercomEvent(key, {
+        deliveryId: event.id ?? null,
+        topic,
+        payload: body,
+      });
+      if (!r.ok && r.buffered) {
+        throw new TemporalBufferedError("intercom event buffered — Intercom should redeliver");
+      }
+      return r.ok;
+    }
     return this.store.acceptInbound(event.id ?? null, topic, body as object);
   }
 

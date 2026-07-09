@@ -16,9 +16,12 @@ const vaultLog = log.child("vault");
 
 export type VaultState = "unconfigured" | "up" | "down" | "denied";
 
-// One KV entry per integration under <kvBasePath>/<integration>.
-export type VaultIntegration = "intercom" | "stripe" | "sentry" | "influx";
-export const VAULT_INTEGRATIONS: readonly VaultIntegration[] = ["intercom", "stripe", "sentry", "influx"];
+// One KV entry per integration under <kvBasePath>/<integration>. "temporal"
+// holds the mTLS client cert material (clientCertPem/clientKeyPem/caPem) —
+// Vault-only by design, no local-encryption fallback: a cold cache simply
+// leaves the Temporal connection down until Vault recovers.
+export type VaultIntegration = "intercom" | "stripe" | "sentry" | "influx" | "temporal";
+export const VAULT_INTEGRATIONS: readonly VaultIntegration[] = ["intercom", "stripe", "sentry", "influx", "temporal"];
 
 // Runtime config resolved from BotSettings (see SettingsStore.vaultConfig()).
 export interface VaultRuntimeConfig {

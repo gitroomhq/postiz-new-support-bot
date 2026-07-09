@@ -58,18 +58,56 @@ export class TicketScoreStore {
 
   // PENDING rows are written at submit time; the unique ticketThreadId +
   // skipDuplicates makes concurrent submits single-winner. Retried FAILED rows
-  // are flipped back to PENDING instead (createMany would skip them).
-  async markPending(ticketThreadIds: string[], batchId: string, model: string): Promise<void> {
+  // are flipped back to PENDING instead (createMany would skip them). Each row
+  // snapshots the transcript's staff display names so the model's staff[]
+  // output can be validated when the batch result arrives (possibly after a
+  // restart — the transcript itself is not persisted).
+  async markPending(
+    entries: Array<{ ticketThreadId: string; staffNames: string[] }>,
+    batchId: string,
+    model: string
+  ): Promise<void> {
+    const ids = entries.map((e) => e.ticketThreadId);
     await this.prisma.$transaction([
       this.prisma.ticketScore.updateMany({
-        where: { ticketThreadId: { in: ticketThreadIds }, status: "FAILED" },
+        where: { ticketThreadId: { in: ids }, status: "FAILED" },
         data: { status: "PENDING", batchId, model, error: null },
       }),
       this.prisma.ticketScore.createMany({
-        data: ticketThreadIds.map((ticketThreadId) => ({ ticketThreadId, status: "PENDING", batchId, model })),
+        data: entries.map((e) => ({
+          ticketThreadId: e.ticketThreadId,
+          status: "PENDING",
+          batchId,
+          model,
+          staffNames: e.staffNames,
+        })),
         skipDuplicates: true,
       }),
+      // Pre-existing rows (the retried-FAILED path) were skipped by createMany;
+      // refresh their snapshot. Scoped to this batch so rows claimed by a
+      // concurrent submit are left alone.
+      ...entries.map((e) =>
+        this.prisma.ticketScore.updateMany({
+          where: { ticketThreadId: e.ticketThreadId, batchId },
+          data: { staffNames: e.staffNames },
+        })
+      ),
     ]);
+  }
+
+  // staffNames snapshots for a batch's rows: threadId → names, or null when the
+  // row predates the snapshot column (reconciliation passes those through).
+  async staffNamesForBatch(batchId: string): Promise<Map<string, string[] | null>> {
+    const rows = await this.prisma.ticketScore.findMany({
+      where: { batchId },
+      select: { ticketThreadId: true, staffNames: true },
+    });
+    return new Map(
+      rows.map((r) => [
+        r.ticketThreadId,
+        Array.isArray(r.staffNames) ? r.staffNames.filter((n): n is string => typeof n === "string") : null,
+      ])
+    );
   }
 
   async recordScored(

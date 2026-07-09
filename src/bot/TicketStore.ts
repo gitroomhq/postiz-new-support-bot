@@ -344,10 +344,24 @@ export class TicketStore {
 
   // ---- CSAT ----
 
-  async markCsatPrompted(threadId: string): Promise<void> {
-    await this.prisma.ticket.updateMany({
+  // Claims the per-close-cycle rating prompt. The null-guard makes it single-winner:
+  // true = this caller won and should send the prompt, false = already prompted this
+  // cycle (e.g. a Close landing right after a Resolve).
+  async markCsatPrompted(threadId: string): Promise<boolean> {
+    const result = await this.prisma.ticket.updateMany({
       where: { threadId, csatPromptedAt: null },
       data: { csatPromptedAt: new Date() },
+    });
+    return result.count > 0;
+  }
+
+  // Re-arm the rating prompt when a ticket reopens, so the next resolve/close
+  // prompts again. Only for unrated tickets — a recorded score is final
+  // (recordCsat is single-winner), so re-prompting a rated customer is noise.
+  async resetCsatPrompt(threadId: string): Promise<void> {
+    await this.prisma.ticket.updateMany({
+      where: { threadId, csatScore: null },
+      data: { csatPromptedAt: null },
     });
   }
 

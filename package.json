@@ -4,7 +4,9 @@
   "description": "",
   "main": "dist/index.js",
   "scripts": {
-    "build": "prisma generate && tsc",
+    "build": "prisma generate && tsc && node dist/scripts/bundleWorkflows.js",
+    "test": "node --test \"dist/temporal/__tests__/*.test.js\"",
+    "test:temporal": "TEMPORAL_TEST=1 node --test \"dist/temporal/__tests__/*.test.js\"",
     "start": "SENTRY_PRELOAD_INTEGRATIONS=Http,Express,Postgres node --require @sentry/node/preload dist/index.js",
     "dev": "prisma generate && SENTRY_PRELOAD_INTEGRATIONS=Http,Express,Postgres ts-node -r @sentry/node/preload src/index.ts",
     "db:migrate": "prisma migrate dev",
@@ -23,6 +25,11 @@
     "@prisma/client": "^7.5.0",
     "@sentry/node": "10.63.0",
     "@sentry/profiling-node": "10.63.0",
+    "@temporalio/activity": "1.20.2",
+    "@temporalio/client": "1.20.2",
+    "@temporalio/common": "1.20.2",
+    "@temporalio/worker": "1.20.2",
+    "@temporalio/workflow": "1.20.2",
     "discord.js": "^14.25.1",
     "dotenv": "^17.3.1",
     "express": "^5.2.1",
@@ -30,6 +37,7 @@
     "zod": "^4.4.3"
   },
   "devDependencies": {
+    "@temporalio/testing": "1.20.2",
     "@types/express": "^5.0.6",
     "@types/node": "^25.5.0",
     "prisma": "^7.5.0",
@@ -38,7 +46,8 @@
   },
   "pnpm": {
     "onlyBuiltDependencies": [
-      "@sentry/profiling-node"
+      "@sentry/profiling-node",
+      "@temporalio/core-bridge"
     ]
   }
 }

@@ -177,6 +177,13 @@ model BotSettings {
   vaultTransitMount   String    @default("transit")
   vaultTransitKey     String    @default("support-bot")
   vaultMigratedAt     DateTime?
+  // Temporal migration kill switch: OFF = the legacy in-process setInterval
+  // schedulers run exactly as before; ON = they stay stopped and the Temporal
+  // worker owns all background work. Address/namespace come from env
+  // (TEMPORAL_*); the mTLS client cert lives in Vault KV ("temporal" entry).
+  // temporalImportDoneAt = the one-time state import into workflows completed.
+  temporalEnabled      Boolean   @default(false)
+  temporalImportDoneAt DateTime?
   updatedAt           DateTime  @updatedAt
 
   @@map("bot_settings")
@@ -251,6 +258,7 @@ model TicketScore {
   rootCause        String?
   summary          String?
   staffScores      Json?     // [{ name, tone, clarity, correctness }]
+  staffNames       Json?     // string[]: STAFF display names seen in the transcript at submit time — the allowlist the model's staff[] output is reconciled against (null on rows from before this column existed)
   inputTokens      Int?
   outputTokens     Int?
   costUsd          Float?

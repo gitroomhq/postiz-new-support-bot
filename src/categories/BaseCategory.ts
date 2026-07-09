@@ -21,6 +21,10 @@ export interface TicketContext {
   // new tickets and its members are added to the thread.
   staffPingRoleId: string | null;
   aiSolveEnabled: boolean;
+  // Temporal regime: the modal handler stops after the thread + ticket exist;
+  // the auto-answer runs later inside the ticket workflow's autoAnswer child
+  // (which calls deliverAutoAnswer through an activity).
+  deferAutoAnswer?: boolean;
   initialEmoji: string;
   // Emoji of the initial priority, or null when none is configured (title then
   // carries only the status emoji).
@@ -103,10 +107,8 @@ export abstract class BaseCategory {
     }
 
     const userInput = interaction.fields.getTextInputValue("user_input");
-    const prompt = this.buildPrompt(userInput);
 
     let thread: ThreadChannel | null = null;
-    let thinkingMsg: Message | null = null;
     try {
       thread = await threadsChannel.threads.create({
         name: `${ctx.initialEmoji}${ctx.initialPriorityEmoji ? ` ${ctx.initialPriorityEmoji}` : ""} ${interaction.user.displayName} — ${this.label}`,
@@ -153,6 +155,53 @@ export abstract class BaseCategory {
         return;
       }
 
+      // Temporal regime: the auto-answer runs as a workflow child (durable,
+      // retry-visible); the interactive part of ticket creation ends here.
+      if (ctx.deferAutoAnswer) return;
+
+      const result = await this.deliverAutoAnswer(thread, interaction.user.id, userInput, responder, ctx);
+      if (!result.ok) {
+        // deliverAutoAnswer already repaired the thread + pinged staff; this is
+        // the only place that still owns the ephemeral reply.
+        await interaction
+          .editReply({
+            embeds: [
+              makeEmbed(
+                `Your support thread ${thread} was created, but the automated answer failed — a support member will help you there shortly.`,
+                COLORS.warn
+              ),
+            ],
+          })
+          .catch(() => {});
+      }
+    } catch (error) {
+      // Thread-creation failure (the auto-answer path handles its own errors).
+      void error;
+      const ephemeralEmbed = thread
+        ? makeEmbed(
+            `Your support thread ${thread} was created, but something went wrong — a support member will help you there shortly.`,
+            COLORS.warn
+          )
+        : makeEmbed("Something went wrong while processing your request. Please try again later.", COLORS.danger);
+      await interaction.editReply({ embeds: [ephemeralEmbed] }).catch(() => {});
+    }
+  }
+
+  // The customer-facing AI first answer: thinking placeholder → streamed
+  // messages → final embeds → GitHub-issue / feedback buttons. Never throws;
+  // on failure it repairs the thread (placeholder overwrite + staff ping) and
+  // reports the outcome. Shared by the legacy inline path and the Temporal
+  // runAutoAnswer activity.
+  async deliverAutoAnswer(
+    thread: ThreadChannel,
+    customerId: string,
+    userInput: string,
+    responder: (prompt: string, onUpdate?: (messages: string[]) => void) => Promise<string | string[]>,
+    ctx: TicketContext
+  ): Promise<{ ok: boolean; apiLimit: boolean }> {
+    const prompt = this.buildPrompt(userInput);
+    let thinkingMsg: Message | null = null;
+    try {
       // Thinking animation until first real content arrives
       thinkingMsg = await thread.send({ content: "Thinking (that might take a while)..." });
       let hasContent = false;
@@ -242,7 +291,7 @@ export abstract class BaseCategory {
           : "This looks like a real bug. Would you like to create a GitHub issue for it?";
 
         const issueButton = new ButtonBuilder()
-          .setCustomId(`create_issue:${interaction.user.id}:${label}`)
+          .setCustomId(`create_issue:${customerId}:${label}`)
           .setLabel(buttonLabel)
           .setEmoji("📝")
           .setStyle(ButtonStyle.Success);
@@ -253,12 +302,12 @@ export abstract class BaseCategory {
       } else {
         // No CTA — ask if the answer helped
         const yesButton = new ButtonBuilder()
-          .setCustomId(`feedback_yes:${interaction.user.id}`)
+          .setCustomId(`feedback_yes:${customerId}`)
           .setLabel("Yes, this helped!")
           .setStyle(ButtonStyle.Success);
 
         const noButton = new ButtonBuilder()
-          .setCustomId(`feedback_no:${interaction.user.id}`)
+          .setCustomId(`feedback_no:${customerId}`)
           .setLabel("No, I need more help")
           .setStyle(ButtonStyle.Danger);
 
@@ -266,6 +315,7 @@ export abstract class BaseCategory {
 
         await thread.send({ embeds: [makeEmbed("Did this answer help you?", this.getColor())], components: [row] });
       }
+      return { ok: true, apiLimit: false };
     } catch (error) {
       const isLimit = error instanceof ClaudeApiLimitError;
       const publicMsg = isLimit
@@ -276,16 +326,15 @@ export abstract class BaseCategory {
       // Repair the public thread: the "Thinking (that might take a while)..."
       // placeholder must never be left hanging. Overwrite it (it may already
       // hold partial API-error text) or post fresh if it was never sent. This
-      // now runs for ANY failure, not just API limits — previously a generic
-      // error only touched the ephemeral reply and left the thread stuck.
+      // runs for ANY failure, not just API limits.
       if (thinkingMsg) {
         await thinkingMsg.edit({ content: "", embeds: [publicEmbed] }).catch(() => {});
-      } else if (thread) {
+      } else {
         await thread.send({ embeds: [publicEmbed] }).catch(() => {});
       }
 
       // Ping staff in-thread so a human picks the ticket up (both failure paths).
-      if (thread && ctx.staffPingRoleId) {
+      if (ctx.staffPingRoleId) {
         await thread
           .send({
             content: `<@&${ctx.staffPingRoleId}>`,
@@ -295,15 +344,7 @@ export abstract class BaseCategory {
           .catch(() => {});
       }
 
-      // Update the ephemeral reply. When the thread exists the failure is already
-      // surfaced there; otherwise this is the only thing the user sees.
-      const ephemeralEmbed = thread
-        ? makeEmbed(
-            `Your support thread ${thread} was created, but the automated answer failed — a support member will help you there shortly.`,
-            COLORS.warn
-          )
-        : makeEmbed("Something went wrong while processing your request. Please try again later.", COLORS.danger);
-      await interaction.editReply({ embeds: [ephemeralEmbed] }).catch(() => {});
+      return { ok: false, apiLimit: isLimit };
     }
   }
 

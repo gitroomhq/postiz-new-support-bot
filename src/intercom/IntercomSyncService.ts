@@ -5,6 +5,7 @@ import { SessionStore } from "../auth/SessionStore";
 import { IntercomStore } from "./IntercomStore";
 import { EnsurePayload, MessageAttachmentRef, OutboxEventType, OutboxPayload } from "./types";
 import { log } from "../util/logger";
+import type { TemporalProducers } from "../temporal/producers";
 
 const syncLog = log.child("intercom:sync");
 
@@ -52,6 +53,28 @@ export class IntercomSyncService {
     this.threadUrlBuilder = builder;
   }
 
+  // Temporal seam: when the Temporal regime is active, composed events are
+  // signalled into the per-ticket workflow's outbox instead of inserted into
+  // the intercom_outbox table — every hook call site stays untouched.
+  private producers: TemporalProducers | null = null;
+
+  setTemporalProducers(producers: TemporalProducers): void {
+    this.producers = producers;
+  }
+
+  private temporalActive(): boolean {
+    return this.producers?.enabled() ?? false;
+  }
+
+  // Single enqueue choke point for both regimes.
+  private async emit(threadId: string, type: OutboxEventType, payload: OutboxPayload): Promise<void> {
+    if (this.temporalActive()) {
+      await this.producers!.intercomEnqueue(threadId, type, payload);
+      return;
+    }
+    await this.store.enqueue(threadId, type, payload);
+  }
+
   enabled(): boolean {
     return this.settingsStore.intercomMode() !== "none" && this.settingsStore.intercomConfigured();
   }
@@ -77,7 +100,7 @@ export class IntercomSyncService {
     if (!composed) return;
     await this.chained(ticket.threadId, async () => {
       await this.ensureLink(ticket);
-      await this.store.enqueue(ticket.threadId, "message", { ...composed, attachmentMode: "urls" });
+      await this.emit(ticket.threadId, "message", { ...composed, attachmentMode: "urls" });
     });
   }
 
@@ -87,7 +110,7 @@ export class IntercomSyncService {
     if (!ticket) return;
     await this.chained(ticket.threadId, async () => {
       await this.ensureLink(ticket);
-      await this.store.enqueue(ticket.threadId, "message", {
+      await this.emit(ticket.threadId, "message", {
         direction: "outgoing",
         content: `🤖 AI:\n${finalText}`,
       });
@@ -108,7 +131,7 @@ export class IntercomSyncService {
     const resolved = toTag.closesThread || isResolvedTag(toTag);
     await this.chained(ticket.threadId, async () => {
       await this.ensureLink(ticket);
-      await this.store.enqueue(ticket.threadId, "status", {
+      await this.emit(ticket.threadId, "status", {
         statusTagId: toTag.id,
         statusLabel: `${toTag.emoji} ${toTag.label}`,
         fromLabel: fromTag ? `${fromTag.emoji} ${fromTag.label}` : null,
@@ -130,7 +153,7 @@ export class IntercomSyncService {
     if (!ticket) return;
     await this.chained(ticket.threadId, async () => {
       await this.ensureLink(ticket);
-      await this.store.enqueue(ticket.threadId, "priority", {
+      await this.emit(ticket.threadId, "priority", {
         priorityLabel: `${toTag.emoji} ${toTag.label}`,
         fromLabel: fromTag ? `${fromTag.emoji} ${fromTag.label}` : null,
         actorName,
@@ -149,7 +172,7 @@ export class IntercomSyncService {
     if (!ticket) return;
     await this.chained(ticket.threadId, async () => {
       await this.ensureLink(ticket);
-      await this.store.enqueue(ticket.threadId, "csat", { score, comment: comment ?? null });
+      await this.emit(ticket.threadId, "csat", { score, comment: comment ?? null });
     });
   }
 
@@ -157,7 +180,7 @@ export class IntercomSyncService {
   // ensureLink — it is only ever called for conversations that already have one.
   async enqueueAgentWarning(ticketThreadId: string): Promise<void> {
     await this.chained(ticketThreadId, async () => {
-      await this.store.enqueue(ticketThreadId, "note", { content: AGENT_WARNING_TEXT });
+      await this.emit(ticketThreadId, "note", { content: AGENT_WARNING_TEXT });
     });
   }
 
@@ -226,7 +249,13 @@ export class IntercomSyncService {
       add("csat", { score: ticket.csatScore, comment: ticket.csatComment });
     }
 
-    await this.store.enqueueMany(events);
+    if (this.temporalActive()) {
+      for (const event of events) {
+        await this.producers!.intercomEnqueue(event.ticketThreadId, event.type, event.payload);
+      }
+    } else {
+      await this.store.enqueueMany(events);
+    }
     return events.length;
   }
 
@@ -264,6 +293,9 @@ export class IntercomSyncService {
   }
 
   private async ensureLink(ticket: TicketWithTag, categoryLabel?: string | null): Promise<void> {
+    // Temporal regime: the per-ticket workflow synthesizes the ensure event
+    // itself (payload composed fresh at delivery time) — nothing to enqueue.
+    if (this.temporalActive()) return;
     if (await this.store.hasLinkOrPendingEnsure(ticket.threadId)) return;
     const payload = this.buildEnsurePayload(ticket, categoryLabel ?? categoryLabelOf(ticket, this.categoryLabelResolver));
     if (ticket.customerId) {
