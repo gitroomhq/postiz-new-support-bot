@@ -109,6 +109,7 @@ import {
 import { VaultService, VAULT_INTEGRATIONS, type VaultTestReport } from "../vault/VaultService";
 import type { TemporalOpsBinding, TemporalProducers } from "../temporal/producers";
 import { describeSaResult } from "../temporal/searchAttributes";
+import { buildIdIsDegenerate } from "../temporal/buildId";
 import type { TicketScoreResultType } from "../scoring/scoringPrompt";
 import type { AiRunInput, AutoAnswerInput } from "../temporal/types";
 import { validateCertPair } from "../temporal/certs";
@@ -3987,7 +3988,7 @@ export class DiscordBot {
       lines.push(
         `**Worker:** ${ops.workerManager.running() ? "✅ polling" : "⏹️ stopped"} · build \`${v.buildId}\` (deployment \`${v.deploymentName}\`)${
           promoted === true ? " · current" : promoted === false ? " · ⚠️ NOT promoted to current" : ""
-        }`,
+        }${buildIdIsDegenerate(v.buildId) ? " · ⚠️ degenerate build id (package version — every deploy looks identical; rebuild with the stamped buildInfo.json in dist)" : ""}`,
         `**Background work:** ${s.temporalEnabled() ? "running (worker active)" : "⏸️ paused — signals park server-side until resumed"}`
       );
 

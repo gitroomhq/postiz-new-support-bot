@@ -287,7 +287,9 @@ export async function ticketWorkflow(input: TicketWorkflowInput): Promise<void> 
       if (snap.exists === false) snap = await quick.loadTicketState(threadId);
       syncStatusSa(snap.statusLabel);
       // Static UI context for the Temporal UI (ids only — no question text).
-      upsertMemo({ categoryId: c.categoryId, aiSolve: c.aiSolve });
+      // Gated like every SA command: upsertMemo emits a history command, so an
+      // ungated call would replay-mismatch runs started before this release.
+      if (saEnabled) upsertMemo({ categoryId: c.categoryId, aiSolve: c.aiSolve });
       enqueueIc("ensure", null);
       // aiSolve=false needs nothing here: the modal handler already pinged
       // staff inline (that path never left the interactive segment).

@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { RetryBuffer, type BufferedOp } from "../RetryBuffer";
 import { parseCertInfo, validateCertPair } from "../certs";
-import { resolveBuildId, resetBuildIdCacheForTests } from "../buildId";
+import { resolveBuildId, resetBuildIdCacheForTests, buildIdIsDegenerate } from "../buildId";
 import {
   ticketWorkflowId,
   intercomDeliveryChildId,
@@ -75,12 +75,21 @@ test("validateCertPair accepts the fixture pair and rejects a bad key", () => {
   assert.throws(() => validateCertPair("nope", FIXTURE_KEY_PEM, null), /certificate/i);
 });
 
-test("resolveBuildId resolves (git checkout or fallback) and memoizes", () => {
+test("resolveBuildId resolves (build stamp or git checkout) and memoizes", () => {
   resetBuildIdCacheForTests();
   const first = resolveBuildId();
   assert.ok(first.length >= 5, `expected a build id, got "${first}"`);
+  assert.ok(!buildIdIsDegenerate(first), `built/test env must not resolve the degenerate fallback ("${first}")`);
   assert.equal(resolveBuildId(), first);
   resetBuildIdCacheForTests();
+});
+
+test("buildIdIsDegenerate flags package-version ids only", () => {
+  assert.equal(buildIdIsDegenerate("1.0.0"), true);
+  assert.equal(buildIdIsDegenerate("12.34.5"), true);
+  assert.equal(buildIdIsDegenerate("unknown"), true);
+  assert.equal(buildIdIsDegenerate("3f8c25"), false);
+  assert.equal(buildIdIsDegenerate("d41d8c"), false);
 });
 
 test("workflow id scheme matches the documented shapes", () => {
