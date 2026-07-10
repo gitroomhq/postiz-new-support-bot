@@ -500,6 +500,18 @@ export class StripeClient {
     return { efws, truncated: true };
   }
 
+  // Screenshot/PDF proof for the bank: uploads via the Files API with the
+  // dispute_evidence purpose. The returned file id goes into one of the
+  // dispute's FILE evidence slots (receipt, customer_communication, …) via
+  // updateDisputeEvidence. dispute_evidence accepts PDF/JPEG/PNG; callers
+  // validate type/size (combined evidence is capped by Stripe at ~4.5MB).
+  async uploadDisputeEvidenceFile(name: string, data: Buffer, contentType: string): Promise<Stripe.File> {
+    return this.stripe.files.create({
+      purpose: "dispute_evidence",
+      file: { data, name, type: contentType },
+    });
+  }
+
   // Stripe's `submit` param defaults to TRUE — this wrapper makes it mandatory
   // so a draft save can never accidentally submit to the bank. submit:false
   // stages evidence server-side; submit:true sends it (usually once, ever).

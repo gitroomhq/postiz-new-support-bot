@@ -2,6 +2,8 @@ import {
   ActionRowBuilder,
   ButtonStyle,
   EmbedBuilder,
+  FileUploadBuilder,
+  LabelBuilder,
   ModalBuilder,
   StringSelectMenuBuilder,
   TextInputBuilder,
@@ -70,6 +72,32 @@ const EVIDENCE_FIELDS_POLICY: EvidenceFieldSpec[] = [
 ];
 const POLICY_REASONS = new Set(["subscription_canceled", "credit_not_processed"]);
 const EVIDENCE_KEYS = new Set([...EVIDENCE_FIELDS_DEFAULT, ...EVIDENCE_FIELDS_POLICY].map((f) => f.key));
+
+// FILE evidence slots (Stripe file ids, distinct from the *_disclosure text
+// fields) — where an uploaded screenshot/PDF proof lands.
+const EVIDENCE_FILE_SLOTS: Array<{ key: string; label: string }> = [
+  { key: "uncategorized_file", label: "Uncategorized file (general proof)" },
+  { key: "receipt", label: "Receipt" },
+  { key: "customer_communication", label: "Customer communication" },
+  { key: "service_documentation", label: "Service documentation / usage proof" },
+  { key: "refund_policy", label: "Refund policy (file)" },
+  { key: "cancellation_policy", label: "Cancellation policy (file)" },
+];
+const EVIDENCE_FILE_KEYS = [
+  "receipt",
+  "customer_communication",
+  "customer_signature",
+  "service_documentation",
+  "shipping_documentation",
+  "duplicate_charge_documentation",
+  "refund_policy",
+  "cancellation_policy",
+  "uncategorized_file",
+] as const;
+// Stripe dispute_evidence uploads accept PDF/JPEG/PNG; combined evidence is
+// capped around 4.5MB, so individual proofs are held to 4MB.
+const PROOF_TYPES = new Set(["image/png", "image/jpeg", "application/pdf"]);
+const PROOF_MAX_BYTES = 4 * 1024 * 1024;
 
 function evidenceFieldsFor(reason: string | null | undefined): EvidenceFieldSpec[] {
   return POLICY_REASONS.has(reason ?? "") ? EVIDENCE_FIELDS_POLICY : EVIDENCE_FIELDS_DEFAULT;
@@ -359,6 +387,104 @@ export class DisputesHub {
         if (!session?.disputeId) return;
         await interaction.deferUpdate();
         await this.ctx.sessions.runExclusive(token, interaction, () => this.runAiDraft(interaction, token));
+      },
+    },
+    // ---- evidence file proof (screenshots/PDFs → Stripe Files API) ----
+    {
+      kind: "button",
+      id: "billadmin_dp_proof:",
+      match: "prefix",
+      handler: async (interaction) => {
+        const token = interaction.customId.split(":")[1];
+        const session = await this.ctx.sessions.getOwnedSession(token, interaction);
+        if (!session?.disputeId) return;
+        await interaction.showModal(
+          new ModalBuilder()
+            .setCustomId(`billadmin_dp_proofm:${token}`)
+            .setTitle("Attach proof for the bank")
+            .addLabelComponents(
+              new LabelBuilder()
+                .setLabel("Screenshot or PDF (max 4MB)")
+                .setFileUploadComponent(
+                  new FileUploadBuilder().setCustomId("proof_file").setMinValues(1).setMaxValues(1).setRequired(true)
+                ),
+              new LabelBuilder()
+                .setLabel("Evidence slot it proves")
+                .setStringSelectMenuComponent(
+                  new StringSelectMenuBuilder()
+                    .setCustomId("proof_slot")
+                    .addOptions(EVIDENCE_FILE_SLOTS.map((s) => ({ label: s.label, value: s.key })))
+                )
+            )
+        );
+      },
+    },
+    {
+      kind: "modal",
+      id: "billadmin_dp_proofm:",
+      match: "prefix",
+      handler: async (interaction) => {
+        const token = interaction.customId.split(":")[1];
+        const session = await this.ctx.sessions.getOwnedSession(token, interaction);
+        if (!session?.disputeId) return;
+        const disputeId = session.disputeId;
+        const attachment = interaction.fields.getUploadedFiles("proof_file", true).first();
+        const slot = interaction.fields.getStringSelectValues("proof_slot")[0];
+        if (!attachment || !EVIDENCE_FILE_SLOTS.some((s) => s.key === slot)) return;
+
+        const contentType = attachment.contentType?.split(";")[0].toLowerCase() ?? "";
+        if (!PROOF_TYPES.has(contentType)) {
+          await interaction.reply({
+            embeds: [makeEmbed("The bank only accepts **PNG, JPEG or PDF** evidence files.", COLORS.danger)],
+            flags: 64,
+          });
+          return;
+        }
+        if (attachment.size > PROOF_MAX_BYTES) {
+          await interaction.reply({
+            embeds: [
+              makeEmbed(
+                "File too large — Stripe caps combined dispute evidence around 4.5MB, so keep each proof under **4MB**.",
+                COLORS.danger
+              ),
+            ],
+            flags: 64,
+          });
+          return;
+        }
+
+        await this.ctx.sessions.ackModal(interaction);
+        await this.ctx.sessions.runExclusive(token, interaction, async () => {
+          // Guard: file evidence is rejected by Stripe once the response window
+          // closed — re-check live before uploading.
+          const fresh = await this.ctx.stripe.getDispute(disputeId);
+          if (!RESPONDABLE.has(fresh.status)) {
+            await this.renderDetail(interaction, token, `⚠️ Status is **${fresh.status}** — evidence files can no longer be attached.`);
+            return;
+          }
+          const res = await fetch(attachment.url);
+          if (!res.ok) throw new Error(`Discord CDN download failed (${res.status})`);
+          const data = Buffer.from(await res.arrayBuffer());
+          const file = await this.ctx.stripe.uploadDisputeEvidenceFile(attachment.name, data, contentType);
+          await this.ctx.stripe.updateDisputeEvidence(
+            disputeId,
+            { [slot]: file.id } as Stripe.DisputeUpdateParams.Evidence,
+            false,
+            `billadmin-dpfile-${interaction.id}`
+          );
+          this.ctx.audit.log(interaction, {
+            action: "Dispute evidence file staged",
+            targetCustomerId: session.customerId,
+            objectId: disputeId,
+            outcome: `\`${file.id}\` (${attachment.name}, ${Math.round(attachment.size / 1024)}KB) staged as ${slot} (NOT submitted)`,
+            severity: "info",
+          });
+          await this.renderDetail(
+            interaction,
+            token,
+            `📎 \`${attachment.name}\` uploaded and staged as **${slot}** — it reaches the bank when you Submit Evidence.`
+          );
+        });
       },
     },
     // ---- accept (close as lost) ----
@@ -1157,13 +1283,19 @@ export class DisputesHub {
     const ed = dispute.evidence_details;
     const dueText = ed?.due_by ? `<t:${ed.due_by}:R> (<t:${ed.due_by}:f>)${ed.past_due ? " · ⚠️ PAST DUE" : ""}` : "no response window";
     const draftFields = Object.keys((local.evidenceDraft ?? {}) as Record<string, string>).length;
+    const stagedFiles = dispute.evidence
+      ? EVIDENCE_FILE_KEYS.filter((key) => (dispute.evidence as unknown as Record<string, unknown>)[key])
+      : [];
     const evidenceState = [
       draftFields ? `local draft: ${draftFields} field(s)` : "no local draft",
       ed?.has_evidence ? "staged at Stripe" : "nothing staged",
+      stagedFiles.length ? `📎 files: ${stagedFiles.join(", ")}` : null,
       local.evidenceSubmittedAt
         ? `submitted <t:${Math.floor(local.evidenceSubmittedAt.getTime() / 1000)}:R>`
         : `submissions: ${ed?.submission_count ?? 0}`,
-    ].join(" · ");
+    ]
+      .filter(Boolean)
+      .join(" · ");
     const card = dispute.payment_method_details?.card;
     const cardText = card
       ? `${card.brand ?? "card"}${card.case_type ? ` · ${card.case_type}` : ""}${card.network_reason_code ? ` · network code ${card.network_reason_code}` : ""}`
@@ -1216,17 +1348,18 @@ export class DisputesHub {
         buttonRow(
           btn(`billadmin_dp_ev_edit:${token}`, "Edit Evidence", ButtonStyle.Primary, !respondable),
           btn(`billadmin_dp_ai:${token}`, "AI Draft", ButtonStyle.Primary, !respondable),
+          btn(`billadmin_dp_proof:${token}`, "Attach Proof", ButtonStyle.Primary, !respondable),
           btn(`billadmin_dp_ev_submit:${token}`, "Submit Evidence", ButtonStyle.Danger, !respondable || !(ed?.has_evidence || draftFields > 0)),
-          btn(`billadmin_dp_accept:${token}`, "Accept Dispute", ButtonStyle.Danger, terminal),
-          btn(`billadmin_dp_refund:${token}`, "Refund to Prevent", ButtonStyle.Secondary, !dispute.is_charge_refundable)
+          btn(`billadmin_dp_accept:${token}`, "Accept Dispute", ButtonStyle.Danger, terminal)
         ),
         buttonRow(
+          btn(`billadmin_dp_refund:${token}`, "Refund to Prevent", ButtonStyle.Secondary, !dispute.is_charge_refundable),
           btn(`billadmin_blk_open:${token}:dp`, "Block…", ButtonStyle.Danger),
           btn(`billadmin_dp_notes:${token}`, "Notes", ButtonStyle.Secondary),
           btn(`billadmin_dp_bm:${token}`, bookmarked ? "Remove Bookmark" : "Bookmark", ButtonStyle.Secondary),
-          btn(`billadmin_dp_watch:${token}`, watching ? "Unwatch" : "Watch", ButtonStyle.Secondary),
-          btn(`billadmin_nav_back:${token}`, "Back", ButtonStyle.Secondary)
+          btn(`billadmin_dp_watch:${token}`, watching ? "Unwatch" : "Watch", ButtonStyle.Secondary)
         ),
+        buttonRow(btn(`billadmin_nav_back:${token}`, "Back", ButtonStyle.Secondary)),
       ],
     });
   }
