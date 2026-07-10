@@ -12,7 +12,9 @@ import type Stripe from "stripe";
 import { StripeClient } from "../../StripeClient";
 import { embed as makeEmbed, COLORS } from "../../../util/embeds";
 import { Logger } from "../../../util/logger";
+import { exportBillingEvent } from "../../../metrics/MetricsExporter";
 import { backRow, btn, buttonRow, chargeLine, invoiceLine, selectRow, textInput } from "../ui";
+import { buildNoteModal, renderNotesPanel } from "../qolUi";
 import { pushNav, type BillAdminSession, type Panel, type RenderInteraction, type RouteEntry } from "../types";
 import type { HubContext } from "./HubContext";
 
@@ -189,6 +191,96 @@ export async function renderListPage(
   components.push(buttonRow(...navButtons));
 
   await interaction.editReply({ embeds: [embed], components });
+}
+
+// Shared refund confirm step: entered from the refund modal, the charge detail
+// panel and the Disputes hub's refund-to-prevent flow (hence exported, like
+// renderListPage — no hub-to-hub dependency). Resolves the subscription behind
+// the charge via its invoice (getInvoice → invoice.parent.subscription_details
+// .subscription) and stashes it in the session, so "Refund + cancel sub"
+// cancels exactly that subscription — never a guessed one derived from the
+// customer.
+export async function showRefundConfirm(
+  ctx: HubContext,
+  interaction: RenderInteraction,
+  token: string,
+  charge: Stripe.Charge,
+  cancelTarget = "billadmin_hub:charges"
+): Promise<void> {
+  const session = ctx.sessions.get(token);
+  if (!session) return;
+  const fmt = (v: number) => ctx.stripe.formatAmount(v, charge.currency);
+  const remaining = charge.amount - charge.amount_refunded;
+  const amountMinor = session.refundAmountMinor ?? null;
+
+  let subscriptionId: string | null = null;
+  const invoiceId = chargeInvoiceId(charge);
+  if (invoiceId) {
+    try {
+      const invoice = await ctx.stripe.getInvoice(invoiceId);
+      const subRef = invoice.parent?.subscription_details?.subscription;
+      subscriptionId = subRef ? (typeof subRef === "string" ? subRef : subRef.id) : null;
+    } catch (error) {
+      logger.warn("Could not resolve the charge's invoice for subscription lookup", {
+        chargeId: charge.id,
+        invoiceId,
+        error: String(error),
+      });
+    }
+  }
+  session.subscriptionId = subscriptionId ?? undefined;
+  // Land the refund result back on wherever the flow was launched from (the
+  // charge detail when opened there, the Charges hub for the id-modal flow),
+  // instead of always dumping to the hub top menu.
+  session.refundReturn = cancelTarget;
+
+  const notes = [
+    charge.disputed
+      ? "🚩 **This charge is disputed** — a refund only helps at the inquiry / early-warning stage; Stripe rejects refunds on formal chargebacks."
+      : null,
+    subscriptionId
+      ? null
+      : "ℹ️ No subscription attached to this charge — cancel explicitly via Subscriptions if needed.",
+    "ℹ️ Admin refunds don't record a self-service lock: the customer's own refund flow could still refund any remainder.",
+    "ℹ️ **Refund as Fraudulent** also puts the card + email on Stripe's built-in block lists.",
+  ].filter(Boolean);
+
+  const embed = new EmbedBuilder()
+    .setTitle("Confirm refund")
+    .setColor(COLORS.danger)
+    .addFields(
+      { name: "Charge", value: `\`${charge.id}\``, inline: true },
+      { name: "Customer", value: charge.customer ? `\`${typeof charge.customer === "string" ? charge.customer : charge.customer.id}\`` : "—", inline: true },
+      { name: "Created", value: `<t:${charge.created}:D>`, inline: true },
+      { name: "Original", value: fmt(charge.amount), inline: true },
+      { name: "Already refunded", value: fmt(charge.amount_refunded), inline: true },
+      { name: "Remaining", value: fmt(remaining), inline: true },
+      {
+        name: "This refund",
+        value: amountMinor != null ? `**${fmt(amountMinor)}** (partial)` : `**${fmt(remaining)}** (full remainder)`,
+        inline: false,
+      },
+      {
+        name: "Subscription",
+        value: subscriptionId
+          ? `\`${subscriptionId}\` — cancelled if you pick **Refund + cancel sub**`
+          : "none attached to this charge",
+        inline: false,
+      }
+    )
+    .setDescription(notes.join("\n"));
+
+  await interaction.editReply({
+    embeds: [embed],
+    components: [
+      buttonRow(
+        btn(`billadmin_refund_exec:${token}`, "Refund", ButtonStyle.Danger),
+        btn(`billadmin_refund_execsub:${token}`, "Refund + cancel sub", ButtonStyle.Danger, !subscriptionId),
+        btn(`billadmin_refund_execfr:${token}`, "Refund as Fraudulent", ButtonStyle.Danger),
+        btn(cancelTarget, "Cancel", ButtonStyle.Secondary)
+      ),
+    ],
+  });
 }
 
 // Charges hub: charge & invoice history, disputes/fraud signals, refunds.
@@ -378,11 +470,115 @@ export class ChargesHub {
       match: "prefix",
       handler: (interaction) => this.executeRefund(interaction, interaction.customId.split(":")[1], true),
     },
+    // Fraudulent-reason refund: Stripe additionally adds the card + email to
+    // its built-in block lists (the refund-to-prevent flow's preferred exit).
+    {
+      kind: "button",
+      id: "billadmin_refund_execfr:",
+      match: "prefix",
+      handler: (interaction) => this.executeRefund(interaction, interaction.customId.split(":")[1], false, "fraudulent"),
+    },
     {
       kind: "modal",
       id: "billadmin_refund_modal",
       match: "exact",
       handler: (interaction) => this.handleRefundModal(interaction),
+    },
+    // ---- charge-detail QoL: team notes + shared bookmark ----
+    {
+      kind: "button",
+      id: "billadmin_ch_notes:",
+      match: "prefix",
+      handler: async (interaction) => {
+        const [, token, pageStr, npageStr] = interaction.customId.split(":");
+        const session = await this.ctx.sessions.getOwnedSession(token, interaction);
+        if (!session?.chargeId) return;
+        await interaction.deferUpdate();
+        const page = Math.max(0, Number.parseInt(pageStr, 10) || 0);
+        await this.ctx.sessions.tryRender(interaction, () =>
+          renderNotesPanel(this.ctx, interaction, {
+            type: "charge",
+            objectId: session.chargeId!,
+            backId: `billadmin_ch_det:${token}:${page}`,
+            addNoteId: `billadmin_ch_noteadd:${token}:${page}`,
+            pageBaseId: `billadmin_ch_notes:${token}:${page}`,
+            page: Math.max(0, Number.parseInt(npageStr, 10) || 0),
+          })
+        );
+      },
+    },
+    {
+      kind: "button",
+      id: "billadmin_ch_noteadd:",
+      match: "prefix",
+      handler: async (interaction) => {
+        const [, token, pageStr] = interaction.customId.split(":");
+        const session = await this.ctx.sessions.getOwnedSession(token, interaction);
+        if (!session?.chargeId) return;
+        const page = Math.max(0, Number.parseInt(pageStr, 10) || 0);
+        await interaction.showModal(buildNoteModal(`billadmin_ch_notem:${token}:${page}`, session.chargeId));
+      },
+    },
+    {
+      kind: "modal",
+      id: "billadmin_ch_notem:",
+      match: "prefix",
+      handler: async (interaction) => {
+        const [, token, pageStr] = interaction.customId.split(":");
+        const session = await this.ctx.sessions.getOwnedSession(token, interaction);
+        if (!session?.chargeId) return;
+        const page = Math.max(0, Number.parseInt(pageStr, 10) || 0);
+        const text = interaction.fields.getTextInputValue("note_text").trim();
+        await this.ctx.sessions.ackModal(interaction);
+        await this.ctx.sessions.tryRender(interaction, async () => {
+          if (text) {
+            await this.ctx.qolStore.addNote(
+              "charge",
+              session.chargeId!,
+              interaction.user.id,
+              interaction.user.displayName ?? interaction.user.username,
+              text
+            );
+          }
+          await renderNotesPanel(this.ctx, interaction, {
+            type: "charge",
+            objectId: session.chargeId!,
+            backId: `billadmin_ch_det:${token}:${page}`,
+            addNoteId: `billadmin_ch_noteadd:${token}:${page}`,
+            pageBaseId: `billadmin_ch_notes:${token}:${page}`,
+            notice: text ? "✅ Note added." : undefined,
+          });
+        });
+      },
+    },
+    {
+      kind: "button",
+      id: "billadmin_ch_bm:",
+      match: "prefix",
+      handler: async (interaction) => {
+        const [, token, pageStr] = interaction.customId.split(":");
+        const session = await this.ctx.sessions.getOwnedSession(token, interaction);
+        if (!session?.chargeId) return;
+        await interaction.deferUpdate();
+        const page = Math.max(0, Number.parseInt(pageStr, 10) || 0);
+        await this.ctx.sessions.tryRender(interaction, async () => {
+          const charge = await this.ctx.stripe.getCharge(session.chargeId!);
+          const label = `${this.ctx.stripe.formatAmount(charge.amount, charge.currency)} · ${charge.status}`;
+          const { bookmarked } = await this.ctx.qolStore.toggleBookmark(
+            "charge",
+            session.chargeId!,
+            label,
+            interaction.user.id,
+            interaction.user.displayName ?? interaction.user.username
+          );
+          await this.renderChargeDetail(
+            interaction,
+            token,
+            page,
+            bookmarked ? "🔖 Bookmarked for the team." : "Bookmark removed."
+          );
+        });
+      },
     },
   ];
 
@@ -545,99 +741,37 @@ export class ChargesHub {
     });
   }
 
-  // Shared refund confirm step: entered from the refund modal and from the
-  // charge detail panel. Resolves the subscription behind the charge via its
-  // invoice (getInvoice → invoice.parent.subscription_details.subscription) and
-  // stashes it in the session, so "Refund + cancel sub" cancels exactly that
-  // subscription — never a guessed one derived from the customer.
-  private async showRefundConfirm(
+  // Delegates to the exported confirm step (shared with the Disputes hub's
+  // refund-to-prevent flow, same pattern as the exported renderListPage).
+  showRefundConfirm(
     interaction: RenderInteraction,
     token: string,
     charge: Stripe.Charge,
-    cancelTarget = "billadmin_hub:charges"
+    cancelTarget?: string
   ): Promise<void> {
-    const session = this.ctx.sessions.get(token);
-    if (!session) return;
-    const fmt = (v: number) => this.ctx.stripe.formatAmount(v, charge.currency);
-    const remaining = charge.amount - charge.amount_refunded;
-    const amountMinor = session.refundAmountMinor ?? null;
-
-    let subscriptionId: string | null = null;
-    const invoiceId = chargeInvoiceId(charge);
-    if (invoiceId) {
-      try {
-        const invoice = await this.ctx.stripe.getInvoice(invoiceId);
-        const subRef = invoice.parent?.subscription_details?.subscription;
-        subscriptionId = subRef ? (typeof subRef === "string" ? subRef : subRef.id) : null;
-      } catch (error) {
-        logger.warn("Could not resolve the charge's invoice for subscription lookup", {
-          chargeId: charge.id,
-          invoiceId,
-          error: String(error),
-        });
-      }
-    }
-    session.subscriptionId = subscriptionId ?? undefined;
-    // Land the refund result back on wherever the flow was launched from (the
-    // charge detail when opened there, the Charges hub for the id-modal flow),
-    // instead of always dumping to the hub top menu.
-    session.refundReturn = cancelTarget;
-
-    const notes = [
-      charge.disputed
-        ? "🚩 **This charge is disputed** — refunding usually won't release disputed funds."
-        : null,
-      subscriptionId
-        ? null
-        : "ℹ️ No subscription attached to this charge — cancel explicitly via Subscriptions if needed.",
-      "ℹ️ Admin refunds don't record a self-service lock: the customer's own refund flow could still refund any remainder.",
-    ].filter(Boolean);
-
-    const embed = new EmbedBuilder()
-      .setTitle("Confirm refund")
-      .setColor(COLORS.danger)
-      .addFields(
-        { name: "Charge", value: `\`${charge.id}\``, inline: true },
-        { name: "Customer", value: charge.customer ? `\`${typeof charge.customer === "string" ? charge.customer : charge.customer.id}\`` : "—", inline: true },
-        { name: "Created", value: `<t:${charge.created}:D>`, inline: true },
-        { name: "Original", value: fmt(charge.amount), inline: true },
-        { name: "Already refunded", value: fmt(charge.amount_refunded), inline: true },
-        { name: "Remaining", value: fmt(remaining), inline: true },
-        {
-          name: "This refund",
-          value: amountMinor != null ? `**${fmt(amountMinor)}** (partial)` : `**${fmt(remaining)}** (full remainder)`,
-          inline: false,
-        },
-        {
-          name: "Subscription",
-          value: subscriptionId
-            ? `\`${subscriptionId}\` — cancelled if you pick **Refund + cancel sub**`
-            : "none attached to this charge",
-          inline: false,
-        }
-      )
-      .setDescription(notes.join("\n"));
-
-    await interaction.editReply({
-      embeds: [embed],
-      components: [
-        buttonRow(
-          btn(`billadmin_refund_exec:${token}`, "Refund", ButtonStyle.Danger),
-          btn(`billadmin_refund_execsub:${token}`, "Refund + cancel sub", ButtonStyle.Danger, !subscriptionId),
-          btn(cancelTarget, "Cancel", ButtonStyle.Secondary)
-        ),
-      ],
-    });
+    return showRefundConfirm(this.ctx, interaction, token, charge, cancelTarget);
   }
 
   // ---- charge detail ----
 
-  private async renderChargeDetail(interaction: RenderInteraction, token: string, page: number): Promise<void> {
+  // Public: the Disputes hub's Jump-to-ID and bookmark board land here too
+  // (bound through BillingAdmin, like the TargetResolver handlers).
+  async renderChargeDetail(interaction: RenderInteraction, token: string, page: number, notice?: string): Promise<void> {
     const session = this.ctx.sessions.get(token);
     if (!session?.chargeId) return;
 
     const charge = await this.ctx.stripe.getCharge(session.chargeId);
-    const dispute = charge.disputed ? await this.ctx.stripe.getDisputeForCharge(charge.id) : null;
+    const chargeCustomerId = typeof charge.customer === "string" ? charge.customer : (charge.customer?.id ?? null);
+    const [dispute, blockHit, bookmarked, latestNote] = await Promise.all([
+      charge.disputed ? this.ctx.stripe.getDisputeForCharge(charge.id) : Promise.resolve(null),
+      this.ctx.blockStore.anyBlocked({
+        customerId: chargeCustomerId,
+        email: charge.billing_details?.email ?? charge.receipt_email,
+        fingerprint: charge.payment_method_details?.card?.fingerprint,
+      }),
+      this.ctx.qolStore.isBookmarked("charge", charge.id),
+      this.ctx.qolStore.latestNote("charge", charge.id),
+    ]);
     const fmt = (v: number) => this.ctx.stripe.formatAmount(v, charge.currency);
     const remaining = charge.amount - charge.amount_refunded;
     const invoiceId = chargeInvoiceId(charge);
@@ -653,8 +787,17 @@ export class ChargesHub {
 
     const embed = new EmbedBuilder()
       .setTitle(`Charge — \`${charge.id}\``)
-      .setColor(charge.disputed ? COLORS.warn : COLORS.brand)
+      .setColor(blockHit ? COLORS.danger : charge.disputed ? COLORS.warn : COLORS.brand)
       .addFields(
+        ...(blockHit
+          ? [
+              {
+                name: "⛔ BLOCKED",
+                value: `${blockHit.kind} \`${blockHit.value.slice(0, 100)}\` — ${blockHit.reason.slice(0, 300)}`,
+                inline: false,
+              },
+            ]
+          : []),
         { name: "Amount", value: `**${fmt(charge.amount)}**`, inline: true },
         { name: "Status", value: charge.status, inline: true },
         { name: "Created", value: `<t:${charge.created}:D>`, inline: true },
@@ -671,8 +814,18 @@ export class ChargesHub {
         { name: "Risk", value: riskText, inline: true },
         { name: "Payment method", value: pmText.slice(0, 1024), inline: true },
         { name: "Invoice", value: invoiceId ? `\`${invoiceId}\`` : "—", inline: true },
-        { name: "Receipt", value: charge.receipt_url ? `[open receipt](${charge.receipt_url})` : "—", inline: true }
+        { name: "Receipt", value: charge.receipt_url ? `[open receipt](${charge.receipt_url})` : "—", inline: true },
+        ...(latestNote
+          ? [
+              {
+                name: "Latest note",
+                value: `<t:${Math.floor(latestNote.createdAt.getTime() / 1000)}:R> **${latestNote.authorName}** — ${latestNote.text}`.slice(0, 1024),
+                inline: false,
+              },
+            ]
+          : [])
       );
+    if (notice) embed.setDescription(notice.slice(0, 4096));
 
     await interaction.editReply({
       embeds: [embed],
@@ -682,6 +835,11 @@ export class ChargesHub {
           btn("billadmin_hub:invoices", "View invoice", ButtonStyle.Secondary, !invoiceId),
           btn(`billadmin_c360_refresh:${token}`, "Customer 360", ButtonStyle.Secondary, !session.customerId),
           btn(`billadmin_nav_back:${token}`, "Back", ButtonStyle.Secondary)
+        ),
+        buttonRow(
+          btn(`billadmin_ch_notes:${token}:${page}`, "Notes", ButtonStyle.Secondary),
+          btn(`billadmin_ch_bm:${token}:${page}`, bookmarked ? "Remove Bookmark" : "Bookmark", ButtonStyle.Secondary),
+          btn(`billadmin_blk_open:${token}:ch:${page}`, "Block…", ButtonStyle.Danger)
         ),
       ],
     });
@@ -787,7 +945,12 @@ export class ChargesHub {
     });
   }
 
-  private async executeRefund(interaction: ButtonInteraction, token: string, withCancel: boolean): Promise<void> {
+  private async executeRefund(
+    interaction: ButtonInteraction,
+    token: string,
+    withCancel: boolean,
+    reason?: Stripe.RefundCreateParams.Reason
+  ): Promise<void> {
     const session = await this.ctx.sessions.getOwnedSession(token, interaction);
     if (!session?.chargeId) return;
     await interaction.deferUpdate();
@@ -811,17 +974,23 @@ export class ChargesHub {
       // Per-click idempotency key: stable across Discord retries of this click, but
       // unique across deliberate repeat refunds (reusing refund-${chargeId} would
       // silently return the first refund on a second partial).
+      const actionLabel = withCancel
+        ? "Refund + cancel subscription"
+        : reason === "fraudulent"
+          ? "Refund (marked fraudulent)"
+          : "Refund";
       let result: Awaited<ReturnType<StripeClient["refundChargeAmount"]>>;
       try {
         result = await this.ctx.stripe.refundChargeAmount(
           session.chargeId!,
           session.refundAmountMinor ?? null,
-          `billadmin-refund-${interaction.id}`
+          `billadmin-refund-${interaction.id}`,
+          reason
         );
       } catch (error) {
         const msg = error instanceof Error ? error.message : String(error);
         this.ctx.audit.log(interaction, {
-          action: withCancel ? "Refund + cancel subscription" : "Refund",
+          action: actionLabel,
           targetCustomerId: session.customerId,
           objectId: session.chargeId,
           amountText: session.refundAmountMinor != null ? `${session.refundAmountMinor} (minor units)` : "full remainder",
@@ -850,23 +1019,31 @@ export class ChargesHub {
         }
       }
 
+      const fraudNote =
+        reason === "fraudulent" ? "\n🚫 Marked fraudulent — Stripe added the card + email to its block lists." : "";
       const amountText = this.ctx.stripe.formatAmount(result.amount, result.currency);
       this.ctx.audit.log(interaction, {
-        action: withCancel ? "Refund + cancel subscription" : "Refund",
+        action: actionLabel,
         targetCustomerId: session.customerId,
         objectId: session.chargeId,
         amountText,
         outcome: `Refund \`${result.refundId}\` (${result.status ?? "pending"})${
           session.refundAmountMinor != null ? " — partial" : " — full remainder"
-        }${cancelNote.replace(/\n/g, " ")}${lockNote.replace(/\n/g, " ")}`,
+        }${cancelNote.replace(/\n/g, " ")}${fraudNote.replace(/\n/g, " ")}${lockNote.replace(/\n/g, " ")}`,
         severity: "success",
+      });
+      exportBillingEvent({
+        event: "refund",
+        amountMinor: result.amount,
+        currency: result.currency,
+        chargeId: session.chargeId,
       });
 
       await interaction.editReply({
         embeds: [
           makeEmbed(
             `↩️ Refunded **${amountText}** on \`${session.chargeId}\` — ` +
-              `refund \`${result.refundId}\` (${result.status ?? "pending"}).${cancelNote}${lockNote}`,
+              `refund \`${result.refundId}\` (${result.status ?? "pending"}).${cancelNote}${fraudNote}${lockNote}`,
             COLORS.success
           ),
         ],

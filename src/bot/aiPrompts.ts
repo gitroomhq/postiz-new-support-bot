@@ -290,7 +290,9 @@ function toolNotes(tools: AiToolAvailability): string {
   }
   if (tools.stripe) {
     notes.push(
-      "You have read-only Stripe tools (mcp__stripe__*) to inspect the customer's billing: customer, subscriptions, invoices, charges, payment intents, disputes, cards, tax ids."
+      "You have read-only Stripe tools (mcp__stripe__*) to inspect the customer's billing: customer, subscriptions, invoices, charges, payment intents, disputes, cards, tax ids. " +
+        "Account-wide dispute tools: list_disputes / get_dispute for dispute state and evidence deadlines, get_dispute_ratio for the plain and VAMP-style dispute ratios (may take ~10s). " +
+        "All read-only — you cannot submit evidence, close disputes or block anyone."
     );
     notes.push(
       "When a customer id / exact email isn't known, or a card/last4/charge lookup comes up empty, SEARCH account-wide: " +
@@ -374,4 +376,57 @@ Do not promise refunds, releases or timelines unless the ticket already establis
   }
 
 ${contextBlock}`;
+}
+
+export interface DisputeEvidenceContext {
+  disputeId: string;
+  reason: string;
+  status: string;
+  amountText: string;
+  disputeCreated: string; // ISO date
+  evidenceDueBy: string | null; // ISO date
+  charge: {
+    id: string;
+    created: string; // ISO date
+    amountText: string;
+    description: string | null;
+    cardBrand: string | null;
+    cardLast4: string | null;
+  } | null;
+  customer: { id: string; email: string | null; name: string | null; created: string | null } | null;
+  subscriptions: Array<{ plan: string; status: string; started: string }>;
+  // Which evidence fields the staff modal will show — the model fills exactly these.
+  fields: string[];
+}
+
+// Drafts dispute-evidence text for staff review. The output is STRICT JSON and
+// is only ever saved as a LOCAL draft — the AI path has no route to Stripe;
+// staging/submitting happens through the human-reviewed modal + confirm.
+export function buildDisputeEvidencePrompt(ctx: DisputeEvidenceContext): string {
+  const facts = [
+    `Dispute: ${ctx.disputeId} · reason ${ctx.reason} · status ${ctx.status} · amount ${ctx.amountText} · opened ${ctx.disputeCreated}${ctx.evidenceDueBy ? ` · evidence due ${ctx.evidenceDueBy}` : ""}`,
+    ctx.charge
+      ? `Charge: ${ctx.charge.id} · ${ctx.charge.amountText} · created ${ctx.charge.created}${ctx.charge.description ? ` · description "${ctx.charge.description}"` : ""}${ctx.charge.cardBrand ? ` · ${ctx.charge.cardBrand} •••• ${ctx.charge.cardLast4 ?? "????"}` : ""}`
+      : "Charge: unknown",
+    ctx.customer
+      ? `Customer: ${ctx.customer.id}${ctx.customer.email ? ` · ${ctx.customer.email}` : ""}${ctx.customer.name ? ` · ${ctx.customer.name}` : ""}${ctx.customer.created ? ` · Stripe customer since ${ctx.customer.created}` : ""}`
+      : "Customer: unknown",
+    ctx.subscriptions.length
+      ? `Subscriptions:\n${ctx.subscriptions.map((s) => `- ${s.plan} · ${s.status} · started ${s.started}`).join("\n")}`
+      : "Subscriptions: none found",
+  ].join("\n");
+
+  return `You draft chargeback-dispute evidence for Postiz (a social-media scheduling SaaS, sold as a subscription; the merchant is the Postiz team).
+
+Write from the merchant's perspective, factual and concise — evidence text is read by bank analysts who skim.
+STRICT RULES:
+- Use ONLY the facts below. NEVER invent order numbers, IP addresses, log lines, dates, communications or policies.
+- Where usage/access data is unavailable, return an EMPTY string for access_activity_log rather than fabricating one.
+- service_date should be the charge date unless the facts say otherwise. customer_email_address must be the customer's email from the facts (or empty).
+- Each field at most 3500 characters.
+
+FACTS:
+${facts}
+
+Respond with ONLY a JSON object (no code fences, no commentary) whose keys are exactly: ${ctx.fields.join(", ")}.`;
 }

@@ -14,6 +14,7 @@ import type Stripe from "stripe";
 import { embed as makeEmbed, COLORS } from "../../../util/embeds";
 import { Logger } from "../../../util/logger";
 import { backRow, btn, buttonRow, formatAddress, selectRow, stripeErrorEmbed, subPlanLabel, textInput } from "../ui";
+import { buildNoteModal, renderNotesPanel } from "../qolUi";
 import type { BillAdminSession, Panel, RenderInteraction, RouteEntry } from "../types";
 import type { HubContext } from "./HubContext";
 
@@ -227,6 +228,93 @@ export class CustomersHub {
         await this.ctx.sessions.tryRender(interaction, () => this.renderOverview(interaction, token));
       },
     },
+    // ---- Customer-360 QoL: team notes + shared bookmark ----
+    {
+      kind: "button",
+      id: "billadmin_c360_notes:",
+      match: "prefix",
+      handler: async (interaction) => {
+        const [, token, npageStr] = interaction.customId.split(":");
+        const session = await this.ctx.sessions.getOwnedSession(token, interaction);
+        if (!session?.customerId) return;
+        await interaction.deferUpdate();
+        await this.ctx.sessions.tryRender(interaction, () =>
+          renderNotesPanel(this.ctx, interaction, {
+            type: "customer",
+            objectId: session.customerId!,
+            backId: `billadmin_c360_refresh:${token}`,
+            addNoteId: `billadmin_c360_noteadd:${token}`,
+            pageBaseId: `billadmin_c360_notes:${token}`,
+            page: Math.max(0, Number.parseInt(npageStr, 10) || 0),
+          })
+        );
+      },
+    },
+    {
+      kind: "button",
+      id: "billadmin_c360_noteadd:",
+      match: "prefix",
+      handler: async (interaction) => {
+        const token = interaction.customId.split(":")[1];
+        const session = await this.ctx.sessions.getOwnedSession(token, interaction);
+        if (!session?.customerId) return;
+        await interaction.showModal(buildNoteModal(`billadmin_c360_notem:${token}`, session.customerId));
+      },
+    },
+    {
+      kind: "modal",
+      id: "billadmin_c360_notem:",
+      match: "prefix",
+      handler: async (interaction) => {
+        const token = interaction.customId.split(":")[1];
+        const session = await this.ctx.sessions.getOwnedSession(token, interaction);
+        if (!session?.customerId) return;
+        const text = interaction.fields.getTextInputValue("note_text").trim();
+        await this.ctx.sessions.ackModal(interaction);
+        await this.ctx.sessions.tryRender(interaction, async () => {
+          if (text) {
+            await this.ctx.qolStore.addNote(
+              "customer",
+              session.customerId!,
+              interaction.user.id,
+              interaction.user.displayName ?? interaction.user.username,
+              text
+            );
+          }
+          await renderNotesPanel(this.ctx, interaction, {
+            type: "customer",
+            objectId: session.customerId!,
+            backId: `billadmin_c360_refresh:${token}`,
+            addNoteId: `billadmin_c360_noteadd:${token}`,
+            pageBaseId: `billadmin_c360_notes:${token}`,
+            notice: text ? "✅ Note added." : undefined,
+          });
+        });
+      },
+    },
+    {
+      kind: "button",
+      id: "billadmin_c360_bm:",
+      match: "prefix",
+      handler: async (interaction) => {
+        const token = interaction.customId.split(":")[1];
+        const session = await this.ctx.sessions.getOwnedSession(token, interaction);
+        if (!session?.customerId) return;
+        await interaction.deferUpdate();
+        await this.ctx.sessions.tryRender(interaction, async () => {
+          const customer = await this.ctx.stripe.getCustomer(session.customerId!);
+          const label = customer?.email ?? customer?.name ?? null;
+          await this.ctx.qolStore.toggleBookmark(
+            "customer",
+            session.customerId!,
+            label,
+            interaction.user.id,
+            interaction.user.displayName ?? interaction.user.username
+          );
+          await this.renderOverview(interaction, token);
+        });
+      },
+    },
     {
       kind: "button",
       id: "billadmin_editcust_show:",
@@ -390,6 +478,13 @@ export class CustomersHub {
     }
     const charges = chargesRes.charges;
 
+    // Blocklist + QoL context (needs customer.email, so it runs after the fetch).
+    const [blocks, bookmarked, latestNote] = await Promise.all([
+      this.ctx.blockStore.listForCustomer(customerId, customer.email),
+      this.ctx.qolStore.isBookmarked("customer", customerId),
+      this.ctx.qolStore.latestNote("customer", customerId),
+    ]);
+
     // The Link/Unlink action in the 360 select reuses the existing link panel,
     // which is keyed on a Discord user — pre-resolve it from the reverse lookup.
     session.targetDiscordUserId = linkRows[0]?.discordUserId;
@@ -448,8 +543,21 @@ export class CustomersHub {
 
     const embed = new EmbedBuilder()
       .setTitle(`👤 Customer 360 — \`${customer.id}\``)
-      .setColor(customer.delinquent || disputedCount ? COLORS.warn : COLORS.brand)
+      .setColor(blocks.length ? COLORS.danger : customer.delinquent || disputedCount ? COLORS.warn : COLORS.brand)
       .addFields(
+        ...(blocks.length
+          ? [
+              {
+                name: "⛔ BLOCKED",
+                value: blocks
+                  .slice(0, 5)
+                  .map((b) => `${b.kind} \`${b.value.slice(0, 60)}\` — ${b.reason.slice(0, 120)}`)
+                  .join("\n")
+                  .slice(0, 1024),
+                inline: false,
+              },
+            ]
+          : []),
         { name: "Email", value: (customer.email ?? "—").slice(0, 1024), inline: true },
         { name: "Name", value: (customer.name ?? "—").slice(0, 1024), inline: true },
         { name: "Created", value: `<t:${customer.created}:D>`, inline: true },
@@ -481,7 +589,16 @@ export class CustomersHub {
           value: disputedCount ? `🚩 **${disputedCount}** disputed charge(s) among recent charges` : "none among recent charges",
           inline: false,
         },
-        { name: "Discord / Postiz", value: linkText.slice(0, 1024), inline: false }
+        { name: "Discord / Postiz", value: linkText.slice(0, 1024), inline: false },
+        ...(latestNote
+          ? [
+              {
+                name: "Latest note",
+                value: `<t:${Math.floor(latestNote.createdAt.getTime() / 1000)}:R> **${latestNote.authorName}** — ${latestNote.text}`.slice(0, 1024),
+                inline: false,
+              },
+            ]
+          : [])
       )
       .setFooter({ text: "Lifetime spend & dispute count from the 100 most recent charges" });
 
@@ -512,6 +629,9 @@ export class CustomersHub {
         selectRow(actionSelect),
         buttonRow(
           btn(`billadmin_c360_refresh:${token}`, "Refresh", ButtonStyle.Secondary),
+          btn(`billadmin_c360_notes:${token}`, "Notes", ButtonStyle.Secondary),
+          btn(`billadmin_c360_bm:${token}`, bookmarked ? "Remove Bookmark" : "Bookmark", ButtonStyle.Secondary),
+          btn(`billadmin_blk_open:${token}:c360`, "Block…", ButtonStyle.Danger),
           btn(`billadmin_nav_back:${token}`, "Back", ButtonStyle.Secondary)
         ),
       ],

@@ -13,6 +13,7 @@ import {
   SA_CONVERSATION_ID,
   SA_TICKET_THREAD_ID,
   scoreOneWorkflowId,
+  SIG_DISPUTES_RUN_NOW,
   SIG_HUMAN_MESSAGE,
   SIG_INBOUND_EVENT,
   SIG_INTERCOM_ENQUEUE,
@@ -322,6 +323,15 @@ export class TemporalProducers {
     });
   }
 
+  async disputesRunNow(): Promise<GatewayResult> {
+    return this.temporal.signalWithStart({
+      workflowType: "disputesLoopWorkflow",
+      workflowId: SINGLETONS.disputesLoop,
+      signalName: SIG_DISPUTES_RUN_NOW,
+      options: looperStartOptions(SINGLETONS.disputesLoop),
+    });
+  }
+
   async runReportNow(): Promise<GatewayResult> {
     return this.temporal.startWorkflow({
       workflowType: "publishStatusReportWorkflow",
@@ -344,6 +354,7 @@ export class TemporalProducers {
       ["scoringLoopWorkflow", SINGLETONS.scoringLoop],
       ["metricsSnapshotWorkflow", SINGLETONS.metricsSnapshot],
       ["cleanupLoopWorkflow", SINGLETONS.cleanupLoop],
+      ["disputesLoopWorkflow", SINGLETONS.disputesLoop],
     ];
     const client = await this.temporal.client();
     for (const [type, id] of singles) {

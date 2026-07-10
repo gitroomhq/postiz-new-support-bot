@@ -230,6 +230,8 @@ export function buildRootPanel(config: BotConfig): Panel {
         "🧾 **Invoices** — per-customer & open invoices, one-off invoices, credit notes",
         "💳 **Cards** — card hunts by fingerprint / last 4 · set default · detach",
         "🎟️ **Promos** — promo codes & coupons · 🏢 **Business** — our own company data (name, address, VAT)",
+        "🛡️ **Disputes** — account-wide dispute console: ratio, evidence, accept, block cards/users",
+        "🔖 **Bookmarks** — the team's pinned disputes/customers/charges · **Jump to ID** — open any Stripe id",
       ].join("\n")
     )
     .setFooter({
@@ -248,6 +250,9 @@ export function buildRootPanel(config: BotConfig): Panel {
         btn("billadmin_hub:cards", "Cards", ButtonStyle.Primary)
       ),
       buttonRow(
+        btn("billadmin_dp_hub", "Disputes", ButtonStyle.Primary),
+        btn("billadmin_bm_list", "Bookmarks", ButtonStyle.Secondary),
+        btn("billadmin_jump", "Jump to ID", ButtonStyle.Secondary),
         btn("billadmin_open:promo", "Promos", ButtonStyle.Secondary),
         btn("billadmin_hub:business", "Business", ButtonStyle.Secondary)
       ),
@@ -327,6 +332,7 @@ export function buildHubPanel(area: string, config: BotConfig): Panel {
       .setDescription(
         [
           "**Read** — a user's charge history · disputes & fraud signals · customer balance history.",
+          "**Disputes Overview** — the account-wide dispute console: ratio, evidence, accept, blocklist.",
           "**Find by Amount** — account-wide payment attempts **including declined / bank-blocked** ones",
           "(those never become a charge, so they only show up here).",
           "**Adjust Balance** — grant an account credit or add a debit; applied to future invoices.",
@@ -339,7 +345,8 @@ export function buildHubPanel(area: string, config: BotConfig): Panel {
       components: [
         buttonRow(
           btn("billadmin_open:charges", "Charges for User", ButtonStyle.Primary),
-          btn("billadmin_open:fraud", "Disputes & Fraud", ButtonStyle.Primary),
+          btn("billadmin_dp_hub", "Disputes Overview", ButtonStyle.Primary),
+          btn("billadmin_open:fraud", "Fraud Check (User)", ButtonStyle.Primary),
           btn("billadmin_pay_open:hist", "Balance History", ButtonStyle.Primary),
           btn("billadmin_open:findamount", "Find by Amount", ButtonStyle.Primary)
         ),

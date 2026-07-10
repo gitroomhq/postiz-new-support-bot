@@ -1,5 +1,6 @@
 import { defineQuery, defineSignal, defineUpdate } from "@temporalio/workflow";
 import {
+  SIG_DISPUTES_RUN_NOW,
   SIG_HUMAN_MESSAGE,
   SIG_INBOUND_EVENT,
   SIG_INTERCOM_ENQUEUE,
@@ -38,6 +39,7 @@ export const inboundEventSignal = defineSignal<[InboundEventSignal]>(SIG_INBOUND
 export const kbRefreshNowSignal = defineSignal(SIG_KB_REFRESH_NOW);
 export const scoringRunNowSignal = defineSignal(SIG_SCORING_RUN_NOW);
 export const scoringEscalationRunNowSignal = defineSignal(SIG_SCORING_ESCALATION_RUN_NOW);
+export const disputesRunNowSignal = defineSignal(SIG_DISPUTES_RUN_NOW);
 
 export const applyStatusUpdate = defineUpdate<ApplyStatusResult, [StatusChangeRequest]>(UPD_APPLY_STATUS);
 export const applyPriorityUpdate = defineUpdate<{ ok: boolean }, [PriorityChangeRequest]>(UPD_APPLY_PRIORITY);

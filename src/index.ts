@@ -38,6 +38,12 @@ import { SnapshotScheduler } from "./metrics/SnapshotScheduler";
 import { AiRunStore } from "./bot/AiRunStore";
 import { TicketAiRunStore } from "./bot/TicketAiRunStore";
 import { LightAiRunner } from "./bot/LightAiRunner";
+import { DisputeStore } from "./bot/billing/DisputeStore";
+import { BlockStore } from "./bot/billing/BlockStore";
+import { BillingQolStore } from "./bot/billing/BillingQolStore";
+import { BlockService } from "./bot/billing/BlockService";
+import { CachedRatioEngine } from "./bot/billing/disputeRatio";
+import { DisputeMonitor } from "./bot/billing/DisputeMonitor";
 import { TicketScoreStore } from "./scoring/TicketScoreStore";
 import { TicketScoringService } from "./scoring/TicketScoringService";
 import { TemporalService } from "./temporal/TemporalService";
@@ -170,10 +176,25 @@ async function main() {
   const kbScheduler = new KnowledgeBaseScheduler(settingsStore, process.cwd());
   const githubClient = new GitHubClient(config);
   const stripeClient = new StripeClient(config);
-  const stripeWebhookHandler = new StripeWebhookHandler(settingsStore, sessionStore, stripeClient);
-  const billingAdmin = new BillingAdmin(config, stripeClient, sessionStore, settingsStore, auditLogger);
+  // Dispute console: local dispute mirror, blocklist (+ Radar bridge), team
+  // notes/bookmarks, the shared ratio cache and the looper tick body.
+  const disputeStore = new DisputeStore(prisma);
+  const blockStore = new BlockStore(prisma);
+  const qolStore = new BillingQolStore(prisma);
+  const blockService = new BlockService(settingsStore, stripeClient, blockStore);
+  const ratioEngine = new CachedRatioEngine(stripeClient);
+  const disputeMonitor = new DisputeMonitor(settingsStore, sessionStore, stripeClient, disputeStore, blockStore, ratioEngine);
+  const stripeWebhookHandler = new StripeWebhookHandler(settingsStore, sessionStore, stripeClient, disputeStore, blockService);
+  const billingAdmin = new BillingAdmin(config, stripeClient, sessionStore, settingsStore, auditLogger, {
+    disputeStore,
+    blockStore,
+    blockService,
+    qolStore,
+    ratio: ratioEngine,
+    lightAiRunner,
+  });
 
-  const billingCategory = new BillingCategory(stripeClient, sessionStore, settingsStore, statusService, ticketStore, auditLogger, tierStore);
+  const billingCategory = new BillingCategory(stripeClient, sessionStore, settingsStore, statusService, ticketStore, auditLogger, tierStore, blockStore);
   const categoryRegistry = new CategoryRegistry()
     .register(new HowToCategory())
     .register(new BugsCategory())
@@ -230,13 +251,15 @@ async function main() {
     stripeWebhookHandler,
     intercomInboxApp,
     { prisma, lightAiRunner, scoringService, scoreStore, ticketAiRunStore },
-    { service: vaultService, migrator: vaultMigrator }
+    { service: vaultService, migrator: vaultMigrator },
+    { blockService }
   );
   // The client exists as soon as the constructor ran; nothing fires before login.
   auditLogger.bindClient(bot.client);
   intercomWebhookHandler.bindClient(bot.client);
   intercomInboxApp.bindClient(bot.client);
   stripeWebhookHandler.bindClient(bot.client);
+  disputeMonitor.bindClient(bot.client);
   scoringService.bindClient(bot.client);
   // Thread URLs need the guild id, only known once the client is ready —
   // resolved lazily per call.
@@ -288,6 +311,7 @@ async function main() {
     ticketAiRunStore,
     stripeWebhookHandler,
     billingCategory,
+    disputeMonitor,
     vaultMigrator,
     bot,
     client: bot.client,

@@ -144,6 +144,20 @@ model BotSettings {
   // Bot's public origin for programmatic webhook registration; falls back to
   // new URL(POSTIZ_CALLBACK_URL).origin when unset.
   publicBaseUrl           String?
+  // Dispute management (paired with /config → Billing → Disputes). Auto-action
+  // toggles ship OFF so deploys are inert until an admin enables them. The
+  // Radar value-list ids are provisioned once via the panel; the lists only
+  // act when a Dashboard rule references them (Radar for Fraud Teams).
+  disputeAutoCancelSub    Boolean @default(false)
+  disputeAutoBlock        Boolean @default(false)
+  disputeReminderDays     Int     @default(3)
+  disputeRatioWarnPct     Float   @default(0.5)
+  disputeRatioCriticalPct Float   @default(0.9)
+  disputeRatioLastLevel   String  @default("ok") // ok | warn | critical — alert-on-transition state
+  radarListCardId         String?
+  radarListEmailId        String?
+  radarListCustomerId     String?
+  radarListIpId           String?
   // InfluxDB 2.x metrics export (edited via /config → Analytics; no .env on deploy).
   // Token is encrypted at rest (crypto.ts). Exporter is inactive until all four
   // connection fields are set AND influxEnabled is true.
@@ -512,4 +526,97 @@ model IntercomPendingPost {
 
   @@index([ticketThreadId, bodyHash])
   @@map("intercom_pending_posts")
+}
+
+// Local mirror of Stripe disputes, fed by webhooks and reconciled by the
+// disputes looper. Stripe's disputes.list has no status filter, so the
+// open-disputes overview reads from here; evidenceDraft holds the staff/AI
+// draft text before it is staged at Stripe (survives Discord session expiry).
+model StripeDispute {
+  id                  String    @id // Stripe dispute id (dp_… / du_…)
+  chargeId            String
+  paymentIntentId     String?
+  customerId          String? // Stripe cus_… (null for guest charges / deleted customers)
+  amount              Int
+  currency            String
+  reason              String
+  status              String // needs_response | under_review | warning_* | won | lost | prevented
+  evidenceDueBy       DateTime?
+  evidenceDraft       Json? // local staff/AI evidence draft ({ field: text })
+  evidenceSubmittedAt DateTime?
+  lastReminderAt      DateTime? // evidence-due reminder damper (≤1 ping / 24h / dispute)
+  disputeCreatedAt    DateTime
+  closedAt            DateTime?
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+
+  @@index([status])
+  @@index([evidenceDueBy])
+  @@index([chargeId])
+  @@index([customerId])
+  @@map("stripe_disputes")
+}
+
+// Billing blocklist: one row per blocked identifier, mirrored into a Stripe
+// Radar value list (radarItemId) so future payments are blocked at Stripe,
+// while the bot denies self-service billing and flags staff panels. Unblock
+// hard-deletes the row — action history lives in the audit channel + Influx.
+model BlockedEntity {
+  id          String   @id @default(cuid())
+  kind        String // card_fingerprint | email | customer_id | ip_address
+  value       String // emails are stored lowercased
+  reason      String
+  source      String   @default("manual") // manual | auto_dispute
+  actorId     String? // Discord admin id (null = automatic)
+  actorName   String?
+  customerId  String? // related cus_… for BLOCKED-banner lookups
+  disputeId   String?
+  radarItemId String? // rli_… — needed to remove the Radar item on unblock
+  createdAt   DateTime @default(now())
+
+  @@unique([kind, value])
+  @@index([customerId])
+  @@map("blocked_entities")
+}
+
+// Team-visible staff notes on billing objects (dispute/customer/charge) — the
+// billing-panel counterpart of ticket_notes.
+model BillingNote {
+  id         String   @id @default(cuid())
+  objectType String // dispute | customer | charge
+  objectId   String
+  authorId   String
+  authorName String
+  text       String
+  createdAt  DateTime @default(now())
+
+  @@index([objectType, objectId])
+  @@map("billing_notes")
+}
+
+// Shared team bookmark board for billing objects (one row per object — a
+// pinned watchlist every admin sees and edits, not per-user lists).
+model BillingBookmark {
+  id          String   @id @default(cuid())
+  objectType  String // dispute | customer | charge
+  objectId    String
+  label       String? // display label snapshotted at bookmark time
+  addedById   String
+  addedByName String
+  createdAt   DateTime @default(now())
+
+  @@unique([objectType, objectId])
+  @@map("billing_bookmarks")
+}
+
+// Per-admin dispute watch subscriptions — watchers get a DM when the dispute's
+// status changes or funds move.
+model DisputeWatch {
+  id        String   @id @default(cuid())
+  disputeId String
+  userId    String // Discord user id
+  createdAt DateTime @default(now())
+
+  @@unique([disputeId, userId])
+  @@map("dispute_watches")
 }

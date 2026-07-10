@@ -74,6 +74,8 @@ import { IntercomClient, IntercomHttpError } from "../intercom/IntercomClient";
 import { IntercomWebhookHandler } from "../intercom/IntercomWebhookHandler";
 import { IntercomInboxApp } from "../intercom/IntercomInboxApp";
 import { BillingAdmin } from "./BillingAdmin";
+import { RADAR_LISTS, type BlockService } from "./billing/BlockService";
+import type { BlockKind } from "./billing/BlockStore";
 import { TICKET_ATTR_PRIORITY, TICKET_ATTR_CSAT, TICKET_ATTR_THREAD } from "../intercom/IntercomEventExecutor";
 import { IntercomMode, IntercomRegion } from "../config/SettingsStore";
 import {
@@ -199,6 +201,10 @@ export class DiscordBot {
     private vault?: {
       service: VaultService;
       migrator: VaultMigrator;
+    },
+    // Dispute console (drives /config → Billing → Disputes: Radar provisioning).
+    private disputes?: {
+      blockService: BlockService;
     }
   ) {
     this.client = new Client({
@@ -2062,6 +2068,9 @@ export class DiscordBot {
     "search_charges_by_last4",
     "search_charges_by_card_fingerprint",
     "get_dispute_for_charge",
+    "list_disputes",
+    "get_dispute",
+    "get_dispute_ratio",
     "list_customer_cards",
     "list_tax_ids",
   ].map((name) => `mcp__stripe__${name}`);
@@ -3644,14 +3653,71 @@ export class DiscordBot {
       new ButtonBuilder().setCustomId("config_billing_limits").setLabel("Set Limits").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("config_billing_plans").setLabel("Plan Allowlist").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("config_stripe_webhook").setLabel("Webhooks").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("config_disputes").setLabel("Disputes").setStyle(ButtonStyle.Primary)
+    );
+    const buttons2 = new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder().setCustomId("config_billing_clear_channel").setLabel("Clear Channel").setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId("config_reporting").setLabel("Back").setStyle(ButtonStyle.Secondary)
     );
 
     return {
       embeds: [embed],
-      components: [new ActionRowBuilder<ChannelSelectMenuBuilder>().addComponents(channelSelect), buttons],
+      components: [new ActionRowBuilder<ChannelSelectMenuBuilder>().addComponents(channelSelect), buttons, buttons2],
     };
+  }
+
+  private buildDisputesConfigPanel() {
+    const s = this.settingsStore;
+    const listLine = (kind: BlockKind) => {
+      const spec = RADAR_LISTS[kind];
+      const id = s.radarListId(kind);
+      return `• \`@${spec.alias}\` (${kind}) — ${id ? `provisioned \`${id}\`` : "_not provisioned_"}`;
+    };
+    const embed = new EmbedBuilder()
+      .setTitle("Dispute Settings")
+      .setColor(0x5865f2)
+      .setDescription(
+        [
+          `**Auto-cancel subscriptions on dispute:** ${s.disputeAutoCancelSub() ? "on" : "off"}`,
+          `**Auto-block card+email+customer on dispute:** ${s.disputeAutoBlock() ? "on" : "off"}`,
+          `**Evidence-due reminder lead:** ${s.disputeReminderDays()} day(s) before the deadline (≤1 ping / 24h / dispute)`,
+          `**Ratio thresholds:** warn ≥ ${s.disputeRatioWarnPct()}% · critical ≥ ${s.disputeRatioCriticalPct()}% (month VAMP-style figure) — current level: **${s.disputeRatioLastLevel()}**`,
+          "",
+          "**Radar value lists** (the Stripe half of the blocklist):",
+          listLine("card_fingerprint"),
+          listLine("email"),
+          listLine("customer_id"),
+          listLine("ip_address"),
+          "",
+          "⚠️ Value lists only block payments once a **Radar rule references them** — rules can't be created via API. One-time setup in the Stripe Dashboard → Radar → Rules (needs **Radar for Fraud Teams**), e.g.:",
+          "```",
+          `Block if :card_fingerprint: in @${RADAR_LISTS.card_fingerprint.alias}`,
+          `Block if :email: in @${RADAR_LISTS.email.alias}`,
+          `Block if :customer: in @${RADAR_LISTS.customer_id.alias}`,
+          `Block if :ip_address: in @${RADAR_LISTS.ip_address.alias}`,
+          "```",
+          "_Verify the attribute names against the rule editor's autocomplete — Stripe occasionally renames them._",
+          "",
+          "Reminders + ratio alerts post to the billing audit channel. The dispute looper ticks every 6h (**Run Check Now** forces one).",
+        ].join("\n")
+      );
+    const row1 = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId("config_disputes_toggle_cancel")
+        .setLabel(`Auto-cancel: ${s.disputeAutoCancelSub() ? "on" : "off"}`)
+        .setStyle(s.disputeAutoCancelSub() ? ButtonStyle.Success : ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId("config_disputes_toggle_block")
+        .setLabel(`Auto-block: ${s.disputeAutoBlock() ? "on" : "off"}`)
+        .setStyle(s.disputeAutoBlock() ? ButtonStyle.Success : ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("config_disputes_limits").setLabel("Set Thresholds").setStyle(ButtonStyle.Primary)
+    );
+    const row2 = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId("config_disputes_radar").setLabel("Provision Radar Lists").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("config_disputes_run_now").setLabel("Run Check Now").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("config_billing").setLabel("Back").setStyle(ButtonStyle.Secondary)
+    );
+    return { embeds: [embed], components: [row1, row2] };
   }
 
   private buildStripeWebhookPanel() {
@@ -5630,6 +5696,67 @@ export class DiscordBot {
       return;
     }
 
+    if (id === "config_disputes") {
+      await interaction.update(this.buildDisputesConfigPanel());
+      return;
+    }
+
+    if (id === "config_disputes_toggle_cancel") {
+      const next = !this.settingsStore.disputeAutoCancelSub();
+      await this.settingsStore.updateDisputes({ disputeAutoCancelSub: next });
+      this.auditConfig(interaction, `Dispute auto-cancel subscriptions → ${next ? "on" : "off"}`);
+      await interaction.update(this.buildDisputesConfigPanel());
+      return;
+    }
+
+    if (id === "config_disputes_toggle_block") {
+      const next = !this.settingsStore.disputeAutoBlock();
+      await this.settingsStore.updateDisputes({ disputeAutoBlock: next });
+      this.auditConfig(interaction, `Dispute auto-block → ${next ? "on" : "off"}`);
+      await interaction.update(this.buildDisputesConfigPanel());
+      return;
+    }
+
+    if (id === "config_disputes_limits") {
+      const s = this.settingsStore;
+      const modal = new ModalBuilder().setCustomId("config_disputes_limits_modal").setTitle("Dispute Thresholds");
+      const mkInput = (cid: string, label: string, value: string) =>
+        new ActionRowBuilder<TextInputBuilder>().addComponents(
+          new TextInputBuilder().setCustomId(cid).setLabel(label).setStyle(TextInputStyle.Short).setRequired(true).setValue(value)
+        );
+      modal.addComponents(
+        mkInput("reminder_days", "Reminder lead (days before due, 1-30)", String(s.disputeReminderDays())),
+        mkInput("warn_pct", "Ratio warn threshold (%)", String(s.disputeRatioWarnPct())),
+        mkInput("critical_pct", "Ratio critical threshold (%)", String(s.disputeRatioCriticalPct()))
+      );
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (id === "config_disputes_radar") {
+      await interaction.deferUpdate();
+      if (!this.disputes) return;
+      // List ids are plain rsl_… identifiers, not secrets — safe to display.
+      const results = await this.disputes.blockService.ensureRadarLists();
+      const summary = results
+        .map((r) => `${r.kind}: ${r.listId ? `${r.created ? "created" : "ok"} (\`${r.listId}\`)` : `FAILED — ${r.error?.slice(0, 100)}`}`)
+        .join(" · ");
+      this.auditConfig(interaction, `Radar value lists provisioned → ${summary.slice(0, 400)}`);
+      await interaction.editReply(this.buildDisputesConfigPanel());
+      return;
+    }
+
+    if (id === "config_disputes_run_now") {
+      await interaction.deferUpdate();
+      const result = await this.temporalOps?.producers.disputesRunNow();
+      this.auditConfig(
+        interaction,
+        `Dispute check triggered → ${result?.ok ? "signalled" : "not routable (Temporal off?)"}`
+      );
+      await interaction.editReply(this.buildDisputesConfigPanel());
+      return;
+    }
+
     if (id === "config_billing_plans") {
       // Plan allowlist for the /billing subscription pickers — the panel and
       // its flows live in the billing admin; its Back returns to config_billing.
@@ -7323,6 +7450,37 @@ export class DiscordBot {
       });
       this.auditConfig(interaction, "Refund guardrails updated");
       await interaction.reply({ embeds: [makeEmbed("Refund guardrails updated.", COLORS.success)], flags: 64 });
+      return;
+    }
+
+    if (interaction.customId === "config_disputes_limits_modal") {
+      const daysRaw = interaction.fields.getTextInputValue("reminder_days").trim();
+      const warnRaw = interaction.fields.getTextInputValue("warn_pct").trim();
+      const criticalRaw = interaction.fields.getTextInputValue("critical_pct").trim();
+
+      const days = Number(daysRaw);
+      if (!Number.isInteger(days) || days < 1 || days > 30) {
+        await interaction.reply({ embeds: [makeEmbed("Reminder lead must be a whole number of days between 1 and 30.", COLORS.danger)], flags: 64 });
+        return;
+      }
+      const warn = Number(warnRaw);
+      const critical = Number(criticalRaw);
+      if (!Number.isFinite(warn) || warn <= 0 || !Number.isFinite(critical) || critical <= 0) {
+        await interaction.reply({ embeds: [makeEmbed("Thresholds must be positive percentages, e.g. `0.5` and `0.9`.", COLORS.danger)], flags: 64 });
+        return;
+      }
+      if (warn >= critical) {
+        await interaction.reply({ embeds: [makeEmbed("The warn threshold must be LOWER than the critical threshold.", COLORS.danger)], flags: 64 });
+        return;
+      }
+
+      await this.settingsStore.updateDisputes({
+        disputeReminderDays: days,
+        disputeRatioWarnPct: warn,
+        disputeRatioCriticalPct: critical,
+      });
+      this.auditConfig(interaction, `Dispute thresholds updated → remind ${days}d, warn ${warn}%, critical ${critical}%`);
+      await interaction.reply({ embeds: [makeEmbed("Dispute thresholds updated.", COLORS.success)], flags: 64 });
       return;
     }
 

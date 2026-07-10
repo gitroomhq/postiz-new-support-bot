@@ -68,6 +68,12 @@ export interface BillAdminSession {
   // Hub area the flow was entered from — Back buttons return here when an
   // action (e.g. Overview) is listed in more than one hub.
   originHub?: string;
+  // Dispute console + block flow state.
+  disputeId?: string;
+  blockCandidates?: { kind: string; value: string }[];
+  blockSel?: string[]; // selected candidates, "kind|value"
+  blockReason?: string;
+  blockReturn?: string; // re-render id of the panel the block flow was opened from
   targetDiscordUserId?: string;
   promoCodeId?: string;
   paymentMethodId?: string;

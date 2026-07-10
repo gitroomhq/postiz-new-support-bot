@@ -174,7 +174,15 @@ export type BillingEventKind =
   | "charge_review_approved"
   | "charge_review_denied"
   | "dispute"
-  | "fraud_warning";
+  | "fraud_warning"
+  | "dispute_updated"
+  | "dispute_won"
+  | "dispute_lost"
+  | "dispute_accepted"
+  | "evidence_submitted"
+  | "dispute_reminder"
+  | "block"
+  | "unblock";
 
 export function exportBillingEvent(p: {
   event: BillingEventKind;
@@ -217,6 +225,32 @@ export function exportSnapshotTotals(p: {
       overdue: p.overdue,
       awaiting_first_response: p.awaitingFirstResponse,
       pending_charge_reviews: p.pendingChargeReviews,
+    }
+  );
+}
+
+// Dispute-console gauges. Counts come from the 5-minute snapshot tick; the
+// ratio percentages only from the (6-hourly) dispute monitor tick — computing
+// them needs Stripe sweeps that would be abusive at snapshot cadence. No
+// identifier values in tags (cardinality + PII).
+export function exportDisputeSnapshot(p: {
+  open: number;
+  dueSoon: number;
+  blocked: number;
+  plain30dPct?: number | null;
+  vamp30dPct?: number | null;
+  vampMonthPct?: number | null;
+}): void {
+  writePoint(
+    "dispute_snapshot",
+    {},
+    {
+      open: p.open,
+      due_soon: p.dueSoon,
+      blocked: p.blocked,
+      plain_30d_pct: p.plain30dPct ?? undefined,
+      vamp_30d_pct: p.vamp30dPct ?? undefined,
+      vamp_month_pct: p.vampMonthPct ?? undefined,
     }
   );
 }

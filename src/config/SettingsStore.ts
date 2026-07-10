@@ -555,6 +555,48 @@ export class SettingsStore {
     }
   }
 
+  // ---- Dispute management (/config → Billing → Disputes) ----
+
+  disputeAutoCancelSub(): boolean {
+    return this.settings.disputeAutoCancelSub;
+  }
+
+  disputeAutoBlock(): boolean {
+    return this.settings.disputeAutoBlock;
+  }
+
+  disputeReminderDays(): number {
+    return this.settings.disputeReminderDays;
+  }
+
+  disputeRatioWarnPct(): number {
+    return this.settings.disputeRatioWarnPct;
+  }
+
+  disputeRatioCriticalPct(): number {
+    return this.settings.disputeRatioCriticalPct;
+  }
+
+  // Last alerted ratio level — threshold alerts fire on transitions only.
+  disputeRatioLastLevel(): "ok" | "warn" | "critical" {
+    const v = this.settings.disputeRatioLastLevel;
+    return v === "warn" || v === "critical" ? v : "ok";
+  }
+
+  // Provisioned Radar value-list ids (not secrets — plain rsl_… ids).
+  radarListId(kind: "card_fingerprint" | "email" | "customer_id" | "ip_address"): string | null {
+    switch (kind) {
+      case "card_fingerprint":
+        return this.settings.radarListCardId;
+      case "email":
+        return this.settings.radarListEmailId;
+      case "customer_id":
+        return this.settings.radarListCustomerId;
+      case "ip_address":
+        return this.settings.radarListIpId;
+    }
+  }
+
   // Sentry DSN (null = disabled). DB-first with env fallback: the deploy has no
   // editable .env. `||` not `??` — an empty string stored in the DB must fall
   // through to the env var instead of silently disabling Sentry.
@@ -1061,6 +1103,32 @@ export class SettingsStore {
     this.settings = await this.prisma.botSettings.update({
       where: { id: "global" },
       data: { allowedPriceIds: priceIds.join(",") },
+    });
+  }
+
+  async updateDisputes(data: {
+    disputeAutoCancelSub?: boolean;
+    disputeAutoBlock?: boolean;
+    disputeReminderDays?: number;
+    disputeRatioWarnPct?: number;
+    disputeRatioCriticalPct?: number;
+  }): Promise<void> {
+    this.settings = await this.prisma.botSettings.update({ where: { id: "global" }, data });
+  }
+
+  async updateRadarLists(data: {
+    radarListCardId?: string | null;
+    radarListEmailId?: string | null;
+    radarListCustomerId?: string | null;
+    radarListIpId?: string | null;
+  }): Promise<void> {
+    this.settings = await this.prisma.botSettings.update({ where: { id: "global" }, data });
+  }
+
+  async setDisputeRatioLevel(level: "ok" | "warn" | "critical"): Promise<void> {
+    this.settings = await this.prisma.botSettings.update({
+      where: { id: "global" },
+      data: { disputeRatioLastLevel: level },
     });
   }
 

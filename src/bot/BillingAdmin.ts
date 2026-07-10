@@ -34,6 +34,23 @@ import { PromosHub } from "./billing/hubs/PromosHub";
 import { InvoicesHub } from "./billing/hubs/InvoicesHub";
 import { PaymentsHub } from "./billing/hubs/PaymentsHub";
 import { BusinessHub } from "./billing/hubs/BusinessHub";
+import { DisputesHub } from "./billing/hubs/DisputesHub";
+import type { DisputeStore } from "./billing/DisputeStore";
+import type { BlockStore } from "./billing/BlockStore";
+import type { BlockService } from "./billing/BlockService";
+import type { BillingQolStore } from "./billing/BillingQolStore";
+import type { CachedRatioEngine } from "./billing/disputeRatio";
+import type { LightAiRunner } from "./LightAiRunner";
+
+// Dispute-console + QoL dependencies handed through to the hubs.
+export interface BillingAdminExtras {
+  disputeStore: DisputeStore;
+  blockStore: BlockStore;
+  blockService: BlockService;
+  qolStore: BillingQolStore;
+  ratio: CachedRatioEngine;
+  lightAiRunner: LightAiRunner;
+}
 
 type Handler<I> = (interaction: I) => Promise<void>;
 
@@ -78,6 +95,7 @@ export class BillingAdmin {
   private invoices: InvoicesHub;
   private payments: PaymentsHub;
   private business: BusinessHub;
+  private disputes: DisputesHub;
 
   private buttonRoutes = new RouteTable<ButtonInteraction>();
   private selectRoutes = new RouteTable<StringSelectMenuInteraction>();
@@ -89,7 +107,8 @@ export class BillingAdmin {
     private stripeClient: StripeClient,
     private sessionStore: SessionStore,
     private settingsStore: SettingsStore,
-    auditLogger: AuditLogger
+    auditLogger: AuditLogger,
+    extras: BillingAdminExtras
   ) {
     this.priceBook = new PriceBook(stripeClient);
     this.audit = new AdminAudit(settingsStore, auditLogger);
@@ -101,6 +120,12 @@ export class BillingAdmin {
       audit: this.audit,
       sessionStore: this.sessionStore,
       settingsStore: this.settingsStore,
+      disputeStore: extras.disputeStore,
+      blockStore: extras.blockStore,
+      blockService: extras.blockService,
+      qolStore: extras.qolStore,
+      ratio: extras.ratio,
+      lightAiRunner: extras.lightAiRunner,
     };
 
     this.targets = new TargetResolver(ctx);
@@ -112,6 +137,7 @@ export class BillingAdmin {
     this.invoices = new InvoicesHub(ctx);
     this.payments = new PaymentsHub(ctx);
     this.business = new BusinessHub(ctx);
+    this.disputes = new DisputesHub(ctx);
 
     // The resolver dispatches a resolved customer to the owning hub's renderer.
     this.targets.bindHandlers({
@@ -127,6 +153,12 @@ export class BillingAdmin {
       buildLinkPanel: (token, notice) => this.customers.buildLinkPanel(token, notice),
     });
 
+    // Jump-to-ID / bookmark board landing points owned by other hubs.
+    this.disputes.bindHandlers({
+      renderCustomerOverview: (i, token) => this.customers.renderOverview(i, token),
+      renderChargeDetail: (i, token, page, notice) => this.charges.renderChargeDetail(i, token, page, notice),
+    });
+
     const sources: { routes: RouteEntry[] }[] = [
       this.targets,
       this.cards,
@@ -137,6 +169,7 @@ export class BillingAdmin {
       this.invoices,
       this.payments,
       this.business,
+      this.disputes,
       { routes: this.facadeRoutes() },
     ];
     for (const source of sources) {

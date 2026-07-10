@@ -28,6 +28,7 @@ export const SINGLETONS = {
   scoringLoop: "scoring-loop",
   metricsSnapshot: "metrics-snapshot",
   cleanupLoop: "cleanup-loop",
+  disputesLoop: "disputes-loop",
 } as const;
 
 export const VAULT_UPGRADE_WORKFLOW_ID = "vault-upgrade";
@@ -51,6 +52,7 @@ export const LOOPER_GENERATIONS: Record<string, number> = {
   [SINGLETONS.scoringLoop]: 3, // gen 3: escalation branch + scoringEscalationRunNow signal
   [SINGLETONS.metricsSnapshot]: 1,
   [SINGLETONS.cleanupLoop]: 1,
+  [SINGLETONS.disputesLoop]: 1,
 };
 
 // ---- Custom search attributes ----
@@ -83,6 +85,7 @@ export const SIG_INBOUND_EVENT = "inboundEvent";
 export const SIG_KB_REFRESH_NOW = "kbRefreshNow";
 export const SIG_SCORING_RUN_NOW = "scoringRunNow";
 export const SIG_SCORING_ESCALATION_RUN_NOW = "scoringEscalationRunNow";
+export const SIG_DISPUTES_RUN_NOW = "disputesRunNow";
 export const UPD_APPLY_STATUS = "applyStatus";
 export const UPD_APPLY_PRIORITY = "applyPriority";
 export const QRY_TICKET_STATE = "getState";
@@ -295,6 +298,14 @@ export interface KbTickResult {
   failed: number;
 }
 
+// One disputes-looper tick: Stripe→local reconciliation, evidence-due
+// reminders posted, and the ratio threshold level after the check.
+export interface DisputesTickResult {
+  reconciled: number;
+  reminders: number;
+  ratioLevel: "ok" | "warn" | "critical" | "skipped";
+}
+
 // ---- Scoring (per-batch child workflows for full lifecycle visibility) ----
 
 export interface ScoringState {
@@ -359,6 +370,7 @@ export interface CoreActivities {
 
   // loopers
   kbTick(force: boolean): Promise<KbTickResult>;
+  disputesTick(force: boolean): Promise<DisputesTickResult>;
   scoringGetState(): Promise<ScoringState>;
   scoringSubmit(purpose: "interval" | "backfill" | "escalation"): Promise<ScoringSubmitOutcome>;
   scoringPollBatch(batchId: string): Promise<ScoringBatchPoll>;

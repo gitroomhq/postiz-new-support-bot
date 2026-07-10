@@ -112,6 +112,11 @@ test("scoring-loop is pinned at generation 3 (the escalation-branch rework)", ()
   assert.equal(LOOPER_GENERATIONS[SINGLETONS.scoringLoop], 3);
 });
 
+test("disputes-loop starts at generation 1", () => {
+  // Bump IN THE SAME COMMIT as any history-incompatible disputesLoopWorkflow change.
+  assert.equal(LOOPER_GENERATIONS[SINGLETONS.disputesLoop], 1);
+});
+
 test("looperStartOptions stamps the code generation into the memo", () => {
   const opts = looperStartOptions(SINGLETONS.scoringLoop);
   assert.deepEqual(opts, { memo: { [LOOPER_GEN_MEMO_KEY]: 3 } });

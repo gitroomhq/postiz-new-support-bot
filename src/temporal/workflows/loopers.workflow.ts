@@ -11,7 +11,7 @@ import {
 } from "@temporalio/workflow";
 import type { CoreActivities, ScoringBatchInput } from "../types";
 import { scoringBatchWorkflowId } from "../types";
-import { kbRefreshNowSignal, scoringEscalationRunNowSignal, scoringRunNowSignal } from "./definitions";
+import { disputesRunNowSignal, kbRefreshNowSignal, scoringEscalationRunNowSignal, scoringRunNowSignal } from "./definitions";
 
 // Interval-based recurring jobs as eternal looping workflows (user decision:
 // Schedules only for the wall-clock status report). Each iteration reads its
@@ -196,5 +196,31 @@ export async function cleanupLoopWorkflow(): Promise<void> {
     await light.cleanupTick().catch(() => {});
     await canIfDue(() => continueWithMemo<typeof cleanupLoopWorkflow>());
     await condition(() => false, 5 * 60_000);
+  }
+}
+
+const disputesActs = proxyActivities<CoreActivities>({
+  // Reconcile sweeps disputes + per-dispute charge lookups; the ratio check
+  // adds a charges.search round-trip per window.
+  startToCloseTimeout: "10 minutes",
+  heartbeatTimeout: "2 minutes",
+  retry: { maximumAttempts: 1 }, // the next tick retries naturally
+});
+
+// Dispute console: 6h tick (evidence-due reminders keep their own ≤1-ping/24h
+// damper per dispute, so the cadence only affects how fast NEW near-due
+// disputes are noticed) — reconcile the local mirror against Stripe, post
+// reminders, check the ratio thresholds. /config's "Run now" signals it.
+export async function disputesLoopWorkflow(): Promise<void> {
+  let runNow = false;
+  setHandler(disputesRunNowSignal, () => {
+    runNow = true;
+  });
+  for (;;) {
+    const force = runNow;
+    runNow = false;
+    await disputesActs.disputesTick(force).catch(() => {});
+    await canIfDue(() => continueWithMemo<typeof disputesLoopWorkflow>());
+    await condition(() => runNow, 6 * 60 * 60_000);
   }
 }

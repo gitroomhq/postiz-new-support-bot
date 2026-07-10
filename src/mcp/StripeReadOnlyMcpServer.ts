@@ -10,6 +10,7 @@ import { McpServer, ToolCallback } from "@modelcontextprotocol/sdk/server/mcp.js
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z, ZodRawShape } from "zod";
 import { StripeClient } from "../bot/StripeClient";
+import { computeDisputeRatios } from "../bot/billing/disputeRatio";
 import { BotConfig } from "../config";
 import { Logger } from "../util/logger";
 
@@ -210,6 +211,31 @@ readTool(
   "Fetch the dispute attached to a charge, if any.",
   { chargeId: z.string() },
   ({ chargeId }) => stripe.getDisputeForCharge(chargeId)
+);
+
+readTool(
+  "list_disputes",
+  "List recent account-wide Stripe disputes (newest first). Optional daysBack narrows by creation date. " +
+    "Read-only: evidence submission / accepting / blocking happen via the /billing Discord panel only.",
+  { limit: z.number().int().min(1).max(100).optional(), daysBack: z.number().int().min(1).max(365).optional() },
+  ({ limit, daysBack }) =>
+    stripe.listDisputes(limit ?? 25, undefined, daysBack ? Math.floor(Date.now() / 1000) - daysBack * 86400 : undefined)
+);
+
+readTool(
+  "get_dispute",
+  "Fetch a dispute by id (dp_.../du_...), including status, reason, evidence state/deadline and balance impact.",
+  { disputeId: z.string().regex(/^(dp|du)_[A-Za-z0-9]+$/) },
+  ({ disputeId }) => stripe.getDispute(disputeId)
+);
+
+readTool(
+  "get_dispute_ratio",
+  "Account dispute ratios for the current calendar month / trailing 30d / trailing 90d: the plain rate " +
+    "(chargeback-stage disputes ÷ succeeded charges, count-based) and the VAMP-style rate ((early-fraud-warning " +
+    "∪ chargeback charges, deduped) ÷ succeeded charges — directional vs. Visa's real VAMP). May take ~10s.",
+  {},
+  () => computeDisputeRatios(stripe)
 );
 
 readTool(

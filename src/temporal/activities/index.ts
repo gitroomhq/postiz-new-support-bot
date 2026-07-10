@@ -15,6 +15,7 @@ import type { StripeWebhookHandler } from "../../bot/StripeWebhookHandler";
 import type { TicketAiRunStore } from "../../bot/TicketAiRunStore";
 import { RECLOSE_DELAY_MS, RESOLVED_EMOJI } from "../../bot/StatusService";
 import type { BillingCategory } from "../../categories/BillingCategory";
+import type { DisputeMonitor } from "../../bot/billing/DisputeMonitor";
 import type { IntercomStore } from "../../intercom/IntercomStore";
 import type { IntercomSyncService } from "../../intercom/IntercomSyncService";
 import type { IntercomEventExecutor } from "../../intercom/IntercomEventExecutor";
@@ -62,6 +63,7 @@ export interface ActivityDeps {
   ticketAiRunStore: TicketAiRunStore;
   stripeWebhookHandler: StripeWebhookHandler;
   billingCategory: BillingCategory;
+  disputeMonitor: DisputeMonitor;
   vaultMigrator: VaultMigrator;
   bot: DiscordBot;
   client: Client;
@@ -91,6 +93,7 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
     ticketAiRunStore,
     stripeWebhookHandler,
     billingCategory,
+    disputeMonitor,
     vaultMigrator,
     bot,
     client,
@@ -672,6 +675,13 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
 
     async executeRefundCore(input) {
       return billingCategory.executeRefundCore(input);
+    },
+
+    // Dispute console tick: reconcile the local mirror, post evidence-due
+    // reminders, check the ratio thresholds (all idempotent per tick).
+    async disputesTick(force) {
+      heartbeat();
+      return disputeMonitor.tick(force);
     },
 
     async runVaultUpgradeJob() {

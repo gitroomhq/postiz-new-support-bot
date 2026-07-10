@@ -41,7 +41,10 @@ const EXPECTED_COLUMNS: Record<string, string[]> = {
     "vaultEnabled", "vaultAddr", "vaultToken", "vaultKvMount", "vaultKvBasePath",
     "vaultTransitMount", "vaultTransitKey", "vaultMigratedAt",
     "temporalEnabled", "temporalAddress", "temporalNamespace", "temporalTaskQueue",
-    "temporalDeploymentName", "temporalTlsServerName", "temporalImportDoneAt", "updatedAt",
+    "temporalDeploymentName", "temporalTlsServerName", "temporalImportDoneAt",
+    "disputeAutoCancelSub", "disputeAutoBlock", "disputeReminderDays",
+    "disputeRatioWarnPct", "disputeRatioCriticalPct", "disputeRatioLastLevel",
+    "radarListCardId", "radarListEmailId", "radarListCustomerId", "radarListIpId", "updatedAt",
   ],
   status_tags: [
     "id", "emoji", "label", "isInitial", "closesThread", "reminderEnabled", "reminderDays", "reminderTarget",
@@ -67,6 +70,18 @@ const EXPECTED_COLUMNS: Record<string, string[]> = {
   intercom_echo_parts: ["id", "kind", "partId", "ticketThreadId", "createdAt"],
   intercom_pending_posts: ["id", "ticketThreadId", "kind", "bodyHash", "createdAt"],
   stripe_webhook_events: ["id", "type", "createdAt"],
+  stripe_disputes: [
+    "id", "chargeId", "paymentIntentId", "customerId", "amount", "currency", "reason", "status",
+    "evidenceDueBy", "evidenceDraft", "evidenceSubmittedAt", "lastReminderAt", "disputeCreatedAt",
+    "closedAt", "createdAt", "updatedAt",
+  ],
+  blocked_entities: [
+    "id", "kind", "value", "reason", "source", "actorId", "actorName", "customerId", "disputeId",
+    "radarItemId", "createdAt",
+  ],
+  billing_notes: ["id", "objectType", "objectId", "authorId", "authorName", "text", "createdAt"],
+  billing_bookmarks: ["id", "objectType", "objectId", "label", "addedById", "addedByName", "createdAt"],
+  dispute_watches: ["id", "disputeId", "userId", "createdAt"],
   ai_runs: [
     "id", "agentName", "kind", "source", "model", "outcome", "sessionId", "batchId", "numTurns", "durationMs",
     "inputTokens", "outputTokens", "cacheReadTokens", "cacheCreationTokens", "costUsd", "toolCalls", "toolErrors",

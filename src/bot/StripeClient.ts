@@ -36,11 +36,14 @@ export class StripeClient {
     // Skip the ~$1 card-verification charges Postiz creates — they aren't
     // subscription charges and must never be offered for refund. The threshold is
     // per-currency: zero-decimal currencies (JPY/KRW…) have no minor units, so a
-    // flat "100 = $1" would wrongly discard real small charges there.
+    // flat "100 = $1" would wrongly discard real small charges there. Disputed
+    // charges are excluded too: Stripe rejects their refunds (charge_disputed)
+    // after the billing-action lock has already been churned.
     const succeededCharge = charges.data.find(
       (c) =>
         c.status === "succeeded" &&
         !c.refunded &&
+        !c.disputed &&
         c.amount > (StripeClient.isZeroDecimal(c.currency) ? 1 : 100)
     ) as ChargeWithInvoice | undefined;
 
@@ -437,6 +440,187 @@ export class StripeClient {
     return res.data;
   }
 
+  // ---- Dispute console (account-wide disputes, evidence, Radar blocklists) ----
+
+  async listDisputes(
+    limit = 25,
+    startingAfter?: string,
+    createdGte?: number
+  ): Promise<{ disputes: Stripe.Dispute[]; hasMore: boolean }> {
+    const res = await this.stripe.disputes.list({
+      limit,
+      ...(startingAfter ? { starting_after: startingAfter } : {}),
+      ...(createdGte ? { created: { gte: createdGte } } : {}),
+    });
+    return { disputes: res.data, hasMore: res.has_more };
+  }
+
+  async getDispute(disputeId: string): Promise<Stripe.Dispute> {
+    return this.stripe.disputes.retrieve(disputeId);
+  }
+
+  // Full sweep of disputes created since a timestamp (ratio + reconciliation).
+  // Dispute volume is low; the page cap is a runaway guard.
+  async listDisputesSince(
+    createdGte: number,
+    maxPages = 20
+  ): Promise<{ disputes: Stripe.Dispute[]; truncated: boolean }> {
+    const disputes: Stripe.Dispute[] = [];
+    let startingAfter: string | undefined;
+    for (let page = 0; page < maxPages; page++) {
+      const res = await this.stripe.disputes.list({
+        limit: 100,
+        created: { gte: createdGte },
+        ...(startingAfter ? { starting_after: startingAfter } : {}),
+      });
+      disputes.push(...res.data);
+      if (!res.has_more || res.data.length === 0) return { disputes, truncated: false };
+      startingAfter = res.data[res.data.length - 1].id;
+    }
+    return { disputes, truncated: true };
+  }
+
+  async listEarlyFraudWarningsSince(
+    createdGte: number,
+    maxPages = 20
+  ): Promise<{ efws: Stripe.Radar.EarlyFraudWarning[]; truncated: boolean }> {
+    const efws: Stripe.Radar.EarlyFraudWarning[] = [];
+    let startingAfter: string | undefined;
+    for (let page = 0; page < maxPages; page++) {
+      const res = await this.stripe.radar.earlyFraudWarnings.list({
+        limit: 100,
+        created: { gte: createdGte },
+        ...(startingAfter ? { starting_after: startingAfter } : {}),
+      });
+      efws.push(...res.data);
+      if (!res.has_more || res.data.length === 0) return { efws, truncated: false };
+      startingAfter = res.data[res.data.length - 1].id;
+    }
+    return { efws, truncated: true };
+  }
+
+  // Stripe's `submit` param defaults to TRUE — this wrapper makes it mandatory
+  // so a draft save can never accidentally submit to the bank. submit:false
+  // stages evidence server-side; submit:true sends it (usually once, ever).
+  async updateDisputeEvidence(
+    disputeId: string,
+    evidence: Stripe.DisputeUpdateParams.Evidence,
+    submit: boolean,
+    idempotencyKey: string
+  ): Promise<Stripe.Dispute> {
+    return this.stripe.disputes.update(disputeId, { evidence, submit }, { idempotencyKey });
+  }
+
+  // Accept the dispute: irreversible, status becomes lost.
+  async closeDispute(disputeId: string, idempotencyKey: string): Promise<Stripe.Dispute> {
+    return this.stripe.disputes.close(disputeId, {}, { idempotencyKey });
+  }
+
+  // One-request count of succeeded charges created since a timestamp — the
+  // dispute-ratio denominator. Search exposes total_count (lists don't); its
+  // freshness lags up to ~1 minute, so callers cache results. extraQuery is
+  // appended verbatim (internal call sites only, never user input).
+  async countSucceededCharges(createdGte: number, extraQuery?: string): Promise<number> {
+    const res = await this.stripe.charges.search({
+      query:
+        `created>=${Math.floor(createdGte)} AND status:"succeeded"` + (extraQuery ? ` AND ${extraQuery}` : ""),
+      limit: 1,
+      expand: ["total_count"],
+    });
+    return res.total_count ?? 0;
+  }
+
+  // Blockable identifiers derivable from a charge. The payment's client IP is
+  // NOT exposed by any Stripe API object — IP blocks stay manual entry.
+  async getChargeBlockIdentifiers(chargeId: string): Promise<{
+    customerId: string | null;
+    email: string | null;
+    cardFingerprint: string | null;
+  }> {
+    const charge = await this.stripe.charges.retrieve(chargeId, { expand: ["customer"] });
+    const customer = charge.customer;
+    const customerId = typeof customer === "string" ? customer : (customer?.id ?? null);
+    const customerEmail =
+      customer && typeof customer !== "string" && !customer.deleted ? (customer.email ?? null) : null;
+    return {
+      customerId,
+      email: charge.billing_details?.email ?? charge.receipt_email ?? customerEmail,
+      cardFingerprint: charge.payment_method_details?.card?.fingerprint ?? null,
+    };
+  }
+
+  // Blocking a customer wants ALL their subscriptions gone — unlike
+  // cancelSoleActiveSubscription's refuse-on-ambiguity, which protects the
+  // self-service flow. A cancel that races an already-finished cancel counts
+  // as success: the end state is what matters.
+  async cancelAllActiveSubscriptions(
+    customerId: string,
+    idempotencyKeyPrefix: string
+  ): Promise<{ cancelled: string[]; failed: string[] }> {
+    const subs = await this.stripe.subscriptions.list({ customer: customerId, status: "all", limit: 100 });
+    const cancelled: string[] = [];
+    const failed: string[] = [];
+    for (const sub of subs.data.filter((s) => s.status !== "canceled")) {
+      try {
+        await this.stripe.subscriptions.cancel(sub.id, {}, { idempotencyKey: `${idempotencyKeyPrefix}-${sub.id}` });
+        cancelled.push(sub.id);
+      } catch {
+        try {
+          const fresh = await this.stripe.subscriptions.retrieve(sub.id);
+          if (fresh.status === "canceled") {
+            cancelled.push(sub.id);
+            continue;
+          }
+        } catch {
+          // fall through to failed
+        }
+        failed.push(sub.id);
+      }
+    }
+    return { cancelled, failed };
+  }
+
+  // ---- Radar value lists (the Stripe half of the blocklist) ----
+  // A value list only blocks payments once a Dashboard-authored Radar rule
+  // references it (there is no Rules API; custom rules need Radar for Fraud Teams).
+
+  async findValueListByAlias(alias: string): Promise<Stripe.Radar.ValueList | null> {
+    const res = await this.stripe.radar.valueLists.list({ alias, limit: 1 });
+    return res.data[0] ?? null;
+  }
+
+  async createValueList(
+    alias: string,
+    name: string,
+    itemType: Stripe.Radar.ValueListCreateParams.ItemType,
+    idempotencyKey: string
+  ): Promise<Stripe.Radar.ValueList> {
+    return this.stripe.radar.valueLists.create({ alias, name, item_type: itemType }, { idempotencyKey });
+  }
+
+  // The `value` filter is an "is like" match — exact equality is re-checked here.
+  async findValueListItem(valueListId: string, value: string): Promise<Stripe.Radar.ValueListItem | null> {
+    const res = await this.stripe.radar.valueListItems.list({ value_list: valueListId, value, limit: 100 });
+    return res.data.find((i) => i.value === value) ?? null;
+  }
+
+  async addValueListItem(
+    valueListId: string,
+    value: string,
+    idempotencyKey: string
+  ): Promise<Stripe.Radar.ValueListItem> {
+    return this.stripe.radar.valueListItems.create({ value_list: valueListId, value }, { idempotencyKey });
+  }
+
+  async deleteValueListItem(itemId: string): Promise<void> {
+    await this.stripe.radar.valueListItems.del(itemId);
+  }
+
+  async listValueListItems(valueListId: string, limit = 100): Promise<Stripe.Radar.ValueListItem[]> {
+    const res = await this.stripe.radar.valueListItems.list({ value_list: valueListId, limit });
+    return res.data;
+  }
+
   async listTaxIds(customerId: string): Promise<Stripe.TaxId[]> {
     const res = await this.stripe.customers.listTaxIds(customerId, { limit: 100 });
     return res.data;
@@ -457,13 +641,20 @@ export class StripeClient {
   // ---- Billing admin panel (/billing) writes ----
 
   // Omitted amount = Stripe refunds the full remaining un-refunded amount.
+  // reason "fraudulent" additionally puts the card + email on Stripe's native
+  // block lists — the refund-to-prevent flow offers it for fraud EFWs/inquiries.
   async refundChargeAmount(
     chargeId: string,
     amountMinor: number | null,
-    idempotencyKey: string
+    idempotencyKey: string,
+    reason?: Stripe.RefundCreateParams.Reason
   ): Promise<{ refundId: string; amount: number; currency: string; status: string | null }> {
     const refund = await this.stripe.refunds.create(
-      { charge: chargeId, ...(amountMinor != null ? { amount: amountMinor } : {}) },
+      {
+        charge: chargeId,
+        ...(amountMinor != null ? { amount: amountMinor } : {}),
+        ...(reason ? { reason } : {}),
+      },
       { idempotencyKey }
     );
     return { refundId: refund.id, amount: refund.amount, currency: refund.currency, status: refund.status };

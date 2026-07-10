@@ -23,6 +23,7 @@ import { StatusService } from "../bot/StatusService";
 import { TicketStore } from "../bot/TicketStore";
 import { AuditLogger } from "../bot/AuditLogger";
 import { EscalationTierStore } from "../config/EscalationTierStore";
+import { BlockStore } from "../bot/billing/BlockStore";
 import { log } from "../util/logger";
 import { metricCount, metricDistribution } from "../util/instrument";
 import { exportBillingEvent } from "../metrics/MetricsExporter";
@@ -46,7 +47,8 @@ export class BillingCategory extends BaseCategory {
     private statusService: StatusService,
     private ticketStore: TicketStore,
     private audit: AuditLogger,
-    private tierStore: EscalationTierStore
+    private tierStore: EscalationTierStore,
+    private blockStore: BlockStore
   ) {
     super();
   }
@@ -439,7 +441,7 @@ export class BillingCategory extends BaseCategory {
     const amountText = this.stripeClient.formatAmount(charge.amount, charge.currency);
 
     // Guardrails: on breach, no Stripe call and no lock row — a human takes over.
-    const breach = await this.checkRefundGuardrails(interaction, charge);
+    const breach = await this.checkRefundGuardrails(interaction, charge, chargeId);
     if (breach) {
       billingLog.warn("billing.refund.blocked", {
         "stripe.charge_id": chargeId,
@@ -517,8 +519,22 @@ export class BillingCategory extends BaseCategory {
   // First tripped guardrail as a human-readable reason, or null when all pass.
   private async checkRefundGuardrails(
     interaction: ButtonInteraction,
-    charge: { amount: number; currency: string }
+    charge: { amount: number; currency: string },
+    chargeId: string
   ): Promise<string | null> {
+    // Blocklisted customers never self-serve money movement — straight to
+    // manual review. Both identities are checked: the invoker's linked Stripe
+    // customer AND the charge's customer (they can differ on stale links).
+    const sessionCustomer = (await this.sessionStore.getSession(interaction.user.id))?.stripeCustomerId ?? null;
+    const chargeCustomer = await this.stripeClient.getChargeCustomerId(chargeId).catch(() => null);
+    let blockHit = sessionCustomer ? await this.blockStore.anyBlocked({ customerId: sessionCustomer }) : null;
+    if (!blockHit && chargeCustomer && chargeCustomer !== sessionCustomer) {
+      blockHit = await this.blockStore.anyBlocked({ customerId: chargeCustomer });
+    }
+    if (blockHit) {
+      return `Customer is on the billing block list (${blockHit.kind}): ${blockHit.reason}`;
+    }
+
     const maxAmount = this.settingsStore.refundMaxAmount();
     if (maxAmount != null) {
       const capCurrency = this.settingsStore.refundMaxAmountCurrency().toLowerCase();
