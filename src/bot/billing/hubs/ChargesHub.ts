@@ -234,10 +234,52 @@ export async function showRefundConfirm(
   // instead of always dumping to the hub top menu.
   session.refundReturn = cancelTarget;
 
+  // "Disputed" alone doesn't tell the admin whether refunding still helps, so
+  // resolve the dispute's stage: at the early-warning / inquiry stage a full
+  // refund prevents the formal chargeback; once formal, Stripe rejects the
+  // refund outright.
+  const dispute = charge.disputed ? await ctx.stripe.getDisputeForCharge(charge.id).catch(() => null) : null;
+  const warningStage =
+    dispute?.status === "warning_needs_response" || dispute?.status === "warning_under_review";
+  const formalOpen = dispute?.status === "needs_response" || dispute?.status === "under_review";
+  session.refundDisputeStage = dispute ? (warningStage && dispute.is_charge_refundable ? "warning" : "formal") : null;
+
+  const disputeNotes: string[] = [];
+  if (charge.disputed) {
+    if (!dispute) {
+      disputeNotes.push(
+        "🚩 **This charge is disputed** — a refund only helps at the inquiry / early-warning stage; Stripe rejects refunds on formal chargebacks."
+      );
+    } else if (warningStage && dispute.is_charge_refundable) {
+      disputeNotes.push(
+        `✅ **This refund can still prevent the chargeback.** Dispute \`${dispute.id}\` is at the early-warning / inquiry stage (\`${dispute.status}\`) — refunding the full remainder closes it before it becomes a formal chargeback. It stays \`${dispute.status}\` until the bank processes the refund (can take a few days).`
+      );
+      if (amountMinor != null && amountMinor < remaining) {
+        disputeNotes.push(
+          "⚠️ **Partial refund selected** — only refunding the **full remainder** reliably prevents the chargeback."
+        );
+      }
+    } else if (warningStage) {
+      disputeNotes.push(
+        `⛔ Dispute \`${dispute.id}\` is still at the warning stage, but Stripe reports the charge as **not refundable** — this refund will be rejected.`
+      );
+    } else if (formalOpen) {
+      disputeNotes.push(
+        `⛔ **Too late to prevent — this is a formal chargeback** (\`${dispute.status}\`). Stripe rejects refunds on it, so this refund will fail. Respond with evidence or accept the dispute instead.`
+      );
+    } else if (dispute.status === "lost") {
+      disputeNotes.push(
+        "⛔ **Dispute already lost** — the bank has already pulled the disputed amount back. Refunding on top would return the money **twice**."
+      );
+    } else {
+      disputeNotes.push(
+        `🚩 Dispute \`${dispute.id}\` is already closed (**${dispute.status}**) — this refund is goodwill only and doesn't change the dispute outcome.`
+      );
+    }
+  }
+
   const notes = [
-    charge.disputed
-      ? "🚩 **This charge is disputed** — a refund only helps at the inquiry / early-warning stage; Stripe rejects refunds on formal chargebacks."
-      : null,
+    ...disputeNotes,
     subscriptionId
       ? null
       : "ℹ️ No subscription attached to this charge — cancel explicitly via Subscriptions if needed.",
@@ -1021,6 +1063,13 @@ export class ChargesHub {
 
       const fraudNote =
         reason === "fraudulent" ? "\n🚫 Marked fraudulent — Stripe added the card + email to its block lists." : "";
+      // Refunding at the warning stage doesn't flip the dispute immediately —
+      // without this note, a still-open dispute panel reads like the refund
+      // didn't work.
+      const disputeNote =
+        session.refundDisputeStage === "warning"
+          ? "\n🛡️ The dispute stays in its `warning_…` status until the bank processes this refund — expect it to close as **prevented / warning_closed** within a few days. No evidence response is needed."
+          : "";
       const amountText = this.ctx.stripe.formatAmount(result.amount, result.currency);
       this.ctx.audit.log(interaction, {
         action: actionLabel,
@@ -1043,7 +1092,7 @@ export class ChargesHub {
         embeds: [
           makeEmbed(
             `↩️ Refunded **${amountText}** on \`${session.chargeId}\` — ` +
-              `refund \`${result.refundId}\` (${result.status ?? "pending"}).${cancelNote}${fraudNote}${lockNote}`,
+              `refund \`${result.refundId}\` (${result.status ?? "pending"}).${disputeNote}${cancelNote}${fraudNote}${lockNote}`,
             COLORS.success
           ),
         ],

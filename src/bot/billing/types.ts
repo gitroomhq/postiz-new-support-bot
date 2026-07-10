@@ -46,6 +46,10 @@ export interface BillAdminSession {
   // Where the refund result panel's Back returns — the panel the refund was
   // launched from (charge detail when opened there, else the Charges hub).
   refundReturn?: string;
+  // Set at refund-confirm time when the charge's dispute is still at the
+  // early-warning / inquiry stage — the success panel uses it to explain that
+  // the dispute stays open until the bank processes the refund.
+  refundDisputeStage?: "warning" | "formal" | null;
   subscriptionId?: string;
   paymentIntentId?: string;
   // Origin-aware Back navigation: a stack of re-renderable button custom-ids
@@ -70,6 +74,11 @@ export interface BillAdminSession {
   originHub?: string;
   // Dispute console + block flow state.
   disputeId?: string;
+  // Overview filter ("all" | "s:<status>" | "r:<reason>") + sort order.
+  dpFilter?: string;
+  dpSort?: "due" | "amount" | "new";
+  // History browser filter ("all" | "o:<won|lost|other>" | "r:<reason>").
+  dpHistFilter?: string;
   blockCandidates?: { kind: string; value: string }[];
   blockSel?: string[]; // selected candidates, "kind|value"
   blockReason?: string;

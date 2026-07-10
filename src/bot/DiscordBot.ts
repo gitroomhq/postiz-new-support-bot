@@ -75,6 +75,8 @@ import { IntercomWebhookHandler } from "../intercom/IntercomWebhookHandler";
 import { IntercomInboxApp } from "../intercom/IntercomInboxApp";
 import { BillingAdmin } from "./BillingAdmin";
 import { RADAR_LISTS, type BlockService } from "./billing/BlockService";
+import { backfillDisputeHistory } from "./billing/DisputeMonitor";
+import type { DisputeStore } from "./billing/DisputeStore";
 import type { BlockKind } from "./billing/BlockStore";
 import { TICKET_ATTR_PRIORITY, TICKET_ATTR_CSAT, TICKET_ATTR_THREAD } from "../intercom/IntercomEventExecutor";
 import { IntercomMode, IntercomRegion } from "../config/SettingsStore";
@@ -202,9 +204,12 @@ export class DiscordBot {
       service: VaultService;
       migrator: VaultMigrator;
     },
-    // Dispute console (drives /config → Billing → Disputes: Radar provisioning).
+    // Dispute console (drives /config → Billing → Disputes: Radar provisioning
+    // + the one-time all-time dispute history backfill).
     private disputes?: {
       blockService: BlockService;
+      stripeClient: StripeClient;
+      disputeStore: DisputeStore;
     }
   ) {
     this.client = new Client({
@@ -3681,7 +3686,15 @@ export class DiscordBot {
           `**Auto-cancel subscriptions on dispute:** ${s.disputeAutoCancelSub() ? "on" : "off"}`,
           `**Auto-block card+email+customer on dispute:** ${s.disputeAutoBlock() ? "on" : "off"}`,
           `**Evidence-due reminder lead:** ${s.disputeReminderDays()} day(s) before the deadline (≤1 ping / 24h / dispute)`,
+          `**Urgent tier:** < ${s.disputeUrgentHours()}h to deadline with nothing submitted → red alert${
+            s.disputeUrgentRoleId() ? ` + <@&${s.disputeUrgentRoleId()}> mention` : " (no role set — select one below to get pinged)"
+          }`,
           `**Ratio thresholds:** warn ≥ ${s.disputeRatioWarnPct()}% · critical ≥ ${s.disputeRatioCriticalPct()}% (month VAMP-style figure) — current level: **${s.disputeRatioLastLevel()}**`,
+          `**History backfill:** ${
+            s.disputeBackfillDoneAt()
+              ? `last run <t:${Math.floor(s.disputeBackfillDoneAt()!.getTime() / 1000)}:R>`
+              : "_never run_ — /billing → Disputes → Stats only covers disputes seen since the mirror existed"
+          }`,
           "",
           "**Radar value lists** (the Stripe half of the blocklist):",
           listLine("card_fingerprint"),
@@ -3714,10 +3727,23 @@ export class DiscordBot {
     );
     const row2 = new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder().setCustomId("config_disputes_radar").setLabel("Provision Radar Lists").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("config_disputes_backfill").setLabel("Backfill History").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("config_disputes_run_now").setLabel("Run Check Now").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId("config_disputes_urgent_role_clear")
+        .setLabel("Clear Urgent Role")
+        .setStyle(ButtonStyle.Secondary)
+        .setDisabled(!s.disputeUrgentRoleId()),
       new ButtonBuilder().setCustomId("config_billing").setLabel("Back").setStyle(ButtonStyle.Secondary)
     );
-    return { embeds: [embed], components: [row1, row2] };
+    const roleSelect = new RoleSelectMenuBuilder()
+      .setCustomId("config_disputes_urgent_role")
+      .setPlaceholder("Urgent dispute role (mentioned when < urgent-hours remain)");
+    if (s.disputeUrgentRoleId()) roleSelect.setDefaultRoles(s.disputeUrgentRoleId()!);
+    return {
+      embeds: [embed],
+      components: [new ActionRowBuilder<RoleSelectMenuBuilder>().addComponents(roleSelect), row1, row2],
+    };
   }
 
   private buildStripeWebhookPanel() {
@@ -5726,10 +5752,50 @@ export class DiscordBot {
         );
       modal.addComponents(
         mkInput("reminder_days", "Reminder lead (days before due, 1-30)", String(s.disputeReminderDays())),
+        mkInput("urgent_hours", "Urgent tier window (hours before due, 1-168)", String(s.disputeUrgentHours())),
         mkInput("warn_pct", "Ratio warn threshold (%)", String(s.disputeRatioWarnPct())),
         mkInput("critical_pct", "Ratio critical threshold (%)", String(s.disputeRatioCriticalPct()))
       );
       await interaction.showModal(modal);
+      return;
+    }
+
+    if (id === "config_disputes_urgent_role_clear") {
+      await this.settingsStore.updateDisputes({ disputeUrgentRoleId: null });
+      this.auditConfig(interaction, "Urgent dispute role cleared");
+      await interaction.update(this.buildDisputesConfigPanel());
+      return;
+    }
+
+    if (id === "config_disputes_backfill") {
+      // All-time Stripe sweep into the local mirror + historical Influx outcome
+      // points. Idempotent, so re-runs are allowed (e.g. after enabling Influx).
+      await interaction.deferReply({ flags: 64 });
+      if (!this.disputes) return;
+      try {
+        const result = await backfillDisputeHistory(this.disputes.stripeClient, this.disputes.disputeStore);
+        await this.settingsStore.updateDisputes({ disputeBackfillDoneAt: new Date() });
+        this.auditConfig(
+          interaction,
+          `Dispute history backfilled → ${result.swept} swept, ${result.terminal} closed, ${result.points} Influx point(s)${result.truncated ? " (sweep truncated)" : ""}`
+        );
+        await interaction.editReply({
+          embeds: [
+            makeEmbed(
+              `✅ Backfill complete — swept **${result.swept}** dispute(s) from Stripe (all-time), **${result.terminal}** closed.` +
+                (result.points
+                  ? ` Wrote **${result.points}** historical outcome point(s) to InfluxDB.`
+                  : " Influx exporter inactive — no analytics points written (re-run after enabling it).") +
+                (result.truncated ? "\n⚠️ Sweep hit the page cap — run again to continue." : ""),
+              COLORS.success
+            ),
+          ],
+        });
+      } catch (error) {
+        await interaction.editReply({
+          embeds: [makeEmbed(`Backfill failed: ${String(error).slice(0, 500)}`, COLORS.danger)],
+        });
+      }
       return;
     }
 
@@ -7455,12 +7521,18 @@ export class DiscordBot {
 
     if (interaction.customId === "config_disputes_limits_modal") {
       const daysRaw = interaction.fields.getTextInputValue("reminder_days").trim();
+      const urgentRaw = interaction.fields.getTextInputValue("urgent_hours").trim();
       const warnRaw = interaction.fields.getTextInputValue("warn_pct").trim();
       const criticalRaw = interaction.fields.getTextInputValue("critical_pct").trim();
 
       const days = Number(daysRaw);
       if (!Number.isInteger(days) || days < 1 || days > 30) {
         await interaction.reply({ embeds: [makeEmbed("Reminder lead must be a whole number of days between 1 and 30.", COLORS.danger)], flags: 64 });
+        return;
+      }
+      const urgentHours = Number(urgentRaw);
+      if (!Number.isInteger(urgentHours) || urgentHours < 1 || urgentHours > 168) {
+        await interaction.reply({ embeds: [makeEmbed("The urgent window must be a whole number of hours between 1 and 168.", COLORS.danger)], flags: 64 });
         return;
       }
       const warn = Number(warnRaw);
@@ -7476,10 +7548,14 @@ export class DiscordBot {
 
       await this.settingsStore.updateDisputes({
         disputeReminderDays: days,
+        disputeUrgentHours: urgentHours,
         disputeRatioWarnPct: warn,
         disputeRatioCriticalPct: critical,
       });
-      this.auditConfig(interaction, `Dispute thresholds updated → remind ${days}d, warn ${warn}%, critical ${critical}%`);
+      this.auditConfig(
+        interaction,
+        `Dispute thresholds updated → remind ${days}d, urgent <${urgentHours}h, warn ${warn}%, critical ${critical}%`
+      );
       await interaction.reply({ embeds: [makeEmbed("Dispute thresholds updated.", COLORS.success)], flags: 64 });
       return;
     }
@@ -7791,12 +7867,18 @@ export class DiscordBot {
   }
 
   private async handleRoleSelect(interaction: RoleSelectMenuInteraction): Promise<void> {
-    if (interaction.customId !== "config_tier_add_role") return;
+    if (interaction.customId !== "config_tier_add_role" && interaction.customId !== "config_disputes_urgent_role") return;
     if (!this.isAdmin(interaction)) {
       await interaction.reply({ embeds: [makeEmbed("Administrator permission required.", COLORS.danger)], flags: 64 });
       return;
     }
     const roleId = interaction.values[0];
+    if (interaction.customId === "config_disputes_urgent_role") {
+      await this.settingsStore.updateDisputes({ disputeUrgentRoleId: roleId });
+      this.auditConfig(interaction, `Urgent dispute role → <@&${roleId}>`);
+      await interaction.update(this.buildDisputesConfigPanel());
+      return;
+    }
     const role = await interaction.guild?.roles.fetch(roleId).catch(() => null);
     // The tier name defaults to the Discord role name; rename it afterwards if needed.
     const tier = await this.tierStore.add(role?.name ?? "Tier", roleId);

@@ -203,6 +203,27 @@ export function exportBillingEvent(p: {
   );
 }
 
+// One point per dispute OUTCOME (terminal transition), reason-tagged so
+// Grafana can split win rate by fraudulent / subscription_canceled / etc.
+// Live emissions stamp "now"; the history backfill passes the historical
+// closedAt so pre-bot outcomes chart correctly. Identical points (same tags +
+// timestamp) overwrite on re-runs, so the backfill is idempotent.
+export function exportDisputeOutcome(p: {
+  outcome: string; // won | lost | prevented | warning_closed
+  reason: string;
+  amountMinor: number;
+  currency: string;
+  submitted: boolean; // evidence was submitted before it closed
+  ts?: Date;
+}): void {
+  writePoint(
+    "dispute_outcomes",
+    { outcome: p.outcome, reason: p.reason, currency: p.currency.toLowerCase() },
+    { count: 1, amount_minor: p.amountMinor, submitted: p.submitted ? 1 : 0 },
+    p.ts
+  );
+}
+
 export function exportIntercomQueueDepth(p: { queue: "outbox" | "inbox"; pending: number; dead: number }): void {
   writePoint("intercom_queue", { queue: p.queue }, { pending: p.pending, dead: p.dead });
 }

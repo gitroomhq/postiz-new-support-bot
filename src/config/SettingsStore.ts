@@ -583,6 +583,20 @@ export class SettingsStore {
     return v === "warn" || v === "critical" ? v : "ok";
   }
 
+  // Urgent reminder tier: due within this many hours escalates the reminder.
+  disputeUrgentHours(): number {
+    return this.settings.disputeUrgentHours;
+  }
+
+  // Role the urgent tier mentions; null = urgent styling without a ping.
+  disputeUrgentRoleId(): string | null {
+    return this.settings.disputeUrgentRoleId;
+  }
+
+  disputeBackfillDoneAt(): Date | null {
+    return this.settings.disputeBackfillDoneAt;
+  }
+
   // Provisioned Radar value-list ids (not secrets — plain rsl_… ids).
   radarListId(kind: "card_fingerprint" | "email" | "customer_id" | "ip_address"): string | null {
     switch (kind) {
@@ -1112,6 +1126,9 @@ export class SettingsStore {
     disputeReminderDays?: number;
     disputeRatioWarnPct?: number;
     disputeRatioCriticalPct?: number;
+    disputeUrgentHours?: number;
+    disputeUrgentRoleId?: string | null;
+    disputeBackfillDoneAt?: Date;
   }): Promise<void> {
     this.settings = await this.prisma.botSettings.update({ where: { id: "global" }, data });
   }

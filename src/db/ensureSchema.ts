@@ -532,6 +532,15 @@ const STATEMENTS: string[] = [
   `CREATE INDEX IF NOT EXISTS "stripe_disputes_evidenceDueBy_idx" ON "stripe_disputes"("evidenceDueBy")`,
   `CREATE INDEX IF NOT EXISTS "stripe_disputes_chargeId_idx" ON "stripe_disputes"("chargeId")`,
   `CREATE INDEX IF NOT EXISTS "stripe_disputes_customerId_idx" ON "stripe_disputes"("customerId")`,
+  // Dispute workflow v2: submitted-evidence snapshot (AI exemplars), urgent
+  // reminder tier damper + settings, history/analytics (closedAt ordering) and
+  // the one-time all-time backfill stamp.
+  `ALTER TABLE "stripe_disputes" ADD COLUMN IF NOT EXISTS "evidenceFinal" JSONB`,
+  `ALTER TABLE "stripe_disputes" ADD COLUMN IF NOT EXISTS "lastUrgentReminderAt" TIMESTAMP(3)`,
+  `CREATE INDEX IF NOT EXISTS "stripe_disputes_closedAt_idx" ON "stripe_disputes"("closedAt")`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "disputeUrgentHours" INTEGER NOT NULL DEFAULT 48`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "disputeUrgentRoleId" TEXT`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "disputeBackfillDoneAt" TIMESTAMP(3)`,
   `CREATE TABLE IF NOT EXISTS "blocked_entities" (
     "id" TEXT NOT NULL,
     "kind" TEXT NOT NULL,

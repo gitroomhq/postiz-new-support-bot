@@ -481,6 +481,24 @@ export class StripeClient {
     return { disputes, truncated: true };
   }
 
+  // All-time dispute sweep for the one-time history backfill. Same pagination
+  // as listDisputesSince but without a created floor; the page cap is a
+  // runaway guard (20k disputes — far beyond any realistic account history).
+  async listAllDisputes(maxPages = 200): Promise<{ disputes: Stripe.Dispute[]; truncated: boolean }> {
+    const disputes: Stripe.Dispute[] = [];
+    let startingAfter: string | undefined;
+    for (let page = 0; page < maxPages; page++) {
+      const res = await this.stripe.disputes.list({
+        limit: 100,
+        ...(startingAfter ? { starting_after: startingAfter } : {}),
+      });
+      disputes.push(...res.data);
+      if (!res.has_more || res.data.length === 0) return { disputes, truncated: false };
+      startingAfter = res.data[res.data.length - 1].id;
+    }
+    return { disputes, truncated: true };
+  }
+
   async listEarlyFraudWarningsSince(
     createdGte: number,
     maxPages = 20

@@ -21,7 +21,13 @@ import { showRefundConfirm } from "./ChargesHub";
 import { reconcileDisputes } from "../DisputeMonitor";
 import { describeRatioWindow } from "../disputeRatio";
 import { BLOCK_KIND_LABELS, type BlockKind } from "../BlockStore";
-import { RESPONDABLE_DISPUTE_STATUSES } from "../DisputeStore";
+import {
+  OPEN_DISPUTE_STATUSES,
+  RESPONDABLE_DISPUTE_STATUSES,
+  TEXT_EVIDENCE_KEYS,
+  type ClosedDisputeFilter,
+  type OpenDisputeFilter,
+} from "../DisputeStore";
 import {
   pushNav,
   type BillAdminSession,
@@ -53,25 +59,84 @@ interface EvidenceFieldSpec {
   style: TextInputStyle;
 }
 
-// 5-input Discord budget, reason-adaptive: the fraud-default set vs. the
-// policy set for cancellation/credit disputes. Field keys ARE the Stripe
-// evidence keys (DisputeUpdateParams.Evidence), so the modal round-trips 1:1.
-const EVIDENCE_FIELDS_DEFAULT: EvidenceFieldSpec[] = [
-  { key: "product_description", label: "Product / service description", style: TextInputStyle.Paragraph },
-  { key: "customer_email_address", label: "Customer email", style: TextInputStyle.Short },
-  { key: "service_date", label: "Service date", style: TextInputStyle.Short },
-  { key: "access_activity_log", label: "Access / usage activity log", style: TextInputStyle.Paragraph },
-  { key: "uncategorized_text", label: "Response narrative", style: TextInputStyle.Paragraph },
+// Full Stripe TEXT-evidence coverage, split into ≤5-field groups (Discord's
+// modal budget). The evidence editor lists the groups; picking one opens its
+// modal. Field keys ARE the Stripe evidence keys (DisputeUpdateParams.Evidence),
+// so the modals round-trip 1:1 with what's staged.
+interface EvidenceGroup {
+  key: string;
+  label: string;
+  emoji: string;
+  fields: EvidenceFieldSpec[];
+}
+
+const EVIDENCE_GROUPS: EvidenceGroup[] = [
+  {
+    key: "core",
+    label: "Core response",
+    emoji: "📝",
+    fields: [
+      { key: "product_description", label: "Product / service description", style: TextInputStyle.Paragraph },
+      { key: "customer_email_address", label: "Customer email", style: TextInputStyle.Short },
+      { key: "service_date", label: "Service date", style: TextInputStyle.Short },
+      { key: "access_activity_log", label: "Access / usage activity log", style: TextInputStyle.Paragraph },
+      { key: "uncategorized_text", label: "Response narrative", style: TextInputStyle.Paragraph },
+    ],
+  },
+  {
+    key: "policy",
+    label: "Policies & rebuttal",
+    emoji: "📜",
+    fields: [
+      { key: "refund_policy_disclosure", label: "Refund policy disclosure", style: TextInputStyle.Paragraph },
+      { key: "refund_refusal_explanation", label: "Refund refusal explanation", style: TextInputStyle.Paragraph },
+      { key: "cancellation_policy_disclosure", label: "Cancellation policy disclosure", style: TextInputStyle.Paragraph },
+      { key: "cancellation_rebuttal", label: "Cancellation rebuttal", style: TextInputStyle.Paragraph },
+    ],
+  },
+  {
+    key: "customer",
+    label: "Customer identity",
+    emoji: "👤",
+    fields: [
+      { key: "customer_name", label: "Customer name", style: TextInputStyle.Short },
+      { key: "billing_address", label: "Billing address", style: TextInputStyle.Paragraph },
+      { key: "customer_purchase_ip", label: "Customer purchase IP", style: TextInputStyle.Short },
+    ],
+  },
+  {
+    key: "duplicate",
+    label: "Duplicate charge",
+    emoji: "🔁",
+    fields: [
+      { key: "duplicate_charge_id", label: "Original (non-duplicate) charge id", style: TextInputStyle.Short },
+      { key: "duplicate_charge_explanation", label: "Why the charges are distinct", style: TextInputStyle.Paragraph },
+    ],
+  },
+  {
+    key: "shipping",
+    label: "Shipping (physical goods)",
+    emoji: "📦",
+    fields: [
+      { key: "shipping_carrier", label: "Carrier", style: TextInputStyle.Short },
+      { key: "shipping_tracking_number", label: "Tracking number", style: TextInputStyle.Short },
+      { key: "shipping_date", label: "Shipping date", style: TextInputStyle.Short },
+      { key: "shipping_address", label: "Shipping address", style: TextInputStyle.Paragraph },
+    ],
+  },
 ];
-const EVIDENCE_FIELDS_POLICY: EvidenceFieldSpec[] = [
-  { key: "product_description", label: "Product / service description", style: TextInputStyle.Paragraph },
-  { key: "refund_policy_disclosure", label: "Refund policy disclosure", style: TextInputStyle.Paragraph },
-  { key: "cancellation_policy_disclosure", label: "Cancellation policy disclosure", style: TextInputStyle.Paragraph },
-  { key: "cancellation_rebuttal", label: "Cancellation rebuttal", style: TextInputStyle.Paragraph },
-  { key: "uncategorized_text", label: "Response narrative", style: TextInputStyle.Paragraph },
-];
+
 const POLICY_REASONS = new Set(["subscription_canceled", "credit_not_processed"]);
-const EVIDENCE_KEYS = new Set([...EVIDENCE_FIELDS_DEFAULT, ...EVIDENCE_FIELDS_POLICY].map((f) => f.key));
+const EVIDENCE_KEYS = new Set<string>(TEXT_EVIDENCE_KEYS);
+
+// Which groups matter most for a given dispute reason — the editor lists them
+// first with a ⭐ and the AI draft fills exactly their fields.
+function recommendedGroupKeys(reason: string | null | undefined): string[] {
+  if (POLICY_REASONS.has(reason ?? "")) return ["core", "policy"];
+  if (reason === "duplicate") return ["duplicate", "core"];
+  if (reason === "product_not_received") return ["core", "shipping"];
+  return ["core"];
+}
 
 // FILE evidence slots (Stripe file ids, distinct from the *_disclosure text
 // fields) — where an uploaded screenshot/PDF proof lands.
@@ -99,9 +164,39 @@ const EVIDENCE_FILE_KEYS = [
 const PROOF_TYPES = new Set(["image/png", "image/jpeg", "application/pdf"]);
 const PROOF_MAX_BYTES = 4 * 1024 * 1024;
 
-function evidenceFieldsFor(reason: string | null | undefined): EvidenceFieldSpec[] {
-  return POLICY_REASONS.has(reason ?? "") ? EVIDENCE_FIELDS_POLICY : EVIDENCE_FIELDS_DEFAULT;
+// Field keys the AI draft fills: the union of the reason's recommended groups.
+function aiDraftFieldsFor(reason: string | null | undefined): string[] {
+  const groups = recommendedGroupKeys(reason);
+  return EVIDENCE_GROUPS.filter((g) => groups.includes(g.key)).flatMap((g) => g.fields.map((f) => f.key));
 }
+
+// Overview filter values round-trip through the select as "all" | "s:<status>"
+// | "r:<reason>"; history uses "all" | "o:<outcome>" | "r:<reason>".
+function parseOpenFilter(v: string | undefined): OpenDisputeFilter | undefined {
+  if (!v || v === "all") return undefined;
+  if (v.startsWith("s:")) return { status: v.slice(2) };
+  if (v.startsWith("r:")) return { reason: v.slice(2) };
+  return undefined;
+}
+
+function parseClosedFilter(v: string | undefined): ClosedDisputeFilter | undefined {
+  if (!v || v === "all") return undefined;
+  if (v.startsWith("o:")) {
+    const outcome = v.slice(2);
+    return outcome === "won" || outcome === "lost" || outcome === "other" ? { outcome } : undefined;
+  }
+  if (v.startsWith("r:")) return { reason: v.slice(2) };
+  return undefined;
+}
+
+const SORT_LABELS: Record<"due" | "amount" | "new", string> = {
+  due: "Sort: Deadline",
+  amount: "Sort: Amount",
+  new: "Sort: Newest",
+};
+const SORT_CYCLE: Array<"due" | "amount" | "new"> = ["due", "amount", "new"];
+
+const OUTCOME_EMOJI: Record<string, string> = { won: "🏆", lost: "❌", prevented: "🛑", warning_closed: "⚪" };
 
 // Cross-hub landing points for Jump-to-ID and the bookmark board — bound by
 // BillingAdmin (same pattern as TargetResolver.bindHandlers).
@@ -208,7 +303,7 @@ export class DisputesHub {
         });
       },
     },
-    // ---- evidence ----
+    // ---- evidence editor (group picker → per-group modal) ----
     {
       kind: "button",
       id: "billadmin_dp_ev_edit:",
@@ -217,21 +312,41 @@ export class DisputesHub {
         const token = interaction.customId.split(":")[1];
         const session = await this.ctx.sessions.getOwnedSession(token, interaction);
         if (!session?.disputeId) return;
-        // No defer — showModal must be the first response.
-        const row = await this.ctx.disputeStore.get(session.disputeId);
+        await interaction.deferUpdate();
+        await this.ctx.sessions.tryRender(interaction, () => this.renderEvidenceEditor(interaction, token));
+      },
+    },
+    {
+      kind: "select",
+      id: "billadmin_dp_evgsel:",
+      match: "prefix",
+      handler: async (interaction) => {
+        const token = interaction.customId.split(":")[1];
+        const session = await this.ctx.sessions.getOwnedSession(token, interaction);
+        if (!session?.disputeId) return;
+        const group = EVIDENCE_GROUPS.find((g) => g.key === interaction.values[0]);
+        if (!group) return;
+        // No defer — showModal must be the first response. Prefill: local
+        // draft wins, else what's already staged at Stripe (so opening a group
+        // never blanks server-side text on re-save).
+        const [row, dispute] = await Promise.all([
+          this.ctx.disputeStore.get(session.disputeId),
+          this.ctx.stripe.getDispute(session.disputeId),
+        ]);
         const draft = (row?.evidenceDraft ?? {}) as Record<string, string>;
-        const fields = evidenceFieldsFor(row?.reason);
+        const staged = (dispute.evidence ?? {}) as unknown as Record<string, unknown>;
         const modal = new ModalBuilder()
           .setCustomId(`billadmin_dp_evm:${token}`)
-          .setTitle(`Evidence — ${session.disputeId}`.slice(0, 45));
-        for (const field of fields) {
+          .setTitle(`${group.label} — ${session.disputeId}`.slice(0, 45));
+        for (const field of group.fields) {
+          const stagedValue = typeof staged[field.key] === "string" ? (staged[field.key] as string) : undefined;
           modal.addComponents(
             new ActionRowBuilder<TextInputBuilder>().addComponents(
               textInput(field.key, field.label, {
                 required: false,
                 style: field.style,
                 maxLength: 4000,
-                value: draft[field.key],
+                value: draft[field.key] ?? stagedValue,
               })
             )
           );
@@ -260,10 +375,10 @@ export class DisputesHub {
         await this.ctx.sessions.ackModal(interaction);
         await this.ctx.sessions.tryRender(interaction, async () => {
           if (Object.keys(evidence).length === 0) {
-            await this.renderDetail(interaction, token, "Nothing to save — all evidence fields were empty.");
+            await this.renderEvidenceEditor(interaction, token, "Nothing to save — all evidence fields were empty.");
             return;
           }
-          await this.ctx.disputeStore.saveEvidenceDraft(disputeId, evidence);
+          await this.ctx.disputeStore.mergeEvidenceDraft(disputeId, evidence);
           // submit:false stages at Stripe without sending to the bank.
           await this.ctx.stripe.updateDisputeEvidence(
             disputeId,
@@ -278,7 +393,7 @@ export class DisputesHub {
             outcome: `${Object.keys(evidence).length} field(s) staged (NOT submitted)`,
             severity: "info",
           });
-          await this.renderDetail(interaction, token, "💾 Evidence staged at Stripe (not submitted yet).");
+          await this.renderEvidenceEditor(interaction, token, "💾 Evidence staged at Stripe (not submitted yet).");
         });
       },
     },
@@ -387,6 +502,167 @@ export class DisputesHub {
         if (!session?.disputeId) return;
         await interaction.deferUpdate();
         await this.ctx.sessions.runExclusive(token, interaction, () => this.runAiDraft(interaction, token));
+      },
+    },
+    // ---- staged-evidence review (read-back of what the bank will get) ----
+    {
+      kind: "button",
+      id: "billadmin_dp_evrev:",
+      match: "prefix",
+      handler: async (interaction) => {
+        const [, token, pageStr] = interaction.customId.split(":");
+        const session = await this.ctx.sessions.getOwnedSession(token, interaction);
+        if (!session?.disputeId) return;
+        await interaction.deferUpdate();
+        const page = Math.max(0, Number.parseInt(pageStr, 10) || 0);
+        await this.ctx.sessions.tryRender(interaction, () => this.renderReviewStaged(interaction, token, page));
+      },
+    },
+    {
+      kind: "select",
+      id: "billadmin_dp_fsel:",
+      match: "prefix",
+      handler: async (interaction) => {
+        const token = interaction.customId.split(":")[1];
+        const session = await this.ctx.sessions.getOwnedSession(token, interaction);
+        if (!session?.disputeId) return;
+        await interaction.deferUpdate();
+        const slot = interaction.values[0];
+        if (!(EVIDENCE_FILE_KEYS as readonly string[]).includes(slot)) return;
+        await this.ctx.sessions.tryRender(interaction, async () => {
+          const embed = new EmbedBuilder()
+            .setTitle("Remove staged evidence file")
+            .setColor(COLORS.warn)
+            .setDescription(
+              `Clear the **${slot}** slot for \`${session.disputeId}\`?\n\nThe uploaded file stays in your Stripe account but is detached from this dispute — it will NOT reach the bank. You can attach a new proof afterwards.`
+            );
+          await interaction.editReply({
+            embeds: [embed],
+            components: [
+              buttonRow(
+                btn(`billadmin_dp_frmx:${token}:${slot}`, "Remove File", ButtonStyle.Danger),
+                btn(`billadmin_dp_evrev:${token}:0`, "Back", ButtonStyle.Secondary)
+              ),
+            ],
+          });
+        });
+      },
+    },
+    {
+      kind: "button",
+      id: "billadmin_dp_frmx:",
+      match: "prefix",
+      handler: async (interaction) => {
+        const [, token, slot] = interaction.customId.split(":");
+        const session = await this.ctx.sessions.getOwnedSession(token, interaction);
+        if (!session?.disputeId) return;
+        const disputeId = session.disputeId;
+        if (!(EVIDENCE_FILE_KEYS as readonly string[]).includes(slot)) return;
+        await interaction.deferUpdate();
+        await this.ctx.sessions.runExclusive(token, interaction, async () => {
+          const fresh = await this.ctx.stripe.getDispute(disputeId);
+          if (!RESPONDABLE.has(fresh.status)) {
+            await this.renderReviewStaged(interaction, token, 0, `⚠️ Status is **${fresh.status}** — evidence can no longer be changed.`);
+            return;
+          }
+          // Emptyable field: "" detaches the file from the dispute.
+          await this.ctx.stripe.updateDisputeEvidence(
+            disputeId,
+            { [slot]: "" } as Stripe.DisputeUpdateParams.Evidence,
+            false,
+            `billadmin-dpfrm-${interaction.id}`
+          );
+          this.ctx.audit.log(interaction, {
+            action: "Dispute evidence file removed",
+            targetCustomerId: session.customerId,
+            objectId: disputeId,
+            outcome: `Cleared file slot ${slot} (staged only — nothing was submitted)`,
+            severity: "info",
+          });
+          await this.renderReviewStaged(interaction, token, 0, `🗑️ File slot **${slot}** cleared.`);
+        });
+      },
+    },
+    // ---- overview filter + sort ----
+    {
+      kind: "select",
+      id: "billadmin_dp_fil:",
+      match: "prefix",
+      handler: async (interaction) => {
+        const token = interaction.customId.split(":")[1];
+        const session = await this.ctx.sessions.getOwnedSession(token, interaction);
+        if (!session) return;
+        await interaction.deferUpdate();
+        session.dpFilter = interaction.values[0];
+        await this.ctx.sessions.tryRender(interaction, () => this.renderOverview(interaction, token, 0));
+      },
+    },
+    {
+      kind: "button",
+      id: "billadmin_dp_sort:",
+      match: "prefix",
+      handler: async (interaction) => {
+        const token = interaction.customId.split(":")[1];
+        const session = await this.ctx.sessions.getOwnedSession(token, interaction);
+        if (!session) return;
+        await interaction.deferUpdate();
+        const current = session.dpSort ?? "due";
+        session.dpSort = SORT_CYCLE[(SORT_CYCLE.indexOf(current) + 1) % SORT_CYCLE.length];
+        await this.ctx.sessions.tryRender(interaction, () => this.renderOverview(interaction, token, 0));
+      },
+    },
+    // ---- history browser + analytics ----
+    {
+      kind: "button",
+      id: "billadmin_dp_hist:",
+      match: "prefix",
+      handler: async (interaction) => {
+        const [, token, pageStr] = interaction.customId.split(":");
+        const session = await this.ctx.sessions.getOwnedSession(token, interaction);
+        if (!session) return;
+        await interaction.deferUpdate();
+        const page = Math.max(0, Number.parseInt(pageStr, 10) || 0);
+        await this.ctx.sessions.tryRender(interaction, () => this.renderHistory(interaction, token, page));
+      },
+    },
+    {
+      kind: "select",
+      id: "billadmin_dp_hfil:",
+      match: "prefix",
+      handler: async (interaction) => {
+        const token = interaction.customId.split(":")[1];
+        const session = await this.ctx.sessions.getOwnedSession(token, interaction);
+        if (!session) return;
+        await interaction.deferUpdate();
+        session.dpHistFilter = interaction.values[0];
+        await this.ctx.sessions.tryRender(interaction, () => this.renderHistory(interaction, token, 0));
+      },
+    },
+    {
+      kind: "select",
+      id: "billadmin_dp_hpick:",
+      match: "prefix",
+      handler: async (interaction) => {
+        const [, token, pageStr] = interaction.customId.split(":");
+        const session = await this.ctx.sessions.getOwnedSession(token, interaction);
+        if (!session) return;
+        await interaction.deferUpdate();
+        const page = Math.max(0, Number.parseInt(pageStr, 10) || 0);
+        pushNav(session, `billadmin_dp_hist:${token}:${page}`);
+        session.disputeId = interaction.values[0];
+        await this.ctx.sessions.tryRender(interaction, () => this.renderDetail(interaction, token));
+      },
+    },
+    {
+      kind: "button",
+      id: "billadmin_dp_stats:",
+      match: "prefix",
+      handler: async (interaction) => {
+        const token = interaction.customId.split(":")[1];
+        const session = await this.ctx.sessions.getOwnedSession(token, interaction);
+        if (!session) return;
+        await interaction.deferUpdate();
+        await this.ctx.sessions.tryRender(interaction, () => this.renderStats(interaction, token));
       },
     },
     // ---- evidence file proof (screenshots/PDFs → Stripe Files API) ----
@@ -1152,8 +1428,11 @@ export class DisputesHub {
     if (!session) return;
     session.originHub ??= "pay";
 
-    const [{ rows, total }, closed, ratios] = await Promise.all([
-      this.ctx.disputeStore.listOpen(page * PAGE_SIZE, PAGE_SIZE),
+    const filter = parseOpenFilter(session.dpFilter);
+    const sort = session.dpSort ?? "due";
+    const [{ rows, total }, reasons, closed, ratios] = await Promise.all([
+      this.ctx.disputeStore.listOpen(page * PAGE_SIZE, PAGE_SIZE, filter, sort),
+      this.ctx.disputeStore.openReasons(),
       this.ctx.disputeStore.closedSummarySince(90),
       this.ctx.ratio.get().catch((error) => {
         logger.warn("ratio computation failed", { error: String(error) });
@@ -1187,8 +1466,10 @@ export class DisputesHub {
           notice,
           ratioBlock,
           "",
-          `**Open disputes (${total})**${total > PAGE_SIZE ? ` · page ${page + 1}/${Math.max(1, Math.ceil(total / PAGE_SIZE))}` : ""}`,
-          lines.length ? lines.join("\n") : "None 🎉",
+          `**Open disputes (${total})**${filter ? ` · filtered: ${filter.status ?? filter.reason}` : ""}${
+            total > PAGE_SIZE ? ` · page ${page + 1}/${Math.max(1, Math.ceil(total / PAGE_SIZE))}` : ""
+          }`,
+          lines.length ? lines.join("\n") : filter ? "No open disputes match this filter." : "None 🎉",
           closed.won + closed.lost + closed.otherClosed > 0
             ? `\nClosed in the last 90d: **${closed.won}** won · **${closed.lost}** lost${closed.otherClosed ? ` · **${closed.otherClosed}** other (prevented / inquiry closed)` : ""}`
             : undefined,
@@ -1220,13 +1501,36 @@ export class DisputesHub {
         )
       );
     }
+    // Filter select: all open + the four open statuses + the reasons present.
+    if (total > 0 || filter) {
+      const active = session.dpFilter ?? "all";
+      const options = [
+        { label: "All open disputes", value: "all", default: active === "all" },
+        ...OPEN_DISPUTE_STATUSES.map((s) => ({ label: `Status: ${s}`, value: `s:${s}`, default: active === `s:${s}` })),
+        ...reasons.slice(0, 20).map((r) => ({
+          label: `Reason: ${r.reason} (${r.count})`.slice(0, 100),
+          value: `r:${r.reason}`.slice(0, 100),
+          default: active === `r:${r.reason}`,
+        })),
+      ];
+      components.push(
+        selectRow(
+          new StringSelectMenuBuilder().setCustomId(`billadmin_dp_fil:${token}`).setPlaceholder("Filter…").addOptions(options.slice(0, 25))
+        )
+      );
+    }
     components.push(
       buttonRow(
         btn(`billadmin_dp_page:${token}:${page - 1}`, "Prev", ButtonStyle.Secondary, page <= 0),
         btn(`billadmin_dp_page:${token}:${page + 1}`, "Next", ButtonStyle.Secondary, (page + 1) * PAGE_SIZE >= total),
-        btn(`billadmin_blk_list:${token}:0`, "Blocklist", ButtonStyle.Secondary),
-        btn(`billadmin_dp_sync:${token}`, "Sync from Stripe", ButtonStyle.Secondary),
+        btn(`billadmin_dp_sort:${token}`, SORT_LABELS[sort], ButtonStyle.Secondary, total <= 1),
         btn(`billadmin_nav_back:${token}`, "Back", ButtonStyle.Secondary)
+      ),
+      buttonRow(
+        btn(`billadmin_dp_hist:${token}:0`, "History", ButtonStyle.Secondary),
+        btn(`billadmin_dp_stats:${token}`, "Stats", ButtonStyle.Secondary),
+        btn(`billadmin_blk_list:${token}:0`, "Blocklist", ButtonStyle.Secondary),
+        btn(`billadmin_dp_sync:${token}`, "Sync from Stripe", ButtonStyle.Secondary)
       )
     );
     await interaction.editReply({ embeds: [embed], components });
@@ -1307,6 +1611,25 @@ export class DisputesHub {
         : "—";
     const respondable = RESPONDABLE.has(dispute.status);
     const terminal = TERMINAL.has(dispute.status);
+    // Stage-aware refundable text: a bare "yes/no" hides the two states that
+    // matter — "refund now and this never becomes a chargeback" vs "already
+    // refunded, the warning just hasn't closed yet" (the bank can take days).
+    const warningStage = dispute.status === "warning_needs_response" || dispute.status === "warning_under_review";
+    let refundableText: string;
+    if (terminal) {
+      refundableText = "— dispute closed";
+    } else if (dispute.is_charge_refundable) {
+      refundableText = warningStage
+        ? "yes — a **full refund now** prevents this from becoming a formal chargeback"
+        : "yes";
+    } else if (warningStage) {
+      const detailCharge = chargeId ? await this.ctx.stripe.getCharge(chargeId).catch(() => null) : null;
+      refundableText = detailCharge?.refunded
+        ? "already fully refunded ✅ — waiting for the bank to close this warning (can take a few days)"
+        : "no — Stripe no longer allows a refund on this charge";
+    } else {
+      refundableText = "no — formal chargeback: Stripe rejects refunds, respond with evidence instead";
+    }
     const eligibility = ed && "enhanced_eligibility_types" in ed && Array.isArray(ed.enhanced_eligibility_types) && ed.enhanced_eligibility_types.length
       ? ed.enhanced_eligibility_types.join(", ")
       : null;
@@ -1325,7 +1648,7 @@ export class DisputesHub {
         { name: "Evidence", value: evidenceState.slice(0, 1024), inline: false },
         { name: "Charge", value: chargeId ? `\`${chargeId}\`` : "—", inline: true },
         { name: "Card", value: cardText.slice(0, 1024), inline: true },
-        { name: "Refundable", value: dispute.is_charge_refundable ? "yes — refund can still prevent it" : "no", inline: true },
+        { name: "Refundable", value: refundableText.slice(0, 1024), inline: true },
         { name: "Customer", value: linked.slice(0, 1024), inline: false },
         ...(eligibility
           ? [{ name: "Enhanced eligibility", value: `${eligibility} — compelling-evidence flows live in the Stripe Dashboard`.slice(0, 1024), inline: false }]
@@ -1349,17 +1672,344 @@ export class DisputesHub {
           btn(`billadmin_dp_ev_edit:${token}`, "Edit Evidence", ButtonStyle.Primary, !respondable),
           btn(`billadmin_dp_ai:${token}`, "AI Draft", ButtonStyle.Primary, !respondable),
           btn(`billadmin_dp_proof:${token}`, "Attach Proof", ButtonStyle.Primary, !respondable),
-          btn(`billadmin_dp_ev_submit:${token}`, "Submit Evidence", ButtonStyle.Danger, !respondable || !(ed?.has_evidence || draftFields > 0)),
-          btn(`billadmin_dp_accept:${token}`, "Accept Dispute", ButtonStyle.Danger, terminal)
+          // Review works on any dispute with evidence at Stripe — including
+          // closed ones (post-mortem of what was actually sent to the bank).
+          btn(`billadmin_dp_evrev:${token}:0`, "Review Evidence", ButtonStyle.Primary, !(ed?.has_evidence || stagedFiles.length > 0)),
+          btn(`billadmin_dp_ev_submit:${token}`, "Submit Evidence", ButtonStyle.Danger, !respondable || !(ed?.has_evidence || draftFields > 0))
         ),
         buttonRow(
+          btn(`billadmin_dp_accept:${token}`, "Accept Dispute", ButtonStyle.Danger, terminal),
           btn(`billadmin_dp_refund:${token}`, "Refund to Prevent", ButtonStyle.Secondary, !dispute.is_charge_refundable),
           btn(`billadmin_blk_open:${token}:dp`, "Block…", ButtonStyle.Danger),
           btn(`billadmin_dp_notes:${token}`, "Notes", ButtonStyle.Secondary),
-          btn(`billadmin_dp_bm:${token}`, bookmarked ? "Remove Bookmark" : "Bookmark", ButtonStyle.Secondary),
-          btn(`billadmin_dp_watch:${token}`, watching ? "Unwatch" : "Watch", ButtonStyle.Secondary)
+          btn(`billadmin_dp_bm:${token}`, bookmarked ? "Remove Bookmark" : "Bookmark", ButtonStyle.Secondary)
         ),
-        buttonRow(btn(`billadmin_nav_back:${token}`, "Back", ButtonStyle.Secondary)),
+        buttonRow(
+          btn(`billadmin_dp_watch:${token}`, watching ? "Unwatch" : "Watch", ButtonStyle.Secondary),
+          btn(`billadmin_nav_back:${token}`, "Back", ButtonStyle.Secondary)
+        ),
+      ],
+    });
+  }
+
+  // ---- evidence editor (field-group picker) ----
+
+  private async renderEvidenceEditor(interaction: RenderInteraction, token: string, notice?: string): Promise<void> {
+    const session = this.ctx.sessions.get(token);
+    if (!session?.disputeId) return;
+    const [row, dispute] = await Promise.all([
+      this.ctx.disputeStore.get(session.disputeId),
+      this.ctx.stripe.getDispute(session.disputeId),
+    ]);
+    const draft = (row?.evidenceDraft ?? {}) as Record<string, string>;
+    const staged = (dispute.evidence ?? {}) as unknown as Record<string, unknown>;
+    const recommended = recommendedGroupKeys(dispute.reason);
+    const respondable = RESPONDABLE.has(dispute.status);
+
+    const groupLine = (g: EvidenceGroup) => {
+      const stagedCount = g.fields.filter((f) => typeof staged[f.key] === "string" && (staged[f.key] as string).trim()).length;
+      const draftDiffers = g.fields.filter((f) => {
+        const d = draft[f.key]?.trim();
+        return d && d !== (typeof staged[f.key] === "string" ? (staged[f.key] as string).trim() : "");
+      }).length;
+      const star = recommended.includes(g.key) ? " ⭐" : "";
+      const parts = [
+        `${stagedCount}/${g.fields.length} staged`,
+        draftDiffers ? `✏️ ${draftDiffers} draft field(s) not staged yet` : null,
+      ].filter(Boolean);
+      return `${g.emoji} **${g.label}**${star} — ${parts.join(" · ")}`;
+    };
+
+    // Recommended groups first, in their recommendation order.
+    const ordered = [...EVIDENCE_GROUPS].sort((a, b) => {
+      const ai = recommended.indexOf(a.key);
+      const bi = recommended.indexOf(b.key);
+      return (ai === -1 ? recommended.length : ai) - (bi === -1 ? recommended.length : bi);
+    });
+
+    const embed = new EmbedBuilder()
+      .setTitle(`📝 Evidence — \`${dispute.id}\``)
+      .setColor(respondable ? COLORS.brand : COLORS.warn)
+      .setDescription(
+        [
+          notice,
+          `Reason **${dispute.reason}** — ⭐ marks the sections that matter most for it. Pick a section to edit; **Save stages at Stripe** (submit:false, the bank sees nothing until Submit Evidence).`,
+          "",
+          ...ordered.map(groupLine),
+          "",
+          "Empty inputs are left untouched — existing staged text is never cleared by saving a blank field.",
+          respondable ? null : `⚠️ Status is **${dispute.status}** — evidence can no longer be changed.`,
+        ]
+          .filter((line) => line !== null && line !== undefined)
+          .join("\n")
+          .slice(0, 4096)
+      );
+
+    const components: Panel["components"] = [];
+    if (respondable) {
+      components.push(
+        selectRow(
+          new StringSelectMenuBuilder()
+            .setCustomId(`billadmin_dp_evgsel:${token}`)
+            .setPlaceholder("Edit a section…")
+            .addOptions(
+              ordered.map((g) => ({
+                label: `${g.label}${recommended.includes(g.key) ? " ⭐" : ""}`.slice(0, 100),
+                description: g.fields.map((f) => f.key).join(", ").slice(0, 100),
+                value: g.key,
+                emoji: g.emoji,
+              }))
+            )
+        )
+      );
+    }
+    components.push(
+      buttonRow(
+        btn(`billadmin_dp_evrev:${token}:0`, "Review Evidence", ButtonStyle.Primary, !(dispute.evidence_details?.has_evidence || false)),
+        btn(`billadmin_dp_ai:${token}`, "AI Draft", ButtonStyle.Primary, !respondable),
+        btn(`billadmin_dp_proof:${token}`, "Attach Proof", ButtonStyle.Primary, !respondable),
+        btn(`billadmin_dp_det:${token}`, "Back", ButtonStyle.Secondary)
+      )
+    );
+    await interaction.editReply({ embeds: [embed], components });
+  }
+
+  // ---- staged-evidence review (exactly what the bank will receive) ----
+
+  private async renderReviewStaged(interaction: RenderInteraction, token: string, page: number, notice?: string): Promise<void> {
+    const session = this.ctx.sessions.get(token);
+    if (!session?.disputeId) return;
+    const [row, dispute] = await Promise.all([
+      this.ctx.disputeStore.get(session.disputeId),
+      this.ctx.stripe.getDispute(session.disputeId),
+    ]);
+    const draft = (row?.evidenceDraft ?? {}) as Record<string, string>;
+    const staged = (dispute.evidence ?? {}) as unknown as Record<string, unknown>;
+    const respondable = RESPONDABLE.has(dispute.status);
+    const ed = dispute.evidence_details;
+
+    const textFields = TEXT_EVIDENCE_KEYS.filter(
+      (key) => typeof staged[key] === "string" && (staged[key] as string).trim()
+    );
+    const files = EVIDENCE_FILE_KEYS.filter((key) => typeof staged[key] === "string" && staged[key]);
+
+    const FIELDS_PER_PAGE = 4;
+    const pageCount = Math.max(1, Math.ceil(textFields.length / FIELDS_PER_PAGE));
+    const boundedPage = Math.min(page, pageCount - 1);
+    const pageFields = textFields.slice(boundedPage * FIELDS_PER_PAGE, (boundedPage + 1) * FIELDS_PER_PAGE);
+
+    // Draft fields that exist locally but aren't staged (or differ) — the
+    // things that would be missing if Submit were pressed right now.
+    const unstagedDraft: string[] = TEXT_EVIDENCE_KEYS.filter((key) => {
+      const d = draft[key]?.trim();
+      return d && d !== (typeof staged[key] === "string" ? (staged[key] as string).trim() : "");
+    });
+
+    const fieldBlock = (key: string) => {
+      const value = (staged[key] as string).trim();
+      const differs = unstagedDraft.includes(key) ? " · ✏️ local draft differs" : "";
+      const shown = value.length > 350 ? `${value.slice(0, 350)}… _(${value.length} chars total)_` : value;
+      return `**${key}** — ${value.length} chars${differs}\n> ${shown.replace(/\n/g, "\n> ")}`;
+    };
+
+    const submissions = ed?.submission_count ?? 0;
+    const embed = new EmbedBuilder()
+      .setTitle(`🔎 Staged evidence — \`${dispute.id}\``)
+      .setColor(respondable ? COLORS.brand : COLORS.warn)
+      .setDescription(
+        [
+          notice,
+          `This is what the bank receives on Submit. ${submissions > 0 ? `Already submitted **${submissions}×**.` : "Not submitted yet."}${
+            ed?.due_by ? ` Due <t:${ed.due_by}:R>.` : ""
+          }`,
+          "",
+          textFields.length
+            ? `**Text fields (${textFields.length})**${pageCount > 1 ? ` · page ${boundedPage + 1}/${pageCount}` : ""}`
+            : "**No text evidence staged.**",
+          ...pageFields.map(fieldBlock),
+          "",
+          files.length
+            ? `**Files (${files.length})**\n${files.map((key) => `📎 **${key}** — \`${staged[key]}\``).join("\n")}`
+            : "**No evidence files attached.**",
+          unstagedDraft.length
+            ? `\n✏️ **${unstagedDraft.length} local draft field(s) are NOT staged yet** (${unstagedDraft.slice(0, 6).join(", ")}${unstagedDraft.length > 6 ? ", …" : ""}) — open Edit Evidence and save them, or they won't reach the bank.`
+            : null,
+        ]
+          .filter((line) => line !== null && line !== undefined)
+          .join("\n")
+          .slice(0, 4096)
+      );
+
+    const components: Panel["components"] = [];
+    if (respondable && files.length) {
+      components.push(
+        selectRow(
+          new StringSelectMenuBuilder()
+            .setCustomId(`billadmin_dp_fsel:${token}`)
+            .setPlaceholder("Remove a staged file…")
+            .addOptions(files.slice(0, 25).map((key) => ({ label: key, description: String(staged[key]).slice(0, 100), value: key })))
+        )
+      );
+    }
+    components.push(
+      buttonRow(
+        btn(`billadmin_dp_evrev:${token}:${boundedPage - 1}`, "Prev", ButtonStyle.Secondary, boundedPage <= 0),
+        btn(`billadmin_dp_evrev:${token}:${boundedPage + 1}`, "Next", ButtonStyle.Secondary, boundedPage + 1 >= pageCount),
+        btn(`billadmin_dp_ev_submit:${token}`, "Submit Evidence", ButtonStyle.Danger, !respondable || !(ed?.has_evidence || false)),
+        btn(`billadmin_dp_ev_edit:${token}`, "Edit Evidence", ButtonStyle.Secondary, !respondable),
+        btn(`billadmin_dp_det:${token}`, "Back", ButtonStyle.Secondary)
+      )
+    );
+    await interaction.editReply({ embeds: [embed], components });
+  }
+
+  // ---- closed-dispute history browser ----
+
+  private async renderHistory(interaction: RenderInteraction, token: string, page: number, notice?: string): Promise<void> {
+    const session = this.ctx.sessions.get(token);
+    if (!session) return;
+    const filter = parseClosedFilter(session.dpHistFilter);
+    const [{ rows, total }, reasons] = await Promise.all([
+      this.ctx.disputeStore.listClosed(page * PAGE_SIZE, PAGE_SIZE, filter),
+      this.ctx.disputeStore.closedReasons(),
+    ]);
+
+    const lines = rows.map((d) => {
+      const emoji = OUTCOME_EMOJI[d.status] ?? "⚪";
+      const closed = d.closedAt ? ` · closed <t:${Math.floor(d.closedAt.getTime() / 1000)}:R>` : "";
+      const submitted = d.evidenceSubmittedAt ? " · 📨 responded" : d.status === "lost" ? " · ⚠️ no response" : "";
+      return `${emoji} \`${d.id}\` · **${this.ctx.stripe.formatAmount(d.amount, d.currency)}** · ${d.reason} · ${d.status}${closed}${submitted}`;
+    });
+
+    const backfilledAt = this.ctx.settingsStore.disputeBackfillDoneAt();
+    const embed = new EmbedBuilder()
+      .setTitle(`📜 Dispute history (${total})`)
+      .setColor(COLORS.brand)
+      .setDescription(
+        [
+          notice,
+          `Closed disputes in the local mirror${filter ? ` · filtered: ${filter.outcome ?? filter.reason}` : ""}${
+            total > PAGE_SIZE ? ` · page ${page + 1}/${Math.max(1, Math.ceil(total / PAGE_SIZE))}` : ""
+          }`,
+          "",
+          lines.length ? lines.join("\n") : "No closed disputes recorded yet.",
+          backfilledAt
+            ? null
+            : "\nℹ️ Only disputes seen since the mirror existed are listed — run **/config → Billing → Disputes → Backfill History** to import the full Stripe history.",
+        ]
+          .filter((line) => line !== null && line !== undefined)
+          .join("\n")
+          .slice(0, 4096)
+      );
+
+    const components: Panel["components"] = [];
+    if (rows.length) {
+      components.push(
+        selectRow(
+          new StringSelectMenuBuilder()
+            .setCustomId(`billadmin_dp_hpick:${token}:${page}`)
+            .setPlaceholder("Open a dispute…")
+            .addOptions(
+              rows.slice(0, 25).map((d) => ({
+                label: `${this.ctx.stripe.formatAmount(d.amount, d.currency)} · ${d.reason} · ${d.status}`.slice(0, 100),
+                description: `${d.id}${d.closedAt ? ` · closed ${d.closedAt.toISOString().slice(0, 10)}` : ""}`.slice(0, 100),
+                value: d.id,
+              }))
+            )
+        )
+      );
+    }
+    if (total > 0 || filter) {
+      const active = session.dpHistFilter ?? "all";
+      components.push(
+        selectRow(
+          new StringSelectMenuBuilder()
+            .setCustomId(`billadmin_dp_hfil:${token}`)
+            .setPlaceholder("Filter…")
+            .addOptions(
+              [
+                { label: "All closed disputes", value: "all", default: active === "all" },
+                { label: "Won", value: "o:won", default: active === "o:won" },
+                { label: "Lost", value: "o:lost", default: active === "o:lost" },
+                { label: "Other (prevented / inquiry closed)", value: "o:other", default: active === "o:other" },
+                ...reasons.slice(0, 20).map((r) => ({
+                  label: `Reason: ${r.reason} (${r.count})`.slice(0, 100),
+                  value: `r:${r.reason}`.slice(0, 100),
+                  default: active === `r:${r.reason}`,
+                })),
+              ].slice(0, 25)
+            )
+        )
+      );
+    }
+    components.push(
+      buttonRow(
+        btn(`billadmin_dp_hist:${token}:${page - 1}`, "Prev", ButtonStyle.Secondary, page <= 0),
+        btn(`billadmin_dp_hist:${token}:${page + 1}`, "Next", ButtonStyle.Secondary, (page + 1) * PAGE_SIZE >= total),
+        btn(`billadmin_dp_stats:${token}`, "Stats", ButtonStyle.Secondary),
+        btn(`billadmin_dp_home:${token}`, "Disputes Overview", ButtonStyle.Secondary),
+        btn(`billadmin_nav_back:${token}`, "Back", ButtonStyle.Secondary)
+      )
+    );
+    await interaction.editReply({ embeds: [embed], components });
+  }
+
+  // ---- outcome analytics ----
+
+  private async renderStats(interaction: RenderInteraction, token: string): Promise<void> {
+    const session = this.ctx.sessions.get(token);
+    if (!session) return;
+    const [allTime, d90, byReason] = await Promise.all([
+      this.ctx.disputeStore.outcomeStats(),
+      this.ctx.disputeStore.outcomeStats(90),
+      this.ctx.disputeStore.statsByReason(),
+    ]);
+
+    const fmtAmounts = (amounts: Record<string, number>) => {
+      const parts = Object.entries(amounts).map(([currency, minor]) => this.ctx.stripe.formatAmount(minor, currency));
+      return parts.length ? parts.join(" + ") : "—";
+    };
+    const fmtRate = (pct: number | null) => (pct == null ? "n/a (nothing decided)" : `${pct.toFixed(1)}%`);
+    const windowBlock = (label: string, s: typeof allTime) =>
+      [
+        `**${label}** — ${s.won + s.lost + s.other} closed`,
+        `🏆 won **${s.won}** · ❌ lost **${s.lost}** · ⚪ other **${s.other}** · win rate **${fmtRate(s.winRatePct)}**`,
+        `recovered ${fmtAmounts(s.wonAmount)} · conceded ${fmtAmounts(s.lostAmount)}`,
+        s.lostUnanswered > 0 ? `⚠️ **${s.lostUnanswered}** lost without any evidence response` : null,
+      ]
+        .filter(Boolean)
+        .join("\n");
+
+    const reasonLines = byReason
+      .slice(0, 10)
+      .map((r) => `• **${r.reason}** — 🏆 ${r.won} / ❌ ${r.lost}${r.other ? ` / ⚪ ${r.other}` : ""} · win rate ${fmtRate(r.winRatePct)}`);
+
+    const backfilledAt = this.ctx.settingsStore.disputeBackfillDoneAt();
+    const embed = new EmbedBuilder()
+      .setTitle("📊 Dispute outcomes")
+      .setColor(COLORS.brand)
+      .setDescription(
+        [
+          windowBlock("All time", allTime),
+          "",
+          windowBlock("Last 90 days (by close date)", d90),
+          "",
+          reasonLines.length ? `**By reason (all time)**\n${reasonLines.join("\n")}` : "**By reason** — no closed disputes yet.",
+          "",
+          backfilledAt
+            ? `History backfilled <t:${Math.floor(backfilledAt.getTime() / 1000)}:R>. Win rate = won ÷ (won + lost); "other" (prevented / closed inquiries) doesn't count against you.`
+            : "⚠️ Stats only cover disputes seen since the mirror existed — run **/config → Billing → Disputes → Backfill History** for lifetime numbers. Win rate = won ÷ (won + lost).",
+        ].join("\n").slice(0, 4096)
+      );
+
+    await interaction.editReply({
+      embeds: [embed],
+      components: [
+        buttonRow(
+          btn(`billadmin_dp_hist:${token}:0`, "History", ButtonStyle.Secondary),
+          btn(`billadmin_dp_home:${token}`, "Disputes Overview", ButtonStyle.Secondary),
+          btn(`billadmin_nav_back:${token}`, "Back", ButtonStyle.Secondary)
+        ),
       ],
     });
   }
@@ -1380,7 +2030,17 @@ export class DisputesHub {
     const customer = customerId ? await this.ctx.stripe.getCustomer(customerId).catch(() => null) : null;
     const subs = customerId ? await this.ctx.stripe.listSubscriptions(customerId).catch(() => []) : [];
 
-    const fields = evidenceFieldsFor(dispute.reason).map((f) => f.key);
+    // Real customer-communication material + few-shot exemplars from past
+    // wins; both are best-effort — the draft still runs when they're missing.
+    const [intercomHistory, wonExemplars] = await Promise.all([
+      this.collectIntercomHistory(customerId, customer?.email ?? null).catch((error) => {
+        logger.warn("intercom history lookup failed", { error: String(error) });
+        return null;
+      }),
+      this.ctx.disputeStore.wonEvidenceExemplars(dispute.reason || "unknown", 2).catch(() => []),
+    ]);
+
+    const fields = aiDraftFieldsFor(dispute.reason);
     const iso = (unix: number) => new Date(unix * 1000).toISOString().slice(0, 10);
     const prompt = buildDisputeEvidencePrompt({
       disputeId: dispute.id,
@@ -1408,6 +2068,8 @@ export class DisputesHub {
         started: iso(sub.created),
       })),
       fields,
+      intercomHistory,
+      wonExemplars,
     });
 
     // Claude Code CLI run with Read/Glob/Grep over the cloned Postiz source +
@@ -1450,19 +2112,67 @@ export class DisputesHub {
       draft = { uncategorized_text: (messages[messages.length - 1] ?? "").trim().slice(0, 3800) };
     }
 
-    await this.ctx.disputeStore.saveEvidenceDraft(dispute.id, draft);
+    await this.ctx.disputeStore.mergeEvidenceDraft(dispute.id, draft);
     this.ctx.audit.log(interaction, {
       action: "Dispute AI evidence draft",
       targetCustomerId: customerId ?? undefined,
       objectId: dispute.id,
-      outcome: `Draft saved locally (${Object.keys(draft).length} field(s)) — nothing sent to Stripe`,
+      outcome: `Draft saved locally (${Object.keys(draft).length} field(s)${intercomHistory ? ", with Intercom history" : ""}${
+        wonExemplars.length ? `, ${wonExemplars.length} won-dispute exemplar(s)` : ""
+      }) — nothing sent to Stripe`,
       severity: "info",
     });
-    await this.renderDetail(
+    await this.renderEvidenceEditor(
       interaction,
       token,
-      "🤖 AI draft saved **locally** — open **Edit Evidence** to review/adjust, then Save + Submit. Nothing was sent to Stripe."
+      "🤖 AI draft saved **locally** — open the sections below to review/adjust and **Save** to stage, then Submit. Nothing was sent to Stripe."
     );
+  }
+
+  // Support-history context for the AI draft: resolve the customer to Intercom
+  // contacts (bridge contacts carry the Discord id as external_id and no email,
+  // so both lookups run), pull their newest conversations and render bounded
+  // plaintext transcripts. Null on any shortfall — the draft works without it.
+  private async collectIntercomHistory(customerId: string | null, email: string | null): Promise<string | null> {
+    if (this.ctx.settingsStore.intercomMode() === "none") return null;
+    const contactIds = new Set<string>();
+    if (customerId) {
+      const discordIds = await this.ctx.sessionStore.findDiscordIdsByStripeId(customerId).catch(() => []);
+      for (const discordId of discordIds.slice(0, 3)) {
+        const contact = await this.ctx.intercom.findContactByExternalId(discordId).catch(() => null);
+        if (contact) contactIds.add(contact.id);
+      }
+    }
+    if (email) {
+      for (const id of await this.ctx.intercom.searchContactIdsByEmail(email).catch(() => [])) contactIds.add(id);
+    }
+    if (contactIds.size === 0) return null;
+
+    const conversations: Array<{ id: string; createdAt: Date | null }> = [];
+    for (const contactId of [...contactIds].slice(0, 3)) {
+      conversations.push(...(await this.ctx.intercom.searchConversationsByContact(contactId, 3).catch(() => [])));
+    }
+    const newest = [...new Map(conversations.map((c) => [c.id, c])).values()]
+      .sort((a, b) => (b.createdAt?.getTime() ?? 0) - (a.createdAt?.getTime() ?? 0))
+      .slice(0, 3);
+
+    const blocks: string[] = [];
+    let budget = 5000; // keep the prompt bounded — transcripts can be huge
+    for (const convo of newest) {
+      const transcript = await this.ctx.intercom.getConversationTranscript(convo.id).catch(() => []);
+      if (!transcript.length) continue;
+      const lines = transcript
+        .slice(0, 12)
+        .map(
+          (m) =>
+            `  - [${m.at ? m.at.toISOString().slice(0, 10) : "?"}] ${m.author}: ${m.text.replace(/\s+/g, " ").slice(0, 300)}`
+        );
+      const block = `- Conversation started ${convo.createdAt ? convo.createdAt.toISOString().slice(0, 10) : "?"}:\n${lines.join("\n")}`;
+      if (block.length > budget) break;
+      budget -= block.length;
+      blocks.push(block);
+    }
+    return blocks.length ? blocks.join("\n") : null;
   }
 
   // ---- block flow helpers ----

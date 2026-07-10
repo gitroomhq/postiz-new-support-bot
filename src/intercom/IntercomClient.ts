@@ -193,7 +193,85 @@ export class IntercomClient {
     await this.json("/data_attributes", "POST", { name, description, model: "contact", data_type: "string" }, "data attribute create");
   }
 
+  // Email lookup for the dispute-evidence context: a Stripe customer's email →
+  // Intercom contact ids (an email can map to lead + user duplicates).
+  async searchContactIdsByEmail(email: string): Promise<string[]> {
+    const data = await this.json<{ data?: Array<{ id?: string | number }> }>(
+      "/contacts/search",
+      "POST",
+      { query: { field: "email", operator: "=", value: email }, pagination: { per_page: 10 } },
+      "contact search by email"
+    );
+    return (data.data ?? []).map((c) => (c.id != null ? String(c.id) : null)).filter((id): id is string => !!id);
+  }
+
   // ---- Conversations ----
+
+  // Newest conversations a contact participates in — the dispute-evidence
+  // context pulls their transcripts as customer_communication material.
+  async searchConversationsByContact(
+    contactId: string,
+    limit = 5
+  ): Promise<Array<{ id: string; createdAt: Date | null }>> {
+    const data = await this.json<{
+      conversations?: Array<{ id?: string | number; created_at?: number }>;
+    }>(
+      "/conversations/search",
+      "POST",
+      {
+        query: { field: "contact_ids", operator: "=", value: contactId },
+        pagination: { per_page: Math.min(limit, 25) },
+      },
+      "conversation search"
+    );
+    return (data.conversations ?? [])
+      .filter((c) => c.id != null)
+      .map((c) => ({ id: String(c.id), createdAt: c.created_at ? new Date(c.created_at * 1000) : null }))
+      .sort((a, b) => (b.createdAt?.getTime() ?? 0) - (a.createdAt?.getTime() ?? 0))
+      .slice(0, limit);
+  }
+
+  // Full conversation rendered as plaintext (display_as=plaintext strips
+  // Intercom's HTML bodies): the opening message plus every human-authored
+  // comment, in order. Notes and bot parts are skipped — evidence needs the
+  // actual customer/agent exchange.
+  async getConversationTranscript(
+    conversationId: string
+  ): Promise<Array<{ author: string; at: Date | null; text: string }>> {
+    const data = await this.json<{
+      created_at?: number;
+      source?: { body?: string | null; author?: { type?: string; name?: string | null } };
+      conversation_parts?: {
+        conversation_parts?: Array<{
+          part_type?: string;
+          body?: string | null;
+          created_at?: number;
+          author?: { type?: string; name?: string | null };
+        }>;
+      };
+    }>(`/conversations/${encodeURIComponent(conversationId)}?display_as=plaintext`, "GET", undefined, "conversation get");
+
+    const authorLabel = (author?: { type?: string; name?: string | null }) =>
+      author?.type === "admin" || author?.type === "team" ? `agent${author.name ? ` ${author.name}` : ""}` : "customer";
+    const out: Array<{ author: string; at: Date | null; text: string }> = [];
+    if (data.source?.body?.trim()) {
+      out.push({
+        author: authorLabel(data.source.author),
+        at: data.created_at ? new Date(data.created_at * 1000) : null,
+        text: data.source.body.trim(),
+      });
+    }
+    for (const part of data.conversation_parts?.conversation_parts ?? []) {
+      if (part.part_type !== "comment" || !part.body?.trim()) continue;
+      if (part.author?.type === "bot") continue;
+      out.push({
+        author: authorLabel(part.author),
+        at: part.created_at ? new Date(part.created_at * 1000) : null,
+        text: part.body.trim(),
+      });
+    }
+    return out;
+  }
 
   // Contact-initiated conversation. The response is a Message object; the
   // conversation id lives in its conversation_id field.

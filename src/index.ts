@@ -192,6 +192,7 @@ async function main() {
     qolStore,
     ratio: ratioEngine,
     claudeRunner,
+    intercom: intercomClient,
   });
 
   const billingCategory = new BillingCategory(stripeClient, sessionStore, settingsStore, statusService, ticketStore, auditLogger, tierStore, blockStore);
@@ -252,7 +253,7 @@ async function main() {
     intercomInboxApp,
     { prisma, lightAiRunner, scoringService, scoreStore, ticketAiRunStore },
     { service: vaultService, migrator: vaultMigrator },
-    { blockService }
+    { blockService, stripeClient, disputeStore }
   );
   // The client exists as soon as the constructor ran; nothing fires before login.
   auditLogger.bindClient(bot.client);

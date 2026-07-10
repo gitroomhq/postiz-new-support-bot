@@ -154,6 +154,12 @@ model BotSettings {
   disputeRatioWarnPct     Float   @default(0.5)
   disputeRatioCriticalPct Float   @default(0.9)
   disputeRatioLastLevel   String  @default("ok") // ok | warn | critical — alert-on-transition state
+  // Urgent reminder tier: respondable + unsubmitted + due within this many
+  // hours escalates the reminder (red embed + role mention). Role unset =
+  // urgent styling without a mention, so the deploy ships inert.
+  disputeUrgentHours      Int     @default(48)
+  disputeUrgentRoleId     String?
+  disputeBackfillDoneAt   DateTime? // last all-time dispute history backfill run
   radarListCardId         String?
   radarListEmailId        String?
   radarListCustomerId     String?
@@ -543,8 +549,10 @@ model StripeDispute {
   status              String // needs_response | under_review | warning_* | won | lost | prevented
   evidenceDueBy       DateTime?
   evidenceDraft       Json? // local staff/AI evidence draft ({ field: text })
+  evidenceFinal       Json? // text evidence as last seen at Stripe once submitted ({ field: text }) — won-dispute exemplars for AI drafting
   evidenceSubmittedAt DateTime?
   lastReminderAt      DateTime? // evidence-due reminder damper (≤1 ping / 24h / dispute)
+  lastUrgentReminderAt DateTime? // urgent-tier damper (≤1 urgent ping / 24h / dispute)
   disputeCreatedAt    DateTime
   closedAt            DateTime?
   createdAt           DateTime  @default(now())
@@ -554,6 +562,7 @@ model StripeDispute {
   @@index([evidenceDueBy])
   @@index([chargeId])
   @@index([customerId])
+  @@index([closedAt])
   @@map("stripe_disputes")
 }
 

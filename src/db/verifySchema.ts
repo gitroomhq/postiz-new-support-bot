@@ -44,6 +44,7 @@ const EXPECTED_COLUMNS: Record<string, string[]> = {
     "temporalDeploymentName", "temporalTlsServerName", "temporalImportDoneAt",
     "disputeAutoCancelSub", "disputeAutoBlock", "disputeReminderDays",
     "disputeRatioWarnPct", "disputeRatioCriticalPct", "disputeRatioLastLevel",
+    "disputeUrgentHours", "disputeUrgentRoleId", "disputeBackfillDoneAt",
     "radarListCardId", "radarListEmailId", "radarListCustomerId", "radarListIpId", "updatedAt",
   ],
   status_tags: [
@@ -72,8 +73,8 @@ const EXPECTED_COLUMNS: Record<string, string[]> = {
   stripe_webhook_events: ["id", "type", "createdAt"],
   stripe_disputes: [
     "id", "chargeId", "paymentIntentId", "customerId", "amount", "currency", "reason", "status",
-    "evidenceDueBy", "evidenceDraft", "evidenceSubmittedAt", "lastReminderAt", "disputeCreatedAt",
-    "closedAt", "createdAt", "updatedAt",
+    "evidenceDueBy", "evidenceDraft", "evidenceFinal", "evidenceSubmittedAt", "lastReminderAt",
+    "lastUrgentReminderAt", "disputeCreatedAt", "closedAt", "createdAt", "updatedAt",
   ],
   blocked_entities: [
     "id", "kind", "value", "reason", "source", "actorId", "actorName", "customerId", "disputeId",

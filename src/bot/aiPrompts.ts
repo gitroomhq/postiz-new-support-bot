@@ -397,6 +397,12 @@ export interface DisputeEvidenceContext {
   subscriptions: Array<{ plan: string; status: string; started: string }>;
   // Which evidence fields the staff modal will show — the model fills exactly these.
   fields: string[];
+  // Real support-conversation excerpts for THIS customer (Intercom), already
+  // plaintext + length-bounded. Null = bridge off / no contact / lookup failed.
+  intercomHistory: string | null;
+  // Submitted text evidence from past WON disputes (same reason preferred) —
+  // style/structure reference only, their customer facts must never leak.
+  wonExemplars: Array<{ reason: string; evidence: Record<string, string> }>;
 }
 
 // Drafts dispute-evidence text for staff review — runs on the Claude Code CLI
@@ -417,7 +423,23 @@ export function buildDisputeEvidencePrompt(ctx: DisputeEvidenceContext): string 
     ctx.subscriptions.length
       ? `Subscriptions:\n${ctx.subscriptions.map((s) => `- ${s.plan} · ${s.status} · started ${s.started}`).join("\n")}`
       : "Subscriptions: none found",
-  ].join("\n");
+    ctx.intercomHistory
+      ? `Support conversations with this customer (Intercom, real quotes usable as customer_communication evidence):\n${ctx.intercomHistory}`
+      : null,
+  ]
+    .filter(Boolean)
+    .join("\n");
+
+  const exemplarBlock = ctx.wonExemplars.length
+    ? `\nPAST WON DISPUTES (style/structure reference ONLY — these are OTHER customers' cases; never copy their names, emails, dates, plans or any customer-specific detail into this draft):\n${ctx.wonExemplars
+        .map(
+          (ex, i) =>
+            `--- Won dispute ${i + 1} (reason: ${ex.reason}) ---\n${Object.entries(ex.evidence)
+              .map(([key, text]) => `${key}: ${text.slice(0, 700)}`)
+              .join("\n")}`
+        )
+        .join("\n")}\n`
+    : "";
 
   return `You draft chargeback-dispute evidence for Postiz (a social-media scheduling SaaS, sold as a subscription; the merchant is the Postiz team).
 
@@ -429,8 +451,10 @@ RULES:
 - The reader is a BANK ANALYST, not a developer. NEVER include internal artifacts in the evidence text: no file paths, repository or folder names, code identifiers, function/variable names, "./postiz-docs/…" style references, or any mention that you searched a codebase. Cite policies by their public location only (e.g. "as published on the Postiz documentation site" or "shown during checkout"), in plain business language.
 - Policy fields (refund_policy_disclosure, cancellation_policy_disclosure, cancellation_rebuttal): find the actual published policy/terms in the docs or source and quote or faithfully paraphrase them. If no explicit policy document exists, accurately describe how the product verifiably behaves per the code/docs (e.g. self-service cancellation available anytime from the billing settings, subscriptions bill per period until cancelled) — never present behavior the code doesn't have.
 - NEVER invent customer-specific facts: no fabricated order numbers, IP addresses, raw log lines, dates or communications. Customer-specific content comes ONLY from the FACTS below — service_date is the charge date; customer_email_address is the customer's email; access_activity_log describes the factual account/billing history from the FACTS (signup date, subscription plan/status, renewal charges) in prose, not fabricated log lines.
+- If the FACTS include real support conversations, they are strong evidence: quote or faithfully summarize the relevant exchanges (what the customer asked, what was delivered/answered, dates) — especially where they show the customer actively used the product, acknowledged the subscription, or was helped. Never quote anything from a conversation that isn't in the FACTS.
+- If past won disputes are provided, mirror what made them effective (structure, tone, which facts they led with) — but every customer-specific detail in this draft must come from THIS dispute's FACTS.
 - Each field at most 3500 characters.
-
+${exemplarBlock}
 FACTS:
 ${facts}
 
