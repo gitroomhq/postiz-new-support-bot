@@ -514,12 +514,25 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
     // signal, which bypasses the due-check.
     async kbTick(force) {
       heartbeat();
-      if (force) {
-        const r = await kbScheduler.refreshNow();
-        return { refreshed: true, ...r };
+      // Tarball downloads can outlast the 90s heartbeatTimeout — keep the
+      // activity alive while a refresh is in flight.
+      const keepalive = setInterval(() => {
+        try {
+          heartbeat();
+        } catch {
+          /* worker shutting down — the refresh finishes on its own */
+        }
+      }, 30_000);
+      try {
+        if (force) {
+          const r = await kbScheduler.refreshNow();
+          return { refreshed: true, ...r };
+        }
+        await kbScheduler.tick();
+        return { refreshed: false, ok: 0, failed: 0 };
+      } finally {
+        clearInterval(keepalive);
       }
-      await kbScheduler.tick();
-      return { refreshed: false, ok: 0, failed: 0 };
     },
 
     // Scoring loop state: is a submit due, and which Anthropic batches are

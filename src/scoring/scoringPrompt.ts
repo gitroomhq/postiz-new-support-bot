@@ -24,6 +24,7 @@ The user message contains:
    - STAFF — a human support team member. The name is their Discord display name.
    - BOT — the automated support bot (AI first answers, status notices, forms, CSAT prompts).
 3. Optionally staff-only internal notes and the ticket's status-change history.
+4. Precomputed timing metrics: minutes from the customer's opening message to the first substantive STAFF/BOT response, and hours from open to close. When present, use these figures for promptness and wait judgments instead of re-deriving them from timestamps; "unknown" means the metric could not be computed.
 
 Long transcripts may be truncated in the middle; a marker line indicates where content was removed. Judge from what is present and do not penalize anyone for content inside the truncated region.
 
@@ -43,6 +44,8 @@ Calibration anchors:
 - 9-10: Excellent. Fast, precise, warm, complete. The staff anticipated follow-up questions, verified the fix, and the customer's closing messages are clearly satisfied ("that fixed it, thanks so much!"). Reserve 10 for genuinely flawless handling.
 
 If the customer never replied after the first answer, infer from what is available: a correct, complete answer with silence afterwards is typically 6-8; an answer that plainly missed the point followed by silence is 3-5.
+
+Also produce cx_rationale: ONE sentence (max ~200 characters) naming the decisive factors behind your cx_score, citing concrete facts from the transcript (e.g. "Resolved fully and the customer thanked staff, but the first response took two days"). It must explain the score, not restate the number, and it must be consistent with the calibration anchors above.
 
 ## Dimension 2 — customer sentiment (start and end)
 
@@ -177,6 +180,7 @@ export const SCORING_OUTPUT_SCHEMA = {
   additionalProperties: false,
   required: [
     "cx_score",
+    "cx_rationale",
     "customer_sentiment_start",
     "customer_sentiment_end",
     "resolution",
@@ -190,6 +194,7 @@ export const SCORING_OUTPUT_SCHEMA = {
   ],
   properties: {
     cx_score: SCORE_1_TO_10,
+    cx_rationale: { type: "string" },
     customer_sentiment_start: SENTIMENT_ENUM,
     customer_sentiment_end: SENTIMENT_ENUM,
     resolution: { type: "string", enum: ["resolved", "unresolved", "workaround"] },
@@ -228,6 +233,10 @@ const sentiment = z.enum(["very_negative", "negative", "neutral", "positive", "v
 
 export const TicketScoreResult = z.object({
   cx_score: score110,
+  // Default (not required): a batch submitted with the pre-rationale output
+  // schema may still be in flight when this code deploys — its results must
+  // keep parsing instead of failing the whole batch.
+  cx_rationale: z.string().default(""),
   customer_sentiment_start: sentiment,
   customer_sentiment_end: sentiment,
   resolution: z.enum(["resolved", "unresolved", "workaround"]),
@@ -250,10 +259,16 @@ export interface ScoringTicketMeta {
   createdAt: Date;
   closedAt: Date | null;
   csatScore: number | null;
+  // Minutes from the customer's opening message to the first substantive
+  // STAFF/BOT response, precomputed from the transcript (null = unknown).
+  firstResponseMinutes: number | null;
 }
 
 // Volatile per-ticket content — always AFTER the cached system prefix.
 export function renderScoringUserMessage(ticket: ScoringTicketMeta, transcript: string): string {
+  const closeHours = ticket.closedAt
+    ? Math.round(((ticket.closedAt.getTime() - ticket.createdAt.getTime()) / (60 * 60 * 1000)) * 10) / 10
+    : null;
   const lines = [
     "Evaluate this closed support ticket.",
     "",
@@ -261,6 +276,8 @@ export function renderScoringUserMessage(ticket: ScoringTicketMeta, transcript: 
     `Opened: ${ticket.createdAt.toISOString()}`,
     `Closed: ${ticket.closedAt ? ticket.closedAt.toISOString() : "unknown"}`,
     `Customer CSAT rating: ${ticket.csatScore != null ? `${ticket.csatScore}/5` : "not given"}`,
+    `Time to first response: ${ticket.firstResponseMinutes != null ? `${ticket.firstResponseMinutes} minutes` : "unknown"}`,
+    `Time from open to close: ${closeHours != null && closeHours >= 0 ? `${closeHours} hours` : "unknown"}`,
     "",
     "Transcript:",
     transcript,

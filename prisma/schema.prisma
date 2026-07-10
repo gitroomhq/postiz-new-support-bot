@@ -256,6 +256,7 @@ model TicketScore {
   batchId          String?   // Anthropic msgbatch_… holding/produced this score
   model            String?
   cxScore          Int?      // 1-10 predicted customer-experience score
+  cxRationale      String?   // one-sentence model justification for cxScore
   sentimentStart   String?   // very_negative | negative | neutral | positive | very_positive
   sentimentEnd     String?
   agentTone        Int?      // 1-10, staff overall

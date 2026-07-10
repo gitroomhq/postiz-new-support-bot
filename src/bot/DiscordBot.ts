@@ -2468,6 +2468,34 @@ export class DiscordBot {
       return;
     }
     if (!score || score.status === "PENDING") {
+      // Queued in a submitted Anthropic batch → say so instead of the generic
+      // "not yet". Gated on ticket.closed: only closed tickets are batched,
+      // and reopening deletes the score row, so an open ticket with a PENDING
+      // row is a transient reopen race — "still open" is the truthful answer.
+      if (score?.status === "PENDING" && ticket.closed && score.batchId?.startsWith("msgbatch_")) {
+        const batch = await this.analytics.scoreStore.getBatch(score.batchId).catch(() => null);
+        if (batch?.status === "SUBMITTED") {
+          await interaction.editReply({
+            embeds: [
+              makeEmbed(
+                `<#${threadId}> is queued in scoring batch \`${batch.anthropicBatchId}\` (submitted <t:${Math.floor(batch.submittedAt.getTime() / 1000)}:R>) — awaiting results from Anthropic.`,
+                COLORS.brand
+              ),
+            ],
+          });
+          return;
+        }
+        // Batch already ended/failed (poll lag records the result within about
+        // a minute) or its row is missing — the generic message below covers it.
+      }
+      if (score?.status === "PENDING" && score.batchId === "manual") {
+        await interaction.editReply({
+          embeds: [
+            makeEmbed(`<#${threadId}> is being scored directly right now ("Score one now") — check back shortly.`, COLORS.brand),
+          ],
+        });
+        return;
+      }
       const state = !ticket.closed
         ? "The ticket is still open — scoring runs after close."
         : this.settingsStore.scoringEnabled()
@@ -2512,6 +2540,7 @@ export class DiscordBot {
           inline: true,
         },
         ...(score.rootCause ? [{ name: "Root cause", value: score.rootCause.slice(0, 1024) }] : []),
+        ...(score.cxRationale ? [{ name: "CX rationale", value: score.cxRationale.slice(0, 1024) }] : []),
         ...(staff.length > 0
           ? [
               {
@@ -3364,9 +3393,22 @@ export class DiscordBot {
                 ? `${sentryActive() ? "on" : "configured ⚠️ restart pending"} · traces ${s.sentryTracesSampleRate()} · logs ${s.sentryLogsEnabled() ? "on" : "off"}`
                 : "off"
             }`,
-            `InfluxDB: ${influxActive() ? `on → \`${s.influxBucket()}\`` : s.influxEnabled() ? "enabled ⚠️ incomplete config" : "off"} · Scoring: ${
-              s.scoringEnabled() ? `every ${s.scoringIntervalHours()}h, \`${s.scoringModel()}\`` : "off"
-            }`,
+          ].join("\n"),
+          inline: false,
+        },
+        {
+          name: "AI & Analytics",
+          value: [
+            `Model: \`${s.aiModel()}\` · light \`${s.aiModelLight()}\``,
+            `KB refresh: ${s.kbRefreshEnabled() ? `every ${s.kbRefreshIntervalHours()}h` : "off"}${s.kbLastRefreshAt() ? ` · last <t:${Math.floor(s.kbLastRefreshAt()!.getTime() / 1000)}:R>` : ""}`,
+            `Scoring: ${s.scoringEnabled() ? `every ${s.scoringIntervalHours()}h, \`${s.scoringModel()}\`` : "off"}`,
+            `InfluxDB: ${influxActive() ? `on → \`${s.influxBucket()}\`` : s.influxEnabled() ? "enabled ⚠️ incomplete config" : "off"}`,
+          ].join("\n"),
+          inline: false,
+        },
+        {
+          name: "Infrastructure",
+          value: [
             `Vault: ${this.vaultStatusLine()}`,
             `Temporal: ${
               s.temporalEnabled()
@@ -3379,36 +3421,32 @@ export class DiscordBot {
             }`,
           ].join("\n"),
           inline: false,
-        },
-        {
-          name: "AI & Knowledge",
-          value: [
-            `Model: \`${s.aiModel()}\` · light \`${s.aiModelLight()}\``,
-            `KB refresh: ${s.kbRefreshEnabled() ? `every ${s.kbRefreshIntervalHours()}h` : "off"}${s.kbLastRefreshAt() ? ` · last <t:${Math.floor(s.kbLastRefreshAt()!.getTime() / 1000)}:R>` : ""}`,
-          ].join("\n"),
-          inline: false,
         }
       );
 
-    // One nav button per embed section; Workflow and Reporting & Audit open sub-menus.
-    const nav = [
+    // Button rows mirror the embed field order: core sections, Integrations,
+    // AI & Analytics, then Infrastructure sharing a row with the utilities
+    // (Secondary style keeps the two groups visually distinct).
+    const core = [
       new ButtonBuilder().setCustomId("config_general").setLabel("General Settings").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("config_workflow").setLabel("Workflow").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("config_reporting").setLabel("Reporting & Audit").setStyle(ButtonStyle.Primary),
+    ];
+    const integrations = [
       new ButtonBuilder().setCustomId("config_intercom").setLabel("Intercom").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("config_sentry").setLabel("Sentry").setStyle(ButtonStyle.Primary),
     ];
-    const actions = [
+    const aiAnalytics = [
       new ButtonBuilder().setCustomId("config_ai").setLabel("AI & Knowledge").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("config_analytics").setLabel("Analytics").setStyle(ButtonStyle.Primary),
+    ];
+    const infraUtility = [
       new ButtonBuilder().setCustomId("config_vault").setLabel("Vault").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("config_temporal").setLabel("Temporal").setStyle(ButtonStyle.Primary),
-    ];
-    const utility = [
       new ButtonBuilder().setCustomId("config_reverify").setLabel("Re-Verify").setStyle(ButtonStyle.Secondary),
     ];
     if (!s.backfillDone()) {
-      utility.push(
+      infraUtility.push(
         new ButtonBuilder().setCustomId("config_backfill").setLabel("Backfill existing tickets").setStyle(ButtonStyle.Secondary)
       );
     }
@@ -3416,9 +3454,10 @@ export class DiscordBot {
     return {
       embeds: [embed],
       components: [
-        new ActionRowBuilder<ButtonBuilder>().addComponents(nav),
-        new ActionRowBuilder<ButtonBuilder>().addComponents(actions),
-        new ActionRowBuilder<ButtonBuilder>().addComponents(utility),
+        new ActionRowBuilder<ButtonBuilder>().addComponents(core),
+        new ActionRowBuilder<ButtonBuilder>().addComponents(integrations),
+        new ActionRowBuilder<ButtonBuilder>().addComponents(aiAnalytics),
+        new ActionRowBuilder<ButtonBuilder>().addComponents(infraUtility),
       ],
     };
   }
@@ -3896,7 +3935,8 @@ export class DiscordBot {
         .setLabel(`Scoring: ${s.scoringEnabled() ? "on" : "off"}`)
         .setStyle(s.scoringEnabled() ? ButtonStyle.Success : ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId("config_analytics_scoring_opts").setLabel("Scoring Options").setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId("config_analytics_score_one").setLabel("Score one now").setStyle(ButtonStyle.Secondary)
+      new ButtonBuilder().setCustomId("config_analytics_score_one").setLabel("Score one now").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("config_analytics_batch").setLabel("View Current Batch").setStyle(ButtonStyle.Secondary)
     );
 
     const backfillRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
@@ -3916,7 +3956,72 @@ export class DiscordBot {
     return { embeds: [embed], components: [influxRow, scoringRow, backfillRow] };
   }
 
-  // One-line Vault state for the main config panel's Integrations field.
+  // /config → Analytics → View Current Batch: read-only snapshot of the
+  // in-flight Anthropic scoring batch and the tickets awaiting results.
+  private async buildScoringBatchPanel() {
+    const controls = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId("config_analytics_batch").setLabel("Refresh").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("config_analytics").setLabel("Back").setStyle(ButtonStyle.Secondary)
+    );
+    const batches = this.analytics ? await this.analytics.scoreStore.pendingBatches().catch(() => []) : [];
+    const batch = batches[0];
+    if (!batch) {
+      const embed = new EmbedBuilder()
+        .setTitle("Current Scoring Batch")
+        .setColor(0x5865f2)
+        .setDescription(
+          "No scoring batch is in flight. Batches are submitted on the scoring interval (or by a backfill drain) and usually return within ~1h."
+        );
+      return { embeds: [embed], components: [controls] };
+    }
+
+    const threadIds = await this.analytics!.scoreStore.ticketsInBatch(batch.anthropicBatchId).catch(() => [] as string[]);
+    const submitted = Math.floor(batch.submittedAt.getTime() / 1000);
+    // Mirrors BATCH_DEADLINE_MS in src/temporal/workflows/loopers.workflow.ts —
+    // not imported, workflow modules must not leak into the bot bundle.
+    const deadline = Math.floor((batch.submittedAt.getTime() + 26 * 60 * 60 * 1000) / 1000);
+    const embed = new EmbedBuilder()
+      .setTitle("Current Scoring Batch")
+      .setColor(0x5865f2)
+      .setDescription(
+        [
+          `**Batch:** \`${batch.anthropicBatchId}\``,
+          `**Purpose:** ${batch.purpose} · **Model:** \`${batch.model}\``,
+          `**Submitted:** <t:${submitted}:R> · **Hard deadline:** <t:${deadline}:R>`,
+          `**Requests:** ${batch.requestCount} · **Still pending:** ${threadIds.length}`,
+          ...(batches.length > 1 ? [`${batches.length - 1} more submitted batch(es) queued behind this one.`] : []),
+          "",
+          "Results are polled every minute; Anthropic typically finishes within ~1h.",
+        ].join("\n")
+      );
+
+    // Up to 60 mentions across 3 fields of 20 (~25 chars each, well under the
+    // 1024-char field cap). No pagination: interval batches are small, only
+    // backfill batches approach 200, and a batch resolves within ~1h. If a
+    // full listing is ever needed, page statelessly via
+    // config_analytics_batch_page:<n> re-querying per click.
+    const SHOW_MAX = 60;
+    const PER_FIELD = 20;
+    const shown = Math.min(threadIds.length, SHOW_MAX);
+    for (let i = 0; i < shown; i += PER_FIELD) {
+      embed.addFields({
+        name: i === 0 ? `Tickets (${shown} of ${threadIds.length} shown)` : "​",
+        value: threadIds
+          .slice(i, i + PER_FIELD)
+          .map((id) => `<#${id}>`)
+          .join(" "),
+      });
+    }
+    if (threadIds.length > SHOW_MAX) {
+      embed.addFields({ name: "​", value: `…and ${threadIds.length - SHOW_MAX} more awaiting results in this batch.` });
+    }
+    if (threadIds.length === 0) {
+      embed.addFields({ name: "Tickets", value: "_All rows already resolved — the batch is about to close._" });
+    }
+    return { embeds: [embed], components: [controls] };
+  }
+
+  // One-line Vault state for the main config panel's Infrastructure field.
   private vaultStatusLine(): string {
     const s = this.settingsStore;
     const service = this.vault?.service;
@@ -5679,6 +5784,11 @@ export class DiscordBot {
 
     if (id === "config_analytics") {
       await interaction.update(await this.buildAnalyticsPanel());
+      return;
+    }
+
+    if (id === "config_analytics_batch") {
+      await interaction.update(await this.buildScoringBatchPanel());
       return;
     }
 

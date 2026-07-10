@@ -74,9 +74,10 @@ const EXPECTED_COLUMNS: Record<string, string[]> = {
     "id", "ticketThreadId", "subcommand", "input", "result", "invokerId", "invokerName", "model", "createdAt",
   ],
   ticket_scores: [
-    "id", "ticketThreadId", "status", "attempts", "batchId", "model", "cxScore", "sentimentStart", "sentimentEnd",
-    "agentTone", "agentClarity", "agentCorrectness", "resolution", "fcr", "escalationNeeded", "topic", "rootCause",
-    "summary", "staffScores", "staffNames", "inputTokens", "outputTokens", "costUsd", "error", "scoredAt", "createdAt",
+    "id", "ticketThreadId", "status", "attempts", "batchId", "model", "cxScore", "cxRationale", "sentimentStart",
+    "sentimentEnd", "agentTone", "agentClarity", "agentCorrectness", "resolution", "fcr", "escalationNeeded", "topic",
+    "rootCause", "summary", "staffScores", "staffNames", "inputTokens", "outputTokens", "costUsd", "error", "scoredAt",
+    "createdAt",
   ],
   scoring_batches: [
     "id", "anthropicBatchId", "status", "purpose", "model", "requestCount", "succeededCount", "erroredCount",

@@ -122,6 +122,7 @@ export class TicketScoreStore {
         status: "SCORED",
         attempts: { increment: 1 },
         cxScore: parsed.cx_score,
+        cxRationale: parsed.cx_rationale || null,
         sentimentStart: parsed.customer_sentiment_start,
         sentimentEnd: parsed.customer_sentiment_end,
         agentTone: parsed.agent_overall.tone,
@@ -176,6 +177,21 @@ export class TicketScoreStore {
 
   async pendingBatches(): Promise<ScoringBatch[]> {
     return this.prisma.scoringBatch.findMany({ where: { status: "SUBMITTED" }, orderBy: { submittedAt: "asc" } });
+  }
+
+  async getBatch(anthropicBatchId: string): Promise<ScoringBatch | null> {
+    return this.prisma.scoringBatch.findUnique({ where: { anthropicBatchId } });
+  }
+
+  // Thread ids still awaiting results in a batch. PENDING-only: SCORED/FAILED
+  // rows keep their batchId for provenance, so status is the in-flight filter.
+  async ticketsInBatch(batchId: string): Promise<string[]> {
+    const rows = await this.prisma.ticketScore.findMany({
+      where: { batchId, status: "PENDING" },
+      select: { ticketThreadId: true },
+      orderBy: [{ createdAt: "asc" }, { ticketThreadId: "asc" }],
+    });
+    return rows.map((r) => r.ticketThreadId);
   }
 
   async closeBatch(

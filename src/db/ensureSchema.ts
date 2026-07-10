@@ -416,6 +416,7 @@ const STATEMENTS: string[] = [
     "batchId" TEXT,
     "model" TEXT,
     "cxScore" INTEGER,
+    "cxRationale" TEXT,
     "sentimentStart" TEXT,
     "sentimentEnd" TEXT,
     "agentTone" INTEGER,
@@ -441,6 +442,8 @@ const STATEMENTS: string[] = [
   `CREATE INDEX IF NOT EXISTS "ticket_scores_status_idx" ON "ticket_scores"("status")`,
   // Transcript staff-name snapshot used to validate the model's staff[] names.
   `ALTER TABLE "ticket_scores" ADD COLUMN IF NOT EXISTS "staffNames" JSONB`,
+  // One-sentence model justification for cxScore (shown by /ai score).
+  `ALTER TABLE "ticket_scores" ADD COLUMN IF NOT EXISTS "cxRationale" TEXT`,
   // Submitted Anthropic Message Batches — persisted so polling survives restarts.
   `CREATE TABLE IF NOT EXISTS "scoring_batches" (
     "id" TEXT NOT NULL,

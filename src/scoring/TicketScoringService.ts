@@ -108,7 +108,7 @@ export class TicketScoringService {
   // the allowlist the model's staff[] output is reconciled against later.
   private async fetchTranscript(
     ticket: Ticket
-  ): Promise<{ text: string; customerMessages: number; staffNames: string[] } | null> {
+  ): Promise<{ text: string; customerMessages: number; staffNames: string[]; firstResponseMinutes: number | null } | null> {
     if (!this.client) throw new Error("Discord client not bound yet");
     const channel = await this.client.channels.fetch(ticket.threadId).catch(() => null);
     if (!channel || !channel.isThread()) return null;
@@ -148,6 +148,21 @@ export class TicketScoringService {
     // the bot), so count it as a customer message for the trivial-ticket check.
     if (ticket.question?.trim()) customerMessages++;
 
+    // Timing metric for the scoring prompt: minutes from the customer's opening
+    // (the modal question at createdAt, else their first thread message) to the
+    // first STAFF/BOT message after it. Content-less messages were skipped
+    // above, so whatever remains counts as substantive.
+    const firstCustomerTs = ticket.question?.trim()
+      ? ticket.createdAt.getTime()
+      : (collected.find((m) => m.role === "CUSTOMER")?.ts.getTime() ?? null);
+    let firstResponseMinutes: number | null = null;
+    if (firstCustomerTs != null) {
+      const firstResponse = collected.find((m) => m.role !== "CUSTOMER" && m.ts.getTime() >= firstCustomerTs);
+      if (firstResponse) {
+        firstResponseMinutes = Math.max(0, Math.round((firstResponse.ts.getTime() - firstCustomerTs) / 60_000));
+      }
+    }
+
     const lines: string[] = [];
     if (ticket.question?.trim()) {
       lines.push(`[${ticket.createdAt.toISOString()}] CUSTOMER (${ticket.customerDisplayName ?? "customer"}): ${ticket.question.trim()}`);
@@ -163,7 +178,7 @@ export class TicketScoringService {
         "\n[... transcript truncated: middle portion removed ...]\n" +
         text.slice(text.length - tail);
     }
-    return { text, customerMessages, staffNames: [...staffNames] };
+    return { text, customerMessages, staffNames: [...staffNames], firstResponseMinutes };
   }
 
   // Snap the model's staff[] names to the transcript's real display names and
@@ -190,10 +205,12 @@ export class TicketScoringService {
     parsed.staff = staff;
   }
 
-  private buildRequestParams(ticket: Ticket, transcript: string): Anthropic.Messages.MessageCreateParamsNonStreaming {
+  // Prompt-shaping fields shared byte-for-byte by every scoring request AND
+  // the cache-warmup call — the cache key covers this prefix, so building both
+  // from one place keeps them identical by construction.
+  private sharedParams(): Pick<Anthropic.Messages.MessageCreateParamsNonStreaming, "model" | "system" | "output_config"> {
     return {
       model: this.settings.scoringModel(),
-      max_tokens: 2_000,
       // Stable cached prefix first (>4096 tokens — Haiku's cache minimum);
       // the volatile ticket content lives in the user message after it.
       system: [
@@ -205,6 +222,16 @@ export class TicketScoringService {
           schema: SCORING_OUTPUT_SCHEMA as unknown as Record<string, unknown>,
         },
       },
+    };
+  }
+
+  private buildRequestParams(
+    ticket: Ticket,
+    transcript: { text: string; firstResponseMinutes: number | null }
+  ): Anthropic.Messages.MessageCreateParamsNonStreaming {
+    return {
+      ...this.sharedParams(),
+      max_tokens: 2_000,
       messages: [
         {
           role: "user",
@@ -215,12 +242,92 @@ export class TicketScoringService {
               createdAt: ticket.createdAt,
               closedAt: ticket.closedAt,
               csatScore: ticket.csatScore,
+              firstResponseMinutes: transcript.firstResponseMinutes,
             },
-            transcript
+            transcript.text
           ),
         },
       ],
     };
+  }
+
+  // ---- Prompt-cache warmup ----
+
+  // One-shot (per process) sanity check that the rubric still exceeds the
+  // model's minimum cacheable prefix — below it, caching silently never
+  // engages (countTokens is free).
+  private promptSizeChecked = false;
+
+  private async assertPromptCacheable(): Promise<void> {
+    if (this.promptSizeChecked) return;
+    this.promptSizeChecked = true;
+    try {
+      const { model, system } = this.sharedParams();
+      const count = await this.anthropic.messages.countTokens({
+        model,
+        system,
+        messages: [{ role: "user", content: "x" }],
+      });
+      if (count.input_tokens < 4096) {
+        scoreLog.warn("scoring.prompt_below_cache_minimum", { "scoring.prompt_tokens": count.input_tokens });
+      } else {
+        scoreLog.info("scoring.prompt_tokens", { "scoring.prompt_tokens": count.input_tokens });
+      }
+    } catch {
+      this.promptSizeChecked = false; // transient — try again next batch
+    }
+  }
+
+  // Anthropic processes batch entries concurrently, so a cold batch can race
+  // every request past the first cache write — all pay cache_creation, none
+  // read. One regular Messages call with the identical prefix right before
+  // submission writes the cache entry so the batch can hit it. Never blocks
+  // submission: worst case is the old cold-batch behavior.
+  private async warmScoringCache(requestCount: number): Promise<void> {
+    if (requestCount <= 1) return; // a single request has nothing to share with
+    await this.assertPromptCacheable();
+    try {
+      const model = this.settings.scoringModel();
+      const response = await this.anthropic.messages.create(
+        {
+          ...this.sharedParams(),
+          // max_tokens: 0 is rejected alongside output_config, and dropping
+          // output_config would change the cached prefix — 1 throwaway token.
+          max_tokens: 1,
+          messages: [{ role: "user", content: "cache warmup" }],
+        },
+        { timeout: 30_000, maxRetries: 1 }
+      );
+      const usage: ResultUsage = {
+        inputTokens: response.usage.input_tokens ?? 0,
+        outputTokens: response.usage.output_tokens ?? 0,
+        cacheReadTokens: response.usage.cache_read_input_tokens ?? 0,
+        cacheCreationTokens: response.usage.cache_creation_input_tokens ?? 0,
+      };
+      scoreLog.info("scoring.cache_warmup", {
+        "scoring.cache_creation_tokens": usage.cacheCreationTokens,
+        "scoring.cache_read_tokens": usage.cacheReadTokens,
+      });
+      // Full-price call → 2x the batch rate, recorded immediately so the daily
+      // budget guard (ai_runs, kind ticket_scoring) counts it — the batch's own
+      // aggregate row only lands when (if) the batch ends.
+      const runRecord = {
+        agentName: "ticket-scoring",
+        kind: "ticket_scoring",
+        source: "api",
+        model,
+        outcome: "cache_warmup",
+        inputTokens: usage.inputTokens,
+        outputTokens: usage.outputTokens,
+        cacheReadTokens: usage.cacheReadTokens,
+        cacheCreationTokens: usage.cacheCreationTokens,
+        costUsd: batchCostUsd(model, usage) * 2,
+      };
+      await this.aiRunStore.record(runRecord).catch(() => undefined);
+      exportAiRun(runRecord);
+    } catch (err) {
+      scoreLog.warn("scoring.cache_warmup_failed", { "error": String(err) });
+    }
   }
 
   // ---- Budget guardrail ----
@@ -275,7 +382,7 @@ export class TicketScoringService {
           continue;
         }
         staffNamesByThread.set(ticket.threadId, transcript.staffNames);
-        requests.push({ custom_id: ticket.threadId, params: this.buildRequestParams(ticket, transcript.text) });
+        requests.push({ custom_id: ticket.threadId, params: this.buildRequestParams(ticket, transcript) });
       } catch (err) {
         scoreLog.warn("scoring.transcript_failed", {
           "ticket.thread_id": ticket.threadId,
@@ -291,6 +398,7 @@ export class TicketScoringService {
       return { submitted: 0, skipped, drained: false, budgetBlocked: false, batchId: null };
     }
 
+    await this.warmScoringCache(requests.length);
     const batch = await this.anthropic.messages.batches.create({ requests });
     await this.scoreStore.createBatch({
       anthropicBatchId: batch.id,
@@ -465,12 +573,26 @@ export class TicketScoringService {
       "scoring.expired": expired,
       "scoring.cost_usd": costUsd,
       "scoring.cache_read_tokens": totals.cacheReadTokens,
+      "scoring.cache_creation_tokens": totals.cacheCreationTokens,
     });
     metricCount("scoring.tickets_scored", succeeded);
-    if (totals.cacheReadTokens === 0 && succeeded > 1) {
-      // The shared rubric should cache across a batch — zero reads means the
-      // prefix fell below the model's minimum or was byte-unstable.
-      scoreLog.warn("scoring.cache_never_hit", { "scoring.batch_id": anthropicBatchId });
+    if (succeeded > 1 && totals.cacheReadTokens === 0) {
+      if (totals.cacheCreationTokens > 0) {
+        // Every request wrote the prefix instead of reading it — concurrency
+        // misses; the pre-submit warmup should make this rare.
+        scoreLog.info("scoring.cache_never_hit", {
+          "scoring.batch_id": anthropicBatchId,
+          "scoring.cache_creation_tokens": totals.cacheCreationTokens,
+          "scoring.succeeded": succeeded,
+        });
+      } else {
+        // Nothing was even written: the prefix fell below the model's minimum
+        // cacheable size or caching is silently off.
+        scoreLog.warn("scoring.cache_never_written", {
+          "scoring.batch_id": anthropicBatchId,
+          "scoring.succeeded": succeeded,
+        });
+      }
     }
   }
 
@@ -492,7 +614,7 @@ export class TicketScoringService {
     if (!transcript) throw new Error("Thread no longer exists on Discord.");
 
     const model = this.settings.scoringModel();
-    const response = await this.anthropic.messages.create(this.buildRequestParams(ticket, transcript.text));
+    const response = await this.anthropic.messages.create(this.buildRequestParams(ticket, transcript));
     const text = response.content
       .filter((b): b is Anthropic.Messages.TextBlock => b.type === "text")
       .map((b) => b.text)
