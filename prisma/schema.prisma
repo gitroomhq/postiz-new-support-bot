@@ -163,6 +163,15 @@ model BotSettings {
   // One-time historical backfill flag: while true the scheduler keeps submitting
   // oldest-first batches (one in flight) until no unscored closed tickets remain.
   scoringBackfillPending    Boolean   @default(false)
+  // Evaluation escalation: tickets the scoring model flags as beyond its reliable
+  // evaluation are re-scored by a stronger model in a daily batch (~12x cost per
+  // ticket — off by default; also inert while scoringEnabled is off). Model is
+  // free-text but must be a real model id (the scoring path resolves no aliases).
+  scoringEscalationEnabled            Boolean   @default(false)
+  scoringEscalationModel              String    @default("claude-sonnet-4-6")
+  scoringEscalationIntervalHours      Int       @default(24)
+  scoringEscalationMaxTicketsPerBatch Int       @default(25)
+  scoringEscalationLastRunAt          DateTime?
   // HashiCorp Vault connection (edited via /config → Vault; no .env on deploy).
   // vaultToken is encrypted at rest with the LOCAL crypto.ts key — it is the
   // bootstrap credential, Vault can't wrap its own token. vaultMigratedAt is the
@@ -251,7 +260,7 @@ model TicketAiRun {
 model TicketScore {
   id               String    @id @default(cuid())
   ticketThreadId   String    @unique
-  status           String    @default("PENDING") // PENDING | SCORED | FAILED | SKIPPED
+  status           String    @default("PENDING") // PENDING | SCORED | FAILED | SKIPPED | ESCALATED (awaiting escalated re-score)
   attempts         Int       @default(0)
   batchId          String?   // Anthropic msgbatch_… holding/produced this score
   model            String?
@@ -270,6 +279,15 @@ model TicketScore {
   summary          String?
   staffScores      Json?     // [{ name, tone, clarity, correctness }]
   staffNames       Json?     // string[]: STAFF display names seen in the transcript at submit time — the allowlist the model's staff[] output is reconciled against (null on rows from before this column existed)
+  // Evaluation escalation: escalated=true from the moment the scoring model's
+  // eval_escalation flag is honored, kept through the re-score as provenance
+  // (a SCORED row with escalated=true was scored by the escalation model).
+  escalated        Boolean   @default(false)
+  escalationReason String?   // the flagging model's one-sentence eval_escalation_reason
+  // Complexity snapshot taken at submit time (transcriptChars is pre-truncation) —
+  // the objective veto that gates the model's escalation flag at result time.
+  customerMessages Int?
+  transcriptChars  Int?
   inputTokens      Int?
   outputTokens     Int?
   costUsd          Float?
@@ -287,12 +305,13 @@ model ScoringBatch {
   id               String    @id @default(cuid())
   anthropicBatchId String    @unique
   status           String    @default("SUBMITTED") // SUBMITTED | ENDED | FAILED
-  purpose          String    // "interval" | "backfill" | (manual smoke tests bypass batches)
+  purpose          String    // "interval" | "backfill" | "escalation" | (manual smoke tests bypass batches)
   model            String
   requestCount     Int
   succeededCount   Int       @default(0)
   erroredCount     Int       @default(0)
   expiredCount     Int       @default(0)
+  escalatedCount   Int       @default(0) // results whose eval_escalation flag was honored
   costUsd          Float?
   submittedAt      DateTime  @default(now())
   endedAt          DateTime?

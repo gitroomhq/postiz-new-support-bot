@@ -189,6 +189,8 @@ test("workflow suite (time-skipping)", { skip: !ENABLED && "set TEMPORAL_TEST=1 
     pendingBatchIds: [],
     due: false,
     backfill: false,
+    escalationDue: false,
+    escalationPendingCount: 0,
     ...over,
   });
 
@@ -308,6 +310,65 @@ test("workflow suite (time-skipping)", { skip: !ENABLED && "set TEMPORAL_TEST=1 
       await handle.signal("scoringRunNow");
       await env.sleep("3 minutes");
       assert.equal(submits, 1, "the run-now signal must force a submit");
+      await handle.terminate("test done");
+    });
+  });
+
+  await t.test("escalation submits when due but a due regular batch wins the shared tick", async () => {
+    const submits: string[] = [];
+    let getStates = 0;
+    const activities: AnyRecord = {
+      scoringGetState: async () => {
+        getStates++;
+        // Tick 1: regular AND escalation both due — regular must win; the
+        // still-due escalation submits on the next tick.
+        return scoringState({ due: getStates === 1, escalationDue: true, escalationPendingCount: 3 });
+      },
+      scoringSubmit: async (purpose: string) => {
+        submits.push(purpose);
+        return { batchId: null, submitted: 1, skipped: 0, drained: false, budgetBlocked: false };
+      },
+      scoringPollBatch: async () => ({ status: "processed", processingStatus: "ended" }),
+      scoringExpireBatch: async () => {},
+    };
+    const worker = await makeWorker(activities);
+    await worker.runUntil(async () => {
+      const handle = await env.client.workflow.start("scoringLoopWorkflow", {
+        taskQueue,
+        workflowId: "scoring-loop-t5",
+      });
+      await env.sleep("3 minutes");
+      assert.deepEqual(
+        submits.slice(0, 2),
+        ["interval", "escalation"],
+        `regular batch wins the shared tick, escalation follows (saw ${submits.join(",")})`
+      );
+      await handle.terminate("test done");
+    });
+  });
+
+  await t.test("scoringEscalationRunNow forces an escalation submit even when not due", async () => {
+    const submits: string[] = [];
+    const activities: AnyRecord = {
+      scoringGetState: async () => scoringState(),
+      scoringSubmit: async (purpose: string) => {
+        submits.push(purpose);
+        return { batchId: null, submitted: 0, skipped: 0, drained: true, budgetBlocked: false };
+      },
+      scoringPollBatch: async () => ({ status: "processed", processingStatus: "ended" }),
+      scoringExpireBatch: async () => {},
+    };
+    const worker = await makeWorker(activities);
+    await worker.runUntil(async () => {
+      const handle = await env.client.workflow.start("scoringLoopWorkflow", {
+        taskQueue,
+        workflowId: "scoring-loop-t6",
+      });
+      await env.sleep("3 minutes");
+      assert.equal(submits.length, 0, "nothing due, no signal → no submit");
+      await handle.signal("scoringEscalationRunNow");
+      await env.sleep("3 minutes");
+      assert.deepEqual(submits, ["escalation"], "the escalation run-now signal must force an escalation submit");
       await handle.terminate("test done");
     });
   });

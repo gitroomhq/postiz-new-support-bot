@@ -548,23 +548,40 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
         : [];
       const lastRun = settingsStore.scoringLastRunAt();
       const intervalMs = Math.max(1, settingsStore.scoringIntervalHours()) * 60 * 60 * 1000;
+      // Escalation rides the same loop: due only while enabled (scoring is the
+      // master gate), the daily interval elapsed AND the queue is non-empty.
+      const escEnabled = enabled && settingsStore.scoringEscalationEnabled();
+      const escalationPendingCount = escEnabled
+        ? await scoringService.escalationQueueCount().catch(() => 0)
+        : 0;
+      const lastEscRun = settingsStore.scoringEscalationLastRunAt();
+      const escIntervalMs = Math.max(1, settingsStore.scoringEscalationIntervalHours()) * 60 * 60 * 1000;
       return {
         enabled,
         pendingBatchIds: pending.map((p) => p.anthropicBatchId),
         due: !lastRun || Date.now() - lastRun.getTime() >= intervalMs,
         backfill: settingsStore.scoringBackfillPending(),
+        escalationDue:
+          escEnabled &&
+          escalationPendingCount > 0 &&
+          (!lastEscRun || Date.now() - lastEscRun.getTime() >= escIntervalMs),
+        escalationPendingCount,
       };
     },
 
     // Submit one batch (transcript gathering + Anthropic create) and keep the
-    // legacy bookkeeping: recordScoringRun on any work, clear the backfill
+    // legacy bookkeeping: record the run stamp on any work, clear the backfill
     // flag when the last unscored ticket drained.
     async scoringSubmit(purpose) {
       heartbeat();
       const result = await scoringService.submitBatch(purpose);
       if (!result.budgetBlocked) {
         if (result.submitted > 0 || result.skipped > 0) {
-          await settingsStore.recordScoringRun();
+          if (purpose === "escalation") {
+            await settingsStore.recordScoringEscalationRun();
+          } else {
+            await settingsStore.recordScoringRun();
+          }
         }
         if (purpose === "backfill" && result.drained) {
           await settingsStore.setScoringBackfillPending(false);
@@ -631,8 +648,10 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
     },
 
     async scoreOneNow(threadId) {
+      // ScoreOneOutcome — carried as an opaque JSON string through the
+      // workflow; the /config modal handler branches on `escalated`.
       const result = await scoringService.scoreOneNow(threadId);
-      return typeof result === "string" ? result : JSON.stringify(result);
+      return JSON.stringify(result);
     },
 
     // ================= AI =================

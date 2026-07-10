@@ -36,6 +36,8 @@ const EXPECTED_COLUMNS: Record<string, string[]> = {
     "influxEnabled", "influxUrl", "influxOrg", "influxBucket", "influxToken",
     "scoringEnabled", "scoringIntervalHours", "scoringModel", "scoringMaxTicketsPerBatch",
     "scoringMaxBudgetUsdPerDay", "scoringLastRunAt", "scoringBackfillPending",
+    "scoringEscalationEnabled", "scoringEscalationModel", "scoringEscalationIntervalHours",
+    "scoringEscalationMaxTicketsPerBatch", "scoringEscalationLastRunAt",
     "vaultEnabled", "vaultAddr", "vaultToken", "vaultKvMount", "vaultKvBasePath",
     "vaultTransitMount", "vaultTransitKey", "vaultMigratedAt",
     "temporalEnabled", "temporalAddress", "temporalNamespace", "temporalTaskQueue",
@@ -76,12 +78,12 @@ const EXPECTED_COLUMNS: Record<string, string[]> = {
   ticket_scores: [
     "id", "ticketThreadId", "status", "attempts", "batchId", "model", "cxScore", "cxRationale", "sentimentStart",
     "sentimentEnd", "agentTone", "agentClarity", "agentCorrectness", "resolution", "fcr", "escalationNeeded", "topic",
-    "rootCause", "summary", "staffScores", "staffNames", "inputTokens", "outputTokens", "costUsd", "error", "scoredAt",
-    "createdAt",
+    "rootCause", "summary", "staffScores", "staffNames", "escalated", "escalationReason", "customerMessages",
+    "transcriptChars", "inputTokens", "outputTokens", "costUsd", "error", "scoredAt", "createdAt",
   ],
   scoring_batches: [
     "id", "anthropicBatchId", "status", "purpose", "model", "requestCount", "succeededCount", "erroredCount",
-    "expiredCount", "costUsd", "submittedAt", "endedAt",
+    "expiredCount", "escalatedCount", "costUsd", "submittedAt", "endedAt",
   ],
 };
 

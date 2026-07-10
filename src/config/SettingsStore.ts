@@ -755,6 +755,29 @@ export class SettingsStore {
     return this.settings.scoringBackfillPending;
   }
 
+  // ---- Evaluation escalation (daily re-score of flagged tickets, ~12x/ticket) ----
+
+  scoringEscalationEnabled(): boolean {
+    return this.settings.scoringEscalationEnabled;
+  }
+
+  // Free-text like scoringModel; must be a real model id (no alias resolution).
+  scoringEscalationModel(): string {
+    return this.settings.scoringEscalationModel;
+  }
+
+  scoringEscalationIntervalHours(): number {
+    return this.settings.scoringEscalationIntervalHours;
+  }
+
+  scoringEscalationMaxTicketsPerBatch(): number {
+    return this.settings.scoringEscalationMaxTicketsPerBatch;
+  }
+
+  scoringEscalationLastRunAt(): Date | null {
+    return this.settings.scoringEscalationLastRunAt;
+  }
+
   // The Influx token is encrypted at rest; pass a field as undefined to leave it
   // unchanged, null/"" to clear it.
   async updateAnalytics(data: {
@@ -769,6 +792,10 @@ export class SettingsStore {
     scoringMaxTicketsPerBatch?: number;
     scoringMaxBudgetUsdPerDay?: number;
     scoringBackfillPending?: boolean;
+    scoringEscalationEnabled?: boolean;
+    scoringEscalationModel?: string;
+    scoringEscalationIntervalHours?: number;
+    scoringEscalationMaxTicketsPerBatch?: number;
   }): Promise<void> {
     const { influxToken, ...rest } = data;
     this.settings = await this.prisma.botSettings.update({
@@ -863,6 +890,13 @@ export class SettingsStore {
     this.settings = await this.prisma.botSettings.update({
       where: { id: "global" },
       data: { scoringLastRunAt: new Date() },
+    });
+  }
+
+  async recordScoringEscalationRun(): Promise<void> {
+    this.settings = await this.prisma.botSettings.update({
+      where: { id: "global" },
+      data: { scoringEscalationLastRunAt: new Date() },
     });
   }
 

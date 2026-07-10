@@ -21,13 +21,15 @@ export class TicketScoreStore {
   // Closed tickets that still need scoring: no score row at all, or a FAILED row
   // below the attempt cap. Oldest-first so the historical backfill drains
   // chronologically (interval batches are small enough that order is moot).
+  // Escalated rows are excluded even when FAILED — a failed escalated re-score
+  // retries on the escalation route, never back through the cheap model.
   async listUnscoredClosed(limit: number): Promise<Ticket[]> {
     const rows = await this.prisma.$queryRaw<{ threadId: string }[]>`
       SELECT t."threadId"
       FROM "tickets" t
       LEFT JOIN "ticket_scores" s ON s."ticketThreadId" = t."threadId"
       WHERE t."closed" = true
-        AND (s."id" IS NULL OR (s."status" = 'FAILED' AND s."attempts" < ${MAX_ATTEMPTS}))
+        AND (s."id" IS NULL OR (s."status" = 'FAILED' AND s."attempts" < ${MAX_ATTEMPTS} AND NOT s."escalated"))
       ORDER BY t."createdAt" ASC
       LIMIT ${limit}`;
     if (rows.length === 0) return [];
@@ -44,7 +46,39 @@ export class TicketScoreStore {
       FROM "tickets" t
       LEFT JOIN "ticket_scores" s ON s."ticketThreadId" = t."threadId"
       WHERE t."closed" = true
-        AND (s."id" IS NULL OR (s."status" = 'FAILED' AND s."attempts" < ${MAX_ATTEMPTS}))`;
+        AND (s."id" IS NULL OR (s."status" = 'FAILED' AND s."attempts" < ${MAX_ATTEMPTS} AND NOT s."escalated"))`;
+    return Number(rows[0]?.count ?? 0);
+  }
+
+  // Work list for the daily escalation batch: freshly-flagged rows plus failed
+  // escalated re-scores below the attempt cap. Oldest-first; anything over the
+  // per-batch cap simply waits for the next day's batch.
+  async listEscalatedForRescore(limit: number): Promise<Ticket[]> {
+    const rows = await this.prisma.$queryRaw<{ threadId: string }[]>`
+      SELECT t."threadId"
+      FROM "tickets" t
+      JOIN "ticket_scores" s ON s."ticketThreadId" = t."threadId"
+      WHERE t."closed" = true
+        AND (s."status" = 'ESCALATED'
+             OR (s."status" = 'FAILED' AND s."escalated" AND s."attempts" < ${MAX_ATTEMPTS}))
+      ORDER BY t."createdAt" ASC
+      LIMIT ${limit}`;
+    if (rows.length === 0) return [];
+    const tickets = await this.prisma.ticket.findMany({
+      where: { threadId: { in: rows.map((r) => r.threadId) } },
+    });
+    const order = new Map(rows.map((r, i) => [r.threadId, i]));
+    return tickets.sort((a, b) => (order.get(a.threadId) ?? 0) - (order.get(b.threadId) ?? 0));
+  }
+
+  async countEscalatedForRescore(): Promise<number> {
+    const rows = await this.prisma.$queryRaw<{ count: bigint }[]>`
+      SELECT COUNT(*)::bigint AS count
+      FROM "tickets" t
+      JOIN "ticket_scores" s ON s."ticketThreadId" = t."threadId"
+      WHERE t."closed" = true
+        AND (s."status" = 'ESCALATED'
+             OR (s."status" = 'FAILED' AND s."escalated" AND s."attempts" < ${MAX_ATTEMPTS}))`;
     return Number(rows[0]?.count ?? 0);
   }
 
@@ -57,20 +91,27 @@ export class TicketScoreStore {
   }
 
   // PENDING rows are written at submit time; the unique ticketThreadId +
-  // skipDuplicates makes concurrent submits single-winner. Retried FAILED rows
-  // are flipped back to PENDING instead (createMany would skip them). Each row
-  // snapshots the transcript's staff display names so the model's staff[]
-  // output can be validated when the batch result arrives (possibly after a
-  // restart — the transcript itself is not persisted).
+  // skipDuplicates makes concurrent submits single-winner. Retried FAILED and
+  // queued ESCALATED rows are flipped back to PENDING instead (createMany would
+  // skip them) — the work lists control which of the two ever reaches a given
+  // submit path. Each row snapshots the transcript's staff display names (the
+  // model's staff[] output is validated against them when the batch result
+  // arrives, possibly after a restart) plus the complexity stats that gate the
+  // eval_escalation flag at result time (the transcript itself is not persisted).
   async markPending(
-    entries: Array<{ ticketThreadId: string; staffNames: string[] }>,
+    entries: Array<{
+      ticketThreadId: string;
+      staffNames: string[];
+      customerMessages: number;
+      transcriptChars: number;
+    }>,
     batchId: string,
     model: string
   ): Promise<void> {
     const ids = entries.map((e) => e.ticketThreadId);
     await this.prisma.$transaction([
       this.prisma.ticketScore.updateMany({
-        where: { ticketThreadId: { in: ids }, status: "FAILED" },
+        where: { ticketThreadId: { in: ids }, status: { in: ["FAILED", "ESCALATED"] } },
         data: { status: "PENDING", batchId, model, error: null },
       }),
       this.prisma.ticketScore.createMany({
@@ -80,32 +121,47 @@ export class TicketScoreStore {
           batchId,
           model,
           staffNames: e.staffNames,
+          customerMessages: e.customerMessages,
+          transcriptChars: e.transcriptChars,
         })),
         skipDuplicates: true,
       }),
-      // Pre-existing rows (the retried-FAILED path) were skipped by createMany;
-      // refresh their snapshot. Scoped to this batch so rows claimed by a
-      // concurrent submit are left alone.
+      // Pre-existing rows (the retried-FAILED/ESCALATED path) were skipped by
+      // createMany; refresh their snapshot. Scoped to this batch so rows
+      // claimed by a concurrent submit are left alone.
       ...entries.map((e) =>
         this.prisma.ticketScore.updateMany({
           where: { ticketThreadId: e.ticketThreadId, batchId },
-          data: { staffNames: e.staffNames },
+          data: {
+            staffNames: e.staffNames,
+            customerMessages: e.customerMessages,
+            transcriptChars: e.transcriptChars,
+          },
         })
       ),
     ]);
   }
 
-  // staffNames snapshots for a batch's rows: threadId → names, or null when the
-  // row predates the snapshot column (reconciliation passes those through).
-  async staffNamesForBatch(batchId: string): Promise<Map<string, string[] | null>> {
+  // Submit-time snapshots for a batch's rows: staffNames (null when the row
+  // predates the column — reconciliation passes those through) plus the
+  // complexity stats behind the escalation veto (null likewise fails the veto).
+  async snapshotsForBatch(batchId: string): Promise<
+    Map<string, { staffNames: string[] | null; customerMessages: number | null; transcriptChars: number | null }>
+  > {
     const rows = await this.prisma.ticketScore.findMany({
       where: { batchId },
-      select: { ticketThreadId: true, staffNames: true },
+      select: { ticketThreadId: true, staffNames: true, customerMessages: true, transcriptChars: true },
     });
     return new Map(
       rows.map((r) => [
         r.ticketThreadId,
-        Array.isArray(r.staffNames) ? r.staffNames.filter((n): n is string => typeof n === "string") : null,
+        {
+          staffNames: Array.isArray(r.staffNames)
+            ? r.staffNames.filter((n): n is string => typeof n === "string")
+            : null,
+          customerMessages: r.customerMessages,
+          transcriptChars: r.transcriptChars,
+        },
       ])
     );
   }
@@ -149,6 +205,50 @@ export class TicketScoreStore {
       where: { ticketThreadId },
       data: { status: "FAILED", attempts: { increment: 1 }, error: error.slice(0, 1_000) },
     });
+  }
+
+  // The scoring model's eval_escalation flag was honored: park the row for the
+  // daily escalation batch. The cheap model's scores are deliberately discarded
+  // (the row was PENDING — score columns are already null); only its spend is
+  // kept visible. attempts resets so the escalated re-score gets a fresh cap.
+  async recordEscalated(
+    ticketThreadId: string,
+    reason: string,
+    usage: { inputTokens: number; outputTokens: number },
+    costUsd: number
+  ): Promise<void> {
+    await this.prisma.ticketScore.update({
+      where: { ticketThreadId },
+      data: {
+        status: "ESCALATED",
+        escalated: true,
+        escalationReason: reason.slice(0, 1_000) || null,
+        attempts: 0,
+        error: null,
+        inputTokens: usage.inputTokens,
+        outputTokens: usage.outputTokens,
+        costUsd,
+      },
+    });
+  }
+
+  // Escalation was disabled with rows still queued (or their in-flight batch
+  // failed afterwards): hand everything back to the normal scoring route.
+  // attempts resets so they get a fresh cap there; PENDING rows are left for
+  // their batch to resolve. Called from the regular submit path whenever
+  // escalation is off, so nothing can strand.
+  async requeueEscalatedToNormal(): Promise<number> {
+    const res = await this.prisma.ticketScore.updateMany({
+      where: { OR: [{ status: "ESCALATED" }, { status: "FAILED", escalated: true }] },
+      data: {
+        status: "FAILED",
+        attempts: 0,
+        escalated: false,
+        escalationReason: null,
+        error: "escalation disabled — requeued for normal scoring",
+      },
+    });
+    return res.count;
   }
 
   // Terminal skip (deleted thread, trivial transcript) — never retried.
@@ -196,7 +296,7 @@ export class TicketScoreStore {
 
   async closeBatch(
     anthropicBatchId: string,
-    counts: { succeeded: number; errored: number; expired: number },
+    counts: { succeeded: number; errored: number; expired: number; escalated: number },
     costUsd: number
   ): Promise<void> {
     await this.prisma.scoringBatch.update({
@@ -206,6 +306,7 @@ export class TicketScoreStore {
         succeededCount: counts.succeeded,
         erroredCount: counts.errored,
         expiredCount: counts.expired,
+        escalatedCount: counts.escalated,
         costUsd,
         endedAt: new Date(),
       },

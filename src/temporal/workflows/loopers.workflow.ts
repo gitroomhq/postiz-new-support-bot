@@ -11,7 +11,7 @@ import {
 } from "@temporalio/workflow";
 import type { CoreActivities, ScoringBatchInput } from "../types";
 import { scoringBatchWorkflowId } from "../types";
-import { kbRefreshNowSignal, scoringRunNowSignal } from "./definitions";
+import { kbRefreshNowSignal, scoringEscalationRunNowSignal, scoringRunNowSignal } from "./definitions";
 
 // Interval-based recurring jobs as eternal looping workflows (user decision:
 // Schedules only for the wall-clock status report). Each iteration reads its
@@ -87,15 +87,25 @@ export async function kbRefreshWorkflow(): Promise<void> {
 // (scoring-batch-<id>) so the whole lifecycle — submit, every poll round-trip,
 // the moment results come back and get processed — is visible per batch in the
 // Temporal UI. The loop keeps the legacy invariants: one batch in flight,
-// 60s cadence, interval/backfill due-check, Run-Scoring-Now signal.
+// 60s cadence, interval/backfill due-check, Run-Scoring-Now signal. The daily
+// escalation re-score batch rides the same loop: regular work wins a shared
+// tick, escalation submits on a later one (adoption covers both kinds).
 export async function scoringLoopWorkflow(): Promise<void> {
   let runNow = false;
+  let escalationNow = false;
   setHandler(scoringRunNowSignal, () => {
     runNow = true;
   });
+  setHandler(scoringEscalationRunNowSignal, () => {
+    escalationNow = true;
+  });
   for (;;) {
+    // Capture-and-clear BOTH flags up front: a flag left set while disabled
+    // would make the condition() below return immediately — a 0s hot loop.
     const force = runNow;
     runNow = false;
+    const escForce = escalationNow;
+    escalationNow = false;
     try {
       const state = await scoringQuick.scoringGetState();
       if (state.enabled) {
@@ -110,13 +120,19 @@ export async function scoringLoopWorkflow(): Promise<void> {
           const purpose = state.backfill ? "backfill" : "interval";
           const r = await scoringSubmitActs.scoringSubmit(purpose);
           if (r.batchId) await watchBatch(r.batchId, purpose);
+          // A manual escalation press preempted by a due regular batch is
+          // re-armed (only reachable while enabled, so it cannot hot-loop).
+          if (escForce) escalationNow = true;
+        } else if (state.escalationDue || escForce) {
+          const r = await scoringSubmitActs.scoringSubmit("escalation");
+          if (r.batchId) await watchBatch(r.batchId, "escalation");
         }
       }
     } catch {
       // transient (activity budget exhausted) — the next tick retries
     }
     await canIfDue(() => continueWithMemo<typeof scoringLoopWorkflow>());
-    await condition(() => runNow, 60_000);
+    await condition(() => runNow || escalationNow, 60_000);
   }
 }
 

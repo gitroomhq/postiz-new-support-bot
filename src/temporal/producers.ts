@@ -20,6 +20,7 @@ import {
   SIG_NOOP,
   SIG_REMINDERS_PAUSED,
   SIG_REQUEST_STATUS_CHANGE,
+  SIG_SCORING_ESCALATION_RUN_NOW,
   SIG_SCORING_RUN_NOW,
   SIG_TICKET_CREATED,
   SINGLETONS,
@@ -308,6 +309,15 @@ export class TemporalProducers {
       workflowType: "scoringLoopWorkflow",
       workflowId: SINGLETONS.scoringLoop,
       signalName: SIG_SCORING_RUN_NOW,
+      options: looperStartOptions(SINGLETONS.scoringLoop),
+    });
+  }
+
+  async scoringEscalationRunNow(): Promise<GatewayResult> {
+    return this.temporal.signalWithStart({
+      workflowType: "scoringLoopWorkflow",
+      workflowId: SINGLETONS.scoringLoop,
+      signalName: SIG_SCORING_ESCALATION_RUN_NOW,
       options: looperStartOptions(SINGLETONS.scoringLoop),
     });
   }

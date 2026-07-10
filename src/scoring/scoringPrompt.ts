@@ -92,6 +92,21 @@ agent_overall scores the human staff contribution as a whole. Additionally, prod
 - root_cause: one short sentence (max ~120 characters) naming the underlying cause in operational terms, e.g. "Instagram token expired and reconnect flow was unclear", "Duplicate subscription created by double checkout", "User expected a feature that only exists on the Pro plan". Write "Unclear from transcript" when it cannot be determined.
 - summary: two or three sentences a support lead could read instead of the transcript: what the customer wanted, what happened, how it ended.
 
+## Dimension 6 — evaluation escalation (meta)
+
+eval_escalation is a flag about YOUR OWN evaluation, not about the ticket: set it to true ONLY when this transcript exceeds what you can reliably evaluate with this rubric, signalling that a stronger model should redo the entire evaluation. It is completely separate from escalation_needed (Dimension 4), which is a fact about the support process.
+
+The ONLY legitimate reasons:
+- Two or more staff members whose interleaved, parallel exchanges you genuinely cannot attribute or follow well enough to score them individually.
+- A truncation marker removed content you demonstrably need — e.g. the decisive diagnosis or the resolution outcome happened inside the truncated region — leaving resolution or cx_score a coin flip.
+- An extremely long back-and-forth (dozens of customer messages) whose final resolution state is genuinely undeterminable from what is present.
+
+Rules:
+- Even when eval_escalation is true, still fill every other field with your best-effort evaluation.
+- Difficulty is not a reason. Ambiguity the tie-breakers above can settle is not a reason. Technical content outside your comfort zone is not a reason on its own.
+- Expected frequency: well under 5% of tickets. When in doubt, set false and produce your best scores — a defensible evaluation is always preferred over an escalation.
+- eval_escalation_reason: exactly "" when false; when true, ONE short sentence naming the concrete obstacle (e.g. "Four interleaved staff hand-offs make attribution and the final resolution state unreliable").
+
 ## Worked examples
 
 Example A — transcript sketch:
@@ -99,7 +114,7 @@ Example A — transcript sketch:
 [10:04] BOT: (AI answer) This usually means the LinkedIn authorization expired. Please go to Settings → Channels, remove LinkedIn, and reconnect it. LinkedIn tokens expire every 60 days.
 [10:31] CUSTOMER (dana): That did it — posts are flowing again. Thanks!
 [10:32] STAFF (mia): Great! Closing this one — reconnecting refreshes the 60-day token. Reach out any time.
-Correct evaluation: cx_score 9 (fast, correct, effortless), sentiment start neutral, end very_positive, agent_overall tone 8 / clarity 8 / correctness 9 (mia's one message was friendly and accurate; the heavy lifting was the bot's, which counts toward CX, not staff), staff [mia: 8/8/9], resolution resolved, first_contact_resolution true, escalation_needed false, topic integration, root_cause "LinkedIn OAuth token expired after 60 days; reconnect restored publishing".
+Correct evaluation: cx_score 9 (fast, correct, effortless), sentiment start neutral, end very_positive, agent_overall tone 8 / clarity 8 / correctness 9 (mia's one message was friendly and accurate; the heavy lifting was the bot's, which counts toward CX, not staff), staff [mia: 8/8/9], resolution resolved, first_contact_resolution true, escalation_needed false, topic integration, root_cause "LinkedIn OAuth token expired after 60 days; reconnect restored publishing", eval_escalation false.
 
 Example B — transcript sketch:
 [Mon 09:15] CUSTOMER (leo): I was charged twice this month, please fix this. Really not okay.
@@ -108,14 +123,14 @@ Example B — transcript sketch:
 [Wed 16:40] STAFF (sam): Sorry for the wait. I can see a duplicate subscription — refunding the second charge now and cancelling the duplicate.
 [Wed 16:55] STAFF (sam): Done — refund issued, you'll see it in 5-10 business days. Apologies again.
 [Wed 17:30] CUSTOMER (leo): ok thanks.
-Correct evaluation: cx_score 5 (correct outcome, but a two-day wait and an unhelpful first answer on a money issue), sentiment start negative, end neutral (a flat "ok thanks" after friction, not warmth), agent_overall tone 8 / clarity 8 / correctness 9 (sam handled it well once engaged — the delay hurts CX, and tone/clarity/correctness judge the messages actually written), staff [sam: 8/8/9], resolution resolved, first_contact_resolution false, escalation_needed false, topic billing, root_cause "Duplicate subscription caused a double charge; second charge refunded and duplicate cancelled".
+Correct evaluation: cx_score 5 (correct outcome, but a two-day wait and an unhelpful first answer on a money issue), sentiment start negative, end neutral (a flat "ok thanks" after friction, not warmth), agent_overall tone 8 / clarity 8 / correctness 9 (sam handled it well once engaged — the delay hurts CX, and tone/clarity/correctness judge the messages actually written), staff [sam: 8/8/9], resolution resolved, first_contact_resolution false, escalation_needed false, topic billing, root_cause "Duplicate subscription caused a double charge; second charge refunded and duplicate cancelled", eval_escalation false.
 
 Example C — transcript sketch:
 [Tue] CUSTOMER (kim): How do I bulk-import 200 posts from a spreadsheet?
 [Tue] BOT: (AI answer describing a CSV import feature that does not actually exist in Postiz)
 [Thu] CUSTOMER (kim): I can't find that menu anywhere.
 [7 days later] BOT: This ticket was closed due to inactivity.
-Correct evaluation: cx_score 2 (wrong answer, then abandoned), sentiment start neutral, end negative (mild frustration, unaddressed), agent_overall 5/5/5 with staff [] (no human ever participated — the neutral default applies; the bad AI answer is punished through cx_score), resolution unresolved, first_contact_resolution false, escalation_needed false (nobody escalated, even though someone should have), topic how_to, root_cause "AI first answer hallucinated a nonexistent import feature and no human followed up".
+Correct evaluation: cx_score 2 (wrong answer, then abandoned), sentiment start neutral, end negative (mild frustration, unaddressed), agent_overall 5/5/5 with staff [] (no human ever participated — the neutral default applies; the bad AI answer is punished through cx_score), resolution unresolved, first_contact_resolution false, escalation_needed false (nobody escalated, even though someone should have), topic how_to, root_cause "AI first answer hallucinated a nonexistent import feature and no human followed up", eval_escalation false (a bad ticket is still an easy ticket to evaluate).
 
 Example D — transcript sketch:
 [09:00] CUSTOMER (ana): URGENT!!! Your app posted the same tweet 14 times to my company account. This is a DISASTER. Fix it NOW or refund everything.
@@ -124,14 +139,14 @@ Example D — transcript sketch:
 [09:25] STAFF (mia): Understood, and again, I'm sorry. The team has rolled back the deploy and I've filed the incident internally — the root fix ships this week. I've also added a month's credit to your subscription for the trouble. I'll message here once the fix is confirmed live.
 [Fri 11:00] STAFF (mia): Fix is live and verified — retries are now idempotent. Your queue is un-paused. Thanks for your patience.
 [Fri 11:30] CUSTOMER (ana): Appreciate the follow-through. We're good.
-Correct evaluation: cx_score 7 (the incident itself was terrible, but the handling was near-perfect: fast, empathetic, compensated, followed up unprompted — CX reflects the whole experience, so the underlying failure caps it below 9), sentiment start very_negative, end positive, agent_overall tone 10 / clarity 9 / correctness 9 (textbook de-escalation and ownership), staff [mia: 10/9/9], resolution resolved (the underlying bug was fixed and verified, not merely worked around), first_contact_resolution false (multi-day, multi-step), escalation_needed true (incident filed internally, deploy rolled back — beyond the first responder's own scope), topic bug, root_cause "Deploy introduced a non-idempotent retry loop that posted duplicates; rolled back and fixed".
+Correct evaluation: cx_score 7 (the incident itself was terrible, but the handling was near-perfect: fast, empathetic, compensated, followed up unprompted — CX reflects the whole experience, so the underlying failure caps it below 9), sentiment start very_negative, end positive, agent_overall tone 10 / clarity 9 / correctness 9 (textbook de-escalation and ownership), staff [mia: 10/9/9], resolution resolved (the underlying bug was fixed and verified, not merely worked around), first_contact_resolution false (multi-day, multi-step), escalation_needed true (incident filed internally, deploy rolled back — beyond the first responder's own scope), topic bug, root_cause "Deploy introduced a non-idempotent retry loop that posted duplicates; rolled back and fixed", eval_escalation false (dramatic but perfectly followable — note escalation_needed true and eval_escalation false are independent).
 
 Example E — transcript sketch:
 [14:10] CUSTOMER (raj): Can Postiz auto-generate hashtags with AI for every post?
 [14:12] BOT: (AI answer) Postiz does not currently auto-generate hashtags. You can save hashtag groups as snippets and insert them quickly, which many teams use instead.
 [14:20] CUSTOMER (raj): Ah ok. Would be a cool feature. The snippets tip helps, thanks.
 [14:25] STAFF (sam): Agreed it would be cool — I've logged your request on our feature board. Snippets guide is here if useful: …
-Correct evaluation: cx_score 8 (honest, instant, helpful alternative, request logged — for a feature request this is close to ideal), sentiment start neutral, end positive, agent_overall tone 8 / clarity 8 / correctness 8, staff [sam: 8/8/8], resolution workaround (the desired capability does not exist; the customer got a usable alternative), first_contact_resolution true (the first answer settled it; sam's follow-up added value but was not required to resolve), escalation_needed false (logging a feature request is routine, not an escalation), topic feature_request, root_cause "Requested AI hashtag generation is not a product capability; snippets offered as alternative".
+Correct evaluation: cx_score 8 (honest, instant, helpful alternative, request logged — for a feature request this is close to ideal), sentiment start neutral, end positive, agent_overall tone 8 / clarity 8 / correctness 8, staff [sam: 8/8/8], resolution workaround (the desired capability does not exist; the customer got a usable alternative), first_contact_resolution true (the first answer settled it; sam's follow-up added value but was not required to resolve), escalation_needed false (logging a feature request is routine, not an escalation), topic feature_request, root_cause "Requested AI hashtag generation is not a product capability; snippets offered as alternative", eval_escalation false.
 
 ## Edge cases and tie-breakers
 
@@ -191,6 +206,8 @@ export const SCORING_OUTPUT_SCHEMA = {
     "summary",
     "agent_overall",
     "staff",
+    "eval_escalation",
+    "eval_escalation_reason",
   ],
   properties: {
     cx_score: SCORE_1_TO_10,
@@ -223,6 +240,8 @@ export const SCORING_OUTPUT_SCHEMA = {
         },
       },
     },
+    eval_escalation: { type: "boolean" },
+    eval_escalation_reason: { type: "string" },
   },
 } as const;
 
@@ -249,6 +268,10 @@ export const TicketScoreResult = z.object({
   staff: z.array(
     z.object({ name: z.string(), tone: score110, clarity: score110, correctness: score110 })
   ),
+  // Defaults (not required) for the same in-flight-batch reason as cx_rationale:
+  // results produced under the pre-escalation output schema must keep parsing.
+  eval_escalation: z.boolean().default(false),
+  eval_escalation_reason: z.string().default(""),
 });
 
 export type TicketScoreResultType = z.infer<typeof TicketScoreResult>;

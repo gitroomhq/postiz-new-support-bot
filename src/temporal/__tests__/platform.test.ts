@@ -107,14 +107,14 @@ test("every looper singleton has an integer generation ≥ 1", () => {
   }
 });
 
-test("scoring-loop is pinned at generation 2 (the per-batch-children rework)", () => {
-  // Regression pin: lowering this re-wedges any still-running gen-2 singleton.
-  assert.equal(LOOPER_GENERATIONS[SINGLETONS.scoringLoop], 2);
+test("scoring-loop is pinned at generation 3 (the escalation-branch rework)", () => {
+  // Regression pin: lowering this re-wedges any still-running gen-3 singleton.
+  assert.equal(LOOPER_GENERATIONS[SINGLETONS.scoringLoop], 3);
 });
 
 test("looperStartOptions stamps the code generation into the memo", () => {
   const opts = looperStartOptions(SINGLETONS.scoringLoop);
-  assert.deepEqual(opts, { memo: { [LOOPER_GEN_MEMO_KEY]: 2 } });
+  assert.deepEqual(opts, { memo: { [LOOPER_GEN_MEMO_KEY]: 3 } });
   assert.deepEqual(looperStartOptions("unknown-id"), { memo: { [LOOPER_GEN_MEMO_KEY]: 1 } });
 });
 

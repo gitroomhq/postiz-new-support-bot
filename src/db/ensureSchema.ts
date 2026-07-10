@@ -430,6 +430,10 @@ const STATEMENTS: string[] = [
     "summary" TEXT,
     "staffScores" JSONB,
     "staffNames" JSONB,
+    "escalated" BOOLEAN NOT NULL DEFAULT false,
+    "escalationReason" TEXT,
+    "customerMessages" INTEGER,
+    "transcriptChars" INTEGER,
     "inputTokens" INTEGER,
     "outputTokens" INTEGER,
     "costUsd" DOUBLE PRECISION,
@@ -444,6 +448,14 @@ const STATEMENTS: string[] = [
   `ALTER TABLE "ticket_scores" ADD COLUMN IF NOT EXISTS "staffNames" JSONB`,
   // One-sentence model justification for cxScore (shown by /ai score).
   `ALTER TABLE "ticket_scores" ADD COLUMN IF NOT EXISTS "cxRationale" TEXT`,
+  // Evaluation escalation: flag/reason survive the whole re-score lifecycle
+  // (NOT NULL DEFAULT false keeps the raw-SQL work-list predicates null-safe);
+  // customerMessages/transcriptChars are the submit-time complexity snapshot
+  // (pre-truncation) that gates the model's flag at result time.
+  `ALTER TABLE "ticket_scores" ADD COLUMN IF NOT EXISTS "escalated" BOOLEAN NOT NULL DEFAULT false`,
+  `ALTER TABLE "ticket_scores" ADD COLUMN IF NOT EXISTS "escalationReason" TEXT`,
+  `ALTER TABLE "ticket_scores" ADD COLUMN IF NOT EXISTS "customerMessages" INTEGER`,
+  `ALTER TABLE "ticket_scores" ADD COLUMN IF NOT EXISTS "transcriptChars" INTEGER`,
   // Submitted Anthropic Message Batches — persisted so polling survives restarts.
   `CREATE TABLE IF NOT EXISTS "scoring_batches" (
     "id" TEXT NOT NULL,
@@ -455,6 +467,7 @@ const STATEMENTS: string[] = [
     "succeededCount" INTEGER NOT NULL DEFAULT 0,
     "erroredCount" INTEGER NOT NULL DEFAULT 0,
     "expiredCount" INTEGER NOT NULL DEFAULT 0,
+    "escalatedCount" INTEGER NOT NULL DEFAULT 0,
     "costUsd" DOUBLE PRECISION,
     "submittedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "endedAt" TIMESTAMP(3),
@@ -462,6 +475,14 @@ const STATEMENTS: string[] = [
   )`,
   `CREATE UNIQUE INDEX IF NOT EXISTS "scoring_batches_anthropicBatchId_key" ON "scoring_batches"("anthropicBatchId")`,
   `CREATE INDEX IF NOT EXISTS "scoring_batches_status_idx" ON "scoring_batches"("status")`,
+  // Results whose eval_escalation flag was honored in this batch.
+  `ALTER TABLE "scoring_batches" ADD COLUMN IF NOT EXISTS "escalatedCount" INTEGER NOT NULL DEFAULT 0`,
+  // Evaluation-escalation knobs (paired with /config → Analytics → Escalation).
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "scoringEscalationEnabled" BOOLEAN NOT NULL DEFAULT false`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "scoringEscalationModel" TEXT NOT NULL DEFAULT 'claude-sonnet-4-6'`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "scoringEscalationIntervalHours" INTEGER NOT NULL DEFAULT 24`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "scoringEscalationMaxTicketsPerBatch" INTEGER NOT NULL DEFAULT 25`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "scoringEscalationLastRunAt" TIMESTAMP(3)`,
   // HashiCorp Vault connection (paired with /config → Vault). vaultToken is
   // encrypted with the LOCAL crypto.ts key — the bootstrap credential Vault
   // itself can't wrap. vaultMigratedAt = storage cutover (null = Postgres).

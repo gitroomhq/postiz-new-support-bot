@@ -96,7 +96,7 @@ import {
 } from "../util/instrument";
 import { PrismaClient } from "../generated/prisma/client";
 import { LightAiRunner } from "./LightAiRunner";
-import { TicketScoringService } from "../scoring/TicketScoringService";
+import { TicketScoringService, type ScoreOneOutcome } from "../scoring/TicketScoringService";
 import { TicketScoreStore } from "../scoring/TicketScoreStore";
 import { TicketAiRunStore } from "./TicketAiRunStore";
 import { reconfigureInflux, pingInflux, influxActive } from "../metrics/InfluxWriter";
@@ -110,7 +110,6 @@ import { VaultService, VAULT_INTEGRATIONS, type VaultTestReport } from "../vault
 import type { TemporalOpsBinding, TemporalProducers } from "../temporal/producers";
 import { describeSaResult } from "../temporal/searchAttributes";
 import { buildIdIsDegenerate } from "../temporal/buildId";
-import type { TicketScoreResultType } from "../scoring/scoringPrompt";
 import type { AiRunInput, AutoAnswerInput } from "../temporal/types";
 import { validateCertPair } from "../temporal/certs";
 import { VaultMigrator, COLUMN_LABELS, type MigrateItemResult, type MigrateReport } from "../vault/VaultMigrator";
@@ -2475,10 +2474,11 @@ export class DiscordBot {
       if (score?.status === "PENDING" && ticket.closed && score.batchId?.startsWith("msgbatch_")) {
         const batch = await this.analytics.scoreStore.getBatch(score.batchId).catch(() => null);
         if (batch?.status === "SUBMITTED") {
+          const kind = batch.purpose === "escalation" ? "escalation re-score batch" : "scoring batch";
           await interaction.editReply({
             embeds: [
               makeEmbed(
-                `<#${threadId}> is queued in scoring batch \`${batch.anthropicBatchId}\` (submitted <t:${Math.floor(batch.submittedAt.getTime() / 1000)}:R>) — awaiting results from Anthropic.`,
+                `<#${threadId}> is queued in ${kind} \`${batch.anthropicBatchId}\` (submitted <t:${Math.floor(batch.submittedAt.getTime() / 1000)}:R>) — awaiting results from Anthropic.`,
                 COLORS.brand
               ),
             ],
@@ -2512,6 +2512,23 @@ export class DiscordBot {
     if (score.status === "FAILED") {
       await interaction.editReply({
         embeds: [makeEmbed(`Scoring failed for <#${threadId}> (attempt ${score.attempts}/3): ${score.error ?? "unknown error"}`, COLORS.warn)],
+      });
+      return;
+    }
+    if (score.status === "ESCALATED") {
+      const escEnabled = this.settingsStore.scoringEscalationEnabled();
+      await interaction.editReply({
+        embeds: [
+          makeEmbed(
+            [
+              `⤴️ <#${threadId}> was flagged as beyond \`${score.model ?? "the scoring model"}\`'s reliable evaluation${score.escalationReason ? `: "${score.escalationReason}"` : "."}`,
+              escEnabled
+                ? `Queued for re-score with \`${this.settingsStore.scoringEscalationModel()}\` (escalation batch runs every ${this.settingsStore.scoringEscalationIntervalHours()}h). "Score one now" in /config → Analytics re-scores it immediately.`
+                : "Escalation is currently disabled (/config → Analytics) — the ticket returns to normal scoring with the next interval batch.",
+            ].join("\n"),
+            COLORS.brand
+          ),
+        ],
       });
       return;
     }
@@ -2554,7 +2571,7 @@ export class DiscordBot {
           : []),
       )
       .setFooter({
-        text: `Scored ${score.scoredAt ? score.scoredAt.toISOString().slice(0, 16).replace("T", " ") : "—"} · ${score.model ?? ""} · $${(score.costUsd ?? 0).toFixed(4)}`,
+        text: `Scored ${score.scoredAt ? score.scoredAt.toISOString().slice(0, 16).replace("T", " ") : "—"} · ${score.model ?? ""} · $${(score.costUsd ?? 0).toFixed(4)}${score.escalated ? " · escalated eval" : ""}`,
       });
     await interaction.editReply({ embeds: [scoreEmbed] });
   }
@@ -3424,29 +3441,24 @@ export class DiscordBot {
         }
       );
 
-    // Button rows mirror the embed field order: core sections, Integrations,
-    // AI & Analytics, then Infrastructure sharing a row with the utilities
-    // (Secondary style keeps the two groups visually distinct).
+    // Nav mirrors the embed fields: three core sections, then three hub
+    // buttons that open sub-menus (same pattern as the Workflow and
+    // Reporting & Audit hubs), then utilities.
     const core = [
       new ButtonBuilder().setCustomId("config_general").setLabel("General Settings").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("config_workflow").setLabel("Workflow").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("config_reporting").setLabel("Reporting & Audit").setStyle(ButtonStyle.Primary),
     ];
-    const integrations = [
-      new ButtonBuilder().setCustomId("config_intercom").setLabel("Intercom").setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId("config_sentry").setLabel("Sentry").setStyle(ButtonStyle.Primary),
+    const hubs = [
+      new ButtonBuilder().setCustomId("config_integrations").setLabel("Integrations").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("config_aianalytics").setLabel("AI & Analytics").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("config_infra").setLabel("Infrastructure").setStyle(ButtonStyle.Primary),
     ];
-    const aiAnalytics = [
-      new ButtonBuilder().setCustomId("config_ai").setLabel("AI & Knowledge").setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId("config_analytics").setLabel("Analytics").setStyle(ButtonStyle.Primary),
-    ];
-    const infraUtility = [
-      new ButtonBuilder().setCustomId("config_vault").setLabel("Vault").setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId("config_temporal").setLabel("Temporal").setStyle(ButtonStyle.Primary),
+    const utility = [
       new ButtonBuilder().setCustomId("config_reverify").setLabel("Re-Verify").setStyle(ButtonStyle.Secondary),
     ];
     if (!s.backfillDone()) {
-      infraUtility.push(
+      utility.push(
         new ButtonBuilder().setCustomId("config_backfill").setLabel("Backfill existing tickets").setStyle(ButtonStyle.Secondary)
       );
     }
@@ -3455,9 +3467,8 @@ export class DiscordBot {
       embeds: [embed],
       components: [
         new ActionRowBuilder<ButtonBuilder>().addComponents(core),
-        new ActionRowBuilder<ButtonBuilder>().addComponents(integrations),
-        new ActionRowBuilder<ButtonBuilder>().addComponents(aiAnalytics),
-        new ActionRowBuilder<ButtonBuilder>().addComponents(infraUtility),
+        new ActionRowBuilder<ButtonBuilder>().addComponents(hubs),
+        new ActionRowBuilder<ButtonBuilder>().addComponents(utility),
       ],
     };
   }
@@ -3516,6 +3527,80 @@ export class DiscordBot {
       new ButtonBuilder().setCustomId("config_back_main").setLabel("Back").setStyle(ButtonStyle.Secondary)
     );
 
+    return { embeds: [embed], components: [buttons] };
+  }
+
+  // The three right-hand hub panels — same pattern as Workflow / Reporting &
+  // Audit: live status lines, one button per sub-panel, Back to main.
+  // Sub-panels opened from a hub route their own Back button to the hub.
+  private buildIntegrationsHubPanel() {
+    const s = this.settingsStore;
+    const embed = new EmbedBuilder()
+      .setTitle("Integrations")
+      .setColor(0x5865f2)
+      .setDescription(
+        [
+          `**Intercom:** ${s.intercomMode() === "none" ? "off" : `${s.intercomMode()}${s.intercomConfigured() ? "" : " ⚠️ not configured"}`}`,
+          `**Sentry:** ${
+            s.sentryDsn()
+              ? `${sentryActive() ? "on" : "configured ⚠️ restart pending"} · traces ${s.sentryTracesSampleRate()} · logs ${s.sentryLogsEnabled() ? "on" : "off"}`
+              : "off"
+          }`,
+        ].join("\n")
+      );
+    const buttons = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId("config_intercom").setLabel("Intercom").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("config_sentry").setLabel("Sentry").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("config_back_main").setLabel("Back").setStyle(ButtonStyle.Secondary)
+    );
+    return { embeds: [embed], components: [buttons] };
+  }
+
+  private buildAiAnalyticsHubPanel() {
+    const s = this.settingsStore;
+    const embed = new EmbedBuilder()
+      .setTitle("AI & Analytics")
+      .setColor(0x5865f2)
+      .setDescription(
+        [
+          `**AI models:** \`${s.aiModel()}\` · light \`${s.aiModelLight()}\``,
+          `**KB refresh:** ${s.kbRefreshEnabled() ? `every ${s.kbRefreshIntervalHours()}h` : "off"}${s.kbLastRefreshAt() ? ` · last <t:${Math.floor(s.kbLastRefreshAt()!.getTime() / 1000)}:R>` : ""}`,
+          `**Scoring:** ${s.scoringEnabled() ? `every ${s.scoringIntervalHours()}h, \`${s.scoringModel()}\`` : "off"}`,
+          `**InfluxDB:** ${influxActive() ? `on → \`${s.influxBucket()}\`` : s.influxEnabled() ? "enabled ⚠️ incomplete config" : "off"}`,
+        ].join("\n")
+      );
+    const buttons = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId("config_ai").setLabel("AI & Knowledge").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("config_analytics").setLabel("Analytics").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("config_back_main").setLabel("Back").setStyle(ButtonStyle.Secondary)
+    );
+    return { embeds: [embed], components: [buttons] };
+  }
+
+  private buildInfrastructureHubPanel() {
+    const s = this.settingsStore;
+    const embed = new EmbedBuilder()
+      .setTitle("Infrastructure")
+      .setColor(0x5865f2)
+      .setDescription(
+        [
+          `**Vault:** ${this.vaultStatusLine()}`,
+          `**Temporal:** ${
+            s.temporalEnabled()
+              ? this.temporalOps?.service.state() === "up"
+                ? "on · connected"
+                : "on ⚠️ server unreachable"
+              : this.temporalOps?.service.configured()
+                ? "configured · off"
+                : "off"
+          }`,
+        ].join("\n")
+      );
+    const buttons = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId("config_vault").setLabel("Vault").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("config_temporal").setLabel("Temporal").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("config_back_main").setLabel("Back").setStyle(ButtonStyle.Secondary)
+    );
     return { embeds: [embed], components: [buttons] };
   }
 
@@ -3732,7 +3817,7 @@ export class DiscordBot {
         .setCustomId("config_intercom_region")
         .setLabel(`Region: ${s.intercomRegion().toUpperCase()}`)
         .setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId("config_back_main").setLabel("Back").setStyle(ButtonStyle.Secondary)
+      new ButtonBuilder().setCustomId("config_integrations").setLabel("Back").setStyle(ButtonStyle.Secondary)
     );
 
     const extraButtons = new ActionRowBuilder<ButtonBuilder>().addComponents(
@@ -3758,7 +3843,7 @@ export class DiscordBot {
           `**Knowledge-base auto-refresh:** ${s.kbRefreshEnabled() ? `on — every ${s.kbRefreshIntervalHours()}h` : "off"}`,
           `**Last refresh:** ${last ? `<t:${Math.floor(last.getTime() / 1000)}:R>` : "_never_"}`,
           "",
-          "The AI answers by searching the cloned Postiz source + docs in `search/`; the refresh git-pulls them so answers track upstream. Models are free-text — any Claude alias/id the CLI accepts works.",
+          "The AI answers by searching the Postiz source + docs snapshots in `search/`; the refresh downloads fresh GitHub tarballs so answers track upstream. Models are free-text — any Claude alias/id the CLI accepts works.",
         ].join("\n")
       );
 
@@ -3783,7 +3868,7 @@ export class DiscordBot {
       new ButtonBuilder().setCustomId("config_kb_refresh_now").setLabel("Refresh Now").setStyle(ButtonStyle.Secondary)
     );
     const navRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
-      new ButtonBuilder().setCustomId("config_back_main").setLabel("Back").setStyle(ButtonStyle.Secondary)
+      new ButtonBuilder().setCustomId("config_aianalytics").setLabel("Back").setStyle(ButtonStyle.Secondary)
     );
 
     return { embeds: [embed], components: [modelRow, kbRow, navRow] };
@@ -3865,7 +3950,7 @@ export class DiscordBot {
         .setLabel("Send test event")
         .setStyle(ButtonStyle.Primary)
         .setDisabled(!sentryActive()),
-      new ButtonBuilder().setCustomId("config_back_main").setLabel("Back").setStyle(ButtonStyle.Secondary)
+      new ButtonBuilder().setCustomId("config_integrations").setLabel("Back").setStyle(ButtonStyle.Secondary)
     );
 
     return { embeds: [embed], components: [setupButtons, toggleButtons, readButtons, actionButtons] };
@@ -3880,12 +3965,13 @@ export class DiscordBot {
       ? "⚠️ stored token can't be decrypted (key source rotated) — re-enter it"
       : mask(s.influxToken());
 
-    const [unscored, pendingBatches] = this.analytics
+    const [unscored, pendingBatches, escalationQueue] = this.analytics
       ? await Promise.all([
           this.analytics.scoreStore.countUnscoredClosed().catch(() => 0),
           this.analytics.scoreStore.pendingBatches().catch(() => []),
+          this.analytics.scoreStore.countEscalatedForRescore().catch(() => 0),
         ])
-      : [0, []];
+      : [0, [], 0];
     const pending = pendingBatches[0];
 
     const embed = new EmbedBuilder()
@@ -3911,6 +3997,13 @@ export class DiscordBot {
           `**Last batch:** ${s.scoringLastRunAt() ? `<t:${Math.floor(s.scoringLastRunAt()!.getTime() / 1000)}:R>` : "_never_"} · **Unscored closed tickets:** ${unscored}`,
           `**In flight:** ${pending ? `\`${pending.anthropicBatchId}\` (${pending.requestCount} tickets, submitted <t:${Math.floor(pending.submittedAt.getTime() / 1000)}:R>)` : "_none_"}`,
           `**Historical backfill:** ${s.scoringBackfillPending() ? "⏳ draining (one batch in flight at a time)" : "idle"}`,
+          "",
+          `**Escalation re-scores:** ${
+            s.scoringEscalationEnabled()
+              ? `**on** — \`${s.scoringEscalationModel()}\` every ${s.scoringEscalationIntervalHours()}h, max ${s.scoringEscalationMaxTicketsPerBatch()}/batch`
+              : "**off** — flagged tickets are scored normally"
+          } · **queued:** ${escalationQueue}`,
+          `**Last escalation batch:** ${s.scoringEscalationLastRunAt() ? `<t:${Math.floor(s.scoringEscalationLastRunAt()!.getTime() / 1000)}:R>` : "_never_"} — tickets the scoring model flags as beyond its reliable evaluation are re-scored by this model (~12x/ticket; needs scoring **on**; shares the daily budget).`,
           "",
           "Scoring uses the Anthropic **Batch API** (50% discount, results within ~1h) with a prompt-cached rubric — ≈$0.005/ticket. Influx settings apply live on save.",
         ].join("\n")
@@ -3939,6 +4032,22 @@ export class DiscordBot {
       new ButtonBuilder().setCustomId("config_analytics_batch").setLabel("View Current Batch").setStyle(ButtonStyle.Secondary)
     );
 
+    const escalationRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId("config_analytics_toggle_escalation")
+        .setLabel(`Escalation: ${s.scoringEscalationEnabled() ? "on" : "off"}`)
+        .setStyle(s.scoringEscalationEnabled() ? ButtonStyle.Success : ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId("config_analytics_escalation_opts")
+        .setLabel("Escalation Options")
+        .setStyle(ButtonStyle.Primary),
+      new ButtonBuilder()
+        .setCustomId("config_analytics_escalation_run")
+        .setLabel("Run Escalation Now")
+        .setStyle(ButtonStyle.Secondary)
+        .setDisabled(!s.scoringEnabled() || !s.scoringEscalationEnabled())
+    );
+
     const backfillRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder()
         .setCustomId("config_analytics_backfill_influx")
@@ -3950,10 +4059,10 @@ export class DiscordBot {
         .setLabel("Backfill scores (all closed tickets)")
         .setStyle(ButtonStyle.Secondary)
         .setDisabled(s.scoringBackfillPending()),
-      new ButtonBuilder().setCustomId("config_back_main").setLabel("Back").setStyle(ButtonStyle.Secondary)
+      new ButtonBuilder().setCustomId("config_aianalytics").setLabel("Back").setStyle(ButtonStyle.Secondary)
     );
 
-    return { embeds: [embed], components: [influxRow, scoringRow, backfillRow] };
+    return { embeds: [embed], components: [influxRow, scoringRow, escalationRow, backfillRow] };
   }
 
   // /config → Analytics → View Current Batch: read-only snapshot of the
@@ -4120,7 +4229,7 @@ export class DiscordBot {
       new ButtonBuilder().setCustomId("config_temporal_conn").setLabel("Connection").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("config_temporal_certs").setLabel("Certificates").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("config_temporal_test").setLabel("Test Connection").setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId("config_back_main").setLabel("Back").setStyle(ButtonStyle.Secondary)
+      new ButtonBuilder().setCustomId("config_infra").setLabel("Back").setStyle(ButtonStyle.Secondary)
     );
     const row2 = new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder().setCustomId("config_temporal_sa").setLabel("Ensure Search Attributes").setStyle(ButtonStyle.Secondary),
@@ -4491,7 +4600,7 @@ export class DiscordBot {
         .setLabel("Reverse migration")
         .setStyle(ButtonStyle.Danger)
         .setDisabled(!service || !service.storageActive() || service.state() !== "up"),
-      new ButtonBuilder().setCustomId("config_back_main").setLabel("Back").setStyle(ButtonStyle.Secondary)
+      new ButtonBuilder().setCustomId("config_infra").setLabel("Back").setStyle(ButtonStyle.Secondary)
     );
 
     return { embeds: [embed], components: [connRow, migrateRow] };
@@ -5374,6 +5483,18 @@ export class DiscordBot {
       await interaction.update(this.buildConfigMainPanel());
       return;
     }
+    if (id === "config_integrations") {
+      await interaction.update(this.buildIntegrationsHubPanel());
+      return;
+    }
+    if (id === "config_aianalytics") {
+      await interaction.update(this.buildAiAnalyticsHubPanel());
+      return;
+    }
+    if (id === "config_infra") {
+      await interaction.update(this.buildInfrastructureHubPanel());
+      return;
+    }
 
     if (id === "config_toggle_ai") {
       await this.settingsStore.updateGeneral({ aiSolveEnabled: !this.settingsStore.aiSolveEnabled() });
@@ -5927,6 +6048,83 @@ export class DiscordBot {
         )
       );
       await interaction.showModal(modal);
+      return;
+    }
+
+    if (id === "config_analytics_toggle_escalation") {
+      const turningOff = this.settingsStore.scoringEscalationEnabled();
+      // Turning off hands the queue back to normal scoring so nothing strands
+      // (the regular submit path also self-heals, this just makes it immediate).
+      const requeued =
+        turningOff && this.analytics
+          ? await this.analytics.scoreStore.requeueEscalatedToNormal().catch(() => 0)
+          : 0;
+      await this.settingsStore.updateAnalytics({ scoringEscalationEnabled: !turningOff });
+      this.auditConfig(
+        interaction,
+        `Scoring escalation → ${
+          turningOff ? `off${requeued ? ` (${requeued} queued ticket(s) returned to normal scoring)` : ""}` : "on"
+        }`
+      );
+      await interaction.update(await this.buildAnalyticsPanel());
+      return;
+    }
+
+    if (id === "config_analytics_escalation_opts") {
+      const s = this.settingsStore;
+      const modal = new ModalBuilder()
+        .setCustomId("config_analytics_escalation_modal")
+        .setTitle("Escalation Re-score Options");
+      modal.addComponents(
+        new ActionRowBuilder<TextInputBuilder>().addComponents(
+          new TextInputBuilder()
+            .setCustomId("model")
+            .setLabel("Escalation model id (real id, ~12x cost)")
+            .setStyle(TextInputStyle.Short)
+            .setRequired(true)
+            .setValue(s.scoringEscalationModel())
+        ),
+        new ActionRowBuilder<TextInputBuilder>().addComponents(
+          new TextInputBuilder()
+            .setCustomId("interval")
+            .setLabel("Batch interval in hours (24 = daily)")
+            .setStyle(TextInputStyle.Short)
+            .setRequired(true)
+            .setValue(String(s.scoringEscalationIntervalHours()))
+        ),
+        new ActionRowBuilder<TextInputBuilder>().addComponents(
+          new TextInputBuilder()
+            .setCustomId("max_batch")
+            .setLabel("Max tickets per escalation batch")
+            .setStyle(TextInputStyle.Short)
+            .setRequired(true)
+            .setValue(String(s.scoringEscalationMaxTicketsPerBatch()))
+        )
+      );
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (id === "config_analytics_escalation_run") {
+      await interaction.deferReply({ flags: 64 });
+      const ops = this.temporalOps;
+      if (!ops) {
+        await interaction.editReply({
+          embeds: [makeEmbed("Temporal stack is not wired in this process.", COLORS.warn)],
+        });
+        return;
+      }
+      const r = await ops.producers.scoringEscalationRunNow();
+      await interaction.editReply({
+        embeds: [
+          makeEmbed(
+            r.ok
+              ? "Triggered an escalation re-score batch via Temporal (submits once no other batch is in flight)."
+              : `Couldn't trigger the escalation batch: ${r.error ?? "Temporal unreachable"}.`,
+            r.ok ? COLORS.success : COLORS.danger
+          ),
+        ],
+      });
       return;
     }
 
@@ -6858,6 +7056,47 @@ export class DiscordBot {
       return;
     }
 
+    if (interaction.customId === "config_analytics_escalation_modal") {
+      const model = interaction.fields.getTextInputValue("model").trim();
+      const interval = Number.parseInt(interaction.fields.getTextInputValue("interval").trim(), 10);
+      const maxBatch = Number.parseInt(interaction.fields.getTextInputValue("max_batch").trim(), 10);
+      if (
+        !model ||
+        !Number.isInteger(interval) || interval < 1 || interval > 168 ||
+        !Number.isInteger(maxBatch) || maxBatch < 1 || maxBatch > 1_000
+      ) {
+        await interaction.reply({
+          embeds: [
+            makeEmbed(
+              "Invalid values — model non-empty (a real model id, aliases are not resolved), interval 1-168 hours, max tickets 1-1000.",
+              COLORS.danger
+            ),
+          ],
+          flags: 64,
+        });
+        return;
+      }
+      await this.settingsStore.updateAnalytics({
+        scoringEscalationModel: model,
+        scoringEscalationIntervalHours: interval,
+        scoringEscalationMaxTicketsPerBatch: maxBatch,
+      });
+      this.auditConfig(
+        interaction,
+        `Escalation options → every ${interval}h, model \`${model}\`, ${maxBatch}/batch`
+      );
+      await interaction.reply({
+        embeds: [
+          makeEmbed(
+            `Escalation options saved — every ${interval}h on \`${model}\`, max ${maxBatch}/batch. Escalation batches share the daily scoring budget cap.`,
+            COLORS.success
+          ),
+        ],
+        flags: 64,
+      });
+      return;
+    }
+
     if (interaction.customId === "config_analytics_score_one_modal") {
       const threadId = interaction.fields.getTextInputValue("thread").trim();
       if (!this.analytics) {
@@ -6870,18 +7109,35 @@ export class DiscordBot {
         // active (dedup by workflow id, Temporal UI visibility); null =
         // unavailable or the workflow failed — fall back to the direct call,
         // whose real error surfaces through this catch.
-        let parsed: TicketScoreResultType | null = null;
+        let outcome: ScoreOneOutcome | null = null;
         if (this.temporalProducers?.enabled()) {
           const json = await this.temporalProducers.executeScoreOne(threadId);
           if (json != null) {
             try {
-              parsed = JSON.parse(json) as TicketScoreResultType;
+              const candidate = JSON.parse(json) as ScoreOneOutcome;
+              if (candidate && typeof candidate.escalated === "boolean") outcome = candidate;
             } catch {
-              parsed = null;
+              outcome = null;
             }
           }
         }
-        if (!parsed) parsed = await this.analytics.scoringService.scoreOneNow(threadId);
+        if (!outcome) outcome = await this.analytics.scoringService.scoreOneNow(threadId);
+        if (outcome.escalated) {
+          this.auditConfig(interaction, `Manual score → <#${threadId}> flagged for escalated re-score`);
+          await interaction.editReply({
+            embeds: [
+              makeEmbed(
+                [
+                  `⤴️ <#${threadId}> was flagged as beyond \`${this.settingsStore.scoringModel()}\`'s reliable evaluation${outcome.reason ? `: "${outcome.reason}"` : "."}`,
+                  `Queued for re-score with \`${this.settingsStore.scoringEscalationModel()}\` in the next escalation batch — or press "Score one now" again to run that model immediately.`,
+                ].join("\n"),
+                COLORS.warn
+              ),
+            ],
+          });
+          return;
+        }
+        const parsed = outcome.result;
         this.auditConfig(interaction, `Manual score → <#${threadId}> (CX ${parsed.cx_score}/10)`);
         await interaction.editReply({
           embeds: [

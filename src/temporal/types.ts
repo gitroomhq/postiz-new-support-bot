@@ -48,7 +48,7 @@ export const STATUS_REPORT_SCHEDULE_ID = "status-report";
 export const LOOPER_GEN_MEMO_KEY = "looperGen";
 export const LOOPER_GENERATIONS: Record<string, number> = {
   [SINGLETONS.kbRefresh]: 1,
-  [SINGLETONS.scoringLoop]: 2, // gen 2: scoringTick → getState/submit + per-batch children
+  [SINGLETONS.scoringLoop]: 3, // gen 3: escalation branch + scoringEscalationRunNow signal
   [SINGLETONS.metricsSnapshot]: 1,
   [SINGLETONS.cleanupLoop]: 1,
 };
@@ -82,6 +82,7 @@ export const SIG_NOOP = "noop";
 export const SIG_INBOUND_EVENT = "inboundEvent";
 export const SIG_KB_REFRESH_NOW = "kbRefreshNow";
 export const SIG_SCORING_RUN_NOW = "scoringRunNow";
+export const SIG_SCORING_ESCALATION_RUN_NOW = "scoringEscalationRunNow";
 export const UPD_APPLY_STATUS = "applyStatus";
 export const UPD_APPLY_PRIORITY = "applyPriority";
 export const QRY_TICKET_STATE = "getState";
@@ -302,6 +303,11 @@ export interface ScoringState {
   pendingBatchIds: string[];
   due: boolean;
   backfill: boolean;
+  // Daily escalation re-score batch: due only while escalation is enabled,
+  // its interval has elapsed AND the queue is non-empty (regular work wins a
+  // shared tick; escalation submits on a later one).
+  escalationDue: boolean;
+  escalationPendingCount: number;
 }
 
 export interface ScoringSubmitOutcome {
@@ -354,7 +360,7 @@ export interface CoreActivities {
   // loopers
   kbTick(force: boolean): Promise<KbTickResult>;
   scoringGetState(): Promise<ScoringState>;
-  scoringSubmit(purpose: "interval" | "backfill"): Promise<ScoringSubmitOutcome>;
+  scoringSubmit(purpose: "interval" | "backfill" | "escalation"): Promise<ScoringSubmitOutcome>;
   scoringPollBatch(batchId: string): Promise<ScoringBatchPoll>;
   // Deadline backstop: fail a batch that outlived its processing window so
   // its tickets become retryable (no-op if already finalized).
