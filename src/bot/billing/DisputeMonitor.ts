@@ -2,7 +2,7 @@ import { ActionRowBuilder, ButtonBuilder, ButtonStyle, Client, EmbedBuilder } fr
 import { SettingsStore } from "../../config/SettingsStore";
 import { SessionStore } from "../../auth/SessionStore";
 import { StripeClient } from "../StripeClient";
-import { DisputeStore } from "./DisputeStore";
+import { DisputeStore, OPEN_DISPUTE_STATUSES } from "./DisputeStore";
 import { BlockStore } from "./BlockStore";
 import { CachedRatioEngine, describeRatioWindow, ratioLevel, type RatioLevel } from "./disputeRatio";
 import { COLORS } from "../../util/embeds";
@@ -17,15 +17,31 @@ const DAY_S = 24 * 60 * 60;
 // Stripe → local table reconciliation: upserts every dispute created in the
 // last 90 days, then re-checks any locally-open dispute the sweep missed
 // (closes older than the window, missed webhooks). Shared by the looper tick
-// and the /billing "Sync from Stripe" button.
-export async function reconcileDisputes(
-  stripe: StripeClient,
-  disputeStore: DisputeStore
-): Promise<{ synced: number; truncated: boolean }> {
+// and the /billing "Sync from Stripe" button. The status breakdown feeds the
+// sync notice — most synced disputes are usually already closed, and a bare
+// total reads like "sync did nothing" when the open list doesn't change.
+export interface ReconcileResult {
+  synced: number;
+  open: number;
+  won: number;
+  lost: number;
+  otherClosed: number;
+  truncated: boolean;
+}
+
+const OPEN_SET = new Set<string>(OPEN_DISPUTE_STATUSES);
+
+export async function reconcileDisputes(stripe: StripeClient, disputeStore: DisputeStore): Promise<ReconcileResult> {
   const since = Math.floor(Date.now() / 1000) - 90 * DAY_S;
   const sweep = await stripe.listDisputesSince(since);
   const seen = new Set<string>();
-  let synced = 0;
+  const result: ReconcileResult = { synced: 0, open: 0, won: 0, lost: 0, otherClosed: 0, truncated: sweep.truncated };
+  const tally = (status: string) => {
+    if (OPEN_SET.has(status)) result.open++;
+    else if (status === "won") result.won++;
+    else if (status === "lost") result.lost++;
+    else result.otherClosed++; // prevented, warning_closed
+  };
   for (const dispute of sweep.disputes) {
     seen.add(dispute.id);
     const chargeId = typeof dispute.charge === "string" ? dispute.charge : (dispute.charge?.id ?? null);
@@ -34,7 +50,8 @@ export async function reconcileDisputes(
       existing?.customerId ??
       (chargeId ? await stripe.getChargeCustomerId(chargeId).catch(() => null) : null);
     await disputeStore.upsertFromStripe(dispute, customerId);
-    synced++;
+    tally(dispute.status);
+    result.synced++;
   }
   // Locally open but absent from the sweep — fetch individually to catch up.
   for (const id of await disputeStore.listOpenIds()) {
@@ -43,12 +60,13 @@ export async function reconcileDisputes(
       const fresh = await stripe.getDispute(id);
       const existing = await disputeStore.get(id);
       await disputeStore.upsertFromStripe(fresh, existing?.customerId ?? null);
-      synced++;
+      tally(fresh.status);
+      result.synced++;
     } catch (error) {
       monitorLog.warn("dispute re-check failed", { "stripe.dispute_id": id, error: String(error) });
     }
   }
-  return { synced, truncated: sweep.truncated };
+  return result;
 }
 
 // The disputes-looper tick body: reconcile → evidence-due reminders → ratio

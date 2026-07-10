@@ -16,7 +16,7 @@ export const RESPONDABLE_DISPUTE_STATUSES = ["needs_response", "warning_needs_re
 // not flip a closed dispute back to under_review (webhooks are unordered).
 const TERMINAL_STATUSES = new Set(["won", "lost", "prevented", "warning_closed"]);
 
-const DAY_MS = 24 * 60 * 60 * 1000;
+export const DAY_MS = 24 * 60 * 60 * 1000;
 
 // Local mirror of Stripe disputes. Stripe's disputes.list can't filter by
 // status, so the open-disputes overview and the reminder looper read from
@@ -124,6 +124,27 @@ export class DisputeStore {
       select: { id: true },
     });
     return rows.map((r) => r.id);
+  }
+
+  // Overview footer context: outcome tallies of NON-open disputes created in
+  // the trailing window (won / lost / prevented+closed-inquiry).
+  async closedSummarySince(days: number, now: Date = new Date()): Promise<{ won: number; lost: number; otherClosed: number }> {
+    const rows = await this.prisma.stripeDispute.groupBy({
+      by: ["status"],
+      where: {
+        status: { notIn: [...OPEN_DISPUTE_STATUSES] },
+        disputeCreatedAt: { gte: new Date(now.getTime() - days * DAY_MS) },
+      },
+      _count: { _all: true },
+    });
+    const summary = { won: 0, lost: 0, otherClosed: 0 };
+    for (const row of rows) {
+      const count = row._count._all;
+      if (row.status === "won") summary.won += count;
+      else if (row.status === "lost") summary.lost += count;
+      else summary.otherClosed += count;
+    }
+    return summary;
   }
 
   // ---- Watch subscriptions (DM on status change) ----

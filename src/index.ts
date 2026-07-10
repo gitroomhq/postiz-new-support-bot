@@ -191,7 +191,7 @@ async function main() {
     blockService,
     qolStore,
     ratio: ratioEngine,
-    lightAiRunner,
+    claudeRunner,
   });
 
   const billingCategory = new BillingCategory(stripeClient, sessionStore, settingsStore, statusService, ticketStore, auditLogger, tierStore, blockStore);

@@ -173,7 +173,9 @@ export class DisputesHub {
             interaction,
             token,
             0,
-            `🔄 Synced ${result.synced} dispute(s) from Stripe${result.truncated ? " (sweep truncated)" : ""}.`
+            `🔄 Synced ${result.synced} dispute(s) from Stripe — ${result.open} open · ${result.won} won · ${result.lost} lost${
+              result.otherClosed ? ` · ${result.otherClosed} other closed` : ""
+            }${result.truncated ? " (sweep truncated)" : ""}. Only open disputes are listed below.`
           );
         });
       },
@@ -1024,8 +1026,9 @@ export class DisputesHub {
     if (!session) return;
     session.originHub ??= "pay";
 
-    const [{ rows, total }, ratios] = await Promise.all([
+    const [{ rows, total }, closed, ratios] = await Promise.all([
       this.ctx.disputeStore.listOpen(page * PAGE_SIZE, PAGE_SIZE),
+      this.ctx.disputeStore.closedSummarySince(90),
       this.ctx.ratio.get().catch((error) => {
         logger.warn("ratio computation failed", { error: String(error) });
         return null;
@@ -1060,6 +1063,9 @@ export class DisputesHub {
           "",
           `**Open disputes (${total})**${total > PAGE_SIZE ? ` · page ${page + 1}/${Math.max(1, Math.ceil(total / PAGE_SIZE))}` : ""}`,
           lines.length ? lines.join("\n") : "None 🎉",
+          closed.won + closed.lost + closed.otherClosed > 0
+            ? `\nClosed in the last 90d: **${closed.won}** won · **${closed.lost}** lost${closed.otherClosed ? ` · **${closed.otherClosed}** other (prevented / inquiry closed)` : ""}`
+            : undefined,
         ]
           .filter((line) => line !== undefined)
           .join("\n")
@@ -1271,30 +1277,45 @@ export class DisputesHub {
       fields,
     });
 
-    const [text] = await this.ctx.lightAiRunner.run(prompt, undefined, {
-      model: this.ctx.settingsStore.aiModelLight(),
+    // Claude Code CLI run with Read/Glob/Grep over the cloned Postiz source +
+    // docs (same knowledge base as /ai), bounded by the /config → AI ask
+    // levers. Filling policy fields requires actually finding the terms.
+    const effortRaw = this.ctx.settingsStore.aiEffortAsk();
+    const effort = effortRaw === "low" || effortRaw === "high" || effortRaw === "max" ? effortRaw : "medium";
+    const messages = await this.ctx.claudeRunner.run(prompt, undefined, {
+      promptPrefix: null,
+      model: this.ctx.settingsStore.aiModel(),
+      effort,
+      maxBudgetUsd: this.ctx.settingsStore.aiMaxBudgetUsdAsk(),
+      timeoutMs: 300_000,
       telemetry: { agentName: "ai-dispute-evidence", kind: "staff_command" },
-      maxTokens: 8_000,
-      timeoutMs: 120_000,
     });
 
-    // Tolerant strict-JSON parse: strip code fences; on failure, the raw text
-    // becomes the uncategorized narrative rather than being lost.
-    const cleaned = text
-      .trim()
-      .replace(/^```(?:json)?\s*/i, "")
-      .replace(/```\s*$/, "");
+    // The final message carries the JSON; earlier ones are research narration.
+    // Scan backwards for the first parseable object; fall back to the raw tail
+    // as the uncategorized narrative rather than losing the run.
     let draft: Record<string, string> = {};
-    try {
-      const parsed = JSON.parse(cleaned) as Record<string, unknown>;
-      for (const key of fields) {
-        const value = parsed[key];
-        if (typeof value === "string" && value.trim()) draft[key] = value.trim().slice(0, 3800);
+    for (let i = messages.length - 1; i >= 0 && Object.keys(draft).length === 0; i--) {
+      const cleaned = messages[i]
+        .trim()
+        .replace(/^```(?:json)?\s*/i, "")
+        .replace(/```\s*$/, "");
+      const start = cleaned.indexOf("{");
+      const end = cleaned.lastIndexOf("}");
+      if (start === -1 || end <= start) continue;
+      try {
+        const parsed = JSON.parse(cleaned.slice(start, end + 1)) as Record<string, unknown>;
+        for (const key of fields) {
+          const value = parsed[key];
+          if (typeof value === "string" && value.trim()) draft[key] = value.trim().slice(0, 3800);
+        }
+      } catch {
+        // keep scanning earlier messages
       }
-    } catch {
-      draft = { uncategorized_text: cleaned.slice(0, 3800) };
     }
-    if (Object.keys(draft).length === 0) draft = { uncategorized_text: cleaned.slice(0, 3800) };
+    if (Object.keys(draft).length === 0) {
+      draft = { uncategorized_text: (messages[messages.length - 1] ?? "").trim().slice(0, 3800) };
+    }
 
     await this.ctx.disputeStore.saveEvidenceDraft(dispute.id, draft);
     this.ctx.audit.log(interaction, {

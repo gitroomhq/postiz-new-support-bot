@@ -5,9 +5,11 @@ import {
   buildWindowNumbers,
   computeDisputeRatios,
   computeVampNumerator,
+  countWithSearchCap,
   isChargebackStage,
   ratioLevel,
   windowStarts,
+  SEARCH_TOTAL_CAP,
   type DisputeRatios,
   type RatioStripeReads,
 } from "../../bot/billing/disputeRatio";
@@ -104,6 +106,53 @@ test("computeDisputeRatios buckets by window and propagates truncation", async (
   assert.equal(r.d90.chargebacks, 2);
   assert.equal(r.d90.succeeded, 400);
   assert.equal(r.month.plainPct, 1.0);
+});
+
+test("countWithSearchCap: under-cap window is a single request", async () => {
+  let calls = 0;
+  const n = await countWithSearchCap(
+    async () => {
+      calls++;
+      return 6944;
+    },
+    0,
+    90 * 86400
+  );
+  assert.equal(n, 6944);
+  assert.equal(calls, 1);
+});
+
+test("countWithSearchCap: capped window splits until slices are exact", async () => {
+  // A "true" distribution of 20,000 charges spread uniformly over 90 days —
+  // the fake search returns min(real, cap) exactly like Stripe does.
+  const total = 20_000;
+  const span = 90 * 86400;
+  const realCount = (gte: number, lt: number) => Math.round(((lt - gte) / span) * total);
+  let calls = 0;
+  const n = await countWithSearchCap(
+    async (gte, lt) => {
+      calls++;
+      return Math.min(realCount(gte, lt), SEARCH_TOTAL_CAP);
+    },
+    0,
+    span
+  );
+  assert.equal(n, total); // NOT 10,000
+  assert.ok(calls >= 3 && calls <= 15, `expected a handful of slice requests, got ${calls}`);
+});
+
+test("countWithSearchCap: bottoms out at 1h slices instead of recursing forever", async () => {
+  let calls = 0;
+  const n = await countWithSearchCap(
+    async () => {
+      calls++;
+      return SEARCH_TOTAL_CAP; // pathologically capped at every granularity
+    },
+    0,
+    2 * 3600
+  );
+  assert.equal(n, 2 * SEARCH_TOTAL_CAP); // two 1h floors
+  assert.equal(calls, 3); // whole window + two halves, no deeper
 });
 
 test("ratioLevel: month VAMP figure drives transitions; null → ok", () => {

@@ -10,7 +10,7 @@ import type { BlockStore } from "../BlockStore";
 import type { BlockService } from "../BlockService";
 import type { BillingQolStore } from "../BillingQolStore";
 import type { CachedRatioEngine } from "../disputeRatio";
-import type { LightAiRunner } from "../../LightAiRunner";
+import type { ClaudeCodeRunner } from "../../ClaudeCodeRunner";
 
 // Shared dependency bundle handed to every hub (and the target resolver).
 export interface HubContext {
@@ -27,5 +27,7 @@ export interface HubContext {
   blockService: BlockService;
   qolStore: BillingQolStore;
   ratio: CachedRatioEngine;
-  lightAiRunner: LightAiRunner;
+  // Evidence drafting runs on the Claude Code CLI (Read/Glob/Grep over the
+  // cloned Postiz source + docs) so policy fields can cite real terms.
+  claudeRunner: ClaudeCodeRunner;
 }

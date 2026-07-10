@@ -40,7 +40,7 @@ import type { BlockStore } from "./billing/BlockStore";
 import type { BlockService } from "./billing/BlockService";
 import type { BillingQolStore } from "./billing/BillingQolStore";
 import type { CachedRatioEngine } from "./billing/disputeRatio";
-import type { LightAiRunner } from "./LightAiRunner";
+import type { ClaudeCodeRunner } from "./ClaudeCodeRunner";
 
 // Dispute-console + QoL dependencies handed through to the hubs.
 export interface BillingAdminExtras {
@@ -49,7 +49,7 @@ export interface BillingAdminExtras {
   blockService: BlockService;
   qolStore: BillingQolStore;
   ratio: CachedRatioEngine;
-  lightAiRunner: LightAiRunner;
+  claudeRunner: ClaudeCodeRunner;
 }
 
 type Handler<I> = (interaction: I) => Promise<void>;
@@ -125,7 +125,7 @@ export class BillingAdmin {
       blockService: extras.blockService,
       qolStore: extras.qolStore,
       ratio: extras.ratio,
-      lightAiRunner: extras.lightAiRunner,
+      claudeRunner: extras.claudeRunner,
     };
 
     this.targets = new TargetResolver(ctx);

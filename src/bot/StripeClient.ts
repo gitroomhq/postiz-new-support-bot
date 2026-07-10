@@ -1,5 +1,6 @@
 import Stripe from "stripe";
 import { BotConfig } from "../config";
+import { countWithSearchCap } from "./billing/disputeRatio";
 
 export interface SubscriptionInvoice {
   invoiceId: string;
@@ -516,18 +517,25 @@ export class StripeClient {
     return this.stripe.disputes.close(disputeId, {}, { idempotencyKey });
   }
 
-  // One-request count of succeeded charges created since a timestamp — the
-  // dispute-ratio denominator. Search exposes total_count (lists don't); its
-  // freshness lags up to ~1 minute, so callers cache results. extraQuery is
-  // appended verbatim (internal call sites only, never user input).
-  async countSucceededCharges(createdGte: number, extraQuery?: string): Promise<number> {
-    const res = await this.stripe.charges.search({
-      query:
-        `created>=${Math.floor(createdGte)} AND status:"succeeded"` + (extraQuery ? ` AND ${extraQuery}` : ""),
-      limit: 1,
-      expand: ["total_count"],
-    });
-    return res.total_count ?? 0;
+  // Count of succeeded charges in [createdGte, createdLt) — the dispute-ratio
+  // denominator. Search exposes total_count (lists don't) but CAPS it at
+  // 10,000, so busy windows are counted in recursively-split time slices
+  // (countWithSearchCap) — exact at any realistic volume for a few extra
+  // requests. Search freshness lags up to ~1 minute; callers cache results.
+  async countSucceededCharges(createdGte: number, createdLt?: number): Promise<number> {
+    const lt = Math.floor(createdLt ?? Date.now() / 1000 + 60);
+    return countWithSearchCap(
+      async (gte, sliceLt) => {
+        const res = await this.stripe.charges.search({
+          query: `created>=${Math.floor(gte)} AND created<${Math.floor(sliceLt)} AND status:"succeeded"`,
+          limit: 1,
+          expand: ["total_count"],
+        });
+        return res.total_count ?? 0;
+      },
+      Math.floor(createdGte),
+      lt
+    );
   }
 
   // Blockable identifiers derivable from a charge. The payment's client IP is

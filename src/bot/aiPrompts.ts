@@ -399,9 +399,12 @@ export interface DisputeEvidenceContext {
   fields: string[];
 }
 
-// Drafts dispute-evidence text for staff review. The output is STRICT JSON and
-// is only ever saved as a LOCAL draft — the AI path has no route to Stripe;
-// staging/submitting happens through the human-reviewed modal + confirm.
+// Drafts dispute-evidence text for staff review — runs on the Claude Code CLI
+// with Read/Glob/Grep over the cloned Postiz source + docs, so policy fields
+// can quote the REAL published terms instead of staying empty. The output is
+// STRICT JSON and is only ever saved as a LOCAL draft — the AI path has no
+// route to Stripe; staging/submitting happens through the human-reviewed
+// modal + confirm.
 export function buildDisputeEvidencePrompt(ctx: DisputeEvidenceContext): string {
   const facts = [
     `Dispute: ${ctx.disputeId} · reason ${ctx.reason} · status ${ctx.status} · amount ${ctx.amountText} · opened ${ctx.disputeCreated}${ctx.evidenceDueBy ? ` · evidence due ${ctx.evidenceDueBy}` : ""}`,
@@ -418,15 +421,17 @@ export function buildDisputeEvidencePrompt(ctx: DisputeEvidenceContext): string 
 
   return `You draft chargeback-dispute evidence for Postiz (a social-media scheduling SaaS, sold as a subscription; the merchant is the Postiz team).
 
+You are working inside the Postiz knowledge base: Read/Glob/Grep the product source at ./postiz-app and the documentation at ./postiz-docs. Search them for real, quotable material — refund/cancellation/terms policy pages, pricing and plan descriptions, feature docs, subscription/billing behavior in the code.
+
 Write from the merchant's perspective, factual and concise — evidence text is read by bank analysts who skim.
-STRICT RULES:
-- Use ONLY the facts below. NEVER invent order numbers, IP addresses, log lines, dates, communications or policies.
-- Where usage/access data is unavailable, return an EMPTY string for access_activity_log rather than fabricating one.
-- service_date should be the charge date unless the facts say otherwise. customer_email_address must be the customer's email from the facts (or empty).
+RULES:
+- Fill EVERY requested field with substantive text. No field may be empty.
+- Policy fields (refund_policy_disclosure, cancellation_policy_disclosure, cancellation_rebuttal): find the actual published policy/terms in the docs or source and quote or faithfully paraphrase them, noting where they are published. If no explicit policy document exists, accurately describe how the product verifiably behaves per the code/docs (e.g. self-service cancellation available anytime from the billing settings, subscriptions bill per period until cancelled) — never present behavior the code doesn't have.
+- NEVER invent customer-specific facts: no fabricated order numbers, IP addresses, raw log lines, dates or communications. Customer-specific content comes ONLY from the FACTS below — service_date is the charge date; customer_email_address is the customer's email; access_activity_log describes the factual account/billing history from the FACTS (signup date, subscription plan/status, renewal charges) in prose, not fabricated log lines.
 - Each field at most 3500 characters.
 
 FACTS:
 ${facts}
 
-Respond with ONLY a JSON object (no code fences, no commentary) whose keys are exactly: ${ctx.fields.join(", ")}.`;
+FINAL ANSWER: after your research, respond with ONLY a JSON object (no code fences, no commentary before or after it) whose keys are exactly: ${ctx.fields.join(", ")}.`;
 }

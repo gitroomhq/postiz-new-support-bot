@@ -40,7 +40,31 @@ export interface RatioStripeReads {
     createdGte: number,
     maxPages?: number
   ): Promise<{ efws: Stripe.Radar.EarlyFraudWarning[]; truncated: boolean }>;
-  countSucceededCharges(createdGte: number, extraQuery?: string): Promise<number>;
+  countSucceededCharges(createdGte: number, createdLt?: number): Promise<number>;
+}
+
+// Stripe's Search API caps total_count at 10,000 — a busy window reports
+// exactly 10000 instead of the real count (observed in prod: 90d showed
+// 36/10000 while 30d alone had ~7k charges). SEARCH_TOTAL_CAP is the detection
+// threshold; countWithSearchCap makes counts exact by splitting a capped time
+// slice in half and summing, recursing until every slice is under the cap (or
+// an hour wide — beyond that the cap is accepted as the floor).
+export const SEARCH_TOTAL_CAP = 10_000;
+const MIN_SLICE_S = 3600;
+
+export async function countWithSearchCap(
+  countOnce: (gte: number, lt: number) => Promise<number>,
+  gte: number,
+  lt: number
+): Promise<number> {
+  const count = await countOnce(gte, lt);
+  if (count < SEARCH_TOTAL_CAP || lt - gte <= MIN_SLICE_S) return count;
+  const mid = Math.floor((gte + lt) / 2);
+  const [left, right] = await Promise.all([
+    countWithSearchCap(countOnce, gte, mid),
+    countWithSearchCap(countOnce, mid, lt),
+  ]);
+  return left + right;
 }
 
 const DAY_S = 24 * 60 * 60;
@@ -106,15 +130,16 @@ export function buildWindowNumbers(
 }
 
 // One 90-day fetch each of disputes + EFWs (bucketed client-side per window)
-// plus three one-request succeeded-charge counts via charges.search.
+// plus succeeded-charge counts via charges.search (cap-split, so exact).
 export async function computeDisputeRatios(stripe: RatioStripeReads, now: Date = new Date()): Promise<DisputeRatios> {
   const starts = windowStarts(now);
+  const nowS = Math.floor(now.getTime() / 1000) + 60; // +60s: search indexing lag headroom
   const [disputesRes, efwsRes, succMonth, succ30, succ90] = await Promise.all([
     stripe.listDisputesSince(starts.d90),
     stripe.listEarlyFraudWarningsSince(starts.d90),
-    stripe.countSucceededCharges(starts.month),
-    stripe.countSucceededCharges(starts.d30),
-    stripe.countSucceededCharges(starts.d90),
+    stripe.countSucceededCharges(starts.month, nowS),
+    stripe.countSucceededCharges(starts.d30, nowS),
+    stripe.countSucceededCharges(starts.d90, nowS),
   ]);
 
   const bucket = (gte: number) => ({
@@ -148,12 +173,15 @@ function fmtPct(value: number | null): string {
 }
 
 // One embed-friendly line per window, shared by the hub header and the
-// threshold-alert embeds so both always show identical numbers.
+// threshold-alert embeds so both always show identical numbers. "inquiry-stage"
+// counts disputes created in the window that are CURRENTLY at inquiry stage
+// (incl. closed inquiries) — one recent inquiry therefore shows up in every
+// window, which is expected, not a stuck counter.
 export function describeRatioWindow(label: string, w: RatioWindowNumbers, truncated: boolean): string {
   const approx = truncated ? "≥" : "";
   const plain = `${approx}${w.chargebacks}/${w.succeeded} = ${fmtPct(w.plainPct)}`;
   const vamp = `${approx}${w.vampNumerator}/${w.succeeded} = ${fmtPct(w.vampPct)}`;
-  const inquiries = w.inquiries > 0 ? ` · ${w.inquiries} inquir${w.inquiries === 1 ? "y" : "ies"}` : "";
+  const inquiries = w.inquiries > 0 ? ` · ${w.inquiries} at inquiry stage` : "";
   return `**${label}** · disputes ${plain} · VAMP-style ${vamp}${inquiries}`;
 }
 
