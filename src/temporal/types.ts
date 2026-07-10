@@ -3,6 +3,13 @@
 // code (producers, activities, panel) — it must never import anything beyond
 // type-level TS. No Node builtins, no app modules.
 
+// Type-only deep import: the SearchAttributeKey interface itself is not
+// re-exported from the @temporalio/common package root (the pair/update
+// types are). Erased at compile time, so the workflow bundle never sees it.
+import type { SearchAttributeKey } from "@temporalio/common/lib/search-attributes";
+
+export type KeywordSaKey = SearchAttributeKey<"KEYWORD">;
+
 // ---- Workflow id scheme (id = dedup/collision semantics) ----
 
 export const ticketWorkflowId = (threadId: string): string => `ticket-${threadId}`;
@@ -13,6 +20,7 @@ export const inboxWorkflowId = (conversationId: string): string => `icx-${conver
 export const aiRunWorkflowId = (userId: string): string => `ai-run-${userId}`;
 export const scoreOneWorkflowId = (threadId: string): string => `score-one-${threadId}`;
 export const stripeEventWorkflowId = (eventId: string): string => `stripe-evt-${eventId}`;
+export const scoringBatchWorkflowId = (batchId: string): string => `scoring-batch-${batchId}`;
 export const refundWorkflowId = (chargeId: string): string => `refund-${chargeId}`;
 
 export const SINGLETONS = {
@@ -23,8 +31,45 @@ export const SINGLETONS = {
 } as const;
 
 export const VAULT_UPGRADE_WORKFLOW_ID = "vault-upgrade";
-export const MIGRATION_IMPORT_WORKFLOW_ID = "temporal-import-v1";
 export const STATUS_REPORT_SCHEDULE_ID = "status-report";
+
+// ---- Looper generations ----
+// Bump a looper's generation IN THE SAME COMMIT as any history-incompatible
+// change to its workflow body (changed activity order/types, new children,
+// different timers). ensureBaseline() terminates a running singleton whose
+// memo generation differs and starts a fresh run stamped with the new one —
+// that IS the upgrade path for loopers, because every deploy replays running
+// workflows on the new bundle (AUTO_UPGRADE, single in-process worker) and a
+// replay mismatch wedges the workflow with nondeterminism task failures.
+// Safe: all four loopers are stateless between iterations (state re-derived
+// from Postgres each tick; in-flight scoring batches are re-adopted via
+// scoringGetState). Stateful long-lived workflows (ticketWorkflow,
+// intercomInboxWorkflow) must use patched() instead — see README.
+export const LOOPER_GEN_MEMO_KEY = "looperGen";
+export const LOOPER_GENERATIONS: Record<string, number> = {
+  [SINGLETONS.kbRefresh]: 1,
+  [SINGLETONS.scoringLoop]: 2, // gen 2: scoringTick → getState/submit + per-batch children
+  [SINGLETONS.metricsSnapshot]: 1,
+  [SINGLETONS.cleanupLoop]: 1,
+};
+
+// ---- Custom search attributes ----
+// Registered idempotently by ensureSearchAttributes() (operator gRPC API over
+// the existing mTLS connection); producers attach them ONLY after
+// TemporalService.searchAttributesReady() confirms registration — a start or
+// upsert naming an UNREGISTERED attribute fails the whole command. Names are
+// permanent: SQL visibility cannot rename or re-type an attribute.
+export const SA_TICKET_THREAD_ID = { name: "ticketThreadId", type: "KEYWORD" } as const satisfies KeywordSaKey;
+export const SA_TICKET_STATUS = { name: "ticketStatus", type: "KEYWORD" } as const satisfies KeywordSaKey;
+export const SA_CONVERSATION_ID = { name: "conversationId", type: "KEYWORD" } as const satisfies KeywordSaKey;
+export const SA_AI_KIND = { name: "aiKind", type: "KEYWORD" } as const satisfies KeywordSaKey;
+
+export const CUSTOM_SEARCH_ATTRIBUTES: ReadonlyArray<KeywordSaKey> = [
+  SA_TICKET_THREAD_ID,
+  SA_TICKET_STATUS,
+  SA_CONVERSATION_ID,
+  SA_AI_KIND,
+];
 
 // ---- Signal / update names (string constants shared with producers) ----
 
@@ -79,6 +124,9 @@ export interface TicketSnapshot {
   closed: boolean;
   closedAtMs: number | null;
   statusTagId: string | null;
+  // Human status tag label (StatusTag.label) — the ticketStatus search
+  // attribute value. Renames apply on the ticket's next transition/scan.
+  statusLabel: string | null;
   tagClosesThread: boolean;
   tagIsResolved: boolean;
   tagReminderEnabled: boolean;
@@ -144,6 +192,8 @@ export interface StatusChangeResult {
   isResolved: boolean;
   closesThread: boolean;
   statusTagId: string;
+  // Label of the applied tag, for the ticketStatus search attribute.
+  statusLabel: string | null;
 }
 
 // ---- Ticket timer evaluation (reminder / resolved auto-close / re-close) ----
@@ -236,25 +286,43 @@ export type RefundOutcome =
       cancelledSubscriptionId: string | null;
     };
 
-// ---- Migration import ----
-
-export interface ImportTicketSeed {
-  threadId: string;
-  carry: TicketCarry;
-}
-
-export interface ImportSummary {
-  ticketWorkflowsStarted: number;
-  outboxImported: number;
-  inboxImported: number;
-}
-
 // ---- Looper activity results ----
 
 export interface KbTickResult {
   refreshed: boolean;
   ok: number;
   failed: number;
+}
+
+// ---- Scoring (per-batch child workflows for full lifecycle visibility) ----
+
+export interface ScoringState {
+  enabled: boolean;
+  // SUBMITTED Anthropic batch ids (restart/CAN adoption — each gets a child).
+  pendingBatchIds: string[];
+  due: boolean;
+  backfill: boolean;
+}
+
+export interface ScoringSubmitOutcome {
+  batchId: string | null;
+  submitted: number;
+  skipped: number;
+  drained: boolean;
+  budgetBlocked: boolean;
+}
+
+export interface ScoringBatchPoll {
+  status: "running" | "processed" | "failed";
+  processingStatus: string | null;
+}
+
+// scoringBatchWorkflow input; polls/deadlineAtMs are the Continue-As-New
+// carry so a long-lived batch keeps its poll count and 26h deadline.
+export interface ScoringBatchInput {
+  batchId: string;
+  polls?: number;
+  deadlineAtMs?: number;
 }
 
 export interface ReportTickResult {
@@ -285,7 +353,12 @@ export interface CoreActivities {
 
   // loopers
   kbTick(force: boolean): Promise<KbTickResult>;
-  scoringTick(): Promise<void>;
+  scoringGetState(): Promise<ScoringState>;
+  scoringSubmit(purpose: "interval" | "backfill"): Promise<ScoringSubmitOutcome>;
+  scoringPollBatch(batchId: string): Promise<ScoringBatchPoll>;
+  // Deadline backstop: fail a batch that outlived its processing window so
+  // its tickets become retryable (no-op if already finalized).
+  scoringExpireBatch(batchId: string): Promise<void>;
   snapshotTick(): Promise<void>;
   cleanupTick(): Promise<void>;
   publishStatusReport(force: boolean): Promise<ReportTickResult>;
@@ -299,12 +372,4 @@ export interface CoreActivities {
   handleStripeEvent(input: StripeEventInput): Promise<void>;
   executeRefundCore(input: RefundWorkflowInput): Promise<RefundOutcome>;
   runVaultUpgradeJob(): Promise<void>;
-
-  // migration import
-  importListTickets(): Promise<ImportTicketSeed[]>;
-  importStartTicketWorkflows(seeds: ImportTicketSeed[]): Promise<number>;
-  importOutboxRows(): Promise<number>;
-  importInboxRows(): Promise<number>;
-  importEnsureBaseline(): Promise<void>;
-  importWriteAudit(summary: ImportSummary): Promise<void>;
 }

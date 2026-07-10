@@ -7,6 +7,7 @@ import type { VaultService } from "../vault/VaultService";
 import { log } from "../util/logger";
 import { RetryBuffer, type BufferedOp } from "./RetryBuffer";
 import { loadTemporalTls, parseCertInfo, type TemporalCertInfo, type TemporalTlsMaterial } from "./certs";
+import { describeSaResult, ensureSearchAttributes, type SaEnsureResult } from "./searchAttributes";
 
 const temporalLog = log.child("temporal");
 
@@ -78,6 +79,8 @@ export interface TemporalTestReport {
   visibilityOk: boolean;
   runningWorkflows: number | null;
   visibilityError: string | null;
+  searchAttributesOk: boolean;
+  searchAttributesDetail: string | null;
 }
 
 export class TemporalService {
@@ -89,6 +92,7 @@ export class TemporalService {
   private lastFailureLogAtMs = 0;
   private buffer = new RetryBuffer(500);
   private overflowAnnounced = false;
+  private saResult: SaEnsureResult | null = null;
   private recoveredHooks: Array<() => Promise<void> | void> = [];
   private timer: NodeJS.Timeout | null = null;
   private ticking = false;
@@ -163,6 +167,46 @@ export class TemporalService {
     this.recoveredHooks.push(hook);
   }
 
+  // ---- custom search attributes ----
+
+  // Producers attach search attributes to starts only while this is true — a
+  // start naming an unregistered attribute would fail the whole command.
+  searchAttributesReady(): boolean {
+    return this.saResult?.ok === true;
+  }
+
+  searchAttributeStatus(): SaEnsureResult | null {
+    return this.saResult;
+  }
+
+  // Manual retry (panel button / Test Connection): re-runs the idempotent
+  // registration — e.g. after operator-API permissions were granted without a
+  // reconnect. Never throws.
+  async ensureSearchAttributesNow(): Promise<SaEnsureResult> {
+    const client = await this.client();
+    if (!client || !this.conn) {
+      return {
+        ok: false,
+        added: [],
+        present: [],
+        mismatched: [],
+        error: this.lastErrorMsg ?? this.configError() ?? "temporal unavailable",
+      };
+    }
+    this.saResult = await ensureSearchAttributes(this.conn, this.envConfig().namespace);
+    return this.saResult;
+  }
+
+  // Once per connection lifetime (memoized on success, retried on every
+  // reconnect — the namespace may have been re-pointed via /config).
+  private async ensureSearchAttributesOnce(): Promise<void> {
+    if (this.saResult?.ok === true || !this.conn) return;
+    this.saResult = await ensureSearchAttributes(this.conn, this.envConfig().namespace);
+    temporalLog.info("temporal.search_attributes", {
+      "temporal.sa_status": describeSaResult(this.saResult),
+    });
+  }
+
   tlsMaterial(): TemporalTlsMaterial | null {
     return loadTemporalTls(this.vault);
   }
@@ -173,6 +217,8 @@ export class TemporalService {
   // probe loop keeps trying.
   async init(): Promise<void> {
     await this.teardownConnection();
+    // Re-check registration against the (possibly re-pointed) namespace.
+    this.saResult = null;
     if (!this.configured()) {
       this.stateVal = "unconfigured";
       this.lastErrorMsg = null;
@@ -313,6 +359,7 @@ export class TemporalService {
       await this.teardownConnection();
       await this.ensureConnected();
       await this.healthCheck();
+      await this.ensureSearchAttributesOnce();
       const prev = this.stateVal;
       this.stateVal = "up";
       this.lastErrorMsg = null;
@@ -533,6 +580,8 @@ export class TemporalService {
       visibilityOk: false,
       runningWorkflows: null,
       visibilityError: null,
+      searchAttributesOk: false,
+      searchAttributesDetail: null,
     };
     report.configError = this.configError();
     report.configured = report.configError == null;
@@ -580,6 +629,10 @@ export class TemporalService {
     } catch (e) {
       report.visibilityError = e instanceof Error ? e.message : String(e);
     }
+    // Doubles as the repair action: re-runs the idempotent registration.
+    const sa = await this.ensureSearchAttributesNow();
+    report.searchAttributesOk = sa.ok;
+    report.searchAttributesDetail = describeSaResult(sa);
     return report;
   }
 }

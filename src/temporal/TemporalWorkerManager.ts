@@ -17,6 +17,16 @@ const workerLog = log.child("temporal:worker");
 const PROMOTE_ATTEMPTS = 30;
 const PROMOTE_BACKOFF_MS = 2_000;
 
+// Shared-process safety caps (SDK defaults: 100 / 40). These bound how many
+// tasks execute SIMULTANEOUSLY — open workflows are unlimited; excess tasks
+// just queue server-side for moments. The Discord bot, Prisma pool and
+// Anthropic/Discord HTTP clients share this event loop; the sizing case is a
+// post-outage burst of ticket timer-scans (3-6 Discord REST calls each) —
+// 25 keeps discord.js's rate-limit queue and the heap bounded while a few
+// hundred backlogged scans still drain in about a minute. Bump via deploy.
+const MAX_CONCURRENT_ACTIVITIES = 25;
+const MAX_CONCURRENT_WORKFLOW_TASKS = 20;
+
 let runtimeInstalled = false;
 
 export class TemporalWorkerManager {
@@ -99,6 +109,8 @@ export class TemporalWorkerManager {
       // Combined-process memory hygiene: the Discord bot shares this heap.
       maxCachedWorkflows: 100,
       reuseV8Context: true,
+      maxConcurrentActivityTaskExecutions: MAX_CONCURRENT_ACTIVITIES,
+      maxConcurrentWorkflowTaskExecutions: MAX_CONCURRENT_WORKFLOW_TASKS,
     });
 
     // worker.run() resolves only on shutdown; trap errors so a worker crash

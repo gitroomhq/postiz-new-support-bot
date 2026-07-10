@@ -177,12 +177,14 @@ model BotSettings {
   vaultTransitMount   String    @default("transit")
   vaultTransitKey     String    @default("support-bot")
   vaultMigratedAt     DateTime?
-  // Temporal migration kill switch: OFF = the legacy in-process setInterval
-  // schedulers run exactly as before; ON = they stay stopped and the Temporal
-  // worker owns all background work. Connection is edited via /config →
+  // Temporal worker pause switch: ON = the worker polls and owns all
+  // background work; OFF = the worker is drained and background work pauses
+  // (fire-and-forget signals keep landing server-side and process on resume;
+  // there is no legacy scheduler fallback). Connection is edited via /config →
   // Temporal → Connection (deploy has no .env access; TEMPORAL_* env vars are
   // first-boot fallbacks only). The mTLS client cert lives in Vault KV
-  // ("temporal" entry). temporalImportDoneAt = one-time state import done.
+  // ("temporal" entry). temporalImportDoneAt = historical timestamp of the
+  // one-time migration import (machinery removed after the cutover).
   temporalEnabled        Boolean   @default(false)
   temporalAddress        String?   // "host:port" of the mTLS frontend
   temporalNamespace      String?
@@ -449,29 +451,10 @@ model IntercomLink {
   @@map("intercom_links")
 }
 
-model IntercomOutboxEvent {
-  id             String   @id @default(cuid())
-  // Global monotonic sequence; per-ticket FIFO comes from draining only the
-  // lowest-seq PENDING event per ticket.
-  seq            Int      @unique @default(autoincrement())
-  ticketThreadId String
-  type           String // ensure | message | note | status | priority | csat
-  payload        Json
-  status         String   @default("PENDING") // PENDING | DEAD
-  attempts       Int      @default(0)
-  nextAttemptAt  DateTime @default(now())
-  lastError      String?
-  createdAt      DateTime @default(now())
-
-  @@index([ticketThreadId, seq])
-  @@index([status, nextAttemptAt])
-  @@map("intercom_outbox")
-}
-
 // Part-id ledger for echo suppression (Intercom has no writable content stamp).
-// The outbox records every conversation/ticket part the bridge creates; the
-// webhook handler atomically claims each part it sees — a conflict means it's
-// either the bridge's own echo or a duplicate delivery, and gets dropped.
+// The bridge records every conversation/ticket part it creates; the webhook
+// handler atomically claims each part it sees — a conflict means it's either
+// the bridge's own echo or a duplicate delivery, and gets dropped.
 model IntercomEchoPart {
   id             String   @id @default(cuid())
   kind           String // "c" = conversation part, "t" = ticket part, "r" = relay body-hash dedup
@@ -482,26 +465,6 @@ model IntercomEchoPart {
   @@unique([kind, partId])
   @@index([createdAt])
   @@map("intercom_echo_parts")
-}
-
-// Durable inbound webhook queue: the HTTP route only inserts a row and 200s;
-// IntercomInboxScheduler processes rows in seq order with retry/dead-letter.
-// deliveryId dedupes Intercom's single redelivery attempt.
-model IntercomInboxEvent {
-  id            String   @id @default(cuid())
-  seq           Int      @unique @default(autoincrement())
-  deliveryId    String?  @unique
-  topic         String
-  payload       Json
-  status        String   @default("PENDING") // PENDING | DEAD
-  attempts      Int      @default(0) // real processing failures (dead-letters at MAX_ATTEMPTS)
-  deferAttempts Int      @default(0) // echo-suppression defers (bounded by MAX_DEFER_ATTEMPTS); kept separate so heavy deferral doesn't burn the retry budget
-  nextAttemptAt DateTime @default(now())
-  lastError     String?
-  receivedAt    DateTime @default(now())
-
-  @@index([status, nextAttemptAt])
-  @@map("intercom_inbox")
 }
 
 // Dedup ledger for incoming Stripe webhook events (Stripe redelivers on non-2xx

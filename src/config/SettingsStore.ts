@@ -806,8 +806,9 @@ export class SettingsStore {
 
   // ---- Temporal (edited via /config → Temporal; certs live in Vault KV) ----
 
-  // OFF = the legacy in-process setInterval schedulers run; ON = they stay
-  // stopped and the Temporal worker owns all background work.
+  // Worker pause switch: ON = the worker polls and owns all background work;
+  // OFF = the worker is drained and background work pauses (signals park
+  // server-side; no legacy fallback exists).
   temporalEnabled(): boolean {
     return this.settings.temporalEnabled;
   }

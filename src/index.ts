@@ -16,8 +16,6 @@ import { CategoryRegistry } from "./bot/CategoryRegistry";
 import { TicketStore } from "./bot/TicketStore";
 import { StatusService } from "./bot/StatusService";
 import { AuditLogger } from "./bot/AuditLogger";
-import { ReminderScheduler } from "./bot/ReminderScheduler";
-import { RecloseScheduler } from "./bot/RecloseScheduler";
 import { StatusReportService } from "./bot/StatusReportService";
 import { StatusReportScheduler } from "./bot/StatusReportScheduler";
 import { KnowledgeBaseScheduler } from "./bot/KnowledgeBaseScheduler";
@@ -28,13 +26,11 @@ import { HowToCategory, BugsCategory, BillingCategory } from "./categories";
 import { IntercomClient } from "./intercom/IntercomClient";
 import { IntercomStore } from "./intercom/IntercomStore";
 import { IntercomSyncService } from "./intercom/IntercomSyncService";
-import { IntercomOutboxScheduler } from "./intercom/IntercomOutboxScheduler";
 import { IntercomEventExecutor } from "./intercom/IntercomEventExecutor";
 import { IntercomWebhookHandler } from "./intercom/IntercomWebhookHandler";
-import { IntercomInboxScheduler } from "./intercom/IntercomInboxScheduler";
 import { IntercomInboxApp } from "./intercom/IntercomInboxApp";
 import { initSentry, shutdownSentry, captureFatal, log } from "./util/logger";
-import { safe, setAiRecordContent, withTickSpan } from "./util/instrument";
+import { safe, setAiRecordContent } from "./util/instrument";
 import { initInflux, reconfigureInflux, shutdownInflux } from "./metrics/InfluxWriter";
 import { VaultService } from "./vault/VaultService";
 import { VaultMigrator } from "./vault/VaultMigrator";
@@ -44,7 +40,6 @@ import { TicketAiRunStore } from "./bot/TicketAiRunStore";
 import { LightAiRunner } from "./bot/LightAiRunner";
 import { TicketScoreStore } from "./scoring/TicketScoreStore";
 import { TicketScoringService } from "./scoring/TicketScoringService";
-import { ScoringScheduler } from "./scoring/ScoringScheduler";
 import { TemporalService } from "./temporal/TemporalService";
 import { TemporalWorkerManager } from "./temporal/TemporalWorkerManager";
 import { TemporalProducers } from "./temporal/producers";
@@ -52,15 +47,6 @@ import { createActivities } from "./temporal/activities";
 import { resolveBuildId } from "./temporal/buildId";
 
 const bootLog = log.child("bootstrap");
-
-// The eleven legacy in-process timers as one switchable unit: OFF-regime runs
-// them exactly as before; the Temporal regime keeps them stopped (workflows own
-// the work). Deleted entirely in release N+1.
-interface LegacySchedulerGroup {
-  start(): void;
-  stop(): void;
-  running(): boolean;
-}
 
 async function main() {
   const config = loadConfig();
@@ -153,8 +139,9 @@ async function main() {
   const intercomStore = new IntercomStore(prisma);
   const intercomClient = new IntercomClient(settingsStore);
   const intercomSync = new IntercomSyncService(settingsStore, intercomStore, sessionStore, ticketStore);
-  // Shared Intercom API executor: the legacy outbox scheduler AND the Temporal
-  // delivery activity both delegate to this one instance (shared caches).
+  // Shared Intercom API executor: the Temporal delivery activity and the
+  // sync service's unconfigured-bootstrap direct fallback both delegate to
+  // this one instance (shared caches).
   const intercomExecutor = new IntercomEventExecutor(
     intercomClient,
     intercomStore,
@@ -163,6 +150,7 @@ async function main() {
     intercomSync,
     auditLogger
   );
+  intercomSync.setExecutor(intercomExecutor);
   const aiRunStore = new AiRunStore(prisma);
   const ticketAiRunStore = new TicketAiRunStore(prisma);
   const scoreStore = new TicketScoreStore(prisma);
@@ -268,82 +256,17 @@ async function main() {
     stripeWebhookHandler.ensureEndpoint().catch((e) => bootLog.error("stripe webhook registration failed", e));
   }
 
-  // ---- Legacy in-process schedulers, as one switchable unit ----
+  // ---- Activity tick-providers (bodies driven by the Temporal loopers) ----
 
-  const reminderScheduler = new ReminderScheduler(bot.client, settingsStore, ticketStore, statusService, auditLogger, tierStore);
   const statusReportScheduler = new StatusReportScheduler(bot.client, settingsStore, reportService);
-  const recloseScheduler = new RecloseScheduler(bot.client, ticketStore, auditLogger);
-  const intercomOutboxScheduler = new IntercomOutboxScheduler(
-    intercomClient,
-    intercomStore,
-    settingsStore,
-    ticketStore,
-    intercomSync,
-    auditLogger,
-    intercomExecutor
-  );
-  const intercomInboxScheduler = new IntercomInboxScheduler(intercomStore, intercomWebhookHandler, auditLogger);
-  // Batch AI scoring of closed tickets (polls in-flight batches every tick,
-  // resumes across restarts via the persisted batch ids).
-  const scoringScheduler = new ScoringScheduler(settingsStore, scoringService);
-  // Periodic Influx gauge snapshots (open tickets, queues, bot_health).
-  const snapshotScheduler = new SnapshotScheduler(prisma, settingsStore, ticketStore, intercomStore);
+  // Influx gauge snapshot body for the metricsSnapshotWorkflow's snapshotTick.
+  const snapshotScheduler = new SnapshotScheduler(prisma, settingsStore, ticketStore);
 
-  // /ai run history lives 3 days past ticket close (a reopen inside the window
-  // keeps it) — hourly sweep, plus one pass at boot to catch downtime.
-  const purgeAiRunHistory = () =>
-    ticketAiRunStore.purgeForClosedTickets().catch((e) => bootLog.error("ai run history purge failed", e));
-  void purgeAiRunHistory();
+  // One boot-time pass to catch downtime; the steady-state purge runs in the
+  // cleanupLoopWorkflow's cleanupTick.
+  void ticketAiRunStore.purgeForClosedTickets().catch((e) => bootLog.error("ai run history purge failed", e));
 
-  const legacySchedulers: LegacySchedulerGroup = (() => {
-    let purgeTimer: NodeJS.Timeout | null = null;
-    let cleanupTimer: NodeJS.Timeout | null = null;
-    let isRunning = false;
-    return {
-      running: () => isRunning,
-      start() {
-        if (isRunning) return;
-        isRunning = true;
-        reminderScheduler.start();
-        statusReportScheduler.start();
-        recloseScheduler.start();
-        // Periodically git-pull the cloned Postiz source/docs so AI answers track upstream.
-        kbScheduler.start();
-        intercomOutboxScheduler.start();
-        intercomInboxScheduler.start();
-        scoringScheduler.start();
-        snapshotScheduler.start();
-        purgeTimer = setInterval(purgeAiRunHistory, 60 * 60 * 1000);
-        // Clean expired pending auths + old Stripe webhook dedup rows every 5 minutes.
-        cleanupTimer = setInterval(() => {
-          withTickSpan("clean-pending-auths", () => sessionStore.cleanExpiredPending()).catch((e) =>
-            log.child("scheduler:clean-pending").error("tick failed", e)
-          );
-          withTickSpan("clean-stripe-events", () => sessionStore.cleanOldStripeEvents()).catch((e) =>
-            log.child("scheduler:clean-stripe-events").error("tick failed", e)
-          );
-        }, 5 * 60 * 1000);
-      },
-      stop() {
-        if (!isRunning) return;
-        isRunning = false;
-        reminderScheduler.stop();
-        statusReportScheduler.stop();
-        recloseScheduler.stop();
-        kbScheduler.stop();
-        intercomOutboxScheduler.stop();
-        intercomInboxScheduler.stop();
-        scoringScheduler.stop();
-        snapshotScheduler.stop();
-        if (purgeTimer) clearInterval(purgeTimer);
-        if (cleanupTimer) clearInterval(cleanupTimer);
-        purgeTimer = null;
-        cleanupTimer = null;
-      },
-    };
-  })();
-
-  // ---- Temporal worker + regime switch ----
+  // ---- Temporal worker (all background work lives in workflows) ----
 
   const workerManager = new TemporalWorkerManager(temporalService, resolveBuildId());
   const activities = createActivities({
@@ -371,17 +294,18 @@ async function main() {
     producers: temporalProducers,
   });
 
-  // Live regime switch (also the /config toggle handler): ON starts the worker
-  // BEFORE stopping legacy — a few seconds of overlap is safe (legacy ticks
-  // are idempotent, DB-state driven); OFF starts legacy before draining the
-  // worker so there is never a gap with nothing running.
-  const setRegime = async (enabled: boolean): Promise<void> => {
+  // Worker pause switch (also the /config toggle handler). ON: reconcile
+  // looper generations + ensure the baseline singletons BEFORE the worker
+  // polls — a stale-generation terminate landing first means a bump deploy
+  // never surfaces nondeterminism task failures — then start the worker.
+  // OFF: drain the worker; background work pauses (fire-and-forget signals
+  // keep landing server-side and process on resume; sync seams fall back to
+  // their direct in-process paths).
+  const setWorkerActive = async (enabled: boolean): Promise<void> => {
     if (enabled) {
-      await workerManager.start(activities as unknown as Record<string, unknown>);
-      legacySchedulers.stop();
       await temporalProducers.ensureBaseline().catch((e) => bootLog.error("temporal baseline setup failed", e));
+      await workerManager.start(activities as unknown as Record<string, unknown>);
     } else {
-      legacySchedulers.start();
       await workerManager.shutdown();
     }
   };
@@ -390,42 +314,46 @@ async function main() {
     producers: temporalProducers,
     service: temporalService,
     workerManager,
-    legacyRunning: () => legacySchedulers.running(),
-    setEnabled: setRegime,
+    setEnabled: setWorkerActive,
+  });
+
+  // Temporal was down during boot (or the worker failed to start): once it
+  // recovers, reconcile the baseline and bring the worker up if it should be.
+  temporalService.onRecovered(async () => {
+    if (!workerOnly && settingsStore.temporalEnabled() && !workerManager.running()) {
+      await setWorkerActive(true);
+    }
   });
 
   if (workerOnly) {
-    // Worker role only: poll regardless of the kill switch (the flag exists so
+    // Worker role only: poll regardless of the pause switch (the flag exists so
     // a future split can run workers while the bot process owns the switch).
     await workerManager.start(activities as unknown as Record<string, unknown>);
     bootLog.info("running in --worker-only mode");
   } else if (settingsStore.temporalEnabled()) {
     try {
-      await setRegime(true);
-      bootLog.info("temporal regime active", { "temporal.build_id": resolveBuildId() });
+      await setWorkerActive(true);
+      bootLog.info("temporal worker active", { "temporal.build_id": resolveBuildId() });
     } catch (e) {
-      // Deliberate policy (user decision): with the kill switch ON, legacy
-      // schedulers stay OFF even when Temporal can't come up — running
-      // workflow timers continue server-side; producers buffer. The audit
-      // embed + /config panel surface it; flipping the toggle is the escape.
-      bootLog.error("temporal worker failed to start — background work is paused until it recovers or the toggle is flipped", e);
+      // Running workflow timers continue server-side; producers buffer; the
+      // onRecovered hook above starts the worker when Temporal comes back.
+      bootLog.error("temporal worker failed to start — background work is paused until it recovers", e);
       void auditLogger.log({
         title: "⏱️ Temporal worker failed to start",
         severity: "warn",
         description:
           "temporalEnabled is on but the worker could not start (Vault certs missing or server unreachable). " +
-          "Background processing is paused — fix the connection or flip /config → Temporal off.",
+          "Background processing is paused — it resumes automatically when the connection recovers.",
         fields: [{ name: "Error", value: (e instanceof Error ? e.message : String(e)).slice(0, 1024), inline: false }],
       });
     }
   } else {
-    legacySchedulers.start();
+    bootLog.warn("temporal worker paused (temporalEnabled off) — background work does not run until it is re-enabled");
   }
 
   // Graceful shutdown
   const shutdown = async () => {
     bootLog.info("shutting down");
-    legacySchedulers.stop();
     // Drain in-flight activities before tearing down the Discord client and
     // Prisma — activities use both.
     await workerManager.shutdown(15_000);

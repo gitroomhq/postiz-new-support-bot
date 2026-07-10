@@ -248,22 +248,13 @@ const STATEMENTS: string[] = [
   `CREATE UNIQUE INDEX IF NOT EXISTS "intercom_links_ticketThreadId_key" ON "intercom_links"("ticketThreadId")`,
   `CREATE UNIQUE INDEX IF NOT EXISTS "intercom_links_conversationId_key" ON "intercom_links"("conversationId")`,
   `CREATE UNIQUE INDEX IF NOT EXISTS "intercom_links_ticketId_key" ON "intercom_links"("ticketId")`,
-  `CREATE TABLE IF NOT EXISTS "intercom_outbox" (
-    "id" TEXT NOT NULL,
-    "seq" SERIAL,
-    "ticketThreadId" TEXT NOT NULL,
-    "type" TEXT NOT NULL,
-    "payload" JSONB NOT NULL,
-    "status" TEXT NOT NULL DEFAULT 'PENDING',
-    "attempts" INTEGER NOT NULL DEFAULT 0,
-    "nextAttemptAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    "lastError" TEXT,
-    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT "intercom_outbox_pkey" PRIMARY KEY ("id")
-  )`,
-  `CREATE UNIQUE INDEX IF NOT EXISTS "intercom_outbox_seq_key" ON "intercom_outbox"("seq")`,
-  `CREATE INDEX IF NOT EXISTS "intercom_outbox_ticketThreadId_seq_idx" ON "intercom_outbox"("ticketThreadId", "seq")`,
-  `CREATE INDEX IF NOT EXISTS "intercom_outbox_status_nextAttemptAt_idx" ON "intercom_outbox"("status", "nextAttemptAt")`,
+  // Removed durable Intercom queue tables (drained by the one-time Temporal
+  // migration import; the queues live in workflows now). Destructive
+  // convergence like the Chatwoot cleanup above: DEAD-row history was also
+  // posted as audit embeds at the time. A rollback to a pre-cleanup build
+  // recreates them empty via that build's own ensureSchema.
+  `DROP TABLE IF EXISTS "intercom_outbox"`,
+  `DROP TABLE IF EXISTS "intercom_inbox"`,
   `CREATE TABLE IF NOT EXISTS "intercom_echo_parts" (
     "id" TEXT NOT NULL,
     "kind" TEXT NOT NULL,
@@ -298,28 +289,8 @@ const STATEMENTS: string[] = [
       UPDATE "status_tags" SET "isCustomerReplyTarget" = true WHERE "label" = 'Waiting for Developer';
     END IF;
   END $$;`,
-  // Intercom bridge overhaul: durable inbound webhook queue, reserve→confirm
-  // echo records, inbound tag-diff damper, snooze tag + Sentry DSN settings.
-  `CREATE TABLE IF NOT EXISTS "intercom_inbox" (
-    "id" TEXT NOT NULL,
-    "seq" SERIAL,
-    "deliveryId" TEXT,
-    "topic" TEXT NOT NULL,
-    "payload" JSONB NOT NULL,
-    "status" TEXT NOT NULL DEFAULT 'PENDING',
-    "attempts" INTEGER NOT NULL DEFAULT 0,
-    "deferAttempts" INTEGER NOT NULL DEFAULT 0,
-    "nextAttemptAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    "lastError" TEXT,
-    "receivedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT "intercom_inbox_pkey" PRIMARY KEY ("id")
-  )`,
-  // Existing installs: echo-defers used to share the `attempts` counter, so a
-  // heavily-deferred part could dead-letter on its first real failure. Split them.
-  `ALTER TABLE "intercom_inbox" ADD COLUMN IF NOT EXISTS "deferAttempts" INTEGER NOT NULL DEFAULT 0`,
-  `CREATE UNIQUE INDEX IF NOT EXISTS "intercom_inbox_seq_key" ON "intercom_inbox"("seq")`,
-  `CREATE UNIQUE INDEX IF NOT EXISTS "intercom_inbox_deliveryId_key" ON "intercom_inbox"("deliveryId")`,
-  `CREATE INDEX IF NOT EXISTS "intercom_inbox_status_nextAttemptAt_idx" ON "intercom_inbox"("status", "nextAttemptAt")`,
+  // Intercom bridge overhaul: reserve→confirm echo records, inbound tag-diff
+  // damper, snooze tag + Sentry DSN settings.
   `CREATE TABLE IF NOT EXISTS "intercom_pending_posts" (
     "id" TEXT NOT NULL,
     "ticketThreadId" TEXT NOT NULL,

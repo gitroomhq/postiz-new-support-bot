@@ -2,21 +2,16 @@ import { Client, TextChannel } from "discord.js";
 import { SettingsStore } from "../config/SettingsStore";
 import { StatusReportService } from "./StatusReportService";
 import { log } from "../util/logger";
-import { withTickSpan, wasCaptured } from "../util/instrument";
+import { withTickSpan } from "../util/instrument";
 
 const schedLog = log.child("scheduler:status-report");
 
 const HOUR_MS = 60 * 60 * 1000;
-// How often we re-check whether a report is due. Kept short and decoupled from the configured
-// cadence so that after a restart the scheduled post fires within ~a minute rather than waiting
-// a full interval. The once-per-day guard makes every extra check a cheap in-memory no-op.
-const CHECK_INTERVAL_MS = 60 * 1000;
 
 export class StatusReportScheduler {
-  private timer: NodeJS.Timeout | null = null;
-  // Guards against a publish outlasting the 60s tick: a second tick could pass
-  // the shouldPublish gate before recordReportRun persists and double-post. (The
-  // Intercom schedulers use the same draining pattern.)
+  // Guards against overlapping publishes (an overlapping Schedule fire or a
+  // manual trigger racing a scheduled one) — the once-per-day guard persists
+  // only after the publish completes.
   private publishing = false;
 
   constructor(
@@ -25,35 +20,10 @@ export class StatusReportScheduler {
     private reportService: StatusReportService
   ) {}
 
-  start(): void {
-    // Check once right away. setInterval's first tick is a full interval out, so without this a
-    // restart after the scheduled time — or a crash-loop that never stays up a whole interval —
-    // would post the report late or miss it for the day entirely. Re-checking on every startup
-    // means the report goes out as long as the process is up at some point past the scheduled
-    // time; the once-per-day guard prevents a double-post.
-    this.runTick();
-    this.timer = setInterval(() => this.runTick(), CHECK_INTERVAL_MS);
-  }
-
-  private runTick(): void {
-    this.tick().catch((err) => {
-      if (!wasCaptured(err)) schedLog.error("tick failed", err);
-    });
-  }
-
-  stop(): void {
-    if (this.timer) clearInterval(this.timer);
-    this.timer = null;
-  }
-
-  async tick(): Promise<void> {
-    await this.publishIfDue(false);
-  }
-
-  // Shared by the legacy 60s tick and the Temporal publishStatusReportWorkflow
-  // activity. force=true (the /config "Run Report Now" path) bypasses the
-  // due-check but still respects the enabled/channel gates and the in-flight
-  // guard. Returns whether a report actually went out.
+  // The body of the Temporal publishStatusReportWorkflow activity (fired by
+  // the "status-report" Schedule or the /config "Run Report Now" button).
+  // force=true bypasses the due-check but still respects the enabled/channel
+  // gates and the in-flight guard. Returns whether a report actually went out.
   async publishIfDue(force: boolean): Promise<{ published: boolean }> {
     if (!this.settings.reportEnabled()) return { published: false };
     const channelId = this.settings.reportChannelId();

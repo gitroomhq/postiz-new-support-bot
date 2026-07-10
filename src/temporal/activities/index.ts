@@ -13,7 +13,7 @@ import type { KnowledgeBaseScheduler } from "../../bot/KnowledgeBaseScheduler";
 import type { StatusReportScheduler } from "../../bot/StatusReportScheduler";
 import type { StripeWebhookHandler } from "../../bot/StripeWebhookHandler";
 import type { TicketAiRunStore } from "../../bot/TicketAiRunStore";
-import { RESOLVED_EMOJI } from "../../bot/StatusService";
+import { RECLOSE_DELAY_MS, RESOLVED_EMOJI } from "../../bot/StatusService";
 import type { BillingCategory } from "../../categories/BillingCategory";
 import type { IntercomStore } from "../../intercom/IntercomStore";
 import type { IntercomSyncService } from "../../intercom/IntercomSyncService";
@@ -30,22 +30,11 @@ import { reconfigureInflux } from "../../metrics/InfluxWriter";
 import { embed, COLORS } from "../../util/embeds";
 import { log } from "../../util/logger";
 import type { TemporalProducers } from "../producers";
-import {
-  SIG_INBOUND_EVENT,
-  SIG_INTERCOM_ENQUEUE,
-  inboxWorkflowId,
-  ticketWorkflowId,
-  type CoreActivities,
-  type IcEventType,
-  type ImportTicketSeed,
-  type TicketSnapshot,
-  type TimerCheckResult,
-} from "../types";
+import { type CoreActivities, type IcEventType, type TicketSnapshot, type TimerCheckResult } from "../types";
 
 const actLog = log.child("temporal:activities");
 
 const DAY_MS = 24 * 60 * 60 * 1000;
-const RECLOSE_DELAY_MS = 30 * 60 * 1000;
 const DEFAULT_RESOLVED_AUTO_CLOSE_DAYS = 3;
 // Politeness pacing between Intercom API deliveries (was CALL_SPACING_MS in
 // the legacy drain loop — now a worker-global limiter across activities).
@@ -123,6 +112,7 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
         closed: false,
         closedAtMs: null,
         statusTagId: null,
+        statusLabel: null,
         tagClosesThread: false,
         tagIsResolved: false,
         tagReminderEnabled: false,
@@ -144,6 +134,7 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
       closed: ticket.closed,
       closedAtMs: ticket.closedAt?.getTime() ?? null,
       statusTagId: ticket.statusTagId,
+      statusLabel: tag?.label ?? null,
       tagClosesThread: tag?.closesThread ?? false,
       tagIsResolved: tag?.emoji === RESOLVED_EMOJI,
       tagReminderEnabled: tag?.reminderEnabled ?? false,
@@ -369,10 +360,10 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
       const ticket = await ticketStore.getByThreadId(input.threadId);
       const tag = settingsStore.tagById(input.tagId);
       if (!ticket) {
-        return { applied: false, reason: "not a tracked ticket", closed: false, isResolved: false, closesThread: false, statusTagId: input.tagId };
+        return { applied: false, reason: "not a tracked ticket", closed: false, isResolved: false, closesThread: false, statusTagId: input.tagId, statusLabel: null };
       }
       if (!tag) {
-        return { applied: false, reason: "unknown status tag", closed: ticket.closed, isResolved: false, closesThread: false, statusTagId: input.tagId };
+        return { applied: false, reason: "unknown status tag", closed: ticket.closed, isResolved: false, closesThread: false, statusTagId: input.tagId, statusLabel: null };
       }
       const isResolved = tag.emoji === RESOLVED_EMOJI;
       const isDone = tag.closesThread || isResolved;
@@ -385,7 +376,7 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
         await intercomSync
           .onStatusChanged(input.threadId, ticket.statusTag ?? null, tag, input.actorName)
           .catch(() => {});
-        return { applied: true, closed: true, isResolved, closesThread: tag.closesThread, statusTagId: tag.id };
+        return { applied: true, closed: true, isResolved, closesThread: tag.closesThread, statusTagId: tag.id, statusLabel: tag.label };
       }
       await statusService.applyStatusDirect(thread, ticket, tag, {
         actorName: input.actorName,
@@ -393,7 +384,7 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
         actorIconUrl: input.actorIconUrl ?? undefined,
         silent: input.silent,
       });
-      return { applied: true, closed: isDone, isResolved, closesThread: tag.closesThread, statusTagId: tag.id };
+      return { applied: true, closed: isDone, isResolved, closesThread: tag.closesThread, statusTagId: tag.id, statusLabel: tag.label };
     },
 
     async applyPriorityStep(input) {
@@ -531,31 +522,62 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
       return { refreshed: false, ok: 0, failed: 0 };
     },
 
-    // Verbatim ScoringScheduler.tick(): poll in-flight Anthropic batches,
-    // submit when due / backfill pending, one batch in flight.
-    async scoringTick() {
-      if (!settingsStore.scoringEnabled()) return;
-      if (!scoringService.hasDiscordClient()) return;
-      heartbeat();
-      await scoringService.pollBatches();
-      if (await scoringService.hasPendingBatches()) return;
-
-      const backfill = settingsStore.scoringBackfillPending();
+    // Scoring loop state: is a submit due, and which Anthropic batches are
+    // still in flight (each gets its own scoring-batch-<id> child workflow).
+    async scoringGetState() {
+      const enabled = settingsStore.scoringEnabled() && scoringService.hasDiscordClient();
+      const pending = enabled
+        ? await deps.prisma.scoringBatch.findMany({
+            where: { status: "SUBMITTED" },
+            orderBy: { submittedAt: "asc" },
+            select: { anthropicBatchId: true },
+          })
+        : [];
       const lastRun = settingsStore.scoringLastRunAt();
       const intervalMs = Math.max(1, settingsStore.scoringIntervalHours()) * 60 * 60 * 1000;
-      const due = !lastRun || Date.now() - lastRun.getTime() >= intervalMs;
-      if (!backfill && !due) return;
+      return {
+        enabled,
+        pendingBatchIds: pending.map((p) => p.anthropicBatchId),
+        due: !lastRun || Date.now() - lastRun.getTime() >= intervalMs,
+        backfill: settingsStore.scoringBackfillPending(),
+      };
+    },
 
+    // Submit one batch (transcript gathering + Anthropic create) and keep the
+    // legacy bookkeeping: recordScoringRun on any work, clear the backfill
+    // flag when the last unscored ticket drained.
+    async scoringSubmit(purpose) {
       heartbeat();
-      const result = await scoringService.submitBatch(backfill ? "backfill" : "interval");
-      if (result.budgetBlocked) return;
-      if (result.submitted > 0 || result.skipped > 0) {
-        await settingsStore.recordScoringRun();
+      const result = await scoringService.submitBatch(purpose);
+      if (!result.budgetBlocked) {
+        if (result.submitted > 0 || result.skipped > 0) {
+          await settingsStore.recordScoringRun();
+        }
+        if (purpose === "backfill" && result.drained) {
+          await settingsStore.setScoringBackfillPending(false);
+          actLog.info("scoring.backfill_complete");
+        }
       }
-      if (backfill && result.drained) {
-        await settingsStore.setScoringBackfillPending(false);
-        actLog.info("scoring.backfill_complete");
-      }
+      return {
+        batchId: result.batchId,
+        submitted: result.submitted,
+        skipped: result.skipped,
+        drained: result.drained,
+        budgetBlocked: result.budgetBlocked,
+      };
+    },
+
+    // One poll round-trip for one batch; when Anthropic reports "ended" this
+    // same call fetches + processes every result (scores, Influx, audit).
+    async scoringPollBatch(batchId) {
+      heartbeat();
+      return scoringService.pollBatchOnce(batchId);
+    },
+
+    // 26h deadline backstop from scoringBatchWorkflow: flip a stuck batch to
+    // FAILED so its tickets become retryable (no-op if already finalized).
+    async scoringExpireBatch(batchId) {
+      await scoringService.expireBatch(batchId);
     },
 
     // Influx gauge snapshots; queue-depth gauges re-sourced from Temporal
@@ -624,121 +646,6 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
       heartbeat();
       await vaultMigrator.runUpgradeJob();
       reconfigureInflux(settingsStore.influxConfig());
-    },
-
-    // ================= migration import =================
-
-    // Open tickets + closed tickets that still owe work (pending re-close or
-    // PENDING outbox rows) each get a ticket workflow.
-    async importListTickets(): Promise<ImportTicketSeed[]> {
-      heartbeat();
-      const rows = await deps.prisma.ticket.findMany({
-        where: { OR: [{ closed: false }, { recloseAt: { not: null } }] },
-        select: { threadId: true },
-      });
-      const pendingOutbox = await deps.prisma.intercomOutboxEvent.findMany({
-        where: { status: "PENDING" },
-        select: { ticketThreadId: true },
-        distinct: ["ticketThreadId"],
-      });
-      const ids = new Set<string>(rows.map((r) => r.threadId));
-      for (const r of pendingOutbox) ids.add(r.ticketThreadId);
-      return [...ids].map((threadId) => ({
-        threadId,
-        carry: { outbox: [], outboxSeq: 0, statusSeq: 0, hasIntercomLink: false, lastEventMs: null },
-      }));
-    },
-
-    // signal-with-start(noop) per ticket: idempotent against already-running
-    // workflows; a fresh start rehydrates from Postgres via loadTicketState.
-    async importStartTicketWorkflows(seeds) {
-      let started = 0;
-      const c = await producers.service().client();
-      if (!c) throw new Error("temporal client unavailable");
-      for (const seed of seeds) {
-        heartbeat();
-        await c.workflow.signalWithStart("ticketWorkflow", {
-          workflowId: ticketWorkflowId(seed.threadId),
-          taskQueue: producers.service().envConfig().taskQueue,
-          args: [{ threadId: seed.threadId }],
-          signal: "noop",
-          signalArgs: [],
-        });
-        started++;
-      }
-      return started;
-    },
-
-    // Replay PENDING outbox rows as intercomEnqueue signals in seq order per
-    // ticket, then mark them IMPORTED so a re-run skips them. DEAD rows stay
-    // as the audit record until the table is dropped in release N+1.
-    async importOutboxRows() {
-      const c = await producers.service().client();
-      if (!c) throw new Error("temporal client unavailable");
-      const rows = await deps.prisma.intercomOutboxEvent.findMany({
-        where: { status: "PENDING" },
-        orderBy: { seq: "asc" },
-      });
-      let imported = 0;
-      for (const row of rows) {
-        heartbeat();
-        await c.workflow.signalWithStart("ticketWorkflow", {
-          workflowId: ticketWorkflowId(row.ticketThreadId),
-          taskQueue: producers.service().envConfig().taskQueue,
-          args: [{ threadId: row.ticketThreadId }],
-          signal: SIG_INTERCOM_ENQUEUE,
-          signalArgs: [{ type: row.type as IcEventType, payload: row.payload }],
-        });
-        await deps.prisma.intercomOutboxEvent.update({ where: { id: row.id }, data: { status: "IMPORTED" } });
-        imported++;
-      }
-      return imported;
-    },
-
-    // Same for the inbound queue → per-conversation inbox workflows.
-    async importInboxRows() {
-      const c = await producers.service().client();
-      if (!c) throw new Error("temporal client unavailable");
-      const rows = await deps.prisma.intercomInboxEvent.findMany({
-        where: { status: "PENDING" },
-        orderBy: { seq: "asc" },
-      });
-      let imported = 0;
-      for (const row of rows) {
-        heartbeat();
-        const payload = row.payload as { data?: { item?: { id?: unknown } } } | null;
-        const itemId = payload?.data?.item?.id;
-        if (itemId != null) {
-          await c.workflow.signalWithStart("intercomInboxWorkflow", {
-            workflowId: inboxWorkflowId(String(itemId)),
-            taskQueue: producers.service().envConfig().taskQueue,
-            args: [{ conversationId: String(itemId) }],
-            signal: SIG_INBOUND_EVENT,
-            signalArgs: [{ deliveryId: row.deliveryId, topic: row.topic, payload: row.payload }],
-          });
-          imported++;
-        }
-        await deps.prisma.intercomInboxEvent.update({ where: { id: row.id }, data: { status: "IMPORTED" } });
-      }
-      return imported;
-    },
-
-    async importEnsureBaseline() {
-      await producers.ensureBaseline();
-    },
-
-    async importWriteAudit(summary) {
-      await settingsStore.updateTemporal({ temporalImportDoneAt: new Date() });
-      void auditLogger.log({
-        title: "⏱️ Temporal import completed",
-        severity: "success",
-        actor: "Temporal migration",
-        fields: [
-          { name: "Ticket workflows", value: String(summary.ticketWorkflowsStarted), inline: true },
-          { name: "Outbox events imported", value: String(summary.outboxImported), inline: true },
-          { name: "Inbox events imported", value: String(summary.inboxImported), inline: true },
-        ],
-      });
     },
   };
 }

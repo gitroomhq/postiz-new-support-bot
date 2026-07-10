@@ -8,7 +8,14 @@ import {
   intercomDeliveryChildId,
   stripeEventWorkflowId,
   aiRunWorkflowId,
+  scoringBatchWorkflowId,
+  CUSTOM_SEARCH_ATTRIBUTES,
+  LOOPER_GEN_MEMO_KEY,
+  LOOPER_GENERATIONS,
+  SINGLETONS,
 } from "../types";
+import { looperStartOptions } from "../looperGeneration";
+import { ensureSearchAttributes, describeSaResult } from "../searchAttributes";
 import { FIXTURE_CERT_PEM, FIXTURE_KEY_PEM } from "./certFixture";
 
 const op = (id: string): BufferedOp => ({
@@ -81,4 +88,126 @@ test("workflow id scheme matches the documented shapes", () => {
   assert.equal(intercomDeliveryChildId("123", 7), "icd-123-7");
   assert.equal(stripeEventWorkflowId("evt_1"), "stripe-evt-evt_1");
   assert.equal(aiRunWorkflowId("42"), "ai-run-42");
+  assert.equal(scoringBatchWorkflowId("msgbatch_1"), "scoring-batch-msgbatch_1");
+});
+
+test("every looper singleton has an integer generation ≥ 1", () => {
+  for (const id of Object.values(SINGLETONS)) {
+    const gen = LOOPER_GENERATIONS[id];
+    assert.ok(Number.isInteger(gen) && gen >= 1, `missing/invalid generation for ${id}: ${gen}`);
+  }
+});
+
+test("scoring-loop is pinned at generation 2 (the per-batch-children rework)", () => {
+  // Regression pin: lowering this re-wedges any still-running gen-2 singleton.
+  assert.equal(LOOPER_GENERATIONS[SINGLETONS.scoringLoop], 2);
+});
+
+test("looperStartOptions stamps the code generation into the memo", () => {
+  const opts = looperStartOptions(SINGLETONS.scoringLoop);
+  assert.deepEqual(opts, { memo: { [LOOPER_GEN_MEMO_KEY]: 2 } });
+  assert.deepEqual(looperStartOptions("unknown-id"), { memo: { [LOOPER_GEN_MEMO_KEY]: 1 } });
+});
+
+test("custom search attribute keys are unique KEYWORDs with stable names", () => {
+  const names = CUSTOM_SEARCH_ATTRIBUTES.map((k) => k.name);
+  assert.deepEqual(names, ["ticketThreadId", "ticketStatus", "conversationId", "aiKind"]);
+  assert.equal(new Set(names).size, names.length);
+  for (const key of CUSTOM_SEARCH_ATTRIBUTES) assert.equal(key.type, "KEYWORD");
+});
+
+// ---- ensureSearchAttributes against a stubbed operator service ----
+
+type SaConn = Parameters<typeof ensureSearchAttributes>[0];
+const KEYWORD = 2; // temporal.api.enums.v1.IndexedValueType.INDEXED_VALUE_TYPE_KEYWORD
+
+const stubConn = (impl: {
+  list: () => Promise<{ customAttributes?: Record<string, number> }>;
+  add?: (req: { namespace: string; searchAttributes: Record<string, number> }) => Promise<unknown>;
+}): SaConn =>
+  ({
+    operatorService: {
+      listSearchAttributes: impl.list,
+      addSearchAttributes: impl.add ?? (async () => ({})),
+    },
+  }) as unknown as SaConn;
+
+const allRegistered = (): Record<string, number> =>
+  Object.fromEntries(CUSTOM_SEARCH_ATTRIBUTES.map((k) => [k.name, KEYWORD]));
+
+test("ensureSearchAttributes: everything already present → ok, nothing added", async () => {
+  let added = false;
+  const res = await ensureSearchAttributes(
+    stubConn({
+      list: async () => ({ customAttributes: allRegistered() }),
+      add: async () => {
+        added = true;
+        return {};
+      },
+    }),
+    "ns"
+  );
+  assert.equal(res.ok, true);
+  assert.equal(added, false);
+  assert.equal(res.present.length, CUSTOM_SEARCH_ATTRIBUTES.length);
+  assert.deepEqual(res.added, []);
+  assert.match(describeSaResult(res), /^ok \(4\)$/);
+});
+
+test("ensureSearchAttributes: missing subset is registered and verified", async () => {
+  const server: Record<string, number> = { ticketThreadId: KEYWORD };
+  const res = await ensureSearchAttributes(
+    stubConn({
+      list: async () => ({ customAttributes: { ...server } }),
+      add: async (req) => {
+        Object.assign(server, req.searchAttributes);
+        return {};
+      },
+    }),
+    "ns"
+  );
+  assert.equal(res.ok, true);
+  assert.deepEqual(res.added.sort(), ["aiKind", "conversationId", "ticketStatus"]);
+  assert.deepEqual(res.present, ["ticketThreadId"]);
+});
+
+test("ensureSearchAttributes: type mismatch is reported and never auto-fixed", async () => {
+  const res = await ensureSearchAttributes(
+    stubConn({
+      list: async () => ({ customAttributes: { ...allRegistered(), ticketStatus: 3 /* INT */ } }),
+      add: async () => {
+        throw new Error("must not add on mismatch");
+      },
+    }),
+    "ns"
+  );
+  assert.equal(res.ok, false);
+  assert.deepEqual(res.mismatched, ["ticketStatus"]);
+});
+
+test("ensureSearchAttributes: ALREADY_EXISTS race from a concurrent registrar is success", async () => {
+  const res = await ensureSearchAttributes(
+    stubConn({
+      list: async () => ({ customAttributes: allRegistered() /* the racer won */ }),
+      add: async () => {
+        throw new Error("search attribute ticketStatus already exists");
+      },
+    }),
+    "ns"
+  );
+  assert.equal(res.ok, true);
+});
+
+test("ensureSearchAttributes: RPC failure never throws, reports error", async () => {
+  const res = await ensureSearchAttributes(
+    stubConn({
+      list: async () => {
+        throw new Error("PERMISSION_DENIED: operator API");
+      },
+    }),
+    "ns"
+  );
+  assert.equal(res.ok, false);
+  assert.match(res.error ?? "", /PERMISSION_DENIED/);
+  assert.match(describeSaResult(res), /^error:/);
 });

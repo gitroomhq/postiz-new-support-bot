@@ -16,6 +16,10 @@ const statusLog = log.child("status");
 
 export const RESOLVED_EMOJI = "✅";
 
+// Chatter in a closed ticket re-locks the thread after this much silence
+// (the ticket workflow's exact re-close deadline; every message pushes it).
+export const RECLOSE_DELAY_MS = 30 * 60 * 1000;
+
 // The subset of a Ticket that applyStatus needs. statusTag is the previous tag
 // shown in the audit trail; the rating prompt is gated by a DB claim (once per
 // close cycle — reopening re-arms it), not by a row field. Callers always pass

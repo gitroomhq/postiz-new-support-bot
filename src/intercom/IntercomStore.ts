@@ -1,5 +1,4 @@
-import { PrismaClient, IntercomLink, IntercomOutboxEvent, IntercomInboxEvent } from "../generated/prisma/client";
-import { OutboxEventType, OutboxPayload } from "./types";
+import { PrismaClient, IntercomLink } from "../generated/prisma/client";
 
 // Relay body-hash dedup rides the echo-part table under this kind (partId =
 // "<threadId>:<bodyHash>"). Fresh window: same body seen twice within it is a
@@ -7,11 +6,10 @@ import { OutboxEventType, OutboxPayload } from "./types";
 const RELAY_KIND = "r";
 const RELAY_FRESH_MS = 2 * 60 * 1000;
 
-// Persistence for the Intercom bridge: thread↔conversation/ticket links, the
-// durable outbox, and the echo-part ledger. Events are executed in per-ticket
-// FIFO order — the drain query returns only the head (lowest seq) PENDING
-// event per ticket, so a failing event blocks its own ticket's queue and
-// nothing else.
+// Persistence for the Intercom bridge: thread↔conversation/ticket links and
+// the echo-part / pending-post ledgers. The durable outbox/inbox queue tables
+// are gone — per-ticket FIFO delivery lives in the ticket workflow's outbox
+// and the per-conversation inbox workflow.
 export class IntercomStore {
   constructor(private prisma: PrismaClient) {}
 
@@ -194,73 +192,6 @@ export class IntercomStore {
     return result.count;
   }
 
-  // ---- Inbound inbox (durable webhook queue) ----
-
-  // false = duplicate delivery (same notification event id) — already queued.
-  async acceptInbound(deliveryId: string | null, topic: string, payload: object): Promise<boolean> {
-    try {
-      await this.prisma.intercomInboxEvent.create({
-        data: { deliveryId: deliveryId || null, topic, payload },
-      });
-      return true;
-    } catch (e) {
-      if ((e as { code?: string }).code === "P2002") return false;
-      throw e;
-    }
-  }
-
-  async listDueInbound(limit: number): Promise<IntercomInboxEvent[]> {
-    return this.prisma.intercomInboxEvent.findMany({
-      where: { status: "PENDING", nextAttemptAt: { lte: new Date() } },
-      orderBy: { seq: "asc" },
-      take: limit,
-    });
-  }
-
-  async deleteInbound(id: string): Promise<void> {
-    await this.prisma.intercomInboxEvent.deleteMany({ where: { id } });
-  }
-
-  async markInboundRetry(id: string, attempts: number, nextAttemptAt: Date, lastError: string): Promise<void> {
-    await this.prisma.intercomInboxEvent.updateMany({
-      where: { id },
-      data: { attempts, nextAttemptAt, lastError: lastError.slice(0, 1000) },
-    });
-  }
-
-  // An echo-defer is not a failure: it advances its OWN counter (bounded by
-  // MAX_DEFER_ATTEMPTS) and leaves `attempts` — the real-failure retry budget —
-  // untouched, so a heavily-deferred part still gets full retries afterwards.
-  async markInboundDefer(id: string, deferAttempts: number, nextAttemptAt: Date, lastError: string): Promise<void> {
-    await this.prisma.intercomInboxEvent.updateMany({
-      where: { id },
-      data: { deferAttempts, nextAttemptAt, lastError: lastError.slice(0, 1000) },
-    });
-  }
-
-  async markInboundDead(id: string, lastError: string): Promise<void> {
-    await this.prisma.intercomInboxEvent.updateMany({
-      where: { id },
-      data: { status: "DEAD", lastError: lastError.slice(0, 1000) },
-    });
-  }
-
-  async retryDeadInbound(): Promise<number> {
-    const result = await this.prisma.intercomInboxEvent.updateMany({
-      where: { status: "DEAD" },
-      data: { status: "PENDING", attempts: 0, nextAttemptAt: new Date() },
-    });
-    return result.count;
-  }
-
-  async inboundCounts(): Promise<{ pending: number; dead: number }> {
-    const [pending, dead] = await Promise.all([
-      this.prisma.intercomInboxEvent.count({ where: { status: "PENDING" } }),
-      this.prisma.intercomInboxEvent.count({ where: { status: "DEAD" } }),
-    ]);
-    return { pending, dead };
-  }
-
   // ---- Inbound tag-diff damper ----
 
   async setLastTags(ticketThreadId: string, tags: string[]): Promise<void> {
@@ -270,105 +201,15 @@ export class IntercomStore {
     });
   }
 
-  // ---- Outbox ----
-
-  async enqueue(ticketThreadId: string, type: OutboxEventType, payload: OutboxPayload): Promise<void> {
-    await this.prisma.intercomOutboxEvent.create({
-      data: { ticketThreadId, type, payload: payload as object },
-    });
-  }
-
-  // Backfill uses this so a ticket is either fully enqueued or not at all —
-  // re-runs after a crash can then safely key off hasLinkOrPendingEnsure.
-  async enqueueMany(events: Array<{ ticketThreadId: string; type: OutboxEventType; payload: OutboxPayload }>): Promise<void> {
-    await this.prisma.intercomOutboxEvent.createMany({
-      data: events.map((e) => ({ ticketThreadId: e.ticketThreadId, type: e.type, payload: e.payload as object })),
-    });
-  }
-
-  async hasPendingEnsure(ticketThreadId: string): Promise<boolean> {
-    const count = await this.prisma.intercomOutboxEvent.count({
-      where: { ticketThreadId, type: "ensure", status: "PENDING" },
-    });
-    return count > 0;
-  }
-
-  // Queued content-producing events for this thread (message/note) — the
-  // webhook handler defers echo decisions while any are in flight.
-  async hasPendingOutboundContent(ticketThreadId: string): Promise<boolean> {
-    const count = await this.prisma.intercomOutboxEvent.count({
-      where: { ticketThreadId, type: { in: ["message", "note", "ensure"] }, status: "PENDING" },
-    });
-    return count > 0;
-  }
-
-  async hasLinkOrPendingEnsure(ticketThreadId: string): Promise<boolean> {
-    if (await this.getLink(ticketThreadId)) return true;
-    return this.hasPendingEnsure(ticketThreadId);
-  }
-
-  // Head (lowest seq) PENDING event per ticket, due now, oldest tickets first.
-  async listDueHeads(limit: number): Promise<IntercomOutboxEvent[]> {
-    return this.prisma.$queryRawUnsafe<IntercomOutboxEvent[]>(
-      `SELECT * FROM (
-         SELECT DISTINCT ON ("ticketThreadId") *
-         FROM "intercom_outbox"
-         WHERE "status" = 'PENDING'
-         ORDER BY "ticketThreadId", "seq" ASC
-       ) heads
-       WHERE "nextAttemptAt" <= NOW()
-       ORDER BY "seq" ASC
-       LIMIT $1`,
-      limit
-    );
-  }
-
-  async markSuccess(id: string): Promise<void> {
-    await this.prisma.intercomOutboxEvent.deleteMany({ where: { id } });
-  }
-
-  async markRetry(id: string, attempts: number, nextAttemptAt: Date, lastError: string): Promise<void> {
-    await this.prisma.intercomOutboxEvent.updateMany({
-      where: { id },
-      data: { attempts, nextAttemptAt, lastError: lastError.slice(0, 1000) },
-    });
-  }
-
-  async markDead(id: string, lastError: string): Promise<void> {
-    await this.prisma.intercomOutboxEvent.updateMany({
-      where: { id },
-      data: { status: "DEAD", lastError: lastError.slice(0, 1000) },
-    });
-  }
-
-  // Re-queues dead-lettered events (config panel "Retry failed" button).
-  async retryDead(): Promise<number> {
-    const result = await this.prisma.intercomOutboxEvent.updateMany({
-      where: { status: "DEAD" },
-      data: { status: "PENDING", attempts: 0, nextAttemptAt: new Date() },
-    });
-    return result.count;
-  }
-
-  async counts(): Promise<{ pending: number; dead: number }> {
-    const [pending, dead] = await Promise.all([
-      this.prisma.intercomOutboxEvent.count({ where: { status: "PENDING" } }),
-      this.prisma.intercomOutboxEvent.count({ where: { status: "DEAD" } }),
-    ]);
-    return { pending, dead };
-  }
-
-  // Full bridge-state wipe (links + queue + echo ledger). Touches NOTHING in
+  // Full bridge-state wipe (links + echo/pending ledgers). Touches NOTHING in
   // Intercom itself — use when the Intercom side was cleared/recreated and the
   // local bookkeeping is stale; the next backfill rebuilds everything.
-  async resetAll(): Promise<{ links: number; events: number; parts: number }> {
-    const [links, events, parts] = await this.prisma.$transaction([
+  async resetAll(): Promise<{ links: number; parts: number }> {
+    const [links, parts] = await this.prisma.$transaction([
       this.prisma.intercomLink.deleteMany(),
-      this.prisma.intercomOutboxEvent.deleteMany(),
       this.prisma.intercomEchoPart.deleteMany(),
-      this.prisma.intercomInboxEvent.deleteMany(),
       this.prisma.intercomPendingPost.deleteMany(),
     ]);
-    return { links: links.count, events: events.count, parts: parts.count };
+    return { links: links.count, parts: parts.count };
   }
 }

@@ -1,13 +1,17 @@
 import { WithStartWorkflowOperation, type Client, type ScheduleSpec } from "@temporalio/client";
-import { WorkflowExecutionAlreadyStartedError } from "@temporalio/common";
+import { WorkflowExecutionAlreadyStartedError, type SearchAttributePair } from "@temporalio/common";
 import type { SettingsStore } from "../config/SettingsStore";
 import { log } from "../util/logger";
 import type { GatewayResult, TemporalService } from "./TemporalService";
+import { looperStartOptions, reconcileLooperGeneration } from "./looperGeneration";
 import {
   aiRunWorkflowId,
   inboxWorkflowId,
-  MIGRATION_IMPORT_WORKFLOW_ID,
+  LOOPER_GENERATIONS,
   refundWorkflowId,
+  SA_AI_KIND,
+  SA_CONVERSATION_ID,
+  SA_TICKET_THREAD_ID,
   scoreOneWorkflowId,
   SIG_HUMAN_MESSAGE,
   SIG_INBOUND_EVENT,
@@ -25,6 +29,7 @@ import {
   UPD_APPLY_PRIORITY,
   UPD_APPLY_STATUS,
   VAULT_UPGRADE_WORKFLOW_ID,
+  type KeywordSaKey,
   type AiRunInput,
   type ApplyStatusResult,
   type HumanMessageSignal,
@@ -54,17 +59,21 @@ export interface TemporalOpsBinding {
     deploymentVersion(): { deploymentName: string; buildId: string };
     promoted(): boolean | null;
   };
-  legacyRunning: () => boolean;
-  // Flip the regime live: ON = start worker then stop legacy schedulers,
-  // OFF = start legacy then drain the worker. Persisting temporalEnabled is
-  // the caller's job (the /config toggle does both).
+  // The temporalEnabled toggle is a worker PAUSE (there is no legacy regime):
+  // ON = reconcile looper generations + start the worker, OFF = drain the
+  // worker (background work pauses; signals keep landing server-side).
+  // Persisting temporalEnabled is the caller's job (the /config toggle does both).
   setEnabled: (enabled: boolean) => Promise<void>;
 }
 
 // The thin facade every producer call site goes through (DiscordBot handlers,
 // StatusService/IntercomSyncService seams, CallbackServer webhooks, Vault
-// hooks). Owns the "is Temporal the active regime?" branch: callers check
-// enabled() and fall back to their legacy path when it's off.
+// hooks). Two gates:
+// - routable(): Temporal is configured — fire-and-forget signals are sent even
+//   while the worker is paused (they land server-side and process on resume).
+// - enabled(): the worker is meant to be active (pause toggle && configured) —
+//   gates the synchronous seams whose callers need an immediate result and
+//   fall back to their direct in-process path otherwise.
 
 export class TemporalProducers {
   constructor(
@@ -72,13 +81,33 @@ export class TemporalProducers {
     private settings: SettingsStore
   ) {}
 
-  // Kill switch AND prerequisites: true = Temporal owns background work.
+  // Worker-active gate (pause toggle AND prerequisites).
   enabled(): boolean {
     return this.temporal.enabled();
   }
 
+  // Configured gate for fire-and-forget signals (ignores the pause toggle).
+  routable(): boolean {
+    return this.temporal.configured();
+  }
+
   service(): TemporalService {
     return this.temporal;
+  }
+
+  // Typed-search-attribute start options, attached ONLY once registration is
+  // confirmed — a start naming an unregistered attribute fails the whole
+  // command, so this helper is how SAs stay unable to break anything. (A
+  // buffered op enqueued while ready could flush against a re-pointed
+  // namespace lacking SAs; the flush failure re-buffers — accepted edge.)
+  private sa(
+    pairs: Array<{ key: KeywordSaKey; value: string | null | undefined }>
+  ): { typedSearchAttributes?: SearchAttributePair[] } {
+    if (!this.temporal.searchAttributesReady()) return {};
+    const list = pairs
+      .filter((p): p is { key: KeywordSaKey; value: string } => p.value != null && p.value !== "")
+      .map((p) => ({ key: p.key, value: p.value }));
+    return list.length > 0 ? { typedSearchAttributes: list } : {};
   }
 
   // ---- ticket workflow signals (buffered fire-and-forget) ----
@@ -90,6 +119,7 @@ export class TemporalProducers {
       args: [{ threadId }],
       signalName,
       signalArgs,
+      options: { ...this.sa([{ key: SA_TICKET_THREAD_ID, value: threadId }]) },
     });
   }
 
@@ -133,6 +163,7 @@ export class TemporalProducers {
         taskQueue: this.temporal.envConfig().taskQueue,
         args: [{ threadId }],
         workflowIdConflictPolicy: "USE_EXISTING",
+        ...this.sa([{ key: SA_TICKET_THREAD_ID, value: threadId }]),
       });
       return await client.workflow.executeUpdateWithStart(updateName, {
         args: [arg],
@@ -157,17 +188,23 @@ export class TemporalProducers {
       args: [{ conversationId }],
       signalName: SIG_INBOUND_EVENT,
       signalArgs: [evt],
+      options: { ...this.sa([{ key: SA_CONVERSATION_ID, value: conversationId }]) },
     });
   }
 
   // ---- Stripe webhook (dedup by workflow id) ----
 
-  async stripeEvent(eventId: string, eventJson: string): Promise<GatewayResult> {
+  async stripeEvent(eventId: string, eventJson: string, eventType?: string): Promise<GatewayResult> {
     return this.temporal.startWorkflow({
       workflowType: "stripeEventWorkflow",
       workflowId: stripeEventWorkflowId(eventId),
       args: [{ eventId, eventJson }],
-      options: { workflowIdReusePolicy: "ALLOW_DUPLICATE_FAILED_ONLY" },
+      options: {
+        workflowIdReusePolicy: "ALLOW_DUPLICATE_FAILED_ONLY",
+        // UI context only — the event type in the workflow list beats opening
+        // the input payload.
+        ...(eventType ? { memo: { eventType } } : {}),
+      },
     });
   }
 
@@ -185,6 +222,11 @@ export class TemporalProducers {
         args: [input],
         workflowIdConflictPolicy: "FAIL",
         workflowIdReusePolicy: "ALLOW_DUPLICATE",
+        memo: { sub: input.sub, threadId: input.threadId },
+        ...this.sa([
+          { key: SA_TICKET_THREAD_ID, value: input.threadId },
+          { key: SA_AI_KIND, value: input.sub },
+        ]),
       });
       return "started";
     } catch (e) {
@@ -194,12 +236,32 @@ export class TemporalProducers {
     }
   }
 
-  async startScoreOne(threadId: string): Promise<GatewayResult> {
-    return this.temporal.startWorkflow({
-      workflowType: "scoreOneWorkflow",
-      workflowId: scoreOneWorkflowId(threadId),
-      args: [{ threadId }],
-    });
+  // /config "Score one now": synchronous outcome; null = Temporal unavailable
+  // or the workflow failed — the caller falls back to the direct in-process
+  // call (same seam shape as executeRefund). USE_EXISTING joins a double-click
+  // onto the already-running score for that thread.
+  async executeScoreOne(threadId: string): Promise<string | null> {
+    const client = await this.temporal.client();
+    if (!client) return null;
+    try {
+      return (await client.workflow.execute("scoreOneWorkflow", {
+        workflowId: scoreOneWorkflowId(threadId),
+        taskQueue: this.temporal.envConfig().taskQueue,
+        args: [{ threadId }],
+        workflowIdConflictPolicy: "USE_EXISTING",
+        workflowIdReusePolicy: "ALLOW_DUPLICATE",
+        ...this.sa([
+          { key: SA_TICKET_THREAD_ID, value: threadId },
+          { key: SA_AI_KIND, value: "score_one" },
+        ]),
+      })) as string;
+    } catch (e) {
+      prodLog.warn("score-one workflow failed — caller falls back to direct call", {
+        "ticket.thread_id": threadId,
+        "error.message": e instanceof Error ? e.message : String(e),
+      });
+      return null;
+    }
   }
 
   // ---- billing (synchronous outcome; null = Temporal unavailable) ----
@@ -213,6 +275,7 @@ export class TemporalProducers {
         taskQueue: this.temporal.envConfig().taskQueue,
         args: [input],
         workflowIdConflictPolicy: "USE_EXISTING",
+        ...this.sa([{ key: SA_TICKET_THREAD_ID, value: input.threadId }]),
       });
     } catch (e) {
       prodLog.warn("refund workflow failed", { "error.message": e instanceof Error ? e.message : String(e) });
@@ -230,19 +293,13 @@ export class TemporalProducers {
     });
   }
 
-  async startMigrationImport(): Promise<GatewayResult> {
-    return this.temporal.startWorkflow({
-      workflowType: "migrationImportWorkflow",
-      workflowId: MIGRATION_IMPORT_WORKFLOW_ID,
-      options: { workflowIdConflictPolicy: "USE_EXISTING" },
-    });
-  }
-
   async kbRefreshNow(): Promise<GatewayResult> {
     return this.temporal.signalWithStart({
       workflowType: "kbRefreshWorkflow",
       workflowId: SINGLETONS.kbRefresh,
       signalName: SIG_KB_REFRESH_NOW,
+      // A race-start from this button must stamp the generation memo too.
+      options: looperStartOptions(SINGLETONS.kbRefresh),
     });
   }
 
@@ -251,6 +308,7 @@ export class TemporalProducers {
       workflowType: "scoringLoopWorkflow",
       workflowId: SINGLETONS.scoringLoop,
       signalName: SIG_SCORING_RUN_NOW,
+      options: looperStartOptions(SINGLETONS.scoringLoop),
     });
   }
 
@@ -265,9 +323,11 @@ export class TemporalProducers {
 
   // ---- baseline: singleton loopers + the status-report Schedule ----
 
-  // Idempotent; called at boot while temporalEnabled and by the migration
-  // import. Signal-with-start(noop) starts a missing looper and no-ops a
-  // running one.
+  // Idempotent; runs before the worker starts (boot / toggle ON) and on
+  // Temporal recovery. Reconciles each singleton's generation first — a
+  // running looper whose workflow body changed shape this release
+  // (LOOPER_GENERATIONS bump) is terminated so the signal-with-start below
+  // brings up a fresh run on the new code; see the note in types.ts.
   async ensureBaseline(): Promise<void> {
     const singles: Array<[string, string]> = [
       ["kbRefreshWorkflow", SINGLETONS.kbRefresh],
@@ -275,8 +335,31 @@ export class TemporalProducers {
       ["metricsSnapshotWorkflow", SINGLETONS.metricsSnapshot],
       ["cleanupLoopWorkflow", SINGLETONS.cleanupLoop],
     ];
+    const client = await this.temporal.client();
     for (const [type, id] of singles) {
-      await this.temporal.signalWithStart({ workflowType: type, workflowId: id, signalName: SIG_NOOP });
+      if (client) {
+        try {
+          const r = await reconcileLooperGeneration(client, id, LOOPER_GENERATIONS[id] ?? 1);
+          if (r.action === "terminated") {
+            prodLog.info("looper generation changed — restarting singleton", {
+              "temporal.workflow_id": id,
+              "looper.gen_from": r.runningGen ?? 0,
+              "looper.gen_to": r.wantedGen,
+            });
+          }
+        } catch (e) {
+          prodLog.warn("looper generation check failed — leaving running instance", {
+            "temporal.workflow_id": id,
+            "error.message": e instanceof Error ? e.message : String(e),
+          });
+        }
+      }
+      await this.temporal.signalWithStart({
+        workflowType: type,
+        workflowId: id,
+        signalName: SIG_NOOP,
+        options: looperStartOptions(id),
+      });
     }
     await this.syncReportSchedule().catch((e) =>
       prodLog.warn("status-report schedule sync failed", {

@@ -60,8 +60,7 @@ import {
 import { GitHubClient } from "./GitHubClient";
 import { CategoryRegistry } from "./CategoryRegistry";
 import { TicketStore, ReconcileChanges, TicketWithTag } from "./TicketStore";
-import { StatusService, RESOLVED_EMOJI } from "./StatusService";
-import { RECLOSE_DELAY_MS } from "./RecloseScheduler";
+import { StatusService, RESOLVED_EMOJI, RECLOSE_DELAY_MS } from "./StatusService";
 import { AuditLogger } from "./AuditLogger";
 import { StatusReportService } from "./StatusReportService";
 import { KnowledgeBaseScheduler } from "./KnowledgeBaseScheduler";
@@ -75,7 +74,7 @@ import { IntercomClient, IntercomHttpError } from "../intercom/IntercomClient";
 import { IntercomWebhookHandler } from "../intercom/IntercomWebhookHandler";
 import { IntercomInboxApp } from "../intercom/IntercomInboxApp";
 import { BillingAdmin } from "./BillingAdmin";
-import { TICKET_ATTR_PRIORITY, TICKET_ATTR_CSAT, TICKET_ATTR_THREAD } from "../intercom/IntercomOutboxScheduler";
+import { TICKET_ATTR_PRIORITY, TICKET_ATTR_CSAT, TICKET_ATTR_THREAD } from "../intercom/IntercomEventExecutor";
 import { IntercomMode, IntercomRegion } from "../config/SettingsStore";
 import {
   log,
@@ -109,6 +108,8 @@ import {
 } from "../metrics/MetricsExporter";
 import { VaultService, VAULT_INTEGRATIONS, type VaultTestReport } from "../vault/VaultService";
 import type { TemporalOpsBinding, TemporalProducers } from "../temporal/producers";
+import { describeSaResult } from "../temporal/searchAttributes";
+import type { TicketScoreResultType } from "../scoring/scoringPrompt";
 import type { AiRunInput, AutoAnswerInput } from "../temporal/types";
 import { validateCertPair } from "../temporal/certs";
 import { VaultMigrator, COLUMN_LABELS, type MigrateItemResult, type MigrateReport } from "../vault/VaultMigrator";
@@ -382,10 +383,11 @@ export class DiscordBot {
       "sync.event": "human_message",
     });
 
-    // Temporal regime: nudge the ticket workflow (re-close deadline push,
-    // retention freshness). The DB stamps below stay — they are the
-    // rehydration source when a completed workflow restarts.
-    if (this.temporalProducers?.enabled()) {
+    // Nudge the ticket workflow (re-close deadline push, retention
+    // freshness) whenever Temporal is configured — a paused worker just
+    // processes the parked signals on resume. The DB stamps below stay —
+    // they are the rehydration source when a completed workflow restarts.
+    if (this.temporalProducers?.routable()) {
       void this.temporalProducers
         .humanMessage(ticket.threadId, {
           atMs: message.createdTimestamp,
@@ -746,9 +748,10 @@ export class DiscordBot {
     }
 
     await this.ticketStore.setRemindersPaused(thread.id, paused);
-    // Temporal regime: the ticket workflow owns the reminder/auto-close/
-    // re-close timers — keep its in-memory pause flag in sync with the DB.
-    if (this.temporalProducers?.enabled()) {
+    // The ticket workflow owns the reminder/auto-close/re-close timers —
+    // keep its in-memory pause flag in sync with the DB (parked signals
+    // deliver on worker resume).
+    if (this.temporalProducers?.routable()) {
       void this.temporalProducers.remindersPaused(thread.id, paused).catch(() => {});
     }
     void this.audit.log({
@@ -1591,17 +1594,20 @@ export class DiscordBot {
             ...(question ? [{ name: "Question", value: question }] : []),
           ],
         });
-        if (this.temporalProducers?.enabled()) {
-          // Temporal regime: one signal-with-start births the ticket workflow —
-          // it enqueues the Intercom ensure and runs the auto-answer child
-          // (deferAutoAnswer above stopped the inline AI path).
+        if (this.temporalProducers?.routable()) {
+          // One signal-with-start births the ticket workflow — it enqueues the
+          // Intercom ensure and (worker active) runs the auto-answer child.
+          // While the worker is paused the inline AI path ran instead
+          // (deferAutoAnswer is gated on enabled()), so aiSolve is forced off
+          // to avoid a second answer when the parked signal processes.
+          const workerActive = this.temporalProducers.enabled();
           void this.temporalProducers
             .ticketCreated(thread.id, {
               categoryId: category.id,
               question: question ?? null,
               customerId,
               displayName,
-              aiSolve: this.settingsStore.aiSolveEnabled(),
+              aiSolve: workerActive && this.settingsStore.aiSolveEnabled(),
             })
             .catch(() => {});
         } else {
@@ -3589,11 +3595,9 @@ export class DiscordBot {
   private async buildIntercomPanel() {
     const s = this.settingsStore;
     const mode = s.intercomMode();
-    const [links, totalTickets, outbox, inbox] = await Promise.all([
+    const [links, totalTickets] = await Promise.all([
       this.intercomStore.countLinks().catch(() => 0),
       this.ticketStore.getAllWithTag().then((t) => t.length).catch(() => 0),
-      this.intercomStore.counts().catch(() => ({ pending: 0, dead: 0 })),
-      this.intercomStore.inboundCounts().catch(() => ({ pending: 0, dead: 0 })),
     ]);
 
     const mask = (value: string | null) => (value ? `••••${value.slice(-4)}` : "_not set_");
@@ -3635,7 +3639,7 @@ export class DiscordBot {
           `**Team routing:** ${s.intercomTeamId() ? `team \`${s.intercomTeamId()}\`` : "_unassigned_"}`,
           "",
           `**Bridged tickets:** ${links}/${totalTickets}`,
-          `**Outbox:** ${outbox.pending} pending · ${outbox.dead} failed — **Inbox:** ${inbox.pending} pending · ${inbox.dead} failed`,
+          "**Queues:** per-ticket outbox + per-conversation inbox run as Temporal workflows (live counts in /config → Temporal); failures land as dead-letter audit embeds.",
           `**Snooze tag:** ${
             s.intercomSnoozeStatusTagId()
               ? (() => {
@@ -3684,11 +3688,6 @@ export class DiscordBot {
     const actionButtons = new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder().setCustomId("config_intercom_team").setLabel("Assign Team").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("config_intercom_backfill").setLabel("Backfill tickets").setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder()
-        .setCustomId("config_intercom_retry_dead")
-        .setLabel(`Retry failed (${outbox.dead + inbox.dead})`)
-        .setStyle(ButtonStyle.Secondary)
-        .setDisabled(outbox.dead === 0 && inbox.dead === 0),
       new ButtonBuilder()
         .setCustomId("config_intercom_region")
         .setLabel(`Region: ${s.intercomRegion().toUpperCase()}`)
@@ -3982,16 +3981,14 @@ export class DiscordBot {
       );
       const buf = svc.bufferStats();
       lines.push(`**Retry buffer:** ${buf.size}/${buf.capacity} buffered · ${buf.droppedTotal} dropped`);
+      lines.push(`**Search attributes:** ${describeSaResult(svc.searchAttributeStatus())}`);
       const v = ops.workerManager.deploymentVersion();
       const promoted = ops.workerManager.promoted();
       lines.push(
         `**Worker:** ${ops.workerManager.running() ? "✅ polling" : "⏹️ stopped"} · build \`${v.buildId}\` (deployment \`${v.deploymentName}\`)${
           promoted === true ? " · current" : promoted === false ? " · ⚠️ NOT promoted to current" : ""
         }`,
-        `**Regime:** ${s.temporalEnabled() ? "Temporal owns background work" : "legacy in-process schedulers"}${
-          ops.legacyRunning() ? " · legacy timers running" : ""
-        }`,
-        `**Import:** ${s.temporalImportDoneAt() ? `done ${rel(s.temporalImportDoneAt()!)}` : "_never ran_"}`
+        `**Background work:** ${s.temporalEnabled() ? "running (worker active)" : "⏸️ paused — signals park server-side until resumed"}`
       );
 
       // Live readouts, best-effort with a short budget — a down server must
@@ -4012,15 +4009,15 @@ export class DiscordBot {
     const row1 = new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder()
         .setCustomId("config_temporal_toggle")
-        .setLabel(s.temporalEnabled() ? "Temporal: on" : "Temporal: off")
-        .setStyle(s.temporalEnabled() ? ButtonStyle.Success : ButtonStyle.Secondary),
+        .setLabel(s.temporalEnabled() ? "Background work: running" : "Background work: paused")
+        .setStyle(s.temporalEnabled() ? ButtonStyle.Success : ButtonStyle.Danger),
       new ButtonBuilder().setCustomId("config_temporal_conn").setLabel("Connection").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("config_temporal_certs").setLabel("Certificates").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("config_temporal_test").setLabel("Test Connection").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("config_back_main").setLabel("Back").setStyle(ButtonStyle.Secondary)
     );
     const row2 = new ActionRowBuilder<ButtonBuilder>().addComponents(
-      new ButtonBuilder().setCustomId("config_temporal_import").setLabel("Run Migration Import").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("config_temporal_sa").setLabel("Ensure Search Attributes").setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId("config_temporal_pause").setLabel("Pause Schedules").setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId("config_temporal_unpause").setLabel("Unpause Schedules").setStyle(ButtonStyle.Secondary)
     );
@@ -4066,7 +4063,7 @@ export class DiscordBot {
       await s.updateTemporal({ temporalEnabled: enabling });
       try {
         await ops.setEnabled(enabling);
-        this.auditConfig(interaction, `Temporal regime → ${enabling ? "on" : "off (legacy schedulers)"}`);
+        this.auditConfig(interaction, `Temporal background work → ${enabling ? "running" : "paused (worker drained)"}`);
       } catch (e) {
         await s.updateTemporal({ temporalEnabled: !enabling });
         await interaction.followUp({
@@ -4080,17 +4077,6 @@ export class DiscordBot {
         });
       }
       await interaction.editReply(await this.buildTemporalPanel());
-      if (enabling && s.temporalEnabled() && !s.temporalImportDoneAt()) {
-        await interaction.followUp({
-          embeds: [
-            makeEmbed(
-              "Temporal is on. Run **Run Migration Import** to start workflows for existing open tickets and replay pending Intercom queue rows.",
-              COLORS.warn
-            ),
-          ],
-          flags: 64,
-        });
-      }
       return;
     }
 
@@ -4108,6 +4094,7 @@ export class DiscordBot {
               line("Namespace", r.namespaceOk, r.namespaceError),
               line("Deployment", r.deploymentFound, r.deploymentError ?? "not found yet (registers on first worker poll)", r.currentVersion ? `current \`${r.currentVersion}\`` : undefined),
               line("Visibility", r.visibilityOk, r.visibilityError, r.runningWorkflows != null ? `${r.runningWorkflows} running` : undefined),
+              line("Search attributes", r.searchAttributesOk, r.searchAttributesDetail, r.searchAttributesOk ? (r.searchAttributesDetail ?? undefined) : undefined),
             ].join("\n"),
             r.configured && r.healthOk && r.namespaceOk ? COLORS.success : COLORS.warn
           ),
@@ -4183,18 +4170,22 @@ export class DiscordBot {
       return;
     }
 
-    if (id === "config_temporal_import") {
+    if (id === "config_temporal_sa") {
       await interaction.deferReply({ flags: 64 });
-      const r = await ops.producers.startMigrationImport();
+      const r = await ops.service.ensureSearchAttributesNow();
+      this.auditConfig(interaction, `Temporal search attributes → ${describeSaResult(r)}`);
       await interaction.editReply({
         embeds: [
           makeEmbed(
-            r.ok
-              ? r.alreadyRunning
-                ? "A migration import is already running — check the audit channel for its summary."
-                : "Migration import started — a summary lands in the audit channel when it finishes."
-              : `Couldn't start the import: ${r.error ?? "Temporal unreachable"}.`,
-            r.ok ? COLORS.success : COLORS.danger
+            [
+              `**Result:** ${describeSaResult(r)}`,
+              ...(r.added.length > 0 ? [`Registered: ${r.added.map((n) => `\`${n}\``).join(", ")}`] : []),
+              ...(r.present.length > 0 ? [`Already present: ${r.present.map((n) => `\`${n}\``).join(", ")}`] : []),
+              ...(r.mismatched.length > 0
+                ? [`⚠️ Type mismatch (must be fixed on the server, cannot be re-typed here): ${r.mismatched.map((n) => `\`${n}\``).join(", ")}`]
+                : []),
+            ].join("\n"),
+            r.ok ? COLORS.success : COLORS.warn
           ),
         ],
       });
@@ -5449,7 +5440,7 @@ export class DiscordBot {
     }
 
     if (id === "config_intercom_reset") {
-      const [links, outbox] = await Promise.all([this.intercomStore.countLinks(), this.intercomStore.counts()]);
+      const links = await this.intercomStore.countLinks();
       const confirm = new ActionRowBuilder<ButtonBuilder>().addComponents(
         new ButtonBuilder().setCustomId("config_intercom_reset_confirm").setLabel("Yes, wipe bridge data").setStyle(ButtonStyle.Danger),
         new ButtonBuilder().setCustomId("config_intercom").setLabel("Cancel").setStyle(ButtonStyle.Secondary)
@@ -5458,7 +5449,7 @@ export class DiscordBot {
         embeds: [
           makeEmbed(
             [
-              `This deletes the bot's local bridge state: **${links}** link(s) and **${outbox.pending + outbox.dead}** queued event(s).`,
+              `This deletes the bot's local bridge state: **${links}** link(s) plus the echo/pending ledgers.`,
               "",
               "Nothing is deleted in Intercom itself. Use this when the Intercom side was cleared or recreated and the bookkeeping is stale — the next **Backfill** rebuilds every ticket from Discord.",
               "⚠️ If the conversations/tickets still exist in Intercom, the next backfill will create duplicates.",
@@ -5475,29 +5466,15 @@ export class DiscordBot {
       const result = await this.intercomStore.resetAll();
       this.auditConfig(
         interaction,
-        `Intercom bridge data reset (${result.links} links, ${result.events} queued events, ${result.parts} echo parts deleted)`
+        `Intercom bridge data reset (${result.links} links, ${result.parts} echo/pending rows deleted)`
       );
       await interaction.update(await this.buildIntercomPanel());
       await interaction.followUp({
         embeds: [
-          makeEmbed(
-            `Bridge data wiped: ${result.links} link(s), ${result.events} event(s). Run **Backfill tickets** to rebuild.`,
-            COLORS.success
-          ),
+          makeEmbed(`Bridge data wiped: ${result.links} link(s). Run **Backfill tickets** to rebuild.`, COLORS.success),
         ],
         flags: 64,
       });
-      return;
-    }
-
-    if (id === "config_intercom_retry_dead") {
-      const requeued = await this.intercomStore.retryDead();
-      const requeuedInbound = await this.intercomStore.retryDeadInbound();
-      this.auditConfig(
-        interaction,
-        `Intercom queues → requeued ${requeued} outbound + ${requeuedInbound} inbound failed event(s)`
-      );
-      await interaction.update(await this.buildIntercomPanel());
       return;
     }
 
@@ -6778,7 +6755,22 @@ export class DiscordBot {
       }
       await interaction.deferReply({ flags: 64 });
       try {
-        const parsed = await this.analytics.scoringService.scoreOneNow(threadId);
+        // Temporal seam: run through scoreOneWorkflow when the worker is
+        // active (dedup by workflow id, Temporal UI visibility); null =
+        // unavailable or the workflow failed — fall back to the direct call,
+        // whose real error surfaces through this catch.
+        let parsed: TicketScoreResultType | null = null;
+        if (this.temporalProducers?.enabled()) {
+          const json = await this.temporalProducers.executeScoreOne(threadId);
+          if (json != null) {
+            try {
+              parsed = JSON.parse(json) as TicketScoreResultType;
+            } catch {
+              parsed = null;
+            }
+          }
+        }
+        if (!parsed) parsed = await this.analytics.scoringService.scoreOneNow(threadId);
         this.auditConfig(interaction, `Manual score → <#${threadId}> (CX ${parsed.cx_score}/10)`);
         await interaction.editReply({
           embeds: [
@@ -7402,7 +7394,7 @@ export class DiscordBot {
 
       for (const ticket of tickets) {
         processed++;
-        if (await this.intercomStore.hasLinkOrPendingEnsure(ticket.threadId)) {
+        if (await this.intercomStore.getLink(ticket.threadId)) {
           skipped++;
           continue;
         }
@@ -7425,7 +7417,7 @@ export class DiscordBot {
         }
       }
 
-      const summary = `Intercom backfill queued **${enqueuedTickets}** ticket(s) (**${enqueuedEvents}** events), skipped ${skipped} already bridged. The outbox pushes them in the background — watch the count in /config → Intercom.`;
+      const summary = `Intercom backfill queued **${enqueuedTickets}** ticket(s) (**${enqueuedEvents}** events), skipped ${skipped} already bridged. The ticket workflows push them in the background — watch the delivery workflows in /config → Temporal.`;
       await report(summary, COLORS.success);
       void this.audit.log({
         title: "🌉 Intercom backfill",
@@ -7502,7 +7494,7 @@ export class DiscordBot {
       }
 
       const summary = [
-        `Intercom wipe done: deleted **${tickets}** ticket(s), **${conversations}** conversation(s); archived **${contacts}** contact(s); local state cleared (${local.links} links, ${local.events} queued events).`,
+        `Intercom wipe done: deleted **${tickets}** ticket(s), **${conversations}** conversation(s); archived **${contacts}** contact(s); local state cleared (${local.links} links).`,
         ...(failures.length > 0
           ? [`⚠️ ${failures.length} deletion(s) failed — remove these in Intercom by hand: ${failures.slice(0, 10).join(", ")}${failures.length > 10 ? ", …" : ""}`]
           : []),

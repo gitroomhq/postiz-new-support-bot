@@ -2,24 +2,21 @@ import { spawn } from "child_process";
 import path from "path";
 import { SettingsStore } from "../config/SettingsStore";
 import { log } from "../util/logger";
-import { withTickSpan, wasCaptured } from "../util/instrument";
+import { withTickSpan } from "../util/instrument";
 
 const schedLog = log.child("scheduler:kb-refresh");
 
 const HOUR_MS = 60 * 60 * 1000;
-// Re-check cadence, decoupled from the configured interval so a fresh boot pulls
-// shortly after start rather than a full interval later. The due-check makes the
-// steady-state ticks cheap in-memory no-ops.
-const CHECK_INTERVAL_MS = 60 * 1000;
 
 // The two repos the postinstall script clones into search/. The AI greps them to
 // ground its answers, so keeping them current keeps the answers current.
 const REPOS = ["postiz-app", "postiz-docs"];
 
-// Periodically `git pull` the cloned Postiz source + docs so the AI answers
-// against upstream, not the checkout captured at install time.
+// `git pull` the cloned Postiz source + docs so the AI answers against
+// upstream, not the checkout captured at install time. Driven by the
+// kbRefreshWorkflow looper's 60s kbTick activity (tick() keeps the
+// enabled/interval due-check itself).
 export class KnowledgeBaseScheduler {
-  private timer: NodeJS.Timeout | null = null;
   private readonly searchDir: string;
   // Guards a pull outlasting the 60s tick (a reset can take a moment on slow
   // disk/network) so two ticks never reset the same repo concurrently.
@@ -30,24 +27,6 @@ export class KnowledgeBaseScheduler {
     baseDir: string
   ) {
     this.searchDir = path.resolve(baseDir, "search");
-  }
-
-  start(): void {
-    // Pull once right away: on first boot kbLastRefreshAt is null (due), and after
-    // long downtime the clone may be stale.
-    this.runTick();
-    this.timer = setInterval(() => this.runTick(), CHECK_INTERVAL_MS);
-  }
-
-  stop(): void {
-    if (this.timer) clearInterval(this.timer);
-    this.timer = null;
-  }
-
-  private runTick(): void {
-    this.tick().catch((err) => {
-      if (!wasCaptured(err)) schedLog.error("tick failed", err);
-    });
   }
 
   async tick(): Promise<void> {

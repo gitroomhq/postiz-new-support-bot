@@ -3,6 +3,7 @@ import { TicketStore, TicketWithTag } from "../bot/TicketStore";
 import { SettingsStore } from "../config/SettingsStore";
 import { SessionStore } from "../auth/SessionStore";
 import { IntercomStore } from "./IntercomStore";
+import type { IntercomEventExecutor } from "./IntercomEventExecutor";
 import { EnsurePayload, MessageAttachmentRef, OutboxEventType, OutboxPayload } from "./types";
 import { log } from "../util/logger";
 import type { TemporalProducers } from "../temporal/producers";
@@ -26,7 +27,8 @@ export const AGENT_WARNING_TEXT =
 
 // Composes and enqueues outbox events for everything the bridge mirrors.
 // Enqueue-only and no-throw: Intercom being down or misconfigured must never
-// break a Discord flow. All HTTP happens later in the IntercomOutboxScheduler.
+// break a Discord flow. All HTTP happens later, inside the per-ticket
+// workflow's Intercom delivery children.
 export class IntercomSyncService {
   // Per-thread promise chains so concurrent hooks enqueue in call order (the
   // outbox seq must match event order — same pattern as StatusService.chains).
@@ -53,26 +55,53 @@ export class IntercomSyncService {
     this.threadUrlBuilder = builder;
   }
 
-  // Temporal seam: when the Temporal regime is active, composed events are
-  // signalled into the per-ticket workflow's outbox instead of inserted into
-  // the intercom_outbox table — every hook call site stays untouched.
+  // Temporal seam: composed events are signalled into the per-ticket
+  // workflow's outbox — every hook call site stays untouched. Signals are sent
+  // whenever Temporal is CONFIGURED (routable), even while the worker is
+  // paused: they land server-side and deliver on resume; outages buffer in the
+  // gateway's RetryBuffer.
   private producers: TemporalProducers | null = null;
+  // Direct fallback for the unconfigured bootstrap state: execute against the
+  // Intercom API immediately (no queue, no retry). Bound late from index.ts
+  // (the executor is constructed after this service).
+  private executor: IntercomEventExecutor | null = null;
 
   setTemporalProducers(producers: TemporalProducers): void {
     this.producers = producers;
   }
 
-  private temporalActive(): boolean {
-    return this.producers?.enabled() ?? false;
+  setExecutor(executor: IntercomEventExecutor): void {
+    this.executor = executor;
   }
 
-  // Single enqueue choke point for both regimes.
+  private temporalRoutable(): boolean {
+    return this.producers?.routable() ?? false;
+  }
+
+  // Single enqueue choke point: workflow signal when Temporal is configured,
+  // best-effort direct delivery otherwise (a failure only costs this one
+  // mirror event — the bridge stays no-throw either way).
   private async emit(threadId: string, type: OutboxEventType, payload: OutboxPayload): Promise<void> {
-    if (this.temporalActive()) {
+    if (this.temporalRoutable()) {
       await this.producers!.intercomEnqueue(threadId, type, payload);
       return;
     }
-    await this.store.enqueue(threadId, type, payload);
+    if (!this.executor) {
+      syncLog.warn("intercom mirror event dropped — temporal unconfigured, no executor bound", {
+        "ticket.thread_id": threadId,
+        "queue.event_type": type,
+      });
+      return;
+    }
+    try {
+      await this.executor.execute(threadId, type, payload);
+    } catch (e) {
+      syncLog.warn("intercom direct delivery failed — event dropped (temporal unconfigured)", {
+        "ticket.thread_id": threadId,
+        "queue.event_type": type,
+        "error.message": e instanceof Error ? e.message : String(e),
+      });
+    }
   }
 
   enabled(): boolean {
@@ -186,9 +215,10 @@ export class IntercomSyncService {
 
   // ---- Backfill ----
 
-  // Enqueues a full historical replay for one ticket in a single transaction
-  // (all-or-nothing, so re-runs can key off hasLinkOrPendingEnsure). Returns the
-  // number of events enqueued, or null when the ticket is already bridged.
+  // Sends a full historical replay for one ticket through emit() (re-runs key
+  // off the created link, so a crash mid-replay may re-send a prefix — the
+  // executor's dampers absorb it). Returns the number of events sent, or null
+  // when the ticket is already bridged.
   // Messages-only mirroring: the transcript replays messages; status/priority/
   // CSAT land as ticket state + attributes, never as notes. Timestamps come
   // from the native created_at backdating — no text prefixes.
@@ -196,7 +226,7 @@ export class IntercomSyncService {
     ticket: TicketWithTag,
     messages: BridgeSourceMessage[] | null // null = thread no longer exists
   ): Promise<number | null> {
-    if (await this.store.hasLinkOrPendingEnsure(ticket.threadId)) return null;
+    if (await this.store.getLink(ticket.threadId)) return null;
 
     const events: Array<{ ticketThreadId: string; type: OutboxEventType; payload: OutboxPayload }> = [];
     const add = (type: OutboxEventType, payload: OutboxPayload) =>
@@ -249,12 +279,8 @@ export class IntercomSyncService {
       add("csat", { score: ticket.csatScore, comment: ticket.csatComment });
     }
 
-    if (this.temporalActive()) {
-      for (const event of events) {
-        await this.producers!.intercomEnqueue(event.ticketThreadId, event.type, event.payload);
-      }
-    } else {
-      await this.store.enqueueMany(events);
+    for (const event of events) {
+      await this.emit(event.ticketThreadId, event.type, event.payload);
     }
     return events.length;
   }
@@ -293,17 +319,20 @@ export class IntercomSyncService {
   }
 
   private async ensureLink(ticket: TicketWithTag, categoryLabel?: string | null): Promise<void> {
-    // Temporal regime: the per-ticket workflow synthesizes the ensure event
-    // itself (payload composed fresh at delivery time) — nothing to enqueue.
-    if (this.temporalActive()) return;
-    if (await this.store.hasLinkOrPendingEnsure(ticket.threadId)) return;
+    // Temporal path: the per-ticket workflow synthesizes the ensure event
+    // itself (ensure-first pump invariant, payload composed fresh at delivery
+    // time) — nothing to send here.
+    if (this.temporalRoutable()) return;
+    // Direct fallback: create the remote objects now so the following
+    // message/note event has something to land on.
+    if (await this.store.getLink(ticket.threadId)) return;
     const payload = this.buildEnsurePayload(ticket, categoryLabel ?? categoryLabelOf(ticket, this.categoryLabelResolver));
     if (ticket.customerId) {
       const session = await this.sessionStore.getSession(ticket.customerId).catch(() => null);
       payload.postizUserId = session?.postizUserId ?? null;
       payload.stripeCustomerId = session?.stripeCustomerId ?? null;
     }
-    await this.store.enqueue(ticket.threadId, "ensure", payload);
+    await this.emit(ticket.threadId, "ensure", payload);
   }
 
   // Customer → incoming verbatim; staff/other humans → outgoing with a name

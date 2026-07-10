@@ -1,12 +1,16 @@
 import {
   allHandlersFinished,
   condition,
-  continueAsNew,
+  executeChild,
+  makeContinueAsNewFunc,
   proxyActivities,
   setHandler,
+  sleep,
   workflowInfo,
+  type Workflow,
 } from "@temporalio/workflow";
-import type { CoreActivities } from "../types";
+import type { CoreActivities, ScoringBatchInput } from "../types";
+import { scoringBatchWorkflowId } from "../types";
 import { kbRefreshNowSignal, scoringRunNowSignal } from "./definitions";
 
 // Interval-based recurring jobs as eternal looping workflows (user decision:
@@ -24,11 +28,23 @@ const kb = proxyActivities<CoreActivities>({
   retry: { maximumAttempts: 1 }, // per-repo failure tolerance lives inside
 });
 
-const scoringActs = proxyActivities<CoreActivities>({
+const scoringQuick = proxyActivities<CoreActivities>({
+  startToCloseTimeout: "30 seconds",
+  retry: { maximumAttempts: 3 },
+});
+
+const scoringSubmitActs = proxyActivities<CoreActivities>({
   // Batch submit fetches up to 200 transcripts with pacing.
   startToCloseTimeout: "30 minutes",
   heartbeatTimeout: "2 minutes",
   retry: { maximumAttempts: 1 }, // next 60s tick retries naturally
+});
+
+const scoringPollActs = proxyActivities<CoreActivities>({
+  // A poll that finds the batch ended also fetches + processes every result
+  // (Discord lookups, score rows, Influx) — give it room.
+  startToCloseTimeout: "15 minutes",
+  retry: { initialInterval: "5 seconds", maximumAttempts: 2 },
 });
 
 const light = proxyActivities<CoreActivities>({
@@ -43,6 +59,13 @@ async function canIfDue(makeNext: () => Promise<never> | Promise<void>): Promise
   }
 }
 
+// Continue-As-New preserving the run's memo: plain continueAsNew() sends
+// memo undefined, which would drop the looper generation stamp (and the
+// scoring batch's purpose memo) on the next run.
+function continueWithMemo<F extends Workflow>(...args: Parameters<F>): Promise<never> {
+  return makeContinueAsNewFunc<F>({ memo: workflowInfo().memo })(...args);
+}
+
 // KB refresh: the activity applies the kbRefreshEnabled/interval due-check
 // itself (legacy KnowledgeBaseScheduler semantics); the loop just provides the
 // 60s cadence + the manual-refresh signal from /config.
@@ -55,24 +78,89 @@ export async function kbRefreshWorkflow(): Promise<void> {
     const force = refreshNow;
     refreshNow = false;
     await kb.kbTick(force).catch(() => {});
-    await canIfDue(() => continueAsNew<typeof kbRefreshWorkflow>());
+    await canIfDue(() => continueWithMemo<typeof kbRefreshWorkflow>());
     await condition(() => refreshNow, 60_000);
   }
 }
 
-// Scoring: poll in-flight Anthropic batches every minute; submit when the
-// interval elapses / backfill pending (all decided inside the activity, which
-// is a verbatim port of ScoringScheduler.tick()).
+// Scoring: each Anthropic Message Batch runs as its OWN child workflow
+// (scoring-batch-<id>) so the whole lifecycle — submit, every poll round-trip,
+// the moment results come back and get processed — is visible per batch in the
+// Temporal UI. The loop keeps the legacy invariants: one batch in flight,
+// 60s cadence, interval/backfill due-check, Run-Scoring-Now signal.
 export async function scoringLoopWorkflow(): Promise<void> {
   let runNow = false;
   setHandler(scoringRunNowSignal, () => {
     runNow = true;
   });
   for (;;) {
-    await scoringActs.scoringTick().catch(() => {});
-    await canIfDue(() => continueAsNew<typeof scoringLoopWorkflow>());
-    await condition(() => runNow, 60_000);
+    const force = runNow;
     runNow = false;
+    try {
+      const state = await scoringQuick.scoringGetState();
+      if (state.enabled) {
+        // Adopt in-flight batches first (restart / Continue-As-New / import —
+        // a CAN terminates running children, so the fresh run re-adopts any
+        // batch that is still SUBMITTED in Postgres). Awaited sequentially:
+        // one batch in flight is the invariant.
+        for (const batchId of state.pendingBatchIds) {
+          await watchBatch(batchId, "adopted");
+        }
+        if (state.due || state.backfill || force) {
+          const purpose = state.backfill ? "backfill" : "interval";
+          const r = await scoringSubmitActs.scoringSubmit(purpose);
+          if (r.batchId) await watchBatch(r.batchId, purpose);
+        }
+      }
+    } catch {
+      // transient (activity budget exhausted) — the next tick retries
+    }
+    await canIfDue(() => continueWithMemo<typeof scoringLoopWorkflow>());
+    await condition(() => runNow, 60_000);
+  }
+}
+
+async function watchBatch(batchId: string, purpose: string): Promise<void> {
+  try {
+    await executeChild(scoringBatchWorkflow, {
+      workflowId: scoringBatchWorkflowId(batchId),
+      args: [{ batchId }],
+      // UI context only (memo needs no registration and cannot fail a start).
+      memo: { batchId, purpose },
+    });
+  } catch {
+    // duplicate id / child failure — the batch stays SUBMITTED in Postgres and
+    // is re-adopted on the next loop pass; never wedge the loop.
+  }
+}
+
+const BATCH_POLL_INTERVAL_MS = 60_000;
+// Anthropic ends every Message Batch within 24h (later, expired results 404
+// and pollBatchOnce fails the batch). 26h is the backstop for a batch stuck
+// reporting "running" so the child can never poll — and block the
+// one-batch-in-flight loop — forever.
+const BATCH_DEADLINE_MS = 26 * 60 * 60 * 1000;
+
+// One Anthropic batch, cradle to grave: a poll activity every minute until the
+// batch ends, then the same activity fetches + processes the results. The
+// workflow history IS the batch timeline; Continue-As-New carries the poll
+// count + deadline when a long batch nears the history limit.
+export async function scoringBatchWorkflow(input: ScoringBatchInput): Promise<{ outcome: string; polls: number }> {
+  // Date.now() is deterministic workflow time; captured once, CAN-stable.
+  const deadlineAtMs = input.deadlineAtMs ?? Date.now() + BATCH_DEADLINE_MS;
+  let polls = input.polls ?? 0;
+  for (;;) {
+    polls++;
+    const r = await scoringPollActs.scoringPollBatch(input.batchId);
+    if (r.status !== "running") return { outcome: r.status, polls };
+    if (Date.now() >= deadlineAtMs) {
+      await scoringQuick.scoringExpireBatch(input.batchId).catch(() => {});
+      return { outcome: "timeout", polls };
+    }
+    await canIfDue(() =>
+      continueWithMemo<typeof scoringBatchWorkflow>({ batchId: input.batchId, polls, deadlineAtMs })
+    );
+    await sleep(BATCH_POLL_INTERVAL_MS);
   }
 }
 
@@ -80,7 +168,7 @@ export async function scoringLoopWorkflow(): Promise<void> {
 export async function metricsSnapshotWorkflow(): Promise<void> {
   for (;;) {
     await light.snapshotTick().catch(() => {});
-    await canIfDue(() => continueAsNew<typeof metricsSnapshotWorkflow>());
+    await canIfDue(() => continueWithMemo<typeof metricsSnapshotWorkflow>());
     await condition(() => false, 5 * 60_000);
   }
 }
@@ -90,7 +178,7 @@ export async function metricsSnapshotWorkflow(): Promise<void> {
 export async function cleanupLoopWorkflow(): Promise<void> {
   for (;;) {
     await light.cleanupTick().catch(() => {});
-    await canIfDue(() => continueAsNew<typeof cleanupLoopWorkflow>());
+    await canIfDue(() => continueWithMemo<typeof cleanupLoopWorkflow>());
     await condition(() => false, 5 * 60_000);
   }
 }

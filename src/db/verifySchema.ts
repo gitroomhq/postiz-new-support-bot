@@ -62,14 +62,7 @@ const EXPECTED_COLUMNS: Record<string, string[]> = {
     "id", "ticketThreadId", "contactId", "contactExternalId", "conversationId", "ticketId", "agentWarnedAt",
     "lastSyncedStateId", "lastSyncedOpen", "lastTagsJson", "createdAt",
   ],
-  intercom_outbox: [
-    "id", "seq", "ticketThreadId", "type", "payload", "status", "attempts", "nextAttemptAt", "lastError", "createdAt",
-  ],
   intercom_echo_parts: ["id", "kind", "partId", "ticketThreadId", "createdAt"],
-  intercom_inbox: [
-    "id", "seq", "deliveryId", "topic", "payload", "status", "attempts", "deferAttempts", "nextAttemptAt", "lastError",
-    "receivedAt",
-  ],
   intercom_pending_posts: ["id", "ticketThreadId", "kind", "bodyHash", "createdAt"],
   stripe_webhook_events: ["id", "type", "createdAt"],
   ai_runs: [

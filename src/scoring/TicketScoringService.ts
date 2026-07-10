@@ -62,6 +62,16 @@ export interface SubmitBatchResult {
   skipped: number;
   drained: boolean; // no unscored closed tickets remained
   budgetBlocked: boolean;
+  // Anthropic batch id when a batch was actually submitted — the Temporal
+  // scoring loop spawns a per-batch child workflow keyed on it.
+  batchId: string | null;
+}
+
+// One poll outcome for ONE batch (the Temporal scoringBatchWorkflow's tick).
+export interface BatchPollOutcome {
+  status: "running" | "processed" | "failed";
+  // Anthropic-side processing status while running (e.g. "in_progress").
+  processingStatus: string | null;
 }
 
 // Background AI quality scoring of closed tickets via the Anthropic Message
@@ -222,14 +232,10 @@ export class TicketScoringService {
     return spent >= budget;
   }
 
-  async hasPendingBatches(): Promise<boolean> {
-    return (await this.scoreStore.pendingBatches()).length > 0;
-  }
-
   // ---- Batch submission ----
 
   async submitBatch(purpose: "interval" | "backfill"): Promise<SubmitBatchResult> {
-    if (this.submitting) return { submitted: 0, skipped: 0, drained: false, budgetBlocked: false };
+    if (this.submitting) return { submitted: 0, skipped: 0, drained: false, budgetBlocked: false, batchId: null };
     this.submitting = true;
     try {
       return await this.doSubmitBatch(purpose);
@@ -243,13 +249,13 @@ export class TicketScoringService {
       scoreLog.warn("scoring.budget_exceeded", {
         "scoring.budget_usd": this.settings.scoringMaxBudgetUsdPerDay(),
       });
-      return { submitted: 0, skipped: 0, drained: false, budgetBlocked: true };
+      return { submitted: 0, skipped: 0, drained: false, budgetBlocked: true, batchId: null };
     }
 
     const limit = Math.max(1, this.settings.scoringMaxTicketsPerBatch());
     const tickets = await this.scoreStore.listUnscoredClosed(limit);
     if (tickets.length === 0) {
-      return { submitted: 0, skipped: 0, drained: true, budgetBlocked: false };
+      return { submitted: 0, skipped: 0, drained: true, budgetBlocked: false, batchId: null };
     }
 
     const requests: Anthropic.Messages.Batches.BatchCreateParams.Request[] = [];
@@ -282,7 +288,7 @@ export class TicketScoringService {
 
     if (requests.length === 0) {
       // Everything in this chunk was skipped; the next tick pulls the next chunk.
-      return { submitted: 0, skipped, drained: false, budgetBlocked: false };
+      return { submitted: 0, skipped, drained: false, budgetBlocked: false, batchId: null };
     }
 
     const batch = await this.anthropic.messages.batches.create({ requests });
@@ -304,33 +310,46 @@ export class TicketScoringService {
       "scoring.skipped": skipped,
     });
     metricCount("scoring.batches_submitted", 1, { purpose });
-    return { submitted: requests.length, skipped, drained: false, budgetBlocked: false };
+    return { submitted: requests.length, skipped, drained: false, budgetBlocked: false, batchId: batch.id };
   }
 
   // ---- Polling & result processing ----
 
-  async pollBatches(): Promise<void> {
+  // One poll for ONE batch — the Temporal scoringBatchWorkflow calls this
+  // every minute so each Anthropic round-trip is visible in the workflow
+  // history (retrieve → still running / ended → results processed).
+  async pollBatchOnce(anthropicBatchId: string): Promise<BatchPollOutcome> {
     const pending = await this.scoreStore.pendingBatches();
-    for (const record of pending) {
-      let batch: Anthropic.Messages.Batches.MessageBatch;
-      try {
-        batch = await this.anthropic.messages.batches.retrieve(record.anthropicBatchId);
-      } catch (err) {
-        // 404 = the batch is gone (results expire after 29 days) — fail it so
-        // its tickets become retryable instead of polling forever.
-        if (err instanceof Anthropic.NotFoundError) {
-          await this.scoreStore.failBatch(record.anthropicBatchId, "batch not found");
-        } else {
-          scoreLog.warn("scoring.poll_failed", {
-            "scoring.batch_id": record.anthropicBatchId,
-            "error": String(err),
-          });
-        }
-        continue;
+    const record = pending.find((r) => r.anthropicBatchId === anthropicBatchId);
+    // Already finalized (processed by a prior run of the batch workflow).
+    if (!record) return { status: "processed", processingStatus: null };
+    let batch: Anthropic.Messages.Batches.MessageBatch;
+    try {
+      batch = await this.anthropic.messages.batches.retrieve(anthropicBatchId);
+    } catch (err) {
+      // 404 = the batch is gone (results expire) — fail it so its tickets
+      // become retryable instead of polling forever.
+      if (err instanceof Anthropic.NotFoundError) {
+        await this.scoreStore.failBatch(anthropicBatchId, "batch not found");
+        return { status: "failed", processingStatus: null };
       }
-      if (batch.processing_status !== "ended") continue;
-      await this.processEndedBatch(record.anthropicBatchId, record.model);
+      throw err; // transient — the workflow's next tick retries
     }
+    if (batch.processing_status !== "ended") {
+      return { status: "running", processingStatus: batch.processing_status };
+    }
+    await this.processEndedBatch(anthropicBatchId, record.model);
+    return { status: "processed", processingStatus: "ended" };
+  }
+
+  // Deadline backstop for scoringBatchWorkflow: fail a batch that outlived
+  // its processing window so its tickets become retryable. No-op when the
+  // batch was already finalized (never flips an ended batch to FAILED).
+  async expireBatch(anthropicBatchId: string): Promise<void> {
+    const pending = await this.scoreStore.pendingBatches();
+    if (!pending.some((r) => r.anthropicBatchId === anthropicBatchId)) return;
+    scoreLog.warn("scoring.batch_expired", { "scoring.batch_id": anthropicBatchId });
+    await this.scoreStore.failBatch(anthropicBatchId, "processing deadline exceeded (26h)");
   }
 
   private async processEndedBatch(anthropicBatchId: string, model: string): Promise<void> {

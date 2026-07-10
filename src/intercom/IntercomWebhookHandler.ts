@@ -16,7 +16,7 @@ import {
 } from "./types";
 
 // Thrown while the thread still has in-flight outbound content that could be
-// the origin of this part — the inbox scheduler retries shortly instead of
+// the origin of this part — the inbox workflow retries shortly instead of
 // risking a double-post. Bounded: after MAX_DEFER_ATTEMPTS the part is relayed
 // anyway (a rare duplicate beats a lost agent reply).
 export class DeferEchoError extends Error {
@@ -28,10 +28,10 @@ export class DeferEchoError extends Error {
 
 const MAX_DEFER_ATTEMPTS = 12;
 
-// Handles inbound Intercom webhooks. The HTTP route only calls accept() (a
-// single durable insert); the IntercomInboxScheduler drives process(), which
-// THROWS on transient failures so the inbox row retries — nothing is lost to
-// a crash mid-handle anymore.
+// Handles inbound Intercom webhooks. The HTTP route only calls accept()
+// (a signal into the per-conversation workflow); the processInboundEvent
+// activity drives process(), which THROWS on transient failures so the
+// workflow retries — nothing is lost to a crash mid-handle.
 //
 // Echo suppression is layered: part-id ledger (claimPart) → pending-post
 // body-hash match (reserve→confirm handshake with the outbox) → bounded defer
@@ -55,26 +55,27 @@ export class IntercomWebhookHandler {
     this.client = client;
   }
 
-  // Temporal seam: when active, inbound events are signalled into the
-  // per-conversation intercomInboxWorkflow (dedup via its deliveryId ring)
-  // instead of the intercom_inbox table. A buffered signal (Temporal down)
-  // throws so the route answers 500 and Intercom's single retry redelivers.
+  // Temporal seam: inbound events are signalled into the per-conversation
+  // intercomInboxWorkflow (dedup via its deliveryId ring) whenever Temporal is
+  // configured — even while the worker is paused, the signal parks server-side
+  // and processes on resume. A buffered signal (Temporal down) throws so the
+  // route answers 500 and Intercom's single retry redelivers.
   private temporalProducers: TemporalProducers | null = null;
 
   setTemporalProducers(producers: TemporalProducers): void {
     this.temporalProducers = producers;
   }
 
-  // HTTP-route half: durably queue the event and return. Never relays inline.
-  // Returns false for duplicate deliveries (same notification event id).
+  // HTTP-route half: durably queue the event and return. Never relays inline
+  // while Temporal is configured. Returns false for duplicate deliveries.
   async accept(body: unknown): Promise<boolean> {
     const event = body as IntercomWebhookEvent;
     const topic = event?.topic;
     if (!topic || topic === "ping") return true;
-    if (this.temporalProducers?.enabled()) {
+    if (this.temporalProducers?.routable()) {
       // Per-item serialization key: conversation id for conversation.* topics,
       // ticket id for ticket.* — handlers are convergent/damped, so distinct
-      // workflows per kind are fine (matches the legacy queue's guarantees).
+      // workflows per kind are fine (matches the old durable queue's guarantees).
       const itemId = (event?.data?.item as { id?: unknown } | undefined)?.id;
       const key = itemId != null ? String(itemId) : null;
       if (!key) return true; // nothing to key on — same as an unknown topic: drop
@@ -88,7 +89,13 @@ export class IntercomWebhookHandler {
       }
       return r.ok;
     }
-    return this.store.acceptInbound(event.id ?? null, topic, body as object);
+    // Direct fallback (Temporal unconfigured — bootstrap state): best-effort
+    // inline handling with no durable queue. Echo decisions can't defer here,
+    // so process with the defer budget exhausted (a rare duplicate beats a
+    // lost agent reply); a transient throw becomes a 500 and Intercom's single
+    // retry redelivers.
+    await this.process(topic, body, MAX_DEFER_ATTEMPTS);
+    return true;
   }
 
   // Scheduler half: dispatch one queued event. Throws on transient failure
@@ -256,8 +263,10 @@ export class IntercomWebhookHandler {
   }
 
   private async hasPendingOutboundContent(threadId: string): Promise<boolean> {
-    if (await this.store.hasPendingPosts(threadId)) return true;
-    return this.store.hasPendingOutboundContent(threadId);
+    // Pending-posts (the reserve→confirm handshake) is the in-flight signal;
+    // queued-but-unsent workflow outbox events can't have created a part yet,
+    // so they don't need to defer the echo decision.
+    return this.store.hasPendingPosts(threadId);
   }
 
   // Rolls back a claimPart so a deferred retry can claim again.

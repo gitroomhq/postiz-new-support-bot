@@ -7,6 +7,8 @@ import {
   setHandler,
   sleep,
   startChild,
+  upsertMemo,
+  upsertSearchAttributes,
   workflowInfo,
 } from "@temporalio/workflow";
 import type {
@@ -19,7 +21,14 @@ import type {
   TicketSnapshot,
   TicketWorkflowInput,
 } from "../types";
-import { autoAnswerChildId, intercomDeliveryChildId, statusChangeChildId } from "../types";
+import {
+  autoAnswerChildId,
+  intercomDeliveryChildId,
+  SA_AI_KIND,
+  SA_TICKET_STATUS,
+  SA_TICKET_THREAD_ID,
+  statusChangeChildId,
+} from "../types";
 import {
   applyPriorityUpdate,
   applyStatusUpdate,
@@ -90,6 +99,19 @@ export async function ticketWorkflow(input: TicketWorkflowInput): Promise<void> 
     touch();
   };
 
+  // Search attributes are attached to this workflow's start only after the
+  // producer confirmed server-side registration — their presence is therefore
+  // the deterministic, replay-safe gate for every SA command this run issues
+  // (an upsert naming an unregistered attribute fails the workflow task).
+  const saEnabled = workflowInfo().typedSearchAttributes.get(SA_TICKET_THREAD_ID) != null;
+  let lastStatusSa: string | null | undefined; // undefined = never synced this run
+  const syncStatusSa = (label: string | null): void => {
+    if (!saEnabled || label === lastStatusSa) return;
+    lastStatusSa = label;
+    // null unsets — a ticket without a tag drops out of status queries.
+    upsertSearchAttributes([{ key: SA_TICKET_STATUS, value: label }]);
+  };
+
   // Serializes status/priority changes (replaces the legacy per-thread
   // promise chains in StatusService).
   let statusChain: Promise<unknown> = Promise.resolve();
@@ -100,6 +122,7 @@ export async function ticketWorkflow(input: TicketWorkflowInput): Promise<void> 
         const res = await executeChild(statusChangeWorkflow, {
           workflowId: statusChangeChildId(threadId, statusSeq++),
           args: [{ threadId, ...req }],
+          ...(saEnabled ? { typedSearchAttributes: [{ key: SA_TICKET_THREAD_ID, value: threadId }] } : {}),
         });
         if (res.applied && snap) {
           // Refresh the completion-relevant fields immediately; the next timer
@@ -107,11 +130,13 @@ export async function ticketWorkflow(input: TicketWorkflowInput): Promise<void> 
           snap.closed = res.closed;
           snap.closedAtMs = res.closed ? now() : null;
           snap.statusTagId = res.statusTagId;
+          snap.statusLabel = res.statusLabel;
           snap.tagClosesThread = res.closesThread;
           snap.tagIsResolved = res.isResolved;
           snap.lastStatusChangeAtMs = now();
           snap.remindersPaused = false; // cleared on every status change (schema rule)
           if (!res.closed) snap.recloseAtMs = null;
+          syncStatusSa(res.statusLabel);
         }
         return res;
       } finally {
@@ -185,6 +210,9 @@ export async function ticketWorkflow(input: TicketWorkflowInput): Promise<void> 
 
   snap = await quick.loadTicketState(threadId);
   hasIntercomLink = hasIntercomLink || snap.hasIntercomLink;
+  // Also re-establishes ticketStatus after Continue-As-New without relying on
+  // server-side attribute carry-over.
+  syncStatusSa(snap.statusLabel);
 
   // ---- Intercom pump fiber: strictly one delivery child at a time per ticket
   // (per-ticket FIFO); its own fiber so a delivery retrying for hours never
@@ -214,6 +242,7 @@ export async function ticketWorkflow(input: TicketWorkflowInput): Promise<void> 
           res = await executeChild(intercomDeliveryWorkflow, {
             workflowId: intercomDeliveryChildId(threadId, ev.seq),
             args: [{ threadId, event: ev }],
+            ...(saEnabled ? { typedSearchAttributes: [{ key: SA_TICKET_THREAD_ID, value: threadId }] } : {}),
           });
         } catch (e) {
           // A delivery child can only fail like this on a non-retryable
@@ -256,6 +285,9 @@ export async function ticketWorkflow(input: TicketWorkflowInput): Promise<void> 
     if (c) {
       creation = null;
       if (snap.exists === false) snap = await quick.loadTicketState(threadId);
+      syncStatusSa(snap.statusLabel);
+      // Static UI context for the Temporal UI (ids only — no question text).
+      upsertMemo({ categoryId: c.categoryId, aiSolve: c.aiSolve });
       enqueueIc("ensure", null);
       // aiSolve=false needs nothing here: the modal handler already pinged
       // staff inline (that path never left the interactive segment).
@@ -272,6 +304,14 @@ export async function ticketWorkflow(input: TicketWorkflowInput): Promise<void> 
               displayName: c.displayName,
             },
           ],
+          ...(saEnabled
+            ? {
+                typedSearchAttributes: [
+                  { key: SA_TICKET_THREAD_ID, value: threadId },
+                  { key: SA_AI_KIND, value: "auto_answer" },
+                ],
+              }
+            : {}),
         });
         void handle
           .result()
@@ -310,6 +350,7 @@ export async function ticketWorkflow(input: TicketWorkflowInput): Promise<void> 
         await sleep(5_000);
         continue;
       }
+      syncStatusSa(snap.statusLabel);
     }
 
     // Timer evaluation: the activity re-reads ticket + tag + Discord and does
@@ -324,6 +365,7 @@ export async function ticketWorkflow(input: TicketWorkflowInput): Promise<void> 
         const r = await timers.checkTicketTimers(threadId);
         snap = r.snapshot;
         hasIntercomLink = hasIntercomLink || r.snapshot.hasIntercomLink;
+        syncStatusSa(snap.statusLabel);
         if (r.statusChange) void runStatusChange(r.statusChange).catch(() => {});
       } catch {
         // Evaluation failed (Discord hiccup) — the next scan retries.
