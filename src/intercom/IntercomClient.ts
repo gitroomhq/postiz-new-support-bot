@@ -102,15 +102,17 @@ export class IntercomClient {
   }
 
   async listAdmins(): Promise<IntercomAdmin[]> {
-    const data = await this.json<{ admins?: Array<{ id?: string | number; name?: string; email?: string }> }>(
-      "/admins",
-      "GET",
-      undefined,
-      "admins"
-    );
+    const data = await this.json<{
+      admins?: Array<{ id?: string | number; name?: string; email?: string; avatar?: { image_url?: string | null } | string | null }>;
+    }>("/admins", "GET", undefined, "admins");
     return (data.admins ?? [])
       .filter((a) => a.id != null)
-      .map((a) => ({ id: String(a.id), name: a.name ?? null, email: a.email ?? null }));
+      .map((a) => ({
+        id: String(a.id),
+        name: a.name ?? null,
+        email: a.email ?? null,
+        avatarUrl: typeof a.avatar === "string" ? a.avatar : a.avatar?.image_url ?? null,
+      }));
   }
 
   async listTeams(): Promise<Array<{ id: string; name: string }>> {

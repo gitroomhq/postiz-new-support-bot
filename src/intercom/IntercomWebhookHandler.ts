@@ -290,7 +290,11 @@ export class IntercomWebhookHandler {
       if (!thread) return; // thread permanently deleted — link disconnected
 
       const avatar = part.author?.avatar;
-      const avatarUrl = typeof avatar === "string" ? avatar : avatar?.image_url ?? null;
+      let avatarUrl = typeof avatar === "string" ? avatar : avatar?.image_url ?? null;
+      if (!avatarUrl && part.author?.id != null) {
+        // Payloads don't always carry the author avatar — the /admins cache does.
+        avatarUrl = (await this.lookupAdmin(String(part.author.id)))?.avatarUrl ?? null;
+      }
       const authorName = part.author?.name || "Intercom agent";
 
       // Posting into an archived thread: un-archive, send, re-archive. The lock
@@ -822,24 +826,30 @@ export class IntercomWebhookHandler {
     }
   }
 
-  // Admin id → display name, cached 10 min (assignment events would otherwise
-  // pay a full /admins listing each; the lookup is purely cosmetic).
-  private adminNamesCache: { at: number; names: Map<string, string> } | null = null;
+  // Admin id → display name/avatar, cached 10 min (webhook payloads don't
+  // always carry the author's avatar, and assignment events would otherwise
+  // pay a full /admins listing each; lookups are purely cosmetic).
+  private adminCache: { at: number; admins: Map<string, { name: string | null; avatarUrl: string | null }> } | null =
+    null;
 
-  private async lookupAdminName(adminId: string): Promise<string | null> {
+  private async lookupAdmin(adminId: string): Promise<{ name: string | null; avatarUrl: string | null } | null> {
     const now = Date.now();
-    if (!this.adminNamesCache || now - this.adminNamesCache.at > 10 * 60 * 1000) {
+    if (!this.adminCache || now - this.adminCache.at > 10 * 60 * 1000) {
       try {
         const admins = await this.intercomClient.listAdmins();
-        this.adminNamesCache = {
+        this.adminCache = {
           at: now,
-          names: new Map(admins.filter((a) => a.name).map((a) => [a.id, a.name!] as const)),
+          admins: new Map(admins.map((a) => [a.id, { name: a.name ?? null, avatarUrl: a.avatarUrl ?? null }] as const)),
         };
       } catch {
-        return this.adminNamesCache?.names.get(adminId) ?? null; // stale beats nothing
+        return this.adminCache?.admins.get(adminId) ?? null; // stale beats nothing
       }
     }
-    return this.adminNamesCache.names.get(adminId) ?? null;
+    return this.adminCache.admins.get(adminId) ?? null;
+  }
+
+  private async lookupAdminName(adminId: string): Promise<string | null> {
+    return (await this.lookupAdmin(adminId))?.name ?? null;
   }
 
   private async fetchThread(threadId: string): Promise<ThreadChannel | null> {
