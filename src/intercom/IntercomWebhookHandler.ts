@@ -312,11 +312,24 @@ export class IntercomWebhookHandler {
           await this.store.recordEchoPart(kind, String(part.id), threadId).catch(() => {});
           return;
         }
-        // Layer 3 — bounded defer: outbound content still queued for this thread
-        // could produce this exact part. The catch below rolls the claim back so
-        // the retry can claim again. `attempt` here is the echo-defer count
-        // (tracked separately from real-failure attempts), so deferral can't
-        // exhaust the retry budget.
+        // Operator/Fin-authored parts can ONLY be the bridge's own output —
+        // the Operator identity never hand-types inbox replies (customers have
+        // no Messenger channel for the real Fin to answer on). There is no
+        // genuine reply to lose, so drop unconditionally instead of the
+        // defer-then-relay tiebreak below (which echoed mirrored AI answers
+        // back into Discord as "Fin" under backfill load).
+        const operatorId = this.settingsStore.intercomOperatorAdminId();
+        const partAuthorId = part.author?.id != null ? String(part.author.id) : null;
+        if (operatorId && partAuthorId === operatorId) {
+          await this.store.recordEchoPart(kind, String(part.id), threadId).catch(() => {});
+          return;
+        }
+        // Layer 3 — bounded defer (human-admin-authored only: a genuine reply
+        // IS possible when the bridge authors as a human): outbound content
+        // still queued for this thread could produce this exact part. The
+        // catch below rolls the claim back so the retry can claim again.
+        // `attempt` is the echo-defer count (tracked separately from
+        // real-failure attempts), so deferral can't exhaust the retry budget.
         if (attempt < MAX_DEFER_ATTEMPTS && (await this.hasPendingOutboundContent(threadId))) {
           throw new DeferEchoError();
         }
@@ -470,6 +483,15 @@ export class IntercomWebhookHandler {
         this.isBridgeAuthor(part) &&
         (await this.store.matchAndDeletePendingPost(threadId, bodyHash(part.body ?? "")))
       ) {
+        await this.store.recordEchoPart(kind, String(part.id), threadId).catch(() => {});
+        return;
+      }
+      // Operator/Fin-authored notes are always the bridge's own (context card,
+      // agent warning, corrective note) — never surface them as staff notes,
+      // even when the pending-post record is gone (see processAgentPart).
+      const operatorId = this.settingsStore.intercomOperatorAdminId();
+      const noteAuthorId = part.author?.id != null ? String(part.author.id) : null;
+      if (operatorId && noteAuthorId === operatorId) {
         await this.store.recordEchoPart(kind, String(part.id), threadId).catch(() => {});
         return;
       }
