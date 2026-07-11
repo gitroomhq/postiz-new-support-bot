@@ -597,6 +597,12 @@ const STATEMENTS: string[] = [
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "radarListEmailId" TEXT`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "radarListCustomerId" TEXT`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "radarListIpId" TEXT`,
+  // Intercom bi-mode hardening: confirmed echo marker, assignee damper,
+  // webhook health stamp, mode-change stamp (gap heal).
+  `ALTER TABLE "intercom_echo_parts" ADD COLUMN IF NOT EXISTS "confirmed" BOOLEAN NOT NULL DEFAULT false`,
+  `ALTER TABLE "intercom_links" ADD COLUMN IF NOT EXISTS "lastAssigneeId" TEXT`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "intercomLastInboundAt" TIMESTAMP(3)`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "intercomModeChangedAt" TIMESTAMP(3)`,
 ];
 
 export async function ensureSchema(prisma: PrismaClient): Promise<void> {

@@ -97,6 +97,8 @@ model BotSettings {
   intercomTeamId        String?                  // team the bridge assigns new conversations/tickets to (null = unassigned)
   // Status tag applied in Discord when an agent snoozes the conversation in Intercom.
   intercomSnoozeStatusTagId String?
+  intercomLastInboundAt DateTime? // last verified inbound webhook — /config health line
+  intercomModeChangedAt DateTime? // last mode flip — none→bi gap heal reads parts newer than this
   // Sentry DSN (set via /config; deploy has no .env access). Null = Sentry disabled.
   sentryDsn             String?
   // Sentry observability knobs (all edited via /config → Sentry).
@@ -486,6 +488,7 @@ model IntercomLink {
   lastSyncedOpen    String? // "open" | "closed" — conversation open/close parity damper
   // Last-seen Intercom tag name set (JSON string[]) — inbound tag-diff damper.
   lastTagsJson      Json?
+  lastAssigneeId    String? // last Intercom admin assignee relayed to Discord (damper)
   createdAt         DateTime  @default(now())
 
   @@map("intercom_links")
@@ -497,9 +500,16 @@ model IntercomLink {
 // the bridge's own echo or a duplicate delivery, and gets dropped.
 model IntercomEchoPart {
   id             String   @id @default(cuid())
-  kind           String // "c" = conversation part, "t" = ticket part, "r" = relay body-hash dedup
+  // "c" = conversation part, "t" = ticket part, "r" = relay body-hash dedup,
+  // "m" = outbound delivery ledger (partId = discordMessageId — retry dedup),
+  // "b" = backfill-enqueued marker (partId = threadId).
+  kind           String
   partId         String
   ticketThreadId String
+  // true = written by the outbound confirm (bridge-created part). A webhook
+  // claim row is unconfirmed; releaseClaim only deletes unconfirmed rows so a
+  // racing confirm's record can never be erased by a deferring webhook.
+  confirmed      Boolean  @default(false)
   createdAt      DateTime @default(now())
 
   @@unique([kind, partId])

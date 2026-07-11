@@ -4,6 +4,7 @@ import { SettingsStore } from "../config/SettingsStore";
 import { SessionStore } from "../auth/SessionStore";
 import { IntercomStore } from "./IntercomStore";
 import type { IntercomEventExecutor } from "./IntercomEventExecutor";
+import { bodyHash } from "./renderDiscordMarkdown";
 import { EnsurePayload, MessageAttachmentRef, OutboxEventType, OutboxPayload } from "./types";
 import { log } from "../util/logger";
 import type { TemporalProducers } from "../temporal/producers";
@@ -25,6 +26,12 @@ export interface BridgeSourceMessage {
 export const AGENT_WARNING_TEXT =
   "⚠️ One-way mirror: this conversation is pushed from Discord. Replies here are NOT delivered to the customer — answer in the Discord thread instead.";
 
+// Posted on a push→bi flip into every conversation that previously received
+// AGENT_WARNING_TEXT — that note is now the most prominent (and wrong)
+// instruction agents see.
+export const BI_CORRECTION_TEXT =
+  "✅ Bi-directional sync is now ON: replies in this conversation ARE delivered to the customer in Discord. (An earlier note here said otherwise — it no longer applies.)";
+
 // Composes and enqueues outbox events for everything the bridge mirrors.
 // Enqueue-only and no-throw: Intercom being down or misconfigured must never
 // break a Discord flow. All HTTP happens later, inside the per-ticket
@@ -39,6 +46,11 @@ export class IntercomSyncService {
   // Builds https://discord.com/channels/{guildId}/{threadId}; bound lazily
   // (the guild id is only known once the Discord client is ready).
   private threadUrlBuilder: (threadId: string) => string | null = () => null;
+  // Current Discord identity (display name + avatar) for the contact refresh;
+  // bound lazily from index.ts once the client exists. Best-effort.
+  private customerInfoResolver:
+    | ((userId: string) => Promise<{ displayName: string | null; avatarUrl: string | null } | null>)
+    | null = null;
 
   constructor(
     private settingsStore: SettingsStore,
@@ -53,6 +65,12 @@ export class IntercomSyncService {
 
   setThreadUrlBuilder(builder: (threadId: string) => string | null): void {
     this.threadUrlBuilder = builder;
+  }
+
+  setCustomerInfoResolver(
+    resolver: (userId: string) => Promise<{ displayName: string | null; avatarUrl: string | null } | null>
+  ): void {
+    this.customerInfoResolver = resolver;
   }
 
   // Temporal seam: composed events are signalled into the per-ticket
@@ -142,6 +160,56 @@ export class IntercomSyncService {
       await this.emit(ticket.threadId, "message", {
         direction: "outgoing",
         content: `🤖 AI:\n${finalText}`,
+        // Synthetic delivery-ledger key (there's no Discord message id here):
+        // a timeout-after-success retry must not double-post the AI answer.
+        discordMessageId: `ai:${threadId}:${bodyHash(finalText)}`,
+      });
+    });
+  }
+
+  // Discord message edited → appended "✏️ edited" part (Intercom can't edit
+  // parts in place). The executor drops it unless the original was mirrored.
+  async onMessageEdited(
+    ticket: TicketWithTag,
+    message: BridgeSourceMessage,
+    isStaff: boolean,
+    editedAtIso: string
+  ): Promise<void> {
+    if (!this.enabled()) return;
+    // Never enqueue for an unbridged ticket: the pump's ensure-first synthesis
+    // would mint a ghost conversation just to have the executor drop the event
+    // (original never mirrored). The executor's ledger check stays the authority.
+    if (!(await this.store.getLink(ticket.threadId))) return;
+    const composed = this.composeMessage(ticket, message, isStaff);
+    if (!composed) return;
+    await this.chained(ticket.threadId, async () => {
+      await this.emit(ticket.threadId, "message_edit", {
+        discordMessageId: message.discordMessageId,
+        editedAtIso,
+        direction: composed.direction,
+        authorName: message.authorName,
+        content: message.content.trim(),
+        ...(message.attachments.length > 0 ? { attachments: message.attachments } : {}),
+      });
+    });
+  }
+
+  // Discord message deleted → appended "🗑️ deleted" part. authorName/direction
+  // may be unknown for uncached messages (null → generic wording).
+  async onMessageDeleted(
+    ticket: TicketWithTag,
+    discordMessageId: string,
+    author: { id: string; name: string } | null
+  ): Promise<void> {
+    if (!this.enabled()) return;
+    // See onMessageEdited — no ghost ensure for unbridged tickets.
+    if (!(await this.store.getLink(ticket.threadId))) return;
+    const isCustomer = author != null && ticket.customerId != null && author.id === ticket.customerId;
+    await this.chained(ticket.threadId, async () => {
+      await this.emit(ticket.threadId, "message_delete", {
+        discordMessageId,
+        direction: isCustomer ? "incoming" : "outgoing",
+        authorName: author?.name ?? null,
       });
     });
   }
@@ -213,12 +281,37 @@ export class IntercomSyncService {
     });
   }
 
+  // push→bi flip: corrective note into every OPEN conversation that got the
+  // push-mode warning; agentWarnedAt is cleared so a later return to push mode
+  // re-warns. Returns the number of conversations corrected.
+  async enqueueBiModeCorrections(): Promise<number> {
+    const links = await this.store.listWarnedLinks();
+    let count = 0;
+    for (const link of links) {
+      const ticket = await this.ticketStore.getByThreadId(link.ticketThreadId);
+      if (!ticket || ticket.closed) {
+        // Closed tickets: no note (nobody is working them), but still reset the
+        // warning so a reopened ticket under a later push window re-warns.
+        await this.store.clearAgentWarned(link.ticketThreadId);
+        continue;
+      }
+      await this.chained(link.ticketThreadId, async () => {
+        await this.emit(link.ticketThreadId, "note", { content: BI_CORRECTION_TEXT });
+      });
+      await this.store.clearAgentWarned(link.ticketThreadId);
+      count++;
+    }
+    return count;
+  }
+
   // ---- Backfill ----
 
-  // Sends a full historical replay for one ticket through emit() (re-runs key
-  // off the created link, so a crash mid-replay may re-send a prefix — the
-  // executor's dampers absorb it). Returns the number of events sent, or null
-  // when the ticket is already bridged.
+  // Sends a full historical replay for one ticket through emit(). Guarded twice:
+  // the link row (ticket already bridged) AND the backfill-enqueued marker —
+  // the link only appears once the ensure DELIVERS, which can be minutes away
+  // on a slow drain, so a re-click (or a second backfill run) would otherwise
+  // enqueue the whole transcript again with no message-level dedup. Returns the
+  // number of events sent, or null when the ticket is already bridged/enqueued.
   // Messages-only mirroring: the transcript replays messages; status/priority/
   // CSAT land as ticket state + attributes, never as notes. Timestamps come
   // from the native created_at backdating — no text prefixes.
@@ -227,6 +320,7 @@ export class IntercomSyncService {
     messages: BridgeSourceMessage[] | null // null = thread no longer exists
   ): Promise<number | null> {
     if (await this.store.getLink(ticket.threadId)) return null;
+    if (!(await this.store.claimBackfill(ticket.threadId))) return null;
 
     const events: Array<{ ticketThreadId: string; type: OutboxEventType; payload: OutboxPayload }> = [];
     const add = (type: OutboxEventType, payload: OutboxPayload) =>
@@ -257,7 +351,10 @@ export class IntercomSyncService {
       }
     }
 
-    // Tail: final state + attributes (no transcript notes).
+    // Tail: final state + attributes (no transcript notes). forceOpenSync: the
+    // replayed contact messages auto-reopen the conversation in Intercom, so
+    // the close must be re-asserted past the lastSyncedOpen damper — without it
+    // every backfilled closed ticket floods the inbox as an open conversation.
     const tag = ticket.statusTag;
     if (tag) {
       add("status", {
@@ -266,6 +363,7 @@ export class IntercomSyncService {
         actorName: "Backfill",
         closed: tag.closesThread,
         resolved: tag.closesThread || isResolvedTag(tag),
+        forceOpenSync: true,
       });
     }
     const priorityTag = ticket.priorityTagId ? this.settingsStore.priorityById(ticket.priorityTagId) : undefined;
@@ -279,8 +377,15 @@ export class IntercomSyncService {
       add("csat", { score: ticket.csatScore, comment: ticket.csatComment });
     }
 
-    for (const event of events) {
-      await this.emit(event.ticketThreadId, event.type, event.payload);
+    try {
+      for (const event of events) {
+        await this.emit(event.ticketThreadId, event.type, event.payload);
+      }
+    } catch (e) {
+      // Enqueue failed partway — release the marker so the ticket can be
+      // retried (delivered messages are still deduped by the m-ledger).
+      await this.store.releaseBackfill(ticket.threadId).catch(() => {});
+      throw e;
     }
     return events.length;
   }
@@ -290,12 +395,23 @@ export class IntercomSyncService {
   // Also used by the outbox executor's 404 self-heal to rebuild the remote objects.
   async buildEnsurePayloadWithSession(ticket: TicketWithTag): Promise<EnsurePayload> {
     const payload = this.buildEnsurePayload(ticket, categoryLabelOf(ticket, this.categoryLabelResolver));
-    if (ticket.customerId) {
-      const session = await this.sessionStore.getSession(ticket.customerId).catch(() => null);
-      payload.postizUserId = session?.postizUserId ?? null;
-      payload.stripeCustomerId = session?.stripeCustomerId ?? null;
-    }
+    await this.enrichPayload(payload, ticket);
     return payload;
+  }
+
+  // Session ids (Postiz/Stripe) + current Discord identity (name/avatar drift).
+  private async enrichPayload(payload: EnsurePayload, ticket: TicketWithTag): Promise<void> {
+    if (!ticket.customerId) return;
+    const session = await this.sessionStore.getSession(ticket.customerId).catch(() => null);
+    payload.postizUserId = session?.postizUserId ?? null;
+    payload.stripeCustomerId = session?.stripeCustomerId ?? null;
+    if (this.customerInfoResolver) {
+      const info = await this.customerInfoResolver(ticket.customerId).catch(() => null);
+      if (info) {
+        payload.customerAvatarUrl = info.avatarUrl;
+        if (info.displayName) payload.customerDisplayName = info.displayName;
+      }
+    }
   }
 
   private buildEnsurePayload(ticket: TicketWithTag, categoryLabel: string | null): EnsurePayload {
@@ -327,11 +443,7 @@ export class IntercomSyncService {
     // message/note event has something to land on.
     if (await this.store.getLink(ticket.threadId)) return;
     const payload = this.buildEnsurePayload(ticket, categoryLabel ?? categoryLabelOf(ticket, this.categoryLabelResolver));
-    if (ticket.customerId) {
-      const session = await this.sessionStore.getSession(ticket.customerId).catch(() => null);
-      payload.postizUserId = session?.postizUserId ?? null;
-      payload.stripeCustomerId = session?.stripeCustomerId ?? null;
-    }
+    await this.enrichPayload(payload, ticket);
     await this.emit(ticket.threadId, "ensure", payload);
   }
 
@@ -350,8 +462,11 @@ export class IntercomSyncService {
     let direction: "incoming" | "outgoing";
     let content: string;
     if (message.authorIsBot) {
+      // Bot messages only reach this path via backfill (live handleMessage
+      // filters bots) — mark them so the imported transcript doesn't read as a
+      // human staff reply. Historical AI answers may already carry the marker.
       direction = "outgoing";
-      content = text;
+      content = text.startsWith("🤖") ? text : `🤖 ${text}`;
     } else if (isCustomer || (!isStaff && ticket.customerId == null)) {
       direction = "incoming";
       content = text;

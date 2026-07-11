@@ -3,6 +3,7 @@ import {
   condition,
   continueAsNew,
   executeChild,
+  patched,
   proxyActivities,
   setHandler,
   sleep,
@@ -34,6 +35,7 @@ import {
   applyStatusUpdate,
   getStateQuery,
   humanMessageSignal,
+  intercomClearOutboxSignal,
   intercomEnqueueSignal,
   noopSignal,
   remindersPausedSignal,
@@ -173,6 +175,22 @@ export async function ticketWorkflow(input: TicketWorkflowInput): Promise<void> 
     enqueueIc(p.type, p.payload);
   });
 
+  // Bumped on every clear-outbox signal: an in-flight ensure that completes
+  // AFTER a clear must not re-assert hasIntercomLink (the link row it created
+  // was just wiped) — the pump compares its captured epoch before latching.
+  let icClearEpoch = 0;
+
+  setHandler(intercomClearOutboxSignal, () => {
+    // Bridge reset/wipe: queued events would resurrect the wiped Intercom data
+    // (requireLink refuses too, but dropping here avoids a dead-letter per
+    // event). hasIntercomLink=false so post-wipe activity synthesizes a fresh
+    // ensure — the mode staying on means a rebuild is intended.
+    outbox.length = 0;
+    hasIntercomLink = false;
+    icClearEpoch++;
+    touch();
+  });
+
   setHandler(remindersPausedSignal, (p) => {
     if (snap) snap.remindersPaused = p.paused;
     touch();
@@ -237,6 +255,7 @@ export async function ticketWorkflow(input: TicketWorkflowInput): Promise<void> 
           outbox.unshift({ seq: outboxSeq++, type: "ensure", payload: null });
         }
         const ev = outbox[0];
+        const epochBefore = icClearEpoch;
         let res: IntercomDeliveryResult;
         try {
           res = await executeChild(intercomDeliveryWorkflow, {
@@ -249,9 +268,21 @@ export async function ticketWorkflow(input: TicketWorkflowInput): Promise<void> 
           // orchestration error — drop the event rather than wedging the queue.
           res = { outcome: "dead", error: e instanceof Error ? e.message : String(e) };
         }
-        if (ev.type === "ensure" && res.outcome === "ok") hasIntercomLink = true;
-        outbox.shift();
+        if (ev.type === "ensure" && res.outcome === "ok" && epochBefore === icClearEpoch) hasIntercomLink = true;
+        // Identity guard: a clear-outbox signal may have emptied/replaced the
+        // queue while the delivery child ran — never shift someone else's head.
+        if (outbox[0] === ev) outbox.shift();
         touch();
+        if (ev.type === "ensure" && res.outcome === "dead" && patched("intercom-ensure-park")) {
+          // A dead ensure is a config/data problem (revoked token, unmapped
+          // ticket type, 422 …). Without parking, the head-synthesis above
+          // would mint a fresh ensure for the still-queued event on the very
+          // next iteration — an infinite hot loop of delivery children and
+          // audit embeds. Hold the queue on the disabled-recheck cadence;
+          // /config fixes are picked up on the next pass.
+          await condition(() => stopping, PUMP_DISABLED_RECHECK_MS);
+          if (stopping) return;
+        }
       }
     } finally {
       pumpExited = true;

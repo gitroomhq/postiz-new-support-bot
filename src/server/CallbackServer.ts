@@ -6,6 +6,7 @@ import { BotConfig } from "../config";
 import { OAuthManager } from "../auth/OAuthManager";
 import { log } from "../util/logger";
 import { metricCount } from "../util/instrument";
+import { exportIntercomWebhook } from "../metrics/MetricsExporter";
 import { TemporalBufferedError } from "../temporal/producers";
 
 const httpLog = log.child("http");
@@ -120,6 +121,9 @@ export class CallbackServer {
         const topic = typeof (req.body as { topic?: unknown })?.topic === "string" ? (req.body as { topic: string }).topic : "unknown";
         if (!this.intercomWebhook || !secret || !signature || !raw || !signatureMatches(raw, secret, signature)) {
           metricCount("intercom.webhooks", 1, { topic, accepted: false });
+          // Influx counter for Grafana alerting: a rotated client secret 403s
+          // EVERY delivery silently (Intercom does not retry 4xx).
+          exportIntercomWebhook("rejected");
           res.status(403).send("Forbidden");
           return;
         }
@@ -127,10 +131,14 @@ export class CallbackServer {
           const accepted = await this.intercomWebhook.accept(req.body);
           httpLog.info("intercom.webhook.received", { "webhook.topic": topic, "webhook.accepted": accepted });
           metricCount("intercom.webhooks", 1, { topic, accepted: true });
+          exportIntercomWebhook("accepted");
           res.status(200).send("ok");
         } catch (e) {
           httpLog.error("intercom webhook enqueue failed", e, { "webhook.topic": topic });
           metricCount("intercom.webhooks", 1, { topic, accepted: false });
+          // Sustained 500s risk Intercom auto-disabling the subscription —
+          // alert on this (see README runbook).
+          exportIntercomWebhook(e instanceof TemporalBufferedError ? "buffered" : "error");
           res.status(500).send("queueing failed");
         }
       }

@@ -21,6 +21,7 @@ import {
   type Interaction,
   type Message,
   type PartialGuildMember,
+  type PartialMessage,
   type ChatInputCommandInteraction,
   type ButtonInteraction,
   type AutocompleteInteraction,
@@ -71,7 +72,7 @@ import { BaseCategory, TicketContext } from "../categories/BaseCategory";
 import { IntercomSyncService, BridgeSourceMessage } from "../intercom/IntercomSyncService";
 import { IntercomStore } from "../intercom/IntercomStore";
 import { IntercomClient, IntercomHttpError } from "../intercom/IntercomClient";
-import { IntercomWebhookHandler } from "../intercom/IntercomWebhookHandler";
+import { INTERCOM_WEBHOOK_TOPICS, IntercomWebhookHandler } from "../intercom/IntercomWebhookHandler";
 import { IntercomInboxApp } from "../intercom/IntercomInboxApp";
 import { BillingAdmin } from "./BillingAdmin";
 import { RADAR_LISTS, type BlockService } from "./billing/BlockService";
@@ -254,6 +255,17 @@ export class DiscordBot {
       this.handleMessage(message).catch((e) => this.reportHandlerError("messageCreate", e));
     });
 
+    // Edits/deletes in ticket threads mirror to Intercom as appended
+    // correction parts (Intercom has no part-edit API). A customer deleting a
+    // leaked secret must not leave it silently frozen in the Intercom copy.
+    this.client.on("messageUpdate", (_oldMessage, newMessage) => {
+      this.handleMessageEdit(newMessage).catch((e) => this.reportHandlerError("messageUpdate", e));
+    });
+
+    this.client.on("messageDelete", (message) => {
+      this.handleMessageDelete(message).catch((e) => this.reportHandlerError("messageDelete", e));
+    });
+
     this.client.on("threadUpdate", (oldThread, newThread) => {
       this.handleThreadUpdate(oldThread, newThread).catch((e) => this.reportHandlerError("threadUpdate", e));
     });
@@ -381,6 +393,49 @@ export class DiscordBot {
       },
       () => this.processTicketMessage(message, ticket)
     );
+  }
+
+  // Human edit in a tracked ticket thread → appended "✏️ edited" part in
+  // Intercom. editedAt gate: Discord also fires messageUpdate for embed/link-
+  // preview attachment with unchanged content — those carry no editedTimestamp.
+  private async handleMessageEdit(newMessage: Message | PartialMessage): Promise<void> {
+    const message = newMessage.partial ? await newMessage.fetch().catch(() => null) : newMessage;
+    if (!message || message.author.bot) return;
+    if (!message.editedAt) return;
+    if (!message.channel.isThread()) return;
+    const ticket = await this.ticketStore.getByThreadId(message.channelId);
+    if (!ticket) return;
+
+    const member = message.member ?? (await message.guild?.members.fetch(message.author.id).catch(() => null)) ?? null;
+    const isStaff = !!member && this.isStaffMember(member);
+    safe(
+      this.intercomSync.onMessageEdited(ticket, this.toBridgeMessage(message, member), isStaff, message.editedAt.toISOString()),
+      "intercom-sync",
+      { "ticket.thread_id": ticket.threadId, "sync.event": "message_edited" }
+    );
+  }
+
+  // Human delete in a tracked ticket thread → appended "🗑️ deleted" part.
+  // Deleted messages can't be fetched — partials still carry id + channel; an
+  // unknown author is safe because the executor only mirrors deletions of
+  // messages its delivery ledger confirms were mirrored (bot messages never
+  // carry their Discord id there).
+  private async handleMessageDelete(message: Message | PartialMessage): Promise<void> {
+    if (message.author?.bot) return;
+    if (!message.channel.isThread()) return;
+    const ticket = await this.ticketStore.getByThreadId(message.channelId);
+    if (!ticket) return;
+
+    const author = message.author
+      ? {
+          id: message.author.id,
+          name: message.member?.displayName ?? message.author.displayName ?? message.author.username,
+        }
+      : null;
+    safe(this.intercomSync.onMessageDeleted(ticket, message.id, author), "intercom-sync", {
+      "ticket.thread_id": ticket.threadId,
+      "sync.event": "message_deleted",
+    });
   }
 
   private async processTicketMessage(message: Message, ticket: TicketWithTag): Promise<void> {
@@ -3856,6 +3911,13 @@ export class DiscordBot {
           `**Team routing:** ${s.intercomTeamId() ? `team \`${s.intercomTeamId()}\`` : "_unassigned_"}`,
           "",
           `**Bridged tickets:** ${links}/${totalTickets}`,
+          // Webhook health: without this line a dead Developer-Hub subscription
+          // (or rotated secret) is indistinguishable from a quiet inbox.
+          `**Last inbound webhook:** ${(() => {
+            const at = s.intercomLastInboundAt();
+            if (at) return `<t:${Math.floor(at.getTime() / 1000)}:R>`;
+            return s.intercomClientSecret() ? "_never — check the Developer Hub subscription + endpoint URL_" : "_n/a (no client secret)_";
+          })()}`,
           "**Queues:** per-ticket outbox + per-conversation inbox run as Temporal workflows (live counts in /config → Temporal); failures land as dead-letter audit embeds.",
           `**Snooze tag:** ${
             s.intercomSnoozeStatusTagId()
@@ -3867,7 +3929,7 @@ export class DiscordBot {
           }`,
           "",
           s.intercomClientSecret()
-            ? "Webhook endpoint: `POST <public-url>/intercom/webhook` (signed via X-Hub-Signature). Topics: conversation.admin.replied / noted / closed / opened / snoozed / unsnoozed, conversation.operator.replied, ticket.state.updated, ticket.admin.replied (+ ticket.note.created if offered). Canvas inbox app: `POST <public-url>/intercom/inbox-app/initialize` + `/submit`."
+            ? `Webhook endpoint: \`POST <public-url>/intercom/webhook\` (signed via X-Hub-Signature). Topics needed: ${INTERCOM_WEBHOOK_TOPICS.join(", ")}. Extra subscriptions are ignored at the door — subscribing everything is fine. Canvas inbox app: \`POST <public-url>/intercom/inbox-app/initialize\` + \`/submit\`.`
             : "_No client secret set — the inbound webhook stays disabled (needed for bi mode and the push-mode agent warning)._",
           "",
           "Modes apply to tickets created inside Discord only; Intercom-native conversations are never touched.",
@@ -5835,18 +5897,95 @@ export class DiscordBot {
       return;
     }
 
+    if (id.startsWith("config_intercom_mode_confirm_")) {
+      // Soft-warning confirm — but the panel can sit open indefinitely, so
+      // re-run the HARD checks (a secret could have been cleared meanwhile).
+      const mode = id.slice("config_intercom_mode_confirm_".length) as IntercomMode;
+      if (mode !== "push" && mode !== "bi") return;
+      await interaction.deferUpdate();
+      const pf = await this.intercomModePreflight(mode);
+      if (pf.hard.length > 0) {
+        await interaction.editReply(await this.buildIntercomPanel());
+        await interaction.followUp({
+          embeds: [
+            makeEmbed(
+              [`Cannot enable **${mode}** — the configuration changed since the preflight:`, ...pf.hard.map((h) => `• ${h}`)].join("\n"),
+              COLORS.danger
+            ),
+          ],
+          flags: 64,
+        });
+        return;
+      }
+      await this.applyIntercomMode(interaction, this.settingsStore.intercomMode(), mode);
+      await interaction.editReply(await this.buildIntercomPanel());
+      return;
+    }
+
     if (id.startsWith("config_intercom_mode_")) {
       const mode = id.slice("config_intercom_mode_".length) as IntercomMode;
       if (mode !== "none" && mode !== "push" && mode !== "bi") return;
       const before = this.settingsStore.intercomMode();
-      await this.settingsStore.updateIntercom({ intercomMode: mode });
-      this.auditConfig(interaction, `Intercom mode → ${mode}`);
-      await interaction.update(await this.buildIntercomPanel());
-      // Turning the bridge on backfills every existing ticket (open + closed);
-      // already-bridged tickets are skipped, so repeat switches are harmless.
-      if (before === "none" && mode !== "none") {
-        safe(this.runIntercomBackfill(interaction), "discord:backfill", { "backfill.trigger": "mode_switch" });
+      if (mode === before) {
+        await interaction.update(await this.buildIntercomPanel());
+        return;
       }
+
+      if (mode === "none") {
+        await this.applyIntercomMode(interaction, before, mode);
+        await interaction.update(await this.buildIntercomPanel());
+        await interaction
+          .followUp({
+            embeds: [
+              makeEmbed(
+                "Bridge off — nothing mirrors in either direction. Intercom agent replies posted while off are healed when you re-enable **bi**; Discord messages sent while off are NOT replayable.",
+                COLORS.warn
+              ),
+            ],
+            flags: 64,
+          })
+          .catch(() => {});
+        return;
+      }
+
+      // Preflight (token probe hits the API — defer first). Hard failures
+      // block the flip; soft ones warn and ask for an explicit confirm.
+      await interaction.deferUpdate();
+      const pf = await this.intercomModePreflight(mode);
+      if (pf.hard.length > 0) {
+        await interaction.editReply(await this.buildIntercomPanel());
+        await interaction.followUp({
+          embeds: [
+            makeEmbed(
+              [`Cannot enable **${mode}** — fix these first:`, ...pf.hard.map((h) => `• ${h}`)].join("\n"),
+              COLORS.danger
+            ),
+          ],
+          flags: 64,
+        });
+        return;
+      }
+      if (pf.soft.length > 0) {
+        const confirm = new ActionRowBuilder<ButtonBuilder>().addComponents(
+          new ButtonBuilder()
+            .setCustomId(`config_intercom_mode_confirm_${mode}`)
+            .setLabel(`Enable ${mode === "bi" ? "Bidirectional" : "Push"} anyway`)
+            .setStyle(ButtonStyle.Primary),
+          new ButtonBuilder().setCustomId("config_intercom").setLabel("Cancel").setStyle(ButtonStyle.Secondary)
+        );
+        await interaction.editReply({
+          embeds: [
+            makeEmbed(
+              [`Preflight passed with warnings for **${mode}**:`, ...pf.soft.map((w) => `• ${w}`)].join("\n"),
+              COLORS.warn
+            ),
+          ],
+          components: [confirm],
+        });
+        return;
+      }
+      await this.applyIntercomMode(interaction, before, mode);
+      await interaction.editReply(await this.buildIntercomPanel());
       return;
     }
 
@@ -5883,7 +6022,12 @@ export class DiscordBot {
     }
 
     if (id === "config_intercom_reset_confirm") {
+      // Queued (pre-reset) events in the ticket workflows would resurrect the
+      // bridge state being reset — clear their outboxes (targets collected
+      // before resetAll, signals sent after; see collectIntercomClearTargets).
+      const clearTargets = await this.collectIntercomClearTargets();
       const result = await this.intercomStore.resetAll();
+      await this.signalIntercomClear(clearTargets);
       this.auditConfig(
         interaction,
         `Intercom bridge data reset (${result.links} links, ${result.parts} echo/pending rows deleted)`
@@ -6430,6 +6574,38 @@ export class DiscordBot {
     }
 
     if (id === "config_intercom_backfill") {
+      // Confirm with counts first (matches the Influx/scoring backfills) — a
+      // replay of every unbridged ticket is a long, noisy drain.
+      const [links, total] = await Promise.all([
+        this.intercomStore.countLinks().catch(() => 0),
+        this.ticketStore.getAllWithTag().then((t) => t.length).catch(() => 0),
+      ]);
+      const unbridged = Math.max(0, total - links);
+      const confirm = new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder()
+          .setCustomId("config_intercom_backfill_confirm")
+          .setLabel("Start backfill")
+          .setStyle(ButtonStyle.Primary)
+          .setDisabled(unbridged === 0),
+        new ButtonBuilder().setCustomId("config_intercom").setLabel("Cancel").setStyle(ButtonStyle.Secondary)
+      );
+      await interaction.update({
+        embeds: [
+          makeEmbed(
+            [
+              `This replays **${unbridged}** unbridged ticket(s) (open + closed, full transcripts) into Intercom; ${links} already-bridged ticket(s) are skipped.`,
+              "",
+              "The drain is paced (~1 event / 300ms) and runs in the background via the ticket workflows. Closed tickets are re-closed at the end of each replay.",
+            ].join("\n"),
+            COLORS.warn
+          ),
+        ],
+        components: [confirm],
+      });
+      return;
+    }
+
+    if (id === "config_intercom_backfill_confirm") {
       await interaction.deferReply({ flags: 64 });
       await this.runIntercomBackfill(interaction);
       return;
@@ -7371,7 +7547,7 @@ export class DiscordBot {
             [
               "Intercom secrets saved — probing the workspace…",
               clientSecret
-                ? "Point the app's webhook at `POST <public-url>/intercom/webhook` and subscribe: conversation.admin.replied / noted / closed / opened, conversation.operator.replied, ticket.state.updated, ticket.admin.replied."
+                ? `Point the app's webhook at \`POST <public-url>/intercom/webhook\` and subscribe at least: ${INTERCOM_WEBHOOK_TOPICS.join(", ")}. Extra subscriptions are ignored at the door.`
                 : "No client secret set — the inbound webhook endpoint stays disabled (needed for bi mode and the push-mode agent warning).",
             ].join("\n"),
             COLORS.success
@@ -7981,6 +8157,178 @@ export class DiscordBot {
   // Enqueueing is DB-only and fast; the actual pushing happens in the outbox
   // drainer at its own pace. Runs after the mode switch none→push/bi and from
   // the panel's "Backfill tickets" button.
+  // Preflight for enabling push/bi. Hard = the bridge cannot work (block);
+  // soft = it works but a sync surface is dark (warn + confirm).
+  private async intercomModePreflight(mode: "push" | "bi"): Promise<{ hard: string[]; soft: string[] }> {
+    const s = this.settingsStore;
+    const hard: string[] = [];
+    const soft: string[] = [];
+
+    if (!s.intercomAccessToken()) {
+      hard.push("No access token (Set Secrets).");
+    } else {
+      try {
+        await this.intercomClient.getMe();
+      } catch (e) {
+        hard.push(`Token probe failed: ${(e instanceof Error ? e.message : String(e)).slice(0, 200)}`);
+      }
+    }
+    if (!s.intercomAuthorAdminId()) hard.push("No authoring admin — Set Secrets auto-detects one, or use Pick Admin.");
+    if (!s.intercomTicketTypeIdFor(null)) hard.push("No Default ticket type mapped (Map Ticket Types).");
+
+    if (mode === "bi") {
+      if (!s.intercomClientSecret()) {
+        hard.push("No client secret — every inbound webhook would be rejected, so agent replies could never reach Discord (Set Secrets).");
+      } else if (!s.intercomLastInboundAt()) {
+        soft.push("No inbound webhook has ever been received — verify the Developer Hub subscription (topics + endpoint URL) before relying on agent replies reaching Discord.");
+      }
+      if (!s.publicBaseUrl()) soft.push("No public base URL configured — set it so the webhook endpoint instructions and thread links resolve.");
+      if (s.tags().filter((t) => t.intercomTicketStateId).length === 0) {
+        soft.push("No status tags are mapped to Intercom ticket states — state changes will not sync (Map States).");
+      }
+      if (!s.closingTag()) soft.push("No closing status tag exists — an Intercom-side close cannot map back to Discord.");
+    }
+    return { hard, soft };
+  }
+
+  // Applies a preflighted mode change + the transition side effects:
+  // push→bi corrective notes, none→bi inbound gap heal.
+  private async applyIntercomMode(interaction: ButtonInteraction, before: IntercomMode, mode: IntercomMode): Promise<void> {
+    // When `before` began — for none→bi this is the start of the off window.
+    const offSince = this.settingsStore.intercomModeChangedAt();
+    await this.settingsStore.setIntercomMode(mode);
+    this.auditConfig(interaction, `Intercom mode → ${mode}`);
+
+    if (before === "push" && mode === "bi") {
+      // Every push-era conversation still shows "replies are NOT delivered" —
+      // now false and actively harmful.
+      safe(
+        this.intercomSync.enqueueBiModeCorrections().then(async (count) => {
+          if (count > 0) {
+            await interaction
+              .followUp({
+                embeds: [
+                  makeEmbed(
+                    `Queued corrective notes for **${count}** open conversation(s) that carry the push-mode "replies don't reach the customer" warning.`,
+                    COLORS.success
+                  ),
+                ],
+                flags: 64,
+              })
+              .catch(() => {});
+          }
+        }),
+        "intercom-sync",
+        { "sync.event": "bi_corrections" }
+      );
+    }
+
+    if (before === "none" && mode === "bi" && offSince) {
+      safe(this.runIntercomGapHeal(interaction, offSince), "discord:intercom-gap-heal", {});
+    }
+
+    if (before === "none") {
+      await interaction
+        .followUp({
+          embeds: [
+            makeEmbed(
+              "Bridge enabled. Existing tickets are NOT auto-backfilled — use **Backfill tickets** (it asks for confirmation). Discord messages sent while the bridge was off were never mirrored and cannot be replayed.",
+              COLORS.neutral
+            ),
+          ],
+          flags: 64,
+        })
+        .catch(() => {});
+    }
+  }
+
+  // none→bi gap heal: agent replies posted in Intercom during the off window
+  // were dropped by the webhook handler (and Intercom does not redeliver).
+  // Re-fetch parts newer than the off-window start for open bridged tickets and
+  // feed them through the normal relay path — the part-id ledger makes anything
+  // already relayed a no-op.
+  private async runIntercomGapHeal(interaction: ButtonInteraction, offSince: Date): Promise<void> {
+    const links = await this.intercomStore.listAllLinks();
+    const sinceUnix = Math.floor(offSince.getTime() / 1000);
+    const pause = () => new Promise((r) => setTimeout(r, 150));
+    let scanned = 0;
+    let conversationsWithParts = 0;
+    let fetchFailures = 0;
+    for (const link of links) {
+      const ticket = await this.ticketStore.getByThreadId(link.ticketThreadId).catch(() => null);
+      if (!ticket || ticket.closed) continue;
+      scanned++;
+      await pause(); // politeness pacing — this loop can hit many conversations back-to-back
+      const parts = await this.intercomClient.getConversationPartsSince(link.conversationId, sinceUnix).catch(() => {
+        fetchFailures++;
+        return [];
+      });
+      if (parts.length === 0) continue;
+      conversationsWithParts++;
+      // Defer budget passed as exhausted: the bridge was off, so there is no
+      // in-flight outbound content these parts could be echoes of.
+      await this.intercomWebhook
+        .process(
+          "conversation.admin.replied",
+          {
+            topic: "conversation.admin.replied",
+            data: { item: { id: link.conversationId, conversation_parts: { conversation_parts: parts } } },
+          },
+          Number.MAX_SAFE_INTEGER
+        )
+        .catch((e) => {
+          log.child("discord:intercom").warn("gap heal relay failed", {
+            "ticket.thread_id": link.ticketThreadId,
+            "error.message": e instanceof Error ? e.message : String(e),
+          });
+        });
+    }
+    await interaction
+      .followUp({
+        embeds: [
+          makeEmbed(
+            [
+              `Gap heal: scanned ${scanned} open bridged ticket(s); ${conversationsWithParts} had Intercom activity from the off window (agent replies were relayed into their threads; notes/state changes are not healed).`,
+              ...(fetchFailures > 0
+                ? [`⚠️ ${fetchFailures} conversation fetch(es) failed — those threads may still be missing agent replies from the off window.`]
+                : []),
+            ].join("\n"),
+            fetchFailures > 0 ? COLORS.warn : COLORS.neutral
+          ),
+        ],
+        flags: 64,
+      })
+      .catch(() => {});
+  }
+
+  // Reset/wipe: queued Intercom events live in workflow state and survive
+  // IntercomStore.resetAll(), so they must be cleared by signal. Two phases:
+  // collect BEFORE resetAll (it deletes the "b" backfill markers), signal
+  // AFTER resetAll (a signal-with-started workflow's state load must see the
+  // post-reset DB, or it re-latches hasIntercomLink from a stale link row).
+  // Targets: linked threads + backfill-enqueued threads (deepest queues, often
+  // link-less) + open tickets (live outboxes) — closed unlinked tickets can't
+  // hold meaningful queues.
+  private async collectIntercomClearTargets(): Promise<string[]> {
+    const targets = new Set<string>();
+    for (const link of await this.intercomStore.listAllLinks().catch(() => [])) targets.add(link.ticketThreadId);
+    for (const threadId of await this.intercomStore.listBackfillClaimedThreadIds().catch(() => [])) {
+      targets.add(threadId);
+    }
+    for (const ticket of await this.ticketStore.listOpenWithTag().catch(() => [])) targets.add(ticket.threadId);
+    return [...targets];
+  }
+
+  private async signalIntercomClear(targets: string[]): Promise<void> {
+    if (!this.temporalProducers?.routable()) return;
+    const CHUNK = 20;
+    for (let i = 0; i < targets.length; i += CHUNK) {
+      await Promise.allSettled(
+        targets.slice(i, i + CHUNK).map((threadId) => this.temporalProducers!.intercomClearOutbox(threadId))
+      );
+    }
+  }
+
   private async runIntercomBackfill(interaction: ButtonInteraction): Promise<void> {
     // Mode-switch calls arrive after interaction.update(); button calls after
     // deferReply(). followUp works for both.
@@ -8056,7 +8404,12 @@ export class DiscordBot {
 
     try {
       const links = await this.intercomStore.listAllLinks();
+      // Queued pre-wipe events survive resetAll (they live in workflow state)
+      // and would otherwise rebuild the bridge while the wipe is deleting —
+      // collect targets before resetAll, signal the clears right after.
+      const clearTargets = await this.collectIntercomClearTargets();
       const local = await this.intercomStore.resetAll();
+      await this.signalIntercomClear(clearTargets);
       await report(`Intercom wipe started — ${links.length} conversation(s) to delete…`);
 
       let tickets = 0;

@@ -56,8 +56,20 @@ export class IntercomStore {
     await this.prisma.intercomLink.updateMany({ where: { ticketThreadId }, data: { ticketId } });
   }
 
-  async deleteLink(ticketThreadId: string): Promise<void> {
-    await this.prisma.intercomLink.deleteMany({ where: { ticketThreadId } });
+  // 404 self-heal: the linked contact was merged/hard-deleted in Intercom and a
+  // fresh one was resolved for the same conversation.
+  async updateLinkContact(ticketThreadId: string, contactId: string, contactExternalId: string): Promise<void> {
+    await this.prisma.intercomLink.updateMany({
+      where: { ticketThreadId },
+      data: { contactId, contactExternalId },
+    });
+  }
+
+  // Returns the delete count so concurrent inbound handlers can tell who
+  // actually disconnected the link (exactly-once disconnect note).
+  async deleteLink(ticketThreadId: string): Promise<number> {
+    const result = await this.prisma.intercomLink.deleteMany({ where: { ticketThreadId } });
+    return result.count;
   }
 
   // Returns true only for the caller that claims the warning (null-guarded), so
@@ -70,6 +82,18 @@ export class IntercomStore {
     return result.count > 0;
   }
 
+  async clearAgentWarned(ticketThreadId: string): Promise<void> {
+    await this.prisma.intercomLink.updateMany({
+      where: { ticketThreadId },
+      data: { agentWarnedAt: null },
+    });
+  }
+
+  // Conversations that received the push-mode agent warning (push→bi correction).
+  async listWarnedLinks(): Promise<IntercomLink[]> {
+    return this.prisma.intercomLink.findMany({ where: { agentWarnedAt: { not: null } } });
+  }
+
   async setLastSyncedStateId(ticketThreadId: string, stateId: string | null): Promise<void> {
     await this.prisma.intercomLink.updateMany({
       where: { ticketThreadId },
@@ -77,7 +101,8 @@ export class IntercomStore {
     });
   }
 
-  async setLastSyncedOpen(ticketThreadId: string, state: "open" | "closed"): Promise<void> {
+  // null restores the "never synced" state (inbound rollback after a failed apply).
+  async setLastSyncedOpen(ticketThreadId: string, state: "open" | "closed" | null): Promise<void> {
     await this.prisma.intercomLink.updateMany({
       where: { ticketThreadId },
       data: { lastSyncedOpen: state },
@@ -100,13 +125,16 @@ export class IntercomStore {
   // duplicate delivery — drop it. Identity-independent by design (the bridge
   // may author as Operator OR as a real human admin).
 
-  async recordEchoPart(kind: "c" | "t", partId: string, ticketThreadId: string): Promise<void> {
-    await this.prisma.intercomEchoPart
-      .create({ data: { kind, partId, ticketThreadId } })
-      .catch((e) => {
-        if ((e as { code?: string }).code === "P2002") return; // already recorded
-        throw e;
-      });
+  // Upsert with confirmed=true: if the webhook's transient claim row for the
+  // same part won the insert race, this converts it into a confirmed record
+  // instead of silently keeping an erasable claim (a deferring webhook's
+  // releaseClaim must never delete the bridge's own confirm).
+  async recordEchoPart(kind: "c" | "t" | "m", partId: string, ticketThreadId: string): Promise<void> {
+    await this.prisma.intercomEchoPart.upsert({
+      where: { kind_partId: { kind, partId } },
+      create: { kind, partId, ticketThreadId, confirmed: true },
+      update: { confirmed: true },
+    });
   }
 
   // Atomically claim a part. true = first sighting (process it); false = the
@@ -121,23 +149,78 @@ export class IntercomStore {
     }
   }
 
-  // Rolls back a claimPart (used when the webhook handler defers a decision —
-  // the retry must be able to claim the part again).
+  // Rolls back a claimPart (defer or relay failure — the retry must be able to
+  // claim again). Only unconfirmed rows: a confirm record is not a claim.
   async releaseClaim(kind: "c" | "t", partId: string): Promise<void> {
-    await this.prisma.intercomEchoPart.deleteMany({ where: { kind, partId } });
+    await this.prisma.intercomEchoPart.deleteMany({ where: { kind, partId, confirmed: false } });
   }
 
+  // ---- Outbound message delivery ledger (kind "m", partId = discordMessageId
+  // [+ edit stamp]) ----
+  // Intercom's API has no idempotency keys; a timeout-after-success retry would
+  // double-post. The executor checks this before the API call and records after
+  // success, shrinking the duplicate window to a crash between call and record.
+
+  async hasDeliveredMessage(deliveryKey: string): Promise<boolean> {
+    const row = await this.prisma.intercomEchoPart.findUnique({
+      where: { kind_partId: { kind: "m", partId: deliveryKey } },
+    });
+    return row != null;
+  }
+
+  async recordDeliveredMessage(deliveryKey: string, ticketThreadId: string): Promise<void> {
+    await this.recordEchoPart("m", deliveryKey, ticketThreadId);
+  }
+
+  // ---- Backfill-enqueued marker (kind "b", partId = threadId) ----
+  // The link row only appears once the ensure DELIVERS, so it can't guard
+  // against re-enqueueing a replay while the first is still queued.
+  async claimBackfill(ticketThreadId: string): Promise<boolean> {
+    try {
+      await this.prisma.intercomEchoPart.create({
+        data: { kind: "b", partId: ticketThreadId, ticketThreadId, confirmed: true },
+      });
+      return true;
+    } catch (e) {
+      if ((e as { code?: string }).code === "P2002") return false;
+      throw e;
+    }
+  }
+
+  // Rolls back a claimBackfill when the enqueue failed partway (the ticket must
+  // stay retryable).
+  async releaseBackfill(ticketThreadId: string): Promise<void> {
+    await this.prisma.intercomEchoPart.deleteMany({ where: { kind: "b", partId: ticketThreadId } });
+  }
+
+  // Threads with a backfill replay enqueued (link may not exist yet) — these
+  // hold the deepest workflow outboxes, so reset/wipe must clear them too.
+  async listBackfillClaimedThreadIds(): Promise<string[]> {
+    const rows = await this.prisma.intercomEchoPart.findMany({
+      where: { kind: "b" },
+      select: { ticketThreadId: true },
+    });
+    return rows.map((r) => r.ticketThreadId);
+  }
+
+  // Sweeps only the ECHO kinds (c/t webhook claims, r relay dedup) — the "m"
+  // delivery ledger and "b" backfill markers carry indefinite-lifetime
+  // semantics: edit/delete mirroring gates on hasDeliveredMessage, and sweeping
+  // an "m" row would silently disable corrections for any message older than
+  // the retention window (the leaked-secret case this feature exists for).
   async cleanupEchoParts(olderThan: Date): Promise<number> {
     const result = await this.prisma.intercomEchoPart.deleteMany({
-      where: { createdAt: { lt: olderThan } },
+      where: { createdAt: { lt: olderThan }, kind: { in: ["c", "t", "r"] } },
     });
     return result.count;
   }
 
   // Cross-topic relay dedup (replaces the old in-memory map — survives
   // restarts). true = first sighting within the fresh window, relay it.
-  async claimRelay(ticketThreadId: string, bodyHashHex: string): Promise<boolean> {
-    const partId = `${ticketThreadId}:${bodyHashHex}`;
+  // relayKey is caller-built (content kind prefix + body/attachment hash) so
+  // notes vs replies and different attachment sets never collide.
+  async claimRelay(ticketThreadId: string, relayKey: string): Promise<boolean> {
+    const partId = `${ticketThreadId}:${relayKey}`;
     try {
       await this.prisma.intercomEchoPart.create({ data: { kind: RELAY_KIND, partId, ticketThreadId } });
       return true;
@@ -153,6 +236,14 @@ export class IntercomStore {
       });
       return true;
     }
+  }
+
+  // Rolls back a claimRelay when the Discord-side relay failed after claiming
+  // (the retry must be able to claim again).
+  async releaseRelay(ticketThreadId: string, relayKey: string): Promise<void> {
+    await this.prisma.intercomEchoPart.deleteMany({
+      where: { kind: RELAY_KIND, partId: `${ticketThreadId}:${relayKey}` },
+    });
   }
 
   // ---- Pending posts (reserve → call → confirm echo handshake) ----
@@ -173,15 +264,28 @@ export class IntercomStore {
 
   // Atomically consume a matching reservation (any kind — a ticket reply can
   // surface on the conversation topic). true = this part is the bridge's own.
+  // Consumes AT MOST ONE row: two identical in-flight staff messages hold two
+  // reservations, and each echo part may only eat one of them.
   async matchAndDeletePendingPost(ticketThreadId: string, bodyHashHex: string): Promise<boolean> {
-    const result = await this.prisma.intercomPendingPost.deleteMany({
+    const row = await this.prisma.intercomPendingPost.findFirst({
       where: { ticketThreadId, bodyHash: bodyHashHex },
+      orderBy: { createdAt: "asc" },
     });
+    if (!row) return false;
+    const result = await this.prisma.intercomPendingPost.deleteMany({ where: { id: row.id } });
     return result.count > 0;
   }
 
   async hasPendingPosts(ticketThreadId: string): Promise<boolean> {
     return (await this.prisma.intercomPendingPost.count({ where: { ticketThreadId } })) > 0;
+  }
+
+  // A dead-lettered outbound event can leave one reservation per attempt (kept
+  // on ambiguous failures so a late-landing part still hash-matches). Once the
+  // event is DEAD nothing will land anymore — sweep them immediately instead of
+  // letting them defer/false-match inbound replies for up to an hour.
+  async deletePendingPostsForThread(ticketThreadId: string): Promise<void> {
+    await this.prisma.intercomPendingPost.deleteMany({ where: { ticketThreadId } });
   }
 
   // Crash leftovers (reserved, process died before confirm/delete).
@@ -198,6 +302,15 @@ export class IntercomStore {
     await this.prisma.intercomLink.updateMany({
       where: { ticketThreadId },
       data: { lastTagsJson: tags },
+    });
+  }
+
+  // ---- Inbound assignment damper ----
+
+  async setLastAssigneeId(ticketThreadId: string, adminId: string | null): Promise<void> {
+    await this.prisma.intercomLink.updateMany({
+      where: { ticketThreadId },
+      data: { lastAssigneeId: adminId },
     });
   }
 

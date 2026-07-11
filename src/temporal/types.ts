@@ -78,6 +78,14 @@ export const CUSTOM_SEARCH_ATTRIBUTES: ReadonlyArray<KeywordSaKey> = [
 export const SIG_TICKET_CREATED = "ticketCreated";
 export const SIG_HUMAN_MESSAGE = "humanMessage";
 export const SIG_INTERCOM_ENQUEUE = "intercomEnqueue";
+export const SIG_INTERCOM_CLEAR_OUTBOX = "intercomClearOutbox";
+
+// Echo-defer budget shared by intercomInboxWorkflow (its defer-retry loop) and
+// IntercomWebhookHandler (which stops THROWING DeferEcho at this count). One
+// constant on purpose: if the handler's cap ended lower the workflow's
+// defer-exhaustion path would be unreachable; higher and defers would be
+// misreported as real failures.
+export const INTERCOM_MAX_ECHO_DEFERS = 24;
 export const SIG_REMINDERS_PAUSED = "remindersPaused";
 export const SIG_REQUEST_STATUS_CHANGE = "requestStatusChange";
 export const SIG_NOOP = "noop";
@@ -92,7 +100,15 @@ export const QRY_TICKET_STATE = "getState";
 
 // ---- Intercom outbox events carried in ticket workflow state ----
 
-export type IcEventType = "ensure" | "message" | "note" | "status" | "priority" | "csat";
+export type IcEventType =
+  | "ensure"
+  | "message"
+  | "note"
+  | "status"
+  | "priority"
+  | "csat"
+  | "message_edit"
+  | "message_delete";
 
 export interface IcEvent {
   seq: number;

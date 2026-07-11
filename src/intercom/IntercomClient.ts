@@ -1,6 +1,6 @@
 import { SettingsStore } from "../config/SettingsStore";
 import { bodyHash } from "./renderDiscordMarkdown";
-import { IntercomAdmin, IntercomTicketState, IntercomTicketType } from "./types";
+import { IntercomAdmin, IntercomTicketState, IntercomTicketType, IntercomWebhookPart } from "./types";
 
 // Thrown for non-2xx responses so the outbox scheduler can classify transient
 // (retry) vs permanent (dead-letter) failures by HTTP status.
@@ -161,6 +161,7 @@ export class IntercomClient {
     externalId: string;
     name: string;
     customAttributes?: Record<string, unknown>;
+    avatarUrl?: string;
   }): Promise<{ id: string }> {
     const data = await this.json<{ id?: string | number }>(
       "/contacts",
@@ -169,6 +170,7 @@ export class IntercomClient {
         role: "user",
         external_id: input.externalId,
         name: input.name,
+        ...(input.avatarUrl ? { avatar: input.avatarUrl } : {}),
         ...(input.customAttributes && Object.keys(input.customAttributes).length > 0
           ? { custom_attributes: input.customAttributes }
           : {}),
@@ -185,6 +187,33 @@ export class IntercomClient {
   // Idempotent for retries — unarchiving a live contact returns it, not an error.
   async unarchiveContact(contactId: string): Promise<void> {
     await this.json(`/contacts/${encodeURIComponent(contactId)}/unarchive`, "POST", undefined, "contact unarchive");
+  }
+
+  // Existence/archived probe for the 404 self-heal: a merged or hard-deleted
+  // contact must be re-resolved, an archived one merely unarchived.
+  async getContact(contactId: string): Promise<{ id: string; archived: boolean } | null> {
+    try {
+      const data = await this.json<{ id?: string | number; archived?: boolean }>(
+        `/contacts/${encodeURIComponent(contactId)}`,
+        "GET",
+        undefined,
+        "contact get"
+      );
+      return data.id != null ? { id: String(data.id), archived: data.archived === true } : null;
+    } catch (e) {
+      if (e instanceof IntercomHttpError && e.status === 404) return null;
+      throw e;
+    }
+  }
+
+  // Refreshes display identity on an existing contact (Discord names drift;
+  // avatar was never set at create time). Never adds an email.
+  async updateContact(contactId: string, input: { name?: string | null; avatarUrl?: string | null }): Promise<void> {
+    const body: Record<string, unknown> = {};
+    if (input.name) body.name = input.name;
+    if (input.avatarUrl) body.avatar = input.avatarUrl;
+    if (Object.keys(body).length === 0) return;
+    await this.json(`/contacts/${encodeURIComponent(contactId)}`, "PUT", body, "contact update");
   }
 
   // Contact custom attributes must be predefined in the workspace; this creates
@@ -271,6 +300,34 @@ export class IntercomClient {
       });
     }
     return out;
+  }
+
+  // The ticket a conversation was converted into (null when never converted).
+  // Used by attachTicket to adopt an existing conversion instead of degrading
+  // to a standalone ticket when convert 4xxes with "already converted".
+  async getConversationTicketId(conversationId: string): Promise<string | null> {
+    const data = await this.json<{ ticket?: { id?: string | number } | null }>(
+      `/conversations/${encodeURIComponent(conversationId)}`,
+      "GET",
+      undefined,
+      "conversation get"
+    );
+    return data.ticket?.id != null ? String(data.ticket.id) : null;
+  }
+
+  // Raw conversation parts (HTML bodies, author ids, attachments) newer than
+  // `sinceUnixSeconds` — the none→bi gap heal feeds these through the normal
+  // webhook relay path.
+  async getConversationPartsSince(
+    conversationId: string,
+    sinceUnixSeconds: number
+  ): Promise<IntercomWebhookPart[]> {
+    const data = await this.json<{
+      conversation_parts?: { conversation_parts?: IntercomWebhookPart[] };
+    }>(`/conversations/${encodeURIComponent(conversationId)}`, "GET", undefined, "conversation get");
+    return (data.conversation_parts?.conversation_parts ?? []).filter(
+      (p) => (p.created_at ?? 0) > sinceUnixSeconds
+    );
   }
 
   // Contact-initiated conversation. The response is a Message object; the

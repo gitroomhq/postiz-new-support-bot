@@ -16,6 +16,7 @@ import {
   SIG_DISPUTES_RUN_NOW,
   SIG_HUMAN_MESSAGE,
   SIG_INBOUND_EVENT,
+  SIG_INTERCOM_CLEAR_OUTBOX,
   SIG_INTERCOM_ENQUEUE,
   SIG_KB_REFRESH_NOW,
   SIG_NOOP,
@@ -135,6 +136,12 @@ export class TemporalProducers {
 
   async intercomEnqueue(threadId: string, type: IcEventType, payload: unknown | null): Promise<GatewayResult> {
     return this.signalTicket(threadId, SIG_INTERCOM_ENQUEUE, { type, payload });
+  }
+
+  // Bridge reset/wipe: drop this ticket's queued (pre-wipe) Intercom events so
+  // they can't resurrect the data the operator just wiped.
+  async intercomClearOutbox(threadId: string): Promise<GatewayResult> {
+    return this.signalTicket(threadId, SIG_INTERCOM_CLEAR_OUTBOX);
   }
 
   async remindersPaused(threadId: string, paused: boolean): Promise<GatewayResult> {

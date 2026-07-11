@@ -25,7 +25,7 @@ const EXPECTED_COLUMNS: Record<string, string[]> = {
     "billingAuditChannelId", "refundMaxAmount", "refundMaxAmountCurrency", "refundMaxPer24h", "refundMinMemberAgeDays",
     "allowedPriceIds", "auditLogChannelId", "intercomMode", "intercomRegion", "intercomAccessToken",
     "intercomClientSecret", "intercomAdminId", "intercomOperatorAdminId", "intercomTicketTypeMap", "intercomTeamId",
-    "intercomSnoozeStatusTagId", "sentryDsn", "sentryEnvironment", "sentryTracesSampleRate", "sentryProfilesSampleRate",
+    "intercomSnoozeStatusTagId", "intercomLastInboundAt", "intercomModeChangedAt", "sentryDsn", "sentryEnvironment", "sentryTracesSampleRate", "sentryProfilesSampleRate",
     "sentryLogsEnabled", "sentryDebug", "sentrySendDefaultPii", "sentryAiRecordContent",
     "sentryReadEnabled", "sentryReadToken", "sentryOrgSlug", "sentryProjectSlug", "sentryReadRegion",
     "aiModel", "aiModelLight",
@@ -66,9 +66,9 @@ const EXPECTED_COLUMNS: Record<string, string[]> = {
   canned_responses: ["id", "name", "content", "ownerId", "createdAt"],
   intercom_links: [
     "id", "ticketThreadId", "contactId", "contactExternalId", "conversationId", "ticketId", "agentWarnedAt",
-    "lastSyncedStateId", "lastSyncedOpen", "lastTagsJson", "createdAt",
+    "lastSyncedStateId", "lastSyncedOpen", "lastTagsJson", "lastAssigneeId", "createdAt",
   ],
-  intercom_echo_parts: ["id", "kind", "partId", "ticketThreadId", "createdAt"],
+  intercom_echo_parts: ["id", "kind", "partId", "ticketThreadId", "confirmed", "createdAt"],
   intercom_pending_posts: ["id", "ticketThreadId", "kind", "bodyHash", "createdAt"],
   stripe_webhook_events: ["id", "type", "createdAt"],
   stripe_disputes: [

@@ -8,7 +8,15 @@
 // a linked customer TICKET created via convert (type = bot category, custom
 // ticket state = bot status tag, Priority/CSAT as ticket attributes).
 
-export type OutboxEventType = "ensure" | "message" | "note" | "status" | "priority" | "csat";
+export type OutboxEventType =
+  | "ensure"
+  | "message"
+  | "note"
+  | "status"
+  | "priority"
+  | "csat"
+  | "message_edit"
+  | "message_delete";
 
 // Creates (or adopts) the contact, conversation and converted ticket, and
 // writes the IntercomLink. Always the first event for a ticket; later events
@@ -34,6 +42,9 @@ export interface EnsurePayload {
   resolved: boolean;
   priorityLabel: string | null; // verbatim "🟧 High" — Priority ticket attribute
   createdAtIso: string; // backdates conversation (created_at)
+  // Current Discord avatar URL — refreshed onto the Intercom contact so repeat
+  // customers don't show under a blank avatar / years-old identity.
+  customerAvatarUrl?: string | null;
 }
 
 export interface MessageAttachmentRef {
@@ -71,6 +82,10 @@ export interface StatusPayload {
   actorName: string;
   closed: boolean;
   resolved: boolean;
+  // Backfill tail: re-assert conversation open/close even when the damper says
+  // it's already there — the replayed contact messages auto-reopen the
+  // conversation in Intercom behind the damper's back.
+  forceOpenSync?: boolean;
 }
 
 export interface PriorityPayload {
@@ -84,13 +99,33 @@ export interface CsatPayload {
   comment?: string | null;
 }
 
+// Intercom has no part-edit/delete API, so edits and deletions mirror as
+// APPENDED parts ("✏️ edited …" / "🗑️ deleted"). Only messages the delivery
+// ledger has confirmed as mirrored produce these (checked at execute time).
+export interface MessageEditPayload {
+  discordMessageId: string;
+  editedAtIso: string; // dedup stamp — repeated edits of one message each mirror once
+  direction: "incoming" | "outgoing";
+  authorName: string;
+  content: string; // the NEW message content, Discord markdown
+  attachments?: MessageAttachmentRef[];
+}
+
+export interface MessageDeletePayload {
+  discordMessageId: string;
+  direction: "incoming" | "outgoing";
+  authorName: string | null; // null when the deleted message wasn't cached
+}
+
 export type OutboxPayload =
   | EnsurePayload
   | MessagePayload
   | NotePayload
   | StatusPayload
   | PriorityPayload
-  | CsatPayload;
+  | CsatPayload
+  | MessageEditPayload
+  | MessageDeletePayload;
 
 // ---- Intercom API shapes (only the fields the bridge reads) ----
 
@@ -139,6 +174,7 @@ export interface IntercomConversationItem {
   conversation_parts?: { conversation_parts?: IntercomWebhookPart[] };
   snoozed_until?: number | null;
   tags?: { tags?: Array<{ id?: string | number; name?: string | null }> };
+  admin_assignee_id?: string | number | null; // conversation.admin.assigned relay
 }
 
 // data.item for ticket.* topics.

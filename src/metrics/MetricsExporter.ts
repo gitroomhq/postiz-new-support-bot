@@ -228,6 +228,27 @@ export function exportIntercomQueueDepth(p: { queue: "outbox" | "inbox"; pending
   writePoint("intercom_queue", { queue: p.queue }, { pending: p.pending, dead: p.dead });
 }
 
+// Since-boot dead-letter counters. Temporal visibility has no cheap "dead"
+// query (dead letters are terminal workflow RESULTS), so the dead-letter audit
+// activities increment these and the snapshot tick exports them alongside the
+// queue depths. Grafana reads deltas, so a restart reset is harmless.
+const intercomDeadCounts = { outbox: 0, inbox: 0 };
+
+export function recordIntercomDeadLetter(queue: "outbox" | "inbox"): void {
+  intercomDeadCounts[queue]++;
+}
+
+export function intercomDeadLetterCount(queue: "outbox" | "inbox"): number {
+  return intercomDeadCounts[queue];
+}
+
+// Inbound webhook outcome counter — "rejected" (bad HMAC) is the one to alert
+// on: a rotated client secret 403s every delivery silently, and Intercom does
+// not retry 4xx.
+export function exportIntercomWebhook(outcome: "accepted" | "rejected" | "buffered" | "error"): void {
+  writePoint("intercom_webhook", { outcome }, { count: 1 });
+}
+
 export function exportSnapshotGauge(dim: "status" | "category", value: string, openCount: number): void {
   writePoint("ticket_snapshot", { dim, value }, { open_count: openCount });
 }

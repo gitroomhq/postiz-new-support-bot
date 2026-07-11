@@ -6,8 +6,10 @@ import { AuditLogger } from "../bot/AuditLogger";
 import { COLORS } from "../util/embeds";
 import { IntercomStore } from "./IntercomStore";
 import { IntercomSyncService } from "./IntercomSyncService";
+import { IntercomClient } from "./IntercomClient";
 import { bodyHash } from "./renderDiscordMarkdown";
 import { TemporalBufferedError, type TemporalProducers } from "../temporal/producers";
+import { INTERCOM_MAX_ECHO_DEFERS } from "../temporal/types";
 import {
   IntercomConversationItem,
   IntercomTicketItem,
@@ -26,7 +28,35 @@ export class DeferEchoError extends Error {
   }
 }
 
-const MAX_DEFER_ATTEMPTS = 12;
+// The webhook topics the bridge handles — the SINGLE source for every place
+// that instructs the operator what to subscribe in the Developer Hub (panel,
+// secrets-modal follow-up). Subscriptions are Developer-Hub-only (no public
+// API), so drift between instruction texts silently disables features.
+// Over-subscribing is harmless: accept() drops anything not in this list
+// BEFORE it reaches Temporal, so "click everything" costs only the HTTP
+// delivery itself (conversation.user.replied is the noisiest extra — it fires
+// once per customer message the bridge mirrors).
+export const INTERCOM_WEBHOOK_TOPICS = [
+  "conversation.admin.replied",
+  "conversation.operator.replied",
+  "conversation.admin.noted",
+  "conversation.admin.closed",
+  "conversation.admin.opened",
+  "conversation.admin.snoozed",
+  "conversation.admin.unsnoozed",
+  "conversation.admin.assigned",
+  "ticket.state.updated",
+  "ticket.admin.replied",
+  "ticket.note.created",
+] as const;
+
+// Shared with intercomInboxWorkflow's defer loop — see INTERCOM_MAX_ECHO_DEFERS.
+const MAX_DEFER_ATTEMPTS = INTERCOM_MAX_ECHO_DEFERS;
+
+const HANDLED_TOPICS: ReadonlySet<string> = new Set(INTERCOM_WEBHOOK_TOPICS);
+
+// Discord "Unknown Channel" — the thread was deleted, not a transient failure.
+const DISCORD_UNKNOWN_CHANNEL = 10003;
 
 // Handles inbound Intercom webhooks. The HTTP route only calls accept()
 // (a signal into the per-conversation workflow); the processInboundEvent
@@ -42,13 +72,18 @@ const MAX_DEFER_ATTEMPTS = 12;
 export class IntercomWebhookHandler {
   private client: Client | null = null;
 
+  // Throttle for the webhook-health stamp (one settings write per minute, not
+  // per event).
+  private lastInboundStampMs = 0;
+
   constructor(
     private settingsStore: SettingsStore,
     private ticketStore: TicketStore,
     private statusService: StatusService,
     private store: IntercomStore,
     private sync: IntercomSyncService,
-    private audit: AuditLogger
+    private audit: AuditLogger,
+    private intercomClient: IntercomClient
   ) {}
 
   bindClient(client: Client): void {
@@ -69,9 +104,22 @@ export class IntercomWebhookHandler {
   // HTTP-route half: durably queue the event and return. Never relays inline
   // while Temporal is configured. Returns false for duplicate deliveries.
   async accept(body: unknown): Promise<boolean> {
+    // Webhook-health stamp: this call only happens after HMAC verification, so
+    // it proves subscription + secret are alive (shown on the /config panel).
+    const nowMs = Date.now();
+    if (nowMs - this.lastInboundStampMs > 60_000) {
+      this.lastInboundStampMs = nowMs;
+      void this.settingsStore.setIntercomLastInboundAt(new Date()).catch(() => {});
+    }
     const event = body as IntercomWebhookEvent;
     const topic = event?.topic;
     if (!topic || topic === "ping") return true;
+    // Door filter: operators may subscribe every topic in the Developer Hub —
+    // anything the bridge doesn't handle is dropped HERE, before it costs a
+    // Temporal signal / inbox workflow (conversation.user.replied alone would
+    // otherwise fire once per mirrored customer message). process() keeps its
+    // unknown-topic default as a backstop.
+    if (!HANDLED_TOPICS.has(topic)) return true;
     if (this.temporalProducers?.routable()) {
       // Per-item serialization key: conversation id for conversation.* topics,
       // ticket id for ticket.* — handlers are convergent/damped, so distinct
@@ -132,6 +180,9 @@ export class IntercomWebhookHandler {
       case "ticket.note.created":
         await this.handleTicketNoteCreated(item as IntercomTicketItem);
         return;
+      case "conversation.admin.assigned":
+        await this.handleConversationAssigned(item as IntercomConversationItem);
+        return;
       default:
         return; // unknown topic — drop
     }
@@ -179,78 +230,89 @@ export class IntercomWebhookHandler {
     // at post time) or another delivery already claimed it.
     if (!(await this.store.claimPart(kind, String(part.id), threadId))) return;
 
-    const partHash = bodyHash(part.body ?? "");
-    const bridgeAuthor = this.isBridgeAuthor(part);
+    // Everything past the claim can fail transiently (Discord fetch/send). Any
+    // throw must roll the claims back, or the Temporal retry finds the part
+    // already claimed, early-returns, and the reply is silently lost while the
+    // activity reports success.
+    let relayKey: string | null = null;
+    try {
+      const partHash = bodyHash(part.body ?? "");
+      const bridgeAuthor = this.isBridgeAuthor(part);
 
-    if (bridgeAuthor) {
-      // Layer 2 — reserve→confirm handshake: a matching pending-post row means
-      // this is our own in-flight post whose confirm hasn't landed yet. Record
-      // the part id so a duplicate delivery is also caught, then drop.
-      if (await this.store.matchAndDeletePendingPost(threadId, partHash)) {
-        await this.store.recordEchoPart(kind, String(part.id), threadId).catch(() => {});
+      if (bridgeAuthor) {
+        // Layer 2 — reserve→confirm handshake: a matching pending-post row means
+        // this is our own in-flight post whose confirm hasn't landed yet. Record
+        // the part id so a duplicate delivery is also caught, then drop.
+        if (await this.store.matchAndDeletePendingPost(threadId, partHash)) {
+          await this.store.recordEchoPart(kind, String(part.id), threadId).catch(() => {});
+          return;
+        }
+        // Layer 3 — bounded defer: outbound content still queued for this thread
+        // could produce this exact part. The catch below rolls the claim back so
+        // the retry can claim again. `attempt` here is the echo-defer count
+        // (tracked separately from real-failure attempts), so deferral can't
+        // exhaust the retry budget.
+        if (attempt < MAX_DEFER_ATTEMPTS && (await this.hasPendingOutboundContent(threadId))) {
+          throw new DeferEchoError();
+        }
+      }
+
+      const mode = this.settingsStore.intercomMode();
+      if (mode === "push") {
+        // One-way mirror: warn the agent (once per conversation) that replies here
+        // don't reach the customer. markAgentWarned is the race-safe claim.
+        if (await this.store.markAgentWarned(threadId)) {
+          await this.sync.enqueueAgentWarning(threadId);
+        }
         return;
       }
-      // Layer 3 — bounded defer: outbound content still queued for this thread
-      // could produce this exact part. claimPart above already succeeded, so
-      // roll the claim back before deferring — the retry must be able to claim
-      // again. `attempt` here is the echo-defer count (tracked separately from
-      // real-failure attempts), so deferral can't exhaust the retry budget.
-      if (attempt < MAX_DEFER_ATTEMPTS && (await this.hasPendingOutboundContent(threadId))) {
-        await this.releaseClaim(kind, String(part.id));
-        throw new DeferEchoError();
+
+      const body = htmlToDiscordText(part.body ?? "");
+      const attachmentRefs = (part.attachments ?? []).filter((a) => a.url);
+      const attachmentLinks = attachmentRefs.map((a) => `📎 [${a.name ?? "attachment"}](${a.url})`).join("\n");
+      const description = truncateEmbedText([body, attachmentLinks].filter(Boolean).join("\n\n"), 4096);
+      if (!description) return; // genuinely empty part — nothing to relay, keep the claim
+
+      // Layer 4 — cross-topic duplicate guard (same reply arriving on another
+      // topic with a different part id). DB-backed: survives restarts. Keyed on
+      // content kind + body + attachments so a repeated short reply ("done"),
+      // image-only replies and note-vs-reply text can never collide.
+      relayKey = `reply:${bodyHash([part.body ?? "", ...attachmentRefs.map((a) => a.url ?? "")].join("\n"))}`;
+      if (!(await this.store.claimRelay(threadId, relayKey))) return;
+
+      const thread = await this.requireThread(threadId);
+      if (!thread) return; // thread permanently deleted — link disconnected
+
+      const avatar = part.author?.avatar;
+      const avatarUrl = typeof avatar === "string" ? avatar : avatar?.image_url ?? null;
+      const embed = new EmbedBuilder()
+        .setColor(COLORS.brand)
+        .setAuthor({
+          name: part.author?.name || "Intercom agent",
+          ...(avatarUrl ? { iconURL: avatarUrl } : {}),
+        })
+        .setDescription(description)
+        .setTimestamp();
+
+      // Posting into an archived thread: un-archive, send, re-archive. The lock
+      // state stays untouched, and the message is bot-authored, so handleMessage
+      // ignores it (no reclose interference, no re-mirror to Intercom).
+      const wasArchived = thread.archived === true;
+      if (wasArchived) await thread.setArchived(false).catch(() => {});
+      const ticket = await this.ticketStore.getByThreadId(threadId);
+      try {
+        await thread.send({
+          content: ticket?.customerId ? `<@${ticket.customerId}>` : undefined,
+          embeds: [embed],
+          allowedMentions: { users: ticket?.customerId ? [ticket.customerId] : [] },
+        });
+      } finally {
+        if (wasArchived) await thread.setArchived(true).catch(() => {});
       }
-    }
-
-    const mode = this.settingsStore.intercomMode();
-    if (mode === "push") {
-      // One-way mirror: warn the agent (once per conversation) that replies here
-      // don't reach the customer. markAgentWarned is the race-safe claim.
-      if (await this.store.markAgentWarned(threadId)) {
-        await this.sync.enqueueAgentWarning(threadId);
-      }
-      return;
-    }
-
-    const body = htmlToDiscordText(part.body ?? "");
-    const attachmentLinks = (part.attachments ?? [])
-      .filter((a) => a.url)
-      .map((a) => `📎 [${a.name ?? "attachment"}](${a.url})`)
-      .join("\n");
-    const description = [body, attachmentLinks].filter(Boolean).join("\n\n").slice(0, 4096);
-    if (!description) return;
-
-    // Layer 4 — cross-topic duplicate guard (same reply arriving on another
-    // topic with a different part id). DB-backed: survives restarts.
-    if (!(await this.store.claimRelay(threadId, partHash))) return;
-
-    const thread = await this.fetchThread(threadId);
-    if (!thread) throw new Error(`Discord thread ${threadId} not fetchable`);
-
-    const avatar = part.author?.avatar;
-    const avatarUrl = typeof avatar === "string" ? avatar : avatar?.image_url ?? null;
-    const embed = new EmbedBuilder()
-      .setColor(COLORS.brand)
-      .setAuthor({
-        name: part.author?.name || "Intercom agent",
-        ...(avatarUrl ? { iconURL: avatarUrl } : {}),
-      })
-      .setDescription(description)
-      .setTimestamp();
-
-    // Posting into an archived thread: un-archive, send, re-archive. The lock
-    // state stays untouched, and the message is bot-authored, so handleMessage
-    // ignores it (no reclose interference, no re-mirror to Intercom).
-    const wasArchived = thread.archived === true;
-    if (wasArchived) await thread.setArchived(false).catch(() => {});
-    const ticket = await this.ticketStore.getByThreadId(threadId);
-    try {
-      await thread.send({
-        content: ticket?.customerId ? `<@${ticket.customerId}>` : undefined,
-        embeds: [embed],
-        allowedMentions: { users: ticket?.customerId ? [ticket.customerId] : [] },
-      });
-    } finally {
-      if (wasArchived) await thread.setArchived(true).catch(() => {});
+    } catch (e) {
+      await this.releaseClaim(kind, String(part.id));
+      if (relayKey) await this.store.releaseRelay(threadId, relayKey).catch(() => {});
+      throw e;
     }
   }
 
@@ -301,26 +363,50 @@ export class IntercomWebhookHandler {
     // Claim first: bridge-authored notes (context card, agent warning,
     // convert fallback) were recorded at post time and fail the claim here.
     if (!(await this.store.claimPart(kind, String(part.id), threadId))) return;
-    if (this.isBridgeAuthor(part) && (await this.store.matchAndDeletePendingPost(threadId, bodyHash(part.body ?? "")))) {
-      return;
+    // Same rollback contract as processAgentPart: a throw after the claim must
+    // release it or the retried delivery silently drops the note.
+    let relayKey: string | null = null;
+    try {
+      if (
+        this.isBridgeAuthor(part) &&
+        (await this.store.matchAndDeletePendingPost(threadId, bodyHash(part.body ?? "")))
+      ) {
+        await this.store.recordEchoPart(kind, String(part.id), threadId).catch(() => {});
+        return;
+      }
+      if (this.settingsStore.intercomMode() !== "bi") {
+        // Not relayed in push/none — release so a real agent note isn't
+        // permanently consumed while the mode is off. Bridge-authored notes
+        // (agent warning, context card) stay claimed: a redelivery landing
+        // after a flip to bi must never relay the bridge's own note as a
+        // "Staff note (from Intercom)".
+        if (!this.isBridgeAuthor(part)) await this.releaseClaim(kind, String(part.id));
+        return;
+      }
+
+      const text = truncateEmbedText(htmlToDiscordText(part.body ?? ""), 1900);
+      if (!text) return;
+      // The same note can surface on both the conversation and the ticket topic.
+      // Distinct key space from replies ("note:" vs "reply:") — identical text
+      // in a note and a reply must not collide.
+      relayKey = `note:${bodyHash(part.body ?? "")}`;
+      if (!(await this.store.claimRelay(threadId, relayKey))) return;
+
+      const authorName = part.author?.name || "Intercom agent";
+      const authorId = part.author?.id != null ? `intercom:${part.author.id}` : "intercom";
+      await this.ticketStore.addNote(threadId, authorId, `${authorName} (Intercom)`, text);
+      void this.audit.log({
+        title: "📝 Staff note (from Intercom)",
+        severity: "info",
+        actor: authorName,
+        threadId,
+        fields: [{ name: "Note", value: text.slice(0, 1024), inline: false }],
+      });
+    } catch (e) {
+      await this.releaseClaim(kind, String(part.id));
+      if (relayKey) await this.store.releaseRelay(threadId, relayKey).catch(() => {});
+      throw e;
     }
-    if (this.settingsStore.intercomMode() !== "bi") return;
-
-    const text = htmlToDiscordText(part.body ?? "").slice(0, 1900);
-    if (!text) return;
-    // The same note can surface on both the conversation and the ticket topic.
-    if (!(await this.store.claimRelay(threadId, bodyHash(part.body ?? "")))) return;
-
-    const authorName = part.author?.name || "Intercom agent";
-    const authorId = part.author?.id != null ? `intercom:${part.author.id}` : "intercom";
-    await this.ticketStore.addNote(threadId, authorId, `${authorName} (Intercom)`, text);
-    void this.audit.log({
-      title: "📝 Staff note (from Intercom)",
-      severity: "info",
-      actor: authorName,
-      threadId,
-      fields: [{ name: "Note", value: text.slice(0, 1024), inline: false }],
-    });
   }
 
   // Agent changed the ticket's (custom) state in Intercom → map back to the
@@ -346,11 +432,19 @@ export class IntercomWebhookHandler {
     if (ticket.statusTagId === tag.id) return; // already there (echo or no-op)
 
     // Pre-mark the synced state so the push-back triggered by applyStatus
-    // skips its ticket update (Intercom already has this state).
+    // skips its ticket update (Intercom already has this state). Rolled back on
+    // failure — otherwise the retry short-circuits on the damper above and the
+    // Intercom-side state change is silently lost.
+    const prevStateId = link.lastSyncedStateId;
     await this.store.setLastSyncedStateId(link.ticketThreadId, stateId);
-    const thread = await this.fetchThread(link.ticketThreadId);
-    if (!thread) throw new Error(`Discord thread ${link.ticketThreadId} not fetchable`);
-    await this.statusService.applyStatus(thread, ticket, tag, { actorName: "Intercom agent" });
+    try {
+      const thread = await this.requireThread(link.ticketThreadId);
+      if (!thread) return;
+      await this.statusService.applyStatus(thread, ticket, tag, { actorName: "Intercom agent" });
+    } catch (e) {
+      await this.store.setLastSyncedStateId(link.ticketThreadId, prevStateId).catch(() => {});
+      throw e;
+    }
   }
 
   // Conversation closed/reopened in Intercom (bi): minimum close/reopen parity.
@@ -371,15 +465,23 @@ export class IntercomWebhookHandler {
     const ticket = await this.ticketStore.getByThreadId(link.ticketThreadId);
     if (!ticket) return;
 
+    const prevOpen = link.lastSyncedOpen === "open" || link.lastSyncedOpen === "closed" ? link.lastSyncedOpen : null;
+
     if (target === "closed") {
       const closingTag = this.settingsStore.closingTag();
       if (!closingTag) return;
       if (ticket.statusTagId === closingTag.id) return;
 
+      // Damper pre-mark with rollback on failure (see handleTicketStateUpdated).
       await this.store.setLastSyncedOpen(link.ticketThreadId, "closed");
-      const thread = await this.fetchThread(link.ticketThreadId);
-      if (!thread) throw new Error(`Discord thread ${link.ticketThreadId} not fetchable`);
-      await this.statusService.applyStatus(thread, ticket, closingTag, { actorName: "Intercom agent" });
+      try {
+        const thread = await this.requireThread(link.ticketThreadId);
+        if (!thread) return;
+        await this.statusService.applyStatus(thread, ticket, closingTag, { actorName: "Intercom agent" });
+      } catch (e) {
+        await this.store.setLastSyncedOpen(link.ticketThreadId, prevOpen).catch(() => {});
+        throw e;
+      }
       return;
     }
 
@@ -389,9 +491,14 @@ export class IntercomWebhookHandler {
     if (!initialTag || ticket.statusTagId === initialTag.id) return;
 
     await this.store.setLastSyncedOpen(link.ticketThreadId, "open");
-    const thread = await this.fetchThread(link.ticketThreadId);
-    if (!thread) throw new Error(`Discord thread ${link.ticketThreadId} not fetchable`);
-    await this.statusService.applyStatus(thread, ticket, initialTag, { actorName: "Intercom agent" });
+    try {
+      const thread = await this.requireThread(link.ticketThreadId);
+      if (!thread) return;
+      await this.statusService.applyStatus(thread, ticket, initialTag, { actorName: "Intercom agent" });
+    } catch (e) {
+      await this.store.setLastSyncedOpen(link.ticketThreadId, prevOpen).catch(() => {});
+      throw e;
+    }
   }
 
   // Agent snoozed in Intercom → configurable snooze status tag in Discord.
@@ -413,8 +520,8 @@ export class IntercomWebhookHandler {
     const ticket = await this.ticketStore.getByThreadId(link.ticketThreadId);
     if (!ticket || ticket.closed || ticket.statusTagId === snoozeTag.id) return;
 
-    const thread = await this.fetchThread(link.ticketThreadId);
-    if (!thread) throw new Error(`Discord thread ${link.ticketThreadId} not fetchable`);
+    const thread = await this.requireThread(link.ticketThreadId);
+    if (!thread) return;
     await this.statusService.applyStatus(thread, ticket, snoozeTag, { actorName: "Intercom agent" });
 
     const until = item.snoozed_until ? `<t:${item.snoozed_until}:f>` : "later";
@@ -449,12 +556,44 @@ export class IntercomWebhookHandler {
       this.settingsStore.initialTag();
     if (!restoreTag || restoreTag.id === snoozeTagId) return;
 
-    const thread = await this.fetchThread(link.ticketThreadId);
-    if (!thread) throw new Error(`Discord thread ${link.ticketThreadId} not fetchable`);
+    const thread = await this.requireThread(link.ticketThreadId);
+    if (!thread) return;
     await this.statusService.applyStatus(thread, ticket, restoreTag, { actorName: "Intercom agent" });
     await thread
       .send({
         embeds: [new EmbedBuilder().setColor(COLORS.neutral).setDescription("▶️ Unsnoozed in Intercom.")],
+        allowedMentions: { parse: [] },
+      })
+      .catch(() => {});
+  }
+
+  // Agent took (or was handed) the conversation in Intercom → one neutral
+  // embed in the Discord thread so staff know who owns it. Damped by
+  // lastAssigneeId; the damper is set before the send — losing one cosmetic
+  // embed to a transient failure beats duplicating it on retry.
+  private async handleConversationAssigned(item: IntercomConversationItem | undefined): Promise<void> {
+    if (this.settingsStore.intercomMode() !== "bi") return;
+    if (!item || item.id == null) return;
+
+    const assigneeId = item.admin_assignee_id != null ? String(item.admin_assignee_id) : null;
+    if (!assigneeId || assigneeId === "0") return; // unassigned / team-only routing
+
+    const link = await this.store.getLinkByConversationId(String(item.id));
+    if (!link) return;
+    if (link.lastAssigneeId === assigneeId) return; // echo or duplicate delivery
+    await this.store.setLastAssigneeId(link.ticketThreadId, assigneeId);
+
+    const name = await this.lookupAdminName(assigneeId);
+
+    const thread = await this.requireThread(link.ticketThreadId);
+    if (!thread) return;
+    await thread
+      .send({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(COLORS.neutral)
+            .setDescription(`👤 Assigned to ${name ?? "an Intercom agent"} in Intercom.`),
+        ],
         allowedMentions: { parse: [] },
       })
       .catch(() => {});
@@ -497,27 +636,119 @@ export class IntercomWebhookHandler {
       .catch(() => {});
   }
 
+  // Admin id → display name, cached 10 min (assignment events would otherwise
+  // pay a full /admins listing each; the lookup is purely cosmetic).
+  private adminNamesCache: { at: number; names: Map<string, string> } | null = null;
+
+  private async lookupAdminName(adminId: string): Promise<string | null> {
+    const now = Date.now();
+    if (!this.adminNamesCache || now - this.adminNamesCache.at > 10 * 60 * 1000) {
+      try {
+        const admins = await this.intercomClient.listAdmins();
+        this.adminNamesCache = {
+          at: now,
+          names: new Map(admins.filter((a) => a.name).map((a) => [a.id, a.name!] as const)),
+        };
+      } catch {
+        return this.adminNamesCache?.names.get(adminId) ?? null; // stale beats nothing
+      }
+    }
+    return this.adminNamesCache.names.get(adminId) ?? null;
+  }
+
   private async fetchThread(threadId: string): Promise<ThreadChannel | null> {
     if (!this.client) return null;
     const channel = await this.client.channels.fetch(threadId).catch(() => null);
     return channel?.isThread() ? (channel as ThreadChannel) : null;
   }
+
+  // Strict thread fetch for relay/state handlers: throws on transient Discord
+  // failures (the inbox workflow retries); a permanently-deleted thread
+  // (Unknown Channel) disconnects the link and returns null so the event —
+  // and every future event on this conversation — stops dead-lettering.
+  private async requireThread(threadId: string): Promise<ThreadChannel | null> {
+    if (!this.client) throw new Error("Discord client not bound yet");
+    let channel;
+    try {
+      channel = await this.client.channels.fetch(threadId);
+    } catch (e) {
+      if ((e as { code?: number }).code === DISCORD_UNKNOWN_CHANNEL) {
+        await this.disconnectDeletedThread(threadId);
+        return null;
+      }
+      throw e;
+    }
+    if (channel?.isThread()) return channel as ThreadChannel;
+    await this.disconnectDeletedThread(threadId);
+    return null;
+  }
+
+  // The Discord thread is gone for good: drop the link (deleteLink's count
+  // makes this exactly-once under concurrent inbound events), leave a note in
+  // the Intercom conversation, and audit.
+  private async disconnectDeletedThread(threadId: string): Promise<void> {
+    const link = await this.store.getLink(threadId);
+    if (!link) return;
+    const removed = await this.store.deleteLink(threadId);
+    if (removed === 0) return; // another handler already disconnected it
+
+    const adminId = this.settingsStore.intercomAuthorAdminId();
+    if (adminId) {
+      await this.intercomClient
+        .replyAsAdmin(link.conversationId, {
+          adminId,
+          body: "<p>⚠️ The linked Discord thread was deleted — this conversation is no longer bridged. Replies here will not reach the customer.</p>",
+          note: true,
+        })
+        .catch(() => {});
+    }
+    void this.audit.log({
+      title: "🔌 Intercom bridge disconnected",
+      severity: "warn",
+      actor: "Intercom bridge",
+      threadId,
+      fields: [
+        { name: "Reason", value: "Discord thread deleted", inline: false },
+        { name: "Conversation", value: link.conversationId, inline: true },
+      ],
+    });
+  }
 }
 
 // Intercom part bodies are HTML → readable Discord text for embeds/notes.
 function htmlToDiscordText(html: string): string {
-  return html
-    .replace(/<br\s*\/?>/gi, "\n")
-    .replace(/<\/p>\s*<p[^>]*>/gi, "\n\n")
-    .replace(/<b>(.*?)<\/b>/gi, "**$1**")
-    .replace(/<i>(.*?)<\/i>/gi, "*$1*")
-    .replace(/<a[^>]*href="([^"]+)"[^>]*>(.*?)<\/a>/gi, (_m, url, text) => (url === text ? url : `[${text}](${url})`))
-    .replace(/<[^>]+>/g, "")
-    .replace(/&nbsp;/g, " ")
-    .replace(/&amp;/g, "&")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .trim();
+  return (
+    html
+      .replace(/<br\s*\/?>/gi, "\n")
+      .replace(/<\/p>\s*<p[^>]*>/gi, "\n\n")
+      .replace(/<li[^>]*>/gi, "\n- ")
+      .replace(/<blockquote[^>]*>/gi, "\n> ")
+      .replace(/<(b|strong)>([\s\S]*?)<\/\1>/gi, "**$2**")
+      .replace(/<(i|em)>([\s\S]*?)<\/\1>/gi, "*$2*")
+      // Inline-pasted screenshots live in the body as <img>, not in
+      // `attachments` — without this an image-only agent reply renders empty
+      // and the customer receives nothing.
+      .replace(/<img[^>]*src="([^"]+)"[^>]*\/?>/gi, (_m, src) => `📷 [image](${src})`)
+      .replace(/<a[^>]*href="([^"]+)"[^>]*>(.*?)<\/a>/gi, (_m, url, text) => (url === text ? url : `[${text}](${url})`))
+      .replace(/<[^>]+>/g, "")
+      .replace(/&nbsp;/g, " ")
+      // &amp; must decode LAST: decoding it first turns "&amp;lt;" into "&lt;"
+      // which the next rule then double-decodes into "<".
+      .replace(/&lt;/g, "<")
+      .replace(/&gt;/g, ">")
+      .replace(/&quot;/g, '"')
+      .replace(/&#39;/g, "'")
+      .replace(/&amp;/g, "&")
+      .trim()
+  );
+}
+
+// Embed-safe truncation: ellipsis marker, never splits a surrogate pair (a
+// lone surrogate makes Discord reject the whole embed).
+function truncateEmbedText(text: string, max: number): string {
+  if (text.length <= max) return text;
+  let cut = text.slice(0, max - 1);
+  const last = cut.charCodeAt(cut.length - 1);
+  if (last >= 0xd800 && last <= 0xdbff) cut = cut.slice(0, -1);
+  return `${cut}…`;
 }

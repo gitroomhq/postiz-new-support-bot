@@ -23,7 +23,11 @@ import { IntercomHttpError } from "../../intercom/IntercomClient";
 import { DeferEchoError, type IntercomWebhookHandler } from "../../intercom/IntercomWebhookHandler";
 import type { EnsurePayload } from "../../intercom/types";
 import type { SnapshotScheduler } from "../../metrics/SnapshotScheduler";
-import { exportIntercomQueueDepth } from "../../metrics/MetricsExporter";
+import {
+  exportIntercomQueueDepth,
+  intercomDeadLetterCount,
+  recordIntercomDeadLetter,
+} from "../../metrics/MetricsExporter";
 import { influxActive } from "../../metrics/InfluxWriter";
 import type { TicketScoringService } from "../../scoring/TicketScoringService";
 import type { VaultMigrator } from "../../vault/VaultMigrator";
@@ -149,7 +153,11 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
       lastReminderAtMs: ticket.lastReminderAt?.getTime() ?? null,
       lastStatusChangeAtMs: ticket.lastStatusChangeAt.getTime(),
       recloseAtMs: ticket.recloseAt?.getTime() ?? null,
-      hasIntercomLink: !!link,
+      // A ticketId-less link is a half-built bridge (ensure died between
+      // conversation-create and convert). Report it as no-link so the pump
+      // keeps synthesizing the ensure that finishes the convert — requireLink
+      // no longer inline-rebuilds, so nothing else would ever retry it.
+      hasIntercomLink: !!link?.ticketId,
     };
   };
 
@@ -426,13 +434,16 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
           payload = (await intercomSync.buildEnsurePayloadWithSession(ticket)) as EnsurePayload;
         }
         heartbeat();
-        await intercomExecutor.execute(threadId, event.type as IcEventType, payload);
+        // Heartbeat between the executor's API calls: a multi-call ensure can
+        // outlive the 45s heartbeatTimeout and retry CONCURRENTLY with the
+        // still-running attempt (duplicate conversations).
+        await intercomExecutor.execute(threadId, event.type as IcEventType, payload, () => heartbeat());
       } catch (e) {
         if (e instanceof IntercomHttpError) {
           // 404 on a non-ensure event: a linked remote object was deleted —
           // self-heal inline (legacy handleFailure behavior), then retry.
           if (e.status === 404 && event.type !== "ensure") {
-            await intercomExecutor.selfHeal404(threadId).catch((healError) => {
+            await intercomExecutor.selfHeal404(threadId, () => heartbeat()).catch((healError) => {
               actLog.error("404 self-heal failed", healError, { "ticket.thread_id": threadId });
             });
             throw ApplicationFailure.create({
@@ -460,6 +471,10 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
     },
 
     async intercomDeadLetterAudit(input) {
+      recordIntercomDeadLetter("outbox");
+      // The dead event's kept-on-ambiguous-failure reservations can no longer
+      // match anything — drop them so they stop deferring inbound replies.
+      await intercomStore.deletePendingPostsForThread(input.threadId).catch(() => {});
       actLog.warn("intercom.delivery.dead_letter", {
         "queue.event_type": input.type,
         "ticket.thread_id": input.threadId,
@@ -477,6 +492,23 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
           { name: "Error", value: input.message.slice(0, 1024), inline: false },
         ],
       });
+      // A dead MESSAGE is a silent transcript gap: the staff member who typed
+      // the reply must find out in the thread, not (only) in the audit channel.
+      if (input.type === "message" || input.type === "message_edit" || input.type === "message_delete") {
+        const thread = await fetchThread(input.threadId).catch(() => null);
+        await thread
+          ?.send({
+            embeds: [
+              embed(
+                "⚠️ A message in this thread could not be synced to Intercom (all retries failed). " +
+                  "Agents working in Intercom will not see it — check /config → Intercom.",
+                COLORS.warn
+              ),
+            ],
+            allowedMentions: { parse: [] },
+          })
+          .catch(() => {});
+      }
     },
 
     // Inbound webhook event → the legacy handler. DeferEchoError becomes a
@@ -494,6 +526,7 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
     },
 
     async inboundDeadLetterAudit(input) {
+      recordIntercomDeadLetter("inbox");
       actLog.error("intercom.inbound.dead_letter", new Error(input.message), {
         "queue.event_topic": input.topic,
         "queue.attempts": input.attempts,
@@ -627,8 +660,16 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
             svc.countWorkflowExecutions({ namespace: ns, query: `WorkflowType="intercomDeliveryWorkflow" AND ExecutionStatus="Running"` }),
             svc.countWorkflowExecutions({ namespace: ns, query: `WorkflowType="intercomInboxWorkflow" AND ExecutionStatus="Running"` }),
           ]);
-          exportIntercomQueueDepth({ queue: "outbox", pending: Number(outbox.count ?? 0), dead: 0 });
-          exportIntercomQueueDepth({ queue: "inbox", pending: Number(inbox.count ?? 0), dead: 0 });
+          exportIntercomQueueDepth({
+            queue: "outbox",
+            pending: Number(outbox.count ?? 0),
+            dead: intercomDeadLetterCount("outbox"),
+          });
+          exportIntercomQueueDepth({
+            queue: "inbox",
+            pending: Number(inbox.count ?? 0),
+            dead: intercomDeadLetterCount("inbox"),
+          });
         }
       } catch {
         // visibility counts are best-effort gauges

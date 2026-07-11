@@ -50,6 +50,10 @@ Every deploy replays running workflows against the new bundle — a changed comm
 
 **Rollback past the legacy-cleanup release**: in the Temporal UI terminate `scoring-loop` and any `scoring-batch-*` runs, redeploy the old SHA (auto re-promotes; its own `ensureSchema` recreates the dropped queue tables empty), then toggle `/config → Temporal` OFF→ON.
 
+**Active `patched()` ids**: `intercom-ensure-park` (ticketWorkflow pump: a dead ensure parks the queue instead of hot-looping) — introduced in the bi-mode hardening release; removable two releases later per the rule above.
+
+> **Intercom webhook runbook**: while Temporal is down every `POST /intercom/webhook` answers 500 (deliberate — Intercom's retry redelivers). *Sustained* failures can make Intercom auto-disable the subscription with only an email notice; the bridge then stays inbound-dead after recovery. Alert on the `intercom_webhook` Influx measurement (`outcome=rejected` = bad/rotated client secret, Intercom does NOT retry 4xx; `outcome=error/buffered` = enqueue failures), and after any prolonged outage check Developer Hub → your app → Webhooks and re-enable the subscription if needed. The `/config → Intercom` panel shows the last verified inbound webhook.
+
 > **Secrets at rest** (Postiz OAuth access tokens, Intercom credentials, the Stripe webhook signing secret) are encrypted with AES-256-GCM. The key is derived (HKDF) from `STRIPE_SECRET_KEY` + `DATABASE_URL` + `DISCORD_TOKEN`, so a database dump alone cannot decrypt them. Rotating any of those three orphans existing ciphertext (fail-soft: affected users re-auth / secrets are re-entered).
 
 ## Setup

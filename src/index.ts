@@ -167,7 +167,8 @@ async function main() {
     statusService,
     intercomStore,
     intercomSync,
-    auditLogger
+    auditLogger,
+    intercomClient
   );
   const oauthManager = new OAuthManager(config, sessionStore);
   const claudeRunner = new ClaudeCodeRunner(process.cwd(), aiRunStore);
@@ -267,6 +268,18 @@ async function main() {
   intercomSync.setThreadUrlBuilder((threadId) => {
     const guild = bot.client.guilds.cache.first();
     return guild ? `https://discord.com/channels/${guild.id}/${threadId}` : null;
+  });
+  // Current Discord identity for the Intercom contact refresh (name drift,
+  // avatar) — resolved lazily per ensure.
+  intercomSync.setCustomerInfoResolver(async (userId) => {
+    const user = await bot.client.users.fetch(userId).catch(() => null);
+    if (!user) return null;
+    const guild = bot.client.guilds.cache.first();
+    const member = guild ? await guild.members.fetch(userId).catch(() => null) : null;
+    return {
+      displayName: member?.displayName ?? user.displayName ?? user.username,
+      avatarUrl: user.displayAvatarURL({ extension: "png", size: 128 }),
+    };
   });
   // --worker-only: log the Discord client in (activities need it) but skip
   // slash-command registration + the HTTP surface; the Temporal worker always

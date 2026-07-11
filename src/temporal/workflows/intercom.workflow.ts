@@ -18,6 +18,7 @@ import type {
   IntercomDeliveryResult,
   IntercomFailureDetails,
 } from "../types";
+import { INTERCOM_MAX_ECHO_DEFERS } from "../types";
 import { inboundEventSignal } from "./definitions";
 
 // ---- Outbound delivery (child of ticketWorkflow, one per queued event) ----
@@ -56,10 +57,11 @@ export async function intercomDeliveryWorkflow(input: IntercomDeliveryInput): Pr
         });
         return { outcome: "dead", error: message };
       }
-      // Legacy backoff: min(5000 · 2^attempts, 15min), Retry-After wins.
+      // Legacy backoff: min(5000 · 2^attempts, 15min), Retry-After wins — but a
+      // hostile/buggy Retry-After never sleeps past the cap either.
       const backoff =
         details?.retryAfterSeconds != null
-          ? details.retryAfterSeconds * 1000
+          ? Math.min(details.retryAfterSeconds * 1000, MAX_DELIVERY_BACKOFF_MS)
           : Math.min(5000 * 2 ** attempt, MAX_DELIVERY_BACKOFF_MS);
       await sleep(backoff);
     }
@@ -80,7 +82,7 @@ function classifyFailure(e: unknown): { details: IntercomFailureDetails | null; 
 
 // Separate defer accounting: echo-deferral must never burn the real retry
 // budget (the activity's own RetryPolicy handles transient failures).
-const MAX_DEFERS = 24;
+const MAX_DEFERS = INTERCOM_MAX_ECHO_DEFERS;
 const DEFER_BACKOFF_MS = 10 * 1000;
 const IDLE_TIMEOUT_MS = 24 * 60 * 60 * 1000;
 const SEEN_RING_SIZE = 50;
@@ -128,8 +130,10 @@ export async function intercomInboxWorkflow(input: { conversationId: string; car
           continue;
         }
         await inbound.inboundDeadLetterAudit({
+          // Defer exhaustion reports defers; a real failure reports the
+          // activity RetryPolicy's 8 attempts (regardless of earlier defers).
+          attempts: isDeferEcho(e) ? defer : 8,
           topic: evt.topic,
-          attempts: defer > 0 ? defer : 8,
           message: failureMessage(e),
         });
         break;

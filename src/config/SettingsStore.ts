@@ -504,6 +504,10 @@ export class SettingsStore {
     return (categoryId ? map[categoryId] : undefined) ?? map["_default"] ?? null;
   }
 
+  // Deliberately does NOT require the client secret for bi: an existing
+  // install running bi without one has a working OUTBOUND mirror, and gating
+  // here would retroactively park every ticket outbox on deploy. The mode
+  // preflight hard-blocks NEW bi flips without a secret instead.
   intercomConfigured(): boolean {
     return Boolean(this.intercomAccessToken() && this.intercomAuthorAdminId() && this.intercomTicketTypeIdFor(null));
   }
@@ -512,6 +516,31 @@ export class SettingsStore {
   // Intercom. Null = snooze events are ignored.
   intercomSnoozeStatusTagId(): string | null {
     return this.settings.intercomSnoozeStatusTagId;
+  }
+
+  // Webhook health: stamped (throttled) on every HMAC-verified inbound webhook;
+  // the /config panel renders it as the "Last inbound" line.
+  intercomLastInboundAt(): Date | null {
+    return this.settings.intercomLastInboundAt;
+  }
+
+  async setIntercomLastInboundAt(at: Date): Promise<void> {
+    this.settings = await this.prisma.botSettings.update({
+      where: { id: "global" },
+      data: { intercomLastInboundAt: at },
+    });
+  }
+
+  // Last mode flip — the none→bi gap heal reads Intercom parts newer than this.
+  intercomModeChangedAt(): Date | null {
+    return this.settings.intercomModeChangedAt;
+  }
+
+  async setIntercomMode(mode: IntercomMode): Promise<void> {
+    this.settings = await this.prisma.botSettings.update({
+      where: { id: "global" },
+      data: { intercomMode: mode, intercomModeChangedAt: new Date() },
+    });
   }
 
   // ---- Stripe webhook ingestion (dispute + early-fraud alerts) ----
