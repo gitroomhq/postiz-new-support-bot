@@ -184,7 +184,8 @@ export interface IntercomConversationItem {
 export interface IntercomTicketItem {
   type?: string;
   id?: string | number;
-  ticket_state?: { id?: string | number } | string | null;
+  // category: submitted | in_progress | waiting_on_customer | resolved
+  ticket_state?: { id?: string | number; category?: string | null } | string | null;
   ticket_parts?: { ticket_parts?: IntercomWebhookPart[] };
 }
 

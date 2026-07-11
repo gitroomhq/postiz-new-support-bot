@@ -453,6 +453,26 @@ export class IntercomWebhookHandler {
     // Our own PUT echoes back as this topic — the pushed state id marks it.
     if (link.lastSyncedStateId === stateId) return;
 
+    // Resolving the ticket in Intercom (resolved-category state) also closes
+    // the conversation — agents expect resolve to clear it from the inbox,
+    // and Intercom itself leaves it open. Damper-first so the close's own
+    // webhook echo is suppressed; safe for any author (closing is never the
+    // boot-a-ticket-open failure mode).
+    const stateCategory =
+      state && typeof state === "object" && typeof state.category === "string" ? state.category : null;
+    if (stateCategory === "resolved" && link.lastSyncedOpen !== "closed") {
+      const adminId = this.settingsStore.intercomAuthorAdminId();
+      if (adminId) {
+        const prevOpen = link.lastSyncedOpen === "open" ? ("open" as const) : null;
+        await this.store.setLastSyncedOpen(link.ticketThreadId, "closed");
+        try {
+          await this.intercomClient.setConversationOpen(link.conversationId, false, adminId);
+        } catch {
+          await this.store.setLastSyncedOpen(link.ticketThreadId, prevOpen).catch(() => {});
+        }
+      }
+    }
+
     const tag = this.settingsStore.tags().find((t) => t.intercomTicketStateId === stateId);
     if (!tag) return; // unmapped state — Intercom-only concept, ignore
 
@@ -460,14 +480,15 @@ export class IntercomWebhookHandler {
     if (!ticket) return;
     if (ticket.statusTagId === tag.id) return; // already there (echo or no-op)
 
-    // Intercom auto-transitions ticket states on customer activity — INCLUDING
-    // the bridge's own mirrored/replayed contact messages (e.g. waiting →
-    // in-progress). A transition that would REOPEN a closed Discord ticket
-    // therefore needs positive attribution to a real agent; the damper above
-    // only covers states the bridge pushed itself.
-    const reopens = ticket.closed && !tag.closesThread;
-    if (reopens && !this.attributedToRealAgent(item.ticket_parts?.ticket_parts)) {
-      this.wbLog.info("inbound state change dropped — would reopen without agent attribution", {
+    // Intercom auto-transitions ticket states on conversation activity —
+    // INCLUDING every message the bridge itself mirrors (customer reply →
+    // in_progress, staff reply → waiting_on_customer). Those must never drive
+    // the Discord status: the bot owns its own waiting-for-customer/team
+    // logic, and the auto-transitions would shuffle every ticket on every
+    // mirrored message. Positive agent attribution required for ALL inbound
+    // state changes; the damper above only covers states the bridge pushed.
+    if (!this.attributedToRealAgent(item.ticket_parts?.ticket_parts)) {
+      this.wbLog.info("inbound state change dropped — no non-bridge agent attribution", {
         "intercom.ticket_id": String(item.id),
         "ticket.thread_id": link.ticketThreadId,
         "intercom.state_id": stateId,

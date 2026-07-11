@@ -518,11 +518,12 @@ export function externalIdFor(payload: EnsurePayload, threadId: string): string 
   return externalIdCandidates(payload, threadId)[0];
 }
 
-// The Resolved tag is identified by convention (✅, matching RESOLVED_EMOJI in
-// StatusService) — resolved tickets close the Intercom conversation without the
-// Discord thread being locked.
+// A resolved-style tag closes the Intercom conversation without the Discord
+// thread being locked. Matched by the ✅ convention (RESOLVED_EMOJI in
+// StatusService) OR by label — the emoji-only convention silently stopped
+// closing conversations the moment a Resolved tag was re-emojied.
 function isResolvedTag(tag: StatusTag): boolean {
-  return tag.emoji === "✅";
+  return tag.emoji === "✅" || /\b(resolved|solved)\b/i.test(tag.label);
 }
 
 function categoryLabelOf(ticket: TicketWithTag, resolve: (id: string | null) => string | null): string | null {
