@@ -5,6 +5,12 @@ import { PrismaClient, IntercomLink } from "../generated/prisma/client";
 // cross-topic duplicate.
 const RELAY_KIND = "r";
 const RELAY_FRESH_MS = 2 * 60 * 1000;
+// Echo-handshake reservations are only meaningful while their post can still
+// plausibly be in flight: reservations are created per delivery ATTEMPT and a
+// call confirms (or its webhook lands) within seconds-to-minutes. Older rows
+// are crash/dead-letter leftovers — matching or deferring against them delays
+// and can even swallow genuine agent replies. The 1h sweep still deletes them.
+const PENDING_POST_FRESH_MS = 10 * 60 * 1000;
 
 // Persistence for the Intercom bridge: thread↔conversation/ticket links and
 // the echo-part / pending-post ledgers. The durable outbox/inbox queue tables
@@ -268,7 +274,11 @@ export class IntercomStore {
   // reservations, and each echo part may only eat one of them.
   async matchAndDeletePendingPost(ticketThreadId: string, bodyHashHex: string): Promise<boolean> {
     const row = await this.prisma.intercomPendingPost.findFirst({
-      where: { ticketThreadId, bodyHash: bodyHashHex },
+      where: {
+        ticketThreadId,
+        bodyHash: bodyHashHex,
+        createdAt: { gt: new Date(Date.now() - PENDING_POST_FRESH_MS) },
+      },
       orderBy: { createdAt: "asc" },
     });
     if (!row) return false;
@@ -277,7 +287,11 @@ export class IntercomStore {
   }
 
   async hasPendingPosts(ticketThreadId: string): Promise<boolean> {
-    return (await this.prisma.intercomPendingPost.count({ where: { ticketThreadId } })) > 0;
+    return (
+      (await this.prisma.intercomPendingPost.count({
+        where: { ticketThreadId, createdAt: { gt: new Date(Date.now() - PENDING_POST_FRESH_MS) } },
+      })) > 0
+    );
   }
 
   // A dead-lettered outbound event can leave one reservation per attempt (kept

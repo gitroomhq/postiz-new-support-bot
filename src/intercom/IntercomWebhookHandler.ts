@@ -202,6 +202,7 @@ export class IntercomWebhookHandler {
     if (!link) return; // Intercom-native conversation — not ours
 
     const parts = item.conversation_parts?.conversation_parts ?? [];
+    this.auditUnrelayableReply("conversation.admin.replied", String(item.id), link.ticketThreadId, parts);
     for (const part of parts) {
       await this.processAgentPart("c", link.ticketThreadId, part, attempt);
     }
@@ -216,9 +217,43 @@ export class IntercomWebhookHandler {
     if (!link) return;
 
     const parts = item.ticket_parts?.ticket_parts ?? [];
+    this.auditUnrelayableReply("ticket.admin.replied", String(item.id), link.ticketThreadId, parts);
     for (const part of parts) {
       await this.processAgentPart("t", link.ticketThreadId, part, attempt);
     }
+  }
+
+  // Diagnostic (Discord-visible — prod has no log access): a reply event for a
+  // BRIDGED conversation whose payload contains no part that survives the
+  // relay prefilters means an agent reply is about to vanish silently — the
+  // exact failure that is otherwise undebuggable. Fires only on reply topics,
+  // only for linked items, with a shape summary of what was actually received.
+  private auditUnrelayableReply(topic: string, itemId: string, threadId: string, parts: IntercomWebhookPart[]): void {
+    const relayable = parts.filter(
+      (p) =>
+        p.id != null &&
+        (!p.part_type || p.part_type === "comment" || p.part_type === "quick_reply") &&
+        (!p.author?.type || ["admin", "bot", "team"].includes(p.author.type))
+    );
+    if (relayable.length > 0) return;
+    const shape =
+      parts.length === 0
+        ? "payload carried NO parts"
+        : parts
+            .map((p) => `type=${p.part_type ?? "?"} author=${p.author?.type ?? "?"} id=${p.id ?? "?"}`)
+            .join(" · ")
+            .slice(0, 1000);
+    void this.audit.log({
+      title: "🌉 Intercom reply not relayable",
+      severity: "warn",
+      actor: "Intercom bridge",
+      threadId,
+      fields: [
+        { name: "Topic", value: topic, inline: true },
+        { name: "Item", value: itemId, inline: true },
+        { name: "Parts", value: shape, inline: false },
+      ],
+    });
   }
 
   // Shared relay path for agent-authored comment parts, conversation- or
