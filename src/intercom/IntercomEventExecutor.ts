@@ -264,16 +264,20 @@ export class IntercomEventExecutor {
         await this.withAuthor((a) => this.client.updateTicket(ticketId, { assigneeId: teamId, adminId: a }));
       } catch (e) {
         if (!isPermanent4xx(e)) throw e;
-        void this.audit.log({
-          title: "🌉 Intercom team assignment failed",
-          severity: "warn",
-          actor: "Intercom bridge",
-          threadId,
-          fields: [
-            { name: "Team", value: teamId, inline: true },
-            { name: "Error", value: (e instanceof Error ? e.message : String(e)).slice(0, 1024), inline: false },
-          ],
-        });
+        // Re-ensure after a partial failure: "already assigned" IS the desired
+        // end state — swallow it instead of spamming the audit channel.
+        if (!isAlreadyAssignedError(e)) {
+          void this.audit.log({
+            title: "🌉 Intercom team assignment failed",
+            severity: "warn",
+            actor: "Intercom bridge",
+            threadId,
+            fields: [
+              { name: "Team", value: teamId, inline: true },
+              { name: "Error", value: (e instanceof Error ? e.message : String(e)).slice(0, 1024), inline: false },
+            ],
+          });
+        }
       }
     }
     beat?.();
@@ -794,6 +798,12 @@ export function isPermanent4xx(e: unknown): boolean {
 // for the bridge that outcome IS the desired end state.
 function isSameStateError(e: unknown): boolean {
   return e instanceof IntercomHttpError && e.status === 400 && /same state/i.test(e.message);
+}
+
+// Assigning a ticket/conversation to the assignee it already has is rejected
+// with a 422 — also the desired end state (routine on ensure re-runs).
+function isAlreadyAssignedError(e: unknown): boolean {
+  return e instanceof IntercomHttpError && e.status === 422 && /already assigned/i.test(e.message);
 }
 
 // The create-contact 409 for an archived record embeds its id, e.g. "An

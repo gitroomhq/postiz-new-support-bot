@@ -497,13 +497,20 @@ export class IntercomWebhookHandler {
       return;
     }
 
-    // target === "open": Intercom auto-reopens a conversation when the bridge
-    // itself updates the linked ticket (state PUT, CSAT/priority attributes
-    // after a close). Those opened events carry a bridge-authored open part —
-    // restore the close instead of booting the Discord ticket back to its
-    // initial status. Only explicit agent reopens fall through.
+    // target === "open": Intercom auto-reopens a conversation on activity the
+    // bridge itself causes, and those reopens must never boot the Discord
+    // status. Two flavors:
     const openParts = item.conversation_parts?.conversation_parts ?? [];
     const openPart = openParts.find((p) => p.part_type === "open") ?? openParts[openParts.length - 1];
+    const openAuthorType = openPart?.author?.type ?? null;
+    // (1) Contact-authored reopen: customers have no Intercom access, so this
+    // can only be the bridge's own replyAsContact mirror (live message or
+    // backfill replay). Discord already owns its reopen logic for customer
+    // messages — drop it. No re-close either: a live customer reply SHOULD
+    // leave the conversation open, and a backfill replay's tail re-closes.
+    if (openAuthorType === "user" || openAuthorType === "lead") return;
+    // (2) Bridge-admin-authored reopen: side effect of the bridge's own ticket
+    // state/attribute writes after a close — restore the close instead.
     if (openPart && this.isBridgeAuthor(openPart)) {
       if (link.lastSyncedOpen === "closed") {
         const adminId = this.settingsStore.intercomAuthorAdminId();
