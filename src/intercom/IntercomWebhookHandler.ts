@@ -202,10 +202,7 @@ export class IntercomWebhookHandler {
     if (!link) return; // Intercom-native conversation — not ours
 
     const parts = item.conversation_parts?.conversation_parts ?? [];
-    this.auditUnrelayableReply("conversation.admin.replied", String(item.id), link.ticketThreadId, parts);
-    for (const part of parts) {
-      await this.processAgentPart("c", link.ticketThreadId, part, attempt);
-    }
+    await this.relayReplyParts("c", "conversation.admin.replied", String(item.id), link, parts, attempt);
     await this.diffTags(link.ticketThreadId, item);
   }
 
@@ -217,37 +214,64 @@ export class IntercomWebhookHandler {
     if (!link) return;
 
     const parts = item.ticket_parts?.ticket_parts ?? [];
-    this.auditUnrelayableReply("ticket.admin.replied", String(item.id), link.ticketThreadId, parts);
-    for (const part of parts) {
-      await this.processAgentPart("t", link.ticketThreadId, part, attempt);
-    }
+    await this.relayReplyParts("t", "ticket.admin.replied", String(item.id), link, parts, attempt);
   }
 
-  // Diagnostic (Discord-visible — prod has no log access): a reply event for a
-  // BRIDGED conversation whose payload contains no part that survives the
-  // relay prefilters means an agent reply is about to vanish silently — the
-  // exact failure that is otherwise undebuggable. Fires only on reply topics,
-  // only for linked items, with a shape summary of what was actually received.
-  private auditUnrelayableReply(topic: string, itemId: string, threadId: string, parts: IntercomWebhookPart[]): void {
-    const relayable = parts.filter(
-      (p) =>
-        p.id != null &&
-        (!p.part_type || p.part_type === "comment" || p.part_type === "quick_reply") &&
-        (!p.author?.type || ["admin", "bot", "team"].includes(p.author.type))
-    );
-    if (relayable.length > 0) return;
+  // Reply-topic relay with an API fallback: Intercom's reply payload sometimes
+  // carries only a side-effect part and NOT the comment itself — observed live
+  // with reply-and-auto-assign, where conversation.admin.replied ships just the
+  // `assignment` part. When no relayable comment is in the payload, pull the
+  // recent parts from the API and run them through the normal relay path (the
+  // part-id ledger dedups anything already handled elsewhere).
+  private async relayReplyParts(
+    kind: "c" | "t",
+    topic: string,
+    itemId: string,
+    link: { ticketThreadId: string; conversationId: string },
+    parts: IntercomWebhookPart[],
+    attempt: number
+  ): Promise<void> {
+    const relayable = (list: IntercomWebhookPart[]) =>
+      list.filter(
+        (p) =>
+          p.id != null &&
+          (!p.part_type || p.part_type === "comment" || p.part_type === "quick_reply") &&
+          (!p.author?.type || ["admin", "bot", "team"].includes(p.author.type))
+      );
+
+    if (relayable(parts).length > 0) {
+      for (const part of parts) {
+        await this.processAgentPart(kind, link.ticketThreadId, part, attempt);
+      }
+      return;
+    }
+
+    // No comment in the payload — fetch the conversation's recent parts.
+    const sinceUnix = Math.floor(Date.now() / 1000) - 15 * 60;
+    const fetched = await this.intercomClient.getConversationPartsSince(link.conversationId, sinceUnix).catch(() => []);
+    const fetchedRelayable = relayable(fetched);
+    if (fetchedRelayable.length > 0) {
+      // Fetched parts are conversation parts regardless of the trigger topic.
+      for (const part of fetchedRelayable) {
+        await this.processAgentPart("c", link.ticketThreadId, part, attempt);
+      }
+      return;
+    }
+
+    // Still nothing — surface it (Discord-visible; prod has no log access):
+    // an agent reply may be vanishing and this is the only trace.
     const shape =
       parts.length === 0
-        ? "payload carried NO parts"
-        : parts
+        ? "payload carried NO parts (API fallback also found none)"
+        : `${parts
             .map((p) => `type=${p.part_type ?? "?"} author=${p.author?.type ?? "?"} id=${p.id ?? "?"}`)
             .join(" · ")
-            .slice(0, 1000);
+            .slice(0, 900)} (API fallback also found none)`;
     void this.audit.log({
       title: "🌉 Intercom reply not relayable",
       severity: "warn",
       actor: "Intercom bridge",
-      threadId,
+      threadId: link.ticketThreadId,
       fields: [
         { name: "Topic", value: topic, inline: true },
         { name: "Item", value: itemId, inline: true },
