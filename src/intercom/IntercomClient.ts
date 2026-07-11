@@ -102,9 +102,11 @@ export class IntercomClient {
   }
 
   async listAdmins(): Promise<IntercomAdmin[]> {
+    // display_avatar=true: without it the endpoint omits avatars entirely
+    // (defaults to false); the avatar arrives as a plain URL string here.
     const data = await this.json<{
       admins?: Array<{ id?: string | number; name?: string; email?: string; avatar?: { image_url?: string | null } | string | null }>;
-    }>("/admins", "GET", undefined, "admins");
+    }>("/admins?display_avatar=true", "GET", undefined, "admins");
     return (data.admins ?? [])
       .filter((a) => a.id != null)
       .map((a) => ({
