@@ -328,7 +328,14 @@ export class IntercomWebhookHandler {
       let avatarUrl = typeof avatar === "string" ? avatar : avatar?.image_url ?? null;
       if (!avatarUrl && part.author?.id != null) {
         // Payloads don't always carry the author avatar — the /admins cache does.
-        avatarUrl = (await this.lookupAdmin(String(part.author.id)))?.avatarUrl ?? null;
+        const admin = await this.lookupAdmin(String(part.author.id));
+        avatarUrl = admin?.avatarUrl ?? null;
+        if (!avatarUrl) {
+          this.wbLog.info("agent avatar unresolved (payload + /admins both empty)", {
+            "intercom.admin_id": String(part.author.id),
+            "intercom.admin_known": admin != null,
+          });
+        }
       }
       const authorName = part.author?.name || "Intercom agent";
 
@@ -846,12 +853,21 @@ export class IntercomWebhookHandler {
     if (!parent || parent.isThread() || !("fetchWebhooks" in parent)) return null;
     try {
       const hooks = await parent.fetchWebhooks();
+      const botAvatar = this.client?.user?.displayAvatarURL({ extension: "png", size: 256 });
+      const existing = hooks.find(
+        (h) => h.owner?.id === this.client?.user?.id && h.name === IntercomWebhookHandler.RELAY_WEBHOOK_NAME
+      );
+      // Default avatar = the bot's own: shows whenever a per-message agent
+      // avatar can't be resolved (never the gray Discord placeholder). Also
+      // backfilled onto webhooks created before this default existed.
+      if (existing && !existing.avatar && botAvatar) {
+        await existing.edit({ avatar: botAvatar }).catch(() => {});
+      }
       const mine =
-        hooks.find(
-          (h) => h.owner?.id === this.client?.user?.id && h.name === IntercomWebhookHandler.RELAY_WEBHOOK_NAME
-        ) ??
+        existing ??
         (await parent.createWebhook({
           name: IntercomWebhookHandler.RELAY_WEBHOOK_NAME,
+          avatar: botAvatar ?? undefined,
           reason: "Intercom bridge: agent replies render under the agent's own name",
         }));
       this.relayWebhooks.set(parentId, mine);
