@@ -10,6 +10,7 @@ import { IntercomClient } from "./IntercomClient";
 import { bodyHash } from "./renderDiscordMarkdown";
 import { TemporalBufferedError, type TemporalProducers } from "../temporal/producers";
 import { INTERCOM_MAX_ECHO_DEFERS } from "../temporal/types";
+import { log } from "../util/logger";
 import {
   IntercomConversationItem,
   IntercomTicketItem,
@@ -76,6 +77,7 @@ export class IntercomWebhookHandler {
   // Throttle for the webhook-health stamp (one settings write per minute, not
   // per event).
   private lastInboundStampMs = 0;
+  private wbLog = log.child("intercom:webhook");
 
   constructor(
     private settingsStore: SettingsStore,
@@ -336,6 +338,21 @@ export class IntercomWebhookHandler {
     );
   }
 
+  // Positive attribution gate for inbound events that would REOPEN a closed
+  // Discord ticket: true only when the newest authored part is a non-bridge
+  // admin/team. Contact ("user"/"lead") activity is by definition the bridge's
+  // own mirror (customers have no Intercom access), bot/workflow and
+  // unattributed parts are Intercom reacting to bridge activity — none of
+  // those may boot a closed ticket. Better to drop a rare ambiguous agent
+  // action (they can reopen in Discord) than to mass-reopen on every replay.
+  private attributedToRealAgent(parts: IntercomWebhookPart[] | undefined): boolean {
+    const author = [...(parts ?? [])].reverse().find((p) => p.author?.type)?.author;
+    if (!author || (author.type !== "admin" && author.type !== "team")) return false;
+    const id = author.id != null ? String(author.id) : null;
+    if (!id) return false;
+    return id !== this.settingsStore.intercomOperatorAdminId() && id !== this.settingsStore.intercomAdminId();
+  }
+
   private async hasPendingOutboundContent(threadId: string): Promise<boolean> {
     // Pending-posts (the reserve→confirm handshake) is the in-flight signal;
     // queued-but-unsent workflow outbox events can't have created a part yet,
@@ -443,6 +460,21 @@ export class IntercomWebhookHandler {
     if (!ticket) return;
     if (ticket.statusTagId === tag.id) return; // already there (echo or no-op)
 
+    // Intercom auto-transitions ticket states on customer activity — INCLUDING
+    // the bridge's own mirrored/replayed contact messages (e.g. waiting →
+    // in-progress). A transition that would REOPEN a closed Discord ticket
+    // therefore needs positive attribution to a real agent; the damper above
+    // only covers states the bridge pushed itself.
+    const reopens = ticket.closed && !tag.closesThread;
+    if (reopens && !this.attributedToRealAgent(item.ticket_parts?.ticket_parts)) {
+      this.wbLog.info("inbound state change dropped — would reopen without agent attribution", {
+        "intercom.ticket_id": String(item.id),
+        "ticket.thread_id": link.ticketThreadId,
+        "intercom.state_id": stateId,
+      });
+      return;
+    }
+
     // Pre-mark the synced state so the push-back triggered by applyStatus
     // skips its ticket update (Intercom already has this state). Rolled back on
     // failure — otherwise the retry short-circuits on the damper above and the
@@ -497,20 +529,15 @@ export class IntercomWebhookHandler {
       return;
     }
 
-    // target === "open": Intercom auto-reopens a conversation on activity the
-    // bridge itself causes, and those reopens must never boot the Discord
-    // status. Two flavors:
+    // target === "open": Intercom auto-reopens conversations on all kinds of
+    // activity the bridge itself causes (mirrored contact replies, ticket
+    // state/attribute writes) — and payload shapes vary, so the rule is
+    // POSITIVE ATTRIBUTION: only a reopen provably authored by a real,
+    // non-bridge agent may touch the Discord status. Everything else is the
+    // bridge's own echo or ambiguous — drop it (and if it was our own admin
+    // write that reopened a closed conversation, restore the close).
     const openParts = item.conversation_parts?.conversation_parts ?? [];
     const openPart = openParts.find((p) => p.part_type === "open") ?? openParts[openParts.length - 1];
-    const openAuthorType = openPart?.author?.type ?? null;
-    // (1) Contact-authored reopen: customers have no Intercom access, so this
-    // can only be the bridge's own replyAsContact mirror (live message or
-    // backfill replay). Discord already owns its reopen logic for customer
-    // messages — drop it. No re-close either: a live customer reply SHOULD
-    // leave the conversation open, and a backfill replay's tail re-closes.
-    if (openAuthorType === "user" || openAuthorType === "lead") return;
-    // (2) Bridge-admin-authored reopen: side effect of the bridge's own ticket
-    // state/attribute writes after a close — restore the close instead.
     if (openPart && this.isBridgeAuthor(openPart)) {
       if (link.lastSyncedOpen === "closed") {
         const adminId = this.settingsStore.intercomAuthorAdminId();
@@ -518,6 +545,13 @@ export class IntercomWebhookHandler {
           await this.intercomClient.setConversationOpen(link.conversationId, false, adminId).catch(() => {});
         }
       }
+      return;
+    }
+    if (!this.attributedToRealAgent(openParts)) {
+      this.wbLog.info("inbound reopen dropped — not attributable to a non-bridge agent", {
+        "intercom.conversation_id": String(item.id),
+        "ticket.thread_id": link.ticketThreadId,
+      });
       return;
     }
 
