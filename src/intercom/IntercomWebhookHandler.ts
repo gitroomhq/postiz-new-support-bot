@@ -1,4 +1,4 @@
-import { Client, EmbedBuilder, ThreadChannel } from "discord.js";
+import { Client, EmbedBuilder, ThreadChannel, Webhook } from "discord.js";
 import { SettingsStore } from "../config/SettingsStore";
 import { TicketStore } from "../bot/TicketStore";
 import { StatusService } from "../bot/StatusService";
@@ -45,6 +45,7 @@ export const INTERCOM_WEBHOOK_TOPICS = [
   "conversation.admin.snoozed",
   "conversation.admin.unsnoozed",
   "conversation.admin.assigned",
+  "conversation.priority.updated",
   "ticket.state.updated",
   "ticket.admin.replied",
   "ticket.note.created",
@@ -183,6 +184,9 @@ export class IntercomWebhookHandler {
       case "conversation.admin.assigned":
         await this.handleConversationAssigned(item as IntercomConversationItem);
         return;
+      case "conversation.priority.updated":
+        await this.handleConversationPriorityUpdated(item as IntercomConversationItem);
+        return;
       default:
         return; // unknown topic — drop
     }
@@ -285,27 +289,35 @@ export class IntercomWebhookHandler {
 
       const avatar = part.author?.avatar;
       const avatarUrl = typeof avatar === "string" ? avatar : avatar?.image_url ?? null;
-      const embed = new EmbedBuilder()
-        .setColor(COLORS.brand)
-        .setAuthor({
-          name: part.author?.name || "Intercom agent",
-          ...(avatarUrl ? { iconURL: avatarUrl } : {}),
-        })
-        .setDescription(description)
-        .setTimestamp();
+      const authorName = part.author?.name || "Intercom agent";
 
       // Posting into an archived thread: un-archive, send, re-archive. The lock
-      // state stays untouched, and the message is bot-authored, so handleMessage
-      // ignores it (no reclose interference, no re-mirror to Intercom).
+      // state stays untouched, and the message is bot/webhook-authored, so
+      // handleMessage ignores it (no reclose interference, no re-mirror).
       const wasArchived = thread.archived === true;
       if (wasArchived) await thread.setArchived(false).catch(() => {});
       const ticket = await this.ticketStore.getByThreadId(threadId);
       try {
-        await thread.send({
-          content: ticket?.customerId ? `<@${ticket.customerId}>` : undefined,
-          embeds: [embed],
-          allowedMentions: { users: ticket?.customerId ? [ticket.customerId] : [] },
+        // Preferred: webhook impersonation — the reply renders as if the agent
+        // wrote natively in Discord (their name + Intercom avatar as the
+        // message author). Falls back to the neutral embed when the bot lacks
+        // Manage Webhooks or the webhook send fails.
+        const mention = ticket?.customerId ? `<@${ticket.customerId}> ` : "";
+        const sent = await this.relayViaWebhook(thread, ticket?.customerId ?? null, authorName, avatarUrl, {
+          content: truncateEmbedText(`${mention}${description}`, 2000),
         });
+        if (!sent) {
+          const embed = new EmbedBuilder()
+            .setColor(COLORS.brand)
+            .setAuthor({ name: authorName, ...(avatarUrl ? { iconURL: avatarUrl } : {}) })
+            .setDescription(description)
+            .setTimestamp();
+          await thread.send({
+            content: ticket?.customerId ? `<@${ticket.customerId}>` : undefined,
+            embeds: [embed],
+            allowedMentions: { users: ticket?.customerId ? [ticket.customerId] : [] },
+          });
+        }
       } finally {
         if (wasArchived) await thread.setArchived(true).catch(() => {});
       }
@@ -485,7 +497,24 @@ export class IntercomWebhookHandler {
       return;
     }
 
-    // target === "open": reopen only if the ticket is actually done/closed.
+    // target === "open": Intercom auto-reopens a conversation when the bridge
+    // itself updates the linked ticket (state PUT, CSAT/priority attributes
+    // after a close). Those opened events carry a bridge-authored open part —
+    // restore the close instead of booting the Discord ticket back to its
+    // initial status. Only explicit agent reopens fall through.
+    const openParts = item.conversation_parts?.conversation_parts ?? [];
+    const openPart = openParts.find((p) => p.part_type === "open") ?? openParts[openParts.length - 1];
+    if (openPart && this.isBridgeAuthor(openPart)) {
+      if (link.lastSyncedOpen === "closed") {
+        const adminId = this.settingsStore.intercomAuthorAdminId();
+        if (adminId) {
+          await this.intercomClient.setConversationOpen(link.conversationId, false, adminId).catch(() => {});
+        }
+      }
+      return;
+    }
+
+    // Reopen only if the ticket is actually done/closed.
     if (!ticket.closed) return;
     const initialTag = this.settingsStore.initialTag();
     if (!initialTag || ticket.statusTagId === initialTag.id) return;
@@ -599,6 +628,32 @@ export class IntercomWebhookHandler {
       .catch(() => {});
   }
 
+  // Agent set the NATIVE priority level in Intercom → the Discord priority tag
+  // with the matching label (Urgent/High/Medium/Low, case-insensitive). The
+  // level is read-only via the public API, so this can never be an echo of the
+  // bridge's own writes (outbound priority lives in the custom "Priority"
+  // ticket attribute). The resulting Discord change pushes back only to that
+  // custom attribute — no loop.
+  private async handleConversationPriorityUpdated(item: IntercomConversationItem | undefined): Promise<void> {
+    if (this.settingsStore.intercomMode() !== "bi") return;
+    if (!item || item.id == null) return;
+    const level = typeof item.priority === "string" ? item.priority.toLowerCase() : null;
+    // "none" (cleared) has no Discord counterpart; legacy binary
+    // "priority"/"not_priority" payloads match no label and fall out below.
+    if (!level || level === "none") return;
+
+    const link = await this.store.getLinkByConversationId(String(item.id));
+    if (!link) return;
+    const priority = this.settingsStore.priorities().find((p) => p.label.toLowerCase() === level);
+    if (!priority) return; // no Discord priority tag with that label — ignore
+    const ticket = await this.ticketStore.getByThreadId(link.ticketThreadId);
+    if (!ticket || ticket.priorityTagId === priority.id) return;
+
+    const thread = await this.requireThread(link.ticketThreadId);
+    if (!thread) return;
+    await this.statusService.applyPriority(thread, ticket, priority, { actorName: "Intercom agent" });
+  }
+
   // Tag changes made in Intercom → one diff embed in the Discord thread.
   // There is no untag webhook topic, so the diff runs on every conversation
   // event that carries tags. Bridge-managed names are skipped; the bridge's
@@ -634,6 +689,75 @@ export class IntercomWebhookHandler {
         allowedMentions: { parse: [] },
       })
       .catch(() => {});
+  }
+
+  // ---- Agent-reply webhook impersonation ----
+  // One bot-owned webhook per parent channel (cached; threads post through the
+  // parent with threadId). Webhook messages carry author.bot=true, so the
+  // messageCreate mirror skips them — same loop safety as the embed path.
+
+  private static readonly RELAY_WEBHOOK_NAME = "Intercom Agent Relay";
+  private relayWebhooks = new Map<string, Webhook>();
+
+  private async relayViaWebhook(
+    thread: ThreadChannel,
+    customerId: string | null,
+    authorName: string,
+    avatarUrl: string | null,
+    message: { content: string }
+  ): Promise<boolean> {
+    const send = async (webhook: Webhook): Promise<void> => {
+      await webhook.send({
+        content: message.content,
+        username: sanitizeWebhookUsername(authorName),
+        ...(avatarUrl ? { avatarURL: avatarUrl } : {}),
+        threadId: thread.id,
+        allowedMentions: { users: customerId ? [customerId] : [] },
+      });
+    };
+    try {
+      const webhook = await this.getRelayWebhook(thread);
+      if (!webhook) return false;
+      await send(webhook);
+      return true;
+    } catch {
+      // Stale cache (webhook deleted by a mod) — refetch once, then give up to
+      // the embed fallback. Never throw: the caller's fallback owns failure.
+      this.relayWebhooks.delete(thread.parentId ?? "");
+      try {
+        const webhook = await this.getRelayWebhook(thread);
+        if (!webhook) return false;
+        await send(webhook);
+        return true;
+      } catch {
+        return false;
+      }
+    }
+  }
+
+  private async getRelayWebhook(thread: ThreadChannel): Promise<Webhook | null> {
+    const parentId = thread.parentId;
+    if (!parentId || !this.client) return null;
+    const cached = this.relayWebhooks.get(parentId);
+    if (cached) return cached;
+
+    const parent = thread.parent ?? (await this.client.channels.fetch(parentId).catch(() => null));
+    if (!parent || parent.isThread() || !("fetchWebhooks" in parent)) return null;
+    try {
+      const hooks = await parent.fetchWebhooks();
+      const mine =
+        hooks.find(
+          (h) => h.owner?.id === this.client?.user?.id && h.name === IntercomWebhookHandler.RELAY_WEBHOOK_NAME
+        ) ??
+        (await parent.createWebhook({
+          name: IntercomWebhookHandler.RELAY_WEBHOOK_NAME,
+          reason: "Intercom bridge: agent replies render under the agent's own name",
+        }));
+      this.relayWebhooks.set(parentId, mine);
+      return mine;
+    } catch {
+      return null; // Missing Manage Webhooks — embed fallback
+    }
   }
 
   // Admin id → display name, cached 10 min (assignment events would otherwise
@@ -741,6 +865,13 @@ function htmlToDiscordText(html: string): string {
       .replace(/&amp;/g, "&")
       .trim()
   );
+}
+
+// Discord rejects webhook usernames containing "discord"/"clyde" (any case)
+// and caps them at 80 chars.
+function sanitizeWebhookUsername(name: string): string {
+  const cleaned = name.replace(/discord|clyde/gi, "").trim().slice(0, 80);
+  return cleaned || "Intercom agent";
 }
 
 // Embed-safe truncation: ellipsis marker, never splits a surrogate pair (a

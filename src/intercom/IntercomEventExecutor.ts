@@ -703,11 +703,13 @@ export class IntercomEventExecutor {
     // while the event was queued). Guarded by lastSyncedStateId: bi-mode
     // webhook-initiated changes already updated Intercom, so the echo push
     // becomes a no-op here.
+    let statePutHappened = false;
     const tag = payload.statusTagId ? this.settingsStore.tagById(payload.statusTagId) : undefined;
     const stateId = tag?.intercomTicketStateId ?? null;
     if (link.ticketId && stateId && link.lastSyncedStateId !== stateId) {
       try {
         await this.withAuthor((a) => this.client.updateTicket(link.ticketId!, { stateId, adminId: a }));
+        statePutHappened = true;
       } catch (e) {
         // "Cannot transition ticket to the same state" — already there
         // (e.g. an agent moved it while the mode was push, or two bot tags
@@ -730,6 +732,24 @@ export class IntercomEventExecutor {
         if (!(payload.forceOpenSync && isPermanent4xx(e))) throw e;
       }
       await this.store.setLastSyncedOpen(threadId, target);
+    } else if (target === "closed" && statePutHappened) {
+      // The state PUT above auto-reopened the conversation in Intercom (any
+      // ticket update does) but the parity damper says it's already closed —
+      // re-assert the close or it sits open in the inbox.
+      await this.reassertConversationClosed(threadId, link);
+    }
+  }
+
+  // Intercom auto-reopens a conversation when the bridge updates the linked
+  // ticket (state or attributes). When the bridge's last synced state is
+  // closed, restore it — otherwise every post-close CSAT/priority write leaves
+  // the conversation open for agents (and fires an opened webhook).
+  private async reassertConversationClosed(threadId: string, link: IntercomLink): Promise<void> {
+    if (link.lastSyncedOpen !== "closed") return;
+    try {
+      await this.withAuthor((a) => this.client.setConversationOpen(link.conversationId, false, a));
+    } catch (e) {
+      if (!isPermanent4xx(e)) throw e; // "already closed" & co — desired end state
     }
   }
 
@@ -744,10 +764,13 @@ export class IntercomEventExecutor {
         // Attribute definition missing — degrade (messages-only mirroring, no note).
         if (!(e instanceof IntercomHttpError && (e.status === 400 || e.status === 422))) throw e;
       }
+      await this.reassertConversationClosed(threadId, link);
     }
   }
 
-  // CSAT lands as a ticket attribute only (messages-only mirroring).
+  // CSAT lands as a ticket attribute only (messages-only mirroring). CSAT
+  // typically arrives AFTER the close — without the re-assert the attribute
+  // write reopens the conversation in Intercom.
   private async executeCsat(threadId: string, payload: CsatPayload): Promise<void> {
     const link = await this.requireLink(threadId);
     if (link.ticketId) {
@@ -758,6 +781,7 @@ export class IntercomEventExecutor {
       } catch (e) {
         if (!(e instanceof IntercomHttpError && (e.status === 400 || e.status === 422))) throw e;
       }
+      await this.reassertConversationClosed(threadId, link);
     }
   }
 }

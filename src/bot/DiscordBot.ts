@@ -8182,11 +8182,27 @@ export class DiscordBot {
       } else if (!s.intercomLastInboundAt()) {
         soft.push("No inbound webhook has ever been received — verify the Developer Hub subscription (topics + endpoint URL) before relying on agent replies reaching Discord.");
       }
-      if (!s.publicBaseUrl()) soft.push("No public base URL configured — set it so the webhook endpoint instructions and thread links resolve.");
+      // resolvedPublicBaseUrl falls back to the POSTIZ_CALLBACK_URL origin, so
+      // this only warns when the deploy has NO known external origin at all.
+      if (!s.resolvedPublicBaseUrl()) {
+        soft.push(
+          "No public base URL known — set it via /config → Reporting & Audit → Billing → Webhooks → Set Public URL (used in the webhook endpoint instructions)."
+        );
+      }
       if (s.tags().filter((t) => t.intercomTicketStateId).length === 0) {
         soft.push("No status tags are mapped to Intercom ticket states — state changes will not sync (Map States).");
       }
       if (!s.closingTag()) soft.push("No closing status tag exists — an Intercom-side close cannot map back to Discord.");
+      // Agent replies impersonate the agent via a channel webhook; without the
+      // permission they degrade to the plainer bot embed.
+      const threadsChannelId = s.threadsChannelId();
+      if (threadsChannelId) {
+        const channel = await this.client.channels.fetch(threadsChannelId).catch(() => null);
+        const me = channel && "guild" in channel && channel.guild ? channel.guild.members.me : null;
+        if (channel && me && !channel.isDMBased() && !channel.permissionsFor(me)?.has(PermissionFlagsBits.ManageWebhooks)) {
+          soft.push("Bot lacks Manage Webhooks in the threads channel — agent replies will render as plain embeds instead of under the agent's name.");
+        }
+      }
     }
     return { hard, soft };
   }
