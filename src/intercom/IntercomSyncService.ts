@@ -281,6 +281,31 @@ export class IntercomSyncService {
     });
   }
 
+  // Reconcile: re-assert a closed/resolved Discord ticket's state onto its
+  // Intercom conversation, BYPASSING the open/close damper (forceOpenSync) —
+  // for drift incidents where Intercom-side auto-reopens left conversations
+  // open that Discord says are done. Only ever closes; open tickets and
+  // unbridged tickets are skipped. Returns true when an event was enqueued.
+  async resyncClosedStatus(ticket: TicketWithTag): Promise<boolean> {
+    if (!this.enabled()) return false;
+    const tag = ticket.statusTag;
+    if (!tag) return false;
+    const resolved = tag.closesThread || isResolvedTag(tag);
+    if (!ticket.closed && !resolved) return false;
+    if (!(await this.store.getLink(ticket.threadId))) return false;
+    await this.chained(ticket.threadId, async () => {
+      await this.emit(ticket.threadId, "status", {
+        statusTagId: tag.id,
+        statusLabel: `${tag.emoji} ${tag.label}`,
+        actorName: "Re-sync",
+        closed: ticket.closed,
+        resolved,
+        forceOpenSync: true,
+      });
+    });
+    return true;
+  }
+
   // push→bi flip: corrective note into every OPEN conversation that got the
   // push-mode warning; agentWarnedAt is cleared so a later return to push mode
   // re-warns. Returns the number of conversations corrected.

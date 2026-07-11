@@ -3975,7 +3975,8 @@ export class DiscordBot {
     );
 
     const extraButtons = new ActionRowBuilder<ButtonBuilder>().addComponents(
-      new ButtonBuilder().setCustomId("config_intercom_snooze").setLabel("Snooze Tag").setStyle(ButtonStyle.Primary)
+      new ButtonBuilder().setCustomId("config_intercom_snooze").setLabel("Snooze Tag").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("config_intercom_resync").setLabel("Sync Closed Tickets").setStyle(ButtonStyle.Secondary)
     );
 
     return { embeds: [embed], components: [modeButtons, setupButtons, actionButtons, extraButtons] };
@@ -6608,6 +6609,31 @@ export class DiscordBot {
     if (id === "config_intercom_backfill_confirm") {
       await interaction.deferReply({ flags: 64 });
       await this.runIntercomBackfill(interaction);
+      return;
+    }
+
+    if (id === "config_intercom_resync") {
+      // Drift reconcile: every ticket closed/resolved in Discord re-asserts its
+      // closed state onto Intercom (damper-bypassing), closing conversations
+      // that incident auto-reopens left open. Nothing is deleted; open tickets
+      // are untouched.
+      await interaction.deferReply({ flags: 64 });
+      if (this.settingsStore.intercomMode() === "none") {
+        await interaction.editReply({
+          embeds: [makeEmbed("The bridge is off — enable Push or Bidirectional first, then run the sync.", COLORS.warn)],
+        });
+        return;
+      }
+      const links = await this.intercomStore.listAllLinks();
+      let enqueued = 0;
+      for (const link of links) {
+        const ticket = await this.ticketStore.getByThreadId(link.ticketThreadId).catch(() => null);
+        if (!ticket) continue;
+        if (await this.intercomSync.resyncClosedStatus(ticket).catch(() => false)) enqueued++;
+      }
+      const summary = `Re-sync queued for **${enqueued}** closed/resolved ticket(s) (of ${links.length} bridged). Their Intercom conversations close in the background via the normal paced delivery queue.`;
+      await interaction.editReply({ embeds: [makeEmbed(summary, COLORS.success)] });
+      this.auditConfig(interaction, `Intercom closed-state re-sync (${enqueued} tickets)`);
       return;
     }
 
