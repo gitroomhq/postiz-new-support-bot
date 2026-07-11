@@ -283,9 +283,12 @@ export class IntercomEventExecutor {
     beat?.();
 
     // Conversation open/close parity: API-created conversations start open.
+    // The ticket's own open flag follows suit — resolved state alone leaves it
+    // listed among open tickets.
     const target: "open" | "closed" = payload.closed || payload.resolved ? "closed" : "open";
     if (target === "closed" && link.lastSyncedOpen !== "closed") {
       await this.withAuthor((a) => this.client.setConversationOpen(link.conversationId, false, a));
+      await this.setTicketOpenParity(ticketId, false);
     }
     if (link.lastSyncedOpen !== target) {
       await this.store.setLastSyncedOpen(threadId, target);
@@ -735,6 +738,7 @@ export class IntercomEventExecutor {
       } catch (e) {
         if (!(payload.forceOpenSync && isPermanent4xx(e))) throw e;
       }
+      await this.setTicketOpenParity(link.ticketId, target === "open");
       await this.store.setLastSyncedOpen(threadId, target);
     } else if (target === "closed" && statePutHappened) {
       // The state PUT above auto-reopened the conversation in Intercom (any
@@ -754,6 +758,21 @@ export class IntercomEventExecutor {
       await this.withAuthor((a) => this.client.setConversationOpen(link.conversationId, false, a));
     } catch (e) {
       if (!isPermanent4xx(e)) throw e; // "already closed" & co — desired end state
+    }
+    await this.setTicketOpenParity(link.ticketId, false);
+  }
+
+  // Ticket open/closed parity: the ticket's open flag is SEPARATE from its
+  // state — a resolved state alone leaves the ticket listed among open
+  // tickets. Best-effort: parity must never dead-letter an event ("already
+  // closed" and other rejection shapes are the desired end state). The flip's
+  // webhook echo is bridge-authored, so the inbound attribution gate drops it.
+  private async setTicketOpenParity(ticketId: string | null, open: boolean): Promise<void> {
+    if (!ticketId) return;
+    try {
+      await this.withAuthor((a) => this.client.updateTicket(ticketId, { open, adminId: a }));
+    } catch (e) {
+      if (!isPermanent4xx(e)) throw e;
     }
   }
 

@@ -539,7 +539,15 @@ export class IntercomClient {
   // accepts an admin OR team id.
   async updateTicket(
     ticketId: string,
-    input: { stateId?: string; attributes?: Record<string, unknown>; adminId?: string; assigneeId?: string }
+    input: {
+      stateId?: string;
+      attributes?: Record<string, unknown>;
+      adminId?: string;
+      assigneeId?: string;
+      // Ticket open/closed flag — separate from the state; false fully closes
+      // the ticket (state alone leaves it listed as an open ticket).
+      open?: boolean;
+    }
   ): Promise<void> {
     const adminIdNum = input.adminId != null ? Number(input.adminId) : NaN;
     await this.json(
@@ -550,6 +558,7 @@ export class IntercomClient {
         ...(input.attributes && Object.keys(input.attributes).length > 0 ? { ticket_attributes: input.attributes } : {}),
         ...(Number.isFinite(adminIdNum) ? { admin_id: adminIdNum } : {}),
         ...(input.assigneeId ? { assignee_id: input.assigneeId } : {}),
+        ...(input.open !== undefined ? { open: input.open } : {}),
         skip_notifications: true,
       },
       "ticket update"
