@@ -1,4 +1,4 @@
-import { PrismaClient, IntercomLink } from "../generated/prisma/client";
+import { PrismaClient, IntercomLink, IntercomMessageMap } from "../generated/prisma/client";
 
 // Relay body-hash dedup rides the echo-part table under this kind (partId =
 // "<threadId>:<bodyHash>"). Fresh window: same body seen twice within it is a
@@ -310,6 +310,49 @@ export class IntercomStore {
     return result.count;
   }
 
+  // ---- Message map (Discord message ↔ Intercom part, delete/edit reflection) ----
+  // "out" rows are upserted by [direction, discordMessageId]: an edit's
+  // redact+repost replaces the partId so later deletes hit the CURRENT part.
+  // "in"/"note" rows are keyed the same way but never repost, so the upsert is
+  // effectively insert-or-refresh (idempotent under webhook redelivery).
+
+  async recordMessageMap(input: {
+    ticketThreadId: string;
+    direction: "out" | "in" | "note";
+    discordMessageId: string;
+    partId: string;
+    via?: "webhook" | "bot" | null;
+  }): Promise<void> {
+    await this.prisma.intercomMessageMap.upsert({
+      where: { direction_discordMessageId: { direction: input.direction, discordMessageId: input.discordMessageId } },
+      create: {
+        ticketThreadId: input.ticketThreadId,
+        direction: input.direction,
+        discordMessageId: input.discordMessageId,
+        partId: input.partId,
+        via: input.via ?? null,
+      },
+      update: { partId: input.partId, via: input.via ?? null, redactedAt: null },
+    });
+  }
+
+  async getMessageMapByPartId(partId: string): Promise<IntercomMessageMap | null> {
+    return this.prisma.intercomMessageMap.findUnique({ where: { partId } });
+  }
+
+  async getOutboundMessageMap(discordMessageId: string): Promise<IntercomMessageMap | null> {
+    return this.prisma.intercomMessageMap.findUnique({
+      where: { direction_discordMessageId: { direction: "out", discordMessageId } },
+    });
+  }
+
+  // Damper for the redact-webhook echo: whichever side deleted first stamps the
+  // row; the other side's handler sees the stamp and stops. null rolls back a
+  // pre-mark after a definite redact failure (same pattern as lastSynced*).
+  async setMessageMapRedactedAt(id: string, at: Date | null): Promise<void> {
+    await this.prisma.intercomMessageMap.updateMany({ where: { id }, data: { redactedAt: at } });
+  }
+
   // ---- Inbound tag-diff damper ----
 
   async setLastTags(ticketThreadId: string, tags: string[]): Promise<void> {
@@ -336,6 +379,7 @@ export class IntercomStore {
       this.prisma.intercomLink.deleteMany(),
       this.prisma.intercomEchoPart.deleteMany(),
       this.prisma.intercomPendingPost.deleteMany(),
+      this.prisma.intercomMessageMap.deleteMany(),
     ]);
     return { links: links.count, parts: parts.count };
   }

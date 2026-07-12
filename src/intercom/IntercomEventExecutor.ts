@@ -1,4 +1,4 @@
-import { IntercomLink } from "../generated/prisma/client";
+import { IntercomLink, IntercomMessageMap } from "../generated/prisma/client";
 import { TicketStore } from "../bot/TicketStore";
 import { AuditLogger } from "../bot/AuditLogger";
 import { SettingsStore } from "../config/SettingsStore";
@@ -621,17 +621,17 @@ export class IntercomEventExecutor {
     const { urls, lines } = this.splitAttachments(payload);
     const body = renderDiscordMarkdownToHtml(`${payload.content}${lines}`);
 
-    const send = async (attachmentUrls: string[], finalBody: string): Promise<void> => {
+    const send = async (attachmentUrls: string[], finalBody: string): Promise<string | null> => {
       if (payload.direction === "incoming") {
         // Contact-authored parts are never relayed back (the webhook handler
         // only processes admin/bot authors) — no echo bookkeeping needed.
-        await this.client.replyAsContact(link.conversationId, {
+        const { partId } = await this.client.replyAsContact(link.conversationId, {
           intercomUserId: link.contactId,
           body: finalBody,
           createdAtIso: payload.externalCreatedAtIso,
           attachmentUrls,
         });
-        return;
+        return partId;
       }
       // Outgoing (admin-authored): reserve → call → confirm, see postAdminNote.
       const pendingId = await this.store.reservePendingPost(threadId, "c", bodyHash(finalBody));
@@ -646,34 +646,56 @@ export class IntercomEventExecutor {
         );
         if (partId) await this.store.recordEchoPart("c", partId, threadId);
         await this.releasePendingPost(pendingId);
+        return partId;
       } catch (e) {
         await this.releasePendingPost(pendingId, e);
         throw e;
       }
     };
 
+    let partId: string | null = null;
     try {
-      await send(urls, body);
+      partId = await send(urls, body);
     } catch (e) {
       // attachment_urls rejected (non-image, dead link, …) → fold into the body.
       if (urls.length > 0 && e instanceof IntercomHttpError && (e.status === 400 || e.status === 422)) {
         const folded = `${body}<p>${urls
           .map((u) => `📎 <a href="${escapeHtmlText(u)}">${escapeHtmlText(u)}</a>`)
           .join("<br>")}</p>`;
-        await send([], folded);
+        partId = await send([], folded);
       } else {
         throw e;
       }
     }
+    // Message map (delete/edit → redact reflection). Only for real Discord
+    // message ids (snowflakes) — synthetic keys ("ai:…") aren't deletable.
+    // Best-effort: a lost map row only degrades a later delete to the
+    // appended-note fallback.
+    if (partId && payload.discordMessageId && /^\d+$/.test(payload.discordMessageId)) {
+      await this.store
+        .recordMessageMap({
+          ticketThreadId: threadId,
+          direction: "out",
+          discordMessageId: payload.discordMessageId,
+          partId,
+        })
+        .catch(() => {});
+    }
     if (deliveryKey) await this.store.recordDeliveredMessage(deliveryKey, threadId).catch(() => {});
   }
 
-  // Edits/deletes mirror as APPENDED parts (Intercom has no part-edit API).
-  // Only fires for messages the ledger confirms were mirrored; each edit stamp
+  // Edits: true reflection is redact-the-old + repost-the-new (Intercom has no
+  // part-edit API). The repost re-records the message map, so later deletes
+  // and further edits always hit the CURRENT part. Redaction failures degrade
+  // to the historical appended-only mirror (the original stays visible). Only
+  // fires for messages the ledger confirms were mirrored; each edit stamp
   // mirrors at most once.
   private async executeMessageEdit(threadId: string, payload: MessageEditPayload): Promise<void> {
     if (!(await this.store.hasDeliveredMessage(payload.discordMessageId))) return;
     const deliveryKey = `${payload.discordMessageId}:e${Date.parse(payload.editedAtIso) || payload.editedAtIso}`;
+    if (await this.store.hasDeliveredMessage(deliveryKey)) return;
+    const map = await this.store.getOutboundMessageMap(payload.discordMessageId);
+    if (map && !map.redactedAt) await this.tryRedactPart(threadId, map);
     const prefix =
       payload.direction === "incoming" ? "✏️ Edited my earlier message:" : `✏️ **${payload.authorName}** edited an earlier message:`;
     await this.deliverMessage(
@@ -681,6 +703,9 @@ export class IntercomEventExecutor {
       {
         direction: payload.direction,
         content: `${prefix}\n${payload.content}`,
+        // The repost adopts the original message id in the map (upsert), so the
+        // NEXT edit/delete redacts this new part.
+        discordMessageId: payload.discordMessageId,
         attachments: payload.attachments,
         attachmentMode: "urls",
       },
@@ -688,14 +713,53 @@ export class IntercomEventExecutor {
     );
   }
 
+  // Deletes: redact the mirrored part (native Intercom tombstone — the content
+  // actually disappears, which is the point for the leaked-secret case).
+  // Pre-feature messages have no map row and fall back to the appended note.
   private async executeMessageDelete(threadId: string, payload: MessageDeletePayload): Promise<void> {
     if (!(await this.store.hasDeliveredMessage(payload.discordMessageId))) return;
     const deliveryKey = `${payload.discordMessageId}:del`;
+    if (await this.store.hasDeliveredMessage(deliveryKey)) return;
+    const map = await this.store.getOutboundMessageMap(payload.discordMessageId);
+    if (map?.redactedAt) {
+      // Already redacted — this Discord delete IS the reflection of an
+      // Intercom-side redaction (or a retried attempt). Nothing to mirror.
+      await this.store.recordDeliveredMessage(deliveryKey, threadId).catch(() => {});
+      return;
+    }
+    if (map && (await this.tryRedactPart(threadId, map))) {
+      await this.store.recordDeliveredMessage(deliveryKey, threadId).catch(() => {});
+      return;
+    }
     const content =
       payload.direction === "incoming"
         ? "🗑️ Deleted an earlier message."
         : `🗑️ ${payload.authorName ? `**${payload.authorName}** deleted an earlier message.` : "A Discord message was deleted."}`;
     await this.deliverMessage(threadId, { direction: payload.direction, content }, deliveryKey);
+  }
+
+  // Redact one mapped part. Pre-mark → call → rollback-only-on-DEFINITE-reject:
+  // the redact triggers a conversation_part.redacted webhook, and the inbound
+  // handler must find the stamp already set — otherwise it treats the bridge's
+  // own redaction as an agent action and deletes the (edited, still existing)
+  // Discord original. Ambiguous failures (timeout/5xx) KEEP the stamp for the
+  // same reason: the redact may have landed and its webhook must still be
+  // recognized as ours (mirrors the releasePendingPost contract). false =
+  // definite rejection (no redact permission / part gone) — the caller
+  // degrades to the appended-note mirror.
+  private async tryRedactPart(threadId: string, map: IntercomMessageMap): Promise<boolean> {
+    const link = await this.requireLink(threadId);
+    await this.store.setMessageMapRedactedAt(map.id, new Date());
+    try {
+      await this.client.redactConversationPart(link.conversationId, map.partId);
+      return true;
+    } catch (e) {
+      if (isPermanent4xx(e)) {
+        await this.store.setMessageMapRedactedAt(map.id, null).catch(() => {});
+        return false;
+      }
+      throw e;
+    }
   }
 
   private async executeNote(threadId: string, payload: NotePayload): Promise<void> {

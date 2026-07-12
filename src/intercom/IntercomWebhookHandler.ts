@@ -1,4 +1,4 @@
-import { Client, EmbedBuilder, ThreadChannel, Webhook } from "discord.js";
+import { AttachmentPayload, Client, EmbedBuilder, ThreadChannel, Webhook } from "discord.js";
 import { SettingsStore } from "../config/SettingsStore";
 import { TicketStore } from "../bot/TicketStore";
 import { StatusService } from "../bot/StatusService";
@@ -55,7 +55,28 @@ export const INTERCOM_WEBHOOK_TOPICS = [
 // Shared with intercomInboxWorkflow's defer loop — see INTERCOM_MAX_ECHO_DEFERS.
 const MAX_DEFER_ATTEMPTS = INTERCOM_MAX_ECHO_DEFERS;
 
-const HANDLED_TOPICS: ReadonlySet<string> = new Set(INTERCOM_WEBHOOK_TOPICS);
+// Handled but deliberately NOT in INTERCOM_WEBHOOK_TOPICS: that const feeds the
+// operator-facing subscription instructions, which stay unchanged by operator
+// choice — the topic is accepted at the door and simply never fires until it
+// is subscribed manually in the Developer Hub.
+const EXTRA_HANDLED_TOPICS = ["conversation_part.redacted"] as const;
+
+const HANDLED_TOPICS: ReadonlySet<string> = new Set([...INTERCOM_WEBHOOK_TOPICS, ...EXTRA_HANDLED_TOPICS]);
+
+// Discord "Unknown Message" — the relayed/origin message is already gone.
+const DISCORD_UNKNOWN_MESSAGE = 10008;
+// Discord "Missing Permissions" — bot lacks Manage Messages for the origin delete.
+const DISCORD_MISSING_PERMISSIONS = 50013;
+
+// Native re-upload cap for relayed Intercom attachments: Discord's baseline
+// upload limit for bots. Bigger files keep the 📎 link fallback.
+const MAX_RELAY_UPLOAD_BYTES = 8 * 1024 * 1024;
+const MAX_RELAY_FILES = 10;
+// Per-file and TOTAL download deadlines. The total must stay well inside the
+// inbound activity's 1-minute startToCloseTimeout — a relay that dawdles past
+// it re-runs as a Temporal retry (the part-id claim drops it, losing the reply).
+const RELAY_DOWNLOAD_TIMEOUT_MS = 10_000;
+const RELAY_DOWNLOAD_BUDGET_MS = 30_000;
 
 // Discord "Unknown Channel" — the thread was deleted, not a transient failure.
 const DISCORD_UNKNOWN_CHANNEL = 10003;
@@ -189,9 +210,138 @@ export class IntercomWebhookHandler {
       case "conversation.priority.updated":
         await this.handleConversationPriorityUpdated(item as IntercomConversationItem);
         return;
+      case "conversation_part.redacted":
+        await this.handlePartRedacted(item as { type?: string; id?: string | number } | undefined);
+        return;
       default:
         return; // unknown topic — drop
     }
+  }
+
+  // Agent deleted (redacted) a message in Intercom → reflect on the Discord
+  // side. The message map tells this apart by direction:
+  //  - "in":   a relayed agent reply → delete the relayed Discord message;
+  //  - "out":  a mirrored Discord message (customer/staff) → delete the ORIGIN
+  //            Discord message (leaked-secret parity; Manage Messages needed);
+  //  - "note": a mirrored internal note → remove the staff note again.
+  // The bridge's own redactions (Discord delete/edit → redact) pre-stamp
+  // redactedAt on the map row, so their webhook echo drops here.
+  private async handlePartRedacted(item: { type?: string; id?: string | number } | undefined): Promise<void> {
+    if (this.settingsStore.intercomMode() === "none") return;
+    // Shape guard: only act when the item is (or is untyped but plausibly) a
+    // conversation part — treating a conversation-shaped item's id as a part id
+    // would poison the part ledger (id spaces can collide).
+    if (item?.type && item.type !== "conversation_part") return;
+    const partId = item?.id != null ? String(item.id) : null;
+    if (!partId) return;
+
+    const map = await this.store.getMessageMapByPartId(partId);
+    if (!map) {
+      // Unknown part: never relayed/mirrored, or pre-feature. Claim the id so
+      // an in-flight relay racing this redaction can't post deleted content
+      // (the reply relay claims the same key first in the normal order). The
+      // thread id is unknown here — the claim row is purely a tombstone.
+      if (item?.type === "conversation_part") {
+        await this.store.claimPart("c", partId, "").catch(() => {});
+      }
+      return;
+    }
+    if (map.redactedAt) return; // the bridge's own redact echoing back, or a duplicate delivery
+
+    // Stamp first (damps the origin delete's messageDelete → message_delete
+    // round trip), roll back on transient failure so the retry can run again.
+    await this.store.setMessageMapRedactedAt(map.id, new Date());
+    try {
+      if (map.direction === "note") {
+        const removed = await this.ticketStore.deleteNoteById(map.discordMessageId);
+        if (removed) {
+          void this.audit.log({
+            title: "🗑️ Intercom note redacted",
+            severity: "info",
+            actor: "Intercom agent",
+            threadId: map.ticketThreadId,
+            fields: [{ name: "Effect", value: "Mirrored staff note removed", inline: false }],
+          });
+        }
+        return;
+      }
+      await this.deleteDiscordMessageForRedaction(map);
+    } catch (e) {
+      await this.store.setMessageMapRedactedAt(map.id, null).catch(() => {});
+      throw e;
+    }
+  }
+
+  // Delete the Discord half of a redacted part. Relayed replies ("in") go
+  // through the relay webhook when possible; origin messages ("out") need
+  // Manage Messages — a permission rejection degrades to an audit warning
+  // instead of retrying forever.
+  private async deleteDiscordMessageForRedaction(map: {
+    ticketThreadId: string;
+    direction: string;
+    discordMessageId: string;
+    via: string | null;
+  }): Promise<void> {
+    const thread = await this.requireThread(map.ticketThreadId);
+    if (!thread) return; // thread permanently gone — nothing left to delete
+
+    if (map.direction === "in" && map.via === "webhook") {
+      const webhook = await this.getRelayWebhook(thread);
+      if (webhook) {
+        try {
+          await webhook.deleteMessage(map.discordMessageId, thread.id);
+          this.auditRedactionDelete(map, "Relayed agent reply removed");
+          return;
+        } catch (e) {
+          if ((e as { code?: number }).code === DISCORD_UNKNOWN_MESSAGE) return; // already gone
+          // Webhook rotated/deleted — fall through to the bot-side delete.
+        }
+      }
+    }
+
+    let message;
+    try {
+      message = await thread.messages.fetch(map.discordMessageId);
+    } catch (e) {
+      if ((e as { code?: number }).code === DISCORD_UNKNOWN_MESSAGE) return; // already gone
+      throw e; // transient — retried by the inbox workflow
+    }
+    try {
+      await message.delete();
+    } catch (e) {
+      if ((e as { code?: number }).code === DISCORD_UNKNOWN_MESSAGE) return;
+      if ((e as { code?: number }).code === DISCORD_MISSING_PERMISSIONS) {
+        void this.audit.log({
+          title: "⚠️ Intercom redaction not reflected",
+          severity: "warn",
+          actor: "Intercom bridge",
+          threadId: map.ticketThreadId,
+          fields: [
+            { name: "Message", value: map.discordMessageId, inline: true },
+            { name: "Reason", value: "Bot lacks Manage Messages — delete the Discord message manually.", inline: false },
+          ],
+        });
+        return;
+      }
+      throw e;
+    }
+    this.auditRedactionDelete(
+      map,
+      map.direction === "in" ? "Relayed agent reply removed" : "Origin Discord message removed"
+    );
+  }
+
+  private auditRedactionDelete(map: { ticketThreadId: string; discordMessageId: string }, effect: string): void {
+    void this.audit.log({
+      title: "🗑️ Intercom message redacted",
+      severity: "info",
+      actor: "Intercom agent",
+      threadId: map.ticketThreadId,
+      fields: [
+        { name: "Effect", value: effect, inline: false },
+        { name: "Message", value: map.discordMessageId, inline: true },
+      ],
+    });
   }
 
   private async handleConversationReply(item: IntercomConversationItem | undefined, attempt: number): Promise<void> {
@@ -345,17 +495,20 @@ export class IntercomWebhookHandler {
         return;
       }
 
-      const body = htmlToDiscordText(part.body ?? "");
-      const attachmentRefs = (part.attachments ?? []).filter((a) => a.url);
-      const attachmentLinks = attachmentRefs.map((a) => `📎 [${a.name ?? "attachment"}](${a.url})`).join("\n");
-      const description = truncateEmbedText([body, attachmentLinks].filter(Boolean).join("\n\n"), 4096);
-      if (!description) return; // genuinely empty part — nothing to relay, keep the claim
+      const { text: bodyText, images: inlineImages } = extractAgentBody(part.body ?? "");
+      const attachmentRefs = dedupeByUrl([
+        ...(part.attachments ?? [])
+          .filter((a): a is { url: string; name?: string | null } => Boolean(a.url))
+          .map((a) => ({ url: a.url, name: a.name ?? null })),
+        ...inlineImages,
+      ]);
+      if (!bodyText && attachmentRefs.length === 0) return; // genuinely empty part — nothing to relay, keep the claim
 
       // Layer 4 — cross-topic duplicate guard (same reply arriving on another
       // topic with a different part id). DB-backed: survives restarts. Keyed on
       // content kind + body + attachments so a repeated short reply ("done"),
       // image-only replies and note-vs-reply text can never collide.
-      relayKey = `reply:${bodyHash([part.body ?? "", ...attachmentRefs.map((a) => a.url ?? "")].join("\n"))}`;
+      relayKey = `reply:${bodyHash([part.body ?? "", ...attachmentRefs.map((a) => a.url)].join("\n"))}`;
       if (!(await this.store.claimRelay(threadId, relayKey))) return;
 
       const thread = await this.requireThread(threadId);
@@ -376,6 +529,12 @@ export class IntercomWebhookHandler {
       }
       const authorName = part.author?.name || "Intercom agent";
 
+      // Native attachment rendering: download and re-upload as real Discord
+      // files (images render inline, no 📎 link line); download failures and
+      // oversized files keep the 📎 masked-link fallback.
+      const { files, linkLines } = await this.downloadRelayAttachments(attachmentRefs);
+      const description = truncateEmbedText([bodyText, linkLines.join("\n")].filter(Boolean).join("\n\n"), 4096);
+
       // Posting into an archived thread: un-archive, send, re-archive. The lock
       // state stays untouched, and the message is bot/webhook-authored, so
       // handleMessage ignores it (no reclose interference, no re-mirror).
@@ -387,22 +546,40 @@ export class IntercomWebhookHandler {
         // wrote natively in Discord (their name + Intercom avatar as the
         // message author). Falls back to the neutral embed when the bot lacks
         // Manage Webhooks or the webhook send fails.
-        const mention = ticket?.customerId ? `<@${ticket.customerId}> ` : "";
-        const sent = await this.relayViaWebhook(thread, ticket?.customerId ?? null, authorName, avatarUrl, {
-          content: truncateEmbedText(`${mention}${description}`, 2000),
+        const mention = ticket?.customerId ? `<@${ticket.customerId}>` : "";
+        const content = truncateEmbedText([mention, description].filter(Boolean).join("\n"), 2000);
+        let via: "webhook" | "bot" = "webhook";
+        let messageId = await this.relayViaWebhook(thread, ticket?.customerId ?? null, authorName, avatarUrl, {
+          content,
+          files,
         });
-        if (!sent) {
+        if (!messageId) {
+          via = "bot";
           const embed = new EmbedBuilder()
             .setColor(COLORS.brand)
             .setAuthor({ name: authorName, ...(avatarUrl ? { iconURL: avatarUrl } : {}) })
-            .setDescription(description)
             .setTimestamp();
-          await thread.send({
+          if (description) embed.setDescription(description);
+          const sent = await thread.send({
             content: ticket?.customerId ? `<@${ticket.customerId}>` : undefined,
             embeds: [embed],
+            files,
             allowedMentions: { users: ticket?.customerId ? [ticket.customerId] : [] },
           });
+          messageId = sent.id;
         }
+        // Message map: lets an Intercom-side redaction of this part delete the
+        // relayed Discord message again. Best-effort — a lost row only means
+        // that one reply can't be auto-removed later.
+        await this.store
+          .recordMessageMap({
+            ticketThreadId: threadId,
+            direction: "in",
+            discordMessageId: messageId,
+            partId: String(part.id),
+            via,
+          })
+          .catch(() => {});
       } finally {
         if (wasArchived) await thread.setArchived(true).catch(() => {});
       }
@@ -515,7 +692,12 @@ export class IntercomWebhookHandler {
 
       const authorName = part.author?.name || "Intercom agent";
       const authorId = part.author?.id != null ? `intercom:${part.author.id}` : "intercom";
-      await this.ticketStore.addNote(threadId, authorId, `${authorName} (Intercom)`, text);
+      const noteId = await this.ticketStore.addNote(threadId, authorId, `${authorName} (Intercom)`, text);
+      // Map note ↔ part so an Intercom-side redaction removes the staff note
+      // again (best-effort, same contract as the reply map).
+      await this.store
+        .recordMessageMap({ ticketThreadId: threadId, direction: "note", discordMessageId: noteId, partId: String(part.id) })
+        .catch(() => {});
       void this.audit.log({
         title: "📝 Staff note (from Intercom)",
         severity: "info",
@@ -853,40 +1035,78 @@ export class IntercomWebhookHandler {
   private static readonly RELAY_WEBHOOK_NAME = "Intercom Agent Relay";
   private relayWebhooks = new Map<string, Webhook>();
 
+  // Returns the sent message's id (recorded in the message map for redaction
+  // reflection), or null when the webhook path is unavailable — the caller's
+  // embed fallback owns failure.
   private async relayViaWebhook(
     thread: ThreadChannel,
     customerId: string | null,
     authorName: string,
     avatarUrl: string | null,
-    message: { content: string }
-  ): Promise<boolean> {
-    const send = async (webhook: Webhook): Promise<void> => {
-      await webhook.send({
-        content: message.content,
+    message: { content: string; files?: AttachmentPayload[] }
+  ): Promise<string | null> {
+    const send = async (webhook: Webhook): Promise<string> => {
+      const sent = await webhook.send({
+        ...(message.content ? { content: message.content } : {}),
+        ...(message.files?.length ? { files: message.files } : {}),
         username: sanitizeWebhookUsername(authorName),
         ...(avatarUrl ? { avatarURL: avatarUrl } : {}),
         threadId: thread.id,
         allowedMentions: { users: customerId ? [customerId] : [] },
       });
+      return sent.id;
     };
     try {
       const webhook = await this.getRelayWebhook(thread);
-      if (!webhook) return false;
-      await send(webhook);
-      return true;
+      if (!webhook) return null;
+      return await send(webhook);
     } catch {
       // Stale cache (webhook deleted by a mod) — refetch once, then give up to
       // the embed fallback. Never throw: the caller's fallback owns failure.
       this.relayWebhooks.delete(thread.parentId ?? "");
       try {
         const webhook = await this.getRelayWebhook(thread);
-        if (!webhook) return false;
-        await send(webhook);
-        return true;
+        if (!webhook) return null;
+        return await send(webhook);
       } catch {
-        return false;
+        return null;
       }
     }
+  }
+
+  // Download Intercom attachments (signed CDN URLs — fetch them NOW, they
+  // expire) for native re-upload. Failures and files past the upload cap fall
+  // back to 📎 masked links; never throws.
+  private async downloadRelayAttachments(
+    refs: Array<{ url: string; name: string | null }>
+  ): Promise<{ files: AttachmentPayload[]; linkLines: string[] }> {
+    const files: AttachmentPayload[] = [];
+    const linkLines: string[] = [];
+    const deadline = Date.now() + RELAY_DOWNLOAD_BUDGET_MS;
+    for (const ref of refs) {
+      const name = ref.name || filenameFromUrl(ref.url);
+      const budgetLeft = deadline - Date.now();
+      if (files.length >= MAX_RELAY_FILES || budgetLeft <= 0) {
+        linkLines.push(`📎 [${name}](${ref.url})`);
+        continue;
+      }
+      try {
+        const res = await fetch(ref.url, {
+          signal: AbortSignal.timeout(Math.min(RELAY_DOWNLOAD_TIMEOUT_MS, budgetLeft)),
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const declared = Number(res.headers.get("content-length") ?? 0);
+        if (declared > MAX_RELAY_UPLOAD_BYTES) throw new Error("attachment exceeds upload cap");
+        const buffer = Buffer.from(await res.arrayBuffer());
+        if (buffer.byteLength === 0 || buffer.byteLength > MAX_RELAY_UPLOAD_BYTES) {
+          throw new Error("attachment empty or exceeds upload cap");
+        }
+        files.push({ attachment: buffer, name });
+      } catch {
+        linkLines.push(`📎 [${name}](${ref.url})`);
+      }
+    }
+    return { files, linkLines };
   }
 
   private async getRelayWebhook(thread: ThreadChannel): Promise<Webhook | null> {
@@ -1034,6 +1254,43 @@ function htmlToDiscordText(html: string): string {
       .replace(/&amp;/g, "&")
       .trim()
   );
+}
+
+// Agent reply body → Discord text + the inline images it embeds. Inline <img>
+// tags are pulled OUT of the text (they re-upload natively alongside
+// `attachments`); Intercom's literal "[Image]" / '[Image "name.png"]' body
+// placeholders (attachment-only replies) are stripped — the file itself
+// arrives separately, so the placeholder is pure noise in Discord.
+function extractAgentBody(html: string): { text: string; images: Array<{ url: string; name: string | null }> } {
+  const images: Array<{ url: string; name: string | null }> = [];
+  const withoutImages = html.replace(/<img[^>]*src="([^"]+)"[^>]*\/?>/gi, (_m, src: string) => {
+    images.push({ url: src, name: null });
+    return "";
+  });
+  const text = htmlToDiscordText(withoutImages)
+    .replace(/\[Image(?:\s+"[^"]*")?\]/gi, "")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  return { text, images };
+}
+
+function dedupeByUrl<T extends { url: string }>(refs: T[]): T[] {
+  const seen = new Set<string>();
+  return refs.filter((ref) => {
+    if (seen.has(ref.url)) return false;
+    seen.add(ref.url);
+    return true;
+  });
+}
+
+function filenameFromUrl(url: string): string {
+  try {
+    const base = decodeURIComponent(new URL(url).pathname.split("/").pop() ?? "");
+    return base || "attachment";
+  } catch {
+    return "attachment";
+  }
 }
 
 // Discord rejects webhook usernames containing "discord"/"clyde" (any case)

@@ -603,6 +603,22 @@ const STATEMENTS: string[] = [
   `ALTER TABLE "intercom_links" ADD COLUMN IF NOT EXISTS "lastAssigneeId" TEXT`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "intercomLastInboundAt" TIMESTAMP(3)`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "intercomModeChangedAt" TIMESTAMP(3)`,
+  // Intercom edit/delete reflection: Discord message ↔ Intercom part map
+  // (redact outbound, conversation_part.redacted inbound).
+  `CREATE TABLE IF NOT EXISTS "intercom_message_maps" (
+    "id" TEXT NOT NULL,
+    "ticketThreadId" TEXT NOT NULL,
+    "direction" TEXT NOT NULL,
+    "discordMessageId" TEXT NOT NULL,
+    "partId" TEXT NOT NULL,
+    "via" TEXT,
+    "redactedAt" TIMESTAMP(3),
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT "intercom_message_maps_pkey" PRIMARY KEY ("id")
+  )`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS "intercom_message_maps_partId_key" ON "intercom_message_maps"("partId")`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS "intercom_message_maps_direction_discordMessageId_key" ON "intercom_message_maps"("direction", "discordMessageId")`,
+  `CREATE INDEX IF NOT EXISTS "intercom_message_maps_ticketThreadId_idx" ON "intercom_message_maps"("ticketThreadId")`,
 ];
 
 export async function ensureSchema(prisma: PrismaClient): Promise<void> {

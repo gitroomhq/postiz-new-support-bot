@@ -433,8 +433,18 @@ export class TicketStore {
 
   // ---- Staff notes ----
 
-  async addNote(ticketThreadId: string, authorId: string, authorName: string, text: string): Promise<void> {
-    await this.prisma.ticketNote.create({ data: { ticketThreadId, authorId, authorName, text } });
+  // Returns the created note id (the Intercom bridge maps it to the source
+  // conversation part so an Intercom-side redaction can remove the note again).
+  async addNote(ticketThreadId: string, authorId: string, authorName: string, text: string): Promise<string> {
+    const row = await this.prisma.ticketNote.create({ data: { ticketThreadId, authorId, authorName, text } });
+    return row.id;
+  }
+
+  // Redaction reflection: remove a mirrored staff note. Returns false when the
+  // note is already gone (idempotent under webhook redelivery).
+  async deleteNoteById(id: string): Promise<boolean> {
+    const result = await this.prisma.ticketNote.deleteMany({ where: { id } });
+    return result.count > 0;
   }
 
   async listNotes(ticketThreadId: string, limit = 15): Promise<TicketNote[]> {

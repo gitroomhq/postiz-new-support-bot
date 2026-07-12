@@ -517,6 +517,28 @@ model IntercomEchoPart {
   @@map("intercom_echo_parts")
 }
 
+// Discord message ↔ Intercom conversation part mapping, both directions —
+// powers true delete/edit reflection (redact API outbound, the
+// conversation_part.redacted webhook inbound). Rows carry indefinite-lifetime
+// semantics like the "m" delivery ledger: a message can be deleted years later.
+model IntercomMessageMap {
+  id               String    @id @default(cuid())
+  ticketThreadId   String
+  // "out"  = Discord message mirrored into Intercom (partId = the created part)
+  // "in"   = Intercom agent reply relayed into Discord (discordMessageId = relayed message)
+  // "note" = Intercom internal note mirrored to a staff note (discordMessageId = TicketNote id)
+  direction        String
+  discordMessageId String
+  partId           String    @unique
+  via              String? // "in" rows: how the relay was sent — "webhook" | "bot"
+  redactedAt       DateTime? // either side already deleted — echo damper for the redact webhook
+  createdAt        DateTime  @default(now())
+
+  @@unique([direction, discordMessageId])
+  @@index([ticketThreadId])
+  @@map("intercom_message_maps")
+}
+
 // Dedup ledger for incoming Stripe webhook events (Stripe redelivers on non-2xx
 // and occasionally at-least-once). The event id is globally unique, so it is the
 // primary key — an insert conflict means "already handled → drop".

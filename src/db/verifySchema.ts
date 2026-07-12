@@ -70,6 +70,9 @@ const EXPECTED_COLUMNS: Record<string, string[]> = {
   ],
   intercom_echo_parts: ["id", "kind", "partId", "ticketThreadId", "confirmed", "createdAt"],
   intercom_pending_posts: ["id", "ticketThreadId", "kind", "bodyHash", "createdAt"],
+  intercom_message_maps: [
+    "id", "ticketThreadId", "direction", "discordMessageId", "partId", "via", "redactedAt", "createdAt",
+  ],
   stripe_webhook_events: ["id", "type", "createdAt"],
   stripe_disputes: [
     "id", "chargeId", "paymentIntentId", "customerId", "amount", "currency", "reason", "status",

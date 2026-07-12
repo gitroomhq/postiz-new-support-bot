@@ -365,11 +365,17 @@ export class IntercomClient {
 
   // Posts as the contact (true attribution, no name prefix). Loop safety for
   // these rests on the webhook handler only relaying admin/bot-authored parts.
+  // Returns the created part id (same body-hash resolution as replyAsAdmin) so
+  // the message map can power later redaction; null when unresolvable.
   async replyAsContact(
     conversationId: string,
     input: { intercomUserId: string; body: string; createdAtIso?: string; attachmentUrls?: string[] }
-  ): Promise<void> {
-    await this.json(
+  ): Promise<{ partId: string | null }> {
+    const data = await this.json<{
+      conversation_parts?: {
+        conversation_parts?: Array<{ id?: string | number; body?: string | null; author?: { type?: string } }>;
+      };
+    }>(
       `/conversations/${encodeURIComponent(conversationId)}/reply`,
       "POST",
       {
@@ -381,6 +387,33 @@ export class IntercomClient {
         ...(input.attachmentUrls?.length ? { attachment_urls: input.attachmentUrls } : {}),
       },
       "contact reply"
+    );
+    const parts = data.conversation_parts?.conversation_parts ?? [];
+    const sentHash = bodyHash(input.body);
+    for (let i = parts.length - 1; i >= 0; i--) {
+      const part = parts[i];
+      const authorType = part.author?.type;
+      if (part.id != null && (authorType === "user" || authorType === "lead") && bodyHash(part.body ?? "") === sentHash) {
+        return { partId: String(part.id) };
+      }
+    }
+    return { partId: null };
+  }
+
+  // Redacts (deletes) a conversation part — Intercom replaces the content with
+  // a native "This message was deleted" tombstone. 404 = part/conversation
+  // gone, 403 = token lacks the redact permission; both are the caller's cue
+  // to fall back to the appended-note mirror.
+  async redactConversationPart(conversationId: string, conversationPartId: string): Promise<void> {
+    await this.json(
+      "/conversations/redact",
+      "POST",
+      {
+        type: "conversation_part",
+        conversation_id: conversationId,
+        conversation_part_id: conversationPartId,
+      },
+      "conversation part redact"
     );
   }
 
