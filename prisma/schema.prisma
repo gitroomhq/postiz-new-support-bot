@@ -152,6 +152,9 @@ model BotSettings {
   // act when a Dashboard rule references them (Radar for Fraud Teams).
   disputeAutoCancelSub    Boolean @default(false)
   disputeAutoBlock        Boolean @default(false)
+  // Exception to ships-OFF: staging a receipt file (submit:false) moves no
+  // money and sends nothing to the bank, so this one defaults ON.
+  disputeAutoAttachReceipt Boolean @default(true)
   disputeReminderDays     Int     @default(3)
   disputeRatioWarnPct     Float   @default(0.5)
   disputeRatioCriticalPct Float   @default(0.9)

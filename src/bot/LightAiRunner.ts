@@ -41,11 +41,21 @@ const PRICES: Array<{ match: string; inPerMTok: number; outPerMTok: number; cach
   { match: "opus", inPerMTok: 5, outPerMTok: 25, cacheReadPerMTok: 0.5, cacheWritePerMTok: 6.25 },
 ];
 
+// Binary inputs (dispute evidence screenshots/PDFs) sent alongside the prompt
+// as vision/document blocks. Callers validate type and size before handing
+// them over; PNG/JPEG go as image blocks, PDF as a document block.
+export interface LightAiAttachment {
+  name: string;
+  mediaType: "image/png" | "image/jpeg" | "application/pdf";
+  data: Buffer;
+}
+
 export interface LightAiRunOptions {
   model: string;
   telemetry: ClaudeRunTelemetry;
   maxTokens?: number;
   timeoutMs?: number;
+  attachments?: LightAiAttachment[];
 }
 
 // Direct Messages API runner for the tool-less staff subcommands (/ai draft,
@@ -113,12 +123,33 @@ export class LightAiRunner {
         let text = "";
         let usage = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 };
 
+        // Attachments precede the prompt text so the instructions can refer to
+        // "the files above" by their listed order. No attachments → plain
+        // string content, byte-identical to the pre-attachment behavior.
+        const content: string | Anthropic.Messages.ContentBlockParam[] = options.attachments?.length
+          ? [
+              ...options.attachments.map((a): Anthropic.Messages.ContentBlockParam =>
+                a.mediaType === "application/pdf"
+                  ? {
+                      type: "document",
+                      source: { type: "base64", media_type: "application/pdf", data: a.data.toString("base64") },
+                      title: a.name.slice(0, 255),
+                    }
+                  : {
+                      type: "image",
+                      source: { type: "base64", media_type: a.mediaType, data: a.data.toString("base64") },
+                    }
+              ),
+              { type: "text", text: prompt },
+            ]
+          : prompt;
+
         try {
           const stream = this.anthropic.messages.stream(
             {
               model,
               max_tokens: options.maxTokens ?? 4_000,
-              messages: [{ role: "user", content: prompt }],
+              messages: [{ role: "user", content }],
             },
             { timeout: options.timeoutMs ?? 120_000 }
           );

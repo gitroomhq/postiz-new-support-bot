@@ -11,6 +11,7 @@ import type { BlockService } from "../BlockService";
 import type { BillingQolStore } from "../BillingQolStore";
 import type { CachedRatioEngine } from "../disputeRatio";
 import type { ClaudeCodeRunner } from "../../ClaudeCodeRunner";
+import type { LightAiRunner } from "../../LightAiRunner";
 import type { IntercomClient } from "../../../intercom/IntercomClient";
 
 // Shared dependency bundle handed to every hub (and the target resolver).
@@ -31,6 +32,9 @@ export interface HubContext {
   // Evidence drafting runs on the Claude Code CLI (Read/Glob/Grep over the
   // cloned Postiz source + docs) so policy fields can cite real terms.
   claudeRunner: ClaudeCodeRunner;
+  // Evidence REVIEW runs tool-less on the cheap model (aiModelLight) — the
+  // staged text plus the evidence files as vision/document blocks.
+  lightAi: LightAiRunner;
   // Customer support history for the evidence draft (customer_communication
   // material). Reads no-op gracefully when the bridge is off.
   intercom: IntercomClient;

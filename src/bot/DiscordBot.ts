@@ -3740,6 +3740,7 @@ export class DiscordBot {
         [
           `**Auto-cancel subscriptions on dispute:** ${s.disputeAutoCancelSub() ? "on" : "off"}`,
           `**Auto-block card+email+customer on dispute:** ${s.disputeAutoBlock() ? "on" : "off"}`,
+          `**Auto-attach receipt as evidence on dispute:** ${s.disputeAutoAttachReceipt() ? "on" : "off"} — stages the charge's receipt/invoice PDF in the \`receipt\` slot (submit stays manual)`,
           `**Evidence-due reminder lead:** ${s.disputeReminderDays()} day(s) before the deadline (≤1 ping / 24h / dispute)`,
           `**Urgent tier:** < ${s.disputeUrgentHours()}h to deadline with nothing submitted → red alert${
             s.disputeUrgentRoleId() ? ` + <@&${s.disputeUrgentRoleId()}> mention` : " (no role set — select one below to get pinged)"
@@ -3778,6 +3779,10 @@ export class DiscordBot {
         .setCustomId("config_disputes_toggle_block")
         .setLabel(`Auto-block: ${s.disputeAutoBlock() ? "on" : "off"}`)
         .setStyle(s.disputeAutoBlock() ? ButtonStyle.Success : ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId("config_disputes_toggle_receipt")
+        .setLabel(`Auto-receipt: ${s.disputeAutoAttachReceipt() ? "on" : "off"}`)
+        .setStyle(s.disputeAutoAttachReceipt() ? ButtonStyle.Success : ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId("config_disputes_limits").setLabel("Set Thresholds").setStyle(ButtonStyle.Primary)
     );
     const row2 = new ActionRowBuilder<ButtonBuilder>().addComponents(
@@ -5802,6 +5807,14 @@ export class DiscordBot {
       const next = !this.settingsStore.disputeAutoBlock();
       await this.settingsStore.updateDisputes({ disputeAutoBlock: next });
       this.auditConfig(interaction, `Dispute auto-block → ${next ? "on" : "off"}`);
+      await interaction.update(this.buildDisputesConfigPanel());
+      return;
+    }
+
+    if (id === "config_disputes_toggle_receipt") {
+      const next = !this.settingsStore.disputeAutoAttachReceipt();
+      await this.settingsStore.updateDisputes({ disputeAutoAttachReceipt: next });
+      this.auditConfig(interaction, `Dispute auto-attach receipt → ${next ? "on" : "off"}`);
       await interaction.update(this.buildDisputesConfigPanel());
       return;
     }

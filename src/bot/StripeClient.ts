@@ -530,6 +530,72 @@ export class StripeClient {
     });
   }
 
+  // Read a staged evidence file back for the AI review: the file object's
+  // `url` points at files.stripe.com/…/contents, which serves the bytes to the
+  // owning account's secret key. Files that can't go to the model (unsupported
+  // type, oversized, Dashboard-uploaded formats) come back with data:null and
+  // a skipped reason instead of throwing, so one bad file never sinks the
+  // whole review.
+  async getEvidenceFileWithContents(
+    fileId: string,
+    maxBytes: number
+  ): Promise<{
+    filename: string;
+    sizeBytes: number;
+    mimeType: "image/png" | "image/jpeg" | "application/pdf" | null;
+    data: Buffer | null;
+    skipped: "unsupported_type" | "too_large" | "no_url" | null;
+  }> {
+    const file = await this.stripe.files.retrieve(fileId);
+    const filename = file.filename ?? fileId;
+    const mimeType =
+      file.type === "pdf"
+        ? ("application/pdf" as const)
+        : file.type === "png"
+          ? ("image/png" as const)
+          : file.type === "jpg" || file.type === "jpeg"
+            ? ("image/jpeg" as const)
+            : null;
+    if (!mimeType) return { filename, sizeBytes: file.size, mimeType, data: null, skipped: "unsupported_type" };
+    if (file.size > maxBytes) return { filename, sizeBytes: file.size, mimeType, data: null, skipped: "too_large" };
+    if (!file.url) return { filename, sizeBytes: file.size, mimeType, data: null, skipped: "no_url" };
+    const res = await fetch(file.url, {
+      headers: { Authorization: `Bearer ${this.config.stripe.secretKey}` },
+    });
+    if (!res.ok) throw new Error(`Stripe file contents download failed (${res.status}) for ${fileId}`);
+    return { filename, sizeBytes: file.size, mimeType, data: Buffer.from(await res.arrayBuffer()), skipped: null };
+  }
+
+  // Receipt PDF for a charge (auto-attached as dispute evidence). Subscription
+  // charges carry an invoice whose `invoice_pdf` URL is documented and public
+  // (tokenized); one-off charges only have the hosted receipt page, whose
+  // "/pdf" variant is undocumented-but-longstanding — hence the %PDF magic-byte
+  // check, so an HTML page never gets uploaded as evidence. Null = no receipt
+  // obtainable; callers treat that as "skip", not an error.
+  async downloadChargeReceiptPdf(chargeId: string, maxBytes: number): Promise<Buffer | null> {
+    const charge = (await this.stripe.charges.retrieve(chargeId)) as ChargeWithInvoice;
+    const urls: string[] = [];
+    const invoiceId = typeof charge.invoice === "string" ? charge.invoice : (charge.invoice?.id ?? null);
+    if (invoiceId) {
+      const invoice = await this.stripe.invoices.retrieve(invoiceId).catch(() => null);
+      if (invoice?.invoice_pdf) urls.push(invoice.invoice_pdf);
+    }
+    if (charge.receipt_url) urls.push(`${charge.receipt_url.split("?")[0].replace(/\/+$/, "")}/pdf`);
+    for (const url of urls) {
+      try {
+        const res = await fetch(url);
+        if (!res.ok) continue;
+        const data = Buffer.from(await res.arrayBuffer());
+        if (data.length === 0 || data.length > maxBytes) continue;
+        if (!data.subarray(0, 5).toString("latin1").startsWith("%PDF")) continue;
+        return data;
+      } catch {
+        // try the next source
+      }
+    }
+    return null;
+  }
+
   // Stripe's `submit` param defaults to TRUE — this wrapper makes it mandatory
   // so a draft save can never accidentally submit to the bank. submit:false
   // stages evidence server-side; submit:true sends it (usually once, ever).

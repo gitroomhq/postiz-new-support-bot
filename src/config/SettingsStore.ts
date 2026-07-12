@@ -594,6 +594,13 @@ export class SettingsStore {
     return this.settings.disputeAutoBlock;
   }
 
+  // Stage the disputed charge's receipt PDF into the `receipt` evidence slot
+  // when a new respondable dispute arrives. Defaults ON (unlike the other
+  // auto-actions): it stages with submit:false, so nothing reaches the bank.
+  disputeAutoAttachReceipt(): boolean {
+    return this.settings.disputeAutoAttachReceipt;
+  }
+
   disputeReminderDays(): number {
     return this.settings.disputeReminderDays;
   }
@@ -1152,6 +1159,7 @@ export class SettingsStore {
   async updateDisputes(data: {
     disputeAutoCancelSub?: boolean;
     disputeAutoBlock?: boolean;
+    disputeAutoAttachReceipt?: boolean;
     disputeReminderDays?: number;
     disputeRatioWarnPct?: number;
     disputeRatioCriticalPct?: number;

@@ -5,6 +5,7 @@ import { SessionStore } from "../auth/SessionStore";
 import { StripeClient } from "./StripeClient";
 import { DisputeStore } from "./billing/DisputeStore";
 import { BlockService } from "./billing/BlockService";
+import { attachReceiptEvidence } from "./billing/receiptEvidence";
 import { COLORS } from "../util/embeds";
 import { log } from "../util/logger";
 import { metricCount } from "../util/instrument";
@@ -243,6 +244,29 @@ export class StripeWebhookHandler {
         } catch (e) {
           await this.sessionStore.releaseBillingAction(`dispute-autoblock-${dispute.id}`).catch(() => {});
           notes.push("⚠️ Auto-block FAILED — will retry");
+          autoActionError = autoActionError ?? e;
+        }
+      }
+    }
+
+    // Receipt auto-attach (defaults ON — stages with submit:false, nothing
+    // reaches the bank). "No receipt available" keeps the claim: retrying
+    // won't conjure one; genuine failures release + rethrow like the others.
+    if (this.settings.disputeAutoAttachReceipt() && chargeId) {
+      const claimed = await this.sessionStore
+        .claimBillingAction("system", `dispute-receipt-${dispute.id}`, "dispute_receipt")
+        .catch(() => false);
+      if (claimed) {
+        try {
+          const result = await attachReceiptEvidence(this.stripe, dispute);
+          if (result.attached) {
+            notes.push("🧾 Receipt auto-staged in the `receipt` evidence slot (submit still manual)");
+          } else if (result.reason === "no_receipt") {
+            notes.push("🧾 Receipt auto-attach: no receipt PDF available for this charge");
+          }
+        } catch (e) {
+          await this.sessionStore.releaseBillingAction(`dispute-receipt-${dispute.id}`).catch(() => {});
+          notes.push("⚠️ Receipt auto-attach FAILED — will retry");
           autoActionError = autoActionError ?? e;
         }
       }

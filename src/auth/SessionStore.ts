@@ -202,7 +202,7 @@ export class SessionStore {
   async claimBillingAction(
     discordUserId: string,
     chargeId: string,
-    action: "refund" | "discount" | "admin_refund" | "dispute_submit" | "dispute_accept" | "dispute_autocancel" | "dispute_autoblock"
+    action: "refund" | "discount" | "admin_refund" | "dispute_submit" | "dispute_accept" | "dispute_autocancel" | "dispute_autoblock" | "dispute_receipt"
   ): Promise<boolean> {
     try {
       await this.prisma.billingAction.create({

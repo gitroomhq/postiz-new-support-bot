@@ -193,6 +193,7 @@ async function main() {
     qolStore,
     ratio: ratioEngine,
     claudeRunner,
+    lightAiRunner,
     intercom: intercomClient,
   });
 

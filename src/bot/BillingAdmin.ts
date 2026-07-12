@@ -41,6 +41,7 @@ import type { BlockService } from "./billing/BlockService";
 import type { BillingQolStore } from "./billing/BillingQolStore";
 import type { CachedRatioEngine } from "./billing/disputeRatio";
 import type { ClaudeCodeRunner } from "./ClaudeCodeRunner";
+import type { LightAiRunner } from "./LightAiRunner";
 import type { IntercomClient } from "../intercom/IntercomClient";
 
 // Dispute-console + QoL dependencies handed through to the hubs.
@@ -51,6 +52,7 @@ export interface BillingAdminExtras {
   qolStore: BillingQolStore;
   ratio: CachedRatioEngine;
   claudeRunner: ClaudeCodeRunner;
+  lightAiRunner: LightAiRunner;
   intercom: IntercomClient;
 }
 
@@ -128,6 +130,7 @@ export class BillingAdmin {
       qolStore: extras.qolStore,
       ratio: extras.ratio,
       claudeRunner: extras.claudeRunner,
+      lightAi: extras.lightAiRunner,
       intercom: extras.intercom,
     };
 

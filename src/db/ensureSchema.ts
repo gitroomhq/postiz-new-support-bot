@@ -589,6 +589,7 @@ const STATEMENTS: string[] = [
   `CREATE UNIQUE INDEX IF NOT EXISTS "dispute_watches_disputeId_userId_key" ON "dispute_watches"("disputeId", "userId")`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "disputeAutoCancelSub" BOOLEAN NOT NULL DEFAULT false`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "disputeAutoBlock" BOOLEAN NOT NULL DEFAULT false`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "disputeAutoAttachReceipt" BOOLEAN NOT NULL DEFAULT true`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "disputeReminderDays" INTEGER NOT NULL DEFAULT 3`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "disputeRatioWarnPct" DOUBLE PRECISION NOT NULL DEFAULT 0.5`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "disputeRatioCriticalPct" DOUBLE PRECISION NOT NULL DEFAULT 0.9`,
