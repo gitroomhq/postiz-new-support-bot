@@ -32,7 +32,7 @@ const EXPECTED_COLUMNS: Record<string, string[]> = {
     "aiEffortAsk", "aiEffortCause", "aiMaxBudgetUsdAsk", "aiMaxBudgetUsdCause", "aiPostizPrefetchEnabled",
     "aiPreviousRunsEnabled",
     "kbRefreshEnabled", "kbRefreshIntervalHours", "kbLastRefreshAt", "refundMaxPer24hPerUser", "stripeWebhookEnabled",
-    "stripeWebhookEndpointId", "stripeWebhookSecret", "publicBaseUrl",
+    "stripeWebhookEndpointId", "stripeWebhookSecret", "stripeSecretKey", "publicBaseUrl",
     "influxEnabled", "influxUrl", "influxOrg", "influxBucket", "influxToken",
     "scoringEnabled", "scoringIntervalHours", "scoringModel", "scoringMaxTicketsPerBatch",
     "scoringMaxBudgetUsdPerDay", "scoringLastRunAt", "scoringBackfillPending",

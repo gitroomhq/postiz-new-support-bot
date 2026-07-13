@@ -12,6 +12,7 @@ export const COLUMN_LABELS: Record<GlobalSecretColumn, string> = {
   intercomAccessToken: "Intercom access token",
   intercomClientSecret: "Intercom client secret",
   stripeWebhookSecret: "Stripe webhook signing secret",
+  stripeSecretKey: "Stripe API key",
   sentryReadToken: "Sentry read token",
   influxToken: "InfluxDB token",
 };
@@ -183,11 +184,15 @@ export class VaultMigrator {
   // ---- Upgrade job (outage-fallback stragglers → Vault) ----
 
   // Idempotent sweep run on recovery, after migrate(), and once at boot:
+  // 0. Stripe API key env seed (runs even without Vault — see the method)
   // 1. global columns still holding enc:v1/plaintext → KV + sentinel
   // 2. columns cleared while Vault was down but whose KV field lingers → delete
   // 3. session rows not yet on Transit → batch-encrypt
   async runUpgradeJob(): Promise<{ globals: number; reconciled: number; sessions: number }> {
     const none = { globals: 0, reconciled: 0, sessions: 0 };
+    // Seed ahead of the vault-up guard: on a vault-less deploy the value still
+    // lands (as local enc:v1) and this same job lifts it after recovery.
+    await this.seedStripeSecretKey();
     if (this.upgrading || !this.vault.storageActive() || this.vault.state() !== "up") return none;
     this.upgrading = true;
     try {
@@ -237,6 +242,23 @@ export class VaultMigrator {
     } finally {
       this.upgrading = false;
     }
+  }
+
+  // ---- Stripe API key seed (env → managed storage, one-time) ----
+
+  // The API key predates the vault system as a pure env var. First boot after
+  // this ships copies it into managed storage so the /config Vault panel can
+  // see (and a later modal rotate) it. Never clobbers an operator-set value:
+  // any non-empty raw column (sentinel or ciphertext, readable or not) counts
+  // as set — env might be the stale side after a rotation.
+  private async seedStripeSecretKey(): Promise<void> {
+    if (this.settings.getSecretColumnRaw("stripeSecretKey")) return;
+    const envKey = process.env.STRIPE_SECRET_KEY;
+    if (!envKey) return;
+    await this.settings.updateStripeSecretKey(envKey);
+    migrateLog.info("vault.seed.stripe_key", {
+      "vault.secret_state": this.settings.secretState("stripeSecretKey"),
+    });
   }
 
   // ---- Session token conversion (shared) ----

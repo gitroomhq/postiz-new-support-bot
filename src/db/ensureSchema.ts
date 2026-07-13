@@ -339,6 +339,8 @@ const STATEMENTS: string[] = [
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "stripeWebhookEnabled" BOOLEAN NOT NULL DEFAULT false`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "stripeWebhookEndpointId" TEXT`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "stripeWebhookSecret" TEXT`,
+  // Stripe account API key — managed copy of the env var (encrypted/vault-held).
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "stripeSecretKey" TEXT`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "publicBaseUrl" TEXT`,
   // Verbatim final AI answer, persisted for GitHub-issue bodies.
   `ALTER TABLE "tickets" ADD COLUMN IF NOT EXISTS "aiAnswer" TEXT`,

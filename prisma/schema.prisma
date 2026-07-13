@@ -154,6 +154,10 @@ model BotSettings {
   stripeWebhookEnabled    Boolean @default(false)
   stripeWebhookEndpointId String?
   stripeWebhookSecret     String? // whsec_… — encrypted (see src/util/crypto.ts)
+  // Stripe account API key (sk_…): managed copy of the STRIPE_SECRET_KEY env
+  // var (auto-seeded on boot, rotatable at runtime). The env var itself never
+  // goes away — it feeds the crypto.ts key derivation and is the read fallback.
+  stripeSecretKey         String?
   // Bot's public origin for programmatic webhook registration; falls back to
   // new URL(POSTIZ_CALLBACK_URL).origin when unset.
   publicBaseUrl           String?

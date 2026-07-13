@@ -1,5 +1,6 @@
 import Stripe from "stripe";
 import { BotConfig } from "../config";
+import type { SettingsStore } from "../config/SettingsStore";
 import { countWithSearchCap } from "./billing/disputeRatio";
 
 export interface SubscriptionInvoice {
@@ -18,10 +19,39 @@ interface ChargeWithInvoice extends Stripe.Charge {
 }
 
 export class StripeClient {
-  private stripe: Stripe;
+  private sdk: Stripe;
+  private sdkKey: string;
 
-  constructor(private config: BotConfig) {
-    this.stripe = new Stripe(config.stripe.secretKey);
+  // `settings` is optional: the read-only MCP server builds a StripeClient in
+  // a child process from a synthetic env-only config (no DB there), and the
+  // env key alone is correct for it.
+  constructor(private config: BotConfig, private settings?: SettingsStore) {
+    this.sdkKey = this.resolveKey();
+    this.sdk = new Stripe(this.sdkKey);
+  }
+
+  // Managed key first (Vault KV / enc:v1 column — rotatable at runtime), boot
+  // env as fallback. `||` not `??`: an empty managed value must fall through
+  // to env, never reach `new Stripe("")`.
+  private resolveKey(): string {
+    return this.settings?.stripeSecretKey() || this.config.stripe.secretKey;
+  }
+
+  // Every API call resolves the key per access — same live-rotation semantics
+  // as the webhook secret — but the SDK instance is rebuilt only when the key
+  // actually changed; steady state costs one string compare.
+  private get stripe(): Stripe {
+    const key = this.resolveKey();
+    if (key !== this.sdkKey) {
+      this.sdkKey = key;
+      this.sdk = new Stripe(key);
+    }
+    return this.sdk;
+  }
+
+  // Key mode for the /billing root panel banner (sk_test_/rk_test_ keys).
+  isTestMode(): boolean {
+    return this.resolveKey().includes("_test_");
   }
 
   async getLastSubscriptionCharge(customerId: string): Promise<SubscriptionInvoice | null> {
@@ -560,7 +590,7 @@ export class StripeClient {
     if (file.size > maxBytes) return { filename, sizeBytes: file.size, mimeType, data: null, skipped: "too_large" };
     if (!file.url) return { filename, sizeBytes: file.size, mimeType, data: null, skipped: "no_url" };
     const res = await fetch(file.url, {
-      headers: { Authorization: `Bearer ${this.config.stripe.secretKey}` },
+      headers: { Authorization: `Bearer ${this.resolveKey()}` },
     });
     if (!res.ok) throw new Error(`Stripe file contents download failed (${res.status}) for ${fileId}`);
     return { filename, sizeBytes: file.size, mimeType, data: Buffer.from(await res.arrayBuffer()), skipped: null };

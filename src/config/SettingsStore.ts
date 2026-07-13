@@ -59,13 +59,14 @@ const DEFAULT_PRIORITIES: PriorityInput[] = [
   { emoji: "🚨", label: "Critical" },
 ];
 
-// The five global secrets and their Vault KV home (one KV entry per
+// The six global secrets and their Vault KV home (one KV entry per
 // integration; field names live inside the entry). Shared by the read
 // resolver, the write router, the panel state helper and the migrator.
 export type GlobalSecretColumn =
   | "intercomAccessToken"
   | "intercomClientSecret"
   | "stripeWebhookSecret"
+  | "stripeSecretKey"
   | "sentryReadToken"
   | "influxToken";
 
@@ -73,6 +74,7 @@ export const GLOBAL_SECRETS: Record<GlobalSecretColumn, { integration: VaultInte
   intercomAccessToken: { integration: "intercom", field: "accessToken" },
   intercomClientSecret: { integration: "intercom", field: "clientSecret" },
   stripeWebhookSecret: { integration: "stripe", field: "webhookSecret" },
+  stripeSecretKey: { integration: "stripe", field: "secretKey" },
   sentryReadToken: { integration: "sentry", field: "readToken" },
   influxToken: { integration: "influx", field: "token" },
 };
@@ -104,7 +106,7 @@ export class SettingsStore {
     this.vault = vault;
   }
 
-  // ---- Vault secret plumbing (the five GLOBAL_SECRETS columns) ----
+  // ---- Vault secret plumbing (the six GLOBAL_SECRETS columns) ----
 
   // Read path. A column holds one of: null/"" (not set), the vault:kv sentinel
   // (value lives in Vault KV → serve from the in-memory cache, null while the
@@ -492,6 +494,26 @@ export class SettingsStore {
     this.settings = await this.prisma.botSettings.update({
       where: { id: "global" },
       data: { agentRipMigratedAt: new Date() },
+    });
+  }
+
+  // ---- Stripe API key ----
+
+  // The account API key (sk_…), local-encrypted or vault-held, with the boot
+  // env var as fallback (Intercom-style). The env var never goes away: it is
+  // required at boot and feeds the local encryption key derivation
+  // (src/util/crypto.ts); the managed copy simply wins so the key can be
+  // rotated without touching the deploy.
+  stripeSecretKey(): string | null {
+    return this.resolveSecret(this.settings.stripeSecretKey, "stripeSecretKey") ?? process.env.STRIPE_SECRET_KEY ?? null;
+  }
+
+  // Routes vault-first with local fallback (used by the boot seed; a /config
+  // modal will reuse it). null clears the managed copy — reads fall back to env.
+  async updateStripeSecretKey(value: string | null): Promise<void> {
+    this.settings = await this.prisma.botSettings.update({
+      where: { id: "global" },
+      data: { stripeSecretKey: await this.routeSecretWrite("stripeSecretKey", value) },
     });
   }
 
