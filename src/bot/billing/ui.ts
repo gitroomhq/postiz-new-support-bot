@@ -10,7 +10,6 @@ import {
   type MessageActionRowComponentBuilder,
 } from "discord.js";
 import type Stripe from "stripe";
-import type { BotConfig } from "../../config";
 import { StripeClient } from "../StripeClient";
 import { embed as makeEmbed, COLORS } from "../../util/embeds";
 import { TARGET_ACTIONS, type BillAdminSession, type Panel, type TargetAction } from "./types";
@@ -214,8 +213,8 @@ export function hubBack(action: TargetAction | "link", origin?: string): string 
 
 // ---- panels ----
 
-export function buildRootPanel(config: BotConfig): Panel {
-  const testMode = config.stripe.secretKey?.includes("_test_");
+export function buildRootPanel(stripe: StripeClient): Panel {
+  const testMode = stripe.isTestMode();
   const embed = new EmbedBuilder()
     .setTitle("Billing Admin")
     .setColor(COLORS.brand)
@@ -263,7 +262,7 @@ export function buildRootPanel(config: BotConfig): Panel {
 // Second navigation level: one hub per top-level area, grouping its actions
 // by CRUD verb. The concrete flows (target pickers, modals, results) hang off
 // the same billadmin_open:/billadmin_manual: ids as before.
-export function buildHubPanel(area: string, config: BotConfig): Panel {
+export function buildHubPanel(area: string, stripe: StripeClient): Panel {
   if (area === "cards") {
     const embed = new EmbedBuilder()
       .setTitle("Cards")
@@ -385,5 +384,5 @@ export function buildHubPanel(area: string, config: BotConfig): Panel {
       ],
     };
   }
-  return buildRootPanel(config);
+  return buildRootPanel(stripe);
 }

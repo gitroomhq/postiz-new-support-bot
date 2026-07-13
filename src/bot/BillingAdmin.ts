@@ -217,7 +217,7 @@ export class BillingAdmin {
         id: "billadmin_hub:",
         match: "prefix",
         handler: async (interaction) => {
-          await interaction.update(buildHubPanel(interaction.customId.split(":")[1], this.config));
+          await interaction.update(buildHubPanel(interaction.customId.split(":")[1], this.stripeClient));
         },
       },
       {
@@ -326,7 +326,7 @@ export class BillingAdmin {
   // ---- root dispatch ----
 
   buildRootPanel(): Panel {
-    return buildRootPanel(this.config);
+    return buildRootPanel(this.stripeClient);
   }
 
   private async handleOpen(interaction: ButtonInteraction, action: string, origin?: string): Promise<void> {

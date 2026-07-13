@@ -97,7 +97,9 @@ export class ClaudeCodeRunner {
   private searchDir: string;
   private baseDir: string;
 
-  constructor(baseDir: string, private aiRunStore?: AiRunStore) {
+  // `stripeKey` resolves the live Stripe API key (vault-held copy first) so
+  // spawned MCP children never run on a stale key after a rotation.
+  constructor(baseDir: string, private aiRunStore?: AiRunStore, private stripeKey?: () => string | null) {
     this.baseDir = baseDir;
     this.searchDir = path.resolve(baseDir, "search");
   }
@@ -168,6 +170,18 @@ export class ClaudeCodeRunner {
             args.push("--max-budget-usd", String(options.maxBudgetUsd));
           }
           if (options.mcpConfig) {
+            // The stripe server env in the caller-built config carries the
+            // boot-time key; it may have rotated in managed storage since.
+            // Freshen at spawn — MCP stdio children do not inherit this
+            // process's env, the config env is the only channel. (Mutating is
+            // safe: DiscordBot builds a fresh config object per run.)
+            const servers = options.mcpConfig.mcpServers as
+              | Record<string, { env?: Record<string, string> } | undefined>
+              | undefined;
+            const stripeEnv = servers?.stripe?.env;
+            if (stripeEnv?.STRIPE_SECRET_KEY) {
+              stripeEnv.STRIPE_SECRET_KEY = this.stripeKey?.() ?? stripeEnv.STRIPE_SECRET_KEY;
+            }
             // --strict-mcp-config: cwd is search/ with two cloned third-party
             // repos — never pick up an .mcp.json from them.
             args.push("--mcp-config", JSON.stringify(options.mcpConfig), "--strict-mcp-config");

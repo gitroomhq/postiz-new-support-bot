@@ -73,6 +73,9 @@ export function loadConfig(): BotConfig {
       repo: optional("GH_BOT_REPO"),
     },
     stripe: {
+      // Still required: it feeds the crypto.ts key derivation and is the read
+      // fallback. Runtime Stripe calls prefer the managed copy
+      // (SettingsStore.stripeSecretKey, seeded from this on first boot).
       secretKey: required("STRIPE_SECRET_KEY"),
       discountCouponId: optional("STRIPE_DISCOUNT_COUPON_ID"),
     },

@@ -171,12 +171,12 @@ async function main() {
     intercomClient
   );
   const oauthManager = new OAuthManager(config, sessionStore);
-  const claudeRunner = new ClaudeCodeRunner(process.cwd(), aiRunStore);
+  const claudeRunner = new ClaudeCodeRunner(process.cwd(), aiRunStore, () => settingsStore.stripeSecretKey());
   const lightAiRunner = new LightAiRunner(aiRunStore);
   const scoringService = new TicketScoringService(settingsStore, scoreStore, aiRunStore);
   const kbScheduler = new KnowledgeBaseScheduler(settingsStore, process.cwd());
   const githubClient = new GitHubClient(config);
-  const stripeClient = new StripeClient(config);
+  const stripeClient = new StripeClient(config, settingsStore);
   // Dispute console: local dispute mirror, blocklist (+ Radar bridge), team
   // notes/bookmarks, the shared ratio cache and the looper tick body.
   const disputeStore = new DisputeStore(prisma);
