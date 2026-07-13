@@ -99,6 +99,17 @@ model BotSettings {
   intercomSnoozeStatusTagId String?
   intercomLastInboundAt DateTime? // last verified inbound webhook — /config health line
   intercomModeChangedAt DateTime? // last mode flip — none→bi gap heal reads parts newer than this
+  // Workspace inactivity sweeper (native/unbridged conversations + tickets):
+  // the bot runs the reminder/auto-close automation Intercom can't apply to
+  // API-created conversations. Ships OFF; edited via /config → Intercom →
+  // Inactivity. Bridged tickets are excluded (per-ticket timers own them).
+  inactivityEnabled          Boolean @default(false)
+  inactivityAgentWaitDays    Int     @default(2) // customer spoke last, no agent reply for N days → note + reopen
+  inactivityCustomerWaitDays Int     @default(3) // agent spoke last, customer silent N days → outbound nag
+  inactivityNagsBeforeClose  Int     @default(2) // unanswered customer nags before the sweeper closes
+  // One-time agent-rip migration stamp (resolved-tag flip + thread sweeps) —
+  // temporalImportDoneAt precedent: machinery removed later, column stays.
+  agentRipMigratedAt DateTime?
   // Sentry DSN (set via /config; deploy has no .env access). Null = Sentry disabled.
   sentryDsn             String?
   // Sentry observability knobs (all edited via /config → Sentry).
@@ -540,6 +551,22 @@ model IntercomMessageMap {
   @@unique([direction, discordMessageId])
   @@index([ticketThreadId])
   @@map("intercom_message_maps")
+}
+
+// Inactivity-sweeper damper state for NATIVE (unbridged) Intercom
+// conversations/tickets — bridged tickets keep their reminder counters on the
+// tickets row. One row per swept object; the nag counter resets when the
+// customer replies between sweeps.
+model IntercomSweepState {
+  id                  String    @id // conversation id, or "ticket:<id>" for native tickets
+  kind                String // "conversation" | "ticket"
+  lastAgentRemindedAt DateTime?
+  customerNagCount    Int       @default(0)
+  lastCustomerNagAt   DateTime?
+  sweepClosedAt       DateTime? // set when the sweeper auto-closed it (skip until it reopens)
+  updatedAt           DateTime  @updatedAt
+
+  @@map("intercom_sweep_state")
 }
 
 // Dedup ledger for incoming Stripe webhook events (Stripe redelivers on non-2xx

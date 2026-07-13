@@ -3,7 +3,6 @@ import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "./generated/prisma/client";
 import { loadConfig } from "./config";
 import { SettingsStore } from "./config/SettingsStore";
-import { CannedResponseStore } from "./config/CannedResponseStore";
 import { EscalationTierStore } from "./config/EscalationTierStore";
 import { SessionStore } from "./auth/SessionStore";
 import { OAuthManager } from "./auth/OAuthManager";
@@ -16,8 +15,7 @@ import { CategoryRegistry } from "./bot/CategoryRegistry";
 import { TicketStore } from "./bot/TicketStore";
 import { StatusService } from "./bot/StatusService";
 import { AuditLogger } from "./bot/AuditLogger";
-import { StatusReportService } from "./bot/StatusReportService";
-import { StatusReportScheduler } from "./bot/StatusReportScheduler";
+import { AgentRipMigration } from "./bot/AgentRipMigration";
 import { KnowledgeBaseScheduler } from "./bot/KnowledgeBaseScheduler";
 import { DiscordBot } from "./bot/DiscordBot";
 import { ensureSchema } from "./db/ensureSchema";
@@ -29,6 +27,7 @@ import { IntercomSyncService } from "./intercom/IntercomSyncService";
 import { IntercomEventExecutor } from "./intercom/IntercomEventExecutor";
 import { IntercomWebhookHandler } from "./intercom/IntercomWebhookHandler";
 import { IntercomInboxApp } from "./intercom/IntercomInboxApp";
+import { InactivitySweeper } from "./intercom/InactivitySweeper";
 import { initSentry, shutdownSentry, captureFatal, log } from "./util/logger";
 import { safe, setAiRecordContent } from "./util/instrument";
 import { initInflux, reconfigureInflux, shutdownInflux } from "./metrics/InfluxWriter";
@@ -36,7 +35,6 @@ import { VaultService } from "./vault/VaultService";
 import { VaultMigrator } from "./vault/VaultMigrator";
 import { SnapshotScheduler } from "./metrics/SnapshotScheduler";
 import { AiRunStore } from "./bot/AiRunStore";
-import { TicketAiRunStore } from "./bot/TicketAiRunStore";
 import { LightAiRunner } from "./bot/LightAiRunner";
 import { DisputeStore } from "./bot/billing/DisputeStore";
 import { BlockStore } from "./bot/billing/BlockStore";
@@ -44,8 +42,6 @@ import { BillingQolStore } from "./bot/billing/BillingQolStore";
 import { BlockService } from "./bot/billing/BlockService";
 import { CachedRatioEngine } from "./bot/billing/disputeRatio";
 import { DisputeMonitor } from "./bot/billing/DisputeMonitor";
-import { TicketScoreStore } from "./scoring/TicketScoreStore";
-import { TicketScoringService } from "./scoring/TicketScoringService";
 import { TemporalService } from "./temporal/TemporalService";
 import { TemporalWorkerManager } from "./temporal/TemporalWorkerManager";
 import { TemporalProducers } from "./temporal/producers";
@@ -67,6 +63,15 @@ async function main() {
 
   await ensureSchema(prisma);
   bootLog.info("schema ensured");
+
+  // One-time agent-rip migration, DB phase — BEFORE settingsStore.load() so
+  // the tag cache (closingTag, tagById) sees the resolved→closing flip from
+  // the first instruction. Idempotent; re-runs until the Discord phase stamps
+  // the flag after bot.start().
+  const ripPhase1 = await AgentRipMigration.runDbPhase(prisma).catch((e) => {
+    bootLog.error("agent-rip DB migration failed — continuing, retried next boot", e);
+    return { migrated: false, tagsFlipped: 0 };
+  });
 
   const sessionStore = new SessionStore(prisma);
   const settingsStore = new SettingsStore(prisma);
@@ -134,8 +139,6 @@ async function main() {
     if (schemaStrict) throw e;
     bootLog.error("schema verification failed", e);
   }
-  const cannedStore = new CannedResponseStore(prisma);
-  await cannedStore.load();
   const tierStore = new EscalationTierStore(prisma);
   await tierStore.load();
   if (await tierStore.seedFromLegacySupportRole(settingsStore.supportRoleId())) {
@@ -158,9 +161,7 @@ async function main() {
   );
   intercomSync.setExecutor(intercomExecutor);
   const aiRunStore = new AiRunStore(prisma);
-  const ticketAiRunStore = new TicketAiRunStore(prisma);
-  const scoreStore = new TicketScoreStore(prisma);
-  const statusService = new StatusService(ticketStore, auditLogger, settingsStore, intercomSync, scoreStore);
+  const statusService = new StatusService(ticketStore, auditLogger, settingsStore, intercomSync);
   const intercomWebhookHandler = new IntercomWebhookHandler(
     settingsStore,
     ticketStore,
@@ -171,9 +172,10 @@ async function main() {
     intercomClient
   );
   const oauthManager = new OAuthManager(config, sessionStore);
+  // ClaudeCodeRunner + LightAiRunner survive the agent-rip for the dispute
+  // console (evidence drafts + summaries in /billing → Disputes).
   const claudeRunner = new ClaudeCodeRunner(process.cwd(), aiRunStore);
   const lightAiRunner = new LightAiRunner(aiRunStore);
-  const scoringService = new TicketScoringService(settingsStore, scoreStore, aiRunStore);
   const kbScheduler = new KnowledgeBaseScheduler(settingsStore, process.cwd());
   const githubClient = new GitHubClient(config);
   const stripeClient = new StripeClient(config);
@@ -229,8 +231,6 @@ async function main() {
     categoryLabelResolver
   );
 
-  const reportService = new StatusReportService(settingsStore, ticketStore, categoryRegistry, scoreStore);
-
   const bot = new DiscordBot(
     config,
     settingsStore,
@@ -238,11 +238,8 @@ async function main() {
     statusService,
     sessionStore,
     oauthManager,
-    claudeRunner,
     githubClient,
     categoryRegistry,
-    reportService,
-    cannedStore,
     auditLogger,
     tierStore,
     intercomSync,
@@ -253,7 +250,6 @@ async function main() {
     kbScheduler,
     stripeWebhookHandler,
     intercomInboxApp,
-    { prisma, lightAiRunner, scoringService, scoreStore, ticketAiRunStore },
     { service: vaultService, migrator: vaultMigrator },
     { blockService, stripeClient, disputeStore }
   );
@@ -263,7 +259,6 @@ async function main() {
   intercomInboxApp.bindClient(bot.client);
   stripeWebhookHandler.bindClient(bot.client);
   disputeMonitor.bindClient(bot.client);
-  scoringService.bindClient(bot.client);
   // Thread URLs need the guild id, only known once the client is ready —
   // resolved lazily per call.
   intercomSync.setThreadUrlBuilder((threadId) => {
@@ -296,19 +291,15 @@ async function main() {
 
   // ---- Activity tick-providers (bodies driven by the Temporal loopers) ----
 
-  const statusReportScheduler = new StatusReportScheduler(bot.client, settingsStore, reportService);
   // Influx gauge snapshot body for the metricsSnapshotWorkflow's snapshotTick.
-  const snapshotScheduler = new SnapshotScheduler(prisma, settingsStore, ticketStore);
-
-  // One boot-time pass to catch downtime; the steady-state purge runs in the
-  // cleanupLoopWorkflow's cleanupTick.
-  void ticketAiRunStore.purgeForClosedTickets().catch((e) => bootLog.error("ai run history purge failed", e));
+  const snapshotScheduler = new SnapshotScheduler(prisma, settingsStore);
+  // Workspace inactivity sweeper body (native/unbridged Intercom objects).
+  const inactivitySweeper = new InactivitySweeper(intercomClient, intercomStore, settingsStore, auditLogger);
 
   // ---- Temporal worker (all background work lives in workflows) ----
 
   const workerManager = new TemporalWorkerManager(temporalService, resolveBuildId());
   const activities = createActivities({
-    prisma,
     settingsStore,
     ticketStore,
     statusService,
@@ -319,16 +310,13 @@ async function main() {
     intercomSync,
     intercomExecutor,
     intercomWebhookHandler,
-    scoringService,
+    inactivitySweeper,
     kbScheduler,
-    reportScheduler: statusReportScheduler,
     snapshotScheduler,
-    ticketAiRunStore,
     stripeWebhookHandler,
     billingCategory,
     disputeMonitor,
     vaultMigrator,
-    bot,
     client: bot.client,
     producers: temporalProducers,
   });
@@ -388,6 +376,17 @@ async function main() {
     }
   } else {
     bootLog.warn("temporal worker paused (temporalEnabled off) — background work does not run until it is re-enabled");
+  }
+
+  // One-time agent-rip migration, Discord phase: lock+archive currently-
+  // resolved threads and strip legacy title emojis. Fire-and-forget, paced,
+  // idempotent; only the interactive process runs it (a split worker process
+  // must not double-rename). Stamps agentRipMigratedAt when done.
+  if (!workerOnly && !ripPhase1.migrated) {
+    const ripMigration = new AgentRipMigration(prisma, settingsStore, bot.client, auditLogger);
+    void ripMigration
+      .runDiscordPhase(ripPhase1.tagsFlipped)
+      .catch((e) => bootLog.error("agent-rip Discord migration failed — retried next boot", e));
   }
 
   // Graceful shutdown

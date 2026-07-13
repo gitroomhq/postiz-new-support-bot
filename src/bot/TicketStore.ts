@@ -1,4 +1,4 @@
-import { PrismaClient, Ticket, StatusTag, TicketNote, TicketTagChange } from "../generated/prisma/client";
+import { PrismaClient, Ticket, StatusTag } from "../generated/prisma/client";
 
 export type TicketWithTag = Ticket & { statusTag: StatusTag | null };
 
@@ -128,44 +128,11 @@ export class TicketStore {
     await this.prisma.ticket.update({ where: { threadId }, data: { recloseAt: null } });
   }
 
-  // Closed tickets whose quiet period has elapsed. Guarded on closed + closesThread so a
-  // ticket that was properly reopened (or whose tag changed) never re-locks by accident.
-  // A ticket paused via /reminders off never re-locks until its status changes.
-  async listRecloseDue(now: Date): Promise<TicketWithTag[]> {
-    return this.prisma.ticket.findMany({
-      where: { recloseAt: { lte: now }, closed: true, remindersPaused: false, statusTag: { closesThread: true } },
-      include: { statusTag: true },
-    });
-  }
-
-  // null = back to the base tier (tier 0 of the escalation ladder).
-  async setEscalationTier(threadId: string, escalationTierId: string | null): Promise<void> {
-    await this.prisma.ticket.update({ where: { threadId }, data: { escalationTierId } });
-  }
-
-  // Priority is a pure label: unlike setStatus it never touches reminder cadence,
-  // closed state, or the re-close timer.
-  async setPriority(threadId: string, priorityTagId: string): Promise<void> {
-    await this.prisma.ticket.update({ where: { threadId }, data: { priorityTagId } });
-  }
-
-  // /reminders on|off. The pause suppresses reminders, auto-close and re-close for
-  // this ticket; setStatus() clears it on the next status change.
-  async setRemindersPaused(threadId: string, paused: boolean): Promise<void> {
-    await this.prisma.ticket.update({ where: { threadId }, data: { remindersPaused: paused } });
-  }
-
   async recordReminder(threadId: string): Promise<void> {
     await this.prisma.ticket.update({
       where: { threadId },
       data: { lastReminderAt: new Date(), reminderCount: { increment: 1 } },
     });
-  }
-
-  // Persist the verbatim final AI answer so a filed GitHub issue is just the
-  // question + answer (no brittle re-scan of thread embeds).
-  async setAiAnswer(threadId: string, aiAnswer: string): Promise<void> {
-    await this.prisma.ticket.update({ where: { threadId }, data: { aiAnswer } });
   }
 
   async close(threadId: string): Promise<void> {
@@ -180,26 +147,6 @@ export class TicketStore {
   async listOpenByCustomerId(customerId: string): Promise<TicketWithTag[]> {
     return this.prisma.ticket.findMany({
       where: { customerId, closed: false },
-      include: { statusTag: true },
-    });
-  }
-
-  // Open tickets whose current status has reminders enabled and that aren't
-  // paused via /reminders off.
-  async listRemindable(): Promise<TicketWithTag[]> {
-    return this.prisma.ticket.findMany({
-      where: { closed: false, remindersPaused: false, statusTag: { reminderEnabled: true } },
-      include: { statusTag: true },
-    });
-  }
-
-  // Tickets currently sitting in a given status tag. Used to auto-close Resolved
-  // tickets after a quiet period (Resolved tickets carry closed=true, so we key off
-  // the status tag rather than the closed flag). Tickets paused via /reminders off
-  // are excluded so they never auto-close.
-  async listInStatus(statusTagId: string): Promise<TicketWithTag[]> {
-    return this.prisma.ticket.findMany({
-      where: { statusTagId, remindersPaused: false },
       include: { statusTag: true },
     });
   }
@@ -267,38 +214,6 @@ export class TicketStore {
 
   // ---- Aggregates for the status report ----
 
-  // Ticket counts grouped by current status tag, category AND closed-state, in one pass.
-  // The report treats the `closed` boolean as the source of truth for open/done (matching
-  // every other metric) and derives every breakdown from this.
-  async statusCategoryBreakdown(): Promise<
-    { statusTagId: string | null; categoryId: string | null; closed: boolean; count: number }[]
-  > {
-    const rows = await this.prisma.ticket.groupBy({
-      by: ["statusTagId", "categoryId", "closed"],
-      _count: { _all: true },
-    });
-    return rows.map((r) => ({
-      statusTagId: r.statusTagId,
-      categoryId: r.categoryId,
-      closed: r.closed,
-      count: r._count._all,
-    }));
-  }
-
-  async countOpenedSince(since: Date): Promise<number> {
-    return this.prisma.ticket.count({ where: { createdAt: { gte: since } } });
-  }
-
-  async countClosedSince(since: Date): Promise<number> {
-    return this.prisma.ticket.count({ where: { closedAt: { gte: since } } });
-  }
-
-  // Overdue = still open (closed=false covers both "resolved" and "closed") and created
-  // more than the configured threshold ago. cutoff = now - thresholdDays.
-  async countOverdue(cutoff: Date): Promise<number> {
-    return this.prisma.ticket.count({ where: { closed: false, createdAt: { lt: cutoff } } });
-  }
-
   // All currently-open tickets, oldest first, with their status tag joined. Backs the
   // Overdue and Age-Breakdown drill-down buttons (both classify/bucket in memory).
   async listOpenWithTag(): Promise<TicketWithTag[]> {
@@ -310,37 +225,6 @@ export class TicketStore {
   }
 
   // ---- Response-time metrics ----
-
-  // Stamps the first support reply. updateMany + null-guard makes it race-safe and
-  // idempotent: only the first stamp ever wins.
-  async setFirstResponse(threadId: string, at: Date): Promise<void> {
-    await this.prisma.ticket.updateMany({
-      where: { threadId, firstResponseAt: null },
-      data: { firstResponseAt: at },
-    });
-  }
-
-  // Median time-to-first-response and time-to-resolution (seconds) over tickets closed in
-  // the window. percentile_cont skips NULL firstResponseAt rows for the first aggregate.
-  async responseTimeMedians(since: Date): Promise<{ firstResponseS: number | null; resolutionS: number | null }> {
-    const rows = await this.prisma.$queryRaw<{ first_response_s: number | null; resolution_s: number | null }[]>`
-      SELECT
-        percentile_cont(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM ("firstResponseAt" - "createdAt"))) AS first_response_s,
-        percentile_cont(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM ("closedAt" - "createdAt"))) AS resolution_s
-      FROM "tickets"
-      WHERE "closedAt" >= ${since}`;
-    const row = rows[0];
-    return {
-      firstResponseS: row?.first_response_s != null ? Number(row.first_response_s) : null,
-      resolutionS: row?.resolution_s != null ? Number(row.resolution_s) : null,
-    };
-  }
-
-  async countAwaitingFirstResponse(): Promise<number> {
-    return this.prisma.ticket.count({
-      where: { closed: false, firstResponseAt: null, customerId: { not: null } },
-    });
-  }
 
   // ---- CSAT ----
 
@@ -384,84 +268,7 @@ export class TicketStore {
     return result.count > 0;
   }
 
-  // All-time rating aggregates (the Feedback drill-down shows the full history, not a window).
-  async csatStats(): Promise<CsatStats> {
-    const [grouped, prompted] = await Promise.all([
-      this.prisma.ticket.groupBy({
-        by: ["csatScore"],
-        where: { csatScore: { not: null } },
-        _count: { _all: true },
-      }),
-      this.prisma.ticket.count({ where: { csatPromptedAt: { not: null } } }),
-    ]);
-
-    const counts = new Map<number, number>();
-    let rated = 0;
-    let sum = 0;
-    for (const row of grouped) {
-      if (row.csatScore == null) continue;
-      counts.set(row.csatScore, row._count._all);
-      rated += row._count._all;
-      sum += row.csatScore * row._count._all;
-    }
-    return { counts, rated, prompted, average: rated > 0 ? sum / rated : null };
-  }
-
-  // Most recent CSAT feedback (rated tickets, with or without a comment), newest first,
-  // for the paginated Feedback drill-down. Selects the thread + context so each row can
-  // deep-link to its ticket. The WHERE mirrors csatStats() so their totals stay in sync —
-  // change both together if the predicate ever moves.
-  async recentCsatFeedback(
-    limit: number,
-    offset: number
-  ): Promise<Pick<Ticket, "threadId" | "question" | "customerDisplayName" | "csatScore" | "csatComment" | "csatRatedAt">[]> {
-    return this.prisma.ticket.findMany({
-      where: { csatScore: { not: null } },
-      orderBy: { csatRatedAt: "desc" },
-      skip: offset,
-      take: limit,
-      select: {
-        threadId: true,
-        question: true,
-        customerDisplayName: true,
-        csatScore: true,
-        csatComment: true,
-        csatRatedAt: true,
-      },
-    });
-  }
-
   // ---- Staff notes ----
-
-  // Returns the created note id (the Intercom bridge maps it to the source
-  // conversation part so an Intercom-side redaction can remove the note again).
-  async addNote(ticketThreadId: string, authorId: string, authorName: string, text: string): Promise<string> {
-    const row = await this.prisma.ticketNote.create({ data: { ticketThreadId, authorId, authorName, text } });
-    return row.id;
-  }
-
-  // Redaction reflection: remove a mirrored staff note. Returns false when the
-  // note is already gone (idempotent under webhook redelivery).
-  async deleteNoteById(id: string): Promise<boolean> {
-    const result = await this.prisma.ticketNote.deleteMany({ where: { id } });
-    return result.count > 0;
-  }
-
-  async listNotes(ticketThreadId: string, limit = 15): Promise<TicketNote[]> {
-    return this.prisma.ticketNote.findMany({
-      where: { ticketThreadId },
-      orderBy: { createdAt: "desc" },
-      take: limit,
-    });
-  }
-
-  // Full note history oldest-first (Intercom backfill; listNotes caps at 15 for /note list).
-  async listAllNotes(ticketThreadId: string): Promise<TicketNote[]> {
-    return this.prisma.ticketNote.findMany({
-      where: { ticketThreadId },
-      orderBy: { createdAt: "asc" },
-    });
-  }
 
   // ---- Status/priority change history ----
   // Emoji+label are snapshotted as text so /status history and /priority history
@@ -491,19 +298,4 @@ export class TicketStore {
     });
   }
 
-  async listTagChanges(ticketThreadId: string, kind: TagChangeKind, limit = 15): Promise<TicketTagChange[]> {
-    return this.prisma.ticketTagChange.findMany({
-      where: { ticketThreadId, kind },
-      orderBy: { createdAt: "desc" },
-      take: limit,
-    });
-  }
-
-  // Full status+priority history oldest-first (Intercom backfill).
-  async listAllTagChanges(ticketThreadId: string): Promise<TicketTagChange[]> {
-    return this.prisma.ticketTagChange.findMany({
-      where: { ticketThreadId },
-      orderBy: { createdAt: "asc" },
-    });
-  }
 }

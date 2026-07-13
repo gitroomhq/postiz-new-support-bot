@@ -5,11 +5,15 @@
 export { ticketWorkflow } from "./ticket.workflow";
 export { statusChangeWorkflow } from "./status.workflow";
 export { intercomDeliveryWorkflow, intercomInboxWorkflow } from "./intercom.workflow";
+// autoAnswerWorkflow / aiRunWorkflow / scoreOneWorkflow are tombstones
+// (agent-rip): nothing starts them anymore, but in-flight runs at deploy time
+// still need their types registered. aiRun/scoreOne go in the follow-up
+// release; autoAnswer stays (referenced by ticketWorkflow's dormant creation
+// branch, which is input-suppressed via aiSolve:false).
 export { autoAnswerWorkflow, aiRunWorkflow, scoreOneWorkflow } from "./ai.workflow";
 export {
   kbRefreshWorkflow,
-  scoringLoopWorkflow,
-  scoringBatchWorkflow,
+  inactivityLoopWorkflow,
   metricsSnapshotWorkflow,
   cleanupLoopWorkflow,
   disputesLoopWorkflow,

@@ -102,15 +102,6 @@ export class ClaudeCodeRunner {
     this.searchDir = path.resolve(baseDir, "search");
   }
 
-  /**
-   * Path to the compiled Stripe read-only MCP server. Always resolves into
-   * dist/ (not src/) because the Claude CLI spawns it with plain node —
-   * in ts-node dev mode this requires a prior `pnpm build`.
-   */
-  stripeServerPath(): string {
-    return path.resolve(this.baseDir, "dist/mcp/StripeReadOnlyMcpServer.js");
-  }
-
   async run(
     prompt: string,
     onUpdate?: (messages: string[]) => void,

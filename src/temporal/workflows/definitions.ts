@@ -8,9 +8,8 @@ import {
   SIG_KB_REFRESH_NOW,
   SIG_NOOP,
   SIG_REMINDERS_PAUSED,
+  SIG_INACTIVITY_RUN_NOW,
   SIG_REQUEST_STATUS_CHANGE,
-  SIG_SCORING_ESCALATION_RUN_NOW,
-  SIG_SCORING_RUN_NOW,
   SIG_TICKET_CREATED,
   UPD_APPLY_PRIORITY,
   UPD_APPLY_STATUS,
@@ -41,9 +40,8 @@ export const requestStatusChangeSignal = defineSignal<[StatusChangeRequest]>(SIG
 export const noopSignal = defineSignal(SIG_NOOP);
 export const inboundEventSignal = defineSignal<[InboundEventSignal]>(SIG_INBOUND_EVENT);
 export const kbRefreshNowSignal = defineSignal(SIG_KB_REFRESH_NOW);
-export const scoringRunNowSignal = defineSignal(SIG_SCORING_RUN_NOW);
-export const scoringEscalationRunNowSignal = defineSignal(SIG_SCORING_ESCALATION_RUN_NOW);
 export const disputesRunNowSignal = defineSignal(SIG_DISPUTES_RUN_NOW);
+export const inactivityRunNowSignal = defineSignal(SIG_INACTIVITY_RUN_NOW);
 
 export const applyStatusUpdate = defineUpdate<ApplyStatusResult, [StatusChangeRequest]>(UPD_APPLY_STATUS);
 export const applyPriorityUpdate = defineUpdate<{ ok: boolean }, [PriorityChangeRequest]>(UPD_APPLY_PRIORITY);

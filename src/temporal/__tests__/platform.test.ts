@@ -7,11 +7,10 @@ import {
   ticketWorkflowId,
   intercomDeliveryChildId,
   stripeEventWorkflowId,
-  aiRunWorkflowId,
-  scoringBatchWorkflowId,
   CUSTOM_SEARCH_ATTRIBUTES,
   LOOPER_GEN_MEMO_KEY,
   LOOPER_GENERATIONS,
+  RETIRED_SINGLETONS,
   SINGLETONS,
 } from "../types";
 import { looperStartOptions } from "../looperGeneration";
@@ -96,8 +95,6 @@ test("workflow id scheme matches the documented shapes", () => {
   assert.equal(ticketWorkflowId("123"), "ticket-123");
   assert.equal(intercomDeliveryChildId("123", 7), "icd-123-7");
   assert.equal(stripeEventWorkflowId("evt_1"), "stripe-evt-evt_1");
-  assert.equal(aiRunWorkflowId("42"), "ai-run-42");
-  assert.equal(scoringBatchWorkflowId("msgbatch_1"), "scoring-batch-msgbatch_1");
 });
 
 test("every looper singleton has an integer generation ≥ 1", () => {
@@ -107,20 +104,29 @@ test("every looper singleton has an integer generation ≥ 1", () => {
   }
 });
 
-test("scoring-loop is pinned at generation 3 (the escalation-branch rework)", () => {
-  // Regression pin: lowering this re-wedges any still-running gen-3 singleton.
-  assert.equal(LOOPER_GENERATIONS[SINGLETONS.scoringLoop], 3);
-});
-
 test("disputes-loop starts at generation 1", () => {
   // Bump IN THE SAME COMMIT as any history-incompatible disputesLoopWorkflow change.
   assert.equal(LOOPER_GENERATIONS[SINGLETONS.disputesLoop], 1);
 });
 
+test("intercom-inactivity-loop starts at generation 1", () => {
+  // Bump IN THE SAME COMMIT as any history-incompatible inactivityLoopWorkflow change.
+  assert.equal(LOOPER_GENERATIONS[SINGLETONS.inactivityLoop], 1);
+});
+
 test("looperStartOptions stamps the code generation into the memo", () => {
-  const opts = looperStartOptions(SINGLETONS.scoringLoop);
-  assert.deepEqual(opts, { memo: { [LOOPER_GEN_MEMO_KEY]: 3 } });
+  const opts = looperStartOptions(SINGLETONS.disputesLoop);
+  assert.deepEqual(opts, { memo: { [LOOPER_GEN_MEMO_KEY]: 1 } });
   assert.deepEqual(looperStartOptions("unknown-id"), { memo: { [LOOPER_GEN_MEMO_KEY]: 1 } });
+});
+
+test("retired singletons can never resurface in SINGLETONS/LOOPER_GENERATIONS", () => {
+  // Their workflow types left the bundle — a re-added id would signal-with-start
+  // a run that immediately wedges on an unknown type.
+  for (const { workflowId } of RETIRED_SINGLETONS) {
+    assert.ok(!Object.values(SINGLETONS).includes(workflowId as never), `${workflowId} re-added to SINGLETONS`);
+    assert.ok(!(workflowId in LOOPER_GENERATIONS), `${workflowId} re-added to LOOPER_GENERATIONS`);
+  }
 });
 
 test("custom search attribute keys are unique KEYWORDs with stable names", () => {

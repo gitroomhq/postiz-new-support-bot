@@ -45,7 +45,9 @@ const EXPECTED_COLUMNS: Record<string, string[]> = {
     "disputeAutoCancelSub", "disputeAutoBlock", "disputeAutoAttachReceipt", "disputeReminderDays",
     "disputeRatioWarnPct", "disputeRatioCriticalPct", "disputeRatioLastLevel",
     "disputeUrgentHours", "disputeUrgentRoleId", "disputeBackfillDoneAt",
-    "radarListCardId", "radarListEmailId", "radarListCustomerId", "radarListIpId", "updatedAt",
+    "radarListCardId", "radarListEmailId", "radarListCustomerId", "radarListIpId",
+    "inactivityEnabled", "inactivityAgentWaitDays", "inactivityCustomerWaitDays", "inactivityNagsBeforeClose",
+    "agentRipMigratedAt", "updatedAt",
   ],
   status_tags: [
     "id", "emoji", "label", "isInitial", "closesThread", "reminderEnabled", "reminderDays", "reminderTarget",
@@ -72,6 +74,9 @@ const EXPECTED_COLUMNS: Record<string, string[]> = {
   intercom_pending_posts: ["id", "ticketThreadId", "kind", "bodyHash", "createdAt"],
   intercom_message_maps: [
     "id", "ticketThreadId", "direction", "discordMessageId", "partId", "via", "redactedAt", "createdAt",
+  ],
+  intercom_sweep_state: [
+    "id", "kind", "lastAgentRemindedAt", "customerNagCount", "lastCustomerNagAt", "sweepClosedAt", "updatedAt",
   ],
   stripe_webhook_events: ["id", "type", "createdAt"],
   stripe_disputes: [

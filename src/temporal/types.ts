@@ -17,22 +17,34 @@ export const statusChangeChildId = (threadId: string, seq: number): string => `s
 export const intercomDeliveryChildId = (threadId: string, seq: number): string => `icd-${threadId}-${seq}`;
 export const autoAnswerChildId = (threadId: string): string => `auto-answer-${threadId}`;
 export const inboxWorkflowId = (conversationId: string): string => `icx-${conversationId}`;
-export const aiRunWorkflowId = (userId: string): string => `ai-run-${userId}`;
-export const scoreOneWorkflowId = (threadId: string): string => `score-one-${threadId}`;
 export const stripeEventWorkflowId = (eventId: string): string => `stripe-evt-${eventId}`;
-export const scoringBatchWorkflowId = (batchId: string): string => `scoring-batch-${batchId}`;
 export const refundWorkflowId = (chargeId: string): string => `refund-${chargeId}`;
 
 export const SINGLETONS = {
   kbRefresh: "kb-refresh",
-  scoringLoop: "scoring-loop",
   metricsSnapshot: "metrics-snapshot",
   cleanupLoop: "cleanup-loop",
   disputesLoop: "disputes-loop",
+  inactivityLoop: "intercom-inactivity-loop",
 } as const;
 
 export const VAULT_UPGRADE_WORKFLOW_ID = "vault-upgrade";
 export const STATUS_REPORT_SCHEDULE_ID = "status-report";
+
+// ---- Retired workflows/schedules (agent-rip release) ----
+// ensureBaseline terminates/deletes these BEFORE the worker starts, every boot
+// (idempotent). A retired id must never reappear in SINGLETONS — their workflow
+// types are no longer registered, so a surviving run would wedge on its next
+// workflow task until the next boot retires it again.
+export const RETIRED_SINGLETONS = [
+  { workflowId: "scoring-loop", reason: "agent-rip: AI ticket scoring removed" },
+] as const;
+// Children of retired singletons that may have been orphaned by a crash race
+// (parent-close TERMINATE normally kills them with the parent).
+export const RETIRED_WORKFLOW_QUERIES = [
+  { query: `WorkflowType="scoringBatchWorkflow" AND ExecutionStatus="Running"`, reason: "agent-rip: AI ticket scoring removed" },
+] as const;
+export const RETIRED_SCHEDULES = [STATUS_REPORT_SCHEDULE_ID] as const;
 
 // ---- Looper generations ----
 // Bump a looper's generation IN THE SAME COMMIT as any history-incompatible
@@ -42,17 +54,16 @@ export const STATUS_REPORT_SCHEDULE_ID = "status-report";
 // that IS the upgrade path for loopers, because every deploy replays running
 // workflows on the new bundle (AUTO_UPGRADE, single in-process worker) and a
 // replay mismatch wedges the workflow with nondeterminism task failures.
-// Safe: all four loopers are stateless between iterations (state re-derived
-// from Postgres each tick; in-flight scoring batches are re-adopted via
-// scoringGetState). Stateful long-lived workflows (ticketWorkflow,
+// Safe: all loopers are stateless between iterations (state re-derived from
+// Postgres each tick). Stateful long-lived workflows (ticketWorkflow,
 // intercomInboxWorkflow) must use patched() instead — see README.
 export const LOOPER_GEN_MEMO_KEY = "looperGen";
 export const LOOPER_GENERATIONS: Record<string, number> = {
   [SINGLETONS.kbRefresh]: 1,
-  [SINGLETONS.scoringLoop]: 3, // gen 3: escalation branch + scoringEscalationRunNow signal
   [SINGLETONS.metricsSnapshot]: 1,
   [SINGLETONS.cleanupLoop]: 1,
   [SINGLETONS.disputesLoop]: 1,
+  [SINGLETONS.inactivityLoop]: 1,
 };
 
 // ---- Custom search attributes ----
@@ -91,9 +102,8 @@ export const SIG_REQUEST_STATUS_CHANGE = "requestStatusChange";
 export const SIG_NOOP = "noop";
 export const SIG_INBOUND_EVENT = "inboundEvent";
 export const SIG_KB_REFRESH_NOW = "kbRefreshNow";
-export const SIG_SCORING_RUN_NOW = "scoringRunNow";
-export const SIG_SCORING_ESCALATION_RUN_NOW = "scoringEscalationRunNow";
 export const SIG_DISPUTES_RUN_NOW = "disputesRunNow";
+export const SIG_INACTIVITY_RUN_NOW = "inactivityRunNow";
 export const UPD_APPLY_STATUS = "applyStatus";
 export const UPD_APPLY_PRIORITY = "applyPriority";
 export const QRY_TICKET_STATE = "getState";
@@ -105,8 +115,14 @@ export type IcEventType =
   | "message"
   | "note"
   | "status"
+  // Legacy member: no producer emits "priority" anymore (axis unbridged), but
+  // events queued in in-flight ticket workflows may still carry it — the
+  // executor skips them.
   | "priority"
   | "csat"
+  // Agent-idle reminder: internal note + reopen so the conversation resurfaces
+  // in the Intercom inbox.
+  | "agent_reminder"
   | "message_edit"
   | "message_delete";
 
@@ -322,42 +338,18 @@ export interface DisputesTickResult {
   ratioLevel: "ok" | "warn" | "critical" | "skipped";
 }
 
-// ---- Scoring (per-batch child workflows for full lifecycle visibility) ----
+// ---- Inactivity sweeper (native/unbridged Intercom conversations + tickets) ----
 
-export interface ScoringState {
-  enabled: boolean;
-  // SUBMITTED Anthropic batch ids (restart/CAN adoption — each gets a child).
-  pendingBatchIds: string[];
-  due: boolean;
-  backfill: boolean;
-  // Daily escalation re-score batch: due only while escalation is enabled,
-  // its interval has elapsed AND the queue is non-empty (regular work wins a
-  // shared tick; escalation submits on a later one).
-  escalationDue: boolean;
-  escalationPendingCount: number;
+export interface InactivitySweepResult {
+  scanned: number;
+  agentReminders: number;
+  customerNags: number;
+  closed: number;
+  skipped: boolean; // disabled or Intercom unconfigured
 }
 
-export interface ScoringSubmitOutcome {
-  batchId: string | null;
-  submitted: number;
-  skipped: number;
-  drained: boolean;
-  budgetBlocked: boolean;
-}
-
-export interface ScoringBatchPoll {
-  status: "running" | "processed" | "failed";
-  processingStatus: string | null;
-}
-
-// scoringBatchWorkflow input; polls/deadlineAtMs are the Continue-As-New
-// carry so a long-lived batch keeps its poll count and 26h deadline.
-export interface ScoringBatchInput {
-  batchId: string;
-  polls?: number;
-  deadlineAtMs?: number;
-}
-
+// Kept for the publishStatusReport tombstone stub (removed in N+1 with the
+// tombstone workflow).
 export interface ReportTickResult {
   published: boolean;
 }
@@ -387,18 +379,15 @@ export interface CoreActivities {
   // loopers
   kbTick(force: boolean): Promise<KbTickResult>;
   disputesTick(force: boolean): Promise<DisputesTickResult>;
-  scoringGetState(): Promise<ScoringState>;
-  scoringSubmit(purpose: "interval" | "backfill" | "escalation"): Promise<ScoringSubmitOutcome>;
-  scoringPollBatch(batchId: string): Promise<ScoringBatchPoll>;
-  // Deadline backstop: fail a batch that outlived its processing window so
-  // its tickets become retryable (no-op if already finalized).
-  scoringExpireBatch(batchId: string): Promise<void>;
+  inactivitySweepTick(force: boolean): Promise<InactivitySweepResult>;
   snapshotTick(): Promise<void>;
   cleanupTick(): Promise<void>;
+  // Tombstone stubs (agent-rip): in-flight runs at deploy time still proxy
+  // these; the workflows + stubs are removed in the follow-up release.
   publishStatusReport(force: boolean): Promise<ReportTickResult>;
   scoreOneNow(threadId: string): Promise<string>;
 
-  // AI
+  // AI (tombstone stubs — see above)
   runAutoAnswer(input: AutoAnswerInput): Promise<{ ok: boolean; apiLimit: boolean }>;
   runStaffAiCommand(input: AiRunInput): Promise<void>;
 

@@ -1,5 +1,4 @@
-import { PrismaClient, Ticket, TicketTagChange } from "../generated/prisma/client";
-import { influxActive, writePoint, flushInflux } from "./InfluxWriter";
+import { writePoint } from "./InfluxWriter";
 
 // Typed, fire-and-forget domain-event exporters over writePoint. Every helper
 // no-ops when the exporter is inactive and never throws — call sites stay
@@ -8,67 +7,6 @@ import { influxActive, writePoint, flushInflux } from "./InfluxWriter";
 // Cardinality rule: tags only for bounded sets (event names, category ids,
 // status labels, a small staff team, model ids). Thread/charge/session ids are
 // always fields.
-
-export function exportTicketCreated(p: { threadId: string; category: string | null; ts?: Date }): void {
-  writePoint(
-    "ticket_events",
-    { event: "created", category: p.category ?? "unknown" },
-    { count: 1, thread_id: p.threadId },
-    p.ts
-  );
-}
-
-export function exportStatusChange(p: {
-  threadId: string;
-  category: string | null;
-  statusTo: string;
-  reopened: boolean;
-  ts?: Date;
-}): void {
-  writePoint(
-    "ticket_events",
-    { event: p.reopened ? "reopened" : "status_change", category: p.category ?? "unknown", status_to: p.statusTo },
-    { count: 1, thread_id: p.threadId },
-    p.ts
-  );
-}
-
-export function exportTicketClosed(p: {
-  threadId: string;
-  category: string | null;
-  resolutionSeconds: number | null;
-  ts?: Date;
-}): void {
-  writePoint(
-    "ticket_events",
-    { event: "closed", category: p.category ?? "unknown" },
-    { count: 1, thread_id: p.threadId, resolution_seconds: p.resolutionSeconds },
-    p.ts
-  );
-}
-
-export function exportFirstResponse(p: {
-  threadId: string;
-  category: string | null;
-  seconds: number;
-  ts?: Date;
-}): void {
-  writePoint(
-    "ticket_events",
-    { event: "first_response", category: p.category ?? "unknown" },
-    { count: 1, thread_id: p.threadId, first_response_seconds: p.seconds },
-    p.ts
-  );
-}
-
-export function exportCsat(p: { threadId: string; category: string | null; score: number; ts?: Date }): void {
-  writePoint(
-    "ticket_events",
-    { event: "csat", category: p.category ?? "unknown" },
-    { count: 1, thread_id: p.threadId, csat_score: p.score },
-    p.ts
-  );
-}
 
 // One point per AI run — interactive CLI runs, direct-API light runs, and one
 // aggregated point per scoring batch. Mirrors the ai_runs Postgres row.
@@ -108,63 +46,6 @@ export function exportAiRun(run: AiRunExport): void {
       session_id: run.sessionId ?? undefined,
     }
   );
-}
-
-// Sentiment enum → ordinal for averaging in Grafana.
-const SENTIMENT_ORDINAL: Record<string, number> = {
-  very_negative: -2,
-  negative: -1,
-  neutral: 0,
-  positive: 1,
-  very_positive: 2,
-};
-
-export function exportTicketScore(p: {
-  threadId: string;
-  category: string | null;
-  cxScore: number;
-  sentimentStart: string;
-  sentimentEnd: string;
-  agentTone: number;
-  agentClarity: number;
-  agentCorrectness: number;
-  resolution: string;
-  fcr: boolean;
-  escalationNeeded: boolean;
-  topic: string;
-  staff: Array<{ name: string; tone: number; clarity: number; correctness: number }>;
-  // Timestamped at the ticket's closedAt so backfilled scores land correctly.
-  ts?: Date;
-}): void {
-  writePoint(
-    "ai_scores",
-    {
-      category: p.category ?? "unknown",
-      resolution: p.resolution,
-      topic: p.topic,
-      fcr: String(p.fcr),
-      escalation: String(p.escalationNeeded),
-    },
-    {
-      count: 1,
-      thread_id: p.threadId,
-      cx_score: p.cxScore,
-      sentiment_start: SENTIMENT_ORDINAL[p.sentimentStart] ?? 0,
-      sentiment_end: SENTIMENT_ORDINAL[p.sentimentEnd] ?? 0,
-      agent_tone: p.agentTone,
-      agent_clarity: p.agentClarity,
-      agent_correctness: p.agentCorrectness,
-    },
-    p.ts
-  );
-  for (const s of p.staff) {
-    writePoint(
-      "ai_staff_scores",
-      { staff: s.name },
-      { count: 1, thread_id: p.threadId, tone: s.tone, clarity: s.clarity, correctness: s.correctness },
-      p.ts
-    );
-  }
 }
 
 export type BillingEventKind =
@@ -249,26 +130,32 @@ export function exportIntercomWebhook(outcome: "accepted" | "rejected" | "buffer
   writePoint("intercom_webhook", { outcome }, { count: 1 });
 }
 
-export function exportSnapshotGauge(dim: "status" | "category", value: string, openCount: number): void {
-  writePoint("ticket_snapshot", { dim, value }, { open_count: openCount });
-}
-
-export function exportSnapshotTotals(p: {
-  open: number;
-  overdue: number;
-  awaitingFirstResponse: number;
-  pendingChargeReviews: number;
+// One point per workspace inactivity sweep (native/unbridged conversations +
+// tickets) — errors > 0 is the alertable field.
+export function exportIntercomSweep(p: {
+  scanned: number;
+  agentReminders: number;
+  customerNags: number;
+  closed: number;
+  errors: number;
 }): void {
   writePoint(
-    "ticket_snapshot_totals",
+    "intercom_sweep",
     {},
     {
-      open: p.open,
-      overdue: p.overdue,
-      awaiting_first_response: p.awaitingFirstResponse,
-      pending_charge_reviews: p.pendingChargeReviews,
+      scanned: p.scanned,
+      agent_reminders: p.agentReminders,
+      customer_nags: p.customerNags,
+      closed: p.closed,
+      errors: p.errors,
     }
   );
+}
+
+// The dispute console's blocked-charge review queue — the one ticket-adjacent
+// gauge that survived the agent-rip (it feeds /charge staffing).
+export function exportPendingChargeReviews(pending: number): void {
+  writePoint("ticket_snapshot_totals", {}, { pending_charge_reviews: pending });
 }
 
 // Dispute-console gauges. Counts come from the 5-minute snapshot tick; the
@@ -306,83 +193,4 @@ export function exportBotHealth(): void {
 // writePoint, keeping the bucket's fields float-typed).
 export function exportVaultHealth(up: boolean): void {
   writePoint("vault_health", {}, { up: up ? 1 : 0 });
-}
-
-// One-time export of all historical tickets from Postgres, emitting points at
-// their HISTORICAL timestamps (createdAt/closedAt/firstResponseAt/csatRatedAt)
-// plus the status-change history from ticket_tag_changes. Triggered from
-// /config → Analytics → "Backfill history".
-export async function backfillTicketHistory(
-  prisma: PrismaClient
-): Promise<{ tickets: number; points: number }> {
-  if (!influxActive()) throw new Error("Influx exporter is not active.");
-  const PAGE = 500;
-  let cursor: string | null = null;
-  let tickets = 0;
-  let points = 0;
-
-  for (;;) {
-    const page: Ticket[] = await prisma.ticket.findMany({
-      take: PAGE,
-      ...(cursor ? { skip: 1, cursor: { id: cursor } } : {}),
-      orderBy: { id: "asc" },
-    });
-    if (page.length === 0) break;
-    cursor = page[page.length - 1].id;
-
-    for (const t of page) {
-      tickets++;
-      exportTicketCreated({ threadId: t.threadId, category: t.categoryId, ts: t.createdAt });
-      points++;
-      if (t.firstResponseAt) {
-        exportFirstResponse({
-          threadId: t.threadId,
-          category: t.categoryId,
-          seconds: (t.firstResponseAt.getTime() - t.createdAt.getTime()) / 1000,
-          ts: t.firstResponseAt,
-        });
-        points++;
-      }
-      if (t.closed && t.closedAt) {
-        exportTicketClosed({
-          threadId: t.threadId,
-          category: t.categoryId,
-          resolutionSeconds: (t.closedAt.getTime() - t.createdAt.getTime()) / 1000,
-          ts: t.closedAt,
-        });
-        points++;
-      }
-      if (t.csatScore != null && t.csatRatedAt) {
-        exportCsat({ threadId: t.threadId, category: t.categoryId, score: t.csatScore, ts: t.csatRatedAt });
-        points++;
-      }
-    }
-  }
-
-  // Status-change history (emoji+label snapshots). Category isn't stored on the
-  // change rows; "unknown" keeps cardinality flat rather than joining per row.
-  let changeCursor: string | null = null;
-  for (;;) {
-    const page: TicketTagChange[] = await prisma.ticketTagChange.findMany({
-      where: { kind: "STATUS" },
-      take: PAGE,
-      ...(changeCursor ? { skip: 1, cursor: { id: changeCursor } } : {}),
-      orderBy: { id: "asc" },
-    });
-    if (page.length === 0) break;
-    changeCursor = page[page.length - 1].id;
-    for (const c of page) {
-      exportStatusChange({
-        threadId: c.ticketThreadId,
-        category: null,
-        statusTo: c.toLabel,
-        reopened: false,
-        ts: c.createdAt,
-      });
-      points++;
-    }
-  }
-
-  await flushInflux();
-  return { tickets, points };
 }

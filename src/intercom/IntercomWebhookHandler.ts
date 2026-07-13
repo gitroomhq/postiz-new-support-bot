@@ -45,7 +45,9 @@ export const INTERCOM_WEBHOOK_TOPICS = [
   "conversation.admin.opened",
   "conversation.admin.snoozed",
   "conversation.admin.unsnoozed",
-  "conversation.priority.updated",
+  // conversation.priority.updated left this list with the priority axis
+  // (agent-rip) — unsubscribe it in the Developer Hub; deliveries drop at the
+  // door until then.
   "ticket.state.updated",
   "ticket.admin.replied",
   "ticket.note.created",
@@ -203,9 +205,6 @@ export class IntercomWebhookHandler {
       case "ticket.note.created":
         await this.handleTicketNoteCreated(item as IntercomTicketItem);
         return;
-      case "conversation.priority.updated":
-        await this.handleConversationPriorityUpdated(item as IntercomConversationItem);
-        return;
       case "conversation_part.redacted":
         await this.handlePartRedacted(item as { type?: string; id?: string | number } | undefined);
         return;
@@ -218,8 +217,9 @@ export class IntercomWebhookHandler {
   // side. The message map tells this apart by direction:
   //  - "in":   a relayed agent reply → delete the relayed Discord message;
   //  - "out":  a mirrored Discord message (customer/staff) → delete the ORIGIN
-  //            Discord message (leaked-secret parity; Manage Messages needed);
-  //  - "note": a mirrored internal note → remove the staff note again.
+  //            Discord message (leaked-secret parity; Manage Messages needed).
+  // ("note"-direction rows are historical only — inbound note storage was
+  // removed with the agent-rip; their delete below no-ops on Unknown Message.)
   // The bridge's own redactions (Discord delete/edit → redact) pre-stamp
   // redactedAt on the map row, so their webhook echo drops here.
   private async handlePartRedacted(item: { type?: string; id?: string | number } | undefined): Promise<void> {
@@ -248,19 +248,6 @@ export class IntercomWebhookHandler {
     // round trip), roll back on transient failure so the retry can run again.
     await this.store.setMessageMapRedactedAt(map.id, new Date());
     try {
-      if (map.direction === "note") {
-        const removed = await this.ticketStore.deleteNoteById(map.discordMessageId);
-        if (removed) {
-          void this.audit.log({
-            title: "🗑️ Intercom note redacted",
-            severity: "info",
-            actor: "Intercom agent",
-            threadId: map.ticketThreadId,
-            fields: [{ name: "Effect", value: "Mirrored staff note removed", inline: false }],
-          });
-        }
-        return;
-      }
       await this.deleteDiscordMessageForRedaction(map);
     } catch (e) {
       await this.store.setMessageMapRedactedAt(map.id, null).catch(() => {});
@@ -542,10 +529,16 @@ export class IntercomWebhookHandler {
         // wrote natively in Discord (their name + Intercom avatar as the
         // message author). Falls back to the neutral embed when the bot lacks
         // Manage Webhooks or the webhook send fails.
-        const mention = ticket?.customerId ? `<@${ticket.customerId}>` : "";
+        // Ping cadence: cm → am(ping) → am(no ping) → cm → am(ping) — mention
+        // the customer only on the FIRST agent reply of each exchange turn, so
+        // an agent sending several messages in a row pings once, and the next
+        // ping arrives only after the customer has spoken again.
+        const ping = ticket ? await this.shouldPingCustomer(thread, ticket).catch(() => true) : false;
+        const pingedCustomerId = ping ? ticket?.customerId ?? null : null;
+        const mention = pingedCustomerId ? `<@${pingedCustomerId}>` : "";
         const content = truncateEmbedText([mention, description].filter(Boolean).join("\n"), 2000);
         let via: "webhook" | "bot" = "webhook";
-        let messageId = await this.relayViaWebhook(thread, ticket?.customerId ?? null, authorName, avatarUrl, {
+        let messageId = await this.relayViaWebhook(thread, pingedCustomerId, authorName, avatarUrl, {
           content,
           files,
         });
@@ -557,10 +550,10 @@ export class IntercomWebhookHandler {
             .setTimestamp();
           if (description) embed.setDescription(description);
           const sent = await thread.send({
-            content: ticket?.customerId ? `<@${ticket.customerId}>` : undefined,
+            content: pingedCustomerId ? `<@${pingedCustomerId}>` : undefined,
             embeds: [embed],
             files,
-            allowedMentions: { users: ticket?.customerId ? [ticket.customerId] : [] },
+            allowedMentions: { users: pingedCustomerId ? [pingedCustomerId] : [] },
           });
           messageId = sent.id;
         }
@@ -592,6 +585,40 @@ export class IntercomWebhookHandler {
     return (
       authorId === this.settingsStore.intercomOperatorAdminId() || authorId === this.settingsStore.intercomAdminId()
     );
+  }
+
+  // How long a turn's no-ping suppression lasts: consecutive agent messages
+  // within this window ping once; an agent message landing later than this
+  // after the previous relay pings again even without customer activity.
+  private static readonly RELAY_PING_SUPPRESSION_MS = 3 * 60 * 60 * 1000;
+
+  // True when the customer has been active since the last relayed agent
+  // message — i.e. this relay is the first agent reply of the current exchange
+  // turn — OR the previous relay is older than the 3h suppression window (a
+  // stale turn re-pings). Customer activity = their newest in-thread message,
+  // floored at the ticket's creation (the modal question is customer activity
+  // even though the "Your question" embed is bot-authored). The last-relay
+  // side comes from the message map's "in" rows, which cover both webhook and
+  // embed-fallback relays. Fails open to true — a duplicate ping beats a
+  // missed one.
+  private async shouldPingCustomer(
+    thread: ThreadChannel,
+    ticket: { customerId: string | null; createdAt: Date }
+  ): Promise<boolean> {
+    if (!ticket.customerId) return false;
+    const lastRelayAt = await this.store.getLatestInboundRelayAt(thread.id);
+    if (!lastRelayAt) return true; // first agent contact on this ticket
+    if (Date.now() - lastRelayAt.getTime() >= IntercomWebhookHandler.RELAY_PING_SUPPRESSION_MS) return true;
+    let lastCustomerAt = ticket.createdAt.getTime();
+    const messages = await thread.messages.fetch({ limit: 25 }).catch(() => null);
+    // Window miss (customer's last message >25 back) means a long agent chain
+    // — exactly the no-ping case, so the floor result is already right.
+    for (const message of messages?.values() ?? []) {
+      if (message.author.id === ticket.customerId && message.createdTimestamp > lastCustomerAt) {
+        lastCustomerAt = message.createdTimestamp;
+      }
+    }
+    return lastCustomerAt > lastRelayAt.getTime();
   }
 
   // Positive attribution gate for inbound events that would REOPEN a closed
@@ -686,14 +713,10 @@ export class IntercomWebhookHandler {
       relayKey = `note:${bodyHash(part.body ?? "")}`;
       if (!(await this.store.claimRelay(threadId, relayKey))) return;
 
+      // Notes are not stored locally anymore (agent-rip: /note is gone and
+      // agents read their own notes in Intercom) — the audit embed is the only
+      // Discord-side record; the claims above still dedup redeliveries.
       const authorName = part.author?.name || "Intercom agent";
-      const authorId = part.author?.id != null ? `intercom:${part.author.id}` : "intercom";
-      const noteId = await this.ticketStore.addNote(threadId, authorId, `${authorName} (Intercom)`, text);
-      // Map note ↔ part so an Intercom-side redaction removes the staff note
-      // again (best-effort, same contract as the reply map).
-      await this.store
-        .recordMessageMap({ ticketThreadId: threadId, direction: "note", discordMessageId: noteId, partId: String(part.id) })
-        .catch(() => {});
       void this.audit.log({
         title: "📝 Staff note (from Intercom)",
         severity: "info",
@@ -928,31 +951,9 @@ export class IntercomWebhookHandler {
       .catch(() => {});
   }
 
-  // Agent set the NATIVE priority level in Intercom → the Discord priority tag
-  // with the matching label (Urgent/High/Medium/Low, case-insensitive). The
-  // level is read-only via the public API, so this can never be an echo of the
-  // bridge's own writes (outbound priority lives in the custom "Priority"
-  // ticket attribute). The resulting Discord change pushes back only to that
-  // custom attribute — no loop.
-  private async handleConversationPriorityUpdated(item: IntercomConversationItem | undefined): Promise<void> {
-    if (this.settingsStore.intercomMode() !== "bi") return;
-    if (!item || item.id == null) return;
-    const level = typeof item.priority === "string" ? item.priority.toLowerCase() : null;
-    // "none" (cleared) has no Discord counterpart; legacy binary
-    // "priority"/"not_priority" payloads match no label and fall out below.
-    if (!level || level === "none") return;
-
-    const link = await this.store.getLinkByConversationId(String(item.id));
-    if (!link) return;
-    const priority = this.settingsStore.priorities().find((p) => p.label.toLowerCase() === level);
-    if (!priority) return; // no Discord priority tag with that label — ignore
-    const ticket = await this.ticketStore.getByThreadId(link.ticketThreadId);
-    if (!ticket || ticket.priorityTagId === priority.id) return;
-
-    const thread = await this.requireThread(link.ticketThreadId);
-    if (!thread) return;
-    await this.statusService.applyPriority(thread, ticket, priority, { actorName: "Intercom agent" });
-  }
+  // (The priority axis is unbridged — agent-rip. Native Intercom priority is
+  // agents' own tool; conversation.priority.updated left the topic list and
+  // now drops at the door until unsubscribed in the Developer Hub.)
 
   // Tag changes made in Intercom → one diff embed in the Discord thread.
   // There is no untag webhook topic, so the diff runs on every conversation
@@ -1189,11 +1190,18 @@ export class IntercomWebhookHandler {
 }
 
 // Intercom part bodies are HTML → readable Discord text for embeds/notes.
+// Block boundaries become SINGLE newlines so the Discord message mirrors the
+// agent's line layout exactly (Intercom's composer emits one <p>/<div> per
+// Enter, rendered single-spaced — a "\n\n" join reads as extra blank lines,
+// and unhandled <div> boundaries used to collapse everything into one
+// paragraph).
 function htmlToDiscordText(html: string): string {
   return (
     html
       .replace(/<br\s*\/?>/gi, "\n")
-      .replace(/<\/p>\s*<p[^>]*>/gi, "\n\n")
+      .replace(/<\/p>\s*<p[^>]*>/gi, "\n")
+      .replace(/<\/div>\s*<div[^>]*>/gi, "\n")
+      .replace(/<\/(p|div|h[1-6])>/gi, "\n")
       .replace(/<li[^>]*>/gi, "\n- ")
       .replace(/<blockquote[^>]*>/gi, "\n> ")
       .replace(/<(b|strong)>([\s\S]*?)<\/\1>/gi, "**$2**")

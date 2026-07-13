@@ -1,10 +1,13 @@
 import { PrismaClient, EscalationTier } from "../generated/prisma/client";
 
-// Ordered staff ladder (position 0 = lowest). Tier 0 gets new-ticket pings and
-// its members are added to ticket threads; membership in any tier role counts as
-// staff. Replaces the legacy single BotSettings.supportRoleId, which survives
-// only as a fallback while no tiers are configured. Mirrors CannedResponseStore's
-// cached-list pattern so permission checks never hit the DB.
+// Staff-role registry (the escalation-LADDER semantics were retired with the
+// agent-rip — agents escalate in Intercom now). Membership in any listed role
+// counts as staff: /charge authorization, ticket rate-limit exemption, and
+// staff/customer classification for the Intercom bridge. Position still
+// matters for exactly one thing: the FIRST role receives the blocked-charge
+// review ping (and unmirrored-ticket agent reminders). Replaces the legacy
+// single BotSettings.supportRoleId, which survives only as a fallback while
+// no roles are configured. Cached list so permission checks never hit the DB.
 export class EscalationTierStore {
   private tiers: EscalationTier[] = [];
 
@@ -36,12 +39,6 @@ export class EscalationTierStore {
   // Role pinged (and added) on new tickets: the lowest tier.
   newTicketRoleId(fallbackRoleId: string | null): string | null {
     return this.lowest()?.roleId ?? fallbackRoleId;
-  }
-
-  // Role that currently owns a ticket: its escalation tier, else the base tier.
-  // A stale tier id (tier deleted) falls back to the base tier too.
-  pingRoleIdFor(escalationTierId: string | null | undefined, fallbackRoleId: string | null): string | null {
-    return this.byId(escalationTierId)?.roleId ?? this.newTicketRoleId(fallbackRoleId);
   }
 
   async add(name: string, roleId: string): Promise<EscalationTier> {

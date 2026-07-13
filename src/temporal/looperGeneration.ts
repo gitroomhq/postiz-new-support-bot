@@ -46,3 +46,37 @@ export async function reconcileLooperGeneration(
 export const looperStartOptions = (workflowId: string): { memo: Record<string, number> } => ({
   memo: { [LOOPER_GEN_MEMO_KEY]: LOOPER_GENERATIONS[workflowId] ?? 1 },
 });
+
+// Terminate a retired singleton if it is still running (idempotent: absent /
+// already-closed runs are a no-op). Retired workflow types are no longer in
+// the bundle, so a surviving run would wedge on its next workflow task — the
+// boot-time retire is what keeps the namespace clean without Temporal-UI
+// access on the deploy host.
+export async function retireWorkflowId(client: Client, workflowId: string, reason: string): Promise<boolean> {
+  const handle = client.workflow.getHandle(workflowId);
+  try {
+    const desc = await handle.describe();
+    if (desc.status.name !== "RUNNING") return false;
+    await handle.terminate(reason);
+    return true;
+  } catch (e) {
+    if (e instanceof WorkflowNotFoundError) return false;
+    throw e;
+  }
+}
+
+// Visibility sweep for retired children orphaned by a crash race (parent-close
+// TERMINATE normally takes them down with the parent). Returns the number of
+// runs terminated.
+export async function retireByQuery(client: Client, query: string, reason: string): Promise<number> {
+  let terminated = 0;
+  for await (const wf of client.workflow.list({ query })) {
+    try {
+      await client.workflow.getHandle(wf.workflowId, wf.runId).terminate(reason);
+      terminated++;
+    } catch (e) {
+      if (!(e instanceof WorkflowNotFoundError)) throw e;
+    }
+  }
+  return terminated;
+}

@@ -147,10 +147,11 @@ export class BillingCategory extends BaseCategory {
     return { outcome: "ok", ...refund, cancelFailed, cancelledSubscriptionId };
   }
 
-  // Role that owns the ticket right now: its escalation tier, else the base tier.
-  private async staffPingRoleFor(threadId: string | null): Promise<string | null> {
-    const ticket = threadId ? await this.ticketStore.getByThreadId(threadId).catch(() => null) : null;
-    return this.tierStore.pingRoleIdFor(ticket?.escalationTierId, this.settingsStore.supportRoleId());
+  // Staff role for the blocked-charge review ping — the ONE surviving Discord
+  // staff ping: refund tickets are never mirrored to Intercom, and the mention
+  // is also what pulls staff into the private thread so /charge works.
+  private staffPingRoleFor(): string | null {
+    return this.tierStore.newTicketRoleId(this.settingsStore.supportRoleId());
   }
 
   protected getInputLabel(): string {
@@ -159,20 +160,6 @@ export class BillingCategory extends BaseCategory {
 
   protected getInputPlaceholder(): string {
     return "e.g. How do I upgrade my plan? I was charged twice...";
-  }
-
-  protected buildPrompt(userInput: string): string {
-    return (
-      `The user has a billing question about Postiz: "${userInput}". ` +
-      `Provide helpful general information about billing, subscriptions, and payments. ` +
-      `Do NOT promise or imply refunds, credits, discounts, cancellations, plan changes, or timelines — ` +
-      `those require a human support member and the account's actual billing state, which you cannot see. ` +
-      `If the request needs any of those, or other manual intervention, tell the user a support member will follow up here.`
-    );
-  }
-
-  protected getColor(): number {
-    return 0x57f287; // Green
   }
 
   override async handleButtonPress(interaction: { showModal: (modal: ModalBuilder) => Promise<void> }): Promise<boolean> {
@@ -270,13 +257,12 @@ export class BillingCategory extends BaseCategory {
 
       // Create a private thread for this refund conversation
       const thread = await threadsChannel.threads.create({
-        name: `${ctx.initialEmoji}${ctx.initialPriorityEmoji ? ` ${ctx.initialPriorityEmoji}` : ""} ${interaction.user.displayName} — Refund Request`,
+        name: `${interaction.user.displayName} — Refund Request`.slice(0, 100),
         type: ChannelType.PrivateThread,
         invitable: false,
       });
 
       await thread.members.add(interaction.user.id);
-      await this.addSupportMembers(thread, ctx.staffPingRoleId, interaction.user.id);
       await ctx.onTicketCreated(thread, interaction.user.id, interaction.user.displayName, "Refund request");
 
       await interaction.editReply({
@@ -628,7 +614,7 @@ export class BillingCategory extends BaseCategory {
       });
     }
 
-    const pingRoleId = await this.staffPingRoleFor(thread?.id ?? null);
+    const pingRoleId = this.staffPingRoleFor();
     if (thread) {
       await thread
         .send({
@@ -683,7 +669,7 @@ export class BillingCategory extends BaseCategory {
         }
       }
 
-      const pingRoleId = await this.staffPingRoleFor(thread?.id ?? null);
+      const pingRoleId = this.staffPingRoleFor();
       if (thread) {
         await thread.send({
           content: pingRoleId ? `<@&${pingRoleId}>` : undefined,

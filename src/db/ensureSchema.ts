@@ -620,6 +620,23 @@ const STATEMENTS: string[] = [
   `CREATE UNIQUE INDEX IF NOT EXISTS "intercom_message_maps_partId_key" ON "intercom_message_maps"("partId")`,
   `CREATE UNIQUE INDEX IF NOT EXISTS "intercom_message_maps_direction_discordMessageId_key" ON "intercom_message_maps"("direction", "discordMessageId")`,
   `CREATE INDEX IF NOT EXISTS "intercom_message_maps_ticketThreadId_idx" ON "intercom_message_maps"("ticketThreadId")`,
+  // Agent-rip release: workspace inactivity sweeper (native/unbridged
+  // conversations + tickets) + the one-time migration stamp.
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "inactivityEnabled" BOOLEAN NOT NULL DEFAULT false`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "inactivityAgentWaitDays" INTEGER NOT NULL DEFAULT 2`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "inactivityCustomerWaitDays" INTEGER NOT NULL DEFAULT 3`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "inactivityNagsBeforeClose" INTEGER NOT NULL DEFAULT 2`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "agentRipMigratedAt" TIMESTAMP(3)`,
+  `CREATE TABLE IF NOT EXISTS "intercom_sweep_state" (
+    "id" TEXT NOT NULL,
+    "kind" TEXT NOT NULL,
+    "lastAgentRemindedAt" TIMESTAMP(3),
+    "customerNagCount" INTEGER NOT NULL DEFAULT 0,
+    "lastCustomerNagAt" TIMESTAMP(3),
+    "sweepClosedAt" TIMESTAMP(3),
+    "updatedAt" TIMESTAMP(3) NOT NULL,
+    CONSTRAINT "intercom_sweep_state_pkey" PRIMARY KEY ("id")
+  )`,
 ];
 
 export async function ensureSchema(prisma: PrismaClient): Promise<void> {
