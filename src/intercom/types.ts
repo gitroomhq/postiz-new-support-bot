@@ -197,6 +197,9 @@ export interface IntercomWebhookPart {
   created_at?: number;
   author?: IntercomWebhookAuthor;
   attachments?: Array<{ url?: string | null; name?: string | null }>;
+  // True once an agent deleted the part — set both in conversation_part.redacted
+  // payloads and on parts fetched via the conversation GET.
+  redacted?: boolean;
 }
 
 // data.item for conversation.* topics.

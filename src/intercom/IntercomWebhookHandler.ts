@@ -8,6 +8,7 @@ import { IntercomStore } from "./IntercomStore";
 import { IntercomSyncService } from "./IntercomSyncService";
 import { IntercomClient } from "./IntercomClient";
 import { bodyHash } from "./renderDiscordMarkdown";
+import { isPermanent4xx } from "./IntercomEventExecutor";
 import { TemporalBufferedError, type TemporalProducers } from "../temporal/producers";
 import { INTERCOM_MAX_ECHO_DEFERS } from "../temporal/types";
 import { log } from "../util/logger";
@@ -206,7 +207,7 @@ export class IntercomWebhookHandler {
         await this.handleTicketNoteCreated(item as IntercomTicketItem);
         return;
       case "conversation_part.redacted":
-        await this.handlePartRedacted(item as { type?: string; id?: string | number } | undefined);
+        await this.handlePartRedacted(item as IntercomConversationItem | undefined);
         return;
       default:
         return; // unknown topic — drop
@@ -222,24 +223,62 @@ export class IntercomWebhookHandler {
   // removed with the agent-rip; their delete below no-ops on Unknown Message.)
   // The bridge's own redactions (Discord delete/edit → redact) pre-stamp
   // redactedAt on the map row, so their webhook echo drops here.
-  private async handlePartRedacted(item: { type?: string; id?: string | number } | undefined): Promise<void> {
+  //
+  // Payload shape: Intercom ships data.item as the CONVERSATION for this topic
+  // (the Developer Hub webhook reference lists its item type as Conversation),
+  // with the affected part(s) flagged `redacted: true` inside
+  // conversation_parts — and deletion payloads can be minimal, carrying no
+  // parts at all, so an API fetch of the full part list is the reliable
+  // fallback. A part-shaped item is still accepted in case older payload
+  // versions deliver the part directly.
+  private async handlePartRedacted(item: IntercomConversationItem | undefined): Promise<void> {
     if (this.settingsStore.intercomMode() === "none") return;
-    // Shape guard: only act when the item is (or is untyped but plausibly) a
-    // conversation part — treating a conversation-shaped item's id as a part id
-    // would poison the part ledger (id spaces can collide).
-    if (item?.type && item.type !== "conversation_part") return;
-    const partId = item?.id != null ? String(item.id) : null;
-    if (!partId) return;
+    if (!item || item.id == null) return;
 
+    if (item.type === "conversation_part") {
+      await this.reflectRedactedPart(String(item.id));
+      return;
+    }
+    // Shape guard: treating an unknown item kind's id as a conversation id is
+    // harmless (the link lookup below misses), but only conversation-shaped
+    // (or untyped) items proceed.
+    if (item.type && item.type !== "conversation") return;
+
+    const conversationId = String(item.id);
+    const link = await this.store.getLinkByConversationId(conversationId);
+    if (!link) return; // Intercom-native conversation — not ours
+
+    const redactedOf = (parts?: IntercomWebhookPart[]) =>
+      (parts ?? []).filter((p) => p.redacted === true && p.id != null);
+
+    let redactedParts = redactedOf(item.conversation_parts?.conversation_parts);
+    if (redactedParts.length === 0) {
+      // Minimal payload — pull every part and reflect all redacted ones.
+      // Convergent: already-reflected parts drop on their redactedAt stamp,
+      // never-bridged ones only tombstone. A permanent 4xx (conversation
+      // deleted) leaves nothing to reflect; transient errors throw so the
+      // inbox workflow retries.
+      try {
+        redactedParts = redactedOf(await this.intercomClient.getConversationPartsSince(conversationId, 0));
+      } catch (e) {
+        if (isPermanent4xx(e)) return;
+        throw e;
+      }
+    }
+    for (const part of redactedParts) {
+      await this.reflectRedactedPart(String(part.id));
+    }
+  }
+
+  // Reflect one redacted conversation part onto Discord via its map row.
+  private async reflectRedactedPart(partId: string): Promise<void> {
     const map = await this.store.getMessageMapByPartId(partId);
     if (!map) {
       // Unknown part: never relayed/mirrored, or pre-feature. Claim the id so
       // an in-flight relay racing this redaction can't post deleted content
       // (the reply relay claims the same key first in the normal order). The
       // thread id is unknown here — the claim row is purely a tombstone.
-      if (item?.type === "conversation_part") {
-        await this.store.claimPart("c", partId, "").catch(() => {});
-      }
+      await this.store.claimPart("c", partId, "").catch(() => {});
       return;
     }
     if (map.redactedAt) return; // the bridge's own redact echoing back, or a duplicate delivery

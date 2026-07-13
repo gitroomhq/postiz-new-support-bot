@@ -209,7 +209,9 @@ function text(textValue: string): CanvasComponent {
 }
 
 function dataRow(label: string, value: string): CanvasComponent {
-  return { type: "text", text: `**${label}:** ${value}`, style: "paragraph" };
+  // Canvas Kit bold is SINGLE-asterisk (like header() above) — `**x**` renders
+  // as a bold x wrapped in literal asterisks.
+  return { type: "text", text: `*${label}:* ${value}`, style: "paragraph" };
 }
 
 function divider(): CanvasComponent {
