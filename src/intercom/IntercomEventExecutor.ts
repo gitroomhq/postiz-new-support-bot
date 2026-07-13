@@ -4,7 +4,7 @@ import { AuditLogger } from "../bot/AuditLogger";
 import { SettingsStore } from "../config/SettingsStore";
 import { IntercomClient, IntercomHttpError } from "./IntercomClient";
 import { IntercomStore } from "./IntercomStore";
-import { IntercomSyncService, externalIdCandidates, isUnmirroredCategory } from "./IntercomSyncService";
+import { IntercomSyncService, externalIdCandidates, isIntercomExempt } from "./IntercomSyncService";
 import { bodyHash, renderDiscordMarkdownToHtml } from "./renderDiscordMarkdown";
 import { log } from "../util/logger";
 import {
@@ -105,10 +105,12 @@ export class IntercomEventExecutor {
         // Refund tickets are never mirrored (emit-layer gate); the ONE event
         // that reaches this executor for them anyway is the ticket workflow's
         // creation-synthesized ensure — short-circuit it as a success so the
-        // pump drains without creating anything.
+        // pump drains without creating anything. Payloads composed since the
+        // per-ticket flag carry it resolved; stale queued payloads fall back
+        // to the legacy (categoryId, question) refund predicate inside.
         const ensurePayload = payload as EnsurePayload;
-        if (isUnmirroredCategory(ensurePayload?.categoryId)) {
-          this.execLog.info("ensure skipped (unmirrored category)", {
+        if (ensurePayload && isIntercomExempt(ensurePayload)) {
+          this.execLog.info("ensure skipped (intercom-exempt ticket)", {
             "ticket.thread_id": threadId,
             "ticket.category_id": ensurePayload?.categoryId ?? "",
           });

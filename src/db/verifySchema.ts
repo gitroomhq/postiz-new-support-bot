@@ -58,7 +58,7 @@ const EXPECTED_COLUMNS: Record<string, string[]> = {
     "id", "threadId", "channelId", "customerId", "customerDisplayName", "categoryId", "statusTagId", "prevStatusTagId",
     "priorityTagId", "escalationTierId", "lastStatusChangeAt", "lastReminderAt", "reminderCount", "remindersPaused", "closed", "closedAt",
     "recloseAt", "question", "aiAnswer", "firstResponseAt", "csatScore", "csatComment", "csatPromptedAt", "csatRatedAt",
-    "createdAt",
+    "createdAt", "intercomExempt",
   ],
   ticket_notes: ["id", "ticketThreadId", "authorId", "authorName", "text", "createdAt"],
   ticket_tag_changes: [

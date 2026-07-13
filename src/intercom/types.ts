@@ -34,6 +34,10 @@ export interface EnsurePayload {
   stripeCustomerId?: string | null;
   categoryId: string | null; // ticket-type map key ("howto" | "bugs" | "billing")
   categoryLabel?: string | null;
+  // Discord-only ticket (refund flow): the executor short-circuits the ensure.
+  // Absent on payloads queued before the flag existed — the executor falls
+  // back to the legacy (categoryId, question) refund predicate.
+  intercomExempt?: boolean;
   question?: string | null; // _default_description_ of the converted ticket
   // true (live tickets): the rendered question doubles as the conversation's
   // opening message. false (backfill): the transcript replay carries the

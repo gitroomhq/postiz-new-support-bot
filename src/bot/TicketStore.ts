@@ -13,6 +13,8 @@ export interface CreateTicketInput {
   customerDisplayName?: string | null;
   categoryId?: string | null;
   question?: string | null;
+  // Discord-only ticket — never mirrored to Intercom (refund-flow threads).
+  intercomExempt?: boolean;
 }
 
 // All-time customer-satisfaction aggregates for the report and its Feedback drill-down.
@@ -45,6 +47,7 @@ export class TicketStore {
         customerDisplayName: input.customerDisplayName ?? null,
         categoryId: input.categoryId ?? null,
         question: input.question ?? null,
+        intercomExempt: input.intercomExempt ?? false,
       },
     });
   }

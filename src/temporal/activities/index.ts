@@ -193,7 +193,13 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
   // legacy staff-role ping, the only place Intercom can't see the ticket.
   // Returns false when there was no route (unmirrored + no staff role): the
   // caller must not report a reminder that never went out.
-  const sendReminder = async (thread: ThreadChannel, ticket: TicketWithTag, tag: StatusTag, target: "SUPPORT" | "CUSTOMER"): Promise<boolean> => {
+  const sendReminder = async (
+    thread: ThreadChannel,
+    ticket: TicketWithTag,
+    tag: StatusTag,
+    target: "SUPPORT" | "CUSTOMER",
+    idleDays: number
+  ): Promise<boolean> => {
     let route: "customer" | "intercom" | "discord" = "customer";
     if (target === "CUSTOMER") {
       await thread.send({
@@ -208,7 +214,7 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
       });
     } else {
       const enqueued = await intercomSync
-        .onAgentReminder(ticket, { idleDays: tag.reminderDays, threadUrl: thread.url })
+        .onAgentReminder(ticket, { idleDays, threadUrl: thread.url })
         .catch(() => false);
       route = enqueued ? "intercom" : "discord";
       if (!enqueued) {
@@ -218,7 +224,7 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
           content: `<@&${pingRoleId}>`,
           embeds: [
             embed(
-              `This ticket has gone ${tag.reminderDays} day(s) without a reply — please follow up.\n\nStatus: ${tag.emoji} ${tag.label}`,
+              `This ticket has gone ${idleDays} day(s) without a reply — please follow up.\n\nStatus: ${tag.emoji} ${tag.label}`,
               COLORS.warn
             ),
           ],
@@ -338,7 +344,17 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
               if (target === "CUSTOMER" && tag.autoCloseAfter != null && ticket.reminderCount >= tag.autoCloseAfter && closingTag) {
                 statusChange = { tagId: closingTag.id, actorName: "Automatic" };
               } else {
-                reminded = await sendReminder(thread, ticket, tag, target);
+                // Real idle time for the reminder copy: elapsed since the
+                // awaited party last acted (status changes count as
+                // activity). Deliberately EXCLUDES lastReminderAt — the fire
+                // reference includes it so the cadence re-arms, but counting
+                // it here would pin the displayed number at reminderDays
+                // forever ("1 day(s)" every day).
+                const idleDays = Math.max(
+                  1,
+                  Math.floor((now - Math.max(ticket.lastStatusChangeAt.getTime(), awaitedAt ?? 0)) / DAY_MS)
+                );
+                reminded = await sendReminder(thread, ticket, tag, target, idleDays);
               }
             }
           }

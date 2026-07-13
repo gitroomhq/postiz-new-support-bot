@@ -639,6 +639,13 @@ const STATEMENTS: string[] = [
     "updatedAt" TIMESTAMP(3) NOT NULL,
     CONSTRAINT "intercom_sweep_state_pkey" PRIMARY KEY ("id")
   )`,
+  // Refund-scope fix: the Intercom unmirror gate moves from the whole billing
+  // category to this per-ticket flag (only refund-flow threads stay
+  // Discord-only). The UPDATE backfills pre-flag refund threads — the refund
+  // flow always stamps question 'Refund request' — and converges to a no-op.
+  `ALTER TABLE "tickets" ADD COLUMN IF NOT EXISTS "intercomExempt" BOOLEAN NOT NULL DEFAULT false`,
+  `UPDATE "tickets" SET "intercomExempt" = true
+    WHERE "categoryId" = 'billing' AND "question" = 'Refund request' AND "intercomExempt" = false`,
 ];
 
 export async function ensureSchema(prisma: PrismaClient): Promise<void> {

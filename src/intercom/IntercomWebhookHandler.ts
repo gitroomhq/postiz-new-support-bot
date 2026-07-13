@@ -469,24 +469,35 @@ export class IntercomWebhookHandler {
           await this.store.recordEchoPart(kind, String(part.id), threadId).catch(() => {});
           return;
         }
-        // Operator/Fin-authored parts can ONLY be the bridge's own output —
-        // the Operator identity never hand-types inbox replies (customers have
-        // no Messenger channel for the real Fin to answer on). There is no
-        // genuine reply to lose, so drop unconditionally instead of the
-        // defer-then-relay tiebreak below (which echoed mirrored AI answers
-        // back into Discord as "Fin" under backfill load).
+        // Operator/Fin-authored parts are AMBIGUOUS, not always ours: the
+        // bridge authors its posts as the Operator (withAuthor, no seat
+        // cost), but a live Fin answers customers under the same identity —
+        // the old unconditional identity drop here silently swallowed every
+        // genuine Fin reply. Echo suppression stays layered and deterministic
+        // instead: the part-id claim (layer 1) kills everything the confirm
+        // step recorded, the pending-post match above covers in-flight posts,
+        // and the defer below holds the reserve→confirm race window. The one
+        // Operator-specific guard left is content-shaped: 🤖-prefixed text is
+        // backfill-mirrored bot output (composeMessage stamps it, nobody
+        // hand-types it) — the exact shape that once echoed back into Discord
+        // as "Fin" under backfill load.
         const operatorId = this.settingsStore.intercomOperatorAdminId();
         const partAuthorId = part.author?.id != null ? String(part.author.id) : null;
-        if (operatorId && partAuthorId === operatorId) {
+        if (
+          operatorId &&
+          partAuthorId === operatorId &&
+          extractAgentBody(part.body ?? "").text.trim().startsWith("🤖")
+        ) {
           await this.store.recordEchoPart(kind, String(part.id), threadId).catch(() => {});
           return;
         }
-        // Layer 3 — bounded defer (human-admin-authored only: a genuine reply
-        // IS possible when the bridge authors as a human): outbound content
-        // still queued for this thread could produce this exact part. The
-        // catch below rolls the claim back so the retry can claim again.
-        // `attempt` is the echo-defer count (tracked separately from
-        // real-failure attempts), so deferral can't exhaust the retry budget.
+        // Layer 3 — bounded defer (every bridge-capable author, Operator
+        // included): outbound content still queued for this thread could
+        // produce this exact part — hold until the confirm lands, then the
+        // retried claim collides. The catch below rolls the claim back so the
+        // retry can claim again. `attempt` is the echo-defer count (tracked
+        // separately from real-failure attempts), so deferral can't exhaust
+        // the retry budget.
         if (attempt < MAX_DEFER_ATTEMPTS && (await this.hasPendingOutboundContent(threadId))) {
           throw new DeferEchoError();
         }
@@ -710,15 +721,11 @@ export class IntercomWebhookHandler {
         await this.store.recordEchoPart(kind, String(part.id), threadId).catch(() => {});
         return;
       }
-      // Operator/Fin-authored notes are always the bridge's own (context card,
-      // agent warning, corrective note) — never surface them as staff notes,
-      // even when the pending-post record is gone (see processAgentPart).
-      const operatorId = this.settingsStore.intercomOperatorAdminId();
-      const noteAuthorId = part.author?.id != null ? String(part.author.id) : null;
-      if (operatorId && noteAuthorId === operatorId) {
-        await this.store.recordEchoPart(kind, String(part.id), threadId).catch(() => {});
-        return;
-      }
+      // (No unconditional Operator drop here: the bridge's own notes —
+      // context card, agent warning, corrective note — are recorded at post
+      // time and die on the claim above or the pending match. An
+      // Operator-authored note that survives both is a genuine Fin note and
+      // surfaces like any staff note; see processAgentPart.)
       if (this.settingsStore.intercomMode() !== "bi") {
         // Not relayed in push/none — release so a real agent note isn't
         // permanently consumed while the mode is off. Bridge-authored notes

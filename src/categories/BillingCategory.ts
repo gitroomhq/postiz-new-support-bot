@@ -266,7 +266,12 @@ export class BillingCategory extends BaseCategory {
       });
 
       await thread.members.add(interaction.user.id);
-      await ctx.onTicketCreated(thread, interaction.user.id, interaction.user.displayName, "Refund request");
+      // intercomExempt: refund threads live Discord-only (self-service +
+      // /charge) — the exact question string doubles as the legacy-ticket
+      // match in ensureSchema's backfill, so keep both in sync.
+      await ctx.onTicketCreated(thread, interaction.user.id, interaction.user.displayName, "Refund request", {
+        intercomExempt: true,
+      });
 
       await interaction.editReply({
         embeds: [makeEmbed(`Your refund request thread has been created: ${thread}`, COLORS.success)],

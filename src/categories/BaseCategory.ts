@@ -19,7 +19,13 @@ export interface TicketContext {
   // Per-user rate limiting. Returns a customer-facing rejection message, or null when
   // the user may open a ticket. Must run before any thread is created.
   guardTicketCreate: (userId: string, guild: Guild | null) => Promise<string | null>;
-  onTicketCreated: (thread: ThreadChannel, customerId: string, displayName: string, question?: string) => Promise<void>;
+  onTicketCreated: (
+    thread: ThreadChannel,
+    customerId: string,
+    displayName: string,
+    question?: string,
+    opts?: { intercomExempt?: boolean }
+  ) => Promise<void>;
 }
 
 // Customer ticket categories. Agent-facing extras (auto-answer, staff pings,

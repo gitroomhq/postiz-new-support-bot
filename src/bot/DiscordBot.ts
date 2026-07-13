@@ -954,7 +954,7 @@ export class DiscordBot {
     const initial = this.settingsStore.initialTag();
     return {
       guardTicketCreate: (userId, guild) => this.ticketCreationBlockReason(userId, guild),
-      onTicketCreated: async (thread, customerId, displayName, question) => {
+      onTicketCreated: async (thread, customerId, displayName, question, opts) => {
         if (!initial) return;
         await this.ticketStore.create({
           threadId: thread.id,
@@ -964,6 +964,7 @@ export class DiscordBot {
           categoryId: category.id,
           statusTagId: initial.id,
           question: question ?? null,
+          intercomExempt: opts?.intercomExempt ?? false,
         });
         log.child("ticket").info("ticket.created", {
           "ticket.thread_id": thread.id,
@@ -1985,7 +1986,8 @@ export class DiscordBot {
     const extraButtons = new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder().setCustomId("config_intercom_snooze").setLabel("Snooze Tag").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("config_intercom_inactivity").setLabel("Inactivity").setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId("config_intercom_resync").setLabel("Sync Closed Tickets").setStyle(ButtonStyle.Secondary)
+      new ButtonBuilder().setCustomId("config_intercom_resync").setLabel("Sync Closed Tickets").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("config_intercom_heal").setLabel("Heal Message Gaps").setStyle(ButtonStyle.Secondary)
     );
 
     return { embeds: [embed], components: [modeButtons, setupButtons, actionButtons, extraButtons] };
@@ -4129,6 +4131,26 @@ export class DiscordBot {
       return;
     }
 
+    if (id === "config_intercom_heal") {
+      // Outage repair over OPEN tickets: bridged tickets get their
+      // never-delivered human messages re-enqueued (delivered-ledger gap —
+      // e.g. the billing-wide gate outage, or pre-link history), unbridged
+      // mirrorable tickets get a regular backfill (also repairs tickets whose
+      // creation ensure was short-circuited by the old gate: their workflows
+      // latched "linked" with no link row, so the next live message would
+      // dead-letter without this). Closed tickets are untouched — use
+      // Backfill tickets for those.
+      await interaction.deferReply({ flags: 64 });
+      if (this.settingsStore.intercomMode() === "none") {
+        await interaction.editReply({
+          embeds: [makeEmbed("The bridge is off — enable Push or Bidirectional first, then heal.", COLORS.warn)],
+        });
+        return;
+      }
+      await this.runIntercomMessageHeal(interaction);
+      return;
+    }
+
     if (id === "config_intercom_secrets") {
       const s = this.settingsStore;
       const modal = new ModalBuilder().setCustomId("config_intercom_secrets_modal").setTitle("Intercom Secrets");
@@ -5509,6 +5531,79 @@ export class DiscordBot {
     } catch (error) {
       log.child("discord:backfill").error("intercom backfill failed", error);
       await report("Intercom backfill failed — check the logs; you can safely run it again from /config → Intercom.", COLORS.danger);
+    }
+  }
+
+  // "Heal Message Gaps": outage repair over OPEN tickets only (closed ones
+  // are Backfill's job). Bridged → healMessageGaps re-enqueues human messages
+  // missing from the delivered ledger; unbridged mirrorable → backfillTicket
+  // (creates the link + transcript — this is what un-wedges tickets whose
+  // creation ensure was short-circuited by the old billing-wide gate).
+  // Idempotent end to end: ledgers dedup messages, claimBackfill dedups
+  // transcripts, so re-running after a partial failure is safe.
+  private async runIntercomMessageHeal(interaction: ButtonInteraction): Promise<void> {
+    const progress = await interaction
+      .followUp({ embeds: [makeEmbed("Intercom gap heal started…", COLORS.neutral)], flags: 64 })
+      .catch(() => null);
+    const report = async (text: string, color: number = COLORS.neutral) => {
+      if (!progress) return;
+      await interaction.webhook.editMessage(progress.id, { embeds: [makeEmbed(text, color)] }).catch(() => {});
+    };
+
+    try {
+      const tickets = (await this.ticketStore.getAllWithTag()).filter((t) => !t.closed);
+      let healedTickets = 0;
+      let healedMessages = 0;
+      let bridgedTickets = 0;
+      let untouched = 0;
+      let gone = 0;
+      let processed = 0;
+
+      for (const ticket of tickets) {
+        processed++;
+        const channel = await this.client.channels.fetch(ticket.threadId).catch(() => null);
+        const thread = channel?.isThread() ? (channel as ThreadChannel) : null;
+        if (!thread) {
+          gone++;
+          continue;
+        }
+        const messages = await this.fetchAllThreadMessages(thread);
+        if (await this.intercomStore.getLink(ticket.threadId)) {
+          const healed = await this.intercomSync.healMessageGaps(ticket, messages).catch(() => null);
+          if (healed != null && healed > 0) {
+            healedTickets++;
+            healedMessages += healed;
+          } else {
+            untouched++;
+          }
+        } else {
+          const count = await this.intercomSync.backfillTicket(ticket, messages).catch(() => null);
+          if (count != null) bridgedTickets++;
+          else untouched++;
+        }
+        if (processed % 10 === 0) {
+          await report(`Gap heal: ${processed}/${tickets.length} open tickets scanned, ${healedMessages} messages queued…`);
+        }
+      }
+
+      const summary = [
+        `Gap heal finished over **${tickets.length}** open ticket(s):`,
+        `• **${healedMessages}** missed message(s) re-queued across **${healedTickets}** bridged ticket(s)`,
+        `• **${bridgedTickets}** unbridged ticket(s) sent to backfill (link + full transcript)`,
+        `• ${untouched} needed nothing, ${gone} thread(s) gone`,
+        "",
+        "Delivery is paced through the ticket workflows; replayed parts keep their original timestamps (created_at backdating).",
+      ].join("\n");
+      await report(summary, COLORS.success);
+      void this.audit.log({
+        title: "🌉 Intercom gap heal",
+        severity: "info",
+        actor: interaction.user.displayName,
+        fields: [{ name: "Result", value: summary.slice(0, 1024) }],
+      });
+    } catch (error) {
+      log.child("discord:backfill").error("intercom gap heal failed", error);
+      await report("Gap heal failed — check the audit channel; it is safe to run again from /config → Intercom.", COLORS.danger);
     }
   }
 

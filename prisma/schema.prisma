@@ -400,6 +400,10 @@ model Ticket {
   customerId          String?
   customerDisplayName String?
   categoryId          String?
+  // Discord-only ticket: never mirrored to Intercom (no conversation, no
+  // ticket, no events). Set at creation by the self-service refund flow —
+  // refunds are handled in-thread via /charge and must not leak to Intercom.
+  intercomExempt      Boolean    @default(false)
   statusTagId         String?
   statusTag           StatusTag? @relation(fields: [statusTagId], references: [id])
   // Status the ticket had before the last status change (plain id, no FK — resolved via

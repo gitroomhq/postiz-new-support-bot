@@ -22,14 +22,19 @@ export interface BridgeSourceMessage {
   createdAt: Date;
 }
 
-// Ticket categories that are NEVER mirrored to Intercom (user decision:
-// refund requests live Discord-only — self-service flow + /charge staff
-// resolution). A /config picker can replace this constant if more categories
-// ever need excluding.
-export const UNMIRRORED_CATEGORY_IDS: ReadonlySet<string> = new Set(["billing"]);
-
-export function isUnmirroredCategory(categoryId: string | null | undefined): boolean {
-  return categoryId != null && UNMIRRORED_CATEGORY_IDS.has(categoryId);
+// Discord-only tickets are NEVER mirrored to Intercom (user decision: refund
+// requests live Discord-only — self-service flow + /charge staff resolution).
+// The per-ticket flag is the primary signal, set by the refund flow at
+// creation; the (category, question) pair is the belt for rows and queued
+// ensure payloads that predate the flag. Scoping this to the flag (not the
+// whole billing category) is deliberate: "Other Billing Question" tickets DO
+// mirror.
+export function isIntercomExempt(shape: {
+  intercomExempt?: boolean | null;
+  categoryId?: string | null;
+  question?: string | null;
+}): boolean {
+  return shape.intercomExempt === true || (shape.categoryId === "billing" && shape.question === "Refund request");
 }
 
 export const AGENT_WARNING_TEXT =
@@ -135,13 +140,17 @@ export class IntercomSyncService {
     return this.settingsStore.intercomMode() !== "none" && this.settingsStore.intercomConfigured();
   }
 
-  // Category gate: refund-request tickets live Discord-only (self-service +
+  // Exemption gate: refund-request tickets live Discord-only (self-service +
   // /charge) and are never mirrored — no conversation, no ticket, no events.
   // Applied at every outbound entry point so nothing ever enqueues for them;
   // the executor's ensure short-circuit is the second belt for the
   // workflow-synthesized creation ensure.
-  private mirrorable(ticket: { categoryId: string | null }): boolean {
-    return !isUnmirroredCategory(ticket.categoryId);
+  private mirrorable(ticket: {
+    intercomExempt?: boolean | null;
+    categoryId?: string | null;
+    question?: string | null;
+  }): boolean {
+    return !isIntercomExempt(ticket);
   }
 
   // ---- Live hooks (called fire-and-forget from DiscordBot/StatusService) ----
@@ -410,6 +419,58 @@ export class IntercomSyncService {
     return events.length;
   }
 
+  // Gap heal for an already-bridged ticket: enqueue the human messages that
+  // never reached Intercom (no "m"-ledger row) — outage windows (the
+  // billing-wide gate) and pre-link history (bridge enabled mid-ticket).
+  // Bot messages are skipped: the question already opens the conversation,
+  // and reminder/status embeds are noise in a live conversation. Old
+  // attachments go as text links (signed CDN urls expire), and original
+  // timestamps survive via created_at backdating. Idempotent: the executor
+  // re-checks the delivered ledger per message, so racing the live mirror
+  // (or a second heal run) can't double-post. Returns the number of message
+  // events enqueued, or null for unmirrored/unbridged tickets (backfillTicket
+  // owns the unbridged case).
+  async healMessageGaps(ticket: TicketWithTag, messages: BridgeSourceMessage[]): Promise<number | null> {
+    if (!this.enabled() || !this.mirrorable(ticket)) return null;
+    if (!(await this.store.getLink(ticket.threadId))) return null;
+
+    const events: Array<{ type: OutboxEventType; payload: OutboxPayload }> = [];
+    for (const message of messages) {
+      if (message.authorIsBot) continue;
+      if (await this.store.hasDeliveredMessage(message.discordMessageId)) continue;
+      const composed = this.composeMessage(ticket, message, !message.authorIsBot && message.authorId !== ticket.customerId);
+      if (!composed) continue;
+      events.push({ type: "message", payload: { ...composed, attachmentMode: "links" } });
+    }
+    const healed = events.length;
+    if (healed === 0) return 0;
+
+    // Replayed contact messages auto-reopen the conversation in Intercom —
+    // re-assert a closed/resolved state past the open/close damper (same
+    // forceOpenSync tail as backfill).
+    const tag = ticket.statusTag;
+    if (tag && (ticket.closed || tag.closesThread || isResolvedTag(tag))) {
+      events.push({
+        type: "status",
+        payload: {
+          statusTagId: tag.id,
+          statusLabel: `${tag.emoji} ${tag.label}`,
+          actorName: "Gap heal",
+          closed: ticket.closed,
+          resolved: tag.closesThread || isResolvedTag(tag),
+          forceOpenSync: true,
+        },
+      });
+    }
+
+    await this.chained(ticket.threadId, async () => {
+      for (const event of events) {
+        await this.emit(ticket.threadId, event.type, event.payload);
+      }
+    });
+    return healed;
+  }
+
   // ---- Composition helpers ----
 
   // Also used by the outbox executor's 404 self-heal to rebuild the remote objects.
@@ -442,6 +503,9 @@ export class IntercomSyncService {
       customerDisplayName: ticket.customerDisplayName,
       categoryId: ticket.categoryId,
       categoryLabel,
+      // Resolved at composition so the executor's short-circuit belt works on
+      // the payload alone (synthesized ensures are composed at delivery time).
+      intercomExempt: isIntercomExempt(ticket),
       question: ticket.question ?? null,
       questionAsOpening: true,
       threadUrl: this.threadUrlBuilder(ticket.threadId),
