@@ -18,16 +18,6 @@ export function coerceEffort(v: string | null | undefined, fallback: AiEffort): 
   return (AI_EFFORT_LEVELS as readonly string[]).includes(s) ? (s as AiEffort) : fallback;
 }
 
-// Totals stored after each scheduled report so the next one can show trend deltas.
-export type ReportSnapshot = {
-  openTotal: number;
-  doneTotal: number;
-  total: number;
-  overdueTotal: number;
-  // Absent in snapshots stored before this field existed; those simply show no delta.
-  awaitingTotal?: number;
-};
-
 export interface TagInput {
   emoji: string;
   label: string;
@@ -256,14 +246,6 @@ export class SettingsStore {
     return this.settings.githubRepo;
   }
 
-  aiSolveEnabled(): boolean {
-    return this.settings.aiSolveEnabled;
-  }
-
-  aiCommandsEnabled(): boolean {
-    return this.settings.aiCommandsEnabled;
-  }
-
   // Main model for customer answers + /ai ask|cause. Free-text (a new model id
   // works without a code change); defaults to the "sonnet" alias.
   aiModel(): string {
@@ -282,26 +264,8 @@ export class SettingsStore {
     return coerceEffort(this.settings.aiEffortAsk, "medium");
   }
 
-  aiEffortCause(): AiEffort {
-    return coerceEffort(this.settings.aiEffortCause, "high");
-  }
-
   aiMaxBudgetUsdAsk(): number {
     return this.settings.aiMaxBudgetUsdAsk;
-  }
-
-  aiMaxBudgetUsdCause(): number {
-    return this.settings.aiMaxBudgetUsdCause;
-  }
-
-  // Kill-switch for the live Postiz account pre-fetch in /ai ask|cause.
-  aiPostizPrefetchEnabled(): boolean {
-    return this.settings.aiPostizPrefetchEnabled;
-  }
-
-  // Feed earlier /ai run results on the same ticket back into new /ai runs.
-  aiPreviousRunsEnabled(): boolean {
-    return this.settings.aiPreviousRunsEnabled;
   }
 
   kbRefreshEnabled(): boolean {
@@ -318,38 +282,6 @@ export class SettingsStore {
 
   backfillDone(): boolean {
     return this.settings.backfillDone;
-  }
-
-  reportChannelId(): string | null {
-    return this.settings.reportChannelId;
-  }
-
-  reportEnabled(): boolean {
-    return this.settings.reportEnabled;
-  }
-
-  reportIntervalHours(): number {
-    return this.settings.reportIntervalHours;
-  }
- 
-  reportHour(): number | null {
-    return this.settings.reportHour;
-  }
- 
-  reportMinute(): number | null {
-    return this.settings.reportMinute;
-  }
- 
-  reportTimezone(): string {
-    return this.settings.reportTimezone;
-  }
-
-  overdueThresholdDays(): number {
-    return this.settings.overdueThresholdDays;
-  }
-
-  reportLastRunAt(): Date | null {
-    return this.settings.reportLastRunAt;
   }
 
   // 0 = disabled for both ticket limits.
@@ -397,14 +329,6 @@ export class SettingsStore {
     return (this.settings.allowedPriceIds ?? "").split(",").filter(Boolean);
   }
 
-  reportLastSnapshot(): ReportSnapshot | null {
-    const snap = this.settings.reportLastSnapshot as unknown;
-    if (snap && typeof snap === "object" && "openTotal" in snap) {
-      return snap as ReportSnapshot;
-    }
-    return null;
-  }
-
   tags(): StatusTag[] {
     return this.tagList;
   }
@@ -431,20 +355,8 @@ export class SettingsStore {
     return this.tagList.find((t) => t.closesThread);
   }
 
-  priorities(): PriorityTag[] {
-    return this.priorityList;
-  }
-
   priorityById(id: string): PriorityTag | undefined {
     return this.priorityList.find((p) => p.id === id);
-  }
-
-  priorityByEmoji(emoji: string): PriorityTag | undefined {
-    return this.priorityList.find((p) => p.emoji === emoji);
-  }
-
-  initialPriority(): PriorityTag | undefined {
-    return this.priorityList.find((p) => p.isInitial);
   }
 
   // ---- Intercom bridge ----
@@ -542,6 +454,46 @@ export class SettingsStore {
     this.settings = await this.prisma.botSettings.update({
       where: { id: "global" },
       data: { intercomMode: mode, intercomModeChangedAt: new Date() },
+    });
+  }
+
+  // ---- Workspace inactivity sweeper (native/unbridged conversations + tickets) ----
+
+  inactivityEnabled(): boolean {
+    return this.settings.inactivityEnabled;
+  }
+
+  inactivityAgentWaitDays(): number {
+    return this.settings.inactivityAgentWaitDays;
+  }
+
+  inactivityCustomerWaitDays(): number {
+    return this.settings.inactivityCustomerWaitDays;
+  }
+
+  inactivityNagsBeforeClose(): number {
+    return this.settings.inactivityNagsBeforeClose;
+  }
+
+  async updateInactivity(data: {
+    inactivityEnabled?: boolean;
+    inactivityAgentWaitDays?: number;
+    inactivityCustomerWaitDays?: number;
+    inactivityNagsBeforeClose?: number;
+  }): Promise<void> {
+    this.settings = await this.prisma.botSettings.update({ where: { id: "global" }, data });
+  }
+
+  // ---- One-time agent-rip migration stamp ----
+
+  agentRipMigratedAt(): Date | null {
+    return this.settings.agentRipMigratedAt;
+  }
+
+  async recordAgentRipMigration(): Promise<void> {
+    this.settings = await this.prisma.botSettings.update({
+      where: { id: "global" },
+      data: { agentRipMigratedAt: new Date() },
     });
   }
 
@@ -704,38 +656,6 @@ export class SettingsStore {
     return this.settings.sentryAiRecordContent;
   }
 
-  // Sentry READ access (separate from the write-only DSN). Token decrypted on read.
-  sentryReadEnabled(): boolean {
-    return this.settings.sentryReadEnabled;
-  }
-
-  sentryReadToken(): string | null {
-    return this.resolveSecret(this.settings.sentryReadToken, "sentryReadToken");
-  }
-
-  sentryOrgSlug(): string | null {
-    return this.settings.sentryOrgSlug?.trim() || null;
-  }
-
-  sentryProjectSlug(): string | null {
-    return this.settings.sentryProjectSlug?.trim() || null;
-  }
-
-  // Data region of the read org — org tokens don't auto-route to EU (de.sentry.io).
-  sentryReadRegion(): "us" | "eu" {
-    return this.settings.sentryReadRegion === "eu" ? "eu" : "us";
-  }
-
-  // True only when read correlation is on AND fully credentialed.
-  sentryReadConfigured(): boolean {
-    return (
-      this.sentryReadEnabled() &&
-      !!this.sentryReadToken() &&
-      !!this.sentryOrgSlug() &&
-      !!this.sentryProjectSlug()
-    );
-  }
-
   // ---- InfluxDB 2.x metrics export (paired with /config → Analytics) ----
 
   influxEnabled(): boolean {
@@ -840,57 +760,7 @@ export class SettingsStore {
 
   // ---- AI ticket scoring (Batch API) ----
 
-  scoringEnabled(): boolean {
-    return this.settings.scoringEnabled;
-  }
-
-  scoringIntervalHours(): number {
-    return this.settings.scoringIntervalHours;
-  }
-
-  // Free-text like aiModel: a new Anthropic model id works without a code change.
-  scoringModel(): string {
-    return this.settings.scoringModel;
-  }
-
-  scoringMaxTicketsPerBatch(): number {
-    return this.settings.scoringMaxTicketsPerBatch;
-  }
-
-  scoringMaxBudgetUsdPerDay(): number {
-    return this.settings.scoringMaxBudgetUsdPerDay;
-  }
-
-  scoringLastRunAt(): Date | null {
-    return this.settings.scoringLastRunAt;
-  }
-
-  scoringBackfillPending(): boolean {
-    return this.settings.scoringBackfillPending;
-  }
-
   // ---- Evaluation escalation (daily re-score of flagged tickets, ~12x/ticket) ----
-
-  scoringEscalationEnabled(): boolean {
-    return this.settings.scoringEscalationEnabled;
-  }
-
-  // Free-text like scoringModel; must be a real model id (no alias resolution).
-  scoringEscalationModel(): string {
-    return this.settings.scoringEscalationModel;
-  }
-
-  scoringEscalationIntervalHours(): number {
-    return this.settings.scoringEscalationIntervalHours;
-  }
-
-  scoringEscalationMaxTicketsPerBatch(): number {
-    return this.settings.scoringEscalationMaxTicketsPerBatch;
-  }
-
-  scoringEscalationLastRunAt(): Date | null {
-    return this.settings.scoringEscalationLastRunAt;
-  }
 
   // The Influx token is encrypted at rest; pass a field as undefined to leave it
   // unchanged, null/"" to clear it.
@@ -900,16 +770,6 @@ export class SettingsStore {
     influxOrg?: string | null;
     influxBucket?: string | null;
     influxToken?: string | null;
-    scoringEnabled?: boolean;
-    scoringIntervalHours?: number;
-    scoringModel?: string;
-    scoringMaxTicketsPerBatch?: number;
-    scoringMaxBudgetUsdPerDay?: number;
-    scoringBackfillPending?: boolean;
-    scoringEscalationEnabled?: boolean;
-    scoringEscalationModel?: string;
-    scoringEscalationIntervalHours?: number;
-    scoringEscalationMaxTicketsPerBatch?: number;
   }): Promise<void> {
     const { influxToken, ...rest } = data;
     this.settings = await this.prisma.botSettings.update({
@@ -1000,27 +860,6 @@ export class SettingsStore {
     });
   }
 
-  async recordScoringRun(): Promise<void> {
-    this.settings = await this.prisma.botSettings.update({
-      where: { id: "global" },
-      data: { scoringLastRunAt: new Date() },
-    });
-  }
-
-  async recordScoringEscalationRun(): Promise<void> {
-    this.settings = await this.prisma.botSettings.update({
-      where: { id: "global" },
-      data: { scoringEscalationLastRunAt: new Date() },
-    });
-  }
-
-  async setScoringBackfillPending(pending: boolean): Promise<void> {
-    this.settings = await this.prisma.botSettings.update({
-      where: { id: "global" },
-      data: { scoringBackfillPending: pending },
-    });
-  }
-
   sentryConfig(): SentryRuntimeConfig {
     return {
       dsn: this.sentryDsn(),
@@ -1047,27 +886,6 @@ export class SettingsStore {
     this.settings = await this.prisma.botSettings.update({
       where: { id: "global" },
       data,
-    });
-  }
-
-  // Sentry READ credentials. The token is encrypted at rest; pass a field as
-  // undefined to leave it unchanged, null/"" to clear it.
-  async updateSentryRead(data: {
-    sentryReadEnabled?: boolean;
-    sentryReadToken?: string | null;
-    sentryOrgSlug?: string | null;
-    sentryProjectSlug?: string | null;
-    sentryReadRegion?: string;
-  }): Promise<void> {
-    const { sentryReadToken, ...rest } = data;
-    this.settings = await this.prisma.botSettings.update({
-      where: { id: "global" },
-      data: {
-        ...rest,
-        ...(sentryReadToken !== undefined
-          ? { sentryReadToken: await this.routeSecretWrite("sentryReadToken", sentryReadToken) }
-          : {}),
-      },
     });
   }
 
@@ -1112,16 +930,10 @@ export class SettingsStore {
     threadsChannelId?: string | null;
     supportRoleId?: string | null;
     githubRepo?: string | null;
-    aiSolveEnabled?: boolean;
-    aiCommandsEnabled?: boolean;
     aiModel?: string;
     aiModelLight?: string;
     aiEffortAsk?: string;
-    aiEffortCause?: string;
     aiMaxBudgetUsdAsk?: number;
-    aiMaxBudgetUsdCause?: number;
-    aiPostizPrefetchEnabled?: boolean;
-    aiPreviousRunsEnabled?: boolean;
     maxOpenTicketsPerUser?: number;
     ticketCooldownMinutes?: number;
     auditLogChannelId?: string | null;
@@ -1208,39 +1020,6 @@ export class SettingsStore {
     });
   }
 
-  async updateReport(data: {
-    reportChannelId?: string | null;
-    reportEnabled?: boolean;
-    reportIntervalHours?: number;
-    reportHour?: number | null;
-    reportMinute?: number | null;
-    reportTimezone?: string;
-    overdueThresholdDays?: number;
-  }): Promise<void> {
-    const merged = { ...this.settings, ...data };
-    const usesScheduledTime = merged.reportHour != null && merged.reportMinute != null;
-
-    // reportLastRunAt records actual posts; the scheduler's once-per-day guard relies on that.
-    // Only interval mode rebases it on enable, so the first post lands one full interval out
-    // instead of firing immediately on the next tick. In scheduled-time mode we leave it
-    // untouched: stamping "now" would make the daily guard skip today's scheduled run (the
-    // original bug), and clearing it would let a later reconfigure re-post on a day a report
-    // already went out (the double-post).
-    const rebase = data.reportEnabled === true && !this.settings.reportEnabled && !usesScheduledTime;
-
-    this.settings = await this.prisma.botSettings.update({
-      where: { id: "global" },
-      data: { ...data, ...(rebase ? { reportLastRunAt: new Date() } : {}) },
-    });
-  }
-
-  async recordReportRun(snapshot: ReportSnapshot): Promise<void> {
-    this.settings = await this.prisma.botSettings.update({
-      where: { id: "global" },
-      data: { reportLastRunAt: new Date(), reportLastSnapshot: snapshot },
-    });
-  }
-
   async markBackfillDone(): Promise<void> {
     this.settings = await this.prisma.botSettings.update({
       where: { id: "global" },
@@ -1251,11 +1030,6 @@ export class SettingsStore {
   async addTag(input: TagInput): Promise<StatusTag> {
     if (this.tagByEmoji(input.emoji.trim())) {
       throw new Error(`A tag with the emoji ${input.emoji.trim()} already exists.`);
-    }
-    // Status and priority emojis must stay disjoint — thread-title parsing tells
-    // the two slots apart by which list the emoji belongs to.
-    if (this.priorityByEmoji(input.emoji.trim())) {
-      throw new Error(`The emoji ${input.emoji.trim()} is already used by a priority.`);
     }
     const nextOrder = this.tagList.reduce((max, t) => Math.max(max, t.sortOrder), -1) + 1;
     const created = await this.prisma.$transaction(async (tx) => {
@@ -1289,9 +1063,6 @@ export class SettingsStore {
       const clash = this.tagByEmoji(input.emoji.trim());
       if (clash && clash.id !== id) {
         throw new Error(`A tag with the emoji ${input.emoji.trim()} already exists.`);
-      }
-      if (this.priorityByEmoji(input.emoji.trim())) {
-        throw new Error(`The emoji ${input.emoji.trim()} is already used by a priority.`);
       }
     }
     const updated = await this.prisma.$transaction(async (tx) => {
@@ -1354,86 +1125,6 @@ export class SettingsStore {
     return { reassignedThreadIds: affected.map((t) => t.threadId), initial };
   }
 
-  async addPriority(input: PriorityInput): Promise<PriorityTag> {
-    const emoji = input.emoji.trim();
-    if (this.priorityByEmoji(emoji)) {
-      throw new Error(`A priority with the emoji ${emoji} already exists.`);
-    }
-    if (this.tagByEmoji(emoji)) {
-      throw new Error(`The emoji ${emoji} is already used by a status tag.`);
-    }
-    const nextOrder = this.priorityList.reduce((max, p) => Math.max(max, p.sortOrder), -1) + 1;
-    const created = await this.prisma.$transaction(async (tx) => {
-      if (input.isInitial) {
-        await tx.priorityTag.updateMany({ data: { isInitial: false } });
-      }
-      return tx.priorityTag.create({
-        data: {
-          emoji,
-          label: input.label.trim(),
-          isInitial: input.isInitial ?? false,
-          sortOrder: nextOrder,
-        },
-      });
-    });
-    await this.refreshPriorities();
-    return created;
-  }
-
-  async editPriority(id: string, input: Partial<PriorityInput>): Promise<PriorityTag> {
-    if (input.emoji) {
-      const emoji = input.emoji.trim();
-      const clash = this.priorityByEmoji(emoji);
-      if (clash && clash.id !== id) {
-        throw new Error(`A priority with the emoji ${emoji} already exists.`);
-      }
-      if (this.tagByEmoji(emoji)) {
-        throw new Error(`The emoji ${emoji} is already used by a status tag.`);
-      }
-    }
-    const updated = await this.prisma.$transaction(async (tx) => {
-      if (input.isInitial) {
-        await tx.priorityTag.updateMany({ where: { id: { not: id } }, data: { isInitial: false } });
-      }
-      return tx.priorityTag.update({
-        where: { id },
-        data: {
-          ...(input.emoji !== undefined ? { emoji: input.emoji.trim() } : {}),
-          ...(input.label !== undefined ? { label: input.label.trim() } : {}),
-          ...(input.isInitial !== undefined ? { isInitial: input.isInitial } : {}),
-        },
-      });
-    });
-    await this.refreshPriorities();
-    return updated;
-  }
-
-  // Deletes a priority, reassigning any open tickets that used it to the initial
-  // priority. Returns the threadIds of reassigned tickets so callers can rename them.
-  async removePriority(id: string): Promise<{ reassignedThreadIds: string[]; initial: PriorityTag }> {
-    const priority = this.priorityById(id);
-    if (!priority) throw new Error("Priority not found.");
-    if (priority.isInitial) throw new Error("The initial priority can't be removed. Mark another priority as initial first.");
-    const initial = this.initialPriority();
-    if (!initial) throw new Error("No initial priority is configured.");
-
-    const affected = await this.prisma.ticket.findMany({
-      where: { priorityTagId: id, closed: false },
-      select: { threadId: true },
-    });
-
-    await this.prisma.$transaction([
-      this.prisma.ticket.updateMany({
-        where: { priorityTagId: id },
-        data: { priorityTagId: initial.id },
-      }),
-      this.prisma.priorityTag.delete({ where: { id } }),
-    ]);
-
-    await this.refreshPriorities();
-    return { reassignedThreadIds: affected.map((t) => t.threadId), initial };
-  }
-
   // Moves a status tag one slot up/down in the display order. Renumbers the whole
   // list to a contiguous 0..n-1 sortOrder so a move is reliable even if existing
   // values were duplicated or sparse. No-op when already at the requested edge.
@@ -1450,17 +1141,4 @@ export class SettingsStore {
     await this.refreshTags();
   }
 
-  // Priority-axis mirror of moveTag.
-  async movePriority(id: string, direction: "up" | "down"): Promise<void> {
-    const order = [...this.priorityList]; // already sorted by sortOrder asc
-    const idx = order.findIndex((p) => p.id === id);
-    if (idx === -1) throw new Error("Priority not found.");
-    const swapIdx = direction === "up" ? idx - 1 : idx + 1;
-    if (swapIdx < 0 || swapIdx >= order.length) return;
-    [order[idx], order[swapIdx]] = [order[swapIdx], order[idx]];
-    await this.prisma.$transaction(
-      order.map((p, i) => this.prisma.priorityTag.update({ where: { id: p.id }, data: { sortOrder: i } }))
-    );
-    await this.refreshPriorities();
-  }
 }

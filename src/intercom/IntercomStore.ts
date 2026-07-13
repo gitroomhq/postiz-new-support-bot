@@ -353,12 +353,54 @@ export class IntercomStore {
     await this.prisma.intercomMessageMap.updateMany({ where: { id }, data: { redactedAt: at } });
   }
 
+  // Newest relayed-agent-message stamp for a thread — the ping-cadence anchor
+  // (mention the customer only on the first agent reply after their activity).
+  async getLatestInboundRelayAt(ticketThreadId: string): Promise<Date | null> {
+    const row = await this.prisma.intercomMessageMap.findFirst({
+      where: { ticketThreadId, direction: "in" },
+      orderBy: { createdAt: "desc" },
+      select: { createdAt: true },
+    });
+    return row?.createdAt ?? null;
+  }
+
   // ---- Inbound tag-diff damper ----
 
   async setLastTags(ticketThreadId: string, tags: string[]): Promise<void> {
     await this.prisma.intercomLink.updateMany({
       where: { ticketThreadId },
       data: { lastTagsJson: tags },
+    });
+  }
+
+  // ---- Inactivity sweeper damper state (native/unbridged objects) ----
+
+  async getSweepState(id: string): Promise<{
+    lastAgentRemindedAt: Date | null;
+    customerNagCount: number;
+    lastCustomerNagAt: Date | null;
+    sweepClosedAt: Date | null;
+  } | null> {
+    return this.prisma.intercomSweepState.findUnique({
+      where: { id },
+      select: { lastAgentRemindedAt: true, customerNagCount: true, lastCustomerNagAt: true, sweepClosedAt: true },
+    });
+  }
+
+  async upsertSweepState(
+    id: string,
+    kind: "conversation" | "ticket",
+    data: {
+      lastAgentRemindedAt?: Date | null;
+      customerNagCount?: number;
+      lastCustomerNagAt?: Date | null;
+      sweepClosedAt?: Date | null;
+    }
+  ): Promise<void> {
+    await this.prisma.intercomSweepState.upsert({
+      where: { id },
+      create: { id, kind, ...data },
+      update: data,
     });
   }
 
@@ -371,6 +413,7 @@ export class IntercomStore {
       this.prisma.intercomEchoPart.deleteMany(),
       this.prisma.intercomPendingPost.deleteMany(),
       this.prisma.intercomMessageMap.deleteMany(),
+      this.prisma.intercomSweepState.deleteMany(),
     ]);
     return { links: links.count, parts: parts.count };
   }

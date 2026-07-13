@@ -4,10 +4,11 @@ import { AuditLogger } from "../bot/AuditLogger";
 import { SettingsStore } from "../config/SettingsStore";
 import { IntercomClient, IntercomHttpError } from "./IntercomClient";
 import { IntercomStore } from "./IntercomStore";
-import { IntercomSyncService, externalIdCandidates } from "./IntercomSyncService";
+import { IntercomSyncService, externalIdCandidates, isUnmirroredCategory } from "./IntercomSyncService";
 import { bodyHash, renderDiscordMarkdownToHtml } from "./renderDiscordMarkdown";
 import { log } from "../util/logger";
 import {
+  AgentReminderPayload,
   CsatPayload,
   EnsurePayload,
   MessageDeletePayload,
@@ -15,7 +16,6 @@ import {
   MessagePayload,
   NotePayload,
   OutboxEventType,
-  PriorityPayload,
   StatusPayload,
 } from "./types";
 
@@ -24,8 +24,8 @@ const MAX_ATTACHMENT_URLS = 10;
 
 // Ticket attributes the bridge writes. Auto-created via the /config "Ensure
 // attributes" action; executors degrade (skip the attribute) when missing.
-export const TICKET_ATTR_PRIORITY = "Priority";
 export const TICKET_ATTR_CSAT = "CSAT";
+export const TICKET_ATTR_CSAT_COMMENT = "CSAT Comment";
 export const TICKET_ATTR_THREAD = "Discord Thread";
 // "Came from Discord" markers on the conversation itself: a tag (find-or-create
 // via API, works with zero setup) and an Origin attribute (definition is
@@ -101,9 +101,22 @@ export class IntercomEventExecutor {
   // the still-running attempt, duplicating conversations.
   async execute(threadId: string, type: OutboxEventType, payload: unknown, beat?: () => void): Promise<void> {
     switch (type) {
-      case "ensure":
-        await this.ensureBridge(threadId, payload as EnsurePayload, beat);
+      case "ensure": {
+        // Refund tickets are never mirrored (emit-layer gate); the ONE event
+        // that reaches this executor for them anyway is the ticket workflow's
+        // creation-synthesized ensure — short-circuit it as a success so the
+        // pump drains without creating anything.
+        const ensurePayload = payload as EnsurePayload;
+        if (isUnmirroredCategory(ensurePayload?.categoryId)) {
+          this.execLog.info("ensure skipped (unmirrored category)", {
+            "ticket.thread_id": threadId,
+            "ticket.category_id": ensurePayload?.categoryId ?? "",
+          });
+          return;
+        }
+        await this.ensureBridge(threadId, ensurePayload, beat);
         return;
+      }
       case "message":
         await this.executeMessage(threadId, payload as MessagePayload);
         return;
@@ -114,10 +127,15 @@ export class IntercomEventExecutor {
         await this.executeStatus(threadId, payload as StatusPayload);
         return;
       case "priority":
-        await this.executePriority(threadId, payload as PriorityPayload);
+        // Legacy queued events from before the priority axis was unbridged
+        // (agent-rip) — nothing to mirror anymore.
+        this.execLog.info("priority event skipped (axis retired)", { "ticket.thread_id": threadId });
         return;
       case "csat":
         await this.executeCsat(threadId, payload as CsatPayload);
+        return;
+      case "agent_reminder":
+        await this.executeAgentReminder(threadId, payload as AgentReminderPayload);
         return;
       case "message_edit":
         await this.executeMessageEdit(threadId, payload as MessageEditPayload);
@@ -225,7 +243,6 @@ export class IntercomEventExecutor {
     // Ticket attributes; the definitions may not exist yet ("/config → Ensure
     // Attributes" or a one-time manual creation fixes that) — degrade.
     const attributes: Record<string, unknown> = { [TICKET_ATTR_THREAD]: threadId };
-    if (payload.priorityLabel) attributes[TICKET_ATTR_PRIORITY] = payload.priorityLabel;
     try {
       await this.withAuthor((a) => this.client.updateTicket(ticketId, { attributes, adminId: a }));
     } catch (e) {
@@ -840,36 +857,57 @@ export class IntercomEventExecutor {
     }
   }
 
-  private async executePriority(threadId: string, payload: PriorityPayload): Promise<void> {
-    const link = await this.requireLink(threadId);
-    if (link.ticketId) {
-      try {
-        await this.withAuthor((a) =>
-          this.client.updateTicket(link.ticketId!, { attributes: { [TICKET_ATTR_PRIORITY]: payload.priorityLabel }, adminId: a })
-        );
-      } catch (e) {
-        // Attribute definition missing — degrade (messages-only mirroring, no note).
-        if (!(e instanceof IntercomHttpError && (e.status === 400 || e.status === 422))) throw e;
-      }
-      await this.reassertConversationClosed(threadId, link);
-    }
-  }
-
-  // CSAT lands as a ticket attribute only (messages-only mirroring). CSAT
-  // typically arrives AFTER the close — without the re-assert the attribute
-  // write reopens the conversation in Intercom.
+  // CSAT: score + the customer's comment. Intercom's native conversation_rating
+  // is READ-ONLY via the public REST API (no rate endpoint; ratings originate
+  // in Messenger, which these customers never see — verified against the API
+  // docs, 1.0–2.15 + Preview), so attributes are the native ceiling:
+  //  - ticket attributes "CSAT" + "CSAT Comment" (definitions auto-creatable
+  //    via /config → Intercom → Ensure Attributes);
+  //  - conversation custom attributes with the same names (definitions can NOT
+  //    be API-created — Origin-marker pattern: 4xx-degrade until they are
+  //    hand-created in Settings → Data → Conversations).
+  // CSAT typically arrives AFTER the close — without the re-assert the
+  // attribute writes reopen the conversation in Intercom.
   private async executeCsat(threadId: string, payload: CsatPayload): Promise<void> {
     const link = await this.requireLink(threadId);
+    const attributes: Record<string, unknown> = { [TICKET_ATTR_CSAT]: `${payload.score}/5` };
+    if (payload.comment?.trim()) attributes[TICKET_ATTR_CSAT_COMMENT] = payload.comment.trim().slice(0, 1024);
     if (link.ticketId) {
       try {
-        await this.withAuthor((a) =>
-          this.client.updateTicket(link.ticketId!, { attributes: { [TICKET_ATTR_CSAT]: `${payload.score}/5` }, adminId: a })
-        );
+        await this.withAuthor((a) => this.client.updateTicket(link.ticketId!, { attributes, adminId: a }));
       } catch (e) {
         if (!(e instanceof IntercomHttpError && (e.status === 400 || e.status === 422))) throw e;
       }
-      await this.reassertConversationClosed(threadId, link);
     }
+    try {
+      await this.client.setConversationAttributes(link.conversationId, attributes);
+    } catch (e) {
+      // Conversation attribute definitions are UI-only — degrade silently
+      // until they exist (same contract as markDiscordOrigin).
+      if (!isPermanent4xx(e)) throw e;
+    }
+    await this.reassertConversationClosed(threadId, link);
+  }
+
+  // Agent-idle reminder (bridged ticket, SUPPORT reminder target): internal
+  // note + reopen so the conversation resurfaces in the Intercom inbox. The
+  // reopen intentionally bypasses the lastSyncedOpen damper — surfacing the
+  // conversation IS the point — and updates it afterwards so status parity
+  // stays coherent. Echo safety: both parts are bridge-authored (attribution
+  // gate drops the webhooks) and the note rides the pending-post handshake.
+  private async executeAgentReminder(threadId: string, payload: AgentReminderPayload): Promise<void> {
+    const link = await this.requireLink(threadId);
+    const lines = [
+      `⏰ <b>Waiting on an agent reply for ${Math.max(1, Math.round(payload.idleDays))} day(s).</b>`,
+      payload.threadUrl ? `<a href="${payload.threadUrl}">Open Discord thread</a>` : null,
+    ].filter(Boolean);
+    await this.postAdminNote(threadId, link.conversationId, `<p>${lines.join("<br>")}</p>`, undefined, true);
+    try {
+      await this.withAuthor((a) => this.client.setConversationOpen(link.conversationId, true, a));
+    } catch (e) {
+      if (!isPermanent4xx(e)) throw e; // "already open" & co — desired end state
+    }
+    await this.store.setLastSyncedOpen(threadId, "open");
   }
 }
 

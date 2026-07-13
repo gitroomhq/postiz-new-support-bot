@@ -1,44 +1,38 @@
-import { WithStartWorkflowOperation, type Client, type ScheduleSpec } from "@temporalio/client";
-import { WorkflowExecutionAlreadyStartedError, type SearchAttributePair } from "@temporalio/common";
+import { WithStartWorkflowOperation, type Client } from "@temporalio/client";
+import type { SearchAttributePair } from "@temporalio/common";
 import type { SettingsStore } from "../config/SettingsStore";
 import { log } from "../util/logger";
 import type { GatewayResult, TemporalService } from "./TemporalService";
-import { looperStartOptions, reconcileLooperGeneration } from "./looperGeneration";
+import { looperStartOptions, reconcileLooperGeneration, retireByQuery, retireWorkflowId } from "./looperGeneration";
 import {
-  aiRunWorkflowId,
   inboxWorkflowId,
   LOOPER_GENERATIONS,
   refundWorkflowId,
-  SA_AI_KIND,
+  RETIRED_SCHEDULES,
+  RETIRED_SINGLETONS,
+  RETIRED_WORKFLOW_QUERIES,
   SA_CONVERSATION_ID,
   SA_TICKET_THREAD_ID,
-  scoreOneWorkflowId,
   SIG_DISPUTES_RUN_NOW,
   SIG_HUMAN_MESSAGE,
+  SIG_INACTIVITY_RUN_NOW,
   SIG_INBOUND_EVENT,
   SIG_INTERCOM_CLEAR_OUTBOX,
   SIG_INTERCOM_ENQUEUE,
   SIG_KB_REFRESH_NOW,
   SIG_NOOP,
-  SIG_REMINDERS_PAUSED,
   SIG_REQUEST_STATUS_CHANGE,
-  SIG_SCORING_ESCALATION_RUN_NOW,
-  SIG_SCORING_RUN_NOW,
   SIG_TICKET_CREATED,
   SINGLETONS,
-  STATUS_REPORT_SCHEDULE_ID,
   stripeEventWorkflowId,
   ticketWorkflowId,
-  UPD_APPLY_PRIORITY,
   UPD_APPLY_STATUS,
   VAULT_UPGRADE_WORKFLOW_ID,
   type KeywordSaKey,
-  type AiRunInput,
   type ApplyStatusResult,
   type HumanMessageSignal,
   type IcEventType,
   type InboundEventSignal,
-  type PriorityChangeRequest,
   type RefundOutcome,
   type RefundWorkflowInput,
   type StatusChangeRequest,
@@ -144,10 +138,6 @@ export class TemporalProducers {
     return this.signalTicket(threadId, SIG_INTERCOM_CLEAR_OUTBOX);
   }
 
-  async remindersPaused(threadId: string, paused: boolean): Promise<GatewayResult> {
-    return this.signalTicket(threadId, SIG_REMINDERS_PAUSED, { paused });
-  }
-
   async requestStatusChange(threadId: string, req: StatusChangeRequest): Promise<GatewayResult> {
     return this.signalTicket(threadId, SIG_REQUEST_STATUS_CHANGE, req);
   }
@@ -157,10 +147,6 @@ export class TemporalProducers {
 
   async applyStatus(threadId: string, req: StatusChangeRequest): Promise<ApplyStatusResult | null> {
     return this.updateTicket<ApplyStatusResult>(threadId, UPD_APPLY_STATUS, req);
-  }
-
-  async applyPriority(threadId: string, req: PriorityChangeRequest): Promise<{ ok: boolean } | null> {
-    return this.updateTicket<{ ok: boolean }>(threadId, UPD_APPLY_PRIORITY, req);
   }
 
   private async updateTicket<R>(threadId: string, updateName: string, arg: unknown): Promise<R | null> {
@@ -217,62 +203,6 @@ export class TemporalProducers {
     });
   }
 
-  // ---- AI ----
-
-  // The workflow id (per user) + REJECT_DUPLICATE conflict policy IS the
-  // per-user /ai mutex. NOT buffered: the invoker is waiting on an ephemeral.
-  async startAiRun(input: AiRunInput): Promise<"started" | "already_running" | "unavailable"> {
-    const client = await this.temporal.client();
-    if (!client) return "unavailable";
-    try {
-      await client.workflow.start("aiRunWorkflow", {
-        workflowId: aiRunWorkflowId(input.userId),
-        taskQueue: this.temporal.envConfig().taskQueue,
-        args: [input],
-        workflowIdConflictPolicy: "FAIL",
-        workflowIdReusePolicy: "ALLOW_DUPLICATE",
-        memo: { sub: input.sub, threadId: input.threadId },
-        ...this.sa([
-          { key: SA_TICKET_THREAD_ID, value: input.threadId },
-          { key: SA_AI_KIND, value: input.sub },
-        ]),
-      });
-      return "started";
-    } catch (e) {
-      if (e instanceof WorkflowExecutionAlreadyStartedError) return "already_running";
-      prodLog.warn("ai run start failed", { "error.message": e instanceof Error ? e.message : String(e) });
-      return "unavailable";
-    }
-  }
-
-  // /config "Score one now": synchronous outcome; null = Temporal unavailable
-  // or the workflow failed — the caller falls back to the direct in-process
-  // call (same seam shape as executeRefund). USE_EXISTING joins a double-click
-  // onto the already-running score for that thread.
-  async executeScoreOne(threadId: string): Promise<string | null> {
-    const client = await this.temporal.client();
-    if (!client) return null;
-    try {
-      return (await client.workflow.execute("scoreOneWorkflow", {
-        workflowId: scoreOneWorkflowId(threadId),
-        taskQueue: this.temporal.envConfig().taskQueue,
-        args: [{ threadId }],
-        workflowIdConflictPolicy: "USE_EXISTING",
-        workflowIdReusePolicy: "ALLOW_DUPLICATE",
-        ...this.sa([
-          { key: SA_TICKET_THREAD_ID, value: threadId },
-          { key: SA_AI_KIND, value: "score_one" },
-        ]),
-      })) as string;
-    } catch (e) {
-      prodLog.warn("score-one workflow failed — caller falls back to direct call", {
-        "ticket.thread_id": threadId,
-        "error.message": e instanceof Error ? e.message : String(e),
-      });
-      return null;
-    }
-  }
-
   // ---- billing (synchronous outcome; null = Temporal unavailable) ----
 
   async executeRefund(input: RefundWorkflowInput): Promise<RefundOutcome | null> {
@@ -312,24 +242,6 @@ export class TemporalProducers {
     });
   }
 
-  async scoringRunNow(): Promise<GatewayResult> {
-    return this.temporal.signalWithStart({
-      workflowType: "scoringLoopWorkflow",
-      workflowId: SINGLETONS.scoringLoop,
-      signalName: SIG_SCORING_RUN_NOW,
-      options: looperStartOptions(SINGLETONS.scoringLoop),
-    });
-  }
-
-  async scoringEscalationRunNow(): Promise<GatewayResult> {
-    return this.temporal.signalWithStart({
-      workflowType: "scoringLoopWorkflow",
-      workflowId: SINGLETONS.scoringLoop,
-      signalName: SIG_SCORING_ESCALATION_RUN_NOW,
-      options: looperStartOptions(SINGLETONS.scoringLoop),
-    });
-  }
-
   async disputesRunNow(): Promise<GatewayResult> {
     return this.temporal.signalWithStart({
       workflowType: "disputesLoopWorkflow",
@@ -339,31 +251,34 @@ export class TemporalProducers {
     });
   }
 
-  async runReportNow(): Promise<GatewayResult> {
-    return this.temporal.startWorkflow({
-      workflowType: "publishStatusReportWorkflow",
-      workflowId: `${STATUS_REPORT_SCHEDULE_ID}-manual`,
-      args: [{ force: true }],
-      options: { workflowIdReusePolicy: "ALLOW_DUPLICATE" },
+  async inactivityRunNow(): Promise<GatewayResult> {
+    return this.temporal.signalWithStart({
+      workflowType: "inactivityLoopWorkflow",
+      workflowId: SINGLETONS.inactivityLoop,
+      signalName: SIG_INACTIVITY_RUN_NOW,
+      options: looperStartOptions(SINGLETONS.inactivityLoop),
     });
   }
 
-  // ---- baseline: singleton loopers + the status-report Schedule ----
+  // ---- baseline: retire dead singletons/schedules, then ensure the live ones ----
 
   // Idempotent; runs before the worker starts (boot / toggle ON) and on
-  // Temporal recovery. Reconciles each singleton's generation first — a
+  // Temporal recovery. Retires agent-rip leftovers first (their workflow
+  // types are no longer registered — a surviving run would wedge on its next
+  // workflow task), then reconciles each live singleton's generation — a
   // running looper whose workflow body changed shape this release
   // (LOOPER_GENERATIONS bump) is terminated so the signal-with-start below
   // brings up a fresh run on the new code; see the note in types.ts.
   async ensureBaseline(): Promise<void> {
+    const client = await this.temporal.client();
+    if (client) await this.retireDead(client);
     const singles: Array<[string, string]> = [
       ["kbRefreshWorkflow", SINGLETONS.kbRefresh],
-      ["scoringLoopWorkflow", SINGLETONS.scoringLoop],
       ["metricsSnapshotWorkflow", SINGLETONS.metricsSnapshot],
       ["cleanupLoopWorkflow", SINGLETONS.cleanupLoop],
       ["disputesLoopWorkflow", SINGLETONS.disputesLoop],
+      ["inactivityLoopWorkflow", SINGLETONS.inactivityLoop],
     ];
-    const client = await this.temporal.client();
     for (const [type, id] of singles) {
       if (client) {
         try {
@@ -389,61 +304,45 @@ export class TemporalProducers {
         options: looperStartOptions(id),
       });
     }
-    await this.syncReportSchedule().catch((e) =>
-      prodLog.warn("status-report schedule sync failed", {
-        "error.message": e instanceof Error ? e.message : String(e),
-      })
-    );
   }
 
-  // Creates/updates the status-report Schedule from the /config report
-  // settings. Called from ensureBaseline and whenever /config → Report saves.
-  async syncReportSchedule(): Promise<void> {
-    const client = await this.temporal.client();
-    if (!client) throw new Error("temporal unavailable");
-    const spec = this.reportScheduleSpec();
-    const desiredPaused = !this.settings.reportEnabled() || !this.settings.reportChannelId();
-    try {
-      const handle = client.schedule.getHandle(STATUS_REPORT_SCHEDULE_ID);
-      await handle.update((prev) => ({
-        ...prev,
-        spec,
-        state: { ...prev.state, paused: desiredPaused },
-      }));
-    } catch {
-      await client.schedule.create({
-        scheduleId: STATUS_REPORT_SCHEDULE_ID,
-        spec,
-        action: {
-          type: "startWorkflow",
-          workflowType: "publishStatusReportWorkflow",
-          args: [{ force: false }],
-          taskQueue: this.temporal.envConfig().taskQueue,
-        },
-        policies: {
-          // The activity's own once-per-day guard is the real protection;
-          // SKIP just avoids pointless overlapping runs.
-          overlap: "SKIP",
-          catchupWindow: "1 day",
-        },
-        state: { paused: desiredPaused },
-      });
+  // Agent-rip retirement: terminate retired singletons + orphaned children,
+  // delete retired Schedules. Every step is idempotent and per-step
+  // best-effort — a Temporal hiccup here must never block the boot; the next
+  // ensureBaseline (recovery / toggle) converges.
+  private async retireDead(client: Client): Promise<void> {
+    for (const { workflowId, reason } of RETIRED_SINGLETONS) {
+      try {
+        if (await retireWorkflowId(client, workflowId, reason)) {
+          prodLog.info("retired singleton terminated", { "temporal.workflow_id": workflowId, "retire.reason": reason });
+        }
+      } catch (e) {
+        prodLog.warn("retired-singleton terminate failed — retried on next baseline", {
+          "temporal.workflow_id": workflowId,
+          "error.message": e instanceof Error ? e.message : String(e),
+        });
+      }
     }
-  }
-
-  // Wall-clock mode (reportHour/Minute in reportTimezone) or interval mode —
-  // same duality as the legacy StatusReportScheduler.
-  private reportScheduleSpec(): ScheduleSpec {
-    const hour = this.settings.reportHour();
-    const minute = this.settings.reportMinute();
-    if (hour != null && minute != null) {
-      return {
-        calendars: [{ hour, minute, comment: "daily status report (/config → Report)" }],
-        timezone: this.settings.reportTimezone(),
-      };
+    for (const { query, reason } of RETIRED_WORKFLOW_QUERIES) {
+      try {
+        const n = await retireByQuery(client, query, reason);
+        if (n > 0) prodLog.info("retired workflows terminated by query", { "retire.query": query, "retire.count": n });
+      } catch (e) {
+        prodLog.warn("retired-query terminate failed — retried on next baseline", {
+          "retire.query": query,
+          "error.message": e instanceof Error ? e.message : String(e),
+        });
+      }
     }
-    const hours = Math.max(1, this.settings.reportIntervalHours());
-    return { intervals: [{ every: `${hours}h` }] };
+    for (const scheduleId of RETIRED_SCHEDULES) {
+      try {
+        await client.schedule.getHandle(scheduleId).delete();
+        prodLog.info("retired schedule deleted", { "temporal.schedule_id": scheduleId });
+      } catch {
+        // Not found (already deleted) or transient — either way the next
+        // baseline pass settles it.
+      }
+    }
   }
 }
 

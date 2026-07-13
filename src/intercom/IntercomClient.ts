@@ -1,6 +1,13 @@
 import { SettingsStore } from "../config/SettingsStore";
 import { bodyHash } from "./renderDiscordMarkdown";
-import { IntercomAdmin, IntercomTicketState, IntercomTicketType, IntercomWebhookPart } from "./types";
+import {
+  IntercomAdmin,
+  IntercomSweepConversation,
+  IntercomSweepTicket,
+  IntercomTicketState,
+  IntercomTicketType,
+  IntercomWebhookPart,
+} from "./types";
 
 // Thrown for non-2xx responses so the outbox scheduler can classify transient
 // (retry) vs permanent (dead-letter) failures by HTTP status.
@@ -610,6 +617,106 @@ export class IntercomClient {
       if (e instanceof IntercomHttpError && e.status === 404) return false;
       throw e;
     }
+  }
+
+  // ---- Inactivity sweeper reads/writes (native/unbridged objects) ----
+
+  // One page of open conversations with the idle-detection fields. The sweeper
+  // pages through the whole workspace; per_page 150 is the search maximum.
+  async searchOpenConversations(startingAfter?: string | null): Promise<{
+    items: IntercomSweepConversation[];
+    nextStartingAfter: string | null;
+  }> {
+    const data = await this.json<{
+      conversations?: Array<{
+        id?: string | number;
+        state?: string;
+        created_at?: number;
+        snoozed_until?: number | null;
+        statistics?: {
+          last_contact_reply_at?: number | null;
+          last_admin_reply_at?: number | null;
+        } | null;
+      }>;
+      pages?: { next?: { starting_after?: string } | null };
+    }>(
+      "/conversations/search",
+      "POST",
+      {
+        query: { field: "open", operator: "=", value: true },
+        pagination: { per_page: 150, ...(startingAfter ? { starting_after: startingAfter } : {}) },
+      },
+      "conversation search (inactivity sweep)"
+    );
+    return {
+      items: (data.conversations ?? [])
+        .filter((c) => c.id != null)
+        .map((c) => ({
+          id: String(c.id),
+          state: c.state ?? "open",
+          createdAt: c.created_at ? new Date(c.created_at * 1000) : null,
+          snoozedUntil: c.snoozed_until ? new Date(c.snoozed_until * 1000) : null,
+          lastContactReplyAt: c.statistics?.last_contact_reply_at
+            ? new Date(c.statistics.last_contact_reply_at * 1000)
+            : null,
+          lastAdminReplyAt: c.statistics?.last_admin_reply_at
+            ? new Date(c.statistics.last_admin_reply_at * 1000)
+            : null,
+        })),
+      nextStartingAfter: data.pages?.next?.starting_after ?? null,
+    };
+  }
+
+  // One page of open tickets (native back-office/tracker work items included).
+  async searchOpenTickets(startingAfter?: string | null): Promise<{
+    items: IntercomSweepTicket[];
+    nextStartingAfter: string | null;
+  }> {
+    const data = await this.json<{
+      tickets?: Array<{
+        id?: string | number;
+        open?: boolean;
+        updated_at?: number;
+        created_at?: number;
+        category?: string;
+      }>;
+      pages?: { next?: { starting_after?: string } | null };
+    }>(
+      "/tickets/search",
+      "POST",
+      {
+        query: { field: "open", operator: "=", value: true },
+        pagination: { per_page: 150, ...(startingAfter ? { starting_after: startingAfter } : {}) },
+      },
+      "ticket search (inactivity sweep)"
+    );
+    return {
+      items: (data.tickets ?? [])
+        .filter((t) => t.id != null)
+        .map((t) => ({
+          id: String(t.id),
+          category: t.category ?? null,
+          updatedAt: t.updated_at ? new Date(t.updated_at * 1000) : null,
+          createdAt: t.created_at ? new Date(t.created_at * 1000) : null,
+        })),
+      nextStartingAfter: data.pages?.next?.starting_after ?? null,
+    };
+  }
+
+  // Admin note on a ticket (the sweeper's agent-idle nag for native tickets —
+  // notes never notify the contact).
+  async replyTicketAsAdmin(ticketId: string, input: { adminId: string; body: string; note?: boolean }): Promise<void> {
+    await this.json(
+      `/tickets/${encodeURIComponent(ticketId)}/reply`,
+      "POST",
+      {
+        message_type: input.note === false ? "comment" : "note",
+        type: "admin",
+        admin_id: input.adminId,
+        body: input.body,
+      },
+      "ticket admin reply"
+    );
   }
 
   // ---- Deletion (the /config "Wipe Intercom data" button) ----

@@ -35,35 +35,17 @@ import {
 } from "discord.js";
 import { BotConfig } from "../config";
 import { embed as makeEmbed, COLORS } from "../util/embeds";
-import { formatDuration } from "../util/format";
 import { SettingsStore, isUnicodeEmoji, ReminderTarget, type GlobalSecretColumn, type SecretState } from "../config/SettingsStore";
-import { CannedResponseStore, normalizeName } from "../config/CannedResponseStore";
-import { EscalationTier, StatusTag, PriorityTag } from "../generated/prisma/client";
-import { applyTitleEmojis } from "../util/threadTitle";
+import { EscalationTier, StatusTag } from "../generated/prisma/client";
 import { EscalationTierStore } from "../config/EscalationTierStore";
 import { SessionStore } from "../auth/SessionStore";
 import { OAuthManager } from "../auth/OAuthManager";
-import { ClaudeCodeRunner, ClaudeRunOptions, ClaudeApiLimitError } from "./ClaudeCodeRunner";
-import Stripe from "stripe";
-import { PostizClient } from "./PostizClient";
 import { StripeClient } from "./StripeClient";
-import { SentryClient } from "./SentryClient";
-import {
-  AiTicketContext,
-  AiSubscriptionSummary,
-  AiToolAvailability,
-  buildTicketContextBlock,
-  buildSummarizePrompt,
-  buildAskPrompt,
-  buildCausePrompt,
-  buildDraftPrompt,
-} from "./aiPrompts";
 import { GitHubClient } from "./GitHubClient";
 import { CategoryRegistry } from "./CategoryRegistry";
 import { TicketStore, ReconcileChanges, TicketWithTag } from "./TicketStore";
-import { StatusService, RESOLVED_EMOJI, RECLOSE_DELAY_MS } from "./StatusService";
+import { StatusService, RECLOSE_DELAY_MS } from "./StatusService";
 import { AuditLogger } from "./AuditLogger";
-import { StatusReportService } from "./StatusReportService";
 import { KnowledgeBaseScheduler } from "./KnowledgeBaseScheduler";
 import { StripeWebhookHandler } from "./StripeWebhookHandler";
 import { CallbackServer } from "../server/CallbackServer";
@@ -79,7 +61,7 @@ import { RADAR_LISTS, type BlockService } from "./billing/BlockService";
 import { backfillDisputeHistory } from "./billing/DisputeMonitor";
 import type { DisputeStore } from "./billing/DisputeStore";
 import type { BlockKind } from "./billing/BlockStore";
-import { TICKET_ATTR_PRIORITY, TICKET_ATTR_CSAT, TICKET_ATTR_THREAD } from "../intercom/IntercomEventExecutor";
+import { TICKET_ATTR_CSAT, TICKET_ATTR_CSAT_COMMENT, TICKET_ATTR_THREAD } from "../intercom/IntercomEventExecutor";
 import { IntercomMode, IntercomRegion } from "../config/SettingsStore";
 import {
   log,
@@ -87,7 +69,6 @@ import {
   sentryActive,
   reconfigureSentry,
   sendSentryTestEvent,
-  sentrySubprocessEnv,
   SentryReconfigureResult,
 } from "../util/logger";
 import {
@@ -99,23 +80,11 @@ import {
   setAiRecordContent,
   metricCount,
 } from "../util/instrument";
-import { PrismaClient } from "../generated/prisma/client";
-import { LightAiRunner } from "./LightAiRunner";
-import { TicketScoringService, type ScoreOneOutcome } from "../scoring/TicketScoringService";
-import { TicketScoreStore } from "../scoring/TicketScoreStore";
-import { TicketAiRunStore } from "./TicketAiRunStore";
 import { reconfigureInflux, pingInflux, influxActive } from "../metrics/InfluxWriter";
-import {
-  exportTicketCreated,
-  exportFirstResponse,
-  exportCsat,
-  backfillTicketHistory,
-} from "../metrics/MetricsExporter";
 import { VaultService, VAULT_INTEGRATIONS, type VaultTestReport } from "../vault/VaultService";
 import type { TemporalOpsBinding, TemporalProducers } from "../temporal/producers";
 import { describeSaResult } from "../temporal/searchAttributes";
 import { buildIdIsDegenerate } from "../temporal/buildId";
-import type { AiRunInput, AutoAnswerInput } from "../temporal/types";
 import { validateCertPair } from "../temporal/certs";
 import { VaultMigrator, COLUMN_LABELS, type MigrateItemResult, type MigrateReport } from "../vault/VaultMigrator";
 
@@ -141,31 +110,9 @@ export class DiscordBot {
     { filters: TicketSearchFilters; ownerUserId: string; createdAt: number }
   >();
 
-  // /ai draft results awaiting the "Post to thread" decision, keyed by the
-  // originating interaction id (embedded in the button customIds). In-memory
-  // only — a restart invalidates drafts, handled via the "expired" path.
-  private aiDraftSessions = new Map<
-    string,
-    // runId: the ticket_ai_runs history row — deleted when the draft is posted
-    // (a posted draft lives in the transcript; keeping it would duplicate context).
-    { text: string; ownerUserId: string; threadId: string; createdAt: number; runId: string | null }
-  >();
-
-  // One concurrent /ai run per user — each run is a Claude Code subprocess.
-  // Legacy-path mutex only; under Temporal the workflow id ai-run-{userId}
-  // (REJECT-duplicate start) is the mutex.
-  private aiRunsInFlight = new Set<string>();
-
-  // Temporal regime: live deferred interactions for in-flight /ai workflow
-  // runs, keyed by interaction id (the AiRunInput.runKey). Same-process only —
-  // a restart loses the ephemeral anyway (activity maximumAttempts is 1).
-  private aiInteractionRegistry = new Map<string, ChatInputCommandInteraction>();
-
   // Bound late from index.ts (the Temporal stack is constructed after the bot).
   private temporalProducers: TemporalProducers | null = null;
   private temporalOps: TemporalOpsBinding | null = null;
-
-  private aiLog = log.child("ai-command");
 
   private discordLog = log.child("discord");
 
@@ -176,11 +123,8 @@ export class DiscordBot {
     private statusService: StatusService,
     private sessionStore: SessionStore,
     private oauthManager: OAuthManager,
-    private claudeRunner: ClaudeCodeRunner,
     private githubClient: GitHubClient,
     private categoryRegistry: CategoryRegistry,
-    private reportService: StatusReportService,
-    private cannedStore: CannedResponseStore,
     private audit: AuditLogger,
     private tierStore: EscalationTierStore,
     private intercomSync: IntercomSyncService,
@@ -191,15 +135,6 @@ export class DiscordBot {
     private kbScheduler: KnowledgeBaseScheduler,
     private stripeWebhook: StripeWebhookHandler,
     private intercomInboxApp?: IntercomInboxApp,
-    // Analytics/scoring collaborators (kept as one optional bundle so the long
-    // positional constructor stays manageable).
-    private analytics?: {
-      prisma: PrismaClient;
-      lightAiRunner: LightAiRunner;
-      scoringService: TicketScoringService;
-      scoreStore: TicketScoreStore;
-      ticketAiRunStore: TicketAiRunStore;
-    },
     // Vault secret storage (drives /config → Vault: panel, test, migrations).
     private vault?: {
       service: VaultService;
@@ -463,47 +398,9 @@ export class DiscordBot {
         .catch(() => {});
     }
 
-    // First support reply on an open ticket. Only support/admin members count, so
-    // another invited human (or the customer) can't skew the metric.
-    if (!ticket.closed && !ticket.firstResponseAt && ticket.customerId && message.author.id !== ticket.customerId) {
-      const isSupport = isStaff;
-      if (isSupport && member) {
-        try {
-          await this.ticketStore.setFirstResponse(ticket.threadId, message.createdAt);
-          // First-response time is a support SLA metric spanning hours — it has
-          // no span equivalent, so the wide event carries the measurement.
-          log.child("ticket").info("ticket.first_response", {
-            "ticket.thread_id": ticket.threadId,
-            "ticket.first_response_ms": message.createdAt.getTime() - ticket.createdAt.getTime(),
-          });
-          exportFirstResponse({
-            threadId: ticket.threadId,
-            category: ticket.categoryId,
-            seconds: (message.createdAt.getTime() - ticket.createdAt.getTime()) / 1000,
-          });
-          void this.audit.log({
-            title: "💬 First response",
-            severity: "success",
-            actor: member.displayName,
-            actorIconUrl: member.displayAvatarURL(),
-            threadId: ticket.threadId,
-            fields: [
-              {
-                name: "Response time",
-                value: formatDuration(message.createdAt.getTime() - ticket.createdAt.getTime()),
-                inline: true,
-              },
-            ],
-          });
-        } catch (e) {
-          log.child("ticket").error("first_response stamp failed", e, { "ticket.thread_id": ticket.threadId });
-        }
-      }
-    }
-
     // Activity in a Closed ticket (staff can post into locked threads; posting un-archives
     // them): don't reopen, just re-close after 30 quiet minutes. Every message — customer
-    // or support — pushes the deadline back. Resolved (✅) is handled below instead.
+    // or support — pushes the deadline back.
     if (ticket.closed && ticket.statusTag?.closesThread) {
       await this.ticketStore.scheduleReclose(ticket.threadId, new Date(Date.now() + RECLOSE_DELAY_MS));
       return;
@@ -518,11 +415,10 @@ export class DiscordBot {
       !ticket.closed &&
       ticket.statusTag?.reminderTarget === "CUSTOMER" &&
       !ticket.statusTag.closesThread &&
-      ticket.statusTag.emoji !== RESOLVED_EMOJI &&
       message.author.id === ticket.customerId
     ) {
       const usable = (t: StatusTag | undefined): t is StatusTag =>
-        !!t && !t.closesThread && t.emoji !== RESOLVED_EMOJI && t.reminderTarget !== "CUSTOMER";
+        !!t && !t.closesThread && t.reminderTarget !== "CUSTOMER";
       const replyTarget = this.settingsStore.customerReplyTarget();
       const prevTag = ticket.prevStatusTagId ? this.settingsStore.tagById(ticket.prevStatusTagId) : undefined;
       const target = usable(replyTarget) ? replyTarget : usable(prevTag) ? prevTag : this.settingsStore.initialTag();
@@ -531,20 +427,7 @@ export class DiscordBot {
           actorName: "Customer reply",
         });
       }
-      return;
     }
-
-    // Only Resolved tickets are reopenable by a reply (Closed threads are locked).
-    if (ticket.statusTag?.emoji !== RESOLVED_EMOJI) return;
-    // Only the ticket's own customer reopens it — support/closing notes don't.
-    if (message.author.id !== ticket.customerId) return;
-
-    const initialTag = this.settingsStore.initialTag();
-    if (!initialTag) return;
-
-    await this.statusService.applyStatus(message.channel as ThreadChannel, ticket, initialTag, {
-      actorName: "Customer reply",
-    });
   }
 
   // A thread was manually locked/archived in Discord: mirror it as a status change.
@@ -559,9 +442,9 @@ export class DiscordBot {
     const newlyArchived = !oldThread.archived && newThread.archived;
     if (!newlyLocked && !newlyArchived) return;
 
-    const target = newlyLocked
-      ? this.settingsStore.closingTag()
-      : this.settingsStore.tagByEmoji(RESOLVED_EMOJI);
+    // Open or closed only (the resolved state is gone): any manual lock or
+    // archive reconciles to the closing tag.
+    const target = this.settingsStore.closingTag();
     if (!target) return;
 
     // Idempotency backstop: applyStatus persists the status BEFORE it locks/archives, so
@@ -671,33 +554,20 @@ export class DiscordBot {
     });
   }
 
+  // Agent ticket-management commands live in Intercom now (agent-rip); the
+  // surviving commands are the customer entry point, admin config, and the
+  // Stripe-side staff tooling Intercom doesn't cover.
   private async handleCommand(interaction: ChatInputCommandInteraction): Promise<void> {
     if (interaction.commandName === "setup") {
       await this.postSupportPanel(interaction);
     } else if (interaction.commandName === "config") {
       await this.handleConfigCommand(interaction);
-    } else if (interaction.commandName === "status") {
-      await this.handleStatusCommand(interaction);
-    } else if (interaction.commandName === "priority") {
-      await this.handlePriorityCommand(interaction);
-    } else if (interaction.commandName === "report") {
-      await this.handleReportCommand(interaction);
     } else if (interaction.commandName === "search-tickets") {
       await this.handleSearchTicketsCommand(interaction);
-    } else if (interaction.commandName === "note") {
-      await this.handleNoteCommand(interaction);
-    } else if (interaction.commandName === "reminders") {
-      await this.handleRemindersCommand(interaction);
-    } else if (interaction.commandName === "escalate") {
-      await this.handleEscalateCommand(interaction);
-    } else if (interaction.commandName === "canned") {
-      await this.handleCannedCommand(interaction);
     } else if (interaction.commandName === "charge") {
       await this.handleChargeCommand(interaction);
     } else if (interaction.commandName === "billing") {
       await this.billingAdmin.handleCommand(interaction);
-    } else if (interaction.commandName === "ai") {
-      await this.handleAiCommand(interaction);
     }
   }
 
@@ -715,548 +585,24 @@ export class DiscordBot {
     }
   }
 
-  // ---- /note: staff-only notes on a ticket (always ephemeral — the customer is in the thread) ----
+  // ---- /search-tickets (kept per user decision: cross-ticket lookup by
+  // billing ids/text is still useful from Discord even with agents in
+  // Intercom) ----
 
-  private async handleNoteCommand(interaction: ChatInputCommandInteraction): Promise<void> {
-    const member = await this.requireSupportOrAdmin(interaction);
-    if (!member) return;
-
-    const channel = interaction.channel ?? (await this.client.channels.fetch(interaction.channelId).catch(() => null));
-    if (!channel?.isThread()) {
-      await interaction.reply({ embeds: [makeEmbed("Use this inside a ticket thread.", COLORS.warn)], flags: 64 });
-      return;
-    }
-    const thread = channel as ThreadChannel;
-
-    let ticket = await this.ticketStore.getByThreadId(thread.id);
-    if (!ticket) {
-      ticket = await this.adoptThread(thread);
-      if (!ticket) {
-        await interaction.reply({ embeds: [makeEmbed("This thread isn't a tracked support ticket.", COLORS.warn)], flags: 64 });
-        return;
-      }
-    }
-
-    if (interaction.options.getSubcommand() === "add") {
-      const text = interaction.options.getString("text", true).trim();
-      if (!text) {
-        await interaction.reply({ embeds: [makeEmbed("Note text is required.", COLORS.warn)], flags: 64 });
-        return;
-      }
-      // Staff notes are Discord-only (messages-only Intercom mirroring).
-      await this.ticketStore.addNote(thread.id, member.id, member.displayName, text);
-      void this.audit.log({
-        title: "📝 Note added",
-        actor: member.displayName,
-        actorIconUrl: member.displayAvatarURL(),
-        threadId: thread.id,
-        fields: [{ name: "Note", value: text }],
-      });
-      await interaction.reply({
-        embeds: [makeEmbed("Staff note added. Only support/admins can read it via `/note list`.", COLORS.success)],
-        flags: 64,
-      });
-      return;
-    }
-
-    const notes = await this.ticketStore.listNotes(thread.id);
-    if (notes.length === 0) {
-      await interaction.reply({ embeds: [makeEmbed("No staff notes on this ticket yet.", COLORS.neutral)], flags: 64 });
-      return;
-    }
-    const lines = notes.map(
-      (n) => `**${n.authorName}** <t:${Math.floor(n.createdAt.getTime() / 1000)}:R>\n${n.text}`
-    );
-    const embed = new EmbedBuilder()
-      .setTitle(`Staff notes — ${notes.length} most recent`)
-      .setColor(COLORS.brand)
-      .setDescription(lines.join("\n\n").slice(0, 4096));
-    await interaction.reply({ embeds: [embed], flags: 64 });
-  }
-
-  // ---- /reminders: per-ticket pause of automatic reminders, auto-close and re-close ----
-  // The pause is temporary by design: any status change clears it (TicketStore.setStatus).
-
-  private async handleRemindersCommand(interaction: ChatInputCommandInteraction): Promise<void> {
-    const member = await this.requireSupportOrAdmin(interaction);
-    if (!member) return;
-
-    const channel = interaction.channel ?? (await this.client.channels.fetch(interaction.channelId).catch(() => null));
-    if (!channel?.isThread()) {
-      await interaction.reply({ embeds: [makeEmbed("Use this inside a ticket thread.", COLORS.warn)], flags: 64 });
-      return;
-    }
-    const thread = channel as ThreadChannel;
-
-    let ticket = await this.ticketStore.getByThreadId(thread.id);
-    if (!ticket) {
-      ticket = await this.adoptThread(thread);
-      if (!ticket) {
-        await interaction.reply({ embeds: [makeEmbed("This thread isn't a tracked support ticket.", COLORS.warn)], flags: 64 });
-        return;
-      }
-    }
-
-    const paused = interaction.options.getSubcommand() === "off";
-    if (ticket.remindersPaused === paused) {
-      await interaction.reply({
-        embeds: [
-          makeEmbed(
-            paused
-              ? "Reminders and auto-close are already paused for this ticket."
-              : "Reminders and auto-close are already active for this ticket.",
-            COLORS.neutral
-          ),
-        ],
-        flags: 64,
-      });
-      return;
-    }
-
-    await this.ticketStore.setRemindersPaused(thread.id, paused);
-    // The ticket workflow owns the reminder/auto-close/re-close timers —
-    // keep its in-memory pause flag in sync with the DB (parked signals
-    // deliver on worker resume).
-    if (this.temporalProducers?.routable()) {
-      void this.temporalProducers.remindersPaused(thread.id, paused).catch(() => {});
-    }
-    void this.audit.log({
-      title: paused ? "🔕 Reminders paused" : "🔔 Reminders resumed",
-      severity: paused ? "warn" : "success",
-      actor: member.displayName,
-      actorIconUrl: member.displayAvatarURL(),
-      threadId: thread.id,
-      ...(paused
-        ? { fields: [{ name: "Resumes", value: "On the next status change or `/reminders on`", inline: true }] }
-        : {}),
-    });
-    await interaction.reply({
-      embeds: [
-        makeEmbed(
-          paused
-            ? "Reminders, auto-close and re-close are paused for this ticket. They resume automatically when the status changes (or via `/reminders on`)."
-            : "Reminders, auto-close and re-close are active again for this ticket.",
-          COLORS.success
-        ),
-      ],
-      flags: 64,
-    });
-  }
-
-  // ---- /escalate: move a ticket up/down the escalation-tier ladder ----
-  // Up pings the target tier's role; down just posts a notice (no ping).
-
-  private async handleEscalateCommand(interaction: ChatInputCommandInteraction): Promise<void> {
-    const member = await this.requireSupportOrAdmin(interaction);
-    if (!member) return;
-
-    const channel = interaction.channel ?? (await this.client.channels.fetch(interaction.channelId).catch(() => null));
-    if (!channel?.isThread()) {
-      await interaction.reply({ embeds: [makeEmbed("Use this inside a ticket thread.", COLORS.warn)], flags: 64 });
-      return;
-    }
-    const thread = channel as ThreadChannel;
-
-    let ticket = await this.ticketStore.getByThreadId(thread.id);
-    if (!ticket) {
-      ticket = await this.adoptThread(thread);
-      if (!ticket) {
-        await interaction.reply({ embeds: [makeEmbed("This thread isn't a tracked support ticket.", COLORS.warn)], flags: 64 });
-        return;
-      }
-    }
-    if (ticket.closed) {
-      await interaction.reply({ embeds: [makeEmbed("This ticket is closed — reopen it before escalating.", COLORS.warn)], flags: 64 });
-      return;
-    }
-
-    const tiers = this.tierStore.list();
-    if (tiers.length === 0) {
-      await interaction.reply({
-        embeds: [makeEmbed("No escalation tiers configured. An admin can add them in `/config` → Escalation.", COLORS.warn)],
-        flags: 64,
-      });
-      return;
-    }
-
-    // null or a stale (deleted-tier) id both mean the base tier.
-    const currentIdx = Math.max(0, tiers.findIndex((t) => t.id === ticket.escalationTierId));
-    const stepUp = interaction.options.getSubcommand() === "up";
-
-    // Optional target tier: jump straight there (e.g. tier 1 → 3) instead of stepping.
-    // Autocomplete supplies ids; hand-typed names still resolve.
-    const tierRaw = interaction.options.getString("tier")?.trim();
-    let targetIdx: number;
-    if (tierRaw) {
-      targetIdx = tiers.findIndex((t) => t.id === tierRaw);
-      if (targetIdx === -1) targetIdx = tiers.findIndex((t) => t.name.toLowerCase() === tierRaw.toLowerCase());
-      if (targetIdx === -1) {
-        await interaction.reply({
-          embeds: [makeEmbed(`Unknown tier **${tierRaw}** — pick one from the autocomplete list.`, COLORS.warn)],
-          flags: 64,
-        });
-        return;
-      }
-      if (targetIdx === currentIdx) {
-        await interaction.reply({
-          embeds: [makeEmbed(`Ticket is already at **${tiers[currentIdx].name}**.`, COLORS.warn)],
-          flags: 64,
-        });
-        return;
-      }
-    } else {
-      targetIdx = currentIdx + (stepUp ? 1 : -1);
-    }
-
-    const target = tiers[targetIdx];
-    if (!target) {
-      await interaction.reply({
-        embeds: [makeEmbed(`Already at the ${stepUp ? "highest" : "lowest"} tier (**${tiers[currentIdx].name}**).`, COLORS.warn)],
-        flags: 64,
-      });
-      return;
-    }
-    // Ping/wording follow the actual direction of the move, not the subcommand used.
-    const up = targetIdx > currentIdx;
-    const reason = interaction.options.getString("reason")?.trim() || null;
-
-    await this.ticketStore.setEscalationTier(thread.id, target.id);
-
-    await thread
-      .send({
-        content: up ? `<@&${target.roleId}>` : undefined,
-        embeds: [
-          makeEmbed(
-            `${up ? "⬆️ Escalated to" : "⬇️ De-escalated to"} **${target.name}** by ${member.displayName}.` +
-              (reason ? `\n**Reason:** ${reason}` : ""),
-            up ? COLORS.warn : COLORS.neutral
-          ),
-        ],
-        allowedMentions: up ? { roles: [target.roleId] } : { parse: [] },
-      })
-      .catch(() => {});
-
-    void this.audit.log({
-      title: up ? "⬆️ Ticket escalated" : "⬇️ Ticket de-escalated",
-      severity: up ? "warn" : "neutral",
-      actor: member.displayName,
-      actorIconUrl: member.displayAvatarURL(),
-      threadId: thread.id,
-      fields: [
-        { name: "From", value: tiers[currentIdx].name, inline: true },
-        { name: "To", value: target.name, inline: true },
-        ...(reason ? [{ name: "Reason", value: reason }] : []),
-      ],
-    });
-
-    await interaction.reply({ embeds: [makeEmbed(`Ticket moved to **${target.name}**.`, COLORS.success)], flags: 64 });
-  }
-
-  // ---- /canned: reply templates managed by the support team ----
-  // add → collects the content in a modal (slash options are single-line),
-  // use → posts the template into a ticket thread, delete → removes it.
-  // Templates are team-wide unless created with visibility "Only me".
-
-  private async handleCannedCommand(interaction: ChatInputCommandInteraction): Promise<void> {
-    const member = await this.requireSupportOrAdmin(interaction);
-    if (!member) return;
-
-    const sub = interaction.options.getSubcommand();
-    if (sub === "add") {
-      await this.handleCannedAdd(interaction);
-    } else if (sub === "view") {
-      await this.handleCannedView(interaction, member);
-    } else if (sub === "delete") {
-      await this.handleCannedDelete(interaction, member);
-    } else {
-      await this.handleCannedUse(interaction, member);
-    }
-  }
-
-  private async handleCannedAdd(interaction: ChatInputCommandInteraction): Promise<void> {
-    const name = normalizeName(interaction.options.getString("name", true));
-    if (!name) {
-      await interaction.reply({ embeds: [makeEmbed("Name is required.", COLORS.warn)], flags: 64 });
-      return;
-    }
-    const personal = interaction.options.getString("visibility") === "personal";
-    const ownerId = personal ? interaction.user.id : null;
-
-    // Catch name clashes before the modal so nobody types a long response and loses it.
-    if (this.cannedStore.getExact(name, ownerId)) {
-      await interaction.reply({
-        embeds: [
-          makeEmbed(
-            personal
-              ? `You already have a personal canned response named \`${name}\`. Delete it first with \`/canned delete\`.`
-              : `A team canned response named \`${name}\` already exists. Delete it first with \`/canned delete\`.`,
-            COLORS.warn
-          ),
-        ],
-        flags: 64,
-      });
-      return;
-    }
-
-    // Name (≤50 chars) and scope ride in the customId; content comes from the modal.
-    const modal = new ModalBuilder()
-      .setCustomId(`canned_add_modal:${personal ? "p" : "t"}:${name}`)
-      .setTitle(personal ? "Add Personal Canned Response" : "Add Team Canned Response");
-    const content = new TextInputBuilder()
-      .setCustomId("content")
-      .setLabel("Content")
-      .setStyle(TextInputStyle.Paragraph)
-      .setRequired(true)
-      .setMaxLength(4000);
-    modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(content));
-    await interaction.showModal(modal);
-  }
-
-  private async handleCannedAddModal(interaction: ModalSubmitInteraction): Promise<void> {
-    const rest = interaction.customId.slice("canned_add_modal:".length);
-    const personal = rest.startsWith("p:");
-    const name = rest.slice(2);
-    const content = interaction.fields.getTextInputValue("content").trim();
-    if (!content) {
-      await interaction.reply({ embeds: [makeEmbed("Content is required.", COLORS.warn)], flags: 64 });
-      return;
-    }
-
-    try {
-      const created = await this.cannedStore.add(name, content, personal ? interaction.user.id : null);
-      void this.audit.log({
-        title: "💬 Canned response added",
-        actor: interaction.user.displayName,
-        actorIconUrl: interaction.user.displayAvatarURL(),
-        fields: [
-          { name: "Name", value: `\`${created.name}\``, inline: true },
-          { name: "Scope", value: personal ? "personal" : "team", inline: true },
-        ],
-      });
-      await interaction.reply({
-        embeds: [
-          makeEmbed(
-            `Added ${personal ? "personal" : "team"} canned response \`${created.name}\`. Post it in a ticket with \`/canned use ${created.name}\`.`,
-            COLORS.success
-          ),
-        ],
-        flags: 64,
-      });
-    } catch (error) {
-      await interaction.reply({
-        embeds: [makeEmbed((error as Error).message || "Failed to save the canned response.", COLORS.danger)],
-        flags: 64,
-      });
-    }
-  }
-
-  private async handleCannedUse(interaction: ChatInputCommandInteraction, member: GuildMember): Promise<void> {
-    const channel = interaction.channel ?? (await this.client.channels.fetch(interaction.channelId).catch(() => null));
-    if (!channel?.isThread() || !(await this.ticketStore.getByThreadId(channel.id))) {
-      await interaction.reply({ embeds: [makeEmbed("Use this inside a tracked ticket thread.", COLORS.warn)], flags: 64 });
-      return;
-    }
-
-    const name = interaction.options.getString("name", true);
-    const canned = this.cannedStore.resolve(name, member.id);
-    if (!canned) {
-      await interaction.reply({
-        embeds: [makeEmbed(`No canned response named \`${name}\`. Create one with \`/canned add\`.`, COLORS.warn)],
-        flags: 64,
-      });
-      return;
-    }
-
-    const embed = new EmbedBuilder()
-      .setDescription(canned.content.slice(0, 4096))
-      .setColor(COLORS.brand)
-      .setAuthor({ name: `Sent by ${member.displayName}`, iconURL: member.displayAvatarURL() });
-    await interaction.reply({ embeds: [embed] });
-    void this.audit.log({
-      title: "💬 Canned response used",
-      actor: member.displayName,
-      actorIconUrl: member.displayAvatarURL(),
-      threadId: channel.id,
-      fields: [{ name: "Name", value: `\`${canned.name}\``, inline: true }],
-    });
-  }
-
-  // Preview privately (ephemeral) — unlike /canned use, this never posts to the
-  // ticket and works anywhere. With no name it lists everything the member can see.
-  private async handleCannedView(interaction: ChatInputCommandInteraction, member: GuildMember): Promise<void> {
-    const name = interaction.options.getString("name");
-    if (!name) {
-      const all = this.cannedStore.listFor(member.id);
-      if (all.length === 0) {
-        await interaction.reply({
-          embeds: [makeEmbed("No canned responses yet. Create one with `/canned add`.", COLORS.warn)],
-          flags: 64,
-        });
-        return;
-      }
-      const list = all
-        .map((c) => `• \`${c.name}\`${c.ownerId ? " (only you)" : ""}`)
-        .join("\n")
-        .slice(0, 4096);
-      const embed = new EmbedBuilder()
-        .setTitle("Canned responses")
-        .setDescription(list)
-        .setColor(COLORS.brand)
-        .setFooter({ text: "Preview one with /canned view name:… · post it with /canned use" });
-      await interaction.reply({ embeds: [embed], flags: 64 });
-      return;
-    }
-
-    const canned = this.cannedStore.resolve(name, member.id);
-    if (!canned) {
-      await interaction.reply({
-        embeds: [makeEmbed(`No canned response named \`${name}\`. Create one with \`/canned add\`.`, COLORS.warn)],
-        flags: 64,
-      });
-      return;
-    }
-
-    const embed = new EmbedBuilder()
-      .setTitle(`\`${canned.name}\`${canned.ownerId ? " (only you)" : ""}`)
-      .setDescription(canned.content.slice(0, 4096))
-      .setColor(COLORS.brand)
-      .setFooter({ text: `Post it in a ticket with /canned use ${canned.name}` });
-    await interaction.reply({ embeds: [embed], flags: 64 });
-  }
-
-  private async handleCannedDelete(interaction: ChatInputCommandInteraction, member: GuildMember): Promise<void> {
-    const name = interaction.options.getString("name", true);
-    // resolve() never returns another user's personal template, so support members
-    // can delete team templates and their own personal ones — nothing else.
-    const canned = this.cannedStore.resolve(name, member.id);
-    if (!canned) {
-      await interaction.reply({ embeds: [makeEmbed(`No canned response named \`${name}\`.`, COLORS.warn)], flags: 64 });
-      return;
-    }
-
-    await this.cannedStore.remove(canned.id);
-    void this.audit.log({
-      title: "🗑️ Canned response deleted",
-      severity: "warn",
-      actor: member.displayName,
-      actorIconUrl: member.displayAvatarURL(),
-      fields: [
-        { name: "Name", value: `\`${canned.name}\``, inline: true },
-        { name: "Scope", value: canned.ownerId ? "personal" : "team", inline: true },
-      ],
-    });
-    await interaction.reply({
-      embeds: [makeEmbed(`Deleted ${canned.ownerId ? "your personal" : "the team"} canned response \`${canned.name}\`.`, COLORS.success)],
-      flags: 64,
-    });
-  }
-
-  private async handleReportCommand(interaction: ChatInputCommandInteraction): Promise<void> {
-    const member = await this.requireSupportOrAdmin(interaction);
-    if (!member) return;
-
-    await interaction.deferReply({ flags: 64 });
-    try {
-      // Manual checks use a trailing 24h window and never advance the scheduled cadence.
-      const { embed, components } = await this.reportService.build({ since: null });
-      await interaction.editReply({ embeds: [embed], components });
-    } catch (error) {
-      this.discordLog.error("report command failed", error);
-      await interaction.editReply({ embeds: [makeEmbed("Couldn't build the status report.", COLORS.danger)] });
-    }
-  }
-
-  // Ephemeral drill-downs behind the report's "Overdue Tickets" / "Age Breakdown" buttons.
-  // Both recompute live from the ticket store, so they keep working on old report messages.
-  private async handleReportDrilldown(interaction: ButtonInteraction): Promise<void> {
-    const member = await this.requireSupportOrAdmin(interaction);
-    if (!member) return;
-
-    // Feedback and AI Quality are paginated: the ephemeral pager encodes the page
-    // in the customId (report_feedback:<n> / report_ai:<n>) and edits its own
-    // message in place; the initial bare click opens a fresh ephemeral reply.
-    if (interaction.customId.startsWith("report_feedback") || interaction.customId.startsWith("report_ai")) {
-      const parts = interaction.customId.split(":");
-      const isPageNav = parts.length > 1;
-      const page = isPageNav ? Math.max(0, Number.parseInt(parts[1] ?? "0", 10) || 0) : 0;
-      if (isPageNav) await interaction.deferUpdate();
-      else await interaction.deferReply({ flags: 64 });
-      try {
-        const { embed, components } = interaction.customId.startsWith("report_ai")
-          ? await this.reportService.buildAiQualityEmbed(page)
-          : await this.reportService.buildFeedbackEmbed(page);
-        await interaction.editReply({ embeds: [embed], components });
-      } catch (error) {
-        this.discordLog.error("report drill-down failed", error, { "discord.custom_id": interaction.customId });
-        await interaction.editReply({
-          embeds: [makeEmbed("Couldn't load that breakdown.", COLORS.danger)],
-          components: [],
-        });
-      }
-      return;
-    }
-
-    await interaction.deferReply({ flags: 64 });
-    try {
-      const embed =
-        interaction.customId === "report_overdue"
-          ? await this.reportService.buildOverdueEmbed()
-          : await this.reportService.buildAgeBreakdownEmbed();
-      await interaction.editReply({ embeds: [embed] });
-    } catch (error) {
-      this.discordLog.error("report drill-down failed", error, { "discord.custom_id": interaction.customId });
-      await interaction.editReply({ embeds: [makeEmbed("Couldn't load that breakdown.", COLORS.danger)] });
-    }
-  }
-
-  // ---- /search-tickets ----
-
-  // Live autocomplete: status tags (runtime-configurable) and canned response names
-  // (cached in memory, zero DB cost).
+  // Live autocomplete for the status filter (runtime-configurable tags).
   private async handleAutocomplete(interaction: AutocompleteInteraction): Promise<void> {
     const focused = interaction.options.getFocused(true);
-    const query = focused.value.toLowerCase();
-
-    let choices: { name: string; value: string }[] = [];
-    if (interaction.commandName === "canned" && focused.name === "name") {
-      // Values are ids so a personal template and a team template with the same
-      // name stay distinguishable; hand-typed names still resolve in the handler.
-      choices = this.cannedStore
-        .listFor(interaction.user.id)
-        .filter((c) => c.name.includes(query))
-        .slice(0, 25)
-        .map((c) => ({ name: `${c.name}${c.ownerId ? " (only you)" : ""}`, value: c.id }));
-    } else if (
-      (interaction.commandName === "search-tickets" || interaction.commandName === "status") &&
-      focused.name === "status"
-    ) {
-      choices = this.settingsStore
+    if (interaction.commandName === "search-tickets" && focused.name === "status") {
+      const query = focused.value.toLowerCase();
+      const tags = this.settingsStore
         .tags()
-        .filter((t) => t.label.toLowerCase().includes(query))
+        .filter((t) => !query || t.label.toLowerCase().includes(query))
         .slice(0, 25)
         .map((t) => ({ name: `${t.emoji} ${t.label}`, value: t.id }));
-    } else if (
-      (interaction.commandName === "search-tickets" || interaction.commandName === "priority") &&
-      focused.name === "priority"
-    ) {
-      choices = this.settingsStore
-        .priorities()
-        .filter((p) => p.label.toLowerCase().includes(query))
-        .slice(0, 25)
-        .map((p) => ({ name: `${p.emoji} ${p.label}`, value: p.id }));
-    } else if (interaction.commandName === "escalate" && focused.name === "tier") {
-      choices = this.tierStore
-        .list()
-        .map((t, i) => ({ name: `Tier ${i + 1} — ${t.name}`, value: t.id }))
-        .filter((c) => c.name.toLowerCase().includes(query))
-        .slice(0, 25);
+      await interaction.respond(tags).catch(() => {});
+      return;
     }
-
-    try {
-      await interaction.respond(choices);
-    } catch {
-      // Autocomplete tokens expire quickly; a late response is harmless to drop.
-    }
+    await interaction.respond([]).catch(() => {});
   }
 
   private async handleSearchTicketsCommand(interaction: ChatInputCommandInteraction): Promise<void> {
@@ -1267,7 +613,6 @@ export class DiscordBot {
 
     const type = interaction.options.getString("type");
     const statusTagId = interaction.options.getString("status");
-    const priorityTagId = interaction.options.getString("priority");
     const state = interaction.options.getString("state");
     const user = interaction.options.getUser("user");
     const postizId = interaction.options.getString("postiz_id");
@@ -1316,7 +661,6 @@ export class DiscordBot {
     const filters: TicketSearchFilters = {
       categoryId: type ?? undefined,
       statusTagId: statusTagId ?? undefined,
-      priorityTagId: priorityTagId ?? undefined,
       closed: state === "open" ? false : state === "closed" ? true : undefined,
       customerIds,
       text: text?.trim() || undefined,
@@ -1363,6 +707,8 @@ export class DiscordBot {
 
     const lines = tickets.map((t) => {
       const status = t.statusTag ? `${t.statusTag.emoji} ${t.statusTag.label}` : "—";
+      // Legacy chip: the priority axis is retired, but old tickets keep their
+      // stored priority until the follow-up release drops the column.
       const priorityTag = t.priorityTagId ? this.settingsStore.priorityById(t.priorityTagId) : undefined;
       const priority = priorityTag ? ` · ${priorityTag.emoji} ${priorityTag.label}` : "";
       const category = t.categoryId ? categoryLabels.get(t.categoryId) ?? t.categoryId : "—";
@@ -1454,24 +800,34 @@ export class DiscordBot {
     await interaction.reply({ embeds: [embed], components: [row] });
   }
 
+  // Old messages permanently carry components of retired agent features —
+  // answer them with a notice instead of Discord's generic "interaction
+  // failed". (csat: and create_issue: stay live: legacy customer surfaces.)
+  private static readonly DEAD_BUTTON_PREFIXES = [
+    "feedback_yes:", // auto-answer "did this help?"
+    "feedback_no:",
+    "ai_draft_", // /ai draft post/discard
+    "report_", // report drill-downs + pagers
+    "setstatus_", // /status confirm/cancel
+    "setpriority_", // /priority confirm/cancel
+  ];
+
   private async handleButton(interaction: ButtonInteraction): Promise<void> {
     if (interaction.customId.startsWith("search_page:")) {
       await this.handleSearchPage(interaction);
       return;
     }
 
-    if (interaction.customId.startsWith("ai_draft_")) {
-      await this.handleAiDraftButton(interaction);
-      return;
-    }
-
-    if (
-      interaction.customId === "report_overdue" ||
-      interaction.customId === "report_age" ||
-      interaction.customId.startsWith("report_feedback") ||
-      interaction.customId.startsWith("report_ai")
-    ) {
-      await this.handleReportDrilldown(interaction);
+    if (DiscordBot.DEAD_BUTTON_PREFIXES.some((p) => interaction.customId.startsWith(p))) {
+      await interaction.reply({
+        embeds: [
+          makeEmbed(
+            "This button belongs to a retired bot feature — support now runs through the ticket thread itself.",
+            COLORS.neutral
+          ),
+        ],
+        flags: 64,
+      });
       return;
     }
 
@@ -1487,11 +843,6 @@ export class DiscordBot {
       return;
     }
 
-    if (interaction.customId.startsWith("feedback_yes:") || interaction.customId.startsWith("feedback_no:")) {
-      await this.handleFeedback(interaction);
-      return;
-    }
-
     if (interaction.customId.startsWith("csat:")) {
       await this.handleCsatRating(interaction);
       return;
@@ -1499,23 +850,6 @@ export class DiscordBot {
 
     if (interaction.customId.startsWith("create_issue:")) {
       await this.handleCreateIssue(interaction);
-      return;
-    }
-
-    if (interaction.customId.startsWith("setstatus_confirm:")) {
-      await this.handleSetStatusConfirm(interaction);
-      return;
-    }
-    if (interaction.customId === "setstatus_cancel") {
-      await this.handleSetStatusCancel(interaction);
-      return;
-    }
-    if (interaction.customId.startsWith("setpriority_confirm:")) {
-      await this.handleSetPriorityConfirm(interaction);
-      return;
-    }
-    if (interaction.customId === "setpriority_cancel") {
-      await this.handleSetPriorityCancel(interaction);
       return;
     }
 
@@ -1618,15 +952,7 @@ export class DiscordBot {
 
   private buildTicketContext(category: BaseCategory): TicketContext {
     const initial = this.settingsStore.initialTag();
-    const initialPriority = this.settingsStore.initialPriority();
     return {
-      staffPingRoleId: this.tierStore.newTicketRoleId(this.settingsStore.supportRoleId()),
-      aiSolveEnabled: this.settingsStore.aiSolveEnabled(),
-      // Temporal regime: the auto-answer runs in the ticket workflow's child,
-      // not inline in the modal handler.
-      deferAutoAnswer: this.temporalProducers?.enabled() ?? false,
-      initialEmoji: initial?.emoji ?? "🟢",
-      initialPriorityEmoji: initialPriority?.emoji ?? null,
       guardTicketCreate: (userId, guild) => this.ticketCreationBlockReason(userId, guild),
       onTicketCreated: async (thread, customerId, displayName, question) => {
         if (!initial) return;
@@ -1637,7 +963,6 @@ export class DiscordBot {
           customerDisplayName: displayName,
           categoryId: category.id,
           statusTagId: initial.id,
-          priorityTagId: initialPriority?.id ?? null,
           question: question ?? null,
         });
         log.child("ticket").info("ticket.created", {
@@ -1645,10 +970,8 @@ export class DiscordBot {
           "ticket.category": category.id,
           "ticket.customer_id": customerId,
           "ticket.has_question": !!question,
-          "ticket.ai_solve_enabled": this.settingsStore.aiSolveEnabled(),
         });
         metricCount("tickets.created", 1, { category: category.id });
-        exportTicketCreated({ threadId: thread.id, category: category.id });
         void this.audit.log({
           title: "🎫 Ticket opened",
           severity: "success",
@@ -1662,18 +985,16 @@ export class DiscordBot {
         });
         if (this.temporalProducers?.routable()) {
           // One signal-with-start births the ticket workflow — it enqueues the
-          // Intercom ensure and (worker active) runs the auto-answer child.
-          // While the worker is paused the inline AI path ran instead
-          // (deferAutoAnswer is gated on enabled()), so aiSolve is forced off
-          // to avoid a second answer when the parked signal processes.
-          const workerActive = this.temporalProducers.enabled();
+          // Intercom ensure and owns the ticket's timers. aiSolve is always
+          // false: the auto-answer was retired with the agent-rip (the
+          // workflow branch stays dormant for old-history replays).
           void this.temporalProducers
             .ticketCreated(thread.id, {
               categoryId: category.id,
               question: question ?? null,
               customerId,
               displayName,
-              aiSolve: workerActive && this.settingsStore.aiSolveEnabled(),
+              aiSolve: false,
             })
             .catch(() => {});
         } else {
@@ -1682,14 +1003,6 @@ export class DiscordBot {
             "sync.event": "ticket_created",
           });
         }
-      },
-      onAiAnswer: async (thread, finalText) => {
-        // Persist the verbatim answer so a filed GitHub issue is just Q + A.
-        void this.ticketStore.setAiAnswer(thread.id, finalText).catch(() => {});
-        safe(this.intercomSync.onAiAnswer(thread.id, finalText), "intercom-sync", {
-          "ticket.thread_id": thread.id,
-          "sync.event": "ai_answer",
-        });
       },
     };
   }
@@ -1732,11 +1045,6 @@ export class DiscordBot {
   private async handleSelectMenu(interaction: StringSelectMenuInteraction): Promise<void> {
     if (interaction.customId === "config_tag_pick") {
       await this.handleConfigTagPick(interaction);
-      return;
-    }
-
-    if (interaction.customId === "config_priority_pick") {
-      await this.handleConfigPriorityPick(interaction);
       return;
     }
 
@@ -1803,11 +1111,6 @@ export class DiscordBot {
       return;
     }
 
-    if (interaction.customId.startsWith("canned_add_modal:")) {
-      await this.handleCannedAddModal(interaction);
-      return;
-    }
-
     const category = this.categoryRegistry.findByModalId(interaction.customId);
     if (!category) return;
 
@@ -1829,18 +1132,7 @@ export class DiscordBot {
       return;
     }
 
-    const responder = (prompt: string, onUpdate?: (messages: string[]) => void) =>
-      this.claudeRunner.run(prompt, onUpdate, {
-        model: this.settingsStore.aiModel(),
-        telemetry: {
-          agentName: `support-${category.id}`,
-          kind: "customer_qa",
-          userId: interaction.user.id,
-          username: interaction.user.displayName,
-        },
-      });
-
-    await category.handleModalSubmit(interaction, responder, threadsChannel, this.buildTicketContext(category), {
+    await category.handleModalSubmit(interaction, threadsChannel, this.buildTicketContext(category), {
       postizUserId: session.postizUserId,
       stripeCustomerId: session.stripeCustomerId,
     });
@@ -1865,13 +1157,13 @@ export class DiscordBot {
         return;
       }
 
-      // Prefer the DB-stored verbatim question + AI answer (Q + A only — nothing
-      // else from the thread, so no incidental customer PII lands in the public
-      // repo). Fall back to scanning embeds for tickets created before those
-      // columns existed.
+      // Prefer the DB-stored verbatim question (nothing else from the thread,
+      // so no incidental customer PII lands in the public repo). The AI answer
+      // comes from the legacy embed scan — this button only exists on old
+      // auto-answer messages (the auto-answer itself was retired).
       const ticket = await this.ticketStore.getByThreadId(thread.id).catch(() => null);
       let userQuestion = ticket?.question ?? "";
-      let aiAnswer = ticket?.aiAnswer ?? "";
+      let aiAnswer = "";
       if (!userQuestion || !aiAnswer) {
         const messages = await thread.messages.fetch({ limit: 10 });
         const ordered = [...messages.values()].reverse();
@@ -1990,8 +1282,6 @@ export class DiscordBot {
         "ticket.thread_id": threadId,
         "csat.score": score,
       });
-      const csatTicket = await this.ticketStore.getByThreadId(threadId).catch(() => null);
-      exportCsat({ threadId, category: csatTicket?.categoryId ?? null, score });
       safe(this.intercomSync.onCsat(threadId, score), "intercom-sync", {
         "ticket.thread_id": threadId,
         "sync.event": "csat",
@@ -2053,1027 +1343,6 @@ export class DiscordBot {
     });
   }
 
-  // Legacy feedback buttons (only shown when AI solve is on). Yes → closing tag, No → initial tag.
-  private async handleFeedback(interaction: ButtonInteraction): Promise<void> {
-    const allowedUserId = interaction.customId.split(":")[1];
-    if (interaction.user.id !== allowedUserId) {
-      await interaction.reply({ embeds: [makeEmbed("Only the original requester can use this.", COLORS.danger)], flags: 64 });
-      return;
-    }
-
-    const isPositive = interaction.customId.startsWith("feedback_yes:");
-    const channel = interaction.channel;
-
-    const disabledRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
-      new ButtonBuilder()
-        .setCustomId("feedback_done")
-        .setLabel(isPositive ? "Resolved" : "Escalated")
-        .setStyle(isPositive ? ButtonStyle.Success : ButtonStyle.Danger)
-        .setDisabled(true)
-    );
-    await interaction.message.edit({ components: [disabledRow] });
-
-    const thread = channel?.isThread() ? (channel as ThreadChannel) : null;
-    const ticket = thread ? await this.ticketStore.getByThreadId(thread.id) : null;
-
-    // The status change this triggers is audited separately by StatusService;
-    // this records the feedback signal itself.
-    void this.audit.log({
-      title: isPositive ? "👍 AI answer helped" : "👎 Escalated to support",
-      severity: isPositive ? "success" : "warn",
-      actor: interaction.user.displayName,
-      actorIconUrl: interaction.user.displayAvatarURL(),
-      threadId: thread?.id,
-    });
-
-    if (isPositive) {
-      const closing = this.settingsStore.closingTag();
-      await interaction.reply({ embeds: [makeEmbed("Glad we could help! Closing this ticket.", COLORS.success)] });
-      if (thread && ticket && closing) {
-        await this.statusService.applyStatus(thread, ticket, closing, { actorName: interaction.user.displayName, actorIconUrl: interaction.user.displayAvatarURL() });
-      } else if (thread) {
-        await thread.setArchived(true).catch(() => {});
-      }
-    } else {
-      const pingRoleId = this.tierStore.pingRoleIdFor(ticket?.escalationTierId, this.settingsStore.supportRoleId());
-      await interaction.reply({
-        content: pingRoleId ? `<@&${pingRoleId}>` : undefined,
-        embeds: [makeEmbed("A support team member will follow up here shortly.", COLORS.brand)],
-        allowedMentions: pingRoleId ? { roles: [pingRoleId] } : { parse: [] },
-      });
-      const initial = this.settingsStore.initialTag();
-      if (thread && ticket && initial) {
-        await this.statusService.applyStatus(thread, ticket, initial, { actorName: interaction.user.displayName, actorIconUrl: interaction.user.displayAvatarURL() });
-      }
-    }
-  }
-
-  // ---- /ai: staff AI assistant on a ticket (summarize | ask | cause | draft) ----
-  // Always ephemeral — Stripe/analysis output must never reach the customer.
-  // Independent of the auto-answer toggle (aiSolveEnabled vs aiCommandsEnabled).
-
-  // Read-only tool allowlists, passed explicitly (never a wildcard) so a new
-  // tool on either server side can't silently become available to the model.
-  private static readonly STRIPE_MCP_TOOLS = [
-    "get_customer",
-    "find_customers_by_email",
-    "search_customers",
-    "list_subscriptions",
-    "get_subscription",
-    "list_invoices",
-    "list_charges",
-    "get_charge",
-    "list_payment_intents",
-    "search_payment_intents_by_amount",
-    "search_charges_by_last4",
-    "search_charges_by_card_fingerprint",
-    "get_dispute_for_charge",
-    "list_disputes",
-    "get_dispute",
-    "get_dispute_ratio",
-    "list_customer_cards",
-    "list_tax_ids",
-  ].map((name) => `mcp__stripe__${name}`);
-
-  // Postiz's hosted MCP exposes the Mastra agent tools; only these three are
-  // annotated readOnlyHint with no third-party side effects (schedulePostTool,
-  // triggerTool, generate image/video are write or open-world — never allowed).
-  private static readonly POSTIZ_MCP_TOOLS = [
-    "integrationList",
-    "integrationSchema",
-    "generateVideoOptions",
-  ].map((name) => `mcp__postiz__${name}`);
-
-  // Sentry's hosted MCP (mcp.sentry.dev) read-only tools, curated for support
-  // triage. Deliberately EXCLUDES every write tool (create_*/update_*) and
-  // analyze_issue_with_seer (triggers a paid Seer run). Explicit list, never a
-  // wildcard — a new server-side tool can't silently become callable.
-  private static readonly SENTRY_MCP_TOOLS = [
-    "whoami",
-    "find_organizations",
-    "find_projects",
-    "find_releases",
-    "list_issues",
-    "get_issue_details",
-    "get_issue_tag_values",
-    "list_issue_events",
-    "list_events",
-    "search_issues",
-    "search_events",
-    "search_issue_events",
-    "get_trace_details",
-  ].map((name) => `mcp__sentry__${name}`);
-
-  private buildAiRunConfig(
-    web: boolean,
-    admin: boolean,
-    postizToken: string | null,
-    sentryMcp = false
-  ): { mcpConfig: Record<string, unknown> | null; extraAllowedTools: string[]; tools: AiToolAvailability } {
-    const extraAllowedTools: string[] = [];
-    const mcpServers: Record<string, unknown> = {};
-
-    if (web) extraAllowedTools.push("WebSearch", "WebFetch");
-
-    const stripe = admin && !!this.config.stripe.secretKey;
-    if (stripe) {
-      mcpServers.stripe = {
-        type: "stdio",
-        command: process.execPath, // node binary — no PATH dependency
-        // Preload registers the Sentry http require-hooks before the server
-        // module loads, so its Stripe API calls become child spans.
-        args: ["--require", "@sentry/node/preload", this.claudeRunner.stripeServerPath()],
-        env: {
-          STRIPE_SECRET_KEY: this.config.stripe.secretKey,
-          // DSN/environment/release/rates plus the currently-active trace
-          // (SENTRY_TRACE/SENTRY_BAGGAGE) — the child SDK consumes all of
-          // these from env, joining its spans into this interaction's trace.
-          ...sentrySubprocessEnv(this.settingsStore.sentryConfig()),
-        },
-      };
-      extraAllowedTools.push(...DiscordBot.STRIPE_MCP_TOOLS);
-    }
-
-    // The customer's own pos_ OAuth token scopes the hosted Postiz MCP to
-    // their organization; read-only via the tool allowlist above.
-    const postiz = !!postizToken && !!this.config.postiz.apiUrl;
-    if (postiz) {
-      mcpServers.postiz = {
-        type: "http",
-        url: `${this.config.postiz.apiUrl}/mcp`,
-        headers: { Authorization: `Bearer ${postizToken}` },
-      };
-      extraAllowedTools.push(...DiscordBot.POSTIZ_MCP_TOOLS);
-    }
-
-    // Sentry read-only MCP for deep error investigation (cause only, when read
-    // access is configured). The hosted endpoint uses Sentry's custom
-    // `Sentry-Bearer` scheme — plain `Bearer` is reserved for MCP OAuth tokens.
-    const sentry = sentryMcp && this.settingsStore.sentryReadConfigured();
-    if (sentry) {
-      const token = this.settingsStore.sentryReadToken();
-      if (token) {
-        mcpServers.sentry = {
-          type: "http",
-          url: "https://mcp.sentry.dev/mcp",
-          headers: { Authorization: `Sentry-Bearer ${token}` },
-        };
-        extraAllowedTools.push(...DiscordBot.SENTRY_MCP_TOOLS);
-      }
-    }
-
-    return {
-      mcpConfig: Object.keys(mcpServers).length > 0 ? { mcpServers } : null,
-      extraAllowedTools,
-      tools: { web, stripe, postiz, sentry },
-    };
-  }
-
-  private async gatherAiTicketContext(
-    thread: ThreadChannel,
-    ticket: TicketWithTag,
-    options: { stripeCustomerId: string | null; postizUserId: string | null; postizToken: string | null }
-  ): Promise<AiTicketContext> {
-    // Pre-fetch the customer's live Postiz account alongside the thread reads —
-    // one cheap parallel HTTP call that replaces the integrationList MCP turn and
-    // adds post-failure data the MCP can't return. Best-effort: never blocks/throws.
-    const postizClient = new PostizClient(this.config);
-    const wantPostiz = !!options.postizToken && this.settingsStore.aiPostizPrefetchEnabled();
-    // Admin-only: the caller sets stripeCustomerId only for admin invokers, so
-    // gating on it here preserves the "staff runs get no Stripe data" invariant.
-    const wantSub = !!options.stripeCustomerId && !!this.config.stripe.secretKey;
-    const wantSentry = this.settingsStore.sentryReadConfigured();
-    const wantPrevRuns = this.settingsStore.aiPreviousRunsEnabled() && !!this.analytics;
-    const [messages, notes, changes, postizAccount, subscription, relatedSentryIssues, previousRuns] =
-      await Promise.all([
-        this.fetchAllThreadMessages(thread),
-        this.ticketStore.listAllNotes(thread.id),
-        this.ticketStore.listAllTagChanges(thread.id),
-        wantPostiz
-          ? postizClient.fetchAccountSnapshot(options.postizToken as string).catch(() => null)
-          : Promise.resolve(null),
-        wantSub
-          ? new StripeClient(this.config)
-              .listSubscriptions(options.stripeCustomerId as string)
-              .then((subs) => this.summarizeSubscription(subs))
-              .catch(() => null)
-          : Promise.resolve(null),
-        wantSentry
-          ? new SentryClient({
-              token: this.settingsStore.sentryReadToken() as string,
-              orgSlug: this.settingsStore.sentryOrgSlug() as string,
-              projectSlug: this.settingsStore.sentryProjectSlug() as string,
-              region: this.settingsStore.sentryReadRegion(),
-            })
-              .findIssues(this.buildSentryQuery(ticket.question))
-              .catch(() => null)
-          : Promise.resolve(null),
-        wantPrevRuns
-          ? this.analytics!.ticketAiRunStore.listRecent(thread.id, 5).catch(() => null)
-          : Promise.resolve(null),
-      ]);
-
-    return {
-      categoryLabel: this.categoryRegistry.getAll().find((c) => c.id === ticket.categoryId)?.label ?? null,
-      statusLabel: ticket.statusTag?.label ?? null,
-      priorityLabel: ticket.priorityTagId
-        ? (this.settingsStore.priorityById(ticket.priorityTagId)?.label ?? null)
-        : null,
-      tierLabel: this.tierStore.byId(ticket.escalationTierId)?.name ?? null,
-      customerDisplayName: ticket.customerDisplayName,
-      createdAt: ticket.createdAt,
-      closed: ticket.closed,
-      question: ticket.question,
-      transcript: messages.map((m) => ({
-        timestamp: m.createdAt,
-        role: (m.authorId === ticket.customerId ? "Customer" : m.authorIsBot ? "Bot" : "Staff") as
-          | "Customer"
-          | "Staff"
-          | "Bot",
-        authorName: m.authorName,
-        content:
-          m.content +
-          (m.attachments.length > 0
-            ? ` ${m.attachments.map((a) => `[attachment: ${a.filename}]`).join(" ")}`
-            : ""),
-      })),
-      notes: notes.map((n) => ({ authorName: n.authorName, content: n.text, createdAt: n.createdAt })),
-      history: changes.map((c) => ({
-        kind: c.kind,
-        fromLabel: c.fromLabel,
-        toLabel: c.toLabel,
-        actorName: c.actorName,
-        createdAt: c.createdAt,
-      })),
-      postizAccount,
-      subscription,
-      relatedSentryIssues,
-      // listRecent returns newest-first; the prompt renders chronologically.
-      previousRuns: previousRuns
-        ? [...previousRuns].reverse().map((r) => ({
-            subcommand: r.subcommand,
-            input: r.input ?? null,
-            result: r.result,
-            invokerName: r.invokerName,
-            createdAt: r.createdAt,
-          }))
-        : null,
-      stripeCustomerId: options.stripeCustomerId,
-      postizUserId: options.postizUserId,
-    };
-  }
-
-  // Builds a heuristic Sentry search from the ticket's opening question — a few
-  // significant keywords, always scoped to unresolved issues. Falls back to all
-  // recent unresolved (top by frequency) when the question yields no usable terms.
-  private static readonly SENTRY_STOPWORDS = new Set([
-    "the", "and", "for", "with", "that", "this", "have", "from", "your", "when", "what",
-    "cant", "cannot", "dont", "isnt", "wont", "doesnt", "about", "there", "their", "would",
-    "could", "should", "please", "help", "issue", "problem", "postiz", "account", "working",
-    "work", "tried", "still", "getting", "error", "errors", "again", "just", "some", "them",
-  ]);
-
-  private buildSentryQuery(question: string | null): string {
-    const terms = (question ?? "")
-      .toLowerCase()
-      .replace(/[^a-z0-9 ]+/g, " ")
-      .split(/\s+/)
-      .filter((w) => w.length >= 4 && !DiscordBot.SENTRY_STOPWORDS.has(w));
-    const unique = [...new Set(terms)].slice(0, 6);
-    return unique.length > 0 ? `is:unresolved ${unique.join(" ")}` : "is:unresolved";
-  }
-
-  // Reduces the customer's Stripe subscriptions to a one-line context summary.
-  // Admin-only path (gated by the caller). Defensive about Basil (SDK v20) field
-  // moves — current_period_end migrated onto subscription items.
-  private summarizeSubscription(subs: Stripe.Subscription[]): AiSubscriptionSummary | null {
-    if (subs.length === 0) return null;
-    const rank = (s: string): number =>
-      s === "active" || s === "trialing" ? 0 : s === "past_due" ? 1 : 2;
-    const sub = [...subs].sort((a, b) => rank(a.status) - rank(b.status))[0];
-    const price = sub.items?.data?.[0]?.price;
-    const product = price?.product;
-    const plan =
-      price?.nickname ||
-      (product && typeof product !== "string" && !(product as Stripe.DeletedProduct).deleted
-        ? (product as Stripe.Product).name
-        : null);
-    const interval = price?.recurring?.interval ?? null;
-    const amount =
-      price?.unit_amount != null
-        ? `$${(price.unit_amount / 100).toFixed(2)} ${(price.currency ?? "").toUpperCase()}${
-            interval ? ` / ${interval}` : ""
-          }`.trim()
-        : null;
-    const rawEnd =
-      (sub as unknown as { current_period_end?: number }).current_period_end ??
-      (sub.items?.data?.[0] as unknown as { current_period_end?: number } | undefined)
-        ?.current_period_end ??
-      null;
-    return {
-      status: sub.status,
-      plan,
-      interval,
-      amount,
-      currentPeriodEnd: typeof rawEnd === "number" ? new Date(rawEnd * 1000).toISOString() : null,
-      cancelAtPeriodEnd: Boolean(sub.cancel_at_period_end),
-    };
-  }
-
-  // Splits AI output into embed-sized chunks, preferring paragraph boundaries.
-  private chunkAiText(text: string, chunkSize = 4000): string[] {
-    const chunks: string[] = [];
-    let rest = text.trim();
-    while (rest.length > chunkSize) {
-      let cut = rest.lastIndexOf("\n\n", chunkSize);
-      if (cut < chunkSize / 2) cut = rest.lastIndexOf("\n", chunkSize);
-      if (cut < chunkSize / 2) cut = chunkSize;
-      chunks.push(rest.slice(0, cut).trim());
-      rest = rest.slice(cut).trim();
-    }
-    if (rest.length > 0) chunks.push(rest);
-    return chunks;
-  }
-
-  // Streams a Claude run into the deferred ephemeral reply (throttled +
-  // serialized edits — concurrent editReply calls resolve out of order).
-  // Returns the final text, or null after an error (already shown to staff).
-  private async streamAiRun(
-    interaction: ChatInputCommandInteraction,
-    sub: string,
-    title: string,
-    prompt: string,
-    options: ClaudeRunOptions,
-    // Tool-less runs (draft/summarize) go through the direct Messages API —
-    // no CLI overhead tokens, no process-spawn latency, same streaming UX.
-    useLightRunner = false,
-    // Temporal activity liveness: called on every stream update.
-    heartbeat?: () => void
-  ): Promise<string | null> {
-    let lastEdit = 0;
-    let editInFlight = false;
-
-    const flush = async (text: string) => {
-      if (editInFlight) return;
-      editInFlight = true;
-      try {
-        const tail = text.length > 3800 ? `…${text.slice(-3800)}` : text;
-        await interaction.editReply({
-          embeds: [
-            new EmbedBuilder()
-              .setTitle(title)
-              .setDescription(`${tail}\n\n⏳ *Generating…*`)
-              .setColor(COLORS.brand),
-          ],
-        });
-      } catch {
-        // Ephemeral edit failures are non-fatal; the final edit will retry.
-      } finally {
-        editInFlight = false;
-      }
-    };
-
-    try {
-      const onUpdate = (messages: string[]) => {
-        heartbeat?.();
-        const now = Date.now();
-        if (now - lastEdit < 2000) return;
-        lastEdit = now;
-        void flush(messages.join("\n\n"));
-      };
-      const light = useLightRunner ? this.analytics?.lightAiRunner : undefined;
-      const result = light
-        ? await light.run(prompt, onUpdate, {
-            model: options.model ?? this.settingsStore.aiModelLight(),
-            telemetry: options.telemetry ?? { agentName: `ai-${sub}`, kind: "staff_command" },
-            timeoutMs: options.timeoutMs,
-          })
-        : await this.claudeRunner.run(prompt, onUpdate, options);
-      return result.join("\n\n").trim();
-    } catch (error) {
-      if (error instanceof ClaudeApiLimitError) {
-        // The runner already reported the limit hit (fingerprinted warning +
-        // metric); this is just the command-level trace in the log stream.
-        this.aiLog.warn("run hit API limit", { "ai.sub": sub, "ticket.thread_id": interaction.channelId ?? "" });
-        await interaction
-          .editReply({
-            embeds: [makeEmbed("AI is temporarily unavailable (API usage limit). Try again later.", COLORS.warn)],
-          })
-          .catch(() => {});
-      } else {
-        this.aiLog.error("run failed", error, {
-          "ai.sub": sub,
-          "ticket.thread_id": interaction.channelId ?? "",
-          "discord.user_id": interaction.user.id,
-        });
-        await interaction
-          .editReply({ embeds: [makeEmbed("The AI run failed — check the logs.", COLORS.danger)] })
-          .catch(() => {});
-      }
-      return null;
-    }
-  }
-
-  // Final result: first chunk replaces the streaming reply, remaining chunks go
-  // out as ephemeral follow-ups (each message has its own 6000-char embed budget).
-  private async sendAiResult(
-    interaction: ChatInputCommandInteraction,
-    title: string,
-    text: string,
-    components?: ActionRowBuilder<ButtonBuilder>[]
-  ): Promise<void> {
-    const chunks = this.chunkAiText(text);
-    const footer = { text: "Staff-only — not visible to the customer" };
-    const embeds = chunks.map((chunk, i) => {
-      const e = new EmbedBuilder().setDescription(chunk).setColor(COLORS.brand);
-      if (i === 0) e.setTitle(title);
-      if (i === chunks.length - 1) e.setFooter(footer);
-      return e;
-    });
-
-    await interaction.editReply({
-      embeds: [embeds[0]],
-      components: chunks.length === 1 ? (components ?? []) : [],
-    });
-    for (let i = 1; i < embeds.length; i++) {
-      await interaction.followUp({
-        embeds: [embeds[i]],
-        components: i === embeds.length - 1 ? (components ?? []) : [],
-        flags: 64,
-      });
-    }
-  }
-
-  // Human-readable sentiment labels for /ai score and the report drill-down.
-  private static readonly SENTIMENT_LABELS: Record<string, string> = {
-    very_negative: "Very negative",
-    negative: "Negative",
-    neutral: "Neutral",
-    positive: "Positive",
-    very_positive: "Very positive",
-  };
-
-  // Ephemeral per-ticket score view (staff-only; gated by aiCommandsEnabled in
-  // the caller). Reads the persisted ticket_scores row — no AI call.
-  private async handleAiScore(interaction: ChatInputCommandInteraction): Promise<void> {
-    if (!this.analytics) {
-      await interaction.reply({ embeds: [makeEmbed("Ticket scoring is not wired up.", COLORS.warn)], flags: 64 });
-      return;
-    }
-    const threadId = interaction.options.getString("thread")?.trim() || interaction.channelId;
-    if (!threadId) {
-      await interaction.reply({ embeds: [makeEmbed("Run this inside a ticket thread or pass a thread id.", COLORS.warn)], flags: 64 });
-      return;
-    }
-    await interaction.deferReply({ flags: 64 });
-
-    const [score, ticket] = await Promise.all([
-      this.analytics.scoreStore.get(threadId),
-      this.ticketStore.getByThreadId(threadId).catch(() => null),
-    ]);
-    if (!ticket) {
-      await interaction.editReply({ embeds: [makeEmbed("That thread isn't a tracked support ticket.", COLORS.warn)] });
-      return;
-    }
-    if (!score || score.status === "PENDING") {
-      // Queued in a submitted Anthropic batch → say so instead of the generic
-      // "not yet". Gated on ticket.closed: only closed tickets are batched,
-      // and reopening deletes the score row, so an open ticket with a PENDING
-      // row is a transient reopen race — "still open" is the truthful answer.
-      if (score?.status === "PENDING" && ticket.closed && score.batchId?.startsWith("msgbatch_")) {
-        const batch = await this.analytics.scoreStore.getBatch(score.batchId).catch(() => null);
-        if (batch?.status === "SUBMITTED") {
-          const kind = batch.purpose === "escalation" ? "escalation re-score batch" : "scoring batch";
-          await interaction.editReply({
-            embeds: [
-              makeEmbed(
-                `<#${threadId}> is queued in ${kind} \`${batch.anthropicBatchId}\` (submitted <t:${Math.floor(batch.submittedAt.getTime() / 1000)}:R>) — awaiting results from Anthropic.`,
-                COLORS.brand
-              ),
-            ],
-          });
-          return;
-        }
-        // Batch already ended/failed (poll lag records the result within about
-        // a minute) or its row is missing — the generic message below covers it.
-      }
-      if (score?.status === "PENDING" && score.batchId === "manual") {
-        await interaction.editReply({
-          embeds: [
-            makeEmbed(`<#${threadId}> is being scored directly right now ("Score one now") — check back shortly.`, COLORS.brand),
-          ],
-        });
-        return;
-      }
-      const state = !ticket.closed
-        ? "The ticket is still open — scoring runs after close."
-        : this.settingsStore.scoringEnabled()
-          ? "Not scored yet — it will be included in an upcoming scoring batch."
-          : "Scoring is disabled (/config → Analytics).";
-      await interaction.editReply({ embeds: [makeEmbed(`No score for <#${threadId}> yet. ${state}`, COLORS.brand)] });
-      return;
-    }
-    if (score.status === "SKIPPED") {
-      const reason = score.error === "too_short" ? "the conversation was too short to score" : (score.error ?? "skipped");
-      await interaction.editReply({ embeds: [makeEmbed(`<#${threadId}> was skipped by scoring (${reason}).`, COLORS.brand)] });
-      return;
-    }
-    if (score.status === "FAILED") {
-      await interaction.editReply({
-        embeds: [makeEmbed(`Scoring failed for <#${threadId}> (attempt ${score.attempts}/3): ${score.error ?? "unknown error"}`, COLORS.warn)],
-      });
-      return;
-    }
-    if (score.status === "ESCALATED") {
-      const escEnabled = this.settingsStore.scoringEscalationEnabled();
-      await interaction.editReply({
-        embeds: [
-          makeEmbed(
-            [
-              `⤴️ <#${threadId}> was flagged as beyond \`${score.model ?? "the scoring model"}\`'s reliable evaluation${score.escalationReason ? `: "${score.escalationReason}"` : "."}`,
-              escEnabled
-                ? `Queued for re-score with \`${this.settingsStore.scoringEscalationModel()}\` (escalation batch runs every ${this.settingsStore.scoringEscalationIntervalHours()}h). "Score one now" in /config → Analytics re-scores it immediately.`
-                : "Escalation is currently disabled (/config → Analytics) — the ticket returns to normal scoring with the next interval batch.",
-            ].join("\n"),
-            COLORS.brand
-          ),
-        ],
-      });
-      return;
-    }
-
-    const s = (v: string | null) => (v ? (DiscordBot.SENTIMENT_LABELS[v] ?? v) : "—");
-    const staff = Array.isArray(score.staffScores)
-      ? (score.staffScores as Array<{ name: string; tone: number; clarity: number; correctness: number }>)
-      : [];
-    const scoreEmbed = new EmbedBuilder()
-      .setTitle("🤖 AI Ticket Score")
-      .setColor((score.cxScore ?? 0) >= 7 ? COLORS.success : (score.cxScore ?? 0) >= 4 ? COLORS.warn : COLORS.danger)
-      .setDescription(score.summary ?? null)
-      .addFields(
-        { name: "Ticket", value: `<#${threadId}>`, inline: true },
-        { name: "CX score", value: `${score.cxScore ?? "—"}/10`, inline: true },
-        { name: "Sentiment", value: `${s(score.sentimentStart)} → ${s(score.sentimentEnd)}`, inline: true },
-        {
-          name: "Resolution",
-          value: `${score.resolution ?? "—"}${score.fcr ? " · first-contact" : ""}${score.escalationNeeded ? " · escalated" : ""}`,
-          inline: true,
-        },
-        { name: "Topic", value: score.topic ?? "—", inline: true },
-        {
-          name: "Agent quality",
-          value: `Tone ${score.agentTone ?? "—"} · Clarity ${score.agentClarity ?? "—"} · Correctness ${score.agentCorrectness ?? "—"}`,
-          inline: true,
-        },
-        ...(score.rootCause ? [{ name: "Root cause", value: score.rootCause.slice(0, 1024) }] : []),
-        ...(score.cxRationale ? [{ name: "CX rationale", value: score.cxRationale.slice(0, 1024) }] : []),
-        ...(staff.length > 0
-          ? [
-              {
-                name: "Per-staff",
-                value: staff
-                  .map((m) => `**${m.name}** — tone ${m.tone}, clarity ${m.clarity}, correctness ${m.correctness}`)
-                  .join("\n")
-                  .slice(0, 1024),
-              },
-            ]
-          : []),
-      )
-      .setFooter({
-        text: `Scored ${score.scoredAt ? score.scoredAt.toISOString().slice(0, 16).replace("T", " ") : "—"} · ${score.model ?? ""} · $${(score.costUsd ?? 0).toFixed(4)}${score.escalated ? " · escalated eval" : ""}`,
-      });
-    await interaction.editReply({ embeds: [scoreEmbed] });
-  }
-
-  private async handleAiCommand(interaction: ChatInputCommandInteraction): Promise<void> {
-    const member = await this.requireSupportOrAdmin(interaction);
-    if (!member) return;
-
-    if (!this.settingsStore.aiCommandsEnabled()) {
-      await interaction.reply({
-        embeds: [makeEmbed("AI commands are disabled (/config → General Settings).", COLORS.warn)],
-        flags: 64,
-      });
-      return;
-    }
-
-    // /ai score is a quick DB lookup, not an AI run — no mutex, no context build.
-    if (interaction.options.getSubcommand() === "score") {
-      await this.handleAiScore(interaction);
-      return;
-    }
-
-    const thread = await this.resolveTicketThread(interaction);
-    if (!thread) return;
-    const ticket = await this.ticketStore.getByThreadId(thread.id);
-    if (!ticket) {
-      await interaction.reply({ embeds: [makeEmbed("This thread isn't a tracked support ticket.", COLORS.warn)], flags: 64 });
-      return;
-    }
-
-    if (this.aiRunsInFlight.has(interaction.user.id)) {
-      await interaction.reply({
-        embeds: [makeEmbed("You already have an /ai run in progress — wait for it to finish.", COLORS.warn)],
-        flags: 64,
-      });
-      return;
-    }
-
-    const sub = interaction.options.getSubcommand();
-    await interaction.deferReply({ flags: 64 });
-
-    // Temporal regime: the run becomes an aiRunWorkflow (id ai-run-{userId} =
-    // the per-user mutex, crash-proof) whose single activity re-enters
-    // runAiSubcommand below through the interaction registry. Unavailable
-    // Temporal falls through to the in-process path.
-    if (this.temporalProducers?.enabled() && (sub === "ask" || sub === "cause" || sub === "draft" || sub === "summarize")) {
-      this.aiInteractionRegistry.set(interaction.id, interaction);
-      const started = await this.temporalProducers.startAiRun({
-        runKey: interaction.id,
-        sub,
-        threadId: thread.id,
-        userId: interaction.user.id,
-      });
-      if (started === "started") return; // the workflow's activity owns the reply now
-      this.aiInteractionRegistry.delete(interaction.id);
-      if (started === "already_running") {
-        await interaction.editReply({
-          embeds: [makeEmbed("You already have an /ai run in progress — wait for it to finish.", COLORS.warn)],
-        });
-        return;
-      }
-      // "unavailable" → legacy in-process run below.
-    }
-
-    this.aiRunsInFlight.add(interaction.user.id);
-    try {
-      await this.runAiSubcommand(interaction, member, sub, thread, ticket);
-    } finally {
-      this.aiRunsInFlight.delete(interaction.user.id);
-    }
-  }
-
-  // The full /ai run body (context gather → CLI/Messages run → result +
-  // history + audit). Shared by the legacy path above and the Temporal
-  // runStaffAiCommand activity (which supplies a heartbeat callback).
-  private async runAiSubcommand(
-    interaction: ChatInputCommandInteraction,
-    member: GuildMember,
-    sub: string,
-    thread: ThreadChannel,
-    ticket: TicketWithTag,
-    heartbeat?: () => void
-  ): Promise<void> {
-    const startedAt = Date.now();
-
-    try {
-      const admin = this.isAdmin(interaction);
-      const session = ticket.customerId
-        ? await this.sessionStore.getSession(ticket.customerId).catch(() => null)
-        : null;
-
-      const context = await this.gatherAiTicketContext(thread, ticket, {
-        // The Stripe hint only goes into the prompt when the Stripe tools are
-        // actually attached (admin invoker) — staff runs never mention it.
-        stripeCustomerId: admin ? (session?.stripeCustomerId ?? null) : null,
-        postizUserId: session?.postizUserId ?? null,
-        // Customer's own pos_ token scopes the pre-fetch to their org (all
-        // staff). On-demand decrypt: session rows carry a redacted token.
-        postizToken:
-          session && ticket.customerId
-            ? await this.sessionStore.getAccessToken(ticket.customerId).catch(() => null)
-            : null,
-      });
-      const contextBlock = buildTicketContextBlock(context);
-
-      let title: string;
-      let prompt: string;
-      let runOptions: ClaudeRunOptions;
-
-      if (sub === "ask" || sub === "cause") {
-        // Postiz MCP is intentionally NOT attached: its only account-specific tool
-        // (integrationList) is replaced by the pre-fetched account snapshot above,
-        // so we drop it to save a cold MCP start + an exploratory turn. Stripe MCP
-        // (admin) still attaches — hence null here, not the customer token. The
-        // Sentry read MCP is attached for `cause` only (deep investigation), gated
-        // on read access being configured.
-        const { mcpConfig, extraAllowedTools, tools } = this.buildAiRunConfig(
-          true,
-          admin,
-          null,
-          sub === "cause"
-        );
-        const isCause = sub === "cause";
-        runOptions = {
-          promptPrefix: null,
-          extraAllowedTools,
-          mcpConfig,
-          timeoutMs: 300_000,
-          model: this.settingsStore.aiModel(),
-          // No --max-turns in this CLI; bound the run with effort + a hard USD cap.
-          // Safe to cap because the pre-fetched account/Sentry context (below)
-          // removes most of the exploratory digging these runs used to do.
-          effort: isCause ? this.settingsStore.aiEffortCause() : this.settingsStore.aiEffortAsk(),
-          maxBudgetUsd: isCause
-            ? this.settingsStore.aiMaxBudgetUsdCause()
-            : this.settingsStore.aiMaxBudgetUsdAsk(),
-          telemetry: {
-            agentName: `ai-${sub}`,
-            kind: "staff_command",
-            userId: interaction.user.id,
-            username: interaction.user.displayName,
-          },
-        };
-        if (sub === "ask") {
-          const question = interaction.options.getString("question", true);
-          title = "🤖 AI Answer";
-          prompt = buildAskPrompt(contextBlock, question, tools);
-        } else {
-          title = "🤖 Root Cause Analysis";
-          prompt = buildCausePrompt(contextBlock, tools);
-        }
-        this.aiLog.info("run started", {
-          "ai.sub": sub,
-          "ticket.thread_id": thread.id,
-          "discord.user_id": interaction.user.id,
-          "tools.stripe": tools.stripe,
-          "tools.postiz": tools.postiz,
-          "tools.web": tools.web,
-        });
-      } else if (sub === "draft") {
-        title = "🤖 Draft Reply";
-        prompt = buildDraftPrompt(contextBlock, interaction.options.getString("instructions"));
-        runOptions = {
-          promptPrefix: null,
-          model: this.settingsStore.aiModelLight(),
-          telemetry: {
-            agentName: "ai-draft",
-            kind: "staff_command",
-            userId: interaction.user.id,
-            username: interaction.user.displayName,
-          },
-        };
-        this.aiLog.info("run started", {
-          "ai.sub": sub,
-          "ticket.thread_id": thread.id,
-          "discord.user_id": interaction.user.id,
-        });
-      } else {
-        title = "🤖 Ticket Summary";
-        prompt = buildSummarizePrompt(contextBlock);
-        runOptions = {
-          promptPrefix: null,
-          model: this.settingsStore.aiModelLight(),
-          telemetry: {
-            agentName: "ai-summarize",
-            kind: "staff_command",
-            userId: interaction.user.id,
-            username: interaction.user.displayName,
-          },
-        };
-        this.aiLog.info("run started", {
-          "ai.sub": sub,
-          "ticket.thread_id": thread.id,
-          "discord.user_id": interaction.user.id,
-        });
-      }
-
-      // draft/summarize are tool-less → direct Messages API when wired.
-      const useLight = sub === "draft" || sub === "summarize";
-      const text = await this.streamAiRun(interaction, sub, title, prompt, runOptions, useLight, heartbeat);
-      if (text === null) return;
-      if (text.length === 0) {
-        await interaction.editReply({ embeds: [makeEmbed("The AI returned an empty answer.", COLORS.warn)] });
-        return;
-      }
-
-      // Persist the result so later /ai runs on this ticket see it as
-      // "Previous AI runs" context. Best-effort — never fails the command.
-      let historyRunId: string | null = null;
-      if (this.settingsStore.aiPreviousRunsEnabled() && this.analytics) {
-        historyRunId = await this.analytics.ticketAiRunStore
-          .record({
-            ticketThreadId: thread.id,
-            subcommand: sub,
-            input:
-              sub === "ask"
-                ? interaction.options.getString("question", true)
-                : sub === "draft"
-                  ? interaction.options.getString("instructions")
-                  : null,
-            result: text,
-            invokerId: interaction.user.id,
-            invokerName: interaction.user.displayName,
-            model: runOptions.model ?? this.settingsStore.aiModelLight(),
-          })
-          .catch((error) => {
-            this.aiLog.error("run history record failed", error, {
-              "ai.sub": sub,
-              "ticket.thread_id": thread.id,
-            });
-            return null;
-          });
-      }
-
-      if (sub === "draft") {
-        const token = interaction.id;
-        this.pruneAiDraftSessions();
-        this.aiDraftSessions.set(token, {
-          text,
-          ownerUserId: interaction.user.id,
-          threadId: thread.id,
-          createdAt: Date.now(),
-          runId: historyRunId,
-        });
-        const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-          new ButtonBuilder().setCustomId(`ai_draft_post:${token}`).setLabel("Post to thread").setStyle(ButtonStyle.Success),
-          new ButtonBuilder().setCustomId(`ai_draft_discard:${token}`).setLabel("Discard").setStyle(ButtonStyle.Secondary)
-        );
-        await this.sendAiResult(interaction, title, text, [row]);
-      } else {
-        await this.sendAiResult(interaction, title, text);
-      }
-
-      const durationSec = Math.round((Date.now() - startedAt) / 1000);
-      // Command-boundary wide event; token/cost detail lives in the runner's
-      // ai.run.completed event and the gen_ai spans.
-      this.aiLog.info("run completed", { "ai.sub": sub, "ticket.thread_id": thread.id });
-      void this.audit.log({
-        title: `🤖 /ai ${sub} used`,
-        severity: "neutral",
-        actor: member.displayName,
-        actorIconUrl: member.displayAvatarURL(),
-        threadId: thread.id,
-        fields: [{ name: "Duration", value: `${durationSec}s`, inline: true }],
-      });
-    } catch (error) {
-      this.aiLog.error("command failed", error, {
-        "ai.sub": sub,
-        "ticket.thread_id": thread.id,
-        "discord.user_id": interaction.user.id,
-      });
-      await interaction
-        .editReply({ embeds: [makeEmbed("Something went wrong — check the logs.", COLORS.danger)] })
-        .catch(() => {});
-    }
-  }
-
-  // ---- Temporal activity hooks (same-process worker; see src/temporal) ----
-
-  // aiRunWorkflow's single activity: re-enter the /ai body via the registered
-  // live interaction. A missing registry entry means the process restarted
-  // mid-run — the ephemeral is gone, nothing to resume (legacy parity).
-  async executeAiRunFromWorkflow(input: AiRunInput, heartbeat: () => void): Promise<void> {
-    const interaction = this.aiInteractionRegistry.get(input.runKey);
-    if (!interaction) {
-      this.aiLog.warn("ai run interaction missing (restart mid-run?)", { "ai.sub": input.sub });
-      return;
-    }
-    try {
-      const member = await this.fetchMember(interaction);
-      const channel = await this.client.channels.fetch(input.threadId).catch(() => null);
-      const ticket = await this.ticketStore.getByThreadId(input.threadId);
-      if (!member || !channel?.isThread() || !ticket) {
-        await interaction
-          .editReply({ embeds: [makeEmbed("The ticket thread is no longer available.", COLORS.warn)] })
-          .catch(() => {});
-        return;
-      }
-      await this.runAiSubcommand(interaction, member, input.sub, channel as ThreadChannel, ticket, heartbeat);
-    } finally {
-      this.aiInteractionRegistry.delete(input.runKey);
-    }
-  }
-
-  // autoAnswerWorkflow's activity: rebuild thread/responder/context and run
-  // the shared BaseCategory.deliverAutoAnswer (streamed first answer, feedback
-  // buttons, failure repair + staff ping all inside).
-  async runAutoAnswerForTicket(input: AutoAnswerInput, heartbeat: () => void): Promise<{ ok: boolean; apiLimit: boolean }> {
-    const category = this.categoryRegistry.getAll().find((c) => c.id === input.categoryId);
-    const channel = await this.client.channels.fetch(input.threadId).catch(() => null);
-    if (!category || !channel?.isThread()) return { ok: false, apiLimit: false };
-    const responder = (prompt: string, onUpdate?: (messages: string[]) => void) =>
-      this.claudeRunner.run(
-        prompt,
-        (messages) => {
-          heartbeat();
-          onUpdate?.(messages);
-        },
-        {
-          model: this.settingsStore.aiModel(),
-          telemetry: {
-            agentName: `support-${category.id}`,
-            kind: "customer_qa",
-            userId: input.customerId,
-            username: input.displayName,
-          },
-        }
-      );
-    return category.deliverAutoAnswer(
-      channel as ThreadChannel,
-      input.customerId,
-      input.question ?? "",
-      responder,
-      this.buildTicketContext(category)
-    );
-  }
-
-  // New-ticket staff ping — the non-AI creation path and the autoAnswer
-  // workflow's hard-failure fallback.
-  async pingStaffForNewTicketThread(threadId: string): Promise<void> {
-    const channel = await this.client.channels.fetch(threadId).catch(() => null);
-    if (!channel?.isThread()) return;
-    const roleId = this.tierStore.newTicketRoleId(this.settingsStore.supportRoleId());
-    if (!roleId) return;
-    await (channel as ThreadChannel).send({
-      content: `<@&${roleId}>`,
-      embeds: [makeEmbed("A new support ticket has been opened and needs attention.")],
-      allowedMentions: { roles: [roleId] },
-    });
-  }
-
-  private pruneAiDraftSessions(): void {
-    const cutoff = Date.now() - 60 * 60 * 1000;
-    for (const [token, session] of this.aiDraftSessions) {
-      if (session.createdAt < cutoff) this.aiDraftSessions.delete(token);
-    }
-  }
-
-  private async handleAiDraftButton(interaction: ButtonInteraction): Promise<void> {
-    const [action, token] = interaction.customId.split(":");
-    const draft = token ? this.aiDraftSessions.get(token) : undefined;
-    if (!draft) {
-      await interaction.update({
-        embeds: [makeEmbed("This draft has expired — run `/ai draft` again.", COLORS.warn)],
-        components: [],
-      });
-      return;
-    }
-
-    // The draft message is ephemeral, so only the owner can normally see the
-    // buttons — this is defense in depth.
-    if (draft.ownerUserId !== interaction.user.id) {
-      await interaction.reply({
-        embeds: [makeEmbed("Only the staff member who generated this draft can use it.", COLORS.danger)],
-        flags: 64,
-      });
-      return;
-    }
-
-    if (action === "ai_draft_discard") {
-      this.aiDraftSessions.delete(token);
-      await interaction.update({ embeds: [makeEmbed("Draft discarded.", COLORS.neutral)], components: [] });
-      return;
-    }
-
-    const member = await this.fetchMember(interaction);
-    if (!member || !this.isStaffMember(member)) {
-      await interaction.reply({ embeds: [makeEmbed("You don't have permission to do that.", COLORS.danger)], flags: 64 });
-      return;
-    }
-
-    const channel = await this.client.channels.fetch(draft.threadId).catch(() => null);
-    if (!channel?.isThread()) {
-      this.aiDraftSessions.delete(token);
-      await interaction.update({
-        embeds: [makeEmbed("The ticket thread no longer exists.", COLORS.danger)],
-        components: [],
-      });
-      return;
-    }
-    const thread = channel as ThreadChannel;
-
-    // Same shape as /canned use: customer-visible embed attributed to the staff member.
-    const embed = new EmbedBuilder()
-      .setDescription(draft.text.slice(0, 4096))
-      .setColor(COLORS.brand)
-      .setAuthor({ name: `Sent by ${member.displayName}`, iconURL: member.displayAvatarURL() });
-    await thread.send({ embeds: [embed] });
-    this.aiDraftSessions.delete(token);
-
-    // The posted draft now lives in the thread transcript — drop its history
-    // row so future /ai runs don't see it twice.
-    if (draft.runId) {
-      void this.analytics?.ticketAiRunStore.delete(draft.runId).catch((error) => {
-        this.aiLog.error("posted-draft history cleanup failed", error, { threadId: thread.id });
-      });
-    }
-
-    // Mirror into Intercom like the auto-answer path does.
-    void this.intercomSync.onAiAnswer(thread.id, draft.text).catch((error) => {
-      this.aiLog.error("draft Intercom mirror failed", error, { threadId: thread.id });
-    });
-
-    await interaction.update({ embeds: [makeEmbed("Draft posted to the thread.", COLORS.success)], components: [] });
-    void this.audit.log({
-      title: "🤖 AI draft posted",
-      severity: "neutral",
-      actor: member.displayName,
-      actorIconUrl: member.displayAvatarURL(),
-      threadId: thread.id,
-    });
-  }
-
   // ---- Permission helpers ----
 
   private async fetchMember(interaction: Interaction): Promise<GuildMember | null> {
@@ -3108,20 +1377,6 @@ export class DiscordBot {
     });
   }
 
-  private isValidTimezone(tz: string): boolean {
-    if (!tz) return false;
-    try {
-      new Intl.DateTimeFormat("en-GB", { timeZone: tz });
-      return true;
-    } catch {
-      return false;
-    }
-  }
- 
-  private formatReportTime(hour: number, minute: number): string {
-    return `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
-  }
- 
   private async requireSupportOrAdmin(
     interaction: ChatInputCommandInteraction | StringSelectMenuInteraction | ButtonInteraction
   ): Promise<GuildMember | null> {
@@ -3134,242 +1389,6 @@ export class DiscordBot {
     return member;
   }
 
-  // ---- /status & /priority (set | history) ----
-
-  // Shared preamble for both commands: must run inside a tracked ticket thread,
-  // adopting a previously-untracked bot-created support thread on the way.
-  private async resolveTicketThread(
-    interaction: ChatInputCommandInteraction
-  ): Promise<ThreadChannel | null> {
-    const channel = interaction.channel ?? (await this.client.channels.fetch(interaction.channelId).catch(() => null));
-    if (!channel?.isThread()) {
-      await interaction.reply({ embeds: [makeEmbed("Use this inside a ticket thread.", COLORS.warn)], flags: 64 });
-      return null;
-    }
-    const thread = channel as ThreadChannel;
-
-    const ticket = await this.ticketStore.getByThreadId(thread.id);
-    if (!ticket) {
-      const adopted = await this.adoptThread(thread);
-      if (!adopted) {
-        await interaction.reply({ embeds: [makeEmbed("This thread isn't a tracked support ticket.", COLORS.warn)], flags: 64 });
-        return null;
-      }
-    }
-    return thread;
-  }
-
-  private async handleStatusCommand(interaction: ChatInputCommandInteraction): Promise<void> {
-    const member = await this.requireSupportOrAdmin(interaction);
-    if (!member) return;
-
-    const thread = await this.resolveTicketThread(interaction);
-    if (!thread) return;
-
-    if (interaction.options.getSubcommand() === "history") {
-      await this.replyTagHistory(interaction, thread.id, "STATUS", "Status");
-      return;
-    }
-
-    // Status is chosen as an autocompleted command option; confirm before applying.
-    const tagId = interaction.options.getString("status", true);
-    const tag = this.settingsStore.tagById(tagId);
-    if (!tag) {
-      await interaction.reply({ embeds: [makeEmbed("Unknown status — pick one from the list.", COLORS.warn)], flags: 64 });
-      return;
-    }
-
-    const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-      new ButtonBuilder().setCustomId(`setstatus_confirm:${tag.id}`).setLabel("Confirm").setStyle(ButtonStyle.Success),
-      new ButtonBuilder().setCustomId("setstatus_cancel").setLabel("Cancel").setStyle(ButtonStyle.Secondary)
-    );
-    await interaction.reply({
-      embeds: [makeEmbed(`Set this ticket's status to **${tag.emoji} ${tag.label}**?`)],
-      components: [row],
-      flags: 64,
-    });
-  }
-
-  private async handlePriorityCommand(interaction: ChatInputCommandInteraction): Promise<void> {
-    const member = await this.requireSupportOrAdmin(interaction);
-    if (!member) return;
-
-    const thread = await this.resolveTicketThread(interaction);
-    if (!thread) return;
-
-    if (interaction.options.getSubcommand() === "history") {
-      await this.replyTagHistory(interaction, thread.id, "PRIORITY", "Priority");
-      return;
-    }
-
-    const priorityId = interaction.options.getString("priority", true);
-    const priority = this.settingsStore.priorityById(priorityId);
-    if (!priority) {
-      await interaction.reply({ embeds: [makeEmbed("Unknown priority — pick one from the list.", COLORS.warn)], flags: 64 });
-      return;
-    }
-
-    const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-      new ButtonBuilder().setCustomId(`setpriority_confirm:${priority.id}`).setLabel("Confirm").setStyle(ButtonStyle.Success),
-      new ButtonBuilder().setCustomId("setpriority_cancel").setLabel("Cancel").setStyle(ButtonStyle.Secondary)
-    );
-    await interaction.reply({
-      embeds: [makeEmbed(`Set this ticket's priority to **${priority.emoji} ${priority.label}**?`)],
-      components: [row],
-      flags: 64,
-    });
-  }
-
-  // Ephemeral changelog backing /status history and /priority history.
-  private async replyTagHistory(
-    interaction: ChatInputCommandInteraction,
-    threadId: string,
-    kind: "STATUS" | "PRIORITY",
-    noun: string
-  ): Promise<void> {
-    const changes = await this.ticketStore.listTagChanges(threadId, kind);
-    if (changes.length === 0) {
-      await interaction.reply({
-        embeds: [makeEmbed(`No ${noun.toLowerCase()} changes recorded on this ticket yet.`, COLORS.neutral)],
-        flags: 64,
-      });
-      return;
-    }
-    const lines = changes.map((c) => {
-      const from = c.fromEmoji ? `${c.fromEmoji} ${c.fromLabel}` : "—";
-      return `**${c.actorName}** <t:${Math.floor(c.createdAt.getTime() / 1000)}:R>\n${from} → ${c.toEmoji} ${c.toLabel}`;
-    });
-    const embed = new EmbedBuilder()
-      .setTitle(`${noun} history — ${changes.length} most recent`)
-      .setColor(COLORS.brand)
-      .setDescription(lines.join("\n\n").slice(0, 4096));
-    await interaction.reply({ embeds: [embed], flags: 64 });
-  }
-
-  private async handleSetStatusConfirm(interaction: ButtonInteraction): Promise<void> {
-    const member = await this.requireSupportOrAdmin(interaction);
-    if (!member) return;
-
-    // interaction.channel can be null on a cold cache (e.g. right after a restart) — fetch it.
-    const channel = interaction.channel ?? (await this.client.channels.fetch(interaction.channelId).catch(() => null));
-    if (!channel?.isThread()) {
-      await interaction.reply({ embeds: [makeEmbed("This can only be used inside a ticket thread.", COLORS.warn)], flags: 64 });
-      return;
-    }
-    const thread = channel as ThreadChannel;
-
-    const tag = this.settingsStore.tagById(interaction.customId.split(":")[1]);
-    const ticket = await this.ticketStore.getByThreadId(thread.id);
-    if (!tag || !ticket) {
-      await interaction.reply({
-        embeds: [makeEmbed("Couldn't apply that status — this thread isn't tracked yet. Run /status set again.", COLORS.warn)],
-        flags: 64,
-      });
-      return;
-    }
-
-    await interaction.deferUpdate();
-    try {
-      await this.statusService.applyStatus(thread, ticket, tag, {
-        actorName: member.displayName,
-        actorIconUrl: member.displayAvatarURL(),
-        actorId: member.id,
-      });
-      await interaction.editReply({
-        embeds: [makeEmbed(`Status set to ${tag.emoji} ${tag.label}.`, COLORS.success)],
-        components: [],
-      });
-    } catch (error) {
-      this.discordLog.error("status set apply failed", error, {
-        "ticket.thread_id": thread.id,
-        "status.tag_id": tag.id,
-      });
-      await interaction.editReply({
-        embeds: [makeEmbed("Something went wrong applying that status.", COLORS.danger)],
-        components: [],
-      });
-    }
-  }
-
-  private async handleSetStatusCancel(interaction: ButtonInteraction): Promise<void> {
-    await interaction.update({ embeds: [makeEmbed("Status change cancelled.", COLORS.neutral)], components: [] });
-  }
-
-  private async handleSetPriorityConfirm(interaction: ButtonInteraction): Promise<void> {
-    const member = await this.requireSupportOrAdmin(interaction);
-    if (!member) return;
-
-    const channel = interaction.channel ?? (await this.client.channels.fetch(interaction.channelId).catch(() => null));
-    if (!channel?.isThread()) {
-      await interaction.reply({ embeds: [makeEmbed("This can only be used inside a ticket thread.", COLORS.warn)], flags: 64 });
-      return;
-    }
-    const thread = channel as ThreadChannel;
-
-    const priority = this.settingsStore.priorityById(interaction.customId.split(":")[1]);
-    const ticket = await this.ticketStore.getByThreadId(thread.id);
-    if (!priority || !ticket) {
-      await interaction.reply({
-        embeds: [makeEmbed("Couldn't apply that priority — this thread isn't tracked yet. Run /priority set again.", COLORS.warn)],
-        flags: 64,
-      });
-      return;
-    }
-
-    await interaction.deferUpdate();
-    try {
-      await this.statusService.applyPriority(thread, ticket, priority, {
-        actorName: member.displayName,
-        actorIconUrl: member.displayAvatarURL(),
-        actorId: member.id,
-      });
-      await interaction.editReply({
-        embeds: [makeEmbed(`Priority set to ${priority.emoji} ${priority.label}.`, COLORS.success)],
-        components: [],
-      });
-    } catch (error) {
-      this.discordLog.error("priority set apply failed", error, {
-        "ticket.thread_id": thread.id,
-        "priority.tag_id": priority.id,
-      });
-      await interaction.editReply({
-        embeds: [makeEmbed("Something went wrong applying that priority.", COLORS.danger)],
-        components: [],
-      });
-    }
-  }
-
-  private async handleSetPriorityCancel(interaction: ButtonInteraction): Promise<void> {
-    await interaction.update({ embeds: [makeEmbed("Priority change cancelled.", COLORS.neutral)], components: [] });
-  }
-
-  private async adoptThread(thread: ThreadChannel) {
-    const initial = this.settingsStore.initialTag();
-    if (!initial) return null;
-    if (thread.parentId !== this.settingsStore.threadsChannelId()) return null;
-    if (thread.ownerId !== this.client.user?.id) return null;
-
-    const leadingEmoji = thread.name.split(" ")[0];
-    const tag = this.settingsStore.tagByEmoji(leadingEmoji) ?? initial;
-    const customer = await this.deriveCustomerId(thread);
-
-    await this.ticketStore.create({
-      threadId: thread.id,
-      channelId: thread.parentId ?? thread.id,
-      customerId: customer.id,
-      customerDisplayName: customer.displayName,
-      statusTagId: tag.id,
-    });
-    void this.audit.log({
-      title: "📌 Ticket adopted",
-      threadId: thread.id,
-      fields: [
-        { name: "Customer", value: customer.id ? `<@${customer.id}>` : "unknown", inline: true },
-        { name: "Status", value: `${tag.emoji} ${tag.label}`, inline: true },
-      ],
-    });
-    return this.ticketStore.getByThreadId(thread.id);
-  }
 
   // Best-effort: the customer is the only non-bot human in a private thread who
   // isn't on a staff (escalation-tier) role. Returns nulls when it can't be determined.
@@ -3435,8 +1454,6 @@ export class DiscordBot {
           name: "General",
           value: [
             `Threads channel: ${s.threadsChannelId() ? `<#${s.threadsChannelId()}>` : "_not set_"}`,
-            `AI solve: ${s.aiSolveEnabled() ? "on" : "off"}`,
-            `AI commands: ${s.aiCommandsEnabled() ? "on" : "off"}`,
             `GitHub repo: ${s.githubRepo() ? `\`${s.githubRepo()}\`` : "_not set_"}`,
             `Ticket limits: ${s.maxOpenTicketsPerUser() > 0 ? `max ${s.maxOpenTicketsPerUser()} open` : "no cap"} · ${s.ticketCooldownMinutes() > 0 ? `${s.ticketCooldownMinutes()}m cooldown` : "no cooldown"}`,
           ].join("\n"),
@@ -3446,10 +1463,9 @@ export class DiscordBot {
           name: "Workflow",
           value: [
             `Status tags: ${s.tags().length}`,
-            `Priorities: ${s.priorities().length}`,
-            `Escalation: ${
+            `Staff roles: ${
               tiers.length
-                ? tiers.map((t) => t.name).join(" → ")
+                ? tiers.map((t) => t.name).join(" · ")
                 : s.supportRoleId()
                   ? "_legacy support role_"
                   : "_not set_"
@@ -3458,13 +1474,8 @@ export class DiscordBot {
           inline: true,
         },
         {
-          name: "Reporting & Audit",
+          name: "Audit & Billing",
           value: [
-            `Status report: ${
-              s.reportEnabled() && s.reportChannelId()
-                ? `${s.reportHour() != null && s.reportMinute() != null ? `daily at ${this.formatReportTime(s.reportHour()!, s.reportMinute()!)} (${s.reportTimezone()})` : `every ${s.reportIntervalHours()}h`} → <#${s.reportChannelId()}>`
-                : "off"
-            }`,
             `Audit log: ${s.auditLogChannelId() ? `<#${s.auditLogChannelId()}>` : "off"}`,
             `Billing audit: ${s.billingAuditChannelId() ? `<#${s.billingAuditChannelId()}>` : "_in-thread ping_"}`,
           ].join("\n"),
@@ -3474,6 +1485,7 @@ export class DiscordBot {
           name: "Integrations",
           value: [
             `Intercom: ${s.intercomMode() === "none" ? "off" : `${s.intercomMode()}${s.intercomConfigured() ? "" : " ⚠️ not configured"}`}`,
+            `Inactivity sweeper: ${s.inactivityEnabled() ? `on · agent ${s.inactivityAgentWaitDays()}d · customer ${s.inactivityCustomerWaitDays()}d` : "off"}`,
             `Sentry: ${
               s.sentryDsn()
                 ? `${sentryActive() ? "on" : "configured ⚠️ restart pending"} · traces ${s.sentryTracesSampleRate()} · logs ${s.sentryLogsEnabled() ? "on" : "off"}`
@@ -3483,11 +1495,10 @@ export class DiscordBot {
           inline: false,
         },
         {
-          name: "AI & Analytics",
+          name: "AI (dispute evidence) & Analytics",
           value: [
-            `Model: \`${s.aiModel()}\` · light \`${s.aiModelLight()}\``,
+            `Model: \`${s.aiModel()}\``,
             `KB refresh: ${s.kbRefreshEnabled() ? `every ${s.kbRefreshIntervalHours()}h` : "off"}${s.kbLastRefreshAt() ? ` · last <t:${Math.floor(s.kbLastRefreshAt()!.getTime() / 1000)}:R>` : ""}`,
-            `Scoring: ${s.scoringEnabled() ? `every ${s.scoringIntervalHours()}h, \`${s.scoringModel()}\`` : "off"}`,
             `InfluxDB: ${influxActive() ? `on → \`${s.influxBucket()}\`` : s.influxEnabled() ? "enabled ⚠️ incomplete config" : "off"}`,
           ].join("\n"),
           inline: false,
@@ -3516,7 +1527,7 @@ export class DiscordBot {
     const core = [
       new ButtonBuilder().setCustomId("config_general").setLabel("General Settings").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("config_workflow").setLabel("Workflow").setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId("config_reporting").setLabel("Reporting & Audit").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("config_reporting").setLabel("Audit & Billing").setStyle(ButtonStyle.Primary),
     ];
     const hubs = [
       new ButtonBuilder().setCustomId("config_integrations").setLabel("Integrations").setStyle(ButtonStyle.Primary),
@@ -3551,10 +1562,9 @@ export class DiscordBot {
       .setDescription(
         [
           `**Status tags:** ${s.tags().length ? s.tags().map((t) => `${t.emoji} ${t.label}`).join(" · ") : "_none_"}`,
-          `**Priorities:** ${s.priorities().length ? s.priorities().map((p) => `${p.emoji} ${p.label}`).join(" · ") : "_none_"}`,
-          `**Escalation:** ${
+          `**Staff roles:** ${
             tiers.length
-              ? tiers.map((t) => t.name).join(" → ")
+              ? tiers.map((t) => t.name).join(" · ")
               : s.supportRoleId()
                 ? "_legacy support role_"
                 : "_not set_"
@@ -3564,33 +1574,27 @@ export class DiscordBot {
 
     const buttons = new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder().setCustomId("config_tags").setLabel("Manage Tags").setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId("config_priorities").setLabel("Manage Priorities").setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId("config_escalation").setLabel("Escalation").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("config_escalation").setLabel("Staff Roles").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("config_back_main").setLabel("Back").setStyle(ButtonStyle.Secondary)
     );
 
     return { embeds: [embed], components: [buttons] };
   }
 
+  // id config_reporting kept for Back-button routing from old ephemerals.
   private buildReportingHubPanel() {
     const s = this.settingsStore;
     const embed = new EmbedBuilder()
-      .setTitle("Reporting & Audit")
+      .setTitle("Audit & Billing")
       .setColor(0x5865f2)
       .setDescription(
         [
-          `**Status report:** ${
-            s.reportEnabled() && s.reportChannelId()
-              ? `${s.reportHour() != null && s.reportMinute() != null ? `daily at ${this.formatReportTime(s.reportHour()!, s.reportMinute()!)} (${s.reportTimezone()})` : `every ${s.reportIntervalHours()}h`} → <#${s.reportChannelId()}>`
-              : "off"
-          }`,
           `**Audit log:** ${s.auditLogChannelId() ? `<#${s.auditLogChannelId()}>` : "off"}`,
           `**Billing audit:** ${s.billingAuditChannelId() ? `<#${s.billingAuditChannelId()}>` : "_in-thread ping_"}`,
         ].join("\n")
       );
 
     const buttons = new ActionRowBuilder<ButtonBuilder>().addComponents(
-      new ButtonBuilder().setCustomId("config_report").setLabel("Status Report").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("config_audit").setLabel("Audit Log").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("config_billing").setLabel("Billing").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("config_back_main").setLabel("Back").setStyle(ButtonStyle.Secondary)
@@ -3628,18 +1632,17 @@ export class DiscordBot {
   private buildAiAnalyticsHubPanel() {
     const s = this.settingsStore;
     const embed = new EmbedBuilder()
-      .setTitle("AI & Analytics")
+      .setTitle("AI (dispute evidence) & Analytics")
       .setColor(0x5865f2)
       .setDescription(
         [
-          `**AI models:** \`${s.aiModel()}\` · light \`${s.aiModelLight()}\``,
+          `**AI model:** \`${s.aiModel()}\``,
           `**KB refresh:** ${s.kbRefreshEnabled() ? `every ${s.kbRefreshIntervalHours()}h` : "off"}${s.kbLastRefreshAt() ? ` · last <t:${Math.floor(s.kbLastRefreshAt()!.getTime() / 1000)}:R>` : ""}`,
-          `**Scoring:** ${s.scoringEnabled() ? `every ${s.scoringIntervalHours()}h, \`${s.scoringModel()}\`` : "off"}`,
           `**InfluxDB:** ${influxActive() ? `on → \`${s.influxBucket()}\`` : s.influxEnabled() ? "enabled ⚠️ incomplete config" : "off"}`,
         ].join("\n")
       );
     const buttons = new ActionRowBuilder<ButtonBuilder>().addComponents(
-      new ButtonBuilder().setCustomId("config_ai").setLabel("AI & Knowledge").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("config_ai").setLabel("AI (dispute evidence)").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("config_analytics").setLabel("Analytics").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("config_back_main").setLabel("Back").setStyle(ButtonStyle.Secondary)
     );
@@ -3981,43 +1984,68 @@ export class DiscordBot {
 
     const extraButtons = new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder().setCustomId("config_intercom_snooze").setLabel("Snooze Tag").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("config_intercom_inactivity").setLabel("Inactivity").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("config_intercom_resync").setLabel("Sync Closed Tickets").setStyle(ButtonStyle.Secondary)
     );
 
     return { embeds: [embed], components: [modeButtons, setupButtons, actionButtons, extraButtons] };
   }
 
+  // /config → Intercom → Inactivity: the workspace sweeper for NATIVE
+  // (unbridged) conversations/tickets — Intercom's own workflow triggers never
+  // fire on API-created objects, so the bot is the automation engine. Bridged
+  // tickets keep their per-ticket timers (tag reminder settings).
+  private buildInactivityPanel() {
+    const s = this.settingsStore;
+    const embed = new EmbedBuilder()
+      .setTitle("Intercom Inactivity Sweeper")
+      .setColor(0x5865f2)
+      .setDescription(
+        [
+          `**Status:** ${s.inactivityEnabled() ? "**on** — sweeping every 30 minutes" : "**off**"}`,
+          "",
+          `**Agent-idle:** after ${s.inactivityAgentWaitDays()} day(s) waiting on an agent → internal note (≤1 per window)`,
+          `**Customer-idle:** after ${s.inactivityCustomerWaitDays()} day(s) of customer silence → outbound reply nag`,
+          `**Auto-close:** after ${s.inactivityNagsBeforeClose()} unanswered nag(s) → conversation (and its native ticket) closed`,
+          "",
+          "Covers every open, unsnoozed conversation and open ticket in the workspace EXCEPT Discord-bridged tickets (their per-tag reminder settings under Workflow → Manage Tags own those). Native tickets only get agent-idle notes — never auto-close.",
+        ].join("\n")
+      );
+
+    const buttons = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId("config_inactivity_toggle")
+        .setLabel(`Sweeper: ${s.inactivityEnabled() ? "on" : "off"}`)
+        .setStyle(s.inactivityEnabled() ? ButtonStyle.Success : ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("config_inactivity_opts").setLabel("Set Thresholds").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("config_inactivity_run").setLabel("Run Now").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("config_intercom").setLabel("Back").setStyle(ButtonStyle.Secondary)
+    );
+
+    return { embeds: [embed], components: [buttons] };
+  }
+
   private buildAiPanel() {
     const s = this.settingsStore;
     const last = s.kbLastRefreshAt();
     const embed = new EmbedBuilder()
-      .setTitle("AI & Knowledge")
+      .setTitle("AI (dispute evidence)")
       .setColor(0x5865f2)
       .setDescription(
         [
-          `**Main model:** \`${s.aiModel()}\` — customer answers, \`/ai ask\` & \`/ai cause\``,
-          `**Light model:** \`${s.aiModelLight()}\` — the tool-less \`/ai summarize\` & \`/ai draft\``,
-          `**Speed limits:** ask → effort \`${s.aiEffortAsk()}\`, ≤ $${s.aiMaxBudgetUsdAsk()}/run · cause → effort \`${s.aiEffortCause()}\`, ≤ $${s.aiMaxBudgetUsdCause()}/run`,
-          `**Previous runs:** ${s.aiPreviousRunsEnabled() ? "replayed into new `/ai` runs on the same ticket (kept 3 days after close)" : "off"}`,
+          `**Model:** \`${s.aiModel()}\` — dispute-evidence drafts (/billing → Disputes)`,
+          `**Speed limits:** effort \`${s.aiEffortAsk()}\`, ≤ $${s.aiMaxBudgetUsdAsk()}/run`,
           "",
           `**Knowledge-base auto-refresh:** ${s.kbRefreshEnabled() ? `on — every ${s.kbRefreshIntervalHours()}h` : "off"}`,
           `**Last refresh:** ${last ? `<t:${Math.floor(last.getTime() / 1000)}:R>` : "_never_"}`,
           "",
-          "The AI answers by searching the Postiz source + docs snapshots in `search/`; the refresh downloads fresh GitHub tarballs so answers track upstream. Models are free-text — any Claude alias/id the CLI accepts works.",
+          "Evidence drafts ground policy text by searching the Postiz source + docs snapshots in `search/`; the refresh downloads fresh GitHub tarballs so drafts track upstream. The model is free-text — any Claude alias/id the CLI accepts works.",
         ].join("\n")
       );
 
     const modelRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
-      new ButtonBuilder().setCustomId("config_ai_model").setLabel("Set Models").setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId("config_ai_perf").setLabel("Speed Limits").setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder()
-        .setCustomId("config_toggle_postiz_prefetch")
-        .setLabel(`Postiz prefetch: ${s.aiPostizPrefetchEnabled() ? "on" : "off"}`)
-        .setStyle(s.aiPostizPrefetchEnabled() ? ButtonStyle.Success : ButtonStyle.Secondary),
-      new ButtonBuilder()
-        .setCustomId("config_toggle_prev_runs")
-        .setLabel(`Previous runs: ${s.aiPreviousRunsEnabled() ? "on" : "off"}`)
-        .setStyle(s.aiPreviousRunsEnabled() ? ButtonStyle.Success : ButtonStyle.Secondary)
+      new ButtonBuilder().setCustomId("config_ai_model").setLabel("Set Model").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("config_ai_perf").setLabel("Speed Limits").setStyle(ButtonStyle.Secondary)
     );
     const kbRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder()
@@ -4056,13 +2084,6 @@ export class DiscordBot {
           `**Traces sample rate:** ${s.sentryTracesSampleRate()} · **Profiles sample rate:** ${s.sentryProfilesSampleRate()}`,
           `**Logs:** ${s.sentryLogsEnabled() ? "on" : "off"} · **Debug:** ${s.sentryDebug() ? "on" : "off"} · **Default PII:** ${s.sentrySendDefaultPii() ? "on" : "off"}`,
           `**AI content capture:** ${s.sentryAiRecordContent() ? "on — prompts/responses/tool I/O recorded on AI spans" : "off — AI metadata only (tokens, cost, tools)"}`,
-          `**Read access (/ai error correlation):** ${
-            s.sentryReadConfigured()
-              ? `on — org \`${s.sentryOrgSlug()}\`, project \`${s.sentryProjectSlug()}\` (${s.sentryReadRegion().toUpperCase()})`
-              : s.sentryReadEnabled()
-                ? "on but incomplete ⚠️ — set token + org + project"
-                : "off"
-          }`,
           "",
           "First-time enable and rate/environment/logs/PII/AI changes apply live. Changing an **active DSN**, toggling **debug**, and first-enabling **console capture** or **profiling** need a restart.",
           "Traces 0 = keep instrumentation but send nothing; fully off = clear the DSN + restart.",
@@ -4093,17 +2114,6 @@ export class DiscordBot {
         .setStyle(s.sentryAiRecordContent() ? ButtonStyle.Success : ButtonStyle.Secondary)
     );
 
-    const readButtons = new ActionRowBuilder<ButtonBuilder>().addComponents(
-      new ButtonBuilder()
-        .setCustomId("config_sentry_read")
-        .setLabel("Set Read Access")
-        .setStyle(ButtonStyle.Primary),
-      new ButtonBuilder()
-        .setCustomId("config_sentry_toggle_read")
-        .setLabel(`Read: ${s.sentryReadEnabled() ? "on" : "off"}`)
-        .setStyle(s.sentryReadEnabled() ? ButtonStyle.Success : ButtonStyle.Secondary)
-    );
-
     const actionButtons = new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder()
         .setCustomId("config_sentry_test")
@@ -4113,7 +2123,7 @@ export class DiscordBot {
       new ButtonBuilder().setCustomId("config_integrations").setLabel("Back").setStyle(ButtonStyle.Secondary)
     );
 
-    return { embeds: [embed], components: [setupButtons, toggleButtons, readButtons, actionButtons] };
+    return { embeds: [embed], components: [setupButtons, toggleButtons, actionButtons] };
   }
 
   // /config → Analytics: InfluxDB export + AI ticket scoring. Async because it
@@ -4125,17 +2135,8 @@ export class DiscordBot {
       ? "⚠️ stored token can't be decrypted (key source rotated) — re-enter it"
       : mask(s.influxToken());
 
-    const [unscored, pendingBatches, escalationQueue] = this.analytics
-      ? await Promise.all([
-          this.analytics.scoreStore.countUnscoredClosed().catch(() => 0),
-          this.analytics.scoreStore.pendingBatches().catch(() => []),
-          this.analytics.scoreStore.countEscalatedForRescore().catch(() => 0),
-        ])
-      : [0, [], 0];
-    const pending = pendingBatches[0];
-
     const embed = new EmbedBuilder()
-      .setTitle("Analytics — InfluxDB & AI Scoring")
+      .setTitle("Analytics — InfluxDB")
       .setColor(0x5865f2)
       .setDescription(
         [
@@ -4148,24 +2149,7 @@ export class DiscordBot {
           }`,
           `**Token:** ${tokenLine}`,
           "",
-          `**AI ticket scoring:** ${
-            s.scoringEnabled()
-              ? `**on** — every ${s.scoringIntervalHours()}h (${Math.round(24 / Math.max(1, s.scoringIntervalHours()))} batches/day), model \`${s.scoringModel()}\``
-              : "**off**"
-          }`,
-          `**Limits:** max ${s.scoringMaxTicketsPerBatch()} tickets/batch · daily budget $${s.scoringMaxBudgetUsdPerDay().toFixed(2)}`,
-          `**Last batch:** ${s.scoringLastRunAt() ? `<t:${Math.floor(s.scoringLastRunAt()!.getTime() / 1000)}:R>` : "_never_"} · **Unscored closed tickets:** ${unscored}`,
-          `**In flight:** ${pending ? `\`${pending.anthropicBatchId}\` (${pending.requestCount} tickets, submitted <t:${Math.floor(pending.submittedAt.getTime() / 1000)}:R>)` : "_none_"}`,
-          `**Historical backfill:** ${s.scoringBackfillPending() ? "⏳ draining (one batch in flight at a time)" : "idle"}`,
-          "",
-          `**Escalation re-scores:** ${
-            s.scoringEscalationEnabled()
-              ? `**on** — \`${s.scoringEscalationModel()}\` every ${s.scoringEscalationIntervalHours()}h, max ${s.scoringEscalationMaxTicketsPerBatch()}/batch`
-              : "**off** — flagged tickets are scored normally"
-          } · **queued:** ${escalationQueue}`,
-          `**Last escalation batch:** ${s.scoringEscalationLastRunAt() ? `<t:${Math.floor(s.scoringEscalationLastRunAt()!.getTime() / 1000)}:R>` : "_never_"} — tickets the scoring model flags as beyond its reliable evaluation are re-scored by this model (~12x/ticket; needs scoring **on**; shares the daily budget).`,
-          "",
-          "Scoring uses the Anthropic **Batch API** (50% discount, results within ~1h) with a prompt-cached rubric — ≈$0.005/ticket. Influx settings apply live on save.",
+          "Exports billing/dispute gauges, Intercom bridge health and AI run costs. Settings apply live on save.",
         ].join("\n")
       );
 
@@ -4179,115 +2163,11 @@ export class DiscordBot {
         .setCustomId("config_analytics_test")
         .setLabel("Send test point")
         .setStyle(ButtonStyle.Primary)
-        .setDisabled(!influxActive())
-    );
-
-    const scoringRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
-      new ButtonBuilder()
-        .setCustomId("config_analytics_toggle_scoring")
-        .setLabel(`Scoring: ${s.scoringEnabled() ? "on" : "off"}`)
-        .setStyle(s.scoringEnabled() ? ButtonStyle.Success : ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId("config_analytics_scoring_opts").setLabel("Scoring Options").setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId("config_analytics_score_one").setLabel("Score one now").setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId("config_analytics_batch").setLabel("View Current Batch").setStyle(ButtonStyle.Secondary)
-    );
-
-    const escalationRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
-      new ButtonBuilder()
-        .setCustomId("config_analytics_toggle_escalation")
-        .setLabel(`Escalation: ${s.scoringEscalationEnabled() ? "on" : "off"}`)
-        .setStyle(s.scoringEscalationEnabled() ? ButtonStyle.Success : ButtonStyle.Secondary),
-      new ButtonBuilder()
-        .setCustomId("config_analytics_escalation_opts")
-        .setLabel("Escalation Options")
-        .setStyle(ButtonStyle.Primary),
-      new ButtonBuilder()
-        .setCustomId("config_analytics_escalation_run")
-        .setLabel("Run Escalation Now")
-        .setStyle(ButtonStyle.Secondary)
-        .setDisabled(!s.scoringEnabled() || !s.scoringEscalationEnabled())
-    );
-
-    const backfillRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
-      new ButtonBuilder()
-        .setCustomId("config_analytics_backfill_influx")
-        .setLabel("Backfill history to Influx")
-        .setStyle(ButtonStyle.Secondary)
         .setDisabled(!influxActive()),
-      new ButtonBuilder()
-        .setCustomId("config_analytics_backfill_scores")
-        .setLabel("Backfill scores (all closed tickets)")
-        .setStyle(ButtonStyle.Secondary)
-        .setDisabled(s.scoringBackfillPending()),
       new ButtonBuilder().setCustomId("config_aianalytics").setLabel("Back").setStyle(ButtonStyle.Secondary)
     );
 
-    return { embeds: [embed], components: [influxRow, scoringRow, escalationRow, backfillRow] };
-  }
-
-  // /config → Analytics → View Current Batch: read-only snapshot of the
-  // in-flight Anthropic scoring batch and the tickets awaiting results.
-  private async buildScoringBatchPanel() {
-    const controls = new ActionRowBuilder<ButtonBuilder>().addComponents(
-      new ButtonBuilder().setCustomId("config_analytics_batch").setLabel("Refresh").setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId("config_analytics").setLabel("Back").setStyle(ButtonStyle.Secondary)
-    );
-    const batches = this.analytics ? await this.analytics.scoreStore.pendingBatches().catch(() => []) : [];
-    const batch = batches[0];
-    if (!batch) {
-      const embed = new EmbedBuilder()
-        .setTitle("Current Scoring Batch")
-        .setColor(0x5865f2)
-        .setDescription(
-          "No scoring batch is in flight. Batches are submitted on the scoring interval (or by a backfill drain) and usually return within ~1h."
-        );
-      return { embeds: [embed], components: [controls] };
-    }
-
-    const threadIds = await this.analytics!.scoreStore.ticketsInBatch(batch.anthropicBatchId).catch(() => [] as string[]);
-    const submitted = Math.floor(batch.submittedAt.getTime() / 1000);
-    // Mirrors BATCH_DEADLINE_MS in src/temporal/workflows/loopers.workflow.ts —
-    // not imported, workflow modules must not leak into the bot bundle.
-    const deadline = Math.floor((batch.submittedAt.getTime() + 26 * 60 * 60 * 1000) / 1000);
-    const embed = new EmbedBuilder()
-      .setTitle("Current Scoring Batch")
-      .setColor(0x5865f2)
-      .setDescription(
-        [
-          `**Batch:** \`${batch.anthropicBatchId}\``,
-          `**Purpose:** ${batch.purpose} · **Model:** \`${batch.model}\``,
-          `**Submitted:** <t:${submitted}:R> · **Hard deadline:** <t:${deadline}:R>`,
-          `**Requests:** ${batch.requestCount} · **Still pending:** ${threadIds.length}`,
-          ...(batches.length > 1 ? [`${batches.length - 1} more submitted batch(es) queued behind this one.`] : []),
-          "",
-          "Results are polled every minute; Anthropic typically finishes within ~1h.",
-        ].join("\n")
-      );
-
-    // Up to 60 mentions across 3 fields of 20 (~25 chars each, well under the
-    // 1024-char field cap). No pagination: interval batches are small, only
-    // backfill batches approach 200, and a batch resolves within ~1h. If a
-    // full listing is ever needed, page statelessly via
-    // config_analytics_batch_page:<n> re-querying per click.
-    const SHOW_MAX = 60;
-    const PER_FIELD = 20;
-    const shown = Math.min(threadIds.length, SHOW_MAX);
-    for (let i = 0; i < shown; i += PER_FIELD) {
-      embed.addFields({
-        name: i === 0 ? `Tickets (${shown} of ${threadIds.length} shown)` : "​",
-        value: threadIds
-          .slice(i, i + PER_FIELD)
-          .map((id) => `<#${id}>`)
-          .join(" "),
-      });
-    }
-    if (threadIds.length > SHOW_MAX) {
-      embed.addFields({ name: "​", value: `…and ${threadIds.length - SHOW_MAX} more awaiting results in this batch.` });
-    }
-    if (threadIds.length === 0) {
-      embed.addFields({ name: "Tickets", value: "_All rows already resolved — the batch is about to close._" });
-    }
-    return { embeds: [embed], components: [controls] };
+    return { embeds: [embed], components: [influxRow] };
   }
 
   // One-line Vault state for the main config panel's Infrastructure field.
@@ -4313,17 +2193,6 @@ export class DiscordBot {
   // version, schedules, migration import). The only ops window besides the
   // Temporal Web UI — prod has no terminal. ----
 
-  // /config report edits must reach the Temporal "status-report" Schedule
-  // (spec + paused state) when that regime owns publishing.
-  private syncTemporalReportSchedule(): void {
-    if (this.temporalProducers?.enabled()) {
-      void this.temporalProducers.syncReportSchedule().catch((e) =>
-        this.discordLog.warn("status-report schedule sync failed", {
-          "error.message": e instanceof Error ? e.message : String(e),
-        })
-      );
-    }
-  }
 
   private async buildTemporalPanel() {
     const s = this.settingsStore;
@@ -4397,9 +2266,7 @@ export class DiscordBot {
       new ButtonBuilder().setCustomId("config_temporal_unpause").setLabel("Unpause Schedules").setStyle(ButtonStyle.Secondary)
     );
     const row3 = new ActionRowBuilder<ButtonBuilder>().addComponents(
-      new ButtonBuilder().setCustomId("config_temporal_kb").setLabel("Refresh KB Now").setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId("config_temporal_score").setLabel("Run Scoring Now").setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId("config_temporal_report").setLabel("Run Report Now").setStyle(ButtonStyle.Secondary)
+      new ButtonBuilder().setCustomId("config_temporal_kb").setLabel("Refresh KB Now").setStyle(ButtonStyle.Secondary)
     );
     return { embeds: [embed], components: [row1, row2, row3] };
   }
@@ -4595,19 +2462,13 @@ export class DiscordBot {
       return;
     }
 
-    if (id === "config_temporal_kb" || id === "config_temporal_score" || id === "config_temporal_report") {
+    if (id === "config_temporal_kb") {
       await interaction.deferReply({ flags: 64 });
-      const r =
-        id === "config_temporal_kb"
-          ? await ops.producers.kbRefreshNow()
-          : id === "config_temporal_score"
-            ? await ops.producers.scoringRunNow()
-            : await ops.producers.runReportNow();
-      const what = id === "config_temporal_kb" ? "KB refresh" : id === "config_temporal_score" ? "scoring run" : "status report";
+      const r = await ops.producers.kbRefreshNow();
       await interaction.editReply({
         embeds: [
           makeEmbed(
-            r.ok ? `Triggered a ${what} via Temporal.` : `Couldn't trigger the ${what}: ${r.error ?? "Temporal unreachable"}.`,
+            r.ok ? "Triggered a KB refresh via Temporal." : `Couldn't trigger the KB refresh: ${r.error ?? "Temporal unreachable"}.`,
             r.ok ? COLORS.success : COLORS.danger
           ),
         ],
@@ -5309,12 +3170,10 @@ export class DiscordBot {
       .setDescription(
         [
           `**Threads channel:** ${s.threadsChannelId() ? `<#${s.threadsChannelId()}>` : "_not set_"}`,
-          `**AI solve:** ${s.aiSolveEnabled() ? "on" : "off"}`,
-          `**AI commands (/ai):** ${s.aiCommandsEnabled() ? "on" : "off"}`,
           `**GitHub repo:** ${s.githubRepo() ? `\`${s.githubRepo()}\`` : "_not set_"}`,
           `**Ticket limits:** ${s.maxOpenTicketsPerUser() > 0 ? `max ${s.maxOpenTicketsPerUser()} open` : "no cap"} · ${s.ticketCooldownMinutes() > 0 ? `${s.ticketCooldownMinutes()}m cooldown` : "no cooldown"}`,
           "",
-          "Staff roles are managed under Escalation.",
+          "Staff roles are managed under Workflow → Staff Roles.",
         ].join("\n")
       );
 
@@ -5325,14 +3184,6 @@ export class DiscordBot {
     if (s.threadsChannelId()) channelSelect.setDefaultChannels(s.threadsChannelId()!);
 
     const buttons = new ActionRowBuilder<ButtonBuilder>().addComponents(
-      new ButtonBuilder()
-        .setCustomId("config_toggle_ai")
-        .setLabel(`AI solve: ${s.aiSolveEnabled() ? "on" : "off"}`)
-        .setStyle(s.aiSolveEnabled() ? ButtonStyle.Success : ButtonStyle.Secondary),
-      new ButtonBuilder()
-        .setCustomId("config_toggle_ai_cmds")
-        .setLabel(`AI commands: ${s.aiCommandsEnabled() ? "on" : "off"}`)
-        .setStyle(s.aiCommandsEnabled() ? ButtonStyle.Success : ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId("config_set_repo").setLabel("Set GitHub Repo").setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId("config_limits").setLabel("Ticket Limits").setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId("config_back_main").setLabel("Back").setStyle(ButtonStyle.Secondary)
@@ -5344,46 +3195,6 @@ export class DiscordBot {
         new ActionRowBuilder<ChannelSelectMenuBuilder>().addComponents(channelSelect),
         buttons,
       ],
-    };
-  }
-
-  private buildReportPanel() {
-    const s = this.settingsStore;
-    const embed = new EmbedBuilder()
-      .setTitle("Status Report")
-      .setColor(0x5865f2)
-      .setDescription(
-        [
-          `**Channel:** ${s.reportChannelId() ? `<#${s.reportChannelId()}>` : "_not set_"}`,
-          `**Enabled:** ${s.reportEnabled() ? "yes" : "no"}`,
-          `**Schedule:** ${s.reportHour() != null && s.reportMinute() != null ? `daily at ${this.formatReportTime(s.reportHour()!, s.reportMinute()!)} (${s.reportTimezone()})` : `every ${s.reportIntervalHours()} hour(s)`}`,
-          `**Timezone:** ${s.reportTimezone()}`,
-          `**Overdue threshold:** ${s.overdueThresholdDays()} day(s)`,
-          "",
-          "Posts an opened/closed + per-status + per-type summary on the configured schedule. Run `/report` for an instant check anytime.",
-        ].join("\n")
-      );
-
-    const channelSelect = new ChannelSelectMenuBuilder()
-      .setCustomId("config_set_reportchannel")
-      .setPlaceholder("Report channel")
-      .addChannelTypes(ChannelType.GuildText);
-    if (s.reportChannelId()) channelSelect.setDefaultChannels(s.reportChannelId()!);
-
-    const buttons = new ActionRowBuilder<ButtonBuilder>().addComponents(
-      new ButtonBuilder()
-        .setCustomId("config_report_toggle")
-        .setLabel(`Reporting: ${s.reportEnabled() ? "on" : "off"}`)
-        .setStyle(s.reportEnabled() ? ButtonStyle.Success : ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId("config_report_time").setLabel("Set Time").setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId("config_report_tz").setLabel("Set Timezone").setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId("config_report_overdue").setLabel("Set Overdue Days").setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId("config_reporting").setLabel("Back").setStyle(ButtonStyle.Secondary)
-    );
-
-    return {
-      embeds: [embed],
-      components: [new ActionRowBuilder<ChannelSelectMenuBuilder>().addComponents(channelSelect), buttons],
     };
   }
 
@@ -5404,7 +3215,9 @@ export class DiscordBot {
                 ]
                   .filter(Boolean)
                   .join(", ");
-                const reminder = t.reminderEnabled ? `${t.reminderDays}d → ${t.reminderTarget.toLowerCase()}` : "no reminders";
+                const reminder = t.reminderEnabled
+                  ? `${t.reminderDays}d → ${t.reminderTarget === "CUSTOMER" ? "customer (Discord ping)" : "agents (Intercom note)"}`
+                  : "no reminders";
                 return `${t.emoji} **${t.label}** — ${reminder}${flags ? ` (${flags})` : ""}`;
               })
               .join("\n")
@@ -5442,14 +3255,8 @@ export class DiscordBot {
         [
           `**Initial:** ${tag.isInitial ? "yes" : "no"}`,
           `**Closes + locks thread:** ${tag.closesThread ? "yes" : "no"}`,
-          `**Reminders:** ${tag.reminderEnabled ? `every ${tag.reminderDays} day(s) → ${tag.reminderTarget.toLowerCase()}` : "off"}`,
-          `**Auto-close after:** ${
-            tag.autoCloseAfter == null
-              ? "never"
-              : tag.emoji === RESOLVED_EMOJI
-                ? `${tag.autoCloseAfter} day(s) of customer silence`
-                : `${tag.autoCloseAfter} customer reminder(s)`
-          }`,
+          `**Reminders:** ${tag.reminderEnabled ? `every ${tag.reminderDays} day(s) → ${tag.reminderTarget === "CUSTOMER" ? "customer (Discord ping)" : "agents (Intercom note + reopen)"}` : "off"}`,
+          `**Auto-close after:** ${tag.autoCloseAfter == null ? "never" : `${tag.autoCloseAfter} unanswered customer reminder(s)`}`,
           `**Customer-reply target:** ${tag.isCustomerReplyTarget ? "yes — a customer reply to a Waiting-for-Customer ticket lands here" : "no"}`,
         ].join("\n")
       );
@@ -5461,7 +3268,10 @@ export class DiscordBot {
         .setStyle(tag.isInitial ? ButtonStyle.Success : ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId(`config_tag_toggle_closes:${tag.id}`).setLabel("Toggle Closes").setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId(`config_tag_toggle_reminder:${tag.id}`).setLabel("Toggle Reminder").setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId(`config_tag_target:${tag.id}`).setLabel(`Target: ${tag.reminderTarget.toLowerCase()}`).setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId(`config_tag_target:${tag.id}`)
+        .setLabel(`Remind: ${tag.reminderTarget === "CUSTOMER" ? "customer" : "agents"}`)
+        .setStyle(ButtonStyle.Secondary),
       new ButtonBuilder()
         .setCustomId(`config_tag_toggle_reply_target:${tag.id}`)
         .setLabel(tag.isCustomerReplyTarget ? "Reply target ✓" : "Set reply target")
@@ -5482,110 +3292,31 @@ export class DiscordBot {
     return { embeds: [embed], components: [toggles, reorder, actions] };
   }
 
-  private buildPrioritiesPanel() {
-    const priorities = this.settingsStore.priorities();
-    const embed = new EmbedBuilder()
-      .setTitle("Priorities")
-      .setColor(0x5865f2)
-      .setDescription(
-        priorities.length
-          ? priorities.map((p) => `${p.emoji} **${p.label}**${p.isInitial ? " (initial)" : ""}`).join("\n")
-          : "_No priorities yet._"
-      )
-      .setFooter({ text: "The initial priority is applied to new tickets. Change a ticket's priority with /priority set." });
-
-    const components: ActionRowBuilder<any>[] = [];
-    if (priorities.length) {
-      const pick = new StringSelectMenuBuilder()
-        .setCustomId("config_priority_pick")
-        .setPlaceholder("Edit a priority")
-        .addOptions(priorities.map((p) => ({ label: p.label, value: p.id, emoji: p.emoji })));
-      components.push(new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(pick));
-    }
-    components.push(
-      new ActionRowBuilder<ButtonBuilder>().addComponents(
-        new ButtonBuilder().setCustomId("config_priority_add").setLabel("Add Priority").setStyle(ButtonStyle.Success),
-        new ButtonBuilder().setCustomId("config_workflow").setLabel("Back").setStyle(ButtonStyle.Secondary)
-      )
-    );
-
-    return { embeds: [embed], components };
-  }
-
-  private buildPriorityEditPanel(priority: PriorityTag) {
-    const priorities = this.settingsStore.priorities();
-    const idx = priorities.findIndex((p) => p.id === priority.id);
-    const atTop = idx <= 0;
-    const atBottom = idx === -1 || idx >= priorities.length - 1;
-
-    const embed = new EmbedBuilder()
-      .setTitle(`Edit ${priority.emoji} ${priority.label}`)
-      .setColor(0x5865f2)
-      .setDescription(`**Initial:** ${priority.isInitial ? "yes" : "no"}`);
-
-    const reorder = new ActionRowBuilder<ButtonBuilder>().addComponents(
-      new ButtonBuilder().setCustomId(`config_priority_move_up:${priority.id}`).setLabel("Move Up").setEmoji("⬆️").setStyle(ButtonStyle.Secondary).setDisabled(atTop),
-      new ButtonBuilder().setCustomId(`config_priority_move_down:${priority.id}`).setLabel("Move Down").setEmoji("⬇️").setStyle(ButtonStyle.Secondary).setDisabled(atBottom)
-    );
-
-    const actions = new ActionRowBuilder<ButtonBuilder>().addComponents(
-      new ButtonBuilder()
-        .setCustomId(`config_priority_set_initial:${priority.id}`)
-        .setLabel(priority.isInitial ? "Initial ✓" : "Set as Initial")
-        .setStyle(priority.isInitial ? ButtonStyle.Success : ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId(`config_priority_edit_basic:${priority.id}`).setLabel("Edit emoji/label").setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId(`config_priority_delete:${priority.id}`).setLabel("Delete").setStyle(ButtonStyle.Danger),
-      new ButtonBuilder().setCustomId("config_priorities").setLabel("Back").setStyle(ButtonStyle.Secondary)
-    );
-
-    return { embeds: [embed], components: [reorder, actions] };
-  }
-
-  private buildPriorityModal(priority?: PriorityTag): ModalBuilder {
-    const modal = new ModalBuilder()
-      .setCustomId(priority ? `config_priority_edit_modal:${priority.id}` : "config_priority_add_modal")
-      .setTitle(priority ? "Edit Priority" : "Add Priority");
-
-    const emoji = new TextInputBuilder().setCustomId("emoji").setLabel("Emoji").setStyle(TextInputStyle.Short).setRequired(true);
-    const label = new TextInputBuilder().setCustomId("label").setLabel("Label").setStyle(TextInputStyle.Short).setRequired(true);
-
-    if (priority) {
-      emoji.setValue(priority.emoji);
-      label.setValue(priority.label);
-    }
-
-    modal.addComponents(
-      new ActionRowBuilder<TextInputBuilder>().addComponents(emoji),
-      new ActionRowBuilder<TextInputBuilder>().addComponents(label)
-    );
-    return modal;
-  }
-
   private buildEscalationPanel() {
     const tiers = this.tierStore.list();
     const embed = new EmbedBuilder()
-      .setTitle("Escalation Tiers")
+      .setTitle("Staff Roles")
       .setColor(0x5865f2)
       .setDescription(
         tiers.length
-          ? tiers.map((t, i) => `**${i + 1}.** ${t.name} — <@&${t.roleId}>`).join("\n")
-          : "_No tiers yet — the legacy support role is used as fallback._"
+          ? tiers.map((t) => `${t.name} — <@&${t.roleId}>`).join("\n")
+          : "_No roles yet — the legacy support role is used as fallback._"
       )
       .setFooter({
-        text: "Tier 1 gets new-ticket pings and its members are added to ticket threads. Any tier role counts as staff. Move tickets with /escalate up|down, optionally straight to a tier.",
+        text: "Members of any role here count as staff: /charge authorization, ticket rate-limit exemption, staff/customer classification for the Intercom bridge, and the blocked-charge review ping (first role).",
       });
 
     const components: ActionRowBuilder<any>[] = [];
     if (tiers.length) {
       const pick = new StringSelectMenuBuilder()
         .setCustomId("config_tier_pick")
-        .setPlaceholder("Edit a tier")
-        .addOptions(tiers.map((t, i) => ({ label: `${i + 1}. ${t.name}`, value: t.id })));
+        .setPlaceholder("Edit a staff role")
+        .addOptions(tiers.map((t) => ({ label: t.name, value: t.id })));
       components.push(new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(pick));
     }
     const addSelect = new RoleSelectMenuBuilder()
       .setCustomId("config_tier_add_role")
-      .setPlaceholder("Add tier: pick its Discord role");
+      .setPlaceholder("Add staff role: pick its Discord role");
     components.push(new ActionRowBuilder<RoleSelectMenuBuilder>().addComponents(addSelect));
     components.push(
       new ActionRowBuilder<ButtonBuilder>().addComponents(
@@ -5600,9 +3331,14 @@ export class DiscordBot {
     const tiers = this.tierStore.list();
     const position = tiers.findIndex((t) => t.id === tier.id);
     const embed = new EmbedBuilder()
-      .setTitle(`Edit tier: ${tier.name}`)
+      .setTitle(`Edit staff role: ${tier.name}`)
       .setColor(0x5865f2)
-      .setDescription([`**Role:** <@&${tier.roleId}>`, `**Position:** ${position + 1} of ${tiers.length}`].join("\n"));
+      .setDescription(
+        [
+          `**Role:** <@&${tier.roleId}>`,
+          `**Position:** ${position + 1} of ${tiers.length} — the first role receives the blocked-charge review ping`,
+        ].join("\n")
+      );
 
     const buttons = new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder().setCustomId(`config_tier_up:${tier.id}`).setLabel("Move Up").setStyle(ButtonStyle.Secondary),
@@ -5656,20 +3392,6 @@ export class DiscordBot {
       return;
     }
 
-    if (id === "config_toggle_ai") {
-      await this.settingsStore.updateGeneral({ aiSolveEnabled: !this.settingsStore.aiSolveEnabled() });
-      this.auditConfig(interaction, `AI solve → ${this.settingsStore.aiSolveEnabled() ? "on" : "off"}`);
-      await interaction.update(this.buildGeneralPanel());
-      return;
-    }
-
-    if (id === "config_toggle_ai_cmds") {
-      await this.settingsStore.updateGeneral({ aiCommandsEnabled: !this.settingsStore.aiCommandsEnabled() });
-      this.auditConfig(interaction, `AI commands (/ai) → ${this.settingsStore.aiCommandsEnabled() ? "on" : "off"}`);
-      await interaction.update(this.buildGeneralPanel());
-      return;
-    }
-
     if (id === "config_ai") {
       await interaction.update(this.buildAiPanel());
       return;
@@ -5678,30 +3400,6 @@ export class DiscordBot {
     if (id === "config_toggle_kb") {
       await this.settingsStore.updateKnowledge({ kbRefreshEnabled: !this.settingsStore.kbRefreshEnabled() });
       this.auditConfig(interaction, `KB auto-refresh → ${this.settingsStore.kbRefreshEnabled() ? "on" : "off"}`);
-      await interaction.update(this.buildAiPanel());
-      return;
-    }
-
-    if (id === "config_toggle_postiz_prefetch") {
-      await this.settingsStore.updateGeneral({
-        aiPostizPrefetchEnabled: !this.settingsStore.aiPostizPrefetchEnabled(),
-      });
-      this.auditConfig(
-        interaction,
-        `Postiz account pre-fetch → ${this.settingsStore.aiPostizPrefetchEnabled() ? "on" : "off"}`
-      );
-      await interaction.update(this.buildAiPanel());
-      return;
-    }
-
-    if (id === "config_toggle_prev_runs") {
-      await this.settingsStore.updateGeneral({
-        aiPreviousRunsEnabled: !this.settingsStore.aiPreviousRunsEnabled(),
-      });
-      this.auditConfig(
-        interaction,
-        `Previous /ai runs in context → ${this.settingsStore.aiPreviousRunsEnabled() ? "on" : "off"}`
-      );
       await interaction.update(this.buildAiPanel());
       return;
     }
@@ -5731,11 +3429,6 @@ export class DiscordBot {
 
     if (id === "config_reverify") {
       await this.handleReVerify(interaction);
-      return;
-    }
-
-    if (id === "config_report") {
-      await interaction.update(this.buildReportPanel());
       return;
     }
 
@@ -6101,6 +3794,64 @@ export class DiscordBot {
       return;
     }
 
+    if (id === "config_intercom_inactivity") {
+      await interaction.update(this.buildInactivityPanel());
+      return;
+    }
+
+    if (id === "config_inactivity_toggle") {
+      await this.settingsStore.updateInactivity({ inactivityEnabled: !this.settingsStore.inactivityEnabled() });
+      this.auditConfig(interaction, `Inactivity sweeper → ${this.settingsStore.inactivityEnabled() ? "on" : "off"}`);
+      await interaction.update(this.buildInactivityPanel());
+      return;
+    }
+
+    if (id === "config_inactivity_opts") {
+      const s = this.settingsStore;
+      const modal = new ModalBuilder().setCustomId("config_inactivity_opts_modal").setTitle("Inactivity Thresholds");
+      const agentDays = new TextInputBuilder()
+        .setCustomId("agent_days")
+        .setLabel("Agent-idle days before a note (1-30)")
+        .setStyle(TextInputStyle.Short)
+        .setRequired(true)
+        .setValue(String(s.inactivityAgentWaitDays()));
+      const customerDays = new TextInputBuilder()
+        .setCustomId("customer_days")
+        .setLabel("Customer-idle days before a nag (1-30)")
+        .setStyle(TextInputStyle.Short)
+        .setRequired(true)
+        .setValue(String(s.inactivityCustomerWaitDays()));
+      const nags = new TextInputBuilder()
+        .setCustomId("nags")
+        .setLabel("Unanswered nags before auto-close (1-10)")
+        .setStyle(TextInputStyle.Short)
+        .setRequired(true)
+        .setValue(String(s.inactivityNagsBeforeClose()));
+      modal.addComponents(
+        new ActionRowBuilder<TextInputBuilder>().addComponents(agentDays),
+        new ActionRowBuilder<TextInputBuilder>().addComponents(customerDays),
+        new ActionRowBuilder<TextInputBuilder>().addComponents(nags)
+      );
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (id === "config_inactivity_run") {
+      await interaction.deferReply({ flags: 64 });
+      const r = await this.temporalProducers?.inactivityRunNow();
+      await interaction.editReply({
+        embeds: [
+          makeEmbed(
+            r?.ok
+              ? "Triggered an inactivity sweep (bypasses the enabled toggle for this one run). Results land in the audit channel."
+              : `Couldn't trigger the sweep: ${r?.error ?? "Temporal unreachable"}.`,
+            r?.ok ? COLORS.success : COLORS.danger
+          ),
+        ],
+      });
+      return;
+    }
+
     if (id === "config_sentry") {
       await interaction.update(this.buildSentryPanel());
       return;
@@ -6119,59 +3870,6 @@ export class DiscordBot {
         )
       );
       await interaction.showModal(modal);
-      return;
-    }
-
-    if (id === "config_sentry_read") {
-      const s = this.settingsStore;
-      const modal = new ModalBuilder().setCustomId("config_sentry_read_modal").setTitle("Sentry Read Access");
-      modal.addComponents(
-        new ActionRowBuilder<TextInputBuilder>().addComponents(
-          new TextInputBuilder()
-            .setCustomId("token")
-            .setLabel("Auth token (blank = keep current)")
-            .setStyle(TextInputStyle.Short)
-            .setRequired(false)
-            .setPlaceholder(s.sentryReadToken() ? "•••• stored (leave blank to keep)" : "event:read, project:read")
-        ),
-        new ActionRowBuilder<TextInputBuilder>().addComponents(
-          new TextInputBuilder()
-            .setCustomId("org")
-            .setLabel("Organization slug")
-            .setStyle(TextInputStyle.Short)
-            .setRequired(false)
-            .setValue(s.sentryOrgSlug() ?? "")
-        ),
-        new ActionRowBuilder<TextInputBuilder>().addComponents(
-          new TextInputBuilder()
-            .setCustomId("project")
-            .setLabel("Project slug")
-            .setStyle(TextInputStyle.Short)
-            .setRequired(false)
-            .setValue(s.sentryProjectSlug() ?? "")
-        ),
-        new ActionRowBuilder<TextInputBuilder>().addComponents(
-          new TextInputBuilder()
-            .setCustomId("region")
-            .setLabel("Data region: us or eu")
-            .setStyle(TextInputStyle.Short)
-            .setRequired(true)
-            .setValue(s.sentryReadRegion())
-        )
-      );
-      await interaction.showModal(modal);
-      return;
-    }
-
-    if (id === "config_sentry_toggle_read") {
-      await this.settingsStore.updateSentryRead({
-        sentryReadEnabled: !this.settingsStore.sentryReadEnabled(),
-      });
-      this.auditConfig(
-        interaction,
-        `Sentry read access → ${this.settingsStore.sentryReadEnabled() ? "on" : "off"}`
-      );
-      await interaction.update(this.buildSentryPanel());
       return;
     }
 
@@ -6259,11 +3957,6 @@ export class DiscordBot {
       return;
     }
 
-    if (id === "config_analytics_batch") {
-      await interaction.update(await this.buildScoringBatchPanel());
-      return;
-    }
-
     if (id.startsWith("config_vault")) {
       await this.handleVaultConfigButton(interaction, id);
       return;
@@ -6335,220 +4028,6 @@ export class DiscordBot {
           embeds: [makeEmbed(`Test write failed: ${error instanceof Error ? error.message : String(error)}`, COLORS.danger)],
         });
       }
-      return;
-    }
-
-    if (id === "config_analytics_toggle_scoring") {
-      await this.settingsStore.updateAnalytics({ scoringEnabled: !this.settingsStore.scoringEnabled() });
-      this.auditConfig(interaction, `AI ticket scoring → ${this.settingsStore.scoringEnabled() ? "on" : "off"}`);
-      await interaction.update(await this.buildAnalyticsPanel());
-      return;
-    }
-
-    if (id === "config_analytics_scoring_opts") {
-      const s = this.settingsStore;
-      const modal = new ModalBuilder().setCustomId("config_analytics_scoring_modal").setTitle("AI Scoring Options");
-      modal.addComponents(
-        new ActionRowBuilder<TextInputBuilder>().addComponents(
-          new TextInputBuilder()
-            .setCustomId("interval")
-            .setLabel("Batch interval in hours (6 = 4x/day)")
-            .setStyle(TextInputStyle.Short)
-            .setRequired(true)
-            .setValue(String(s.scoringIntervalHours()))
-        ),
-        new ActionRowBuilder<TextInputBuilder>().addComponents(
-          new TextInputBuilder()
-            .setCustomId("model")
-            .setLabel("Model id (cheap model recommended)")
-            .setStyle(TextInputStyle.Short)
-            .setRequired(true)
-            .setValue(s.scoringModel())
-        ),
-        new ActionRowBuilder<TextInputBuilder>().addComponents(
-          new TextInputBuilder()
-            .setCustomId("max_batch")
-            .setLabel("Max tickets per batch")
-            .setStyle(TextInputStyle.Short)
-            .setRequired(true)
-            .setValue(String(s.scoringMaxTicketsPerBatch()))
-        ),
-        new ActionRowBuilder<TextInputBuilder>().addComponents(
-          new TextInputBuilder()
-            .setCustomId("budget")
-            .setLabel("Daily budget cap in USD")
-            .setStyle(TextInputStyle.Short)
-            .setRequired(true)
-            .setValue(String(s.scoringMaxBudgetUsdPerDay()))
-        )
-      );
-      await interaction.showModal(modal);
-      return;
-    }
-
-    if (id === "config_analytics_score_one") {
-      const modal = new ModalBuilder().setCustomId("config_analytics_score_one_modal").setTitle("Score One Ticket Now");
-      modal.addComponents(
-        new ActionRowBuilder<TextInputBuilder>().addComponents(
-          new TextInputBuilder()
-            .setCustomId("thread")
-            .setLabel("Thread id of a CLOSED ticket")
-            .setStyle(TextInputStyle.Short)
-            .setRequired(true)
-            .setPlaceholder("e.g. 1234567890123456789")
-        )
-      );
-      await interaction.showModal(modal);
-      return;
-    }
-
-    if (id === "config_analytics_toggle_escalation") {
-      const turningOff = this.settingsStore.scoringEscalationEnabled();
-      // Turning off hands the queue back to normal scoring so nothing strands
-      // (the regular submit path also self-heals, this just makes it immediate).
-      const requeued =
-        turningOff && this.analytics
-          ? await this.analytics.scoreStore.requeueEscalatedToNormal().catch(() => 0)
-          : 0;
-      await this.settingsStore.updateAnalytics({ scoringEscalationEnabled: !turningOff });
-      this.auditConfig(
-        interaction,
-        `Scoring escalation → ${
-          turningOff ? `off${requeued ? ` (${requeued} queued ticket(s) returned to normal scoring)` : ""}` : "on"
-        }`
-      );
-      await interaction.update(await this.buildAnalyticsPanel());
-      return;
-    }
-
-    if (id === "config_analytics_escalation_opts") {
-      const s = this.settingsStore;
-      const modal = new ModalBuilder()
-        .setCustomId("config_analytics_escalation_modal")
-        .setTitle("Escalation Re-score Options");
-      modal.addComponents(
-        new ActionRowBuilder<TextInputBuilder>().addComponents(
-          new TextInputBuilder()
-            .setCustomId("model")
-            .setLabel("Escalation model id (real id, ~12x cost)")
-            .setStyle(TextInputStyle.Short)
-            .setRequired(true)
-            .setValue(s.scoringEscalationModel())
-        ),
-        new ActionRowBuilder<TextInputBuilder>().addComponents(
-          new TextInputBuilder()
-            .setCustomId("interval")
-            .setLabel("Batch interval in hours (24 = daily)")
-            .setStyle(TextInputStyle.Short)
-            .setRequired(true)
-            .setValue(String(s.scoringEscalationIntervalHours()))
-        ),
-        new ActionRowBuilder<TextInputBuilder>().addComponents(
-          new TextInputBuilder()
-            .setCustomId("max_batch")
-            .setLabel("Max tickets per escalation batch")
-            .setStyle(TextInputStyle.Short)
-            .setRequired(true)
-            .setValue(String(s.scoringEscalationMaxTicketsPerBatch()))
-        )
-      );
-      await interaction.showModal(modal);
-      return;
-    }
-
-    if (id === "config_analytics_escalation_run") {
-      await interaction.deferReply({ flags: 64 });
-      const ops = this.temporalOps;
-      if (!ops) {
-        await interaction.editReply({
-          embeds: [makeEmbed("Temporal stack is not wired in this process.", COLORS.warn)],
-        });
-        return;
-      }
-      const r = await ops.producers.scoringEscalationRunNow();
-      await interaction.editReply({
-        embeds: [
-          makeEmbed(
-            r.ok
-              ? "Triggered an escalation re-score batch via Temporal (submits once no other batch is in flight)."
-              : `Couldn't trigger the escalation batch: ${r.error ?? "Temporal unreachable"}.`,
-            r.ok ? COLORS.success : COLORS.danger
-          ),
-        ],
-      });
-      return;
-    }
-
-    if (id === "config_analytics_backfill_influx") {
-      const confirm = new ActionRowBuilder<ButtonBuilder>().addComponents(
-        new ButtonBuilder()
-          .setCustomId("config_analytics_backfill_influx_confirm")
-          .setLabel("Yes, export all history")
-          .setStyle(ButtonStyle.Primary),
-        new ButtonBuilder().setCustomId("config_analytics").setLabel("Cancel").setStyle(ButtonStyle.Secondary)
-      );
-      await interaction.update({
-        embeds: [
-          makeEmbed(
-            "This exports **every historical ticket** (created/closed/first-response/CSAT events at their original timestamps, plus the status-change history) from the database into InfluxDB. Re-running writes the same points again (Influx de-duplicates identical points, so it's safe). No AI cost.",
-            COLORS.brand
-          ),
-        ],
-        components: [confirm],
-      });
-      return;
-    }
-
-    if (id === "config_analytics_backfill_influx_confirm") {
-      await interaction.deferUpdate();
-      try {
-        const { tickets, points } = await backfillTicketHistory(this.analytics!.prisma);
-        this.auditConfig(interaction, `Influx history backfill → ${tickets} tickets, ${points} points`);
-        await interaction.editReply({
-          embeds: [makeEmbed(`✅ Backfilled **${tickets}** tickets (**${points}** points) into InfluxDB.`, COLORS.success)],
-          components: [],
-        });
-      } catch (error) {
-        await interaction.editReply({
-          embeds: [makeEmbed(`Backfill failed: ${error instanceof Error ? error.message : String(error)}`, COLORS.danger)],
-          components: [],
-        });
-      }
-      return;
-    }
-
-    if (id === "config_analytics_backfill_scores") {
-      const unscored = this.analytics ? await this.analytics.scoreStore.countUnscoredClosed().catch(() => 0) : 0;
-      const estimate = unscored * 0.005;
-      const confirm = new ActionRowBuilder<ButtonBuilder>().addComponents(
-        new ButtonBuilder()
-          .setCustomId("config_analytics_backfill_scores_confirm")
-          .setLabel(`Yes, score ${unscored} tickets`)
-          .setStyle(ButtonStyle.Primary)
-          .setDisabled(unscored === 0),
-        new ButtonBuilder().setCustomId("config_analytics").setLabel("Cancel").setStyle(ButtonStyle.Secondary)
-      );
-      await interaction.update({
-        embeds: [
-          makeEmbed(
-            [
-              `This queues **${unscored}** unscored closed ticket(s) for AI scoring, drained oldest-first in batches of ${this.settingsStore.scoringMaxTicketsPerBatch()} (one batch in flight at a time).`,
-              "",
-              `Estimated total cost: **~$${estimate.toFixed(2)}** (Batch API, ≈$0.005/ticket). The daily budget cap ($${this.settingsStore.scoringMaxBudgetUsdPerDay().toFixed(2)}) still applies — a large backfill spreads across days.`,
-              "Scoring must be enabled for the drain to run.",
-            ].join("\n"),
-            COLORS.brand
-          ),
-        ],
-        components: [confirm],
-      });
-      return;
-    }
-
-    if (id === "config_analytics_backfill_scores_confirm") {
-      await this.settingsStore.setScoringBackfillPending(true);
-      this.auditConfig(interaction, "AI score backfill → queued (all unscored closed tickets)");
-      await interaction.update(await this.buildAnalyticsPanel());
       return;
     }
 
@@ -6784,8 +4263,8 @@ export class DiscordBot {
         const existing = types?.find((t) => t.id === typeId)?.attributeNames ?? [];
         const results: string[] = [];
         for (const [name, description] of [
-          [TICKET_ATTR_PRIORITY, "Ticket priority mirrored from the Discord support bot"],
           [TICKET_ATTR_CSAT, "CSAT rating mirrored from the Discord support bot"],
+          [TICKET_ATTR_CSAT_COMMENT, "CSAT comment mirrored from the Discord support bot"],
           [TICKET_ATTR_THREAD, "Discord thread id of the bridged ticket"],
         ] as const) {
           if (existing.includes(name)) {
@@ -6886,67 +4365,15 @@ export class DiscordBot {
       return;
     }
 
-    if (id === "config_report_toggle") {
-      await this.settingsStore.updateReport({ reportEnabled: !this.settingsStore.reportEnabled() });
-      this.syncTemporalReportSchedule();
-      this.auditConfig(interaction, `Status report → ${this.settingsStore.reportEnabled() ? "on" : "off"}`);
-      await interaction.update(this.buildReportPanel());
-      return;
-    }
-
-    if (id === "config_report_time") {
-      const modal = new ModalBuilder().setCustomId("config_report_time_modal").setTitle("Report Time");
-      const hourInput = new TextInputBuilder()
-        .setCustomId("hour")
-        .setLabel("Hour (0-23)")
-        .setStyle(TextInputStyle.Short)
-        .setRequired(true)
-        .setValue(String(this.settingsStore.reportHour() ?? 9));
-      const minuteInput = new TextInputBuilder()
-        .setCustomId("minute")
-        .setLabel("Minute (0-59)")
-        .setStyle(TextInputStyle.Short)
-        .setRequired(true)
-        .setValue(String(this.settingsStore.reportMinute() ?? 0));
-      modal.addComponents(
-        new ActionRowBuilder<TextInputBuilder>().addComponents(hourInput),
-        new ActionRowBuilder<TextInputBuilder>().addComponents(minuteInput)
-      );
-      await interaction.showModal(modal);
-      return;
-    }
-
-    if (id === "config_report_tz") {
-      const modal = new ModalBuilder().setCustomId("config_report_tz_modal").setTitle("Report Timezone");
-      const input = new TextInputBuilder()
-        .setCustomId("tz")
-        .setLabel("IANA timezone (e.g. Europe/Berlin)")
-        .setStyle(TextInputStyle.Short)
-        .setRequired(true)
-        .setValue(this.settingsStore.reportTimezone());
-      modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(input));
-      await interaction.showModal(modal);
-      return;
-    }
-
     if (id === "config_ai_model") {
-      const modal = new ModalBuilder().setCustomId("config_ai_model_modal").setTitle("AI Models");
+      const modal = new ModalBuilder().setCustomId("config_ai_model_modal").setTitle("AI Model");
       const main = new TextInputBuilder()
         .setCustomId("model")
-        .setLabel("Main model (customer + /ai ask/cause)")
+        .setLabel("Model (dispute-evidence drafts)")
         .setStyle(TextInputStyle.Short)
         .setRequired(true)
         .setValue(this.settingsStore.aiModel());
-      const light = new TextInputBuilder()
-        .setCustomId("model_light")
-        .setLabel("Light model (/ai summarize + draft)")
-        .setStyle(TextInputStyle.Short)
-        .setRequired(true)
-        .setValue(this.settingsStore.aiModelLight());
-      modal.addComponents(
-        new ActionRowBuilder<TextInputBuilder>().addComponents(main),
-        new ActionRowBuilder<TextInputBuilder>().addComponents(light)
-      );
+      modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(main));
       await interaction.showModal(modal);
       return;
     }
@@ -6956,33 +4383,19 @@ export class DiscordBot {
       const modal = new ModalBuilder().setCustomId("config_ai_perf_modal").setTitle("AI Speed Limits");
       const effortAsk = new TextInputBuilder()
         .setCustomId("effort_ask")
-        .setLabel("ask effort (low/medium/high/max)")
+        .setLabel("Effort (low/medium/high/max)")
         .setStyle(TextInputStyle.Short)
         .setRequired(true)
         .setValue(s.aiEffortAsk());
-      const effortCause = new TextInputBuilder()
-        .setCustomId("effort_cause")
-        .setLabel("cause effort (low/medium/high/max)")
-        .setStyle(TextInputStyle.Short)
-        .setRequired(true)
-        .setValue(s.aiEffortCause());
       const budgetAsk = new TextInputBuilder()
         .setCustomId("budget_ask")
-        .setLabel("ask budget (USD per run)")
+        .setLabel("Budget (USD per run)")
         .setStyle(TextInputStyle.Short)
         .setRequired(true)
         .setValue(String(s.aiMaxBudgetUsdAsk()));
-      const budgetCause = new TextInputBuilder()
-        .setCustomId("budget_cause")
-        .setLabel("cause budget (USD per run)")
-        .setStyle(TextInputStyle.Short)
-        .setRequired(true)
-        .setValue(String(s.aiMaxBudgetUsdCause()));
       modal.addComponents(
         new ActionRowBuilder<TextInputBuilder>().addComponents(effortAsk),
-        new ActionRowBuilder<TextInputBuilder>().addComponents(effortCause),
-        new ActionRowBuilder<TextInputBuilder>().addComponents(budgetAsk),
-        new ActionRowBuilder<TextInputBuilder>().addComponents(budgetCause)
+        new ActionRowBuilder<TextInputBuilder>().addComponents(budgetAsk)
       );
       await interaction.showModal(modal);
       return;
@@ -6996,19 +4409,6 @@ export class DiscordBot {
         .setStyle(TextInputStyle.Short)
         .setRequired(true)
         .setValue(String(this.settingsStore.kbRefreshIntervalHours()));
-      modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(input));
-      await interaction.showModal(modal);
-      return;
-    }
-
-    if (id === "config_report_overdue") {
-      const modal = new ModalBuilder().setCustomId("config_report_overdue_modal").setTitle("Overdue Threshold");
-      const input = new TextInputBuilder()
-        .setCustomId("days")
-        .setLabel("Days before a ticket counts as overdue")
-        .setStyle(TextInputStyle.Short)
-        .setRequired(true)
-        .setValue(String(this.settingsStore.overdueThresholdDays()));
       modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(input));
       await interaction.showModal(modal);
       return;
@@ -7051,16 +4451,6 @@ export class DiscordBot {
 
     if (id === "config_tag_add") {
       await interaction.showModal(this.buildTagModal());
-      return;
-    }
-
-    if (id === "config_priorities") {
-      await interaction.update(this.buildPrioritiesPanel());
-      return;
-    }
-
-    if (id === "config_priority_add") {
-      await interaction.showModal(this.buildPriorityModal());
       return;
     }
 
@@ -7110,44 +4500,16 @@ export class DiscordBot {
     // Priority-scoped buttons: customId is `config_priority_<action>:<priorityId>`.
     // Must be handled before the tag fallthrough below, which split(":")-parses
     // any remaining id as a tag action.
-    if (id.startsWith("config_priority_")) {
-      const [priorityAction, priorityId] = id.split(":");
-      const priority = priorityId ? this.settingsStore.priorityById(priorityId) : undefined;
-      if (!priority) {
-        await interaction.update(this.buildPrioritiesPanel());
-        return;
-      }
-      if (priorityAction === "config_priority_set_initial") {
-        await this.settingsStore.editPriority(priority.id, { isInitial: true });
-        this.auditConfig(interaction, `Priority ${priority.emoji} ${priority.label} → set as initial`);
-        const updated = this.settingsStore.priorityById(priority.id);
-        await interaction.update(updated ? this.buildPriorityEditPanel(updated) : this.buildPrioritiesPanel());
-        return;
-      }
-      if (priorityAction === "config_priority_edit_basic") {
-        await interaction.showModal(this.buildPriorityModal(priority));
-        return;
-      }
-      if (priorityAction === "config_priority_delete") {
-        await this.handlePriorityDelete(interaction, priority.id);
-        return;
-      }
-      if (priorityAction === "config_priority_move_up" || priorityAction === "config_priority_move_down") {
-        const dir = priorityAction === "config_priority_move_up" ? "up" : "down";
-        await this.settingsStore.movePriority(priority.id, dir);
-        this.auditConfig(interaction, `Priority ${priority.emoji} ${priority.label} → moved ${dir}`);
-        const updated = this.settingsStore.priorityById(priority.id);
-        await interaction.update(updated ? this.buildPriorityEditPanel(updated) : this.buildPrioritiesPanel());
-        return;
-      }
-      return;
-    }
-
     // Tag-scoped buttons: customId is `config_tag_<action>:<tagId>`
     const [action, tagId] = id.split(":");
     const tag = tagId ? this.settingsStore.tagById(tagId) : undefined;
     if (!tag) {
-      await interaction.reply({ embeds: [makeEmbed("That tag no longer exists.", COLORS.warn)], flags: 64 });
+      // Doubles as the tombstone for removed config controls sitting on stale
+      // ephemeral panels.
+      await interaction.reply({
+        embeds: [makeEmbed("This control no longer exists — run /config again.", COLORS.warn)],
+        flags: 64,
+      });
       return;
     }
 
@@ -7262,44 +4624,6 @@ export class DiscordBot {
             note ??
               (result.status === "disabled" ? "Sentry stays off (no DSN)." : "Sentry settings saved."),
             result.status === "restart-required" ? COLORS.warn : COLORS.success
-          ),
-        ],
-        flags: 64,
-      });
-      return;
-    }
-
-    if (interaction.customId === "config_sentry_read_modal") {
-      const token = interaction.fields.getTextInputValue("token").trim();
-      const org = interaction.fields.getTextInputValue("org").trim();
-      const project = interaction.fields.getTextInputValue("project").trim();
-      const region = interaction.fields.getTextInputValue("region").trim().toLowerCase();
-      if (region !== "us" && region !== "eu") {
-        await interaction.reply({
-          embeds: [makeEmbed("Data region must be `us` or `eu`.", COLORS.danger)],
-          flags: 64,
-        });
-        return;
-      }
-      await this.settingsStore.updateSentryRead({
-        sentryOrgSlug: org || null,
-        sentryProjectSlug: project || null,
-        sentryReadRegion: region,
-        // Blank token = leave the stored (encrypted) one unchanged.
-        ...(token ? { sentryReadToken: token } : {}),
-      });
-      // Deliberately no token value in the audit line.
-      this.auditConfig(
-        interaction,
-        `Sentry read creds updated (org ${org || "—"}, project ${project || "—"}, region ${region}${token ? ", token set" : ""})`
-      );
-      await interaction.reply({
-        embeds: [
-          makeEmbed(
-            this.settingsStore.sentryReadConfigured()
-              ? "Sentry read access saved — configured and on."
-              : "Sentry read access saved — still incomplete (need token + org + project, and Read toggled on).",
-            COLORS.success
           ),
         ],
         flags: 64,
@@ -7425,148 +4749,6 @@ export class DiscordBot {
       return;
     }
 
-    if (interaction.customId === "config_analytics_scoring_modal") {
-      const interval = Number.parseInt(interaction.fields.getTextInputValue("interval").trim(), 10);
-      const model = interaction.fields.getTextInputValue("model").trim();
-      const maxBatch = Number.parseInt(interaction.fields.getTextInputValue("max_batch").trim(), 10);
-      const budget = Number.parseFloat(interaction.fields.getTextInputValue("budget").trim());
-      if (
-        !Number.isInteger(interval) || interval < 1 || interval > 168 ||
-        !model ||
-        !Number.isInteger(maxBatch) || maxBatch < 1 || maxBatch > 10_000 ||
-        !Number.isFinite(budget) || budget < 0
-      ) {
-        await interaction.reply({
-          embeds: [
-            makeEmbed(
-              "Invalid values — interval 1-168 hours, model non-empty, max tickets 1-10000, budget ≥ 0.",
-              COLORS.danger
-            ),
-          ],
-          flags: 64,
-        });
-        return;
-      }
-      await this.settingsStore.updateAnalytics({
-        scoringIntervalHours: interval,
-        scoringModel: model,
-        scoringMaxTicketsPerBatch: maxBatch,
-        scoringMaxBudgetUsdPerDay: budget,
-      });
-      this.auditConfig(
-        interaction,
-        `Scoring options → every ${interval}h, model \`${model}\`, ${maxBatch}/batch, $${budget}/day`
-      );
-      await interaction.reply({
-        embeds: [makeEmbed(`Scoring options saved — every ${interval}h on \`${model}\`, max ${maxBatch}/batch, $${budget.toFixed(2)}/day cap.`, COLORS.success)],
-        flags: 64,
-      });
-      return;
-    }
-
-    if (interaction.customId === "config_analytics_escalation_modal") {
-      const model = interaction.fields.getTextInputValue("model").trim();
-      const interval = Number.parseInt(interaction.fields.getTextInputValue("interval").trim(), 10);
-      const maxBatch = Number.parseInt(interaction.fields.getTextInputValue("max_batch").trim(), 10);
-      if (
-        !model ||
-        !Number.isInteger(interval) || interval < 1 || interval > 168 ||
-        !Number.isInteger(maxBatch) || maxBatch < 1 || maxBatch > 1_000
-      ) {
-        await interaction.reply({
-          embeds: [
-            makeEmbed(
-              "Invalid values — model non-empty (a real model id, aliases are not resolved), interval 1-168 hours, max tickets 1-1000.",
-              COLORS.danger
-            ),
-          ],
-          flags: 64,
-        });
-        return;
-      }
-      await this.settingsStore.updateAnalytics({
-        scoringEscalationModel: model,
-        scoringEscalationIntervalHours: interval,
-        scoringEscalationMaxTicketsPerBatch: maxBatch,
-      });
-      this.auditConfig(
-        interaction,
-        `Escalation options → every ${interval}h, model \`${model}\`, ${maxBatch}/batch`
-      );
-      await interaction.reply({
-        embeds: [
-          makeEmbed(
-            `Escalation options saved — every ${interval}h on \`${model}\`, max ${maxBatch}/batch. Escalation batches share the daily scoring budget cap.`,
-            COLORS.success
-          ),
-        ],
-        flags: 64,
-      });
-      return;
-    }
-
-    if (interaction.customId === "config_analytics_score_one_modal") {
-      const threadId = interaction.fields.getTextInputValue("thread").trim();
-      if (!this.analytics) {
-        await interaction.reply({ embeds: [makeEmbed("Scoring is not wired up.", COLORS.warn)], flags: 64 });
-        return;
-      }
-      await interaction.deferReply({ flags: 64 });
-      try {
-        // Temporal seam: run through scoreOneWorkflow when the worker is
-        // active (dedup by workflow id, Temporal UI visibility); null =
-        // unavailable or the workflow failed — fall back to the direct call,
-        // whose real error surfaces through this catch.
-        let outcome: ScoreOneOutcome | null = null;
-        if (this.temporalProducers?.enabled()) {
-          const json = await this.temporalProducers.executeScoreOne(threadId);
-          if (json != null) {
-            try {
-              const candidate = JSON.parse(json) as ScoreOneOutcome;
-              if (candidate && typeof candidate.escalated === "boolean") outcome = candidate;
-            } catch {
-              outcome = null;
-            }
-          }
-        }
-        if (!outcome) outcome = await this.analytics.scoringService.scoreOneNow(threadId);
-        if (outcome.escalated) {
-          this.auditConfig(interaction, `Manual score → <#${threadId}> flagged for escalated re-score`);
-          await interaction.editReply({
-            embeds: [
-              makeEmbed(
-                [
-                  `⤴️ <#${threadId}> was flagged as beyond \`${this.settingsStore.scoringModel()}\`'s reliable evaluation${outcome.reason ? `: "${outcome.reason}"` : "."}`,
-                  `Queued for re-score with \`${this.settingsStore.scoringEscalationModel()}\` in the next escalation batch — or press "Score one now" again to run that model immediately.`,
-                ].join("\n"),
-                COLORS.warn
-              ),
-            ],
-          });
-          return;
-        }
-        const parsed = outcome.result;
-        this.auditConfig(interaction, `Manual score → <#${threadId}> (CX ${parsed.cx_score}/10)`);
-        await interaction.editReply({
-          embeds: [
-            makeEmbed(
-              [
-                `✅ Scored <#${threadId}> — CX **${parsed.cx_score}/10**, ${parsed.resolution}, topic ${parsed.topic}.`,
-                `Agent: tone ${parsed.agent_overall.tone} · clarity ${parsed.agent_overall.clarity} · correctness ${parsed.agent_overall.correctness}.`,
-                "Full breakdown: `/ai score` in the thread.",
-              ].join("\n"),
-              COLORS.success
-            ),
-          ],
-        });
-      } catch (error) {
-        await interaction.editReply({
-          embeds: [makeEmbed(`Scoring failed: ${error instanceof Error ? error.message : String(error)}`, COLORS.danger)],
-        });
-      }
-      return;
-    }
-
     if (interaction.customId === "config_intercom_secrets_modal") {
       const accessToken = interaction.fields.getTextInputValue("access_token").trim();
       const clientSecret = interaction.fields.getTextInputValue("client_secret").trim();
@@ -7628,38 +4810,6 @@ export class DiscordBot {
           await interaction.followUp({ embeds: [makeEmbed(notes.join("\n"), COLORS.neutral)], flags: 64 }).catch(() => {});
         }
       })();
-      return;
-    }
-
-    if (interaction.customId === "config_report_time_modal") {
-      const hourRaw = interaction.fields.getTextInputValue("hour").trim();
-      const minuteRaw = interaction.fields.getTextInputValue("minute").trim();
-      const hour = /^\d+$/.test(hourRaw) ? Number(hourRaw) : NaN;
-      const minute = /^\d+$/.test(minuteRaw) ? Number(minuteRaw) : NaN;
-      if (!Number.isInteger(hour) || hour < 0 || hour > 23 || !Number.isInteger(minute) || minute < 0 || minute > 59) {
-        await interaction.reply({ embeds: [makeEmbed("Enter a valid hour (0-23) and minute (0-59).", COLORS.danger)], flags: 64 });
-        return;
-      }
-      await this.settingsStore.updateReport({ reportHour: hour, reportMinute: minute });
-      this.syncTemporalReportSchedule();
-      this.auditConfig(interaction, `Report time → ${this.formatReportTime(hour, minute)}`);
-      await interaction.reply({
-        embeds: [makeEmbed(`Status report will publish daily at ${this.formatReportTime(hour, minute)} (${this.settingsStore.reportTimezone()}).`, COLORS.success)],
-        flags: 64,
-      });
-      return;
-    }
-
-    if (interaction.customId === "config_report_tz_modal") {
-      const tz = interaction.fields.getTextInputValue("tz").trim();
-      if (!this.isValidTimezone(tz)) {
-        await interaction.reply({ embeds: [makeEmbed("That isn't a valid IANA timezone (e.g. Europe/Berlin, UTC).", COLORS.danger)], flags: 64 });
-        return;
-      }
-      await this.settingsStore.updateReport({ reportTimezone: tz });
-      this.syncTemporalReportSchedule();
-      this.auditConfig(interaction, `Report timezone → ${tz}`);
-      await interaction.reply({ embeds: [makeEmbed(`Report timezone set to ${tz}.`, COLORS.success)], flags: 64 });
       return;
     }
 
@@ -7821,19 +4971,46 @@ export class DiscordBot {
       return;
     }
 
-    if (interaction.customId === "config_ai_model_modal") {
-      const model = interaction.fields.getTextInputValue("model").trim();
-      const modelLight = interaction.fields.getTextInputValue("model_light").trim();
-      if (!model || !modelLight) {
-        await interaction.reply({ embeds: [makeEmbed("Both model names are required.", COLORS.danger)], flags: 64 });
+    if (interaction.customId === "config_inactivity_opts_modal") {
+      const agentDays = Number.parseInt(interaction.fields.getTextInputValue("agent_days").trim(), 10);
+      const customerDays = Number.parseInt(interaction.fields.getTextInputValue("customer_days").trim(), 10);
+      const nags = Number.parseInt(interaction.fields.getTextInputValue("nags").trim(), 10);
+      const inRange = (n: number, lo: number, hi: number) => Number.isInteger(n) && n >= lo && n <= hi;
+      if (!inRange(agentDays, 1, 30) || !inRange(customerDays, 1, 30) || !inRange(nags, 1, 10)) {
+        await interaction.reply({
+          embeds: [makeEmbed("Days must be 1-30 and nags 1-10 (whole numbers).", COLORS.danger)],
+          flags: 64,
+        });
         return;
       }
-      await this.settingsStore.updateGeneral({ aiModel: model, aiModelLight: modelLight });
-      this.auditConfig(interaction, `AI models → main \`${model}\`, light \`${modelLight}\``);
+      await this.settingsStore.updateInactivity({
+        inactivityAgentWaitDays: agentDays,
+        inactivityCustomerWaitDays: customerDays,
+        inactivityNagsBeforeClose: nags,
+      });
+      this.auditConfig(interaction, `Inactivity thresholds → agent ${agentDays}d, customer ${customerDays}d, close after ${nags} nag(s)`);
       await interaction.reply({
         embeds: [
-          makeEmbed(`AI models updated — main \`${model}\`, light \`${modelLight}\`. Applies to the next run.`, COLORS.success),
+          makeEmbed(
+            `Inactivity thresholds saved — agent-idle ${agentDays}d, customer-idle ${customerDays}d, auto-close after ${nags} unanswered nag(s). Applies on the next sweep.`,
+            COLORS.success
+          ),
         ],
+        flags: 64,
+      });
+      return;
+    }
+
+    if (interaction.customId === "config_ai_model_modal") {
+      const model = interaction.fields.getTextInputValue("model").trim();
+      if (!model) {
+        await interaction.reply({ embeds: [makeEmbed("Model name is required.", COLORS.danger)], flags: 64 });
+        return;
+      }
+      await this.settingsStore.updateGeneral({ aiModel: model });
+      this.auditConfig(interaction, `AI model → \`${model}\``);
+      await interaction.reply({
+        embeds: [makeEmbed(`AI model updated — \`${model}\`. Applies to the next evidence draft.`, COLORS.success)],
         flags: 64,
       });
       return;
@@ -7841,11 +5018,9 @@ export class DiscordBot {
 
     if (interaction.customId === "config_ai_perf_modal") {
       const effortAsk = interaction.fields.getTextInputValue("effort_ask").trim().toLowerCase();
-      const effortCause = interaction.fields.getTextInputValue("effort_cause").trim().toLowerCase();
       const budgetAsk = Number(interaction.fields.getTextInputValue("budget_ask").trim());
-      const budgetCause = Number(interaction.fields.getTextInputValue("budget_cause").trim());
       const validEfforts = ["low", "medium", "high", "max"];
-      if (!validEfforts.includes(effortAsk) || !validEfforts.includes(effortCause)) {
+      if (!validEfforts.includes(effortAsk)) {
         await interaction.reply({
           embeds: [makeEmbed("Effort must be one of: low, medium, high, max.", COLORS.danger)],
           flags: 64,
@@ -7853,7 +5028,7 @@ export class DiscordBot {
         return;
       }
       const okBudget = (n: number) => Number.isFinite(n) && n >= 0.05 && n <= 50;
-      if (!okBudget(budgetAsk) || !okBudget(budgetCause)) {
+      if (!okBudget(budgetAsk)) {
         await interaction.reply({
           embeds: [makeEmbed("Budget must be a number between 0.05 and 50 (USD per run).", COLORS.danger)],
           flags: 64,
@@ -7862,20 +5037,12 @@ export class DiscordBot {
       }
       await this.settingsStore.updateGeneral({
         aiEffortAsk: effortAsk,
-        aiEffortCause: effortCause,
         aiMaxBudgetUsdAsk: budgetAsk,
-        aiMaxBudgetUsdCause: budgetCause,
       });
-      this.auditConfig(
-        interaction,
-        `AI speed limits → ask ${effortAsk}/$${budgetAsk}, cause ${effortCause}/$${budgetCause}`
-      );
+      this.auditConfig(interaction, `AI speed limits → effort ${effortAsk}, ≤ $${budgetAsk}/run`);
       await interaction.reply({
         embeds: [
-          makeEmbed(
-            `AI speed limits updated — ask: effort \`${effortAsk}\`, ≤ $${budgetAsk}/run; cause: effort \`${effortCause}\`, ≤ $${budgetCause}/run. Applies to the next run.`,
-            COLORS.success
-          ),
+          makeEmbed(`AI speed limits updated — effort \`${effortAsk}\`, ≤ $${budgetAsk}/run. Applies to the next evidence draft.`, COLORS.success),
         ],
         flags: 64,
       });
@@ -7895,53 +5062,6 @@ export class DiscordBot {
         embeds: [makeEmbed(`Knowledge base will refresh every ${hours}h.`, COLORS.success)],
         flags: 64,
       });
-      return;
-    }
-
-    if (interaction.customId === "config_report_overdue_modal") {
-      const daysRaw = interaction.fields.getTextInputValue("days").trim();
-      const days = /^\d+$/.test(daysRaw) ? Number(daysRaw) : NaN;
-      if (!Number.isInteger(days) || days < 1 || days > 365) {
-        await interaction.reply({ embeds: [makeEmbed("Enter a valid number of days (1-365).", COLORS.danger)], flags: 64 });
-        return;
-      }
-      await this.settingsStore.updateReport({ overdueThresholdDays: days });
-      this.syncTemporalReportSchedule();
-      this.auditConfig(interaction, `Overdue threshold → ${days} day(s)`);
-      await interaction.reply({
-        embeds: [makeEmbed(`Tickets now count as overdue after ${days} day(s).`, COLORS.success)],
-        flags: 64,
-      });
-      return;
-    }
-
-    // Priority modals only carry emoji + label — handle them before the tag-modal
-    // parse below, which reads fields (days/autoclose) they don't have.
-    if (interaction.customId === "config_priority_add_modal" || interaction.customId.startsWith("config_priority_edit_modal:")) {
-      const emoji = interaction.fields.getTextInputValue("emoji").trim();
-      const label = interaction.fields.getTextInputValue("label").trim();
-      if (!isUnicodeEmoji(emoji)) {
-        await interaction.reply({ embeds: [makeEmbed("Emoji must be a single standard (unicode) emoji.", COLORS.danger)], flags: 64 });
-        return;
-      }
-      if (!label) {
-        await interaction.reply({ embeds: [makeEmbed("Label is required.", COLORS.danger)], flags: 64 });
-        return;
-      }
-      try {
-        if (interaction.customId === "config_priority_add_modal") {
-          await this.settingsStore.addPriority({ emoji, label });
-          this.auditConfig(interaction, `Priority added → ${emoji} ${label}`);
-          await interaction.reply({ embeds: [makeEmbed(`Added ${emoji} ${label}.`, COLORS.success)], flags: 64 });
-        } else {
-          const priorityId = interaction.customId.split(":")[1];
-          await this.settingsStore.editPriority(priorityId, { emoji, label });
-          this.auditConfig(interaction, `Priority edited → ${emoji} ${label}`);
-          await interaction.reply({ embeds: [makeEmbed(`Updated ${emoji} ${label}.`, COLORS.success)], flags: 64 });
-        }
-      } catch (error) {
-        await interaction.reply({ embeds: [makeEmbed((error as Error).message || "Failed to save the priority.", COLORS.danger)], flags: 64 });
-      }
       return;
     }
 
@@ -8004,41 +5124,13 @@ export class DiscordBot {
     await interaction.deferUpdate();
     try {
       const tag = this.settingsStore.tagById(tagId);
-      const { reassignedThreadIds, initial } = await this.settingsStore.removeTag(tagId);
+      // Tickets on the deleted tag are reassigned to the initial tag inside
+      // removeTag; titles no longer encode tags, so no renames.
+      await this.settingsStore.removeTag(tagId);
       if (tag) this.auditConfig(interaction, `Status tag deleted → ${tag.emoji} ${tag.label}`);
-      // Rename reassigned threads to the initial tag's emoji (best-effort).
-      for (const threadId of reassignedThreadIds) {
-        const channel = await this.client.channels.fetch(threadId).catch(() => null);
-        if (channel?.isThread()) {
-          const thread = channel as ThreadChannel;
-          await thread.setName(this.statusService.buildThreadName(thread.name, initial.emoji)).catch(() => {});
-        }
-      }
       await interaction.editReply(this.buildTagsPanel());
     } catch (error) {
       await interaction.followUp({ embeds: [makeEmbed((error as Error).message || "Failed to delete the tag.", COLORS.danger)], flags: 64 });
-    }
-  }
-
-  private async handlePriorityDelete(interaction: ButtonInteraction, priorityId: string): Promise<void> {
-    await interaction.deferUpdate();
-    try {
-      const priority = this.settingsStore.priorityById(priorityId);
-      const { reassignedThreadIds, initial } = await this.settingsStore.removePriority(priorityId);
-      if (priority) this.auditConfig(interaction, `Priority deleted → ${priority.emoji} ${priority.label}`);
-      // Rename reassigned threads to the initial priority's emoji (best-effort).
-      for (const threadId of reassignedThreadIds) {
-        const channel = await this.client.channels.fetch(threadId).catch(() => null);
-        if (channel?.isThread()) {
-          const thread = channel as ThreadChannel;
-          await thread
-            .setName(applyTitleEmojis(thread.name, { priorityEmoji: initial.emoji }, (t) => !!this.settingsStore.priorityByEmoji(t)))
-            .catch(() => {});
-        }
-      }
-      await interaction.editReply(this.buildPrioritiesPanel());
-    } catch (error) {
-      await interaction.followUp({ embeds: [makeEmbed((error as Error).message || "Failed to delete the priority.", COLORS.danger)], flags: 64 });
     }
   }
 
@@ -8053,19 +5145,6 @@ export class DiscordBot {
       return;
     }
     await interaction.update(this.buildTagEditPanel(tag));
-  }
-
-  private async handleConfigPriorityPick(interaction: StringSelectMenuInteraction): Promise<void> {
-    if (!this.isAdmin(interaction)) {
-      await interaction.reply({ embeds: [makeEmbed("Administrator permission required.", COLORS.danger)], flags: 64 });
-      return;
-    }
-    const priority = this.settingsStore.priorityById(interaction.values[0]);
-    if (!priority) {
-      await interaction.update(this.buildPrioritiesPanel());
-      return;
-    }
-    await interaction.update(this.buildPriorityEditPanel(priority));
   }
 
   private async handleConfigTierPick(interaction: StringSelectMenuInteraction): Promise<void> {
@@ -8104,20 +5183,12 @@ export class DiscordBot {
   private async handleChannelSelect(interaction: ChannelSelectMenuInteraction): Promise<void> {
     if (
       interaction.customId !== "config_set_channel" &&
-      interaction.customId !== "config_set_reportchannel" &&
       interaction.customId !== "config_set_billingauditchannel" &&
       interaction.customId !== "config_set_auditlogchannel"
     )
       return;
     if (!this.isAdmin(interaction)) {
       await interaction.reply({ embeds: [makeEmbed("Administrator permission required.", COLORS.danger)], flags: 64 });
-      return;
-    }
-    if (interaction.customId === "config_set_reportchannel") {
-      await this.settingsStore.updateReport({ reportChannelId: interaction.values[0] });
-      this.syncTemporalReportSchedule();
-      this.auditConfig(interaction, `Report channel → <#${interaction.values[0]}>`);
-      await interaction.update(this.buildReportPanel());
       return;
     }
     if (interaction.customId === "config_set_billingauditchannel") {
@@ -8627,14 +5698,9 @@ export class DiscordBot {
         }
 
         // Closed state — use the derived tag if known, else the ticket's current tag so a stale
-        // closed flag can still be repaired on an unknown-emoji thread. Resolved (✅) counts as
-        // done even though its thread stays open/unlocked, hence the emoji check.
+        // closed flag can still be repaired on an unknown-emoji thread.
         const effectiveTag = derivedTag ?? ticket.statusTag;
-        const desiredClosed =
-          thread.archived ||
-          thread.locked ||
-          (effectiveTag?.closesThread ?? false) ||
-          effectiveTag?.emoji === RESOLVED_EMOJI;
+        const desiredClosed = thread.archived || thread.locked || (effectiveTag?.closesThread ?? false);
         if (desiredClosed !== ticket.closed) {
           changes.closed = desiredClosed;
           // false→true: safe past timestamp; true→false (reopened): clear it.
@@ -8688,251 +5754,6 @@ export class DiscordBot {
         default_member_permissions: "8", // ADMINISTRATOR
       },
       {
-        name: "status",
-        description: "Ticket status (support/admin only)",
-        options: [
-          {
-            type: 1, // SUB_COMMAND
-            name: "set",
-            description: "Set the status of this support ticket",
-            options: [
-              {
-                type: 3, // STRING
-                name: "status",
-                description: "New status for this ticket",
-                required: true,
-                autocomplete: true,
-              },
-            ],
-          },
-          {
-            type: 1, // SUB_COMMAND
-            name: "history",
-            description: "Show this ticket's status change history",
-          },
-        ],
-      },
-      {
-        name: "priority",
-        description: "Ticket priority (support/admin only)",
-        options: [
-          {
-            type: 1, // SUB_COMMAND
-            name: "set",
-            description: "Set the priority of this support ticket",
-            options: [
-              {
-                type: 3, // STRING
-                name: "priority",
-                description: "New priority for this ticket",
-                required: true,
-                autocomplete: true,
-              },
-            ],
-          },
-          {
-            type: 1, // SUB_COMMAND
-            name: "history",
-            description: "Show this ticket's priority change history",
-          },
-        ],
-      },
-      {
-        name: "report",
-        description: "Show a support status report (support/admin only)",
-      },
-      {
-        name: "note",
-        description: "Staff-only notes on this ticket (support/admin only)",
-        options: [
-          {
-            type: 1, // SUB_COMMAND
-            name: "add",
-            description: "Add a private staff note to this ticket",
-            options: [
-              {
-                type: 3, // STRING
-                name: "text",
-                description: "Note text (only staff can read it)",
-                required: true,
-                max_length: 1000,
-              },
-            ],
-          },
-          {
-            type: 1, // SUB_COMMAND
-            name: "list",
-            description: "List the staff notes on this ticket",
-          },
-        ],
-      },
-      {
-        name: "reminders",
-        description: "Pause/resume automatic reminders & auto-close for this ticket (support/admin only)",
-        options: [
-          {
-            type: 1, // SUB_COMMAND
-            name: "off",
-            description: "Pause reminders & auto-close until the ticket's status changes",
-          },
-          {
-            type: 1, // SUB_COMMAND
-            name: "on",
-            description: "Resume reminders & auto-close for this ticket",
-          },
-        ],
-      },
-      {
-        name: "escalate",
-        description: "Move this ticket up or down the escalation ladder (support/admin only)",
-        options: [
-          {
-            type: 1, // SUB_COMMAND
-            name: "up",
-            description: "Escalate this ticket to the next tier, or straight to a specific one",
-            options: [
-              {
-                type: 3, // STRING
-                name: "tier",
-                description: "Jump directly to this tier (default: one tier up)",
-                required: false,
-                autocomplete: true,
-              },
-              {
-                type: 3, // STRING
-                name: "reason",
-                description: "Why this is being escalated",
-                required: false,
-                max_length: 500,
-              },
-            ],
-          },
-          {
-            type: 1, // SUB_COMMAND
-            name: "down",
-            description: "Step this ticket back down a tier, or straight to a specific one",
-            options: [
-              {
-                type: 3, // STRING
-                name: "tier",
-                description: "Jump directly to this tier (default: one tier down)",
-                required: false,
-                autocomplete: true,
-              },
-              {
-                type: 3, // STRING
-                name: "reason",
-                description: "Why this is being de-escalated",
-                required: false,
-                max_length: 500,
-              },
-            ],
-          },
-        ],
-      },
-      {
-        name: "canned",
-        description: "Canned reply templates (support/admin only)",
-        options: [
-          {
-            type: 1, // SUB_COMMAND
-            name: "add",
-            description: "Create a canned response (a form opens for the content)",
-            options: [
-              {
-                type: 3, // STRING
-                name: "name",
-                description: "Template name",
-                required: true,
-                max_length: 50,
-              },
-              {
-                type: 3, // STRING
-                name: "visibility",
-                description: "Who can use it (default: whole team)",
-                required: false,
-                choices: [
-                  { name: "Whole team", value: "team" },
-                  { name: "Only me", value: "personal" },
-                ],
-              },
-            ],
-          },
-          {
-            type: 1, // SUB_COMMAND
-            name: "use",
-            description: "Post a canned response in this ticket",
-            options: [
-              {
-                type: 3, // STRING
-                name: "name",
-                description: "Template name",
-                required: true,
-                autocomplete: true,
-              },
-            ],
-          },
-          {
-            type: 1, // SUB_COMMAND
-            name: "view",
-            description: "Privately preview a canned response, or list them all",
-            options: [
-              {
-                type: 3, // STRING
-                name: "name",
-                description: "Template to preview (omit to list all available)",
-                required: false,
-                autocomplete: true,
-              },
-            ],
-          },
-          {
-            type: 1, // SUB_COMMAND
-            name: "delete",
-            description: "Delete a canned response",
-            options: [
-              {
-                type: 3, // STRING
-                name: "name",
-                description: "Template name",
-                required: true,
-                autocomplete: true,
-              },
-            ],
-          },
-        ],
-      },
-      {
-        name: "charge",
-        description: "Approve or deny a blocked self-service refund (support/admin only)",
-        options: [
-          {
-            type: 1, // SUB_COMMAND
-            name: "approve",
-            description: "Approve the blocked refund in this ticket and execute it",
-          },
-          {
-            type: 1, // SUB_COMMAND
-            name: "deny",
-            description: "Deny the blocked refund in this ticket",
-            options: [
-              {
-                type: 3, // STRING
-                name: "reason",
-                description: "Reason shown to the customer",
-                required: false,
-                max_length: 500,
-              },
-            ],
-          },
-        ],
-      },
-      {
-        name: "billing",
-        description: "Stripe billing admin panel (admin only)",
-        default_member_permissions: "8", // ADMINISTRATOR
-      },
-      {
         name: "search-tickets",
         description: "Search support tickets by type, status, user, or billing IDs (support/admin only)",
         options: [
@@ -8947,13 +5768,6 @@ export class DiscordBot {
             type: 3, // STRING
             name: "status",
             description: "Ticket status",
-            required: false,
-            autocomplete: true,
-          },
-          {
-            type: 3, // STRING
-            name: "priority",
-            description: "Ticket priority",
             required: false,
             autocomplete: true,
           },
@@ -9006,62 +5820,34 @@ export class DiscordBot {
         ],
       },
       {
-        name: "ai",
-        description: "AI ticket assistant (support/admin only)",
+        name: "charge",
+        description: "Approve or deny a blocked self-service refund (support/admin only)",
         options: [
           {
             type: 1, // SUB_COMMAND
-            name: "summarize",
-            description: "Summarize this ticket: problems, what happened, current state, next steps",
+            name: "approve",
+            description: "Approve the blocked refund in this ticket and execute it",
           },
           {
             type: 1, // SUB_COMMAND
-            name: "ask",
-            description: "Ask the AI a free-form question about this ticket",
+            name: "deny",
+            description: "Deny the blocked refund in this ticket",
             options: [
               {
                 type: 3, // STRING
-                name: "question",
-                description: "What do you want to know?",
-                required: true,
-                max_length: 1000,
-              },
-            ],
-          },
-          {
-            type: 1, // SUB_COMMAND
-            name: "cause",
-            description: "Root-cause analysis of this ticket (repo + web research)",
-          },
-          {
-            type: 1, // SUB_COMMAND
-            name: "draft",
-            description: "Draft a customer-facing reply (you review before posting)",
-            options: [
-              {
-                type: 3, // STRING
-                name: "instructions",
-                description: "Optional guidance for the draft (tone, content, decisions)",
+                name: "reason",
+                description: "Reason shown to the customer",
                 required: false,
-                max_length: 1000,
-              },
-            ],
-          },
-          {
-            type: 1, // SUB_COMMAND
-            name: "score",
-            description: "Show the AI quality score of this ticket (CX, agent quality, resolution)",
-            options: [
-              {
-                type: 3, // STRING
-                name: "thread",
-                description: "Thread id of another ticket (default: the current thread)",
-                required: false,
-                max_length: 30,
+                max_length: 500,
               },
             ],
           },
         ],
+      },
+      {
+        name: "billing",
+        description: "Stripe billing admin panel (admin only)",
+        default_member_permissions: "8", // ADMINISTRATOR
       },
     ];
 

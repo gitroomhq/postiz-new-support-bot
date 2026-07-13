@@ -1,10 +1,9 @@
-import { PriorityTag, StatusTag } from "../generated/prisma/client";
+import { StatusTag } from "../generated/prisma/client";
 import { TicketStore, TicketWithTag } from "../bot/TicketStore";
 import { SettingsStore } from "../config/SettingsStore";
 import { SessionStore } from "../auth/SessionStore";
 import { IntercomStore } from "./IntercomStore";
 import type { IntercomEventExecutor } from "./IntercomEventExecutor";
-import { bodyHash } from "./renderDiscordMarkdown";
 import { EnsurePayload, MessageAttachmentRef, OutboxEventType, OutboxPayload } from "./types";
 import { log } from "../util/logger";
 import type { TemporalProducers } from "../temporal/producers";
@@ -21,6 +20,16 @@ export interface BridgeSourceMessage {
   content: string;
   attachments: MessageAttachmentRef[];
   createdAt: Date;
+}
+
+// Ticket categories that are NEVER mirrored to Intercom (user decision:
+// refund requests live Discord-only — self-service flow + /charge staff
+// resolution). A /config picker can replace this constant if more categories
+// ever need excluding.
+export const UNMIRRORED_CATEGORY_IDS: ReadonlySet<string> = new Set(["billing"]);
+
+export function isUnmirroredCategory(categoryId: string | null | undefined): boolean {
+  return categoryId != null && UNMIRRORED_CATEGORY_IDS.has(categoryId);
 }
 
 export const AGENT_WARNING_TEXT =
@@ -126,6 +135,15 @@ export class IntercomSyncService {
     return this.settingsStore.intercomMode() !== "none" && this.settingsStore.intercomConfigured();
   }
 
+  // Category gate: refund-request tickets live Discord-only (self-service +
+  // /charge) and are never mirrored — no conversation, no ticket, no events.
+  // Applied at every outbound entry point so nothing ever enqueues for them;
+  // the executor's ensure short-circuit is the second belt for the
+  // workflow-synthesized creation ensure.
+  private mirrorable(ticket: { categoryId: string | null }): boolean {
+    return !isUnmirroredCategory(ticket.categoryId);
+  }
+
   // ---- Live hooks (called fire-and-forget from DiscordBot/StatusService) ----
   // All hooks are threadId-based and refetch the ticket row themselves: they run
   // as `void` side-effects after the DB write, so the refetched state is current.
@@ -135,35 +153,19 @@ export class IntercomSyncService {
   async onTicketCreated(threadId: string, categoryLabel: string | null, _question: string | null): Promise<void> {
     if (!this.enabled()) return;
     const ticket = await this.ticketStore.getByThreadId(threadId);
-    if (!ticket) return;
+    if (!ticket || !this.mirrorable(ticket)) return;
     await this.chained(ticket.threadId, async () => {
       await this.ensureLink(ticket, categoryLabel);
     });
   }
 
   async onHumanMessage(ticket: TicketWithTag, message: BridgeSourceMessage, isStaff: boolean): Promise<void> {
-    if (!this.enabled()) return;
+    if (!this.enabled() || !this.mirrorable(ticket)) return;
     const composed = this.composeMessage(ticket, message, isStaff);
     if (!composed) return;
     await this.chained(ticket.threadId, async () => {
       await this.ensureLink(ticket);
       await this.emit(ticket.threadId, "message", { ...composed, attachmentMode: "urls" });
-    });
-  }
-
-  async onAiAnswer(threadId: string, finalText: string): Promise<void> {
-    if (!this.enabled() || !finalText.trim()) return;
-    const ticket = await this.ticketStore.getByThreadId(threadId);
-    if (!ticket) return;
-    await this.chained(ticket.threadId, async () => {
-      await this.ensureLink(ticket);
-      await this.emit(ticket.threadId, "message", {
-        direction: "outgoing",
-        content: `🤖 AI:\n${finalText}`,
-        // Synthetic delivery-ledger key (there's no Discord message id here):
-        // a timeout-after-success retry must not double-post the AI answer.
-        discordMessageId: `ai:${threadId}:${bodyHash(finalText)}`,
-      });
     });
   }
 
@@ -175,7 +177,7 @@ export class IntercomSyncService {
     isStaff: boolean,
     editedAtIso: string
   ): Promise<void> {
-    if (!this.enabled()) return;
+    if (!this.enabled() || !this.mirrorable(ticket)) return;
     // Never enqueue for an unbridged ticket: the pump's ensure-first synthesis
     // would mint a ghost conversation just to have the executor drop the event
     // (original never mirrored). The executor's ledger check stays the authority.
@@ -201,7 +203,7 @@ export class IntercomSyncService {
     discordMessageId: string,
     author: { id: string; name: string } | null
   ): Promise<void> {
-    if (!this.enabled()) return;
+    if (!this.enabled() || !this.mirrorable(ticket)) return;
     // See onMessageEdited — no ghost ensure for unbridged tickets.
     if (!(await this.store.getLink(ticket.threadId))) return;
     const isCustomer = author != null && ticket.customerId != null && author.id === ticket.customerId;
@@ -224,7 +226,7 @@ export class IntercomSyncService {
   ): Promise<void> {
     if (!this.enabled()) return;
     const ticket = await this.ticketStore.getByThreadId(threadId);
-    if (!ticket) return;
+    if (!ticket || !this.mirrorable(ticket)) return;
     const resolved = toTag.closesThread || isResolvedTag(toTag);
     await this.chained(ticket.threadId, async () => {
       await this.ensureLink(ticket);
@@ -239,38 +241,30 @@ export class IntercomSyncService {
     });
   }
 
-  async onPriorityChanged(
-    threadId: string,
-    fromTag: { emoji: string; label: string } | null | undefined,
-    toTag: PriorityTag,
-    actorName: string
-  ): Promise<void> {
-    if (!this.enabled()) return;
-    const ticket = await this.ticketStore.getByThreadId(threadId);
-    if (!ticket) return;
-    await this.chained(ticket.threadId, async () => {
-      await this.ensureLink(ticket);
-      await this.emit(ticket.threadId, "priority", {
-        priorityLabel: `${toTag.emoji} ${toTag.label}`,
-        fromLabel: fromTag ? `${fromTag.emoji} ${fromTag.label}` : null,
-        actorName,
-      });
-    });
-  }
-
-  // Discord staff notes are NOT mirrored to Intercom (messages-only mirroring;
-  // agents working Intercom-first read their own notes there). The inverse —
-  // Intercom notes → TicketNote rows — lives in IntercomWebhookHandler and
-  // must never re-enter the bridge.
+  // (The priority axis is unbridged — agent-rip. Intercom's native priority is
+  // agent-set in the Intercom UI and never synced to Discord.)
 
   async onCsat(threadId: string, score: number, comment?: string | null): Promise<void> {
     if (!this.enabled()) return;
     const ticket = await this.ticketStore.getByThreadId(threadId);
-    if (!ticket) return;
+    if (!ticket || !this.mirrorable(ticket)) return;
     await this.chained(ticket.threadId, async () => {
       await this.ensureLink(ticket);
       await this.emit(ticket.threadId, "csat", { score, comment: comment ?? null });
     });
+  }
+
+  // Agent-idle reminder for a bridged ticket (checkTicketTimers SUPPORT
+  // target): internal note + conversation reopen in Intercom. Returns false
+  // when the bridge is off or the ticket is unmirrored — the caller then falls
+  // back to the legacy Discord staff-role ping.
+  async onAgentReminder(ticket: TicketWithTag, payload: { idleDays: number; threadUrl: string | null }): Promise<boolean> {
+    if (!this.enabled() || !this.mirrorable(ticket)) return false;
+    await this.chained(ticket.threadId, async () => {
+      await this.ensureLink(ticket);
+      await this.emit(ticket.threadId, "agent_reminder", { idleDays: payload.idleDays, threadUrl: payload.threadUrl });
+    });
+    return true;
   }
 
   // Push-mode "replies here don't reach the customer" note. Deliberately skips
@@ -287,7 +281,7 @@ export class IntercomSyncService {
   // open that Discord says are done. Only ever closes; open tickets and
   // unbridged tickets are skipped. Returns true when an event was enqueued.
   async resyncClosedStatus(ticket: TicketWithTag): Promise<boolean> {
-    if (!this.enabled()) return false;
+    if (!this.enabled() || !this.mirrorable(ticket)) return false;
     const tag = ticket.statusTag;
     if (!tag) return false;
     const resolved = tag.closesThread || isResolvedTag(tag);
@@ -344,6 +338,7 @@ export class IntercomSyncService {
     ticket: TicketWithTag,
     messages: BridgeSourceMessage[] | null // null = thread no longer exists
   ): Promise<number | null> {
+    if (!this.mirrorable(ticket)) return null; // refund tickets never bridge
     if (await this.store.getLink(ticket.threadId)) return null;
     if (!(await this.store.claimBackfill(ticket.threadId))) return null;
 
@@ -543,10 +538,13 @@ export function externalIdFor(payload: EnsurePayload, threadId: string): string 
   return externalIdCandidates(payload, threadId)[0];
 }
 
-// A resolved-style tag closes the Intercom conversation without the Discord
-// thread being locked. Matched by the ✅ convention (RESOLVED_EMOJI in
-// StatusService) OR by label — the emoji-only convention silently stopped
-// closing conversations the moment a Resolved tag was re-emojied.
+// A resolved-style tag closes the Intercom conversation. The resolved STATE is
+// gone (agent-rip: tickets are open or closed, and the boot migration flips
+// these tags to closesThread=true), but the predicate stays for inbound
+// Intercom states whose category reads resolved and for pre-migration queued
+// events. Matched by the ✅ convention OR by label — the emoji-only convention
+// silently stopped closing conversations the moment a Resolved tag was
+// re-emojied.
 function isResolvedTag(tag: StatusTag): boolean {
   return tag.emoji === "✅" || /\b(resolved|solved)\b/i.test(tag.label);
 }

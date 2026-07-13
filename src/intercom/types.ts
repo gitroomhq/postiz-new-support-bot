@@ -13,8 +13,13 @@ export type OutboxEventType =
   | "message"
   | "note"
   | "status"
+  // Legacy: the priority axis is unbridged (agent-rip) — no producer emits
+  // this anymore, but queued events may still carry it; executors skip it.
   | "priority"
   | "csat"
+  // Agent-idle reminder for a bridged ticket: internal note + reopen so the
+  // conversation resurfaces in the Intercom inbox.
+  | "agent_reminder"
   | "message_edit"
   | "message_delete";
 
@@ -99,6 +104,13 @@ export interface CsatPayload {
   comment?: string | null;
 }
 
+// Agent-idle reminder on a bridged ticket (checkTicketTimers SUPPORT target):
+// executed as an internal note + conversation reopen.
+export interface AgentReminderPayload {
+  idleDays: number;
+  threadUrl: string | null;
+}
+
 // Intercom has no part-edit/delete API, so edits and deletions mirror as
 // APPENDED parts ("✏️ edited …" / "🗑️ deleted"). Only messages the delivery
 // ledger has confirmed as mirrored produce these (checked at execute time).
@@ -124,8 +136,27 @@ export type OutboxPayload =
   | StatusPayload
   | PriorityPayload
   | CsatPayload
+  | AgentReminderPayload
   | MessageEditPayload
   | MessageDeletePayload;
+
+// ---- Inactivity sweeper shapes (native/unbridged workspace objects) ----
+
+export interface IntercomSweepConversation {
+  id: string;
+  state: string; // "open" | "closed" | "snoozed"
+  createdAt: Date | null;
+  snoozedUntil: Date | null;
+  lastContactReplyAt: Date | null;
+  lastAdminReplyAt: Date | null;
+}
+
+export interface IntercomSweepTicket {
+  id: string;
+  category: string | null; // "Customer" | "Back-office" | "Tracker"
+  updatedAt: Date | null;
+  createdAt: Date | null;
+}
 
 // ---- Intercom API shapes (only the fields the bridge reads) ----
 

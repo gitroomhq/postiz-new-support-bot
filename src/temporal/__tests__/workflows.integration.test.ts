@@ -182,245 +182,35 @@ test("workflow suite (time-skipping)", { skip: !ENABLED && "set TEMPORAL_TEST=1 
     });
   });
 
-  // ---- scoring loop + per-batch child workflows ----
+  // ---- inactivity looper (30-minute cadence + run-now signal) ----
 
-  const scoringState = (over: AnyRecord = {}): AnyRecord => ({
-    enabled: true,
-    pendingBatchIds: [],
-    due: false,
-    backfill: false,
-    escalationDue: false,
-    escalationPendingCount: 0,
-    ...over,
-  });
-
-  await t.test("scoringLoopWorkflow submits when due and watches the batch child to completion", async () => {
-    let getStates = 0;
-    let submits = 0;
-    const polls: string[] = [];
+  await t.test("inactivityLoopWorkflow ticks on its cadence and inactivityRunNow forces a sweep", async () => {
+    const forces: boolean[] = [];
     const activities: AnyRecord = {
-      scoringGetState: async () => {
-        getStates++;
-        // Due exactly once; afterwards the (mock) run was recorded.
-        return scoringState({ due: getStates === 1 });
+      inactivitySweepTick: async (force: boolean) => {
+        forces.push(force);
+        return { scanned: 0, agentReminders: 0, customerNags: 0, closed: 0, skipped: true };
       },
-      scoringSubmit: async (purpose: string) => {
-        submits++;
-        assert.equal(purpose, "interval");
-        return { batchId: "b1", submitted: 3, skipped: 0, drained: false, budgetBlocked: false };
-      },
-      scoringPollBatch: async (batchId: string) => {
-        polls.push(batchId);
-        return polls.length < 3 ? { status: "running", processingStatus: "in_progress" } : { status: "processed", processingStatus: "ended" };
-      },
-      scoringExpireBatch: async () => {},
     };
     const worker = await makeWorker(activities);
     await worker.runUntil(async () => {
-      const handle = await env.client.workflow.start("scoringLoopWorkflow", {
+      const handle = await env.client.workflow.start("inactivityLoopWorkflow", {
         taskQueue,
-        workflowId: "scoring-loop-t1",
+        workflowId: "inactivity-loop-t1",
       });
-      await env.sleep("15 minutes");
-      assert.equal(submits, 1, "exactly one submit for the single due tick");
-      assert.deepEqual(polls, ["b1", "b1", "b1"], "child polls until the batch ends");
-      assert.ok(getStates >= 3, `loop must keep ticking after the batch (${getStates} getStates)`);
-      const child = env.client.workflow.getHandle("scoring-batch-b1");
-      const desc = await child.describe();
-      assert.equal(desc.status.name, "COMPLETED");
-      await handle.terminate("test done");
-    });
-  });
-
-  await t.test("scoringLoopWorkflow adopts pending batches sequentially before submitting", async () => {
-    const order: string[] = [];
-    const remaining = new Set(["a1", "a2"]);
-    const activities: AnyRecord = {
-      scoringGetState: async () => scoringState({ pendingBatchIds: [...remaining].sort() }),
-      scoringSubmit: async () => {
-        order.push("submit");
-        return { batchId: null, submitted: 0, skipped: 0, drained: true, budgetBlocked: false };
-      },
-      scoringPollBatch: async (batchId: string) => {
-        order.push(`poll:${batchId}`);
-        remaining.delete(batchId);
-        return { status: "processed", processingStatus: "ended" };
-      },
-      scoringExpireBatch: async () => {},
-    };
-    const worker = await makeWorker(activities);
-    await worker.runUntil(async () => {
-      const handle = await env.client.workflow.start("scoringLoopWorkflow", {
-        taskQueue,
-        workflowId: "scoring-loop-t2",
-      });
-      await env.sleep("10 minutes");
-      assert.deepEqual(order.slice(0, 2), ["poll:a1", "poll:a2"], `adoption must be sequential, saw ${order.join(",")}`);
-      assert.ok(!order.includes("submit"), "not due → no submit");
-      await handle.terminate("test done");
-    });
-  });
-
-  await t.test("scoringLoopWorkflow never wedges on a failing batch child", async () => {
-    let getStates = 0;
-    const activities: AnyRecord = {
-      scoringGetState: async () => {
-        getStates++;
-        return scoringState({ pendingBatchIds: ["broken"] });
-      },
-      scoringSubmit: async () => ({ batchId: null, submitted: 0, skipped: 0, drained: false, budgetBlocked: false }),
-      scoringPollBatch: async () => {
-        throw ApplicationFailure.create({ message: "poll exploded", type: "Boom", nonRetryable: true });
-      },
-      scoringExpireBatch: async () => {},
-    };
-    const worker = await makeWorker(activities);
-    await worker.runUntil(async () => {
-      const handle = await env.client.workflow.start("scoringLoopWorkflow", {
-        taskQueue,
-        workflowId: "scoring-loop-t3",
-      });
-      await env.sleep("10 minutes");
-      assert.ok(getStates >= 3, `loop must survive child failures and keep ticking (${getStates} getStates)`);
+      // The first tick fires immediately on start, unforced.
+      await env.sleep("1 minute");
+      assert.deepEqual(forces, [false], `expected one immediate unforced tick, saw [${forces.join(",")}]`);
+      // Run-now wakes the 30-minute wait early and forces that sweep.
+      await handle.signal("inactivityRunNow");
+      await env.sleep("1 minute");
+      assert.deepEqual(forces, [false, true], `run-now must force the next tick, saw [${forces.join(",")}]`);
+      // The following cadence tick (~30 minutes later) is unforced again.
+      await env.sleep("31 minutes");
+      assert.deepEqual(forces, [false, true, false], `expected the unforced cadence tick, saw [${forces.join(",")}]`);
       const desc = await handle.describe();
-      assert.equal(desc.status.name, "RUNNING");
+      assert.equal(desc.status.name, "RUNNING", "the looper must keep running between ticks");
       await handle.terminate("test done");
-    });
-  });
-
-  await t.test("scoringRunNow forces a submit even when not due", async () => {
-    let submits = 0;
-    const activities: AnyRecord = {
-      scoringGetState: async () => scoringState({ due: false }),
-      scoringSubmit: async () => {
-        submits++;
-        return { batchId: null, submitted: 0, skipped: 0, drained: false, budgetBlocked: true };
-      },
-      scoringPollBatch: async () => ({ status: "processed", processingStatus: "ended" }),
-      scoringExpireBatch: async () => {},
-    };
-    const worker = await makeWorker(activities);
-    await worker.runUntil(async () => {
-      const handle = await env.client.workflow.start("scoringLoopWorkflow", {
-        taskQueue,
-        workflowId: "scoring-loop-t4",
-      });
-      await env.sleep("3 minutes");
-      assert.equal(submits, 0, "not due, no signal → no submit");
-      await handle.signal("scoringRunNow");
-      await env.sleep("3 minutes");
-      assert.equal(submits, 1, "the run-now signal must force a submit");
-      await handle.terminate("test done");
-    });
-  });
-
-  await t.test("escalation submits when due but a due regular batch wins the shared tick", async () => {
-    const submits: string[] = [];
-    let getStates = 0;
-    const activities: AnyRecord = {
-      scoringGetState: async () => {
-        getStates++;
-        // Tick 1: regular AND escalation both due — regular must win; the
-        // still-due escalation submits on the next tick.
-        return scoringState({ due: getStates === 1, escalationDue: true, escalationPendingCount: 3 });
-      },
-      scoringSubmit: async (purpose: string) => {
-        submits.push(purpose);
-        return { batchId: null, submitted: 1, skipped: 0, drained: false, budgetBlocked: false };
-      },
-      scoringPollBatch: async () => ({ status: "processed", processingStatus: "ended" }),
-      scoringExpireBatch: async () => {},
-    };
-    const worker = await makeWorker(activities);
-    await worker.runUntil(async () => {
-      const handle = await env.client.workflow.start("scoringLoopWorkflow", {
-        taskQueue,
-        workflowId: "scoring-loop-t5",
-      });
-      await env.sleep("3 minutes");
-      assert.deepEqual(
-        submits.slice(0, 2),
-        ["interval", "escalation"],
-        `regular batch wins the shared tick, escalation follows (saw ${submits.join(",")})`
-      );
-      await handle.terminate("test done");
-    });
-  });
-
-  await t.test("scoringEscalationRunNow forces an escalation submit even when not due", async () => {
-    const submits: string[] = [];
-    const activities: AnyRecord = {
-      scoringGetState: async () => scoringState(),
-      scoringSubmit: async (purpose: string) => {
-        submits.push(purpose);
-        return { batchId: null, submitted: 0, skipped: 0, drained: true, budgetBlocked: false };
-      },
-      scoringPollBatch: async () => ({ status: "processed", processingStatus: "ended" }),
-      scoringExpireBatch: async () => {},
-    };
-    const worker = await makeWorker(activities);
-    await worker.runUntil(async () => {
-      const handle = await env.client.workflow.start("scoringLoopWorkflow", {
-        taskQueue,
-        workflowId: "scoring-loop-t6",
-      });
-      await env.sleep("3 minutes");
-      assert.equal(submits.length, 0, "nothing due, no signal → no submit");
-      await handle.signal("scoringEscalationRunNow");
-      await env.sleep("3 minutes");
-      assert.deepEqual(submits, ["escalation"], "the escalation run-now signal must force an escalation submit");
-      await handle.terminate("test done");
-    });
-  });
-
-  await t.test("scoringBatchWorkflow fails a batch stuck past its deadline", async () => {
-    let expired = 0;
-    let pollCount = 0;
-    const activities: AnyRecord = {
-      scoringPollBatch: async () => {
-        pollCount++;
-        return { status: "running", processingStatus: "in_progress" };
-      },
-      scoringExpireBatch: async (batchId: string) => {
-        assert.equal(batchId, "stuck");
-        expired++;
-      },
-    };
-    const worker = await makeWorker(activities);
-    await worker.runUntil(async () => {
-      // Short explicit deadline (the input carry the CAN path also uses) so
-      // the test doesn't need 1 560 real activity round-trips for 26h.
-      // Anchored to the TEST SERVER's clock — earlier subtests already
-      // skipped it days ahead of real time.
-      const envNow = await env.currentTimeMs();
-      const handle = await env.client.workflow.start("scoringBatchWorkflow", {
-        taskQueue,
-        workflowId: "scoring-batch-stuck",
-        args: [{ batchId: "stuck", deadlineAtMs: envNow + 4 * 60_000 }],
-      });
-      const result = (await handle.result()) as { outcome: string; polls: number };
-      assert.equal(result.outcome, "timeout");
-      assert.equal(expired, 1, "the deadline path must fail the batch exactly once");
-      assert.ok(result.polls >= 2 && result.polls === pollCount, `poll count carried correctly (${result.polls})`);
-    });
-  });
-
-  await t.test("scoringBatchWorkflow surfaces a failed batch outcome", async () => {
-    const activities: AnyRecord = {
-      scoringPollBatch: async () => ({ status: "failed", processingStatus: null }),
-      scoringExpireBatch: async () => {
-        throw new Error("must not expire an already-failed batch");
-      },
-    };
-    const worker = await makeWorker(activities);
-    await worker.runUntil(async () => {
-      const handle = await env.client.workflow.start("scoringBatchWorkflow", {
-        taskQueue,
-        workflowId: "scoring-batch-failed",
-        args: [{ batchId: "bad" }],
-      });
-      const result = (await handle.result()) as { outcome: string; polls: number };
-      assert.deepEqual(result, { outcome: "failed", polls: 1 });
     });
   });
 
@@ -478,6 +268,32 @@ test("workflow suite (time-skipping)", { skip: !ENABLED && "set TEMPORAL_TEST=1 
       assert.equal(legacyRun.runningGen, 0);
 
       await env.client.workflow.getHandle("cleanup-loop-gen").terminate("test done").catch(() => {});
+    });
+  });
+
+  // ---- agent-rip retirement (terminate retired singletons, idempotently) ----
+
+  await t.test("retireWorkflowId terminates a running singleton and no-ops on re-run/absent", async () => {
+    const { retireWorkflowId } = await import("../looperGeneration");
+    const activities: AnyRecord = { cleanupTick: async () => {} };
+    const worker = await makeWorker(activities);
+    await worker.runUntil(async () => {
+      await env.client.workflow.signalWithStart("cleanupLoopWorkflow", {
+        taskQueue,
+        workflowId: "retired-loop",
+        signal: "noop",
+        signalArgs: [],
+        memo: { looperGen: 1 },
+      });
+
+      const first = await retireWorkflowId(env.client, "retired-loop", "agent-rip test");
+      assert.equal(first, true);
+      const desc = await env.client.workflow.getHandle("retired-loop").describe();
+      assert.equal(desc.status.name, "TERMINATED");
+
+      // Idempotent: already-terminated and never-started ids are both no-ops.
+      assert.equal(await retireWorkflowId(env.client, "retired-loop", "agent-rip test"), false);
+      assert.equal(await retireWorkflowId(env.client, "never-started-retired", "agent-rip test"), false);
     });
   });
 });

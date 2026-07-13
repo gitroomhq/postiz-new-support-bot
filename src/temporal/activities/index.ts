@@ -1,24 +1,22 @@
 import { heartbeat } from "@temporalio/activity";
 import { ApplicationFailure } from "@temporalio/common";
 import { Client, ThreadChannel } from "discord.js";
-import type { PrismaClient, StatusTag } from "../../generated/prisma/client";
+import type { StatusTag } from "../../generated/prisma/client";
 import type { SettingsStore } from "../../config/SettingsStore";
 import type { EscalationTierStore } from "../../config/EscalationTierStore";
 import type { SessionStore } from "../../auth/SessionStore";
 import type { TicketStore, TicketWithTag } from "../../bot/TicketStore";
 import type { StatusService } from "../../bot/StatusService";
 import type { AuditLogger } from "../../bot/AuditLogger";
-import type { DiscordBot } from "../../bot/DiscordBot";
 import type { KnowledgeBaseScheduler } from "../../bot/KnowledgeBaseScheduler";
-import type { StatusReportScheduler } from "../../bot/StatusReportScheduler";
 import type { StripeWebhookHandler } from "../../bot/StripeWebhookHandler";
-import type { TicketAiRunStore } from "../../bot/TicketAiRunStore";
-import { RECLOSE_DELAY_MS, RESOLVED_EMOJI } from "../../bot/StatusService";
+import { RECLOSE_DELAY_MS } from "../../bot/StatusService";
 import type { BillingCategory } from "../../categories/BillingCategory";
 import type { DisputeMonitor } from "../../bot/billing/DisputeMonitor";
 import type { IntercomStore } from "../../intercom/IntercomStore";
 import type { IntercomSyncService } from "../../intercom/IntercomSyncService";
 import type { IntercomEventExecutor } from "../../intercom/IntercomEventExecutor";
+import type { InactivitySweeper } from "../../intercom/InactivitySweeper";
 import { IntercomHttpError } from "../../intercom/IntercomClient";
 import { DeferEchoError, type IntercomWebhookHandler } from "../../intercom/IntercomWebhookHandler";
 import type { EnsurePayload } from "../../intercom/types";
@@ -29,7 +27,6 @@ import {
   recordIntercomDeadLetter,
 } from "../../metrics/MetricsExporter";
 import { influxActive } from "../../metrics/InfluxWriter";
-import type { TicketScoringService } from "../../scoring/TicketScoringService";
 import type { VaultMigrator } from "../../vault/VaultMigrator";
 import { reconfigureInflux } from "../../metrics/InfluxWriter";
 import { embed, COLORS } from "../../util/embeds";
@@ -40,7 +37,6 @@ import { type CoreActivities, type IcEventType, type TicketSnapshot, type TimerC
 const actLog = log.child("temporal:activities");
 
 const DAY_MS = 24 * 60 * 60 * 1000;
-const DEFAULT_RESOLVED_AUTO_CLOSE_DAYS = 3;
 // Politeness pacing between Intercom API deliveries (was CALL_SPACING_MS in
 // the legacy drain loop — now a worker-global limiter across activities).
 const INTERCOM_CALL_SPACING_MS = 300;
@@ -49,7 +45,6 @@ const ECHO_RETENTION_MS = 14 * DAY_MS;
 const PENDING_POST_RETENTION_MS = 60 * 60 * 1000;
 
 export interface ActivityDeps {
-  prisma: PrismaClient;
   settingsStore: SettingsStore;
   ticketStore: TicketStore;
   statusService: StatusService;
@@ -60,16 +55,13 @@ export interface ActivityDeps {
   intercomSync: IntercomSyncService;
   intercomExecutor: IntercomEventExecutor;
   intercomWebhookHandler: IntercomWebhookHandler;
-  scoringService: TicketScoringService;
+  inactivitySweeper: InactivitySweeper;
   kbScheduler: KnowledgeBaseScheduler;
-  reportScheduler: StatusReportScheduler;
   snapshotScheduler: SnapshotScheduler;
-  ticketAiRunStore: TicketAiRunStore;
   stripeWebhookHandler: StripeWebhookHandler;
   billingCategory: BillingCategory;
   disputeMonitor: DisputeMonitor;
   vaultMigrator: VaultMigrator;
-  bot: DiscordBot;
   client: Client;
   producers: TemporalProducers;
 }
@@ -90,16 +82,13 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
     intercomSync,
     intercomExecutor,
     intercomWebhookHandler,
-    scoringService,
+    inactivitySweeper,
     kbScheduler,
-    reportScheduler,
     snapshotScheduler,
-    ticketAiRunStore,
     stripeWebhookHandler,
     billingCategory,
     disputeMonitor,
     vaultMigrator,
-    bot,
     client,
     producers,
   } = deps;
@@ -143,7 +132,11 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
       statusTagId: ticket.statusTagId,
       statusLabel: tag?.label ?? null,
       tagClosesThread: tag?.closesThread ?? false,
-      tagIsResolved: tag?.emoji === RESOLVED_EMOJI,
+      // The resolved state was removed (agent-rip): tickets are open or
+      // closed. Forced false so in-flight workflow runs stop scanning closed
+      // tickets for the old resolved-auto-close; the field itself is slimmed
+      // out of the snapshot in a later release (workflow code reads it).
+      tagIsResolved: false,
       tagReminderEnabled: tag?.reminderEnabled ?? false,
       tagReminderDays: tag?.reminderDays ?? 3,
       tagReminderTarget: tag?.reminderTarget === "CUSTOMER" ? "CUSTOMER" : "SUPPORT",
@@ -192,8 +185,16 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
     return latest;
   };
 
-  // Port of ReminderScheduler.processTicket's reminder send for ONE ticket.
-  const sendReminder = async (thread: ThreadChannel, ticket: TicketWithTag, tag: StatusTag, target: "SUPPORT" | "CUSTOMER"): Promise<void> => {
+  // One reminder for one ticket. CUSTOMER reminders still ping the customer in
+  // the Discord thread (they never left Discord). SUPPORT reminders no longer
+  // ping a Discord role — agents live in Intercom, so the nag is an internal
+  // note + reopen on the linked conversation (intercomSync.onAgentReminder);
+  // unmirrored tickets (excluded category / bridge off) fall back to the
+  // legacy staff-role ping, the only place Intercom can't see the ticket.
+  // Returns false when there was no route (unmirrored + no staff role): the
+  // caller must not report a reminder that never went out.
+  const sendReminder = async (thread: ThreadChannel, ticket: TicketWithTag, tag: StatusTag, target: "SUPPORT" | "CUSTOMER"): Promise<boolean> => {
+    let route: "customer" | "intercom" | "discord" = "customer";
     if (target === "CUSTOMER") {
       await thread.send({
         content: `<@${ticket.customerId}>`,
@@ -206,27 +207,34 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
         allowedMentions: { users: [ticket.customerId!] },
       });
     } else {
-      const pingRoleId = tierStore.pingRoleIdFor(ticket.escalationTierId, settingsStore.supportRoleId());
-      if (!pingRoleId) return;
-      await thread.send({
-        content: `<@&${pingRoleId}>`,
-        embeds: [
-          embed(
-            `This ticket has gone ${tag.reminderDays} day(s) without a reply — please follow up.\n\nStatus: ${tag.emoji} ${tag.label}`,
-            COLORS.warn
-          ),
-        ],
-        allowedMentions: { roles: [pingRoleId] },
-      });
+      const enqueued = await intercomSync
+        .onAgentReminder(ticket, { idleDays: tag.reminderDays, threadUrl: thread.url })
+        .catch(() => false);
+      route = enqueued ? "intercom" : "discord";
+      if (!enqueued) {
+        const pingRoleId = tierStore.newTicketRoleId(settingsStore.supportRoleId());
+        if (!pingRoleId) return false;
+        await thread.send({
+          content: `<@&${pingRoleId}>`,
+          embeds: [
+            embed(
+              `This ticket has gone ${tag.reminderDays} day(s) without a reply — please follow up.\n\nStatus: ${tag.emoji} ${tag.label}`,
+              COLORS.warn
+            ),
+          ],
+          allowedMentions: { roles: [pingRoleId] },
+        });
+      }
     }
     await ticketStore.recordReminder(ticket.threadId);
     actLog.info("reminder.sent", {
       "ticket.thread_id": ticket.threadId,
       "reminder.target": target.toLowerCase(),
+      "reminder.route": route,
       "reminder.round": ticket.reminderCount + 1,
     });
     void auditLogger.log({
-      title: "⏰ Reminder sent",
+      title: target === "CUSTOMER" ? "⏰ Reminder sent" : route === "intercom" ? "⏰ Agent reminder → Intercom" : "⏰ Agent reminder → Discord (unmirrored)",
       severity: "warn",
       actor: "Automatic",
       threadId: ticket.threadId,
@@ -236,6 +244,7 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
         { name: "Round", value: String(ticket.reminderCount + 1), inline: true },
       ],
     });
+    return true;
   };
 
   // Worker-global Intercom call pacing (replaces the drain loop's spacing).
@@ -329,38 +338,24 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
               if (target === "CUSTOMER" && tag.autoCloseAfter != null && ticket.reminderCount >= tag.autoCloseAfter && closingTag) {
                 statusChange = { tagId: closingTag.id, actorName: "Automatic" };
               } else {
-                await sendReminder(thread, ticket, tag, target);
-                reminded = true;
+                reminded = await sendReminder(thread, ticket, tag, target);
               }
             }
           }
         }
       }
 
-      // ---- resolved auto-close (ReminderScheduler.processResolvedTicket) ----
-      if (!statusChange && tag && tag.emoji === RESOLVED_EMOJI && !ticket.remindersPaused) {
-        const closingTag = settingsStore.closingTag();
-        if (closingTag) {
-          if (!thread) {
-            await ticketStore.close(threadId);
-          } else if (!thread.locked) {
-            const days = tag.autoCloseAfter ?? DEFAULT_RESOLVED_AUTO_CLOSE_DAYS;
-            // A customer reply normally reopens the ticket; if one slipped
-            // through, don't auto-close on top of it.
-            const awaitedAt = await lastAwaitedMessageAt(thread, "CUSTOMER", ticket.customerId);
-            const repliedSinceChange = awaitedAt != null && awaitedAt > ticket.lastStatusChangeAt.getTime();
-            if (!repliedSinceChange && now - ticket.lastStatusChangeAt.getTime() >= days * DAY_MS) {
-              statusChange = { tagId: closingTag.id, actorName: "Automatic" };
-            }
-          }
-        }
-      }
+      // (The resolved-auto-close pass is gone with the resolved state itself —
+      // tickets are open or closed; a closing tag locks+archives immediately.)
 
       return { statusChange, reminded, reclosed, snapshot: await buildSnapshot(threadId) };
     },
 
+    // Tombstone stub (agent-rip): only reachable from the autoAnswerWorkflow
+    // repair path of runs in flight across the deploy — new tickets never
+    // spawn that child (aiSolve is always false).
     async pingStaffForNewTicket(threadId) {
-      await bot.pingStaffForNewTicketThread(threadId);
+      actLog.info("pingStaffForNewTicket skipped (agent-rip tombstone)", { "ticket.thread_id": threadId });
     },
 
     // ================= status / priority =================
@@ -376,8 +371,10 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
       if (!tag) {
         return { applied: false, reason: "unknown status tag", closed: ticket.closed, isResolved: false, closesThread: false, statusTagId: input.tagId, statusLabel: null };
       }
-      const isResolved = tag.emoji === RESOLVED_EMOJI;
-      const isDone = tag.closesThread || isResolved;
+      // Resolved state removed (agent-rip): done = the tag closes the thread.
+      // isResolved is pinned false — in-flight workflow runs still read the
+      // field; the shape slims out in a later release.
+      const isDone = tag.closesThread;
       // No-op guard mirrors handleThreadUpdate's backstop: already there.
       const thread = await fetchThread(input.threadId);
       if (!thread) {
@@ -387,7 +384,7 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
         await intercomSync
           .onStatusChanged(input.threadId, ticket.statusTag ?? null, tag, input.actorName)
           .catch(() => {});
-        return { applied: true, closed: true, isResolved, closesThread: tag.closesThread, statusTagId: tag.id, statusLabel: tag.label };
+        return { applied: true, closed: true, isResolved: false, closesThread: tag.closesThread, statusTagId: tag.id, statusLabel: tag.label };
       }
       await statusService.applyStatusDirect(thread, ticket, tag, {
         actorName: input.actorName,
@@ -395,19 +392,15 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
         actorIconUrl: input.actorIconUrl ?? undefined,
         silent: input.silent,
       });
-      return { applied: true, closed: isDone, isResolved, closesThread: tag.closesThread, statusTagId: tag.id, statusLabel: tag.label };
+      return { applied: true, closed: isDone, isResolved: false, closesThread: tag.closesThread, statusTagId: tag.id, statusLabel: tag.label };
     },
 
+    // Inert stub (agent-rip): the Discord priority axis is unbridged — nothing
+    // issues the applyPriority update anymore, but the workflow keeps the
+    // handler registered (byte-identical ticketWorkflow), so the activity name
+    // must stay implemented for any in-flight update at deploy time.
     async applyPriorityStep(input) {
-      const ticket = await ticketStore.getByThreadId(input.threadId);
-      const priority = settingsStore.priorityById(input.priorityTagId);
-      const thread = await fetchThread(input.threadId);
-      if (!ticket || !priority || !thread) return;
-      await statusService.applyPriorityDirect(thread, ticket, priority, {
-        actorName: input.actorName,
-        actorId: input.actorId ?? undefined,
-        actorIconUrl: input.actorIconUrl ?? undefined,
-      });
+      actLog.info("applyPriorityStep skipped (priority axis retired)", { "ticket.thread_id": input.threadId });
     },
 
     // ================= Intercom =================
@@ -571,79 +564,23 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
       }
     },
 
-    // Scoring loop state: is a submit due, and which Anthropic batches are
-    // still in flight (each gets its own scoring-batch-<id> child workflow).
-    async scoringGetState() {
-      const enabled = settingsStore.scoringEnabled() && scoringService.hasDiscordClient();
-      const pending = enabled
-        ? await deps.prisma.scoringBatch.findMany({
-            where: { status: "SUBMITTED" },
-            orderBy: { submittedAt: "asc" },
-            select: { anthropicBatchId: true },
-          })
-        : [];
-      const lastRun = settingsStore.scoringLastRunAt();
-      const intervalMs = Math.max(1, settingsStore.scoringIntervalHours()) * 60 * 60 * 1000;
-      // Escalation rides the same loop: due only while enabled (scoring is the
-      // master gate), the daily interval elapsed AND the queue is non-empty.
-      const escEnabled = enabled && settingsStore.scoringEscalationEnabled();
-      const escalationPendingCount = escEnabled
-        ? await scoringService.escalationQueueCount().catch(() => 0)
-        : 0;
-      const lastEscRun = settingsStore.scoringEscalationLastRunAt();
-      const escIntervalMs = Math.max(1, settingsStore.scoringEscalationIntervalHours()) * 60 * 60 * 1000;
-      return {
-        enabled,
-        pendingBatchIds: pending.map((p) => p.anthropicBatchId),
-        due: !lastRun || Date.now() - lastRun.getTime() >= intervalMs,
-        backfill: settingsStore.scoringBackfillPending(),
-        escalationDue:
-          escEnabled &&
-          escalationPendingCount > 0 &&
-          (!lastEscRun || Date.now() - lastEscRun.getTime() >= escIntervalMs),
-        escalationPendingCount,
-      };
-    },
-
-    // Submit one batch (transcript gathering + Anthropic create) and keep the
-    // legacy bookkeeping: record the run stamp on any work, clear the backfill
-    // flag when the last unscored ticket drained.
-    async scoringSubmit(purpose) {
+    // Workspace inactivity sweep: native (unbridged) conversations/tickets get
+    // the agent-idle note+reopen and customer-idle nag/auto-close treatment.
+    // The sweeper applies the enable + intercomConfigured gate itself.
+    async inactivitySweepTick(force) {
       heartbeat();
-      const result = await scoringService.submitBatch(purpose);
-      if (!result.budgetBlocked) {
-        if (result.submitted > 0 || result.skipped > 0) {
-          if (purpose === "escalation") {
-            await settingsStore.recordScoringEscalationRun();
-          } else {
-            await settingsStore.recordScoringRun();
-          }
+      const keepalive = setInterval(() => {
+        try {
+          heartbeat();
+        } catch {
+          /* worker shutting down — the sweep finishes on its own */
         }
-        if (purpose === "backfill" && result.drained) {
-          await settingsStore.setScoringBackfillPending(false);
-          actLog.info("scoring.backfill_complete");
-        }
+      }, 30_000);
+      try {
+        return await inactivitySweeper.sweep(force);
+      } finally {
+        clearInterval(keepalive);
       }
-      return {
-        batchId: result.batchId,
-        submitted: result.submitted,
-        skipped: result.skipped,
-        drained: result.drained,
-        budgetBlocked: result.budgetBlocked,
-      };
-    },
-
-    // One poll round-trip for one batch; when Anthropic reports "ended" this
-    // same call fetches + processes every result (scores, Influx, audit).
-    async scoringPollBatch(batchId) {
-      heartbeat();
-      return scoringService.pollBatchOnce(batchId);
-    },
-
-    // 26h deadline backstop from scoringBatchWorkflow: flip a stuck batch to
-    // FAILED so its tickets become retryable (no-op if already finalized).
-    async scoringExpireBatch(batchId) {
-      await scoringService.expireBatch(batchId);
     },
 
     // Influx gauge snapshots; queue-depth gauges re-sourced from Temporal
@@ -677,35 +614,35 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
     },
 
     // 5-minute sweep: pending auths, old Stripe dedup rows, Intercom echo /
-    // pending-post retention (the legacy outbox scheduler's hourly sweeps),
-    // and the /ai run history purge (was its own hourly setInterval).
+    // pending-post retention (the legacy outbox scheduler's hourly sweeps).
     async cleanupTick() {
       await sessionStore.cleanExpiredPending().catch((e) => actLog.error("clean pending auths failed", e));
       await sessionStore.cleanOldStripeEvents().catch((e) => actLog.error("clean stripe events failed", e));
       await intercomStore.cleanupEchoParts(new Date(Date.now() - ECHO_RETENTION_MS)).catch(() => {});
       await intercomStore.cleanupPendingPosts(new Date(Date.now() - PENDING_POST_RETENTION_MS)).catch(() => {});
-      await ticketAiRunStore.purgeForClosedTickets().catch((e) => actLog.error("ai run history purge failed", e));
     },
 
-    async publishStatusReport(force) {
-      return reportScheduler.publishIfDue(force);
+    // ================= agent-rip tombstone stubs =================
+    // In-flight runs at deploy time still proxy these activity names; the
+    // tombstone workflows + stubs are removed in the follow-up release.
+
+    async publishStatusReport() {
+      actLog.info("publishStatusReport skipped (status report retired)");
+      return { published: false };
     },
 
     async scoreOneNow(threadId) {
-      // ScoreOneOutcome — carried as an opaque JSON string through the
-      // workflow; the /config modal handler branches on `escalated`.
-      const result = await scoringService.scoreOneNow(threadId);
-      return JSON.stringify(result);
+      actLog.info("scoreOneNow skipped (scoring retired)", { "ticket.thread_id": threadId });
+      return JSON.stringify({ outcome: "retired" });
     },
 
-    // ================= AI =================
-
     async runAutoAnswer(input) {
-      return bot.runAutoAnswerForTicket(input, () => heartbeat());
+      actLog.info("runAutoAnswer skipped (AI retired)", { "ticket.thread_id": input.threadId });
+      return { ok: true, apiLimit: false };
     },
 
     async runStaffAiCommand(input) {
-      await bot.executeAiRunFromWorkflow(input, () => heartbeat());
+      actLog.info("runStaffAiCommand skipped (/ai retired)", { "ticket.thread_id": input.threadId });
     },
 
     // ================= stripe / billing / vault =================
