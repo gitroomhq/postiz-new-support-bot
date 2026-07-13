@@ -255,9 +255,12 @@ export class BillingCategory extends BaseCategory {
         return;
       }
 
-      // Create a private thread for this refund conversation
+      // Create a private thread for this refund conversation. Truncation
+      // (100-char thread-name cap) may only eat into the display name — the
+      // trailing suffix stays intact, mirroring BaseCategory's ticket titles.
+      const refundSuffix = " — Refund Request";
       const thread = await threadsChannel.threads.create({
-        name: `${interaction.user.displayName} — Refund Request`.slice(0, 100),
+        name: `${interaction.user.displayName.slice(0, 100 - refundSuffix.length)}${refundSuffix}`,
         type: ChannelType.PrivateThread,
         invitable: false,
       });

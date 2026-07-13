@@ -11,6 +11,9 @@ import {
   type ThreadChannel,
 } from "discord.js";
 import { embed as makeEmbed, COLORS } from "../util/embeds";
+import { log } from "../util/logger";
+
+const ticketLog = log.child("ticket");
 
 export interface TicketContext {
   // Per-user rate limiting. Returns a customer-facing rejection message, or null when
@@ -75,10 +78,12 @@ export abstract class BaseCategory {
     let thread: ThreadChannel | null = null;
     try {
       // The trailing " — {label}" is load-bearing: deriveCategoryId parses it
-      // during Re-Verify/adoption. No emoji prefixes — titles no longer encode
-      // status/priority.
+      // during Re-Verify/adoption, so truncation (100-char thread-name cap)
+      // may only eat into the display name, never the suffix. No emoji
+      // prefixes — titles no longer encode status/priority.
+      const suffix = ` — ${this.label}`;
       thread = await threadsChannel.threads.create({
-        name: `${interaction.user.displayName} — ${this.label}`.slice(0, 100),
+        name: `${interaction.user.displayName.slice(0, 100 - suffix.length)}${suffix}`,
         type: ChannelType.PrivateThread,
         invitable: false,
       });
@@ -109,8 +114,14 @@ export abstract class BaseCategory {
         embeds: [makeEmbed(`Your private support thread has been created: ${thread}`, COLORS.success)],
       });
     } catch (error) {
-      // Thread-creation failure.
-      void error;
+      // Thread creation or post-creation setup (member add, ticket row,
+      // question embed) failed — keep the customer-facing fallback, but the
+      // failure itself must be debuggable.
+      ticketLog.error("ticket creation failed", error, {
+        "ticket.category": this.id,
+        "ticket.customer_id": interaction.user.id,
+        "ticket.thread_id": thread?.id ?? "",
+      });
       const ephemeralEmbed = thread
         ? makeEmbed(
             `Your support thread ${thread} was created, but something went wrong — a support member will help you there shortly.`,

@@ -100,7 +100,7 @@ export async function metricsSnapshotWorkflow(): Promise<void> {
 }
 
 // 5-minute sweep: expired pending auths, old Stripe webhook dedup rows,
-// Intercom echo/pending-post retention, ticket AI-run history purge.
+// Intercom echo/pending-post retention.
 export async function cleanupLoopWorkflow(): Promise<void> {
   for (;;) {
     await light.cleanupTick().catch(() => {});

@@ -632,7 +632,6 @@ export class IntercomClient {
         id?: string | number;
         state?: string;
         created_at?: number;
-        waiting_since?: number | null;
         snoozed_until?: number | null;
         statistics?: {
           last_contact_reply_at?: number | null;

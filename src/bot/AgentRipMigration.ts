@@ -203,25 +203,31 @@ export class AgentRipMigration {
   }
 
   // editWithGrace, migration edition: wait briefly, then detach — discord.js
-  // delivers the queued edit FIFO once the per-thread limit clears.
+  // delivers the queued edit FIFO once the per-thread limit clears. Only the
+  // timeout detaches; a real API error (deleted thread, missing permission)
+  // rethrows so the sweeps' per-item catch counts + audits it. A rejection
+  // landing after the grace window is already handled here, so it can never
+  // become an unhandled rejection.
   private boundedEdit(op: Promise<unknown>, edit: string, threadId: string): Promise<void> {
     const settled = op.then(
-      () => true as const,
-      () => true as const
+      () => ({ pending: false as const, failed: false as const, error: null as unknown }),
+      (error: unknown) => ({ pending: false as const, failed: true as const, error })
     );
     let timer: NodeJS.Timeout | undefined;
-    const grace = new Promise<false>((resolve) => {
-      timer = setTimeout(() => resolve(false), EDIT_GRACE_MS);
+    const grace = new Promise<{ pending: true }>((resolve) => {
+      timer = setTimeout(() => resolve({ pending: true }), EDIT_GRACE_MS);
       timer.unref?.();
     });
-    return Promise.race([settled, grace]).then((finished) => {
+    return Promise.race([settled, grace]).then((outcome) => {
       clearTimeout(timer);
-      if (!finished) {
+      if (outcome.pending) {
         migLog.warn("thread edit rate-limited — continuing, it lands when the limit clears", {
           "thread.edit": edit,
           "ticket.thread_id": threadId,
         });
+        return;
       }
+      if (outcome.failed) throw outcome.error;
     });
   }
 }

@@ -191,7 +191,9 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
   // note + reopen on the linked conversation (intercomSync.onAgentReminder);
   // unmirrored tickets (excluded category / bridge off) fall back to the
   // legacy staff-role ping, the only place Intercom can't see the ticket.
-  const sendReminder = async (thread: ThreadChannel, ticket: TicketWithTag, tag: StatusTag, target: "SUPPORT" | "CUSTOMER"): Promise<void> => {
+  // Returns false when there was no route (unmirrored + no staff role): the
+  // caller must not report a reminder that never went out.
+  const sendReminder = async (thread: ThreadChannel, ticket: TicketWithTag, tag: StatusTag, target: "SUPPORT" | "CUSTOMER"): Promise<boolean> => {
     let route: "customer" | "intercom" | "discord" = "customer";
     if (target === "CUSTOMER") {
       await thread.send({
@@ -211,7 +213,7 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
       route = enqueued ? "intercom" : "discord";
       if (!enqueued) {
         const pingRoleId = tierStore.newTicketRoleId(settingsStore.supportRoleId());
-        if (!pingRoleId) return;
+        if (!pingRoleId) return false;
         await thread.send({
           content: `<@&${pingRoleId}>`,
           embeds: [
@@ -242,6 +244,7 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
         { name: "Round", value: String(ticket.reminderCount + 1), inline: true },
       ],
     });
+    return true;
   };
 
   // Worker-global Intercom call pacing (replaces the drain loop's spacing).
@@ -335,8 +338,7 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
               if (target === "CUSTOMER" && tag.autoCloseAfter != null && ticket.reminderCount >= tag.autoCloseAfter && closingTag) {
                 statusChange = { tagId: closingTag.id, actorName: "Automatic" };
               } else {
-                await sendReminder(thread, ticket, tag, target);
-                reminded = true;
+                reminded = await sendReminder(thread, ticket, tag, target);
               }
             }
           }

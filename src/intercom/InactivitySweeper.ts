@@ -76,15 +76,18 @@ export class InactivitySweeper {
           // Bridged conversations are the per-ticket workflow's job.
           if (await this.store.getLinkByConversationId(conv.id)) continue;
 
-          const state = await this.store.getSweepState(conv.id);
+          let state = await this.store.getSweepState(conv.id);
           // The sweeper closed it earlier and it is open again (agent/customer
-          // reopened) — start a fresh cycle.
+          // reopened) — start a fresh cycle. Mirror the reset locally too, or
+          // the nag math below still sees the exhausted pre-close counter and
+          // re-closes the just-reopened conversation on this very tick.
           if (state?.sweepClosedAt) {
             await this.store.upsertSweepState(conv.id, "conversation", {
               sweepClosedAt: null,
               customerNagCount: 0,
               lastCustomerNagAt: null,
             });
+            state = { ...state, sweepClosedAt: null, customerNagCount: 0, lastCustomerNagAt: null };
           }
           // The opening message is contact activity even before any reply.
           const lastCustomerMs = conv.lastContactReplyAt?.getTime() ?? conv.createdAt?.getTime() ?? 0;
@@ -124,9 +127,15 @@ export class InactivitySweeper {
               await paceWrite();
               if (nagCount >= nagsBeforeClose) {
                 await this.client.setConversationOpen(conv.id, false, adminId);
+                writes++;
                 const nativeTicketId = await this.client.getConversationTicketId(conv.id).catch(() => null);
                 if (nativeTicketId) {
+                  // Second Intercom write of this close — pace and count it
+                  // like any other so a close burst can't defeat the spacing
+                  // or the sweep-wide write cap.
+                  await paceWrite();
                   await this.client.updateTicket(nativeTicketId, { open: false, adminId }).catch(() => {});
+                  writes++;
                 }
                 await this.store.upsertSweepState(conv.id, "conversation", { sweepClosedAt: new Date(now) });
                 result.closed++;
@@ -143,8 +152,8 @@ export class InactivitySweeper {
                   sweepClosedAt: null,
                 });
                 result.customerNags++;
+                writes++;
               }
-              writes++;
             } else if (customerRepliedSinceNag && state) {
               // Not due yet, but the reply must reset the counter so a later
               // silence starts a fresh nag cycle.
