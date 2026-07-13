@@ -312,7 +312,6 @@ export class IntercomWebhookHandler {
       if (webhook) {
         try {
           await webhook.deleteMessage(map.discordMessageId, thread.id);
-          this.auditRedactionDelete(map, "Relayed agent reply removed");
           return;
         } catch (e) {
           if ((e as { code?: number }).code === DISCORD_UNKNOWN_MESSAGE) return; // already gone
@@ -347,23 +346,9 @@ export class IntercomWebhookHandler {
       }
       throw e;
     }
-    this.auditRedactionDelete(
-      map,
-      map.direction === "in" ? "Relayed agent reply removed" : "Origin Discord message removed"
-    );
-  }
-
-  private auditRedactionDelete(map: { ticketThreadId: string; discordMessageId: string }, effect: string): void {
-    void this.audit.log({
-      title: "🗑️ Intercom message redacted",
-      severity: "info",
-      actor: "Intercom agent",
-      threadId: map.ticketThreadId,
-      fields: [
-        { name: "Effect", value: effect, inline: false },
-        { name: "Message", value: map.discordMessageId, inline: true },
-      ],
-    });
+    // Successful reflections are deliberately silent (user request) — only the
+    // Missing Permissions degradation above is audit-worthy, since it needs a
+    // manual delete.
   }
 
   private async handleConversationReply(item: IntercomConversationItem | undefined, attempt: number): Promise<void> {
