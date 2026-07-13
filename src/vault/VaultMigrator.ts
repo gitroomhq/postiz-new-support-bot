@@ -65,6 +65,12 @@ export class VaultMigrator {
         error: "Vault is not reachable — run Test Connection and fix the connection first.",
       };
     }
+    // Seed the Stripe API key from the env var on demand too — pressing
+    // Migrate must move it without waiting for the boot upgrade job (which
+    // rides a Temporal workflow under that regime). Pre-cutover the seed
+    // lands as local enc:v1 and the loop below lifts + verifies it like any
+    // other column; post-cutover it routes straight to KV ("already").
+    await this.seedStripeSecretKey();
     const items: MigrateItemResult[] = [];
     for (const column of VaultMigrator.columns()) {
       const name = COLUMN_LABELS[column];
@@ -246,11 +252,12 @@ export class VaultMigrator {
 
   // ---- Stripe API key seed (env → managed storage, one-time) ----
 
-  // The API key predates the vault system as a pure env var. First boot after
-  // this ships copies it into managed storage so the /config Vault panel can
-  // see (and a later modal rotate) it. Never clobbers an operator-set value:
-  // any non-empty raw column (sentinel or ciphertext, readable or not) counts
-  // as set — env might be the stale side after a rotation.
+  // The API key predates the vault system as a pure env var. Copies it into
+  // managed storage so the /config Vault panel can see (and a later modal
+  // rotate) it. Runs from the boot/recovery upgrade job AND the /config
+  // Migrate button. Never clobbers an operator-set value: any non-empty raw
+  // column (sentinel or ciphertext, readable or not) counts as set — env
+  // might be the stale side after a rotation.
   private async seedStripeSecretKey(): Promise<void> {
     if (this.settings.getSecretColumnRaw("stripeSecretKey")) return;
     const envKey = process.env.STRIPE_SECRET_KEY;
