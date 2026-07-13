@@ -45,7 +45,6 @@ export const INTERCOM_WEBHOOK_TOPICS = [
   "conversation.admin.opened",
   "conversation.admin.snoozed",
   "conversation.admin.unsnoozed",
-  "conversation.admin.assigned",
   "conversation.priority.updated",
   "ticket.state.updated",
   "ticket.admin.replied",
@@ -203,9 +202,6 @@ export class IntercomWebhookHandler {
         return;
       case "ticket.note.created":
         await this.handleTicketNoteCreated(item as IntercomTicketItem);
-        return;
-      case "conversation.admin.assigned":
-        await this.handleConversationAssigned(item as IntercomConversationItem);
         return;
       case "conversation.priority.updated":
         await this.handleConversationPriorityUpdated(item as IntercomConversationItem);
@@ -932,38 +928,6 @@ export class IntercomWebhookHandler {
       .catch(() => {});
   }
 
-  // Agent took (or was handed) the conversation in Intercom → one neutral
-  // embed in the Discord thread so staff know who owns it. Damped by
-  // lastAssigneeId; the damper is set before the send — losing one cosmetic
-  // embed to a transient failure beats duplicating it on retry.
-  private async handleConversationAssigned(item: IntercomConversationItem | undefined): Promise<void> {
-    if (this.settingsStore.intercomMode() !== "bi") return;
-    if (!item || item.id == null) return;
-
-    const assigneeId = item.admin_assignee_id != null ? String(item.admin_assignee_id) : null;
-    if (!assigneeId || assigneeId === "0") return; // unassigned / team-only routing
-
-    const link = await this.store.getLinkByConversationId(String(item.id));
-    if (!link) return;
-    if (link.lastAssigneeId === assigneeId) return; // echo or duplicate delivery
-    await this.store.setLastAssigneeId(link.ticketThreadId, assigneeId);
-
-    const name = await this.lookupAdminName(assigneeId);
-
-    const thread = await this.requireThread(link.ticketThreadId);
-    if (!thread) return;
-    await thread
-      .send({
-        embeds: [
-          new EmbedBuilder()
-            .setColor(COLORS.neutral)
-            .setDescription(`👤 Assigned to ${name ?? "an Intercom agent"} in Intercom.`),
-        ],
-        allowedMentions: { parse: [] },
-      })
-      .catch(() => {});
-  }
-
   // Agent set the NATIVE priority level in Intercom → the Discord priority tag
   // with the matching label (Urgent/High/Medium/Low, case-insensitive). The
   // level is read-only via the public API, so this can never be an echo of the
@@ -1163,10 +1127,6 @@ export class IntercomWebhookHandler {
       }
     }
     return this.adminCache.admins.get(adminId) ?? null;
-  }
-
-  private async lookupAdminName(adminId: string): Promise<string | null> {
-    return (await this.lookupAdmin(adminId))?.name ?? null;
   }
 
   private async fetchThread(threadId: string): Promise<ThreadChannel | null> {

@@ -362,15 +362,6 @@ export class IntercomStore {
     });
   }
 
-  // ---- Inbound assignment damper ----
-
-  async setLastAssigneeId(ticketThreadId: string, adminId: string | null): Promise<void> {
-    await this.prisma.intercomLink.updateMany({
-      where: { ticketThreadId },
-      data: { lastAssigneeId: adminId },
-    });
-  }
-
   // Full bridge-state wipe (links + echo/pending ledgers). Touches NOTHING in
   // Intercom itself — use when the Intercom side was cleared/recreated and the
   // local bookkeeping is stale; the next backfill rebuilds everything.
