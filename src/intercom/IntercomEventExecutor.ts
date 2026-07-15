@@ -231,7 +231,7 @@ export class IntercomEventExecutor {
         payload.customerDisplayName ? `Customer: ${escapeHtmlText(payload.customerDisplayName)}` : null,
         payload.categoryLabel ? `Category: ${escapeHtmlText(payload.categoryLabel)}` : null,
         payload.postizUserId ? `Postiz user: ${escapeHtmlText(payload.postizUserId)}` : null,
-        payload.threadUrl ? `<a href="${payload.threadUrl}">Open Discord thread</a>` : `Thread: ${threadId}`,
+        payload.stripeCustomerId ? `Stripe customer: ${escapeHtmlText(payload.stripeCustomerId)}` : null,
       ].filter(Boolean);
       await this.postAdminNote(threadId, link.conversationId, `<p>${contextLines.join("<br>")}</p>`, undefined, true).catch(
         (e) =>
