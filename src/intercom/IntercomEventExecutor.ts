@@ -909,11 +909,7 @@ export class IntercomEventExecutor {
     // default first line; the thread link and reopen stay either way.
     const raw = payload.noteText ?? `Waiting on an agent reply for ${Math.max(1, Math.round(payload.idleDays))} day(s).`;
     const firstLine = `⏰ <b>${escapeHtmlText(applyTeam(raw, teamName))}</b>`;
-    const lines = [
-      firstLine,
-      payload.threadUrl ? `<a href="${payload.threadUrl}">Open Discord thread</a>` : null,
-    ].filter(Boolean);
-    await this.postAdminNote(threadId, link.conversationId, `<p>${lines.join("<br>")}</p>`, undefined, true);
+    await this.postAdminNote(threadId, link.conversationId, `<p>${firstLine}</p>`, undefined, true);
     try {
       await this.withAuthor((a) => this.client.setConversationOpen(link.conversationId, true, a));
     } catch (e) {
