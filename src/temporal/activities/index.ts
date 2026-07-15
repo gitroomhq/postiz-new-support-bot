@@ -325,7 +325,13 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
           const target =
             isIntercomExempt(ticket) || tag.reminderTarget === "CUSTOMER" ? "CUSTOMER" : "SUPPORT";
           if (!(target === "CUSTOMER" && !ticket.customerId)) {
-            const awaitedAt = await lastAwaitedMessageAt(thread, target, ticket.customerId);
+            // Agent replies bridged from Intercom land in Discord as BOT
+            // messages — invisible to the human scan. The relay ledger
+            // ("in" message-map rows) supplies the agent's real last reply
+            // for the SUPPORT idle clock and the staff-spoke-last guard.
+            const relayAtMs = (await intercomSync.lastAgentRelayAt(threadId).catch(() => null))?.getTime() ?? 0;
+            const scanAt = await lastAwaitedMessageAt(thread, target, ticket.customerId);
+            const awaitedAt = target === "SUPPORT" ? Math.max(scanAt ?? 0, relayAtMs) || null : scanAt;
             const reference = Math.max(
               ticket.lastStatusChangeAt.getTime(),
               awaitedAt ?? 0,
@@ -343,13 +349,13 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
                 // Never close a ticket whose customer actually spoke last: the
                 // Waiting-for-Customer tag can be stale when the reply-time
                 // auto-flip was missed (bot down, unusable flip target).
-                // Staff replies arrive via Intercom mirrored as bot messages
-                // (invisible to the SUPPORT human scan), so lastStatusChangeAt
-                // — stamped when the ticket entered this tag — proxies the
-                // agent's last action alongside any human staff message.
+                // The relay ledger gives the agent's real last Intercom reply;
+                // lastStatusChangeAt — stamped when the ticket entered this
+                // tag — stays in the max as a belt for unmirrored gaps.
                 const staffAt = await lastAwaitedMessageAt(thread, "SUPPORT", ticket.customerId);
                 const customerSpokeLast =
-                  awaitedAt != null && awaitedAt > Math.max(staffAt ?? 0, ticket.lastStatusChangeAt.getTime());
+                  awaitedAt != null &&
+                  awaitedAt > Math.max(staffAt ?? 0, relayAtMs, ticket.lastStatusChangeAt.getTime());
                 if (customerSpokeLast) {
                   // Missed auto-flip self-heal — mirror DiscordBot.processTicketMessage.
                   const usable = (t: StatusTag | undefined): t is StatusTag =>

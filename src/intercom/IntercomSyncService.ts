@@ -283,6 +283,14 @@ export class IntercomSyncService {
     return true;
   }
 
+  // Newest relayed-agent-reply stamp for a thread (IntercomMessageMap "in"
+  // rows). Agent replies land in Discord as BOT messages, invisible to the
+  // human-message scans — checkTicketTimers folds this in so an agent who
+  // replied via Intercom isn't nagged as idle.
+  async lastAgentRelayAt(threadId: string): Promise<Date | null> {
+    return this.store.getLatestInboundRelayAt(threadId);
+  }
+
   // Best-effort internal note on the linked conversation (member-leave close
   // & co). No-ops for unmirrored tickets or a disabled bridge.
   async onTicketNote(threadId: string, content: string): Promise<void> {

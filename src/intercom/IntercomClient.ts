@@ -136,6 +136,24 @@ export class IntercomClient {
       .map((t) => ({ id: String(t.id), name: t.name ?? `Team ${t.id}` }));
   }
 
+  private teamNameCache: { fetchedAt: number; byId: Map<string, string> } | null = null;
+
+  // Team id → name via one cached /teams fetch (~5 min TTL, so a team created
+  // or renamed mid-window resolves late). Never throws — team names only
+  // decorate reminder notes and must not fail them.
+  async getTeamNameCached(teamId: string): Promise<string | null> {
+    const TTL_MS = 5 * 60_000;
+    try {
+      if (!this.teamNameCache || Date.now() - this.teamNameCache.fetchedAt >= TTL_MS) {
+        const teams = await this.listTeams();
+        this.teamNameCache = { fetchedAt: Date.now(), byId: new Map(teams.map((t) => [t.id, t.name])) };
+      }
+      return this.teamNameCache.byId.get(teamId) ?? null;
+    } catch {
+      return this.teamNameCache?.byId.get(teamId) ?? null;
+    }
+  }
+
   // ---- Contacts ----
 
   async findContactByExternalId(externalId: string): Promise<{ id: string } | null> {
@@ -629,11 +647,13 @@ export class IntercomClient {
     createdAt: Date | null;
     lastContactReplyAt: Date | null;
     lastAdminReplyAt: Date | null;
+    teamAssigneeId: string | null;
   } | null> {
     try {
       const data = await this.json<{
         state?: string;
         created_at?: number;
+        team_assignee_id?: number | string | null;
         statistics?: {
           last_contact_reply_at?: number | null;
           last_admin_reply_at?: number | null;
@@ -648,6 +668,7 @@ export class IntercomClient {
         lastAdminReplyAt: data.statistics?.last_admin_reply_at
           ? new Date(data.statistics.last_admin_reply_at * 1000)
           : null,
+        teamAssigneeId: data.team_assignee_id != null ? String(data.team_assignee_id) : null,
       };
     } catch (e) {
       if (e instanceof IntercomHttpError && e.status === 404) return null;
@@ -667,6 +688,7 @@ export class IntercomClient {
         state?: string;
         created_at?: number;
         snoozed_until?: number | null;
+        team_assignee_id?: number | string | null;
         statistics?: {
           last_contact_reply_at?: number | null;
           last_admin_reply_at?: number | null;
@@ -696,6 +718,7 @@ export class IntercomClient {
           lastAdminReplyAt: c.statistics?.last_admin_reply_at
             ? new Date(c.statistics.last_admin_reply_at * 1000)
             : null,
+          teamAssigneeId: c.team_assignee_id != null ? String(c.team_assignee_id) : null,
         })),
       nextStartingAfter: data.pages?.next?.starting_after ?? null,
     };
@@ -713,6 +736,7 @@ export class IntercomClient {
         updated_at?: number;
         created_at?: number;
         category?: string;
+        team_assignee_id?: number | string | null;
       }>;
       pages?: { next?: { starting_after?: string } | null };
     }>(
@@ -732,6 +756,7 @@ export class IntercomClient {
           category: t.category ?? null,
           updatedAt: t.updated_at ? new Date(t.updated_at * 1000) : null,
           createdAt: t.created_at ? new Date(t.created_at * 1000) : null,
+          teamAssigneeId: t.team_assignee_id != null ? String(t.team_assignee_id) : null,
         })),
       nextStartingAfter: data.pages?.next?.starting_after ?? null,
     };

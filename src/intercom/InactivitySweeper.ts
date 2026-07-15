@@ -4,6 +4,7 @@ import type { IntercomClient } from "./IntercomClient";
 import type { IntercomStore } from "./IntercomStore";
 import type { InactivitySweepResult } from "../temporal/types";
 import { exportIntercomSweep } from "../metrics/MetricsExporter";
+import { applyTeam } from "./reminderText";
 import { log } from "../util/logger";
 
 const sweepLog = log.child("intercom:sweep");
@@ -16,7 +17,8 @@ const WRITE_SPACING_MS = 400;
 // Logged + audited when hit — never a silent cap.
 const MAX_WRITES_PER_SWEEP = 100;
 
-// Default sweep copy; /config text overrides ({days} placeholder) replace these.
+// Default sweep copy; /config text overrides ({days}/{team} placeholders)
+// replace these. Agent-idle notes always name the assigned team (applyTeam).
 const DEFAULT_AGENT_NOTE = (days: number): string =>
   `⏰ This conversation has been waiting on an agent reply for ${days} day(s).`;
 const DEFAULT_TICKET_NOTE = (days: number): string => `⏰ This ticket has had no activity for ${days} day(s).`;
@@ -70,6 +72,14 @@ export class InactivitySweeper {
       if (wait > 0) await new Promise((r) => setTimeout(r, wait));
       lastWriteAt = Date.now();
     };
+    // Assigned-team name for the agent-idle notes (client caches /teams, so
+    // this is ~one API call per sweep). Falls back to the configured routing
+    // team, then a generic label — never fails the note.
+    const teamNameFor = async (teamAssigneeId: string | null): Promise<string> => {
+      const teamId = teamAssigneeId ?? this.settingsStore.intercomTeamId();
+      const name = teamId ? await this.client.getTeamNameCached(teamId).catch(() => null) : null;
+      return name ?? "the support team";
+    };
 
     // ---- conversations ----
     let cursor: string | null = null;
@@ -110,11 +120,12 @@ export class InactivitySweeper {
             const remindedAt = state?.lastAgentRemindedAt?.getTime() ?? 0;
             if (now - lastCustomerMs >= agentWaitMs && now - remindedAt >= agentWaitMs) {
               const days = Math.floor((now - lastCustomerMs) / DAY_MS);
+              const team = await teamNameFor(conv.teamAssigneeId);
               await paceWrite();
               await this.client.replyAsAdmin(conv.id, {
                 adminId,
                 note: true,
-                body: agentNoteText ? renderDays(agentNoteText, days) : DEFAULT_AGENT_NOTE(days),
+                body: applyTeam(agentNoteText ? renderDays(agentNoteText, days) : DEFAULT_AGENT_NOTE(days), team),
               });
               await this.store.upsertSweepState(conv.id, "conversation", {
                 lastAgentRemindedAt: new Date(now),
@@ -217,11 +228,12 @@ export class InactivitySweeper {
           // idle clock naturally — the damper is a second belt.
           if (now - remindedAt < agentWaitMs) continue;
           const days = Math.floor((now - lastActivityMs) / DAY_MS);
+          const team = await teamNameFor(ticket.teamAssigneeId);
           await paceWrite();
           await this.client.replyTicketAsAdmin(ticket.id, {
             adminId,
             note: true,
-            body: agentNoteText ? renderDays(agentNoteText, days) : DEFAULT_TICKET_NOTE(days),
+            body: applyTeam(agentNoteText ? renderDays(agentNoteText, days) : DEFAULT_TICKET_NOTE(days), team),
           });
           await this.store.upsertSweepState(stateId, "ticket", { lastAgentRemindedAt: new Date(now) });
           writes++;

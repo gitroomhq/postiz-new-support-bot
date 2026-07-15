@@ -3009,17 +3009,19 @@ export class DiscordBot {
       await interaction.deferUpdate();
       try {
         const types = await this.intercomClient.listTicketTypes();
-        // Both Customer and Back-office types work (back-office avoids the
-        // channel gate on Intercom's "ticket created" workflow trigger); list
-        // everything, back-office first, category visible in the description.
+        // Both Customer and Back-office types work. Customer first: convert
+        // merges conversation + ticket into ONE inbox object, while back-office
+        // means a linked pair agents have to juggle (its only edge is that
+        // Intercom's "ticket created" workflow trigger fires for it without a
+        // channel gate). Category stays visible in the description.
         const rank = (t: { category?: string | null }) => {
           const c = (t.category ?? "").toLowerCase();
-          return c === "back-office" ? 0 : c === "customer" ? 1 : 2;
+          return c === "customer" ? 0 : c === "back-office" ? 1 : 2;
         };
         const pool = [...types].sort((a, b) => rank(a) - rank(b));
         if (pool.length === 0) {
           await interaction.followUp({
-            embeds: [makeEmbed("Intercom returned no ticket types — create one in Intercom first (Back-office recommended).", COLORS.warn)],
+            embeds: [makeEmbed("Intercom returned no ticket types — create one in Intercom first (Customer recommended).", COLORS.warn)],
             flags: 64,
           });
           return;
@@ -3142,7 +3144,8 @@ export class DiscordBot {
         makeEmbed(
           [
             "Map each ticket category to an Intercom **ticket type**. The **Default** mapping is required — it catches tickets with no category-specific mapping.",
-            "**Back-office types are recommended**: Intercom's \"ticket created\" workflow trigger channel-gates Customer tickets (API-created ones never match), while back-office tickets trigger without a channel filter — and your customers never see Intercom anyway.",
+            "**Customer types are recommended**: the conversation is converted *into* the ticket, so agents work one unified thread instead of a back-office ticket + separate conversation. Pick a Back-office type only if you depend on Intercom's \"ticket created\" workflow trigger — it never fires for API-created Customer tickets.",
+            "Remapping affects **new** tickets only (existing tickets keep the type they were created with). After switching, re-check **Ticket states** — mapped states must be valid for the new type.",
           ].join("\n"),
           COLORS.neutral
         ),
@@ -3871,7 +3874,7 @@ export class DiscordBot {
         .setRequired(false);
       const agentNoteText = new TextInputBuilder()
         .setCustomId("agent_note_text")
-        .setLabel("Agent-idle note, {days} ok (blank = default)")
+        .setLabel("Agent-idle note, {days}/{team} ok")
         .setStyle(TextInputStyle.Paragraph)
         .setMaxLength(1000)
         .setRequired(false);
@@ -4693,7 +4696,7 @@ export class DiscordBot {
       .setRequired(false);
     const supportText = new TextInputBuilder()
       .setCustomId("support_text")
-      .setLabel("Agent note text, {days} ok (blank = default)")
+      .setLabel("Agent note text, {days}/{team} ok")
       .setStyle(TextInputStyle.Paragraph)
       .setMaxLength(1000)
       .setRequired(false);

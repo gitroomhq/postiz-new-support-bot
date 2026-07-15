@@ -157,6 +157,7 @@ export interface IntercomSweepConversation {
   snoozedUntil: Date | null;
   lastContactReplyAt: Date | null;
   lastAdminReplyAt: Date | null;
+  teamAssigneeId: string | null;
 }
 
 export interface IntercomSweepTicket {
@@ -164,6 +165,7 @@ export interface IntercomSweepTicket {
   category: string | null; // "Customer" | "Back-office" | "Tracker"
   updatedAt: Date | null;
   createdAt: Date | null;
+  teamAssigneeId: string | null;
 }
 
 // ---- Intercom API shapes (only the fields the bridge reads) ----

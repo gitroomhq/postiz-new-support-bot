@@ -6,6 +6,7 @@ import { IntercomClient, IntercomHttpError } from "./IntercomClient";
 import { IntercomStore } from "./IntercomStore";
 import { IntercomSyncService, externalIdCandidates, isIntercomExempt } from "./IntercomSyncService";
 import { bodyHash, renderDiscordMarkdownToHtml } from "./renderDiscordMarkdown";
+import { applyTeam } from "./reminderText";
 import { log } from "../util/logger";
 import {
   AgentReminderPayload,
@@ -526,7 +527,9 @@ export class IntercomEventExecutor {
         if (!isPermanent4xx(e2)) throw e2;
         try {
           // create+link is valid for back-office/tracker types — still a real
-          // Intercom-side link, just not via convert.
+          // Intercom-side link, just not via convert. For CUSTOMER types this
+          // rung is expected to 4xx (conversation_to_link_id is rejected) and
+          // fall through to the standalone rung below.
           ticketId = (
             await this.client.createTicket({
               ticketTypeId,
@@ -899,11 +902,13 @@ export class IntercomEventExecutor {
   // gate drops the webhooks) and the note rides the pending-post handshake.
   private async executeAgentReminder(threadId: string, payload: AgentReminderPayload): Promise<void> {
     const link = await this.requireLink(threadId);
+    // Team resolved at post time, not enqueue time — the payload can sit in
+    // the outbox while the assignment changes.
+    const teamName = await this.resolveAssignedTeamName(link.conversationId);
     // Per-tag override (operator-entered plain text → escaped) replaces the
     // default first line; the thread link and reopen stay either way.
-    const firstLine = payload.noteText
-      ? `⏰ <b>${escapeHtmlText(payload.noteText)}</b>`
-      : `⏰ <b>Waiting on an agent reply for ${Math.max(1, Math.round(payload.idleDays))} day(s).</b>`;
+    const raw = payload.noteText ?? `Waiting on an agent reply for ${Math.max(1, Math.round(payload.idleDays))} day(s).`;
+    const firstLine = `⏰ <b>${escapeHtmlText(applyTeam(raw, teamName))}</b>`;
     const lines = [
       firstLine,
       payload.threadUrl ? `<a href="${payload.threadUrl}">Open Discord thread</a>` : null,
@@ -915,6 +920,16 @@ export class IntercomEventExecutor {
       if (!isPermanent4xx(e)) throw e; // "already open" & co — desired end state
     }
     await this.store.setLastSyncedOpen(threadId, "open");
+  }
+
+  // Name of the team currently assigned to the conversation, falling back to
+  // the configured routing team, then a generic label. Never throws — the
+  // team name only decorates the reminder note, which must post regardless.
+  private async resolveAssignedTeamName(conversationId: string): Promise<string> {
+    const stats = await this.client.getConversationIdleStats(conversationId).catch(() => null);
+    const teamId = stats?.teamAssigneeId ?? this.settingsStore.intercomTeamId();
+    const name = teamId ? await this.client.getTeamNameCached(teamId).catch(() => null) : null;
+    return name ?? "the support team";
   }
 }
 
