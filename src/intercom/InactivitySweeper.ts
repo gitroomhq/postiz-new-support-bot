@@ -16,6 +16,14 @@ const WRITE_SPACING_MS = 400;
 // Logged + audited when hit — never a silent cap.
 const MAX_WRITES_PER_SWEEP = 100;
 
+// Default sweep copy; /config text overrides ({days} placeholder) replace these.
+const DEFAULT_AGENT_NOTE = (days: number): string =>
+  `⏰ This conversation has been waiting on an agent reply for ${days} day(s).`;
+const DEFAULT_TICKET_NOTE = (days: number): string => `⏰ This ticket has had no activity for ${days} day(s).`;
+const DEFAULT_CUSTOMER_NAG =
+  "Are you still there? We haven't heard back from you — this conversation will be closed automatically if we don't hear from you.";
+const renderDays = (template: string, days: number): string => template.split("{days}").join(String(days));
+
 // Workspace inactivity automation for NATIVE (unbridged) Intercom
 // conversations and tickets — Intercom's own workflow triggers are
 // channel-gated and never fire on API-created objects, so the bot is the
@@ -52,6 +60,8 @@ export class InactivitySweeper {
     const agentWaitMs = Math.max(1, this.settingsStore.inactivityAgentWaitDays()) * DAY_MS;
     const customerWaitMs = Math.max(1, this.settingsStore.inactivityCustomerWaitDays()) * DAY_MS;
     const nagsBeforeClose = Math.max(1, this.settingsStore.inactivityNagsBeforeClose());
+    const agentNoteText = this.settingsStore.inactivityAgentNoteText();
+    const nagText = this.settingsStore.inactivityNagText();
     let writes = 0;
     let errors = 0;
     let lastWriteAt = 0;
@@ -104,7 +114,7 @@ export class InactivitySweeper {
               await this.client.replyAsAdmin(conv.id, {
                 adminId,
                 note: true,
-                body: `⏰ This conversation has been waiting on an agent reply for ${days} day(s).`,
+                body: agentNoteText ? renderDays(agentNoteText, days) : DEFAULT_AGENT_NOTE(days),
               });
               await this.store.upsertSweepState(conv.id, "conversation", {
                 lastAgentRemindedAt: new Date(now),
@@ -126,6 +136,24 @@ export class InactivitySweeper {
             if (now - waitedSince >= customerWaitMs) {
               await paceWrite();
               if (nagCount >= nagsBeforeClose) {
+                // The page snapshot can be minutes stale by now — never close
+                // on stale data. Re-fetch: if the conversation is gone, no
+                // longer open, or the customer replied meanwhile, skip (and
+                // restart the nag cycle on a genuine reply). Fail-safe: any
+                // fetch error also skips the close; the next tick retries.
+                const fresh = await this.client.getConversationIdleStats(conv.id).catch(() => null);
+                const freshCustomerMs = fresh?.lastContactReplyAt?.getTime() ?? fresh?.createdAt?.getTime() ?? 0;
+                const freshAdminMs = fresh?.lastAdminReplyAt?.getTime() ?? 0;
+                if (!fresh || fresh.state !== "open" || freshCustomerMs > freshAdminMs) {
+                  if (fresh && freshCustomerMs > freshAdminMs) {
+                    await this.store.upsertSweepState(conv.id, "conversation", {
+                      customerNagCount: 0,
+                      lastCustomerNagAt: null,
+                      sweepClosedAt: null,
+                    });
+                  }
+                  continue;
+                }
                 await this.client.setConversationOpen(conv.id, false, adminId);
                 writes++;
                 const nativeTicketId = await this.client.getConversationTicketId(conv.id).catch(() => null);
@@ -140,11 +168,11 @@ export class InactivitySweeper {
                 await this.store.upsertSweepState(conv.id, "conversation", { sweepClosedAt: new Date(now) });
                 result.closed++;
               } else {
+                const nagDays = Math.floor((now - waitedSince) / DAY_MS);
                 await this.client.replyAsAdmin(conv.id, {
                   adminId,
                   note: false,
-                  body:
-                    "Are you still there? We haven't heard back from you — this conversation will be closed automatically if we don't hear from you.",
+                  body: nagText ? renderDays(nagText, nagDays) : DEFAULT_CUSTOMER_NAG,
                 });
                 await this.store.upsertSweepState(conv.id, "conversation", {
                   customerNagCount: nagCount + 1,
@@ -193,7 +221,7 @@ export class InactivitySweeper {
           await this.client.replyTicketAsAdmin(ticket.id, {
             adminId,
             note: true,
-            body: `⏰ This ticket has had no activity for ${days} day(s).`,
+            body: agentNoteText ? renderDays(agentNoteText, days) : DEFAULT_TICKET_NOTE(days),
           });
           await this.store.upsertSweepState(stateId, "ticket", { lastAgentRemindedAt: new Date(now) });
           writes++;

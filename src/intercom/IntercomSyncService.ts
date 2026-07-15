@@ -265,15 +265,34 @@ export class IntercomSyncService {
 
   // Agent-idle reminder for a bridged ticket (checkTicketTimers SUPPORT
   // target): internal note + conversation reopen in Intercom. Returns false
-  // when the bridge is off or the ticket is unmirrored — the caller then falls
-  // back to the legacy Discord staff-role ping.
-  async onAgentReminder(ticket: TicketWithTag, payload: { idleDays: number; threadUrl: string | null }): Promise<boolean> {
+  // when the bridge is off or the ticket is unmirrored — the caller then sends
+  // no reminder at all (the Discord role-ping fallback is gone).
+  async onAgentReminder(
+    ticket: TicketWithTag,
+    payload: { idleDays: number; threadUrl: string | null; noteText?: string | null }
+  ): Promise<boolean> {
     if (!this.enabled() || !this.mirrorable(ticket)) return false;
     await this.chained(ticket.threadId, async () => {
       await this.ensureLink(ticket);
-      await this.emit(ticket.threadId, "agent_reminder", { idleDays: payload.idleDays, threadUrl: payload.threadUrl });
+      await this.emit(ticket.threadId, "agent_reminder", {
+        idleDays: payload.idleDays,
+        threadUrl: payload.threadUrl,
+        noteText: payload.noteText ?? null,
+      });
     });
     return true;
+  }
+
+  // Best-effort internal note on the linked conversation (member-leave close
+  // & co). No-ops for unmirrored tickets or a disabled bridge.
+  async onTicketNote(threadId: string, content: string): Promise<void> {
+    if (!this.enabled()) return;
+    const ticket = await this.ticketStore.getByThreadId(threadId);
+    if (!ticket || !this.mirrorable(ticket)) return;
+    await this.chained(ticket.threadId, async () => {
+      await this.ensureLink(ticket);
+      await this.emit(ticket.threadId, "note", { content });
+    });
   }
 
   // Push-mode "replies here don't reach the customer" note. Deliberately skips

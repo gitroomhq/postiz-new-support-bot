@@ -899,8 +899,13 @@ export class IntercomEventExecutor {
   // gate drops the webhooks) and the note rides the pending-post handshake.
   private async executeAgentReminder(threadId: string, payload: AgentReminderPayload): Promise<void> {
     const link = await this.requireLink(threadId);
+    // Per-tag override (operator-entered plain text → escaped) replaces the
+    // default first line; the thread link and reopen stay either way.
+    const firstLine = payload.noteText
+      ? `⏰ <b>${escapeHtmlText(payload.noteText)}</b>`
+      : `⏰ <b>Waiting on an agent reply for ${Math.max(1, Math.round(payload.idleDays))} day(s).</b>`;
     const lines = [
-      `⏰ <b>Waiting on an agent reply for ${Math.max(1, Math.round(payload.idleDays))} day(s).</b>`,
+      firstLine,
       payload.threadUrl ? `<a href="${payload.threadUrl}">Open Discord thread</a>` : null,
     ].filter(Boolean);
     await this.postAdminNote(threadId, link.conversationId, `<p>${lines.join("<br>")}</p>`, undefined, true);

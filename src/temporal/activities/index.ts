@@ -14,7 +14,7 @@ import { RECLOSE_DELAY_MS } from "../../bot/StatusService";
 import type { BillingCategory } from "../../categories/BillingCategory";
 import type { DisputeMonitor } from "../../bot/billing/DisputeMonitor";
 import type { IntercomStore } from "../../intercom/IntercomStore";
-import type { IntercomSyncService } from "../../intercom/IntercomSyncService";
+import { isIntercomExempt, type IntercomSyncService } from "../../intercom/IntercomSyncService";
 import type { IntercomEventExecutor } from "../../intercom/IntercomEventExecutor";
 import type { InactivitySweeper } from "../../intercom/InactivitySweeper";
 import { IntercomHttpError } from "../../intercom/IntercomClient";
@@ -43,6 +43,11 @@ const INTERCOM_CALL_SPACING_MS = 300;
 // Retention sweeps folded into the cleanup loop (legacy outbox-scheduler values).
 const ECHO_RETENTION_MS = 14 * DAY_MS;
 const PENDING_POST_RETENTION_MS = 60 * 60 * 1000;
+
+// Default reminder copy; per-tag overrides ({days} placeholder) replace these.
+const DEFAULT_CUSTOMER_REMINDER =
+  "We're still waiting on your reply to keep helping you. This ticket may be closed if we don't hear back.";
+export const renderDays = (template: string, days: number): string => template.split("{days}").join(String(days));
 
 export interface ActivityDeps {
   settingsStore: SettingsStore;
@@ -186,13 +191,13 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
   };
 
   // One reminder for one ticket. CUSTOMER reminders still ping the customer in
-  // the Discord thread (they never left Discord). SUPPORT reminders no longer
-  // ping a Discord role — agents live in Intercom, so the nag is an internal
-  // note + reopen on the linked conversation (intercomSync.onAgentReminder);
-  // unmirrored tickets (excluded category / bridge off) fall back to the
-  // legacy staff-role ping, the only place Intercom can't see the ticket.
-  // Returns false when there was no route (unmirrored + no staff role): the
-  // caller must not report a reminder that never went out.
+  // the Discord thread (they never left Discord). SUPPORT reminders never ping
+  // a Discord role — agents live in Intercom, so the nag is an internal note +
+  // reopen on the linked conversation (intercomSync.onAgentReminder); for
+  // unmirrored tickets (exempt / bridge off) there is deliberately NO route —
+  // a role ping in a thread agents don't watch is pure noise.
+  // Returns false when nothing went out: the caller must not record a
+  // reminder that never happened.
   const sendReminder = async (
     thread: ThreadChannel,
     ticket: TicketWithTag,
@@ -200,37 +205,21 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
     target: "SUPPORT" | "CUSTOMER",
     idleDays: number
   ): Promise<boolean> => {
-    let route: "customer" | "intercom" | "discord" = "customer";
+    let route: "customer" | "intercom" = "customer";
     if (target === "CUSTOMER") {
+      const text = renderDays(tag.reminderTextCustomer ?? DEFAULT_CUSTOMER_REMINDER, idleDays);
       await thread.send({
         content: `<@${ticket.customerId}>`,
-        embeds: [
-          embed(
-            `We're still waiting on your reply to keep helping you. This ticket may be closed if we don't hear back.\n\nStatus: ${tag.emoji} ${tag.label}`,
-            COLORS.warn
-          ),
-        ],
+        embeds: [embed(`${text}\n\nStatus: ${tag.emoji} ${tag.label}`, COLORS.warn)],
         allowedMentions: { users: [ticket.customerId!] },
       });
     } else {
+      const noteText = tag.reminderTextSupport ? renderDays(tag.reminderTextSupport, idleDays) : null;
       const enqueued = await intercomSync
-        .onAgentReminder(ticket, { idleDays, threadUrl: thread.url })
+        .onAgentReminder(ticket, { idleDays, threadUrl: thread.url, noteText })
         .catch(() => false);
-      route = enqueued ? "intercom" : "discord";
-      if (!enqueued) {
-        const pingRoleId = tierStore.newTicketRoleId(settingsStore.supportRoleId());
-        if (!pingRoleId) return false;
-        await thread.send({
-          content: `<@&${pingRoleId}>`,
-          embeds: [
-            embed(
-              `This ticket has gone ${idleDays} day(s) without a reply — please follow up.\n\nStatus: ${tag.emoji} ${tag.label}`,
-              COLORS.warn
-            ),
-          ],
-          allowedMentions: { roles: [pingRoleId] },
-        });
-      }
+      if (!enqueued) return false;
+      route = "intercom";
     }
     await ticketStore.recordReminder(ticket.threadId);
     actLog.info("reminder.sent", {
@@ -240,7 +229,7 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
       "reminder.round": ticket.reminderCount + 1,
     });
     void auditLogger.log({
-      title: target === "CUSTOMER" ? "⏰ Reminder sent" : route === "intercom" ? "⏰ Agent reminder → Intercom" : "⏰ Agent reminder → Discord (unmirrored)",
+      title: target === "CUSTOMER" ? "⏰ Reminder sent" : "⏰ Agent reminder → Intercom",
       severity: "warn",
       actor: "Automatic",
       threadId: ticket.threadId,
@@ -329,7 +318,12 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
         if (!thread) {
           await ticketStore.close(threadId);
         } else if (!thread.archived && !thread.locked) {
-          const target = tag.reminderTarget === "CUSTOMER" ? "CUSTOMER" : "SUPPORT";
+          // Intercom-exempt tickets (self-serve refund flow & co) never have an
+          // agent working them — the customer drives everything, so they always
+          // use the customer-waiting machinery regardless of the shared tag's
+          // reminderTarget (and never attempt agent notes).
+          const target =
+            isIntercomExempt(ticket) || tag.reminderTarget === "CUSTOMER" ? "CUSTOMER" : "SUPPORT";
           if (!(target === "CUSTOMER" && !ticket.customerId)) {
             const awaitedAt = await lastAwaitedMessageAt(thread, target, ticket.customerId);
             const reference = Math.max(
@@ -337,12 +331,53 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
               awaitedAt ?? 0,
               ticket.lastReminderAt?.getTime() ?? 0
             );
-            if (now - reference >= tag.reminderDays * DAY_MS) {
+            // First reminder waits reminderDays; subsequent rounds re-arm on
+            // the (optional) repeat cadence.
+            const repeatDue = ticket.reminderCount > 0 || ticket.lastReminderAt != null;
+            const cadenceDays = repeatDue ? (tag.reminderRepeatDays ?? tag.reminderDays) : tag.reminderDays;
+            if (now - reference >= cadenceDays * DAY_MS) {
               // Auto-close stale Waiting-for-Customer tickets once N reminders
               // went unanswered.
               const closingTag = settingsStore.closingTag();
               if (target === "CUSTOMER" && tag.autoCloseAfter != null && ticket.reminderCount >= tag.autoCloseAfter && closingTag) {
-                statusChange = { tagId: closingTag.id, actorName: "Automatic" };
+                // Never close a ticket whose customer actually spoke last: the
+                // Waiting-for-Customer tag can be stale when the reply-time
+                // auto-flip was missed (bot down, unusable flip target).
+                // Staff replies arrive via Intercom mirrored as bot messages
+                // (invisible to the SUPPORT human scan), so lastStatusChangeAt
+                // — stamped when the ticket entered this tag — proxies the
+                // agent's last action alongside any human staff message.
+                const staffAt = await lastAwaitedMessageAt(thread, "SUPPORT", ticket.customerId);
+                const customerSpokeLast =
+                  awaitedAt != null && awaitedAt > Math.max(staffAt ?? 0, ticket.lastStatusChangeAt.getTime());
+                if (customerSpokeLast) {
+                  // Missed auto-flip self-heal — mirror DiscordBot.processTicketMessage.
+                  const usable = (t: StatusTag | undefined): t is StatusTag =>
+                    !!t && !t.closesThread && t.reminderTarget !== "CUSTOMER";
+                  const replyTarget = settingsStore.customerReplyTarget();
+                  const prevTag = ticket.prevStatusTagId ? settingsStore.tagById(ticket.prevStatusTagId) : undefined;
+                  const flip = usable(replyTarget) ? replyTarget : usable(prevTag) ? prevTag : settingsStore.initialTag();
+                  if (flip && flip.id !== ticket.statusTagId) {
+                    statusChange = { tagId: flip.id, actorName: "Customer reply" };
+                    void auditLogger.log({
+                      title: "⏭️ Auto-close skipped",
+                      severity: "warn",
+                      actor: "Automatic",
+                      threadId,
+                      fields: [
+                        { name: "Reason", value: "Customer replied after the last status change", inline: true },
+                        { name: "Flipped to", value: `${flip.emoji} ${flip.label}`, inline: true },
+                      ],
+                    });
+                  }
+                  // else: no usable flip target — skip silently; next scan retries.
+                } else {
+                  statusChange = {
+                    tagId: closingTag.id,
+                    actorName: "Automatic",
+                    closeNoticeText: tag.autoCloseMessage ?? null,
+                  };
+                }
               } else {
                 // Real idle time for the reminder copy: elapsed since the
                 // awaited party last acted (status changes count as
@@ -407,6 +442,7 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
         actorId: input.actorId ?? undefined,
         actorIconUrl: input.actorIconUrl ?? undefined,
         silent: input.silent,
+        closeNoticeText: input.closeNoticeText ?? undefined,
       });
       return { applied: true, closed: isDone, isResolved: false, closesThread: tag.closesThread, statusTagId: tag.id, statusLabel: tag.label };
     },

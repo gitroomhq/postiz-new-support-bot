@@ -646,6 +646,17 @@ const STATEMENTS: string[] = [
   `ALTER TABLE "tickets" ADD COLUMN IF NOT EXISTS "intercomExempt" BOOLEAN NOT NULL DEFAULT false`,
   `UPDATE "tickets" SET "intercomExempt" = true
     WHERE "categoryId" = 'billing' AND "question" = 'Refund request' AND "intercomExempt" = false`,
+  // Refund eligibility guardrail: max charge age for self-service refunds
+  // (DEFAULT backfills the existing settings row → live at 31d on deploy).
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "refundMaxChargeAgeDays" INTEGER DEFAULT 31`,
+  // Per-tag reminder/auto-close overrides + global sweeper text overrides
+  // (all nullable = built-in defaults; {days} placeholder in texts).
+  `ALTER TABLE "status_tags" ADD COLUMN IF NOT EXISTS "reminderTextCustomer" TEXT`,
+  `ALTER TABLE "status_tags" ADD COLUMN IF NOT EXISTS "reminderTextSupport" TEXT`,
+  `ALTER TABLE "status_tags" ADD COLUMN IF NOT EXISTS "reminderRepeatDays" INTEGER`,
+  `ALTER TABLE "status_tags" ADD COLUMN IF NOT EXISTS "autoCloseMessage" TEXT`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "inactivityNagText" TEXT`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "inactivityAgentNoteText" TEXT`,
 ];
 
 export async function ensureSchema(prisma: PrismaClient): Promise<void> {

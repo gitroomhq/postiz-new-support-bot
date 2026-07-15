@@ -36,6 +36,9 @@ export interface ApplyStatusOptions {
   actorIconUrl?: string;
   actorId?: string; // recorded in the per-ticket change history
   silent?: boolean; // skip the customer notice (used for bulk reassignment)
+  // Per-tag auto-close farewell (resolved from the tag being LEFT by the timer
+  // that decided the close). Unset = default close notice.
+  closeNoticeText?: string | null;
 }
 
 export class StatusService {
@@ -101,6 +104,7 @@ export class StatusService {
         actorId: options.actorId ?? null,
         actorIconUrl: options.actorIconUrl ?? null,
         silent: options.silent,
+        closeNoticeText: options.closeNoticeText ?? null,
       });
       // null = Temporal unreachable right now — fall through to the legacy
       // in-process path so a status change never silently vanishes.
@@ -226,7 +230,8 @@ export class StatusService {
           return false;
         }));
 
-      const note = "This ticket has been closed. Reply here or open a new ticket if you still need help.";
+      const note =
+        options.closeNoticeText || "This ticket has been closed. Reply here or open a new ticket if you still need help.";
       // One message: notice + rating buttons together (a separate prompt message
       // would ping the customer twice). Sent BEFORE the lock/archive below so it
       // still lands on closing statuses.

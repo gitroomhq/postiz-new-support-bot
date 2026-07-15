@@ -107,6 +107,8 @@ model BotSettings {
   inactivityAgentWaitDays    Int     @default(2) // customer spoke last, no agent reply for N days → note + reopen
   inactivityCustomerWaitDays Int     @default(3) // agent spoke last, customer silent N days → outbound nag
   inactivityNagsBeforeClose  Int     @default(2) // unanswered customer nags before the sweeper closes
+  inactivityNagText          String? // sweeper customer nag override ({days} supported); null = built-in default
+  inactivityAgentNoteText    String? // sweeper agent-idle note override ({days} supported); null = built-in default
   // One-time agent-rip migration stamp (resolved-tag flip + thread sweeps) —
   // temporalImportDoneAt precedent: machinery removed later, column stays.
   agentRipMigratedAt DateTime?
@@ -149,6 +151,10 @@ model BotSettings {
   kbLastRefreshAt        DateTime?
   // Per-user self-service refund velocity cap (the existing refundMaxPer24h is global).
   refundMaxPer24hPerUser Int?
+  // Self-service refunds only for charges younger than N days (null = off).
+  // getLastSubscriptionCharge already prefilters to 35 days, so values >35
+  // never trip in practice.
+  refundMaxChargeAgeDays Int? @default(31)
   // Stripe webhook ingestion (disputes + early-fraud alerts). The endpoint is
   // registered programmatically; the signing secret is stored encrypted at rest.
   stripeWebhookEnabled    Boolean @default(false)
@@ -370,6 +376,12 @@ model StatusTag {
   reminderDays    Int      @default(3)
   reminderTarget  String   @default("SUPPORT")
   autoCloseAfter  Int?
+  // Per-tag overrides for the reminder machinery ({days} placeholder = idle
+  // day count). Null = built-in default text / reminderDays cadence.
+  reminderTextCustomer String? // customer reminder embed text
+  reminderTextSupport  String? // agent reminder Intercom-note text
+  reminderRepeatDays   Int?    // cadence after the first reminder; null = reminderDays
+  autoCloseMessage     String? // farewell posted when a ticket is AUTO-closed from this tag
   sortOrder       Int      @default(0)
   // When a customer replies to a Waiting-for-Customer ticket, it moves to the tag
   // flagged here (at most one) instead of reverting to its previous status. Unset

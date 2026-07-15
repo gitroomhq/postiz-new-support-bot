@@ -201,6 +201,10 @@ export interface StatusChangeRequest {
   actorId?: string | null;
   actorIconUrl?: string | null;
   silent?: boolean;
+  // Per-tag auto-close farewell, resolved by checkTicketTimers at decision
+  // time (it belongs to the tag being LEFT, which may have changed by the
+  // time the child executes). Absent/null = default close notice.
+  closeNoticeText?: string | null;
 }
 
 export interface PriorityChangeRequest {

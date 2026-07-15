@@ -113,6 +113,10 @@ export interface CsatPayload {
 export interface AgentReminderPayload {
   idleDays: number;
   threadUrl: string | null;
+  // Rendered per-tag override for the note's first line ({days} already
+  // substituted); absent/null = built-in default. Optional so payloads queued
+  // before this field existed still execute.
+  noteText?: string | null;
 }
 
 // Intercom has no part-edit/delete API, so edits and deletions mirror as

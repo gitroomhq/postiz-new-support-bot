@@ -621,6 +621,40 @@ export class IntercomClient {
 
   // ---- Inactivity sweeper reads/writes (native/unbridged objects) ----
 
+  // Fresh idle-detection fields for ONE conversation — the sweeper's pre-close
+  // re-check (its page snapshot can be minutes stale by the time a close
+  // fires). Null on 404 (conversation deleted meanwhile).
+  async getConversationIdleStats(conversationId: string): Promise<{
+    state: string;
+    createdAt: Date | null;
+    lastContactReplyAt: Date | null;
+    lastAdminReplyAt: Date | null;
+  } | null> {
+    try {
+      const data = await this.json<{
+        state?: string;
+        created_at?: number;
+        statistics?: {
+          last_contact_reply_at?: number | null;
+          last_admin_reply_at?: number | null;
+        } | null;
+      }>(`/conversations/${encodeURIComponent(conversationId)}`, "GET", undefined, "conversation get (idle stats)");
+      return {
+        state: data.state ?? "open",
+        createdAt: data.created_at ? new Date(data.created_at * 1000) : null,
+        lastContactReplyAt: data.statistics?.last_contact_reply_at
+          ? new Date(data.statistics.last_contact_reply_at * 1000)
+          : null,
+        lastAdminReplyAt: data.statistics?.last_admin_reply_at
+          ? new Date(data.statistics.last_admin_reply_at * 1000)
+          : null,
+      };
+    } catch (e) {
+      if (e instanceof IntercomHttpError && e.status === 404) return null;
+      throw e;
+    }
+  }
+
   // One page of open conversations with the idle-detection fields. The sweeper
   // pages through the whole workspace; per_page 150 is the search maximum.
   async searchOpenConversations(startingAfter?: string | null): Promise<{

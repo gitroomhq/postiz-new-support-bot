@@ -237,6 +237,21 @@ export class SessionStore {
     });
   }
 
+  // First-refund-only guardrail: has this Discord user EVER completed a refund
+  // through the bot (no time window)? "admin_refund" is included — unlike the
+  // velocity counters — because a staff-issued refund still means the person
+  // already got money back. Rows are released on Stripe failure, so only
+  // completed refunds count; dispute_* synthetic claims stay excluded.
+  // NOTE: ChargesHub claims admin_refund under the acting STAFF member's id,
+  // so customer-side admin refunds are primarily caught by the Stripe-history
+  // sweep instead (StripeClient.customerHasAnyRefund).
+  async hasEverBeenRefunded(discordUserId: string): Promise<boolean> {
+    const count = await this.prisma.billingAction.count({
+      where: { discordUserId, action: { in: ["refund", "admin_refund"] } },
+    });
+    return count > 0;
+  }
+
   // ---- Blocked-charge manual reviews (staff /charge approve|deny) ----
 
   // A retried self-service refund can trip a guardrail again in the same thread;

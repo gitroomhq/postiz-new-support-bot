@@ -47,11 +47,13 @@ const EXPECTED_COLUMNS: Record<string, string[]> = {
     "disputeUrgentHours", "disputeUrgentRoleId", "disputeBackfillDoneAt",
     "radarListCardId", "radarListEmailId", "radarListCustomerId", "radarListIpId",
     "inactivityEnabled", "inactivityAgentWaitDays", "inactivityCustomerWaitDays", "inactivityNagsBeforeClose",
+    "inactivityNagText", "inactivityAgentNoteText", "refundMaxChargeAgeDays",
     "agentRipMigratedAt", "updatedAt",
   ],
   status_tags: [
     "id", "emoji", "label", "isInitial", "closesThread", "reminderEnabled", "reminderDays", "reminderTarget",
-    "autoCloseAfter", "sortOrder", "isCustomerReplyTarget", "intercomTicketStateId",
+    "autoCloseAfter", "reminderTextCustomer", "reminderTextSupport", "reminderRepeatDays", "autoCloseMessage",
+    "sortOrder", "isCustomerReplyTarget", "intercomTicketStateId",
   ],
   priority_tags: ["id", "emoji", "label", "isInitial", "sortOrder"],
   tickets: [

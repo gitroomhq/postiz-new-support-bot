@@ -414,8 +414,8 @@ export class BillingCategory extends BaseCategory {
 
     await interaction.deferReply();
 
-    // Fresh charge state: drives the amount guardrail and catches already-refunded charges.
-    let charge: { amount: number; currency: string; refunded: boolean };
+    // Fresh charge state: drives the amount/age guardrails and catches already-refunded charges.
+    let charge: { amount: number; currency: string; refunded: boolean; created: Date; customerId: string | null };
     try {
       charge = await this.stripeClient.getChargeAmount(chargeId);
     } catch (error) {
@@ -513,14 +513,14 @@ export class BillingCategory extends BaseCategory {
   // First tripped guardrail as a human-readable reason, or null when all pass.
   private async checkRefundGuardrails(
     interaction: ButtonInteraction,
-    charge: { amount: number; currency: string },
+    charge: { amount: number; currency: string; created: Date; customerId: string | null },
     chargeId: string
   ): Promise<string | null> {
     // Blocklisted customers never self-serve money movement — straight to
     // manual review. Both identities are checked: the invoker's linked Stripe
     // customer AND the charge's customer (they can differ on stale links).
     const sessionCustomer = (await this.sessionStore.getSession(interaction.user.id))?.stripeCustomerId ?? null;
-    const chargeCustomer = await this.stripeClient.getChargeCustomerId(chargeId).catch(() => null);
+    const chargeCustomer = charge.customerId;
     let blockHit = sessionCustomer ? await this.blockStore.anyBlocked({ customerId: sessionCustomer }) : null;
     if (!blockHit && chargeCustomer && chargeCustomer !== sessionCustomer) {
       blockHit = await this.blockStore.anyBlocked({ customerId: chargeCustomer });
@@ -540,6 +540,12 @@ export class BillingCategory extends BaseCategory {
       if (charge.amount > maxAmount) {
         return `Charge amount ${this.stripeClient.formatAmount(charge.amount, charge.currency)} exceeds the self-service limit of ${this.stripeClient.formatAmount(maxAmount, capCurrency)}.`;
       }
+    }
+
+    // Charges must be young: "less than N days ago" — age >= N days breaches.
+    const maxAgeDays = this.settingsStore.refundMaxChargeAgeDays();
+    if (maxAgeDays != null && Date.now() - charge.created.getTime() >= maxAgeDays * DAY_MS) {
+      return `Charge is older than the self-service refund window of ${maxAgeDays} day(s).`;
     }
 
     const maxPer24h = this.settingsStore.refundMaxPer24h();
@@ -574,6 +580,30 @@ export class BillingCategory extends BaseCategory {
       if (Date.now() - joinedAt.getTime() < minAgeDays * DAY_MS) {
         return `Server membership is younger than ${minAgeDays} day(s).`;
       }
+    }
+
+    // First-refund-only: cheap local ledger check before the Stripe sweep.
+    if (await this.sessionStore.hasEverBeenRefunded(interaction.user.id)) {
+      return "User has already received a refund via the bot (self-service refunds are first-time only).";
+    }
+
+    // Stripe-side refund history — catches dashboard/pre-bot/admin refunds the
+    // local ledger can't see. Both identities are swept (stale links, same as
+    // the blocklist above). Errors, truncated sweeps and missing identities all
+    // fail safe to manual review.
+    const historyCustomers = [...new Set([chargeCustomer, sessionCustomer].filter((c): c is string => !!c))];
+    if (historyCustomers.length === 0) return "Refund history could not be verified.";
+    try {
+      for (const customerId of historyCustomers) {
+        const history = await this.stripeClient.customerHasAnyRefund(customerId);
+        if (history.hasRefund) {
+          return "Customer has already received a refund on Stripe (self-service refunds are first-time only).";
+        }
+        if (history.truncated) return "Refund history could not be verified.";
+      }
+    } catch (error) {
+      billingLog.error("refund history lookup failed", error, { "stripe.charge_id": chargeId });
+      return "Refund history could not be verified.";
     }
 
     return null;

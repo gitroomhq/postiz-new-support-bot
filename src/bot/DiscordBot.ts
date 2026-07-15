@@ -244,6 +244,7 @@ export class DiscordBot {
     tickets: TicketWithTag[],
     closingTag: StatusTag
   ): Promise<void> {
+    const MEMBER_LEFT_NOTE = "Closed automatically — the customer left the Discord server.";
     for (const ticket of tickets) {
       const channel = await this.client.channels.fetch(ticket.threadId).catch(() => null);
       if (channel?.isThread()) {
@@ -261,6 +262,12 @@ export class DiscordBot {
           { "ticket.thread_id": ticket.threadId, "sync.event": "status_changed" }
         );
       }
+      // WHY the close happened, for agents reading the Intercom inbox — the
+      // thread itself stays silent (the customer is gone; no notice, no CSAT).
+      safe(this.intercomSync.onTicketNote(ticket.threadId, MEMBER_LEFT_NOTE), "intercom-sync", {
+        "ticket.thread_id": ticket.threadId,
+        "sync.event": "member_left_note",
+      });
     }
   }
 
@@ -1701,6 +1708,8 @@ export class DiscordBot {
           `**Max refunds per 24h (all users):** ${s.refundMaxPer24h() ?? "_no limit_"}`,
           `**Max refunds per 24h (per user):** ${s.refundMaxPer24hPerUser() ?? "_no limit_"}`,
           `**Min server membership age:** ${s.refundMinMemberAgeDays() != null ? `${s.refundMinMemberAgeDays()} day(s)` : "_no minimum_"}`,
+          `**Max charge age for self-service refund:** ${s.refundMaxChargeAgeDays() != null ? `${s.refundMaxChargeAgeDays()} day(s)` : "_no limit_"}`,
+          `**First-refund-only:** always on — users/customers with any prior refund (bot ledger or Stripe history) go to manual review`,
           `**Plan allowlist:** ${s.allowedPriceIds().length ? `${s.allowedPriceIds().length} plan(s) offered in /billing pickers` : "_all active plans offered_"}`,
           "",
           "Refunds that trip a limit are not executed — the ticket is handed to the support team for manual review.",
@@ -1715,6 +1724,7 @@ export class DiscordBot {
 
     const buttons = new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder().setCustomId("config_billing_limits").setLabel("Set Limits").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("config_billing_eligibility").setLabel("Eligibility").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("config_billing_plans").setLabel("Plan Allowlist").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("config_stripe_webhook").setLabel("Webhooks").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("config_disputes").setLabel("Disputes").setStyle(ButtonStyle.Primary)
@@ -2009,6 +2019,7 @@ export class DiscordBot {
           `**Agent-idle:** after ${s.inactivityAgentWaitDays()} day(s) waiting on an agent → internal note (≤1 per window)`,
           `**Customer-idle:** after ${s.inactivityCustomerWaitDays()} day(s) of customer silence → outbound reply nag`,
           `**Auto-close:** after ${s.inactivityNagsBeforeClose()} unanswered nag(s) → conversation (and its native ticket) closed`,
+          `**Texts:** customer nag ${s.inactivityNagText() ? "custom" : "default"} · agent note ${s.inactivityAgentNoteText() ? "custom" : "default"}`,
           "",
           "Covers every open, unsnoozed conversation and open ticket in the workspace EXCEPT Discord-bridged tickets (their per-tag reminder settings under Workflow → Manage Tags own those). Native tickets only get agent-idle notes — never auto-close.",
         ].join("\n")
@@ -2020,6 +2031,7 @@ export class DiscordBot {
         .setLabel(`Sweeper: ${s.inactivityEnabled() ? "on" : "off"}`)
         .setStyle(s.inactivityEnabled() ? ButtonStyle.Success : ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId("config_inactivity_opts").setLabel("Set Thresholds").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("config_inactivity_texts").setLabel("Sweeper Texts").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("config_inactivity_run").setLabel("Run Now").setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId("config_intercom").setLabel("Back").setStyle(ButtonStyle.Secondary)
     );
@@ -3217,8 +3229,12 @@ export class DiscordBot {
                 ]
                   .filter(Boolean)
                   .join(", ");
+                const cadence =
+                  t.reminderRepeatDays != null && t.reminderRepeatDays !== t.reminderDays
+                    ? `${t.reminderDays}d/${t.reminderRepeatDays}d`
+                    : `${t.reminderDays}d`;
                 const reminder = t.reminderEnabled
-                  ? `${t.reminderDays}d → ${t.reminderTarget === "CUSTOMER" ? "customer (Discord ping)" : "agents (Intercom note)"}`
+                  ? `${cadence} → ${t.reminderTarget === "CUSTOMER" ? "customer (Discord ping)" : "agents (Intercom note)"}`
                   : "no reminders";
                 return `${t.emoji} **${t.label}** — ${reminder}${flags ? ` (${flags})` : ""}`;
               })
@@ -3257,8 +3273,13 @@ export class DiscordBot {
         [
           `**Initial:** ${tag.isInitial ? "yes" : "no"}`,
           `**Closes + locks thread:** ${tag.closesThread ? "yes" : "no"}`,
-          `**Reminders:** ${tag.reminderEnabled ? `every ${tag.reminderDays} day(s) → ${tag.reminderTarget === "CUSTOMER" ? "customer (Discord ping)" : "agents (Intercom note + reopen)"}` : "off"}`,
+          `**Reminders:** ${
+            tag.reminderEnabled
+              ? `first after ${tag.reminderDays} day(s), then every ${tag.reminderRepeatDays ?? tag.reminderDays} day(s) → ${tag.reminderTarget === "CUSTOMER" ? "customer (Discord ping)" : "agents (Intercom note + reopen)"}`
+              : "off"
+          }`,
           `**Auto-close after:** ${tag.autoCloseAfter == null ? "never" : `${tag.autoCloseAfter} unanswered customer reminder(s)`}`,
+          `**Custom texts:** customer ${tag.reminderTextCustomer ? "custom" : "default"} · agent ${tag.reminderTextSupport ? "custom" : "default"} · close ${tag.autoCloseMessage ? "custom" : "default"}`,
           `**Customer-reply target:** ${tag.isCustomerReplyTarget ? "yes — a customer reply to a Waiting-for-Customer ticket lands here" : "no"}`,
         ].join("\n")
       );
@@ -3287,6 +3308,7 @@ export class DiscordBot {
 
     const actions = new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder().setCustomId(`config_tag_edit_basic:${tag.id}`).setLabel("Edit emoji/label/days").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId(`config_tag_reminder_cfg:${tag.id}`).setLabel("Reminder Texts").setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId(`config_tag_delete:${tag.id}`).setLabel("Delete").setStyle(ButtonStyle.Danger),
       new ButtonBuilder().setCustomId("config_tags").setLabel("Back").setStyle(ButtonStyle.Secondary)
     );
@@ -3833,6 +3855,31 @@ export class DiscordBot {
         new ActionRowBuilder<TextInputBuilder>().addComponents(agentDays),
         new ActionRowBuilder<TextInputBuilder>().addComponents(customerDays),
         new ActionRowBuilder<TextInputBuilder>().addComponents(nags)
+      );
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (id === "config_inactivity_texts") {
+      const s = this.settingsStore;
+      const modal = new ModalBuilder().setCustomId("config_inactivity_texts_modal").setTitle("Sweeper Texts");
+      const nagText = new TextInputBuilder()
+        .setCustomId("nag_text")
+        .setLabel("Customer nag text (blank = default)")
+        .setStyle(TextInputStyle.Paragraph)
+        .setMaxLength(1000)
+        .setRequired(false);
+      const agentNoteText = new TextInputBuilder()
+        .setCustomId("agent_note_text")
+        .setLabel("Agent-idle note, {days} ok (blank = default)")
+        .setStyle(TextInputStyle.Paragraph)
+        .setMaxLength(1000)
+        .setRequired(false);
+      if (s.inactivityNagText()) nagText.setValue(s.inactivityNagText()!);
+      if (s.inactivityAgentNoteText()) agentNoteText.setValue(s.inactivityAgentNoteText()!);
+      modal.addComponents(
+        new ActionRowBuilder<TextInputBuilder>().addComponents(nagText),
+        new ActionRowBuilder<TextInputBuilder>().addComponents(agentNoteText)
       );
       await interaction.showModal(modal);
       return;
@@ -4387,6 +4434,20 @@ export class DiscordBot {
       return;
     }
 
+    if (id === "config_billing_eligibility") {
+      const s = this.settingsStore;
+      const modal = new ModalBuilder().setCustomId("config_billing_eligibility_modal").setTitle("Refund Eligibility");
+      const chargeAge = new TextInputBuilder()
+        .setCustomId("charge_age")
+        .setLabel("Max charge age, days (blank = off)")
+        .setStyle(TextInputStyle.Short)
+        .setRequired(false)
+        .setValue(s.refundMaxChargeAgeDays() != null ? String(s.refundMaxChargeAgeDays()) : "");
+      modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(chargeAge));
+      await interaction.showModal(modal);
+      return;
+    }
+
     if (id === "config_ai_model") {
       const modal = new ModalBuilder().setCustomId("config_ai_model_modal").setTitle("AI Model");
       const main = new TextInputBuilder()
@@ -4559,6 +4620,9 @@ export class DiscordBot {
     } else if (action === "config_tag_edit_basic") {
       await interaction.showModal(this.buildTagModal(tag));
       return;
+    } else if (action === "config_tag_reminder_cfg") {
+      await interaction.showModal(this.buildTagReminderModal(tag));
+      return;
     } else if (action === "config_tag_delete") {
       await this.handleTagDelete(interaction, tag.id);
       return;
@@ -4614,6 +4678,46 @@ export class DiscordBot {
     }
 
     modal.addComponents(...rows);
+    return modal;
+  }
+
+  // Per-tag reminder/close overrides — a separate modal because buildTagModal
+  // is at Discord's 5-input ceiling. Blank input = clear back to the default.
+  private buildTagReminderModal(tag: StatusTag): ModalBuilder {
+    const modal = new ModalBuilder().setCustomId(`config_tag_reminder_modal:${tag.id}`).setTitle("Reminder Texts");
+    const customerText = new TextInputBuilder()
+      .setCustomId("customer_text")
+      .setLabel("Customer reminder text (blank = default)")
+      .setStyle(TextInputStyle.Paragraph)
+      .setMaxLength(1000)
+      .setRequired(false);
+    const supportText = new TextInputBuilder()
+      .setCustomId("support_text")
+      .setLabel("Agent note text, {days} ok (blank = default)")
+      .setStyle(TextInputStyle.Paragraph)
+      .setMaxLength(1000)
+      .setRequired(false);
+    const autocloseMsg = new TextInputBuilder()
+      .setCustomId("autoclose_msg")
+      .setLabel("Auto-close farewell (blank = default)")
+      .setStyle(TextInputStyle.Paragraph)
+      .setMaxLength(1000)
+      .setRequired(false);
+    const repeatDays = new TextInputBuilder()
+      .setCustomId("repeat_days")
+      .setLabel("Repeat cadence, days (blank = first delay)")
+      .setStyle(TextInputStyle.Short)
+      .setRequired(false);
+    if (tag.reminderTextCustomer) customerText.setValue(tag.reminderTextCustomer);
+    if (tag.reminderTextSupport) supportText.setValue(tag.reminderTextSupport);
+    if (tag.autoCloseMessage) autocloseMsg.setValue(tag.autoCloseMessage);
+    if (tag.reminderRepeatDays != null) repeatDays.setValue(String(tag.reminderRepeatDays));
+    modal.addComponents(
+      new ActionRowBuilder<TextInputBuilder>().addComponents(customerText),
+      new ActionRowBuilder<TextInputBuilder>().addComponents(supportText),
+      new ActionRowBuilder<TextInputBuilder>().addComponents(autocloseMsg),
+      new ActionRowBuilder<TextInputBuilder>().addComponents(repeatDays)
+    );
     return modal;
   }
 
@@ -4906,6 +5010,22 @@ export class DiscordBot {
       return;
     }
 
+    if (interaction.customId === "config_billing_eligibility_modal") {
+      const ageRaw = interaction.fields.getTextInputValue("charge_age").trim();
+      const ageNum = ageRaw ? Number(ageRaw) : null;
+      if (ageRaw && (!Number.isInteger(ageNum!) || ageNum! < 1 || ageNum! > 365)) {
+        await interaction.reply({ embeds: [makeEmbed("Max charge age must be 1-365 days (or blank to disable).", COLORS.danger)], flags: 64 });
+        return;
+      }
+      await this.settingsStore.updateBilling({ refundMaxChargeAgeDays: ageNum });
+      this.auditConfig(
+        interaction,
+        `Refund eligibility updated → max charge age ${ageNum != null ? `${ageNum}d` : "off"}`
+      );
+      await interaction.reply({ embeds: [makeEmbed("Refund eligibility updated.", COLORS.success)], flags: 64 });
+      return;
+    }
+
     if (interaction.customId === "config_disputes_limits_modal") {
       const daysRaw = interaction.fields.getTextInputValue("reminder_days").trim();
       const urgentRaw = interaction.fields.getTextInputValue("urgent_hours").trim();
@@ -5023,6 +5143,24 @@ export class DiscordBot {
       return;
     }
 
+    if (interaction.customId === "config_inactivity_texts_modal") {
+      const nagText = interaction.fields.getTextInputValue("nag_text").trim();
+      const agentNoteText = interaction.fields.getTextInputValue("agent_note_text").trim();
+      await this.settingsStore.updateInactivity({
+        inactivityNagText: nagText || null,
+        inactivityAgentNoteText: agentNoteText || null,
+      });
+      this.auditConfig(
+        interaction,
+        `Sweeper texts → nag ${nagText ? "custom" : "default"}, agent note ${agentNoteText ? "custom" : "default"}`
+      );
+      await interaction.reply({
+        embeds: [makeEmbed("Sweeper texts saved. Applies on the next sweep.", COLORS.success)],
+        flags: 64,
+      });
+      return;
+    }
+
     if (interaction.customId === "config_ai_model_modal") {
       const model = interaction.fields.getTextInputValue("model").trim();
       if (!model) {
@@ -5084,6 +5222,39 @@ export class DiscordBot {
         embeds: [makeEmbed(`Knowledge base will refresh every ${hours}h.`, COLORS.success)],
         flags: 64,
       });
+      return;
+    }
+
+    if (interaction.customId.startsWith("config_tag_reminder_modal:")) {
+      const tagId = interaction.customId.split(":")[1];
+      const tag = this.settingsStore.tagById(tagId);
+      if (!tag) {
+        await interaction.reply({ embeds: [makeEmbed("This tag no longer exists — run /config again.", COLORS.warn)], flags: 64 });
+        return;
+      }
+      const customerText = interaction.fields.getTextInputValue("customer_text").trim();
+      const supportText = interaction.fields.getTextInputValue("support_text").trim();
+      const autocloseMsg = interaction.fields.getTextInputValue("autoclose_msg").trim();
+      const repeatRaw = interaction.fields.getTextInputValue("repeat_days").trim();
+      const repeatNum = repeatRaw ? Number(repeatRaw) : null;
+      if (repeatRaw && (!Number.isInteger(repeatNum!) || repeatNum! < 1 || repeatNum! > 60)) {
+        await interaction.reply({
+          embeds: [makeEmbed("Repeat cadence must be 1-60 days (or blank to reuse the first-reminder delay).", COLORS.danger)],
+          flags: 64,
+        });
+        return;
+      }
+      await this.settingsStore.editTag(tag.id, {
+        reminderTextCustomer: customerText || null,
+        reminderTextSupport: supportText || null,
+        autoCloseMessage: autocloseMsg || null,
+        reminderRepeatDays: repeatNum,
+      });
+      this.auditConfig(
+        interaction,
+        `Status tag ${tag.emoji} ${tag.label} → reminder texts updated (customer ${customerText ? "custom" : "default"}, agent ${supportText ? "custom" : "default"}, close ${autocloseMsg ? "custom" : "default"}, repeat ${repeatNum ?? "= first"})`
+      );
+      await interaction.reply({ embeds: [makeEmbed(`Reminder texts for ${tag.emoji} ${tag.label} updated.`, COLORS.success)], flags: 64 });
       return;
     }
 

@@ -27,6 +27,12 @@ export interface TagInput {
   reminderDays?: number;
   reminderTarget?: ReminderTarget;
   autoCloseAfter?: number | null;
+  // Per-tag overrides ({days} placeholder; null clears back to the built-in
+  // default text / reminderDays cadence).
+  reminderTextCustomer?: string | null;
+  reminderTextSupport?: string | null;
+  reminderRepeatDays?: number | null;
+  autoCloseMessage?: string | null;
   // When set, a customer replying to a Waiting-for-Customer ticket moves it here
   // instead of reverting to its previous status. At most one tag holds this.
   isCustomerReplyTarget?: boolean;
@@ -323,6 +329,12 @@ export class SettingsStore {
     return this.settings.refundMinMemberAgeDays;
   }
 
+  // null = guardrail disabled. Self-service refunds only for charges younger
+  // than this many days; older charges go to manual review.
+  refundMaxChargeAgeDays(): number | null {
+    return this.settings.refundMaxChargeAgeDays;
+  }
+
   // /billing plan allowlist (comma-separated price ids in the DB). Empty = all
   // active recurring prices are offered in the create/change-plan pickers.
   allowedPriceIds(): string[] {
@@ -475,11 +487,23 @@ export class SettingsStore {
     return this.settings.inactivityNagsBeforeClose;
   }
 
+  // Text overrides for the sweeper's customer nag / agent-idle note ({days}
+  // placeholder). Null = built-in default.
+  inactivityNagText(): string | null {
+    return this.settings.inactivityNagText;
+  }
+
+  inactivityAgentNoteText(): string | null {
+    return this.settings.inactivityAgentNoteText;
+  }
+
   async updateInactivity(data: {
     inactivityEnabled?: boolean;
     inactivityAgentWaitDays?: number;
     inactivityCustomerWaitDays?: number;
     inactivityNagsBeforeClose?: number;
+    inactivityNagText?: string | null;
+    inactivityAgentNoteText?: string | null;
   }): Promise<void> {
     this.settings = await this.prisma.botSettings.update({ where: { id: "global" }, data });
   }
@@ -948,6 +972,7 @@ export class SettingsStore {
     refundMaxPer24h?: number | null;
     refundMaxPer24hPerUser?: number | null;
     refundMinMemberAgeDays?: number | null;
+    refundMaxChargeAgeDays?: number | null;
   }): Promise<void> {
     this.settings = await this.prisma.botSettings.update({ where: { id: "global" }, data });
   }
@@ -1083,6 +1108,10 @@ export class SettingsStore {
           ...(input.reminderDays !== undefined ? { reminderDays: input.reminderDays } : {}),
           ...(input.reminderTarget !== undefined ? { reminderTarget: input.reminderTarget } : {}),
           ...(input.autoCloseAfter !== undefined ? { autoCloseAfter: input.autoCloseAfter } : {}),
+          ...(input.reminderTextCustomer !== undefined ? { reminderTextCustomer: input.reminderTextCustomer } : {}),
+          ...(input.reminderTextSupport !== undefined ? { reminderTextSupport: input.reminderTextSupport } : {}),
+          ...(input.reminderRepeatDays !== undefined ? { reminderRepeatDays: input.reminderRepeatDays } : {}),
+          ...(input.autoCloseMessage !== undefined ? { autoCloseMessage: input.autoCloseMessage } : {}),
           ...(input.isCustomerReplyTarget !== undefined ? { isCustomerReplyTarget: input.isCustomerReplyTarget } : {}),
         },
       });

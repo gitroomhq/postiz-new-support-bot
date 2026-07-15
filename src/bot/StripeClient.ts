@@ -164,10 +164,45 @@ export class StripeClient {
     return typeof charge.customer === "string" ? charge.customer : (charge.customer?.id ?? null);
   }
 
-  // Fresh charge state for the refund guardrails (amount cap + already-refunded check).
-  async getChargeAmount(chargeId: string): Promise<{ amount: number; currency: string; refunded: boolean }> {
+  // Fresh charge state for the refund guardrails (amount cap, already-refunded,
+  // charge-age and blocklist/history identity checks).
+  async getChargeAmount(chargeId: string): Promise<{
+    amount: number;
+    currency: string;
+    refunded: boolean;
+    created: Date;
+    customerId: string | null;
+  }> {
     const charge = await this.stripe.charges.retrieve(chargeId);
-    return { amount: charge.amount, currency: charge.currency, refunded: charge.refunded };
+    return {
+      amount: charge.amount,
+      currency: charge.currency,
+      refunded: charge.refunded,
+      created: new Date(charge.created * 1000),
+      customerId: typeof charge.customer === "string" ? charge.customer : (charge.customer?.id ?? null),
+    };
+  }
+
+  // Any refund (full or partial) anywhere in the customer's charge history —
+  // feeds the first-refund-only guardrail. refunds.list has no customer filter
+  // in this API version, so this sweeps charges.list and checks amount_refunded.
+  // The page cap is a runaway guard — callers treat truncated as "could not
+  // verify" (fail-safe to manual review).
+  async customerHasAnyRefund(customerId: string, maxPages = 3): Promise<{ hasRefund: boolean; truncated: boolean }> {
+    let startingAfter: string | undefined;
+    for (let page = 0; page < maxPages; page++) {
+      const res = await this.stripe.charges.list({
+        customer: customerId,
+        limit: 100,
+        ...(startingAfter ? { starting_after: startingAfter } : {}),
+      });
+      if (res.data.some((c) => c.refunded || c.amount_refunded > 0)) {
+        return { hasRefund: true, truncated: false };
+      }
+      if (!res.has_more || res.data.length === 0) return { hasRefund: false, truncated: false };
+      startingAfter = res.data[res.data.length - 1].id;
+    }
+    return { hasRefund: false, truncated: true };
   }
 
   async cancelSubscription(subscriptionId: string): Promise<void> {
