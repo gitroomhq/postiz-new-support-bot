@@ -875,17 +875,26 @@ export class IntercomEventExecutor {
   // attribute writes reopen the conversation in Intercom.
   private async executeCsat(threadId: string, payload: CsatPayload): Promise<void> {
     const link = await this.requireLink(threadId);
-    const attributes: Record<string, unknown> = { [TICKET_ATTR_CSAT]: `${payload.score}/5` };
-    if (payload.comment?.trim()) attributes[TICKET_ATTR_CSAT_COMMENT] = payload.comment.trim().slice(0, 1024);
+    const comment = payload.comment?.trim() ? payload.comment.trim().slice(0, 1024) : null;
+    const ticketAttributes: Record<string, unknown> = { [TICKET_ATTR_CSAT]: `${payload.score}/5` };
+    // Conversation-side CSAT is a NUMBER attribute (create it as Number in
+    // Settings → Data → Conversations) so custom reports can aggregate it
+    // (average/median); the ticket attribute keeps the legacy "n/5" string
+    // its auto-created definition expects.
+    const conversationAttributes: Record<string, unknown> = { [TICKET_ATTR_CSAT]: payload.score };
+    if (comment) {
+      ticketAttributes[TICKET_ATTR_CSAT_COMMENT] = comment;
+      conversationAttributes[TICKET_ATTR_CSAT_COMMENT] = comment;
+    }
     if (link.ticketId) {
       try {
-        await this.withAuthor((a) => this.client.updateTicket(link.ticketId!, { attributes, adminId: a }));
+        await this.withAuthor((a) => this.client.updateTicket(link.ticketId!, { attributes: ticketAttributes, adminId: a }));
       } catch (e) {
         if (!(e instanceof IntercomHttpError && (e.status === 400 || e.status === 422))) throw e;
       }
     }
     try {
-      await this.client.setConversationAttributes(link.conversationId, attributes);
+      await this.client.setConversationAttributes(link.conversationId, conversationAttributes);
     } catch (e) {
       // Conversation attribute definitions are UI-only — degrade silently
       // until they exist (same contract as markDiscordOrigin).
