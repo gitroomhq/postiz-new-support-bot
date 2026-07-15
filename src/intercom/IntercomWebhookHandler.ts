@@ -523,10 +523,15 @@ export class IntercomWebhookHandler {
       if (!bodyText && attachmentRefs.length === 0) return; // genuinely empty part — nothing to relay, keep the claim
 
       // Layer 4 — cross-topic duplicate guard (same reply arriving on another
-      // topic with a different part id). DB-backed: survives restarts. Keyed on
-      // content kind + body + attachments so a repeated short reply ("done"),
-      // image-only replies and note-vs-reply text can never collide.
-      relayKey = `reply:${bodyHash([part.body ?? "", ...attachmentRefs.map((a) => a.url)].join("\n"))}`;
+      // topic with a different part id). DB-backed: survives restarts. The
+      // duplicate pair keeps its author and created_at across topics, so both
+      // scope the key: body hash alone collapsed DISTINCT replies with the
+      // same normalized text ("test" then "Test") inside the freshness window
+      // into one relay — silent loss, hit live 2026-07-15 once customer-type
+      // converts made both topics fire for every reply.
+      relayKey = `reply:${part.author?.id ?? "a?"}:${part.created_at ?? "t?"}:${bodyHash(
+        [part.body ?? "", ...attachmentRefs.map((a) => a.url)].join("\n")
+      )}`;
       if (!(await this.store.claimRelay(threadId, relayKey))) return;
 
       const thread = await this.requireThread(threadId);
@@ -740,8 +745,9 @@ export class IntercomWebhookHandler {
       if (!text) return;
       // The same note can surface on both the conversation and the ticket topic.
       // Distinct key space from replies ("note:" vs "reply:") — identical text
-      // in a note and a reply must not collide.
-      relayKey = `note:${bodyHash(part.body ?? "")}`;
+      // in a note and a reply must not collide. Author + created_at scope the
+      // key so two distinct same-text notes don't collapse (see processAgentPart).
+      relayKey = `note:${part.author?.id ?? "a?"}:${part.created_at ?? "t?"}:${bodyHash(part.body ?? "")}`;
       if (!(await this.store.claimRelay(threadId, relayKey))) return;
 
       // Notes are not stored locally anymore (agent-rip: /note is gone and
