@@ -1,4 +1,4 @@
-import { Prisma, PrismaClient, BotSettings, StatusTag, PriorityTag } from "../generated/prisma/client";
+import { Prisma, PrismaClient, BotSettings, StatusTag } from "../generated/prisma/client";
 import type { SentryRuntimeConfig } from "../util/logger";
 import type { InfluxRuntimeConfig } from "../metrics/InfluxWriter";
 import { decryptSecret, encryptSecret, isVaultKvSentinel, VAULT_KV_SENTINEL } from "../util/crypto";
@@ -50,21 +50,6 @@ const DEFAULT_TAGS: TagInput[] = [
   { emoji: "📁", label: "Closed", closesThread: true, reminderEnabled: false },
 ];
 
-export interface PriorityInput {
-  emoji: string;
-  label: string;
-  isInitial?: boolean;
-}
-
-const DEFAULT_PRIORITIES: PriorityInput[] = [
-  { emoji: "⬜", label: "Very Low" },
-  { emoji: "🟩", label: "Low" },
-  { emoji: "🟨", label: "Medium", isInitial: true },
-  { emoji: "🟧", label: "High" },
-  { emoji: "🟥", label: "Very High" },
-  { emoji: "🚨", label: "Critical" },
-];
-
 // The six global secrets and their Vault KV home (one KV entry per
 // integration; field names live inside the entry). Shared by the read
 // resolver, the write router, the panel state helper and the migrator.
@@ -100,7 +85,6 @@ export function isUnicodeEmoji(input: string): boolean {
 export class SettingsStore {
   private settings!: BotSettings;
   private tagList: StatusTag[] = [];
-  private priorityList: PriorityTag[] = [];
   private vault: VaultService | null = null;
 
   constructor(private prisma: PrismaClient) {}
@@ -216,26 +200,10 @@ export class SettingsStore {
       });
     }
     await this.refreshTags();
-
-    if ((await this.prisma.priorityTag.count()) === 0) {
-      await this.prisma.priorityTag.createMany({
-        data: DEFAULT_PRIORITIES.map((p, i) => ({
-          emoji: p.emoji,
-          label: p.label,
-          isInitial: p.isInitial ?? false,
-          sortOrder: i,
-        })),
-      });
-    }
-    await this.refreshPriorities();
   }
 
   private async refreshTags(): Promise<void> {
     this.tagList = await this.prisma.statusTag.findMany({ orderBy: { sortOrder: "asc" } });
-  }
-
-  private async refreshPriorities(): Promise<void> {
-    this.priorityList = await this.prisma.priorityTag.findMany({ orderBy: { sortOrder: "asc" } });
   }
 
   threadsChannelId(): string | null {
@@ -365,10 +333,6 @@ export class SettingsStore {
 
   closingTag(): StatusTag | undefined {
     return this.tagList.find((t) => t.closesThread);
-  }
-
-  priorityById(id: string): PriorityTag | undefined {
-    return this.priorityList.find((p) => p.id === id);
   }
 
   // ---- Intercom bridge ----

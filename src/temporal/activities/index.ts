@@ -415,7 +415,7 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
       actLog.info("pingStaffForNewTicket skipped (agent-rip tombstone)", { "ticket.thread_id": threadId });
     },
 
-    // ================= status / priority =================
+    // ================= status =================
 
     // The whole transition via StatusService.applyStatusDirect — the exact
     // legacy implementation, serialized by the parent ticket workflow.
@@ -453,14 +453,6 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
       return { applied: true, closed: isDone, isResolved: false, closesThread: tag.closesThread, statusTagId: tag.id, statusLabel: tag.label };
     },
 
-    // Inert stub (agent-rip): the Discord priority axis is unbridged — nothing
-    // issues the applyPriority update anymore, but the workflow keeps the
-    // handler registered (byte-identical ticketWorkflow), so the activity name
-    // must stay implemented for any in-flight update at deploy time.
-    async applyPriorityStep(input) {
-      actLog.info("applyPriorityStep skipped (priority axis retired)", { "ticket.thread_id": input.threadId });
-    },
-
     // ================= Intercom =================
 
     async intercomEnabled() {
@@ -468,7 +460,7 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
     },
 
     // One queued event → the shared executor (ensure ladder / message / note /
-    // status / priority / csat). Throws ApplicationFailure with structured
+    // status / csat). Throws ApplicationFailure with structured
     // details so the delivery workflow replicates the legacy retry policy.
     async executeIntercomEvent(input) {
       const { threadId, event } = input;

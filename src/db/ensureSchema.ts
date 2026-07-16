@@ -181,27 +181,10 @@ const STATEMENTS: string[] = [
     END IF;
   END
   $$`,
-  // Priority tags: a second, status-like axis on tickets (emoji + label only).
-  `CREATE TABLE IF NOT EXISTS "priority_tags" (
-    "id" TEXT NOT NULL,
-    "emoji" TEXT NOT NULL,
-    "label" TEXT NOT NULL,
-    "isInitial" BOOLEAN NOT NULL DEFAULT false,
-    "sortOrder" INTEGER NOT NULL DEFAULT 0,
-    CONSTRAINT "priority_tags_pkey" PRIMARY KEY ("id")
-  )`,
-  `CREATE UNIQUE INDEX IF NOT EXISTS "priority_tags_emoji_key" ON "priority_tags"("emoji")`,
-  `ALTER TABLE "tickets" ADD COLUMN IF NOT EXISTS "priorityTagId" TEXT`,
-  `DO $$
-  BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'tickets_priorityTagId_fkey') THEN
-      ALTER TABLE "tickets" ADD CONSTRAINT "tickets_priorityTagId_fkey"
-        FOREIGN KEY ("priorityTagId") REFERENCES "priority_tags"("id")
-        ON DELETE SET NULL ON UPDATE CASCADE;
-    END IF;
-  END
-  $$`,
-  // Append-only status/priority change history (emoji+label snapshotted as text).
+  // (The priority axis is removed: existing deployments keep an orphaned
+  // "priority_tags" table + "tickets"."priorityTagId" column until the N+1
+  // destructive drop; fresh installs never create them.)
+  // Append-only status change history (emoji+label snapshotted as text).
   `CREATE TABLE IF NOT EXISTS "ticket_tag_changes" (
     "id" TEXT NOT NULL,
     "ticketThreadId" TEXT NOT NULL,

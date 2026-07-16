@@ -2,13 +2,12 @@ import { PrismaClient, Ticket, StatusTag } from "../generated/prisma/client";
 
 export type TicketWithTag = Ticket & { statusTag: StatusTag | null };
 
-export type TagChangeKind = "STATUS" | "PRIORITY";
+export type TagChangeKind = "STATUS";
 
 export interface CreateTicketInput {
   threadId: string;
   channelId: string;
   statusTagId: string;
-  priorityTagId?: string | null;
   customerId?: string | null;
   customerDisplayName?: string | null;
   categoryId?: string | null;
@@ -42,7 +41,6 @@ export class TicketStore {
         threadId: input.threadId,
         channelId: input.channelId,
         statusTagId: input.statusTagId,
-        priorityTagId: input.priorityTagId ?? null,
         customerId: input.customerId ?? null,
         customerDisplayName: input.customerDisplayName ?? null,
         categoryId: input.categoryId ?? null,
@@ -165,7 +163,6 @@ export class TicketStore {
     filters: {
       categoryId?: string;
       statusTagId?: string;
-      priorityTagId?: string;
       closed?: boolean;
       customerIds?: string[];
       text?: string;
@@ -178,7 +175,6 @@ export class TicketStore {
     const where: {
       categoryId?: string;
       statusTagId?: string;
-      priorityTagId?: string;
       closed?: boolean;
       customerId?: { in: string[] };
       OR?: object[];
@@ -186,7 +182,6 @@ export class TicketStore {
     } = {};
     if (filters.categoryId) where.categoryId = filters.categoryId;
     if (filters.statusTagId) where.statusTagId = filters.statusTagId;
-    if (filters.priorityTagId) where.priorityTagId = filters.priorityTagId;
     if (filters.closed !== undefined) where.closed = filters.closed;
     if (filters.customerIds) where.customerId = { in: filters.customerIds };
     if (filters.text) {
@@ -271,11 +266,10 @@ export class TicketStore {
     return result.count > 0;
   }
 
-  // ---- Staff notes ----
-
-  // ---- Status/priority change history ----
-  // Emoji+label are snapshotted as text so /status history and /priority history
-  // survive tag edits and deletions.
+  // ---- Status change history ----
+  // Emoji+label are snapshotted as text so history survives tag edits and
+  // deletions. Legacy rows may carry kind "PRIORITY" — inert history from the
+  // removed priority axis; nothing reads them.
 
   async addTagChange(input: {
     ticketThreadId: string;

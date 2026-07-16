@@ -31,7 +31,6 @@ import {
   statusChangeChildId,
 } from "../types";
 import {
-  applyPriorityUpdate,
   applyStatusUpdate,
   getStateQuery,
   humanMessageSignal,
@@ -73,7 +72,7 @@ const timers = proxyActivities<CoreActivities>({
 
 // The long-lived per-ticket owner: all durable timers (reminders, resolved
 // auto-close, re-close deadline, retention) + the per-ticket Intercom outbox
-// pump + status/priority changes as child workflows.
+// pump + status changes as child workflows.
 export async function ticketWorkflow(input: TicketWorkflowInput): Promise<void> {
   const threadId = input.threadId;
   const outbox: IcEvent[] = input.carry?.outbox ?? [];
@@ -114,7 +113,7 @@ export async function ticketWorkflow(input: TicketWorkflowInput): Promise<void> 
     upsertSearchAttributes([{ key: SA_TICKET_STATUS, value: label }]);
   };
 
-  // Serializes status/priority changes (replaces the legacy per-thread
+  // Serializes status changes (replaces the legacy per-thread
   // promise chains in StatusService).
   let statusChain: Promise<unknown> = Promise.resolve();
   const runStatusChange = (req: StatusChangeRequest): Promise<StatusChangeResult> => {
@@ -210,15 +209,6 @@ export async function ticketWorkflow(input: TicketWorkflowInput): Promise<void> 
       return { ok: res.applied, reason: res.reason };
     } catch (e) {
       return { ok: false, reason: e instanceof Error ? e.message : String(e) };
-    }
-  });
-
-  setHandler(applyPriorityUpdate, async (req) => {
-    try {
-      await quick.applyPriorityStep({ ...req, threadId });
-      return { ok: true };
-    } catch {
-      return { ok: false };
     }
   });
 

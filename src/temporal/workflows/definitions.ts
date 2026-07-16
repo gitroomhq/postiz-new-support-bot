@@ -11,7 +11,6 @@ import {
   SIG_INACTIVITY_RUN_NOW,
   SIG_REQUEST_STATUS_CHANGE,
   SIG_TICKET_CREATED,
-  UPD_APPLY_PRIORITY,
   UPD_APPLY_STATUS,
   QRY_TICKET_STATE,
   type ApplyStatusResult,
@@ -19,7 +18,6 @@ import {
   type IcEvent,
   type IcEventType,
   type InboundEventSignal,
-  type PriorityChangeRequest,
   type RemindersPausedSignal,
   type StatusChangeRequest,
   type TicketCreatedSignal,
@@ -44,7 +42,6 @@ export const disputesRunNowSignal = defineSignal(SIG_DISPUTES_RUN_NOW);
 export const inactivityRunNowSignal = defineSignal(SIG_INACTIVITY_RUN_NOW);
 
 export const applyStatusUpdate = defineUpdate<ApplyStatusResult, [StatusChangeRequest]>(UPD_APPLY_STATUS);
-export const applyPriorityUpdate = defineUpdate<{ ok: boolean }, [PriorityChangeRequest]>(UPD_APPLY_PRIORITY);
 
 export const getStateQuery = defineQuery<{ snapshot: TicketSnapshot | null; outbox: IcEvent[]; outboxDepth: number }>(
   QRY_TICKET_STATE

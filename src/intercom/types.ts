@@ -6,15 +6,16 @@
 // (the transcript — customer messages as contact-authored comments, staff/AI
 // mirror + agent replies as admin comments, notes as conversation notes) plus
 // a linked customer TICKET created via convert (type = bot category, custom
-// ticket state = bot status tag, Priority/CSAT as ticket attributes).
+// ticket state = bot status tag, CSAT as ticket attributes).
 
 export type OutboxEventType =
   | "ensure"
   | "message"
   | "note"
   | "status"
-  // Legacy: the priority axis is unbridged (agent-rip) — no producer emits
-  // this anymore, but queued events may still carry it; executors skip it.
+  // Legacy skip-only member: the priority axis is removed, but durable queued
+  // events may still carry the type — the executor skips it. Drop with the
+  // N+1 cleanup.
   | "priority"
   | "csat"
   // Agent-idle reminder for a bridged ticket: internal note + reopen so the
@@ -49,7 +50,6 @@ export interface EnsurePayload {
   statusLabel: string;
   closed: boolean;
   resolved: boolean;
-  priorityLabel: string | null; // verbatim "🟧 High" — Priority ticket attribute
   createdAtIso: string; // backdates conversation (created_at)
   // Current Discord avatar URL — refreshed onto the Intercom contact so repeat
   // customers don't show under a blank avatar / years-old identity.
@@ -79,7 +79,7 @@ export interface NotePayload {
   externalCreatedAtIso?: string;
 }
 
-// Messages-only mirroring: status/priority events update the ticket object
+// Messages-only mirroring: status events update the ticket object
 // (state / attributes) but never post transcript notes. Old queued payloads
 // may still carry a legacy `note` field — executors ignore it.
 export interface StatusPayload {
@@ -95,12 +95,6 @@ export interface StatusPayload {
   // it's already there — the replayed contact messages auto-reopen the
   // conversation in Intercom behind the damper's back.
   forceOpenSync?: boolean;
-}
-
-export interface PriorityPayload {
-  priorityLabel: string; // verbatim "🟧 High"
-  fromLabel?: string | null;
-  actorName: string;
 }
 
 export interface CsatPayload {
@@ -142,7 +136,6 @@ export type OutboxPayload =
   | MessagePayload
   | NotePayload
   | StatusPayload
-  | PriorityPayload
   | CsatPayload
   | AgentReminderPayload
   | MessageEditPayload
@@ -182,6 +175,13 @@ export interface IntercomTicketType {
   name: string;
   category?: string | null; // "Customer" | "Back-office" | "Tracker"
   attributeNames: string[];
+  attributes: IntercomTicketTypeAttribute[];
+}
+
+export interface IntercomTicketTypeAttribute {
+  id: string;
+  name: string;
+  archived: boolean;
 }
 
 export interface IntercomTicketState {

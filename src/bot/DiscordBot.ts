@@ -91,7 +91,6 @@ import { VaultMigrator, COLUMN_LABELS, type MigrateItemResult, type MigrateRepor
 type TicketSearchFilters = {
   categoryId?: string;
   statusTagId?: string;
-  priorityTagId?: string;
   closed?: boolean;
   customerIds?: string[];
   text?: string;
@@ -714,10 +713,6 @@ export class DiscordBot {
 
     const lines = tickets.map((t) => {
       const status = t.statusTag ? `${t.statusTag.emoji} ${t.statusTag.label}` : "—";
-      // Legacy chip: the priority axis is retired, but old tickets keep their
-      // stored priority until the follow-up release drops the column.
-      const priorityTag = t.priorityTagId ? this.settingsStore.priorityById(t.priorityTagId) : undefined;
-      const priority = priorityTag ? ` · ${priorityTag.emoji} ${priorityTag.label}` : "";
       const category = t.categoryId ? categoryLabels.get(t.categoryId) ?? t.categoryId : "—";
       const who = t.customerId ? `<@${t.customerId}>` : t.customerDisplayName ?? "unknown user";
       const session = t.customerId ? sessionByDiscordId.get(t.customerId) : undefined;
@@ -730,7 +725,7 @@ export class DiscordBot {
         filters.text && t.question
           ? `\n> ${t.question.replace(/\s+/g, " ").slice(0, 80)}${t.question.length > 80 ? "…" : ""}`
           : "";
-      return `${status}${priority} — <#${t.threadId}> — ${category}\n${who}${postiz}${stripe} · ${created}${closedMark}${snippet}`;
+      return `${status} — <#${t.threadId}> — ${category}\n${who}${postiz}${stripe} · ${created}${closedMark}${snippet}`;
     });
 
     const embed = new EmbedBuilder()
@@ -4182,14 +4177,16 @@ export class DiscordBot {
     }
 
     if (id === "config_intercom_heal") {
-      // Outage repair over OPEN tickets: bridged tickets get their
-      // never-delivered human messages re-enqueued (delivered-ledger gap —
-      // e.g. the billing-wide gate outage, or pre-link history), unbridged
-      // mirrorable tickets get a regular backfill (also repairs tickets whose
-      // creation ensure was short-circuited by the old gate: their workflows
-      // latched "linked" with no link row, so the next live message would
-      // dead-letter without this). Closed tickets are untouched — use
-      // Backfill tickets for those.
+      // Outage repair over OPEN tickets, BOTH directions: bridged tickets get
+      // their never-delivered human messages re-enqueued (delivered-ledger
+      // gap — e.g. the billing-wide gate outage, or pre-link history) AND
+      // their Intercom part history re-fed through the inbound relay path
+      // (agent replies whose webhook relay was dropped, e.g. the
+      // reply-and-assign `assignment` shape). Unbridged mirrorable tickets
+      // get a regular backfill (also repairs tickets whose creation ensure
+      // was short-circuited by the old gate: their workflows latched "linked"
+      // with no link row, so the next live message would dead-letter without
+      // this). Closed tickets are untouched — use Backfill tickets for those.
       await interaction.deferReply({ flags: 64 });
       if (this.settingsStore.intercomMode() === "none") {
         await interaction.editReply({
@@ -4332,7 +4329,8 @@ export class DiscordBot {
       const lines: string[] = [];
       const types = await this.intercomClient.listTicketTypes().catch(() => null);
       for (const typeId of typeIds) {
-        const existing = types?.find((t) => t.id === typeId)?.attributeNames ?? [];
+        const type = types?.find((t) => t.id === typeId);
+        const existing = type?.attributeNames ?? [];
         const results: string[] = [];
         for (const [name, description] of [
           [TICKET_ATTR_CSAT, "CSAT rating mirrored from the Discord support bot"],
@@ -4352,6 +4350,17 @@ export class DiscordBot {
             results.push(/exist|taken|unique/i.test(message) ? `${name} ✓` : `${name} ✗`);
           }
         }
+        // Retired attributes: the manual priority axis is removed — archive the
+        // stale "Priority" attribute so old tickets stop surfacing it. Once
+        // archived it no longer matches, so re-clicks are no-ops.
+        for (const retired of type?.attributes.filter((a) => a.name === "Priority" && !a.archived) ?? []) {
+          try {
+            await this.intercomClient.archiveTicketTypeAttribute(typeId, retired.id);
+            results.push(`${retired.name} archived ✓`);
+          } catch {
+            results.push(`${retired.name} archive ✗`);
+          }
+        }
         lines.push(`Type \`${typeId}\`: ${results.join(" · ")}`);
       }
       const failed = lines.some((l) => l.includes("✗"));
@@ -4361,7 +4370,7 @@ export class DiscordBot {
             [
               ...lines,
               ...(failed
-                ? ["", "✗ = could not create via API. Add the attribute manually in Intercom: Settings → Ticket types → add a text attribute with exactly that name."]
+                ? ["", "✗ = API call failed. Fix manually in Intercom: Settings → Ticket types → add a text attribute with exactly that name (or archive it, for retired attributes)."]
                 : []),
               "",
               "Conversations are marked with a **Discord** tag automatically. For the optional `Origin` + `Discord Thread` conversation attributes, create them once by hand (Settings → Data → Conversations) — the API can't define conversation attributes.",
@@ -4583,9 +4592,6 @@ export class DiscordBot {
       return;
     }
 
-    // Priority-scoped buttons: customId is `config_priority_<action>:<priorityId>`.
-    // Must be handled before the tag fallthrough below, which split(":")-parses
-    // any remaining id as a tag action.
     // Tag-scoped buttons: customId is `config_tag_<action>:<tagId>`
     const [action, tagId] = id.split(":");
     const tag = tagId ? this.settingsStore.tagById(tagId) : undefined;
@@ -5710,11 +5716,15 @@ export class DiscordBot {
 
   // "Heal Message Gaps": outage repair over OPEN tickets only (closed ones
   // are Backfill's job). Bridged → healMessageGaps re-enqueues human messages
-  // missing from the delivered ledger; unbridged mirrorable → backfillTicket
-  // (creates the link + transcript — this is what un-wedges tickets whose
-  // creation ensure was short-circuited by the old billing-wide gate).
-  // Idempotent end to end: ledgers dedup messages, claimBackfill dedups
-  // transcripts, so re-running after a partial failure is safe.
+  // missing from the delivered ledger, THEN the ticket's full Intercom part
+  // history is re-fed through the inbound relay path (repairs agent replies
+  // whose webhook relay was dropped — e.g. reply-and-assign shipping the body
+  // on an `assignment` part). Unbridged mirrorable → backfillTicket (creates
+  // the link + transcript — this is what un-wedges tickets whose creation
+  // ensure was short-circuited by the old billing-wide gate). Idempotent end
+  // to end: ledgers dedup messages, part-id claims dedup inbound relays,
+  // claimBackfill dedups transcripts, so re-running after a partial failure
+  // is safe.
   private async runIntercomMessageHeal(interaction: ButtonInteraction): Promise<void> {
     const progress = await interaction
       .followUp({ embeds: [makeEmbed("Intercom gap heal started…", COLORS.neutral)], flags: 64 })
@@ -5732,6 +5742,10 @@ export class DiscordBot {
       let untouched = 0;
       let gone = 0;
       let processed = 0;
+      let inboundParts = 0;
+      let inboundTickets = 0;
+      let inboundFailures = 0;
+      const pause = () => new Promise((r) => setTimeout(r, 150));
 
       for (const ticket of tickets) {
         processed++;
@@ -5742,13 +5756,38 @@ export class DiscordBot {
           continue;
         }
         const messages = await this.fetchAllThreadMessages(thread);
-        if (await this.intercomStore.getLink(ticket.threadId)) {
+        const link = await this.intercomStore.getLink(ticket.threadId);
+        if (link) {
           const healed = await this.intercomSync.healMessageGaps(ticket, messages).catch(() => null);
           if (healed != null && healed > 0) {
             healedTickets++;
             healedMessages += healed;
           } else {
             untouched++;
+          }
+          // Inbound half: agent replies whose webhook relay was dropped (e.g.
+          // reply-and-assign shipping the body on an `assignment` part) —
+          // re-fetch the FULL part history and feed it through the relay path.
+          // The part-id ledger no-ops everything already relayed or
+          // bridge-created, so this is safe to run repeatedly. Runs AFTER the
+          // outbound heal on the pre-fetched message snapshot, so replies it
+          // posts can't be mirrored back by this run (and never by later runs
+          // — relayed messages are bot/webhook-authored, which the outbound
+          // heal skips).
+          await pause(); // politeness pacing — one Intercom GET per bridged ticket
+          try {
+            const parts = await this.intercomClient.getConversationPartsSince(link.conversationId, 0);
+            const fed = await this.intercomWebhook.relayHealedParts(ticket.threadId, parts);
+            if (fed > 0) {
+              inboundTickets++;
+              inboundParts += fed;
+            }
+          } catch (e) {
+            inboundFailures++;
+            log.child("discord:backfill").warn("inbound gap heal failed", {
+              "ticket.thread_id": ticket.threadId,
+              "error.message": e instanceof Error ? e.message : String(e),
+            });
           }
         } else {
           const count = await this.intercomSync.backfillTicket(ticket, messages).catch(() => null);
@@ -5763,8 +5802,12 @@ export class DiscordBot {
       const summary = [
         `Gap heal finished over **${tickets.length}** open ticket(s):`,
         `• **${healedMessages}** missed message(s) re-queued across **${healedTickets}** bridged ticket(s)`,
+        `• **${inboundParts}** Intercom agent part(s) re-checked across **${inboundTickets}** bridged ticket(s) — missed replies were relayed into their threads, already-relayed ones no-op`,
         `• **${bridgedTickets}** unbridged ticket(s) sent to backfill (link + full transcript)`,
         `• ${untouched} needed nothing, ${gone} thread(s) gone`,
+        ...(inboundFailures > 0
+          ? [`⚠️ ${inboundFailures} ticket(s) failed the inbound re-check — safe to run the heal again.`]
+          : []),
         "",
         "Delivery is paced through the ticket workflows; replayed parts keep their original timestamps (created_at backdating).",
       ].join("\n");

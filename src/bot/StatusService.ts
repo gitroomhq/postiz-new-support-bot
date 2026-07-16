@@ -24,7 +24,6 @@ export interface StatusTicket {
   customerId: string | null;
   closed?: boolean;
   statusTag?: { emoji: string; label: string } | null;
-  priorityTagId?: string | null;
   // Used by the metrics export (resolution time / category tag); callers pass
   // full ticket rows, so these are type-only like the fields above.
   createdAt?: Date;
@@ -44,7 +43,7 @@ export interface ApplyStatusOptions {
 export class StatusService {
   // Serializes changes per thread so rapid updates don't interleave their messages.
   private chains = new Map<string, Promise<unknown>>();
-  // Temporal seam: when the Temporal regime is active, status/priority changes
+  // Temporal seam: when the Temporal regime is active, status changes
   // run as workflow updates on the per-ticket workflow (serialized there, one
   // statusChangeWorkflow child per transition) — every call site stays put.
   private producers: TemporalProducers | null = null;

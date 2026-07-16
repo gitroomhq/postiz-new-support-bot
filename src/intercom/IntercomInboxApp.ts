@@ -75,12 +75,10 @@ export class IntercomInboxApp {
 
     if (ticket) {
       const statusLabel = ticket.statusTag ? `${ticket.statusTag.emoji} ${ticket.statusTag.label}` : "—";
-      const priority = ticket.priorityTagId ? this.settingsStore.priorityById(ticket.priorityTagId) : undefined;
       components.push(
         dataRow("Customer", ticket.customerDisplayName ?? ticket.customerId ?? "unknown"),
         dataRow("Category", this.categoryLabelResolver(ticket.categoryId) ?? "—"),
         dataRow("Status", statusLabel),
-        ...(priority ? [dataRow("Priority", `${priority.emoji} ${priority.label}`)] : []),
         ...(ticket.csatScore != null ? [dataRow("CSAT", `${ticket.csatScore}/5`)] : [])
       );
     } else {

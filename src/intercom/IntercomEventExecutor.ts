@@ -130,9 +130,9 @@ export class IntercomEventExecutor {
         await this.executeStatus(threadId, payload as StatusPayload);
         return;
       case "priority":
-        // Legacy queued events from before the priority axis was unbridged
-        // (agent-rip) — nothing to mirror anymore.
-        this.execLog.info("priority event skipped (axis retired)", { "ticket.thread_id": threadId });
+        // Skip-only: the priority axis is removed, but durable queued events
+        // may still carry the type. Drop with the N+1 cleanup.
+        this.execLog.info("priority event skipped (axis removed)", { "ticket.thread_id": threadId });
         return;
       case "csat":
         await this.executeCsat(threadId, payload as CsatPayload);
@@ -836,7 +836,7 @@ export class IntercomEventExecutor {
 
   // Intercom auto-reopens a conversation when the bridge updates the linked
   // ticket (state or attributes). When the bridge's last synced state is
-  // closed, restore it — otherwise every post-close CSAT/priority write leaves
+  // closed, restore it — otherwise every post-close CSAT write leaves
   // the conversation open for agents (and fires an opened webhook).
   private async reassertConversationClosed(threadId: string, link: IntercomLink): Promise<void> {
     if (link.lastSyncedOpen !== "closed") return;

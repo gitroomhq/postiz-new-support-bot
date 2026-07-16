@@ -806,7 +806,9 @@ export class IntercomClient {
         id?: string | number;
         name?: string;
         category?: string;
-        ticket_type_attributes?: { data?: Array<{ name?: string }> } | Array<{ name?: string }>;
+        ticket_type_attributes?:
+          | { data?: Array<{ id?: string | number; name?: string; archived?: boolean }> }
+          | Array<{ id?: string | number; name?: string; archived?: boolean }>;
       }>;
     }>("/ticket_types", "GET", undefined, "ticket types");
     return (data.data ?? [])
@@ -819,6 +821,9 @@ export class IntercomClient {
           name: t.name ?? `Ticket type ${t.id}`,
           category: t.category ?? null,
           attributeNames: attrList.map((a) => a.name ?? "").filter(Boolean),
+          attributes: attrList
+            .filter((a) => a.id != null && a.name)
+            .map((a) => ({ id: String(a.id), name: a.name as string, archived: a.archived === true })),
         };
       });
   }
@@ -843,6 +848,15 @@ export class IntercomClient {
       "POST",
       { name, description, data_type: "string", visible_on_create: false },
       "ticket type attribute create"
+    );
+  }
+
+  async archiveTicketTypeAttribute(ticketTypeId: string, attributeId: string): Promise<void> {
+    await this.json(
+      `/ticket_types/${encodeURIComponent(ticketTypeId)}/attributes/${encodeURIComponent(attributeId)}`,
+      "PUT",
+      { archived: true },
+      "ticket type attribute archive"
     );
   }
 }

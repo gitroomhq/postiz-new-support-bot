@@ -42,10 +42,12 @@ export interface AgentRipSweepSummary {
 //      applyStatus: the tickets are already closed in DB + Intercom, and the
 //      transition body would post close notices / CSAT prompts per ticket.
 //      handleThreadUpdate ignores bot-executor edits, so nothing echoes.
-//   b. Open, unarchived threads get their legacy "{status} {priority?} rest"
-//      title emojis stripped (nothing renames threads anymore). Tokens are
-//      stripped only when they match a CONFIGURED status/priority emoji, so
-//      adopted/plain names are never mangled.
+//   b. Open, unarchived threads get their legacy "{status} rest" title emojis
+//      stripped (nothing renames threads anymore). Tokens are stripped only
+//      when they match a CONFIGURED status emoji, so adopted/plain names are
+//      never mangled. (Legacy priority-emoji stripping went with the priority
+//      axis — prod migrated before the removal, fresh installs have no legacy
+//      titles.)
 //
 // The flag (BotSettings.agentRipMigratedAt) is stamped only when phase 2
 // completes an iteration; per-item failures are counted + audited but don't
@@ -177,21 +179,13 @@ export class AgentRipMigration {
     }
   }
 
-  // "{status} {priority?} rest" → "rest", stripping ONLY configured emojis.
-  // Returns null when nothing needs stripping. Priority emojis are read via
-  // prisma (their SettingsStore accessors are gone with the priority axis).
-  private priorityEmojis: Set<string> | null = null;
-
+  // "{status} rest" → "rest", stripping ONLY configured emojis.
+  // Returns null when nothing needs stripping.
   private async strippedName(currentName: string): Promise<string | null> {
-    if (!this.priorityEmojis) {
-      const rows = await this.prisma.$queryRawUnsafe<Array<{ emoji: string }>>(`SELECT "emoji" FROM "priority_tags"`);
-      this.priorityEmojis = new Set(rows.map((r) => r.emoji));
-    }
     const statusEmojis = new Set(this.settingsStore.tags().map((t) => t.emoji));
     const tokens = currentName.split(" ");
     let index = 0;
     if (index < tokens.length && statusEmojis.has(tokens[index])) index++;
-    if (index < tokens.length && this.priorityEmojis.has(tokens[index])) index++;
     if (index === 0) return null;
     const rest = tokens.slice(index).join(" ").trim();
     return rest.length > 0 ? rest.slice(0, 100) : null;

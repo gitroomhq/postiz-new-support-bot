@@ -86,7 +86,7 @@ export abstract class BaseCategory {
       // The trailing " — {label}" is load-bearing: deriveCategoryId parses it
       // during Re-Verify/adoption, so truncation (100-char thread-name cap)
       // may only eat into the display name, never the suffix. No emoji
-      // prefixes — titles no longer encode status/priority.
+      // prefixes — titles no longer encode status.
       const suffix = ` — ${this.label}`;
       thread = await threadsChannel.threads.create({
         name: `${interaction.user.displayName.slice(0, 100 - suffix.length)}${suffix}`,

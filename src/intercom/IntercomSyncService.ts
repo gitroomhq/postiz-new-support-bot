@@ -250,9 +250,6 @@ export class IntercomSyncService {
     });
   }
 
-  // (The priority axis is unbridged — agent-rip. Intercom's native priority is
-  // agent-set in the Intercom UI and never synced to Discord.)
-
   async onCsat(threadId: string, score: number, comment?: string | null): Promise<void> {
     if (!this.enabled()) return;
     const ticket = await this.ticketStore.getByThreadId(threadId);
@@ -367,9 +364,9 @@ export class IntercomSyncService {
   // on a slow drain, so a re-click (or a second backfill run) would otherwise
   // enqueue the whole transcript again with no message-level dedup. Returns the
   // number of events sent, or null when the ticket is already bridged/enqueued.
-  // Messages-only mirroring: the transcript replays messages; status/priority/
-  // CSAT land as ticket state + attributes, never as notes. Timestamps come
-  // from the native created_at backdating — no text prefixes.
+  // Messages-only mirroring: the transcript replays messages; status/CSAT land
+  // as ticket state + attributes, never as notes. Timestamps come from the
+  // native created_at backdating — no text prefixes.
   async backfillTicket(
     ticket: TicketWithTag,
     messages: BridgeSourceMessage[] | null // null = thread no longer exists
@@ -420,13 +417,6 @@ export class IntercomSyncService {
         closed: tag.closesThread,
         resolved: tag.closesThread || isResolvedTag(tag),
         forceOpenSync: true,
-      });
-    }
-    const priorityTag = ticket.priorityTagId ? this.settingsStore.priorityById(ticket.priorityTagId) : undefined;
-    if (priorityTag) {
-      add("priority", {
-        priorityLabel: `${priorityTag.emoji} ${priorityTag.label}`,
-        actorName: "Backfill",
       });
     }
     if (ticket.csatScore != null) {
@@ -524,7 +514,6 @@ export class IntercomSyncService {
 
   private buildEnsurePayload(ticket: TicketWithTag, categoryLabel: string | null): EnsurePayload {
     const tag = ticket.statusTag;
-    const priorityTag = ticket.priorityTagId ? this.settingsStore.priorityById(ticket.priorityTagId) : undefined;
     return {
       customerId: ticket.customerId,
       customerDisplayName: ticket.customerDisplayName,
@@ -540,7 +529,6 @@ export class IntercomSyncService {
       statusLabel: tag ? `${tag.emoji} ${tag.label}` : "Open",
       closed: ticket.closed && (tag?.closesThread ?? true),
       resolved: ticket.closed || (tag ? isResolvedTag(tag) : false),
-      priorityLabel: priorityTag ? `${priorityTag.emoji} ${priorityTag.label}` : null,
       createdAtIso: ticket.createdAt.toISOString(),
     };
   }

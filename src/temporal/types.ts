@@ -105,7 +105,6 @@ export const SIG_KB_REFRESH_NOW = "kbRefreshNow";
 export const SIG_DISPUTES_RUN_NOW = "disputesRunNow";
 export const SIG_INACTIVITY_RUN_NOW = "inactivityRunNow";
 export const UPD_APPLY_STATUS = "applyStatus";
-export const UPD_APPLY_PRIORITY = "applyPriority";
 export const QRY_TICKET_STATE = "getState";
 
 // ---- Intercom outbox events carried in ticket workflow state ----
@@ -115,9 +114,9 @@ export type IcEventType =
   | "message"
   | "note"
   | "status"
-  // Legacy member: no producer emits "priority" anymore (axis unbridged), but
-  // events queued in in-flight ticket workflows may still carry it — the
-  // executor skips them.
+  // Legacy skip-only member: the priority axis is removed, but events queued
+  // in in-flight ticket workflows may still carry the type — the executor
+  // skips them. Drop with the N+1 cleanup.
   | "priority"
   | "csat"
   // Agent-idle reminder: internal note + reopen so the conversation resurfaces
@@ -205,13 +204,6 @@ export interface StatusChangeRequest {
   // time (it belongs to the tag being LEFT, which may have changed by the
   // time the child executes). Absent/null = default close notice.
   closeNoticeText?: string | null;
-}
-
-export interface PriorityChangeRequest {
-  priorityTagId: string;
-  actorName: string;
-  actorId?: string | null;
-  actorIconUrl?: string | null;
 }
 
 export interface ApplyStatusResult {
@@ -371,7 +363,6 @@ export interface CoreActivities {
   // one implementation shared with the legacy chain; the child workflow owns
   // durability + serialization)
   statusApplyDirect(input: StatusChangeInput): Promise<StatusChangeResult>;
-  applyPriorityStep(input: PriorityChangeRequest & { threadId: string }): Promise<void>;
 
   // intercom
   intercomEnabled(): Promise<boolean>;

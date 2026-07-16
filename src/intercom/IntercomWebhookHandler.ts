@@ -186,10 +186,10 @@ export class IntercomWebhookHandler {
         await this.handleConversationNoted(item as IntercomConversationItem);
         return;
       case "conversation.admin.closed":
-        await this.handleConversationOpenState(item as IntercomConversationItem, "closed");
+        await this.handleConversationOpenState(item as IntercomConversationItem, "closed", attempt);
         return;
       case "conversation.admin.opened":
-        await this.handleConversationOpenState(item as IntercomConversationItem, "open");
+        await this.handleConversationOpenState(item as IntercomConversationItem, "open", attempt);
         return;
       case "conversation.admin.snoozed":
         await this.handleConversationSnoozed(item as IntercomConversationItem);
@@ -375,11 +375,14 @@ export class IntercomWebhookHandler {
   }
 
   // Reply-topic relay with an API fallback: Intercom's reply payload sometimes
-  // carries only a side-effect part and NOT the comment itself — observed live
-  // with reply-and-auto-assign, where conversation.admin.replied ships just the
-  // `assignment` part. When no relayable comment is in the payload, pull the
-  // recent parts from the API and run them through the normal relay path (the
-  // part-id ledger dedups anything already handled elsewhere).
+  // carries only a side-effect part and NOT the comment itself. When the agent
+  // replies and assigns/closes/reopens in ONE composer action, the reply body
+  // rides ON that state part and no comment part exists anywhere — the
+  // candidate filter relays those directly. When the payload still has no
+  // relayable content (e.g. a bare assignment while the comment rides another
+  // delivery), pull the recent parts from the API and run them through the
+  // normal relay path (the part-id ledger dedups anything already handled
+  // elsewhere).
   private async relayReplyParts(
     kind: "c" | "t",
     topic: string,
@@ -388,13 +391,7 @@ export class IntercomWebhookHandler {
     parts: IntercomWebhookPart[],
     attempt: number
   ): Promise<void> {
-    const relayable = (list: IntercomWebhookPart[]) =>
-      list.filter(
-        (p) =>
-          p.id != null &&
-          (!p.part_type || p.part_type === "comment" || p.part_type === "quick_reply") &&
-          (!p.author?.type || ["admin", "bot", "team"].includes(p.author.type))
-      );
+    const relayable = (list: IntercomWebhookPart[]) => list.filter((p) => this.isRelayCandidate(p));
 
     if (relayable(parts).length > 0) {
       for (const part of parts) {
@@ -437,16 +434,63 @@ export class IntercomWebhookHandler {
     });
   }
 
-  // Shared relay path for agent-authored comment parts, conversation- or
+  // Manual-heal entry (Heal Message Gaps button): feed API-fetched
+  // conversation parts straight through the normal relay path — repairs agent
+  // replies whose webhook relay was dropped (e.g. the reply-and-assign
+  // `assignment` shape before the candidate filter covered it). Deliberately
+  // NO API fallback and NO "not relayable" audit: most healed tickets have no
+  // new agent content, which is the expected case, not a warning. Returns the
+  // number of candidate parts fed through — already-relayed and bridge-created
+  // ones no-op on the part-id claim, so the count is "re-checked", not
+  // "reposted". bi-only: relaying is meaningless in push/none, and a heal in
+  // push mode must not blast agent warnings across every conversation.
+  async relayHealedParts(threadId: string, parts: IntercomWebhookPart[]): Promise<number> {
+    if (this.settingsStore.intercomMode() !== "bi") return 0;
+    let candidates = 0;
+    for (const part of parts) {
+      if (!this.isRelayCandidate(part)) continue;
+      candidates++;
+      // Defer budget exhausted (like the none→bi gap heal): this is a manual
+      // pass with no retry loop behind it; layers 1+2 still cover in-flight
+      // echoes, and a rare duplicate beats a lost agent reply.
+      await this.processAgentPart("c", threadId, part, MAX_DEFER_ATTEMPTS);
+    }
+    return candidates;
+  }
+
+  // Filter for parts that may carry a customer-facing agent message.
+  // Contact-authored parts can only be our own mirror (customers have no
+  // Intercom access) — only admin/bot/team authors pass. `comment` and
+  // `quick_reply` ARE replies; `assignment`/`close`/`open` are state parts
+  // that carry the reply body when the agent replied-and-assigned,
+  // replied-and-closed, or replied on a closed conversation in ONE composer
+  // action — Intercom ships NO separate comment part for those (observed live
+  // 2026-07-16: reply-and-auto-assign delivered only a body-bearing
+  // `assignment` part, so the old comment-only filter dropped the reply and
+  // the API fallback found nothing either). State parts qualify only when
+  // they actually carry content: a bare assignment/open/close is a pure state
+  // event, and counting it as relayable would short-circuit the API fallback
+  // that hunts for the real comment. `note`-typed parts stay excluded on
+  // every path — notes are internal-only (they surface via the noted topics
+  // as staff-note audit embeds, never in the customer thread). Redacted parts
+  // never relay: full-history heal fetches see agent-deleted parts, and their
+  // tombstone must not reach the customer.
+  private isRelayCandidate(part: IntercomWebhookPart): boolean {
+    if (part.id == null || part.redacted === true) return false;
+    const authorType = part.author?.type;
+    if (authorType && !["admin", "bot", "team"].includes(authorType)) return false;
+    const type = part.part_type;
+    if (!type || type === "comment" || type === "quick_reply") return true;
+    if (type !== "assignment" && type !== "close" && type !== "open") return false;
+    const { text, images } = extractAgentBody(part.body ?? "");
+    return text.trim().length > 0 || images.length > 0 || (part.attachments ?? []).some((a) => Boolean(a.url));
+  }
+
+  // Shared relay path for agent-authored reply-bearing parts, conversation- or
   // ticket-side. Claims each part exactly once; push mode warns instead of
   // relaying; bi mode posts the embed into the Discord thread.
   private async processAgentPart(kind: "c" | "t", threadId: string, part: IntercomWebhookPart, attempt: number): Promise<void> {
-    if (part.id == null) return;
-    if (part.part_type && part.part_type !== "comment" && part.part_type !== "quick_reply") return;
-    // Contact-authored parts can only be our own mirror (customers have no
-    // Intercom access) — relay only admin/bot/team authors.
-    const authorType = part.author?.type;
-    if (authorType && !["admin", "bot", "team"].includes(authorType)) return;
+    if (!this.isRelayCandidate(part)) return;
 
     // Layer 1 — part-id ledger: false = the bridge created this part (recorded
     // at post time) or another delivery already claimed it.
@@ -847,13 +891,26 @@ export class IntercomWebhookHandler {
   // other becomes a no-op via the statusTagId damper.
   private async handleConversationOpenState(
     item: IntercomConversationItem | undefined,
-    target: "open" | "closed"
+    target: "open" | "closed",
+    attempt: number
   ): Promise<void> {
     if (this.settingsStore.intercomMode() !== "bi") return;
     if (!item || item.id == null) return;
 
     const link = await this.store.getLinkByConversationId(String(item.id));
     if (!link) return;
+
+    // Reply-and-close / reply-on-closed ship the agent's message ON the
+    // close/open part of THIS topic — admin.replied may not fire at all, and
+    // when it does, the part-id claim makes the second arrival a no-op. Relay
+    // content-bearing parts BEFORE any state damping: the bridge's own state
+    // pushes produce bare parts, which the candidate filter drops anyway.
+    for (const part of item.conversation_parts?.conversation_parts ?? []) {
+      if (this.isRelayCandidate(part)) {
+        await this.processAgentPart("c", link.ticketThreadId, part, attempt);
+      }
+    }
+
     // The bridge's own close/open (status parity push) echoes back here.
     if (link.lastSyncedOpen === target) return;
 
@@ -988,9 +1045,9 @@ export class IntercomWebhookHandler {
       .catch(() => {});
   }
 
-  // (The priority axis is unbridged — agent-rip. Native Intercom priority is
-  // agents' own tool; conversation.priority.updated left the topic list and
-  // now drops at the door until unsubscribed in the Developer Hub.)
+  // (Native Intercom priority is agents' own tool — never synced to Discord.
+  // conversation.priority.updated left the topic list and drops at the door
+  // until unsubscribed in the Developer Hub.)
 
   // Tag changes made in Intercom → one diff embed in the Discord thread.
   // There is no untag webhook topic, so the diff runs on every conversation

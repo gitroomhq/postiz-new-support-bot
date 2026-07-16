@@ -55,10 +55,9 @@ const EXPECTED_COLUMNS: Record<string, string[]> = {
     "autoCloseAfter", "reminderTextCustomer", "reminderTextSupport", "reminderRepeatDays", "autoCloseMessage",
     "sortOrder", "isCustomerReplyTarget", "intercomTicketStateId",
   ],
-  priority_tags: ["id", "emoji", "label", "isInitial", "sortOrder"],
   tickets: [
     "id", "threadId", "channelId", "customerId", "customerDisplayName", "categoryId", "statusTagId", "prevStatusTagId",
-    "priorityTagId", "escalationTierId", "lastStatusChangeAt", "lastReminderAt", "reminderCount", "remindersPaused", "closed", "closedAt",
+    "escalationTierId", "lastStatusChangeAt", "lastReminderAt", "reminderCount", "remindersPaused", "closed", "closedAt",
     "recloseAt", "question", "aiAnswer", "firstResponseAt", "csatScore", "csatComment", "csatPromptedAt", "csatRatedAt",
     "createdAt", "intercomExempt",
   ],
