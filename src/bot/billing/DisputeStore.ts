@@ -192,6 +192,15 @@ export class DisputeStore {
     return { rows, total };
   }
 
+  // Stripe panel: all mirrored disputes for one customer, newest first.
+  async listByCustomer(customerId: string, take = 10): Promise<StripeDispute[]> {
+    return this.prisma.stripeDispute.findMany({
+      where: { customerId },
+      orderBy: { disputeCreatedAt: "desc" },
+      take,
+    });
+  }
+
   // Reasons present among open disputes — feeds the overview's filter select.
   async openReasons(): Promise<Array<{ reason: string; count: number }>> {
     const rows = await this.prisma.stripeDispute.groupBy({

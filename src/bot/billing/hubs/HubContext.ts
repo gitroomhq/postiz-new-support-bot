@@ -13,6 +13,8 @@ import type { CachedRatioEngine } from "../disputeRatio";
 import type { ClaudeCodeRunner } from "../../ClaudeCodeRunner";
 import type { LightAiRunner } from "../../LightAiRunner";
 import type { IntercomClient } from "../../../intercom/IntercomClient";
+import type { ApprovalStore } from "../ApprovalStore";
+import type { BillingActionService } from "../actions/BillingActionService";
 
 // Shared dependency bundle handed to every hub (and the target resolver).
 export interface HubContext {
@@ -38,4 +40,7 @@ export interface HubContext {
   // Customer support history for the evidence draft (customer_communication
   // material). Reads no-op gracefully when the bridge is off.
   intercom: IntercomClient;
+  // Intercom canvas/panel billing-action approvals (ApprovalsHub).
+  approvalStore: ApprovalStore;
+  billingActions: BillingActionService;
 }

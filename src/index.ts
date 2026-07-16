@@ -40,6 +40,11 @@ import { DisputeStore } from "./bot/billing/DisputeStore";
 import { BlockStore } from "./bot/billing/BlockStore";
 import { BillingQolStore } from "./bot/billing/BillingQolStore";
 import { BlockService } from "./bot/billing/BlockService";
+import { RefundCoreService } from "./bot/billing/RefundCoreService";
+import { ApprovalStore } from "./bot/billing/ApprovalStore";
+import { BillingActionService } from "./bot/billing/actions/BillingActionService";
+import { PanelTokens } from "./intercom/panel/PanelTokens";
+import { IntercomPanel } from "./intercom/panel/IntercomPanel";
 import { CachedRatioEngine } from "./bot/billing/disputeRatio";
 import { DisputeMonitor } from "./bot/billing/DisputeMonitor";
 import { TemporalService } from "./temporal/TemporalService";
@@ -188,6 +193,33 @@ async function main() {
   const ratioEngine = new CachedRatioEngine(stripeClient);
   const disputeMonitor = new DisputeMonitor(settingsStore, sessionStore, stripeClient, disputeStore, blockStore, ratioEngine);
   const stripeWebhookHandler = new StripeWebhookHandler(settingsStore, sessionStore, stripeClient, disputeStore, blockService);
+  // Intercom canvas/panel billing actions: approval queue + the shared
+  // Discord-independent action brain (levels re-checked per request).
+  const approvalStore = new ApprovalStore(prisma);
+  const refundCoreService = new RefundCoreService(stripeClient, sessionStore);
+  const billingActionService = new BillingActionService(
+    approvalStore,
+    settingsStore,
+    stripeClient,
+    sessionStore,
+    blockService,
+    refundCoreService,
+    intercomStore,
+    ticketStore,
+    intercomExecutor,
+    auditLogger
+  );
+  const panelTokens = new PanelTokens(settingsStore);
+  const intercomPanel = new IntercomPanel(
+    settingsStore,
+    intercomStore,
+    ticketStore,
+    sessionStore,
+    stripeClient,
+    disputeStore,
+    billingActionService,
+    panelTokens
+  );
   const billingAdmin = new BillingAdmin(config, stripeClient, sessionStore, settingsStore, auditLogger, {
     disputeStore,
     blockStore,
@@ -197,9 +229,13 @@ async function main() {
     claudeRunner,
     lightAiRunner,
     intercom: intercomClient,
+    approvalStore,
+    billingActions: billingActionService,
   });
 
-  const billingCategory = new BillingCategory(stripeClient, sessionStore, settingsStore, statusService, ticketStore, auditLogger, tierStore, blockStore);
+  // Shared refund money-movement core: Discord self-service + /charge approve
+  // and the Intercom canvas/panel all run this one idempotent path.
+  const billingCategory = new BillingCategory(stripeClient, sessionStore, settingsStore, statusService, ticketStore, auditLogger, tierStore, blockStore, refundCoreService);
   const categoryRegistry = new CategoryRegistry()
     .register(new HowToCategory())
     .register(new BugsCategory())
@@ -221,6 +257,8 @@ async function main() {
     return categoryRegistry.getAll().find((c) => c.id === id)?.label ?? id;
   };
   intercomSync.setCategoryLabelResolver(categoryLabelResolver);
+  // Human amounts in the refund-flip context note (zero-decimal aware).
+  intercomSync.setAmountFormatter((amountMinor, currency) => stripeClient.formatAmount(amountMinor, currency));
 
   const intercomInboxApp = new IntercomInboxApp(
     settingsStore,
@@ -228,7 +266,9 @@ async function main() {
     ticketStore,
     sessionStore,
     stripeClient,
-    categoryLabelResolver
+    categoryLabelResolver,
+    billingActionService,
+    panelTokens
   );
 
   const bot = new DiscordBot(
@@ -251,10 +291,12 @@ async function main() {
     stripeWebhookHandler,
     intercomInboxApp,
     { service: vaultService, migrator: vaultMigrator },
-    { blockService, stripeClient, disputeStore }
+    { blockService, stripeClient, disputeStore },
+    intercomPanel
   );
   // The client exists as soon as the constructor ran; nothing fires before login.
   auditLogger.bindClient(bot.client);
+  billingActionService.bindClient(bot.client);
   intercomWebhookHandler.bindClient(bot.client);
   intercomInboxApp.bindClient(bot.client);
   stripeWebhookHandler.bindClient(bot.client);
@@ -294,7 +336,7 @@ async function main() {
   // Influx gauge snapshot body for the metricsSnapshotWorkflow's snapshotTick.
   const snapshotScheduler = new SnapshotScheduler(prisma, settingsStore);
   // Workspace inactivity sweeper body (native/unbridged Intercom objects).
-  const inactivitySweeper = new InactivitySweeper(intercomClient, intercomStore, settingsStore, auditLogger);
+  const inactivitySweeper = new InactivitySweeper(intercomClient, intercomStore, settingsStore);
 
   // ---- Temporal worker (all background work lives in workflows) ----
 

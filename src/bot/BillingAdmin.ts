@@ -35,6 +35,9 @@ import { InvoicesHub } from "./billing/hubs/InvoicesHub";
 import { PaymentsHub } from "./billing/hubs/PaymentsHub";
 import { BusinessHub } from "./billing/hubs/BusinessHub";
 import { DisputesHub } from "./billing/hubs/DisputesHub";
+import { ApprovalsHub } from "./billing/hubs/ApprovalsHub";
+import type { ApprovalStore } from "./billing/ApprovalStore";
+import type { BillingActionService } from "./billing/actions/BillingActionService";
 import type { DisputeStore } from "./billing/DisputeStore";
 import type { BlockStore } from "./billing/BlockStore";
 import type { BlockService } from "./billing/BlockService";
@@ -54,6 +57,8 @@ export interface BillingAdminExtras {
   claudeRunner: ClaudeCodeRunner;
   lightAiRunner: LightAiRunner;
   intercom: IntercomClient;
+  approvalStore: ApprovalStore;
+  billingActions: BillingActionService;
 }
 
 type Handler<I> = (interaction: I) => Promise<void>;
@@ -100,6 +105,7 @@ export class BillingAdmin {
   private payments: PaymentsHub;
   private business: BusinessHub;
   private disputes: DisputesHub;
+  private approvals: ApprovalsHub;
 
   private buttonRoutes = new RouteTable<ButtonInteraction>();
   private selectRoutes = new RouteTable<StringSelectMenuInteraction>();
@@ -132,6 +138,8 @@ export class BillingAdmin {
       claudeRunner: extras.claudeRunner,
       lightAi: extras.lightAiRunner,
       intercom: extras.intercom,
+      approvalStore: extras.approvalStore,
+      billingActions: extras.billingActions,
     };
 
     this.targets = new TargetResolver(ctx);
@@ -144,6 +152,7 @@ export class BillingAdmin {
     this.payments = new PaymentsHub(ctx);
     this.business = new BusinessHub(ctx);
     this.disputes = new DisputesHub(ctx);
+    this.approvals = new ApprovalsHub(ctx);
 
     // The resolver dispatches a resolved customer to the owning hub's renderer.
     this.targets.bindHandlers({
@@ -176,6 +185,7 @@ export class BillingAdmin {
       this.payments,
       this.business,
       this.disputes,
+      this.approvals,
       { routes: this.facadeRoutes() },
     ];
     for (const source of sources) {

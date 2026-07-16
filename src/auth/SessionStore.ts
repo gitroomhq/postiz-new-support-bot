@@ -276,6 +276,23 @@ export class SessionStore {
     return this.prisma.pendingChargeReview.findFirst({ where: { threadId, status: "PENDING" } });
   }
 
+  // Any-status review lookup for the refund-flip context note
+  // (getPendingChargeReview filters to PENDING; the note wants resolved
+  // outcomes too).
+  async getChargeReviewAnyStatus(threadId: string) {
+    return this.prisma.pendingChargeReview.findUnique({ where: { threadId } });
+  }
+
+  // Newest completed billing action this customer took since the ticket opened
+  // (BillingAction has no threadId — user+window is the join). Backs the
+  // refund-flip context note's "discount accepted / refund executed" line.
+  async latestBillingActionForUserSince(discordUserId: string, since: Date) {
+    return this.prisma.billingAction.findFirst({
+      where: { discordUserId, createdAt: { gte: since }, action: { in: ["refund", "discount", "admin_refund"] } },
+      orderBy: { createdAt: "desc" },
+    });
+  }
+
   // Any-status lookup: guards the message-based recovery of pre-feature blocks
   // from resurrecting an already-resolved review.
   async hasChargeReview(threadId: string): Promise<boolean> {

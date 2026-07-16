@@ -47,6 +47,34 @@ model PendingChargeReview {
   @@map("pending_charge_reviews")
 }
 
+// Queued billing action from the Intercom canvas/panel awaiting admin approval.
+// actionKey references the ActionRegistry; params are the validated snapshot
+// taken at queue time (revalidated against live Stripe state at execute time).
+model BillingApproval {
+  id               String    @id @default(cuid())
+  actionKey        String
+  paramsJson       Json
+  summary          String // human-readable summary rendered at queue time
+  conversationId   String // Intercom conversation the request came from
+  ticketThreadId   String?
+  stripeCustomerId String?
+  requestedById    String // Intercom teammate id
+  requestedByName  String
+  status           String    @default("PENDING") // PENDING | EXECUTING | EXECUTED | REJECTED | EXPIRED | FAILED
+  reviewerId       String? // "intercom:<id>" or "discord:<id>"
+  reviewerName     String?
+  claimedAt        DateTime? // last claimForExecution stamp — stale-EXECUTING reclaim window
+  resultText       String?
+  errorText        String?
+  expiresAt        DateTime // createdAt + 7 days; lazily flipped to EXPIRED
+  resolvedAt       DateTime?
+  createdAt        DateTime  @default(now())
+
+  @@index([status, createdAt])
+  @@index([conversationId, status])
+  @@map("billing_approvals")
+}
+
 model PendingAuth {
   id               String   @id @default(cuid())
   state            String   @unique
@@ -249,6 +277,17 @@ model BotSettings {
   // server cert carries a hostname. Null = derive from the address.
   temporalTlsServerName  String?
   temporalImportDoneAt DateTime?
+  // Intercom teammates who count as billing admins for canvas/panel actions
+  // (edited via /config → Billing → Intercom Admins). JSON array of
+  // { id, name } — names snapshotted for display.
+  intercomPanelAdminsJson Json?
+  // Per-action access levels for the canvas/panel billing actions:
+  // { "<actionKey>": "none" | "approval" | "all" }. Missing key = the
+  // action's registry default. Edited via /config → Billing → Intercom Actions.
+  billingActionLevelsJson Json?
+  // Auto-generated HMAC key for Stripe-panel URL/API tokens (encrypted at
+  // rest via crypto.ts; seeded on first use — never user-entered or shown).
+  panelTokenSecret        String?
   updatedAt           DateTime  @updatedAt
 
   @@map("bot_settings")
@@ -401,10 +440,15 @@ model Ticket {
   customerId          String?
   customerDisplayName String?
   categoryId          String?
-  // Discord-only ticket: never mirrored to Intercom (no conversation, no
-  // ticket, no events). Set at creation by the self-service refund flow —
-  // refunds are handled in-thread via /charge and must not leak to Intercom.
+  // Discord-only ticket: not mirrored to Intercom (no conversation, no
+  // ticket, no events). Set at creation by the self-service refund flow.
+  // The exemption lifts when the customer sends their first typed message
+  // in the thread (a human needs to see it) — see flipRefundTicket.
   intercomExempt      Boolean    @default(false)
+  // Stamped when the customer's first typed message flipped a refund ticket
+  // from Discord-only to mirrored. Guards the boot backfill (ensureSchema)
+  // from re-exempting the row, and marks the flip for the crash-heal retrigger.
+  intercomExemptLiftedAt DateTime?
   statusTagId         String?
   statusTag           StatusTag? @relation(fields: [statusTagId], references: [id])
   // Status the ticket had before the last status change (plain id, no FK — resolved via

@@ -250,11 +250,12 @@ export function buildRootPanel(stripe: StripeClient): Panel {
       ),
       buttonRow(
         btn("billadmin_dp_hub", "Disputes", ButtonStyle.Primary),
+        btn("billadmin_apr_list:0", "Approvals", ButtonStyle.Primary),
         btn("billadmin_bm_list", "Bookmarks", ButtonStyle.Secondary),
         btn("billadmin_jump", "Jump to ID", ButtonStyle.Secondary),
-        btn("billadmin_open:promo", "Promos", ButtonStyle.Secondary),
-        btn("billadmin_hub:business", "Business", ButtonStyle.Secondary)
+        btn("billadmin_open:promo", "Promos", ButtonStyle.Secondary)
       ),
+      buttonRow(btn("billadmin_hub:business", "Business", ButtonStyle.Secondary)),
     ],
   };
 }

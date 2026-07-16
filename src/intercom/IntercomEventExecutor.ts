@@ -103,12 +103,14 @@ export class IntercomEventExecutor {
   async execute(threadId: string, type: OutboxEventType, payload: unknown, beat?: () => void): Promise<void> {
     switch (type) {
       case "ensure": {
-        // Refund tickets are never mirrored (emit-layer gate); the ONE event
-        // that reaches this executor for them anyway is the ticket workflow's
-        // creation-synthesized ensure — short-circuit it as a success so the
-        // pump drains without creating anything. Payloads composed since the
-        // per-ticket flag carry it resolved; stale queued payloads fall back
-        // to the legacy (categoryId, question) refund predicate inside.
+        // Exempt refund tickets aren't mirrored (emit-layer gate); the ONE
+        // event that reaches this executor for them anyway is the ticket
+        // workflow's creation-synthesized ensure — short-circuit it as a
+        // success so the pump drains without creating anything. Payloads
+        // composed since the per-ticket flag carry it resolved (explicit
+        // false = a flipped refund ticket, which MUST ensure); stale queued
+        // payloads without the field fall back to the legacy
+        // (categoryId, question) refund predicate inside.
         const ensurePayload = payload as EnsurePayload;
         if (ensurePayload && isIntercomExempt(ensurePayload)) {
           this.execLog.info("ensure skipped (intercom-exempt ticket)", {
@@ -586,6 +588,13 @@ export class IntercomEventExecutor {
       if (!definiteReject) return;
     }
     await this.store.deletePendingPost(pendingId).catch(() => {});
+  }
+
+  // Public seam for the Intercom canvas/panel billing actions: internal notes
+  // about queued/executed actions reuse the reserve→call→confirm echo ledger
+  // and the Operator-first authoring exactly like bridge notes.
+  async postPanelNote(threadId: string, conversationId: string, body: string): Promise<void> {
+    await this.postAdminNote(threadId, conversationId, body);
   }
 
   private async postAdminNote(

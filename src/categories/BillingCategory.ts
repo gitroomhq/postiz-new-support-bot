@@ -24,8 +24,9 @@ import { TicketStore } from "../bot/TicketStore";
 import { AuditLogger } from "../bot/AuditLogger";
 import { EscalationTierStore } from "../config/EscalationTierStore";
 import { BlockStore } from "../bot/billing/BlockStore";
+import { RefundCoreService } from "../bot/billing/RefundCoreService";
 import { log } from "../util/logger";
-import { metricCount, metricDistribution } from "../util/instrument";
+import { metricCount } from "../util/instrument";
 import { exportBillingEvent } from "../metrics/MetricsExporter";
 import type { TemporalProducers } from "../temporal/producers";
 import type { RefundOutcome, RefundWorkflowInput } from "../temporal/types";
@@ -48,108 +49,35 @@ export class BillingCategory extends BaseCategory {
     private ticketStore: TicketStore,
     private audit: AuditLogger,
     private tierStore: EscalationTierStore,
-    private blockStore: BlockStore
+    private blockStore: BlockStore,
+    private refundCore: RefundCoreService
   ) {
     super();
   }
 
-  // Temporal seam: when active, the money movement runs inside the
-  // refundWorkflow (workflowId refund-{chargeId} = one more idempotency layer)
-  // via the executeRefundCore activity below. Interactive wrappers stay here.
-  private temporalProducers: TemporalProducers | null = null;
-
+  // Temporal seam forwarding: the refund core moved to RefundCoreService (so
+  // the Intercom canvas/panel shares the exact same path); the seam call site
+  // in index.ts stays untouched.
   setTemporalProducers(producers: TemporalProducers): void {
-    this.temporalProducers = producers;
+    this.refundCore.setTemporalProducers(producers);
   }
 
   // Routes the refund core through Temporal when active (null result =
   // Temporal unreachable → run in-process, exactly the legacy behavior).
   private async runRefundCore(input: RefundWorkflowInput): Promise<RefundOutcome> {
-    if (this.temporalProducers?.enabled()) {
-      const viaWorkflow = await this.temporalProducers.executeRefund(input);
-      if (viaWorkflow != null) return viaWorkflow;
-    }
-    return this.executeRefundCore(input);
+    return this.refundCore.run(input);
   }
 
-  // The money movement shared by the self-service confirm and /charge approve
-  // — ALSO the body of the Temporal refundWorkflow's activity. Idempotency:
-  // the BillingAction unique-index claim (first, before any Stripe call) and
-  // Stripe idempotency keys; "money moved → lock stays" is preserved verbatim.
+  // One-line delegate so the Temporal activity wiring (activities/index.ts →
+  // billingCategory.executeRefundCore) stays untouched.
   async executeRefundCore(input: RefundWorkflowInput): Promise<RefundOutcome> {
-    const { customerId, chargeId, subscriptionId, threadId } = input;
-    // Claim the charge BEFORE calling Stripe — the unique index on the
-    // billing-action row makes exactly one confirm win.
-    if (!(await this.sessionStore.claimBillingAction(customerId, chargeId, "refund"))) {
-      return { outcome: "already_processed" };
-    }
-
-    let refund: { refundId: string; amount: number; currency: string };
-    try {
-      refund = await this.stripeClient.refundCharge(chargeId, `refund-${chargeId}`);
-    } catch (error) {
-      billingLog.error("refund failed", error, { "stripe.charge_id": chargeId });
-      metricCount("billing.refunds", 1, { outcome: "failed" });
-      // Release the lock so the flow can retry; the idempotency key makes a
-      // succeeded-at-Stripe retry return the original refund, not a second one.
-      await this.sessionStore.releaseBillingAction(chargeId).catch(() => {});
-      return { outcome: "refund_failed", error: error instanceof Error ? error.message : String(error) };
-    }
-
-    // Money has moved: from here on the lock stays no matter what.
-    let cancelFailed = false;
-    let cancelledSubscriptionId: string | null = null;
-    try {
-      if (subscriptionId) {
-        await this.stripeClient.cancelSubscription(subscriptionId);
-        cancelledSubscriptionId = subscriptionId;
-      } else {
-        const session = await this.sessionStore.getSession(customerId);
-        if (session?.stripeCustomerId) {
-          const cancelled = await this.stripeClient.cancelSoleActiveSubscription(session.stripeCustomerId);
-          if (cancelled && "ambiguous" in cancelled) {
-            // The charge couldn't be tied to a subscription and the customer
-            // has several active — don't guess which to cancel; hand to staff.
-            cancelFailed = true;
-          } else {
-            cancelledSubscriptionId = cancelled?.subscriptionId ?? null;
-          }
-        }
-      }
-    } catch (error) {
-      // Money moved but the cancel didn't — error level: staff must follow up.
-      billingLog.error("subscription cancel failed after refund", error, {
-        "stripe.charge_id": chargeId,
-        "stripe.subscription_id": subscriptionId ?? "",
-      });
-      cancelFailed = true;
-    }
-
-    billingLog.info("billing.refund.processed", {
-      "stripe.charge_id": chargeId,
-      "stripe.refund_id": refund.refundId,
-      "refund.amount": refund.amount,
-      "refund.currency": refund.currency,
-      "stripe.subscription_id": cancelledSubscriptionId ?? "",
-      "refund.cancel_failed": cancelFailed,
-      "discord.user_id": customerId,
-    });
-    metricCount("billing.refunds", 1, { outcome: "processed" });
-    metricDistribution("billing.refund_amount", refund.amount, { currency: refund.currency });
-    exportBillingEvent({
-      event: "refund",
-      amountMinor: refund.amount,
-      currency: refund.currency,
-      chargeId,
-      threadId,
-    });
-
-    return { outcome: "ok", ...refund, cancelFailed, cancelledSubscriptionId };
+    return this.refundCore.executeRefundCore(input);
   }
 
   // Staff role for the blocked-charge review ping — the ONE surviving Discord
-  // staff ping: refund tickets are never mirrored to Intercom, and the mention
-  // is also what pulls staff into the private thread so /charge works.
+  // staff ping: refund tickets are Discord-only until the customer types
+  // (flipRefundTicket), and the mention is also what pulls staff into the
+  // private thread so /charge works.
   private staffPingRoleFor(): string | null {
     return this.tierStore.newTicketRoleId(this.settingsStore.supportRoleId());
   }
@@ -266,9 +194,11 @@ export class BillingCategory extends BaseCategory {
       });
 
       await thread.members.add(interaction.user.id);
-      // intercomExempt: refund threads live Discord-only (self-service +
-      // /charge) — the exact question string doubles as the legacy-ticket
-      // match in ensureSchema's backfill, so keep both in sync.
+      // intercomExempt: refund threads start Discord-only (self-service +
+      // /charge) and flip to mirrored when the customer sends a typed message
+      // — the exact question string doubles as the legacy-ticket match in
+      // ensureSchema's backfill AND the flip trigger predicate, so keep them
+      // in sync.
       await ctx.onTicketCreated(thread, interaction.user.id, interaction.user.displayName, "Refund request", {
         intercomExempt: true,
       });

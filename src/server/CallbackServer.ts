@@ -37,6 +37,14 @@ export interface StripeWebhookRoute {
   handle: (event: Stripe.Event) => Promise<void>;
 }
 
+// Stripe panel (tokenized standalone page opened from the Intercom canvas).
+// Auth is the panel's own HMAC bearer token — verified inside the route
+// object per request, never here.
+export interface IntercomPanelRoute {
+  page: (token: string) => Promise<{ html: string } | { status: number; message: string }>;
+  api: (endpoint: string, token: string, body: unknown) => Promise<{ status: number; json: object }>;
+}
+
 type RawBodyRequest = Request & { rawBody?: Buffer };
 
 export class CallbackServer {
@@ -48,7 +56,8 @@ export class CallbackServer {
     private onAuthSuccess?: (discordUserId: string, interactionToken: string | null) => Promise<void>,
     private intercomWebhook?: IntercomWebhookRoute,
     private intercomCanvas?: IntercomCanvasRoute,
-    private stripeWebhook?: StripeWebhookRoute
+    private stripeWebhook?: StripeWebhookRoute,
+    private intercomPanel?: IntercomPanelRoute
   ) {
     this.app = express();
     this.setupRoutes();
@@ -178,6 +187,59 @@ export class CallbackServer {
         }
       );
     }
+
+    // Stripe panel: a tokenized standalone page (Canvas Kit sheets are
+    // Messenger-only, so the canvas mints a 15-min personal link instead).
+    // The page is served self-contained (inline CSS/JS, no asset routes);
+    // the strict CSP only allows same-origin XHR back to the API below.
+    this.app.get("/intercom/panel", async (req, res) => {
+      if (!this.intercomPanel) {
+        res.status(404).send("Not found");
+        return;
+      }
+      const token = typeof req.query.t === "string" ? req.query.t : "";
+      try {
+        const result = await this.intercomPanel.page(token);
+        if ("html" in result) {
+          res
+            .status(200)
+            .set({
+              "Content-Type": "text/html; charset=utf-8",
+              "Cache-Control": "no-store",
+              "X-Frame-Options": "DENY",
+              "Content-Security-Policy":
+                "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; img-src data:",
+              "Referrer-Policy": "no-referrer",
+            })
+            .send(result.html);
+        } else {
+          res.status(result.status).set("Cache-Control", "no-store").send(result.message);
+        }
+      } catch (e) {
+        httpLog.error("intercom panel page failed", e);
+        res.status(500).send("Internal error");
+      }
+    });
+
+    this.app.post(
+      "/intercom/panel/api/:endpoint",
+      express.json({ limit: "256kb" }),
+      async (req, res) => {
+        if (!this.intercomPanel) {
+          res.status(404).json({ error: "not_found" });
+          return;
+        }
+        const auth = req.header("authorization") ?? "";
+        const token = auth.startsWith("Bearer ") ? auth.slice("Bearer ".length) : "";
+        try {
+          const result = await this.intercomPanel.api(String(req.params.endpoint), token, req.body);
+          res.status(result.status).set("Cache-Control", "no-store").json(result.json);
+        } catch (e) {
+          httpLog.error("intercom panel api failed", e, { "panel.endpoint": String(req.params.endpoint) });
+          res.status(500).json({ error: "internal" });
+        }
+      }
+    );
 
     // Stripe webhook. Stripe signs with `Stripe-Signature` over the RAW body;
     // constructEvent verifies it with the endpoint's signing secret. We 200 fast

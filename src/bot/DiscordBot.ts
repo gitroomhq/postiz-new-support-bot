@@ -51,11 +51,12 @@ import { StripeWebhookHandler } from "./StripeWebhookHandler";
 import { CallbackServer } from "../server/CallbackServer";
 import { BillingCategory } from "../categories/BillingCategory";
 import { BaseCategory, TicketContext } from "../categories/BaseCategory";
-import { IntercomSyncService, BridgeSourceMessage } from "../intercom/IntercomSyncService";
+import { IntercomSyncService, BridgeSourceMessage, isIntercomExempt } from "../intercom/IntercomSyncService";
 import { IntercomStore } from "../intercom/IntercomStore";
 import { IntercomClient, IntercomHttpError } from "../intercom/IntercomClient";
 import { INTERCOM_WEBHOOK_TOPICS, IntercomWebhookHandler } from "../intercom/IntercomWebhookHandler";
 import { IntercomInboxApp } from "../intercom/IntercomInboxApp";
+import { IntercomPanel } from "../intercom/panel/IntercomPanel";
 import { BillingAdmin } from "./BillingAdmin";
 import { RADAR_LISTS, type BlockService } from "./billing/BlockService";
 import { backfillDisputeHistory } from "./billing/DisputeMonitor";
@@ -63,6 +64,12 @@ import type { DisputeStore } from "./billing/DisputeStore";
 import type { BlockKind } from "./billing/BlockStore";
 import { TICKET_ATTR_CSAT, TICKET_ATTR_CSAT_COMMENT, TICKET_ATTR_THREAD } from "../intercom/IntercomEventExecutor";
 import { IntercomMode, IntercomRegion } from "../config/SettingsStore";
+import {
+  buildActionLevelsPanel,
+  buildActionDetailPanel,
+  buildIntercomAdminsPanel,
+  mergeAdminSelection,
+} from "./configBillingActionsUi";
 import {
   log,
   appRelease,
@@ -145,7 +152,9 @@ export class DiscordBot {
       blockService: BlockService;
       stripeClient: StripeClient;
       disputeStore: DisputeStore;
-    }
+    },
+    // Stripe panel (tokenized standalone page opened from the Intercom canvas).
+    private intercomPanel?: IntercomPanel
   ) {
     this.client = new Client({
       // MessageContent is privileged (enable it in the Dev Portal too) — without it
@@ -385,10 +394,34 @@ export class DiscordBot {
     // problem never touches the Discord flow.
     const member = message.member ?? (await message.guild?.members.fetch(message.author.id).catch(() => null)) ?? null;
     const isStaff = !!member && this.isStaffMember(member);
-    safe(this.intercomSync.onHumanMessage(ticket, this.toBridgeMessage(message, member), isStaff), "intercom-sync", {
-      "ticket.thread_id": ticket.threadId,
-      "sync.event": "human_message",
-    });
+    if (await this.isRefundFlipCandidate(ticket, message)) {
+      // Discord-only refund ticket + the customer typed: flip it to mirrored
+      // (ensure → context note → transcript → this message).
+      safe(
+        this.intercomSync
+          .flipRefundTicket(ticket, this.toBridgeMessage(message, member), () =>
+            this.fetchAllThreadMessages(message.channel as ThreadChannel)
+          )
+          .then((result) => {
+            if (result === "flipped") {
+              void this.audit.log({
+                title: "🔀 Refund ticket flipped to Intercom",
+                severity: "info",
+                actor: "Automatic",
+                threadId: ticket.threadId,
+                fields: [{ name: "Trigger", value: "Customer sent a typed message", inline: false }],
+              });
+            }
+          }),
+        "intercom-sync",
+        { "ticket.thread_id": ticket.threadId, "sync.event": "refund_flip" }
+      );
+    } else {
+      safe(this.intercomSync.onHumanMessage(ticket, this.toBridgeMessage(message, member), isStaff), "intercom-sync", {
+        "ticket.thread_id": ticket.threadId,
+        "sync.event": "human_message",
+      });
+    }
 
     // Nudge the ticket workflow (re-close deadline push, retention
     // freshness) whenever Temporal is configured — a paused worker just
@@ -434,6 +467,27 @@ export class DiscordBot {
         });
       }
     }
+  }
+
+  // Refund-flip trigger: the ticket's CUSTOMER (never staff — user decision),
+  // a non-empty TYPED text (attachment-only doesn't count), an open
+  // refund-shaped ticket, bridge enabled. Two true-branches: the normal
+  // exempt→flip, and the crash-heal retrigger (exemption lifted but the
+  // transcript enqueue never happened — process died between lift and
+  // enqueue). The category/question check short-circuits everything else, so
+  // the two DB probes only ever run inside that tiny crash-heal window.
+  private async isRefundFlipCandidate(ticket: TicketWithTag, message: Message): Promise<boolean> {
+    if (ticket.categoryId !== "billing" || ticket.question !== "Refund request") return false;
+    if (ticket.closed) return false;
+    if (!ticket.customerId || message.author.id !== ticket.customerId) return false;
+    if (!message.content.trim()) return false;
+    if (!this.intercomSync.enabled()) return false;
+    if (isIntercomExempt(ticket)) return true;
+    return (
+      ticket.intercomExemptLiftedAt != null &&
+      !(await this.intercomStore.getLink(ticket.threadId)) &&
+      !(await this.intercomStore.hasBackfillClaim(ticket.threadId))
+    );
   }
 
   // A thread was manually locked/archived in Discord: mirror it as a status change.
@@ -1058,6 +1112,35 @@ export class DiscordBot {
 
     if (interaction.customId.startsWith("config_intercom_")) {
       await this.handleIntercomSelect(interaction);
+      return;
+    }
+
+    // Intercom billing actions: pick an action → per-action level panel.
+    if (interaction.customId.startsWith("config_bact_pick:")) {
+      if (!this.isAdmin(interaction)) {
+        await interaction.reply({ embeds: [makeEmbed("Administrator permission required.", COLORS.danger)], flags: 64 });
+        return;
+      }
+      const page = parseInt(interaction.customId.split(":")[1], 10) || 0;
+      await interaction.update(buildActionDetailPanel(this.settingsStore, interaction.values[0], page));
+      return;
+    }
+
+    // Intercom billing admins: per-page multi-select merge.
+    if (interaction.customId.startsWith("config_badm_pick:")) {
+      if (!this.isAdmin(interaction)) {
+        await interaction.reply({ embeds: [makeEmbed("Administrator permission required.", COLORS.danger)], flags: 64 });
+        return;
+      }
+      const page = parseInt(interaction.customId.split(":")[1], 10) || 0;
+      await interaction.deferUpdate();
+      const teammates = await this.intercomClient.listAdmins().catch(() => null);
+      if (teammates) {
+        const merged = mergeAdminSelection(this.settingsStore, teammates, page, interaction.values);
+        await this.settingsStore.updateIntercomPanelAdmins(merged);
+        this.auditConfig(interaction, `Intercom billing admins → ${merged.length ? merged.map((a) => a.name).join(", ") : "none"}`);
+      }
+      await interaction.editReply(buildIntercomAdminsPanel(this.settingsStore, teammates, page));
       return;
     }
 
@@ -1725,6 +1808,8 @@ export class DiscordBot {
       new ButtonBuilder().setCustomId("config_disputes").setLabel("Disputes").setStyle(ButtonStyle.Primary)
     );
     const buttons2 = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId("config_bact").setLabel("Intercom Actions").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("config_badm").setLabel("Intercom Admins").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("config_billing_clear_channel").setLabel("Clear Channel").setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId("config_reporting").setLabel("Back").setStyle(ButtonStyle.Secondary)
     );
@@ -3456,6 +3541,32 @@ export class DiscordBot {
 
     if (id === "config_billing") {
       await interaction.update(this.buildBillingPanel());
+      return;
+    }
+
+    // Intercom billing-action access levels (canvas/panel).
+    if (id === "config_bact" || id.startsWith("config_bact_page:")) {
+      const page = id === "config_bact" ? 0 : parseInt(id.split(":")[1], 10) || 0;
+      await interaction.update(buildActionLevelsPanel(this.settingsStore, page));
+      return;
+    }
+    if (id.startsWith("config_bact_set:")) {
+      const [, key, level, pageRaw] = id.split(":");
+      if (level === "none" || level === "approval" || level === "all") {
+        await this.settingsStore.updateBillingActionLevel(key, level);
+        this.auditConfig(interaction, `Intercom billing action ${key} → ${level}`);
+      }
+      await interaction.update(buildActionDetailPanel(this.settingsStore, key, parseInt(pageRaw, 10) || 0));
+      return;
+    }
+
+    // Intercom billing admins (teammate picker).
+    if (id === "config_badm" || id.startsWith("config_badm_page:")) {
+      const page = id === "config_badm" ? 0 : parseInt(id.split(":")[1], 10) || 0;
+      // The teammate list comes from the Intercom API — defer, then render.
+      await interaction.deferUpdate();
+      const teammates = await this.intercomClient.listAdmins().catch(() => null);
+      await interaction.editReply(buildIntercomAdminsPanel(this.settingsStore, teammates, page));
       return;
     }
 
@@ -6220,7 +6331,13 @@ export class DiscordBot {
         getSecret: () => this.stripeWebhook.getSecret(),
         constructEvent: (raw, sig, secret) => this.stripeWebhook.constructEvent(raw, sig, secret),
         handle: (event) => this.stripeWebhook.handle(event),
-      }
+      },
+      this.intercomPanel
+        ? {
+            page: (token) => this.intercomPanel!.page(token),
+            api: (endpoint, token, body) => this.intercomPanel!.api(endpoint, token, body),
+          }
+        : undefined
     );
     callbackServer.start();
   }

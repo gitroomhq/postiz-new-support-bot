@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import { Prisma, PrismaClient, BotSettings, StatusTag } from "../generated/prisma/client";
 import type { SentryRuntimeConfig } from "../util/logger";
 import type { InfluxRuntimeConfig } from "../metrics/InfluxWriter";
@@ -8,6 +9,11 @@ export type ReminderTarget = "SUPPORT" | "CUSTOMER";
 
 export type IntercomMode = "none" | "push" | "bi";
 export type IntercomRegion = "us" | "eu" | "au";
+
+// Access level for one canvas/panel billing action: "none" disables it for
+// EVERYONE (admins included), "approval" lets agents queue it for admin
+// approval (admins execute directly), "all" lets agents execute directly too.
+export type BillingActionLevel = "none" | "approval" | "all";
 
 // `--effort` levels accepted by the Claude CLI. Stored free-text in BotSettings
 // but coerced on read so a bad /config value can never break the spawn.
@@ -544,6 +550,79 @@ export class SettingsStore {
     } catch {
       return null;
     }
+  }
+
+  // ---- Intercom billing actions (canvas approve/deny + Stripe panel) ----
+
+  // Intercom teammates who count as billing admins for canvas/panel actions
+  // (names snapshotted for display; ids are the authority).
+  intercomPanelAdmins(): Array<{ id: string; name: string }> {
+    const raw = this.settings.intercomPanelAdminsJson as unknown;
+    if (!Array.isArray(raw)) return [];
+    const out: Array<{ id: string; name: string }> = [];
+    for (const entry of raw) {
+      if (entry && typeof entry === "object" && typeof (entry as { id?: unknown }).id === "string") {
+        const id = (entry as { id: string }).id;
+        const name = (entry as { name?: unknown }).name;
+        out.push({ id, name: typeof name === "string" && name ? name : id });
+      }
+    }
+    return out;
+  }
+
+  isIntercomPanelAdmin(adminId: string): boolean {
+    return this.intercomPanelAdmins().some((a) => a.id === adminId);
+  }
+
+  async updateIntercomPanelAdmins(admins: Array<{ id: string; name: string }>): Promise<void> {
+    this.settings = await this.prisma.botSettings.update({
+      where: { id: "global" },
+      data: { intercomPanelAdminsJson: admins },
+    });
+  }
+
+  // Raw per-action level map ({ "<actionKey>": "none" | "approval" | "all" }).
+  billingActionLevels(): Record<string, string> {
+    const raw = this.settings.billingActionLevelsJson as unknown;
+    if (raw && typeof raw === "object" && !Array.isArray(raw)) return raw as Record<string, string>;
+    return {};
+  }
+
+  // Coerced level for one action; a missing/invalid entry falls back to the
+  // action's registry default (safety: a bad /config value can never widen
+  // access past the registry default).
+  billingActionLevel(key: string, registryDefault: BillingActionLevel): BillingActionLevel {
+    const v = this.billingActionLevels()[key];
+    return v === "none" || v === "approval" || v === "all" ? v : registryDefault;
+  }
+
+  async updateBillingActionLevel(key: string, level: BillingActionLevel): Promise<void> {
+    // Read-modify-write of the single-row JSON map — contention-free in
+    // practice (config edits are admin-manual).
+    const map = { ...this.billingActionLevels(), [key]: level };
+    this.settings = await this.prisma.botSettings.update({
+      where: { id: "global" },
+      data: { billingActionLevelsJson: map },
+    });
+  }
+
+  // Panel-token HMAC key: machine-generated, encrypted with the LOCAL crypto
+  // key (deliberately NOT vault-routed — it signs short-lived links, and
+  // rotation is just clearing the column). Never displayed or echoed.
+  panelTokenSecret(): string | null {
+    const raw = this.settings.panelTokenSecret;
+    return raw ? decryptSecret(raw) : null;
+  }
+
+  async ensurePanelTokenSecret(): Promise<string> {
+    const existing = this.panelTokenSecret();
+    if (existing) return existing;
+    const secret = randomBytes(32).toString("hex");
+    this.settings = await this.prisma.botSettings.update({
+      where: { id: "global" },
+      data: { panelTokenSecret: encryptSecret(secret) },
+    });
+    return secret;
   }
 
   // ---- Dispute management (/config → Billing → Disputes) ----

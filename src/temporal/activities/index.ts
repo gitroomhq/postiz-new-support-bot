@@ -318,10 +318,12 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
         if (!thread) {
           await ticketStore.close(threadId);
         } else if (!thread.archived && !thread.locked) {
-          // Intercom-exempt tickets (self-serve refund flow & co) never have an
-          // agent working them — the customer drives everything, so they always
-          // use the customer-waiting machinery regardless of the shared tag's
-          // reminderTarget (and never attempt agent notes).
+          // Intercom-exempt tickets (self-serve refund flow & co) have no
+          // agent working them — the customer drives everything, so they
+          // always use the customer-waiting machinery regardless of the shared
+          // tag's reminderTarget (and never attempt agent notes). A flipped
+          // refund ticket (customer typed → mirrored, flag now false) leaves
+          // this special case and rejoins the normal reminder machinery.
           const target =
             isIntercomExempt(ticket) || tag.reminderTarget === "CUSTOMER" ? "CUSTOMER" : "SUPPORT";
           if (!(target === "CUSTOMER" && !ticket.customerId)) {

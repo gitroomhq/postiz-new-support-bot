@@ -1,5 +1,4 @@
 import type { SettingsStore } from "../config/SettingsStore";
-import type { AuditLogger } from "../bot/AuditLogger";
 import type { IntercomClient } from "./IntercomClient";
 import type { IntercomStore } from "./IntercomStore";
 import type { InactivitySweepResult } from "../temporal/types";
@@ -14,7 +13,7 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 const WRITE_SPACING_MS = 400;
 // Backstop for a first run against a workspace with a deep idle backlog: the
 // sweep stops writing after this many actions and finishes on later ticks.
-// Logged + audited when hit — never a silent cap.
+// Logged when hit — never a silent cap.
 const MAX_WRITES_PER_SWEEP = 100;
 
 // Default sweep copy; /config text overrides ({days}/{team} placeholders)
@@ -42,8 +41,7 @@ export class InactivitySweeper {
   constructor(
     private client: IntercomClient,
     private store: IntercomStore,
-    private settingsStore: SettingsStore,
-    private audit: AuditLogger
+    private settingsStore: SettingsStore
   ) {}
 
   // force = the /config "Run Now" button: bypasses the enabled toggle (a
@@ -259,23 +257,6 @@ export class InactivitySweeper {
       "sweep.forced": force,
     });
     exportIntercomSweep({ ...result, errors });
-    if (result.agentReminders + result.customerNags + result.closed > 0 || capped) {
-      void this.audit.log({
-        title: "🧹 Intercom inactivity sweep",
-        severity: capped ? "warn" : "neutral",
-        actor: "Automatic",
-        fields: [
-          { name: "Scanned", value: String(result.scanned), inline: true },
-          { name: "Agent notes", value: String(result.agentReminders), inline: true },
-          { name: "Customer nags", value: String(result.customerNags), inline: true },
-          { name: "Closed", value: String(result.closed), inline: true },
-          ...(errors > 0 ? [{ name: "Errors", value: String(errors), inline: true }] : []),
-          ...(capped
-            ? [{ name: "Note", value: `Write cap (${MAX_WRITES_PER_SWEEP}) reached — the rest lands on later ticks.`, inline: false }]
-            : []),
-        ],
-      });
-    }
     return result;
   }
 }

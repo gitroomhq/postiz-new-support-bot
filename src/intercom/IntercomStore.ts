@@ -193,6 +193,15 @@ export class IntercomStore {
     }
   }
 
+  // Cheap existence probe for the "b" transcript-enqueued marker (refund-flip
+  // crash-heal gate — avoids refetching thread history per message).
+  async hasBackfillClaim(ticketThreadId: string): Promise<boolean> {
+    const row = await this.prisma.intercomEchoPart.findUnique({
+      where: { kind_partId: { kind: "b", partId: ticketThreadId } },
+    });
+    return row != null;
+  }
+
   // Rolls back a claimBackfill when the enqueue failed partway (the ticket must
   // stay retryable).
   async releaseBackfill(ticketThreadId: string): Promise<void> {

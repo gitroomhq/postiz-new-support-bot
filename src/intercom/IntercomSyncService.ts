@@ -22,19 +22,23 @@ export interface BridgeSourceMessage {
   createdAt: Date;
 }
 
-// Discord-only tickets are NEVER mirrored to Intercom (user decision: refund
-// requests live Discord-only — self-service flow + /charge staff resolution).
-// The per-ticket flag is the primary signal, set by the refund flow at
-// creation; the (category, question) pair is the belt for rows and queued
-// ensure payloads that predate the flag. Scoping this to the flag (not the
-// whole billing category) is deliberate: "Other Billing Question" tickets DO
-// mirror.
+// Discord-only tickets are not mirrored to Intercom (user decision: refund
+// requests start Discord-only — self-service flow + /charge staff resolution —
+// and flip to mirrored when the customer sends a typed message, see
+// flipRefundTicket). The per-ticket flag is the primary signal and wins in
+// BOTH directions: true = exempt, false = mirrored (a flipped refund ticket).
+// The (category, question) pair is the belt ONLY for shapes that predate the
+// flag (queued pre-flag ensure payloads) — DB rows always carry the flag
+// (NOT NULL column, backfilled by ensureSchema), so rows are governed by the
+// flag alone. Scoping this to the flag (not the whole billing category) is
+// deliberate: "Other Billing Question" tickets DO mirror.
 export function isIntercomExempt(shape: {
   intercomExempt?: boolean | null;
   categoryId?: string | null;
   question?: string | null;
 }): boolean {
-  return shape.intercomExempt === true || (shape.categoryId === "billing" && shape.question === "Refund request");
+  if (typeof shape.intercomExempt === "boolean") return shape.intercomExempt;
+  return shape.categoryId === "billing" && shape.question === "Refund request";
 }
 
 export const AGENT_WARNING_TEXT =
@@ -65,6 +69,11 @@ export class IntercomSyncService {
   private customerInfoResolver:
     | ((userId: string) => Promise<{ displayName: string | null; avatarUrl: string | null } | null>)
     | null = null;
+  // Minor-unit → human amount for the refund-flip context note; bound from
+  // index.ts to StripeClient.formatAmount (zero-decimal aware). The fallback
+  // only runs if the flip fires before the bind.
+  private amountFormatter: (amountMinor: number, currency: string) => string = (a, c) =>
+    `${(a / 100).toFixed(2)} ${c.toUpperCase()}`;
 
   constructor(
     private settingsStore: SettingsStore,
@@ -85,6 +94,10 @@ export class IntercomSyncService {
     resolver: (userId: string) => Promise<{ displayName: string | null; avatarUrl: string | null } | null>
   ): void {
     this.customerInfoResolver = resolver;
+  }
+
+  setAmountFormatter(fmt: (amountMinor: number, currency: string) => string): void {
+    this.amountFormatter = fmt;
   }
 
   // Temporal seam: composed events are signalled into the per-ticket
@@ -140,9 +153,10 @@ export class IntercomSyncService {
     return this.settingsStore.intercomMode() !== "none" && this.settingsStore.intercomConfigured();
   }
 
-  // Exemption gate: refund-request tickets live Discord-only (self-service +
-  // /charge) and are never mirrored — no conversation, no ticket, no events.
-  // Applied at every outbound entry point so nothing ever enqueues for them;
+  // Exemption gate: refund-request tickets start Discord-only (self-service +
+  // /charge) and are not mirrored — no conversation, no ticket, no events —
+  // until the customer's first typed message flips them (flipRefundTicket).
+  // Applied at every outbound entry point so nothing enqueues while exempt;
   // the executor's ensure short-circuit is the second belt for the
   // workflow-synthesized creation ensure.
   private mirrorable(ticket: {
@@ -176,6 +190,112 @@ export class IntercomSyncService {
       await this.ensureLink(ticket);
       await this.emit(ticket.threadId, "message", { ...composed, attachmentMode: "urls" });
     });
+  }
+
+  // Refund-ticket flip: the customer's first TYPED message converts a
+  // Discord-only refund ticket into a normally mirrored one. Runs entirely
+  // inside the per-thread chain so a burst of messages serializes: exactly one
+  // caller wins the DB lift; the transcript enqueue is separately claimed via
+  // the "b" backfill marker (crash-heal: a lost enqueue is retried by the next
+  // qualifying message — see DiscordBot.isRefundFlipCandidate). Event order
+  // through the per-ticket FIFO outbox:
+  //   ensure (explicit payload — the creation ensure was short-circuited but
+  //   latched hasIntercomLink in the workflow, so the pump would never
+  //   synthesize a head for us) → context note → prior typed messages
+  //   (chronological) → the trigger message.
+  // Returns "flipped" (this call created the sequence), "relayed" (already
+  // flipped/claimed — trigger enqueued as a normal message), or "skipped".
+  async flipRefundTicket(
+    ticket: TicketWithTag,
+    trigger: BridgeSourceMessage,
+    loadPriorMessages: () => Promise<BridgeSourceMessage[]>
+  ): Promise<"flipped" | "relayed" | "skipped"> {
+    if (!this.enabled()) return "skipped";
+    let outcome: "flipped" | "relayed" | "skipped" = "skipped";
+    await this.chained(ticket.threadId, async () => {
+      // Refetch: the chain may have queued this behind another flip attempt.
+      const fresh = await this.ticketStore.getByThreadId(ticket.threadId);
+      if (!fresh || fresh.closed) return;
+      // Winner and loser both proceed — the row is non-exempt either way.
+      await this.ticketStore.liftIntercomExempt(fresh.threadId);
+      fresh.intercomExempt = false;
+
+      // One-shot transcript guard, exactly like backfillTicket: the link only
+      // appears once the ensure DELIVERS, so the "b" claim is what stops a
+      // second rapid message from enqueueing the whole sequence again.
+      const transcriptDue =
+        !(await this.store.getLink(fresh.threadId)) && (await this.store.claimBackfill(fresh.threadId));
+
+      if (!transcriptDue) {
+        // Already flipped (or another caller claimed the sequence, queued
+        // ahead of us in the same FIFO outbox) — relay the trigger normally.
+        const composed = this.composeMessage(fresh, trigger, false);
+        if (composed) {
+          await this.ensureLink(fresh);
+          await this.emit(fresh.threadId, "message", { ...composed, attachmentMode: "urls" });
+        }
+        outcome = "relayed";
+        return;
+      }
+
+      try {
+        await this.emit(fresh.threadId, "ensure", await this.buildEnsurePayloadWithSession(fresh));
+        await this.emit(fresh.threadId, "note", { content: await this.buildRefundContextNote(fresh) });
+        const prior = await loadPriorMessages();
+        for (const message of prior) {
+          if (message.authorIsBot) continue;
+          if (message.discordMessageId === trigger.discordMessageId) continue;
+          if (message.createdAt >= trigger.createdAt) continue;
+          const composed = this.composeMessage(fresh, message, message.authorId !== fresh.customerId);
+          if (!composed) continue;
+          // Old signed CDN urls are likely expired — text links only (same
+          // rule as backfill/heal).
+          await this.emit(fresh.threadId, "message", { ...composed, attachmentMode: "links" });
+        }
+        const composedTrigger = this.composeMessage(fresh, trigger, false);
+        if (composedTrigger) {
+          await this.emit(fresh.threadId, "message", { ...composedTrigger, attachmentMode: "urls" });
+        }
+        outcome = "flipped";
+      } catch (e) {
+        // Enqueue failed partway — release the marker so the next qualifying
+        // customer message retries the sequence (delivered events stay deduped
+        // by the "m" ledger).
+        await this.store.releaseBackfill(fresh.threadId).catch(() => {});
+        throw e;
+      }
+    });
+    return outcome;
+  }
+
+  // Internal refund-state summary posted on flip, ahead of the transcript.
+  // Discord markdown — the note executor renders it to HTML. Every line is
+  // best-effort: a data gap degrades to a shorter note, never a throw.
+  private async buildRefundContextNote(ticket: TicketWithTag): Promise<string> {
+    const lines: string[] = ["💳 **Refund ticket — flipped to mirrored** (customer sent a typed message)"];
+    const review = await this.sessionStore.getChargeReviewAnyStatus(ticket.threadId).catch(() => null);
+    const action = ticket.customerId
+      ? await this.sessionStore.latestBillingActionForUserSince(ticket.customerId, ticket.createdAt).catch(() => null)
+      : null;
+
+    if (review) {
+      lines.push(`**Charge:** \`${review.chargeId}\` — ${this.amountFormatter(review.amount, review.currency)}`);
+      lines.push(`**Guardrail:** ${review.reason} — review ${review.status}`);
+    } else {
+      if (action) lines.push(`**Charge:** \`${action.stripeInvoiceId}\``);
+      lines.push("**Guardrail:** none tripped");
+    }
+
+    if (action?.action === "discount") {
+      lines.push("**Discount:** offered → accepted");
+    } else if (action?.action === "refund" || action?.action === "admin_refund") {
+      lines.push(`**Discount:** offered → declined · **Refund:** executed ${action.createdAt.toISOString().slice(0, 10)}`);
+    } else if (review) {
+      lines.push(`**Discount:** offered → declined · **Refund:** blocked, manual review ${review.status}`);
+    } else {
+      lines.push("**Discount:** offered — no decision recorded yet");
+    }
+    return lines.join("\n");
   }
 
   // Discord message edited → appended "✏️ edited" part (Intercom can't edit
@@ -371,7 +491,7 @@ export class IntercomSyncService {
     ticket: TicketWithTag,
     messages: BridgeSourceMessage[] | null // null = thread no longer exists
   ): Promise<number | null> {
-    if (!this.mirrorable(ticket)) return null; // refund tickets never bridge
+    if (!this.mirrorable(ticket)) return null; // still-exempt refund tickets don't bridge
     if (await this.store.getLink(ticket.threadId)) return null;
     if (!(await this.store.claimBackfill(ticket.threadId))) return null;
 

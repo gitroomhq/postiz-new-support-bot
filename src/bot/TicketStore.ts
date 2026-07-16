@@ -50,6 +50,18 @@ export class TicketStore {
     });
   }
 
+  // Refund-ticket flip: clears the Discord-only exemption exactly once (the
+  // intercomExempt:true guard makes concurrent messages single-winner) and
+  // stamps intercomExemptLiftedAt so ensureSchema's boot backfill never
+  // re-exempts the row. Returns true when this caller performed the lift.
+  async liftIntercomExempt(threadId: string): Promise<boolean> {
+    const result = await this.prisma.ticket.updateMany({
+      where: { threadId, intercomExempt: true },
+      data: { intercomExempt: false, intercomExemptLiftedAt: new Date() },
+    });
+    return result.count > 0;
+  }
+
   // Most recent ticket a customer opened, regardless of state (creation-cooldown check).
   async latestByCustomerId(customerId: string): Promise<{ createdAt: Date } | null> {
     return this.prisma.ticket.findFirst({

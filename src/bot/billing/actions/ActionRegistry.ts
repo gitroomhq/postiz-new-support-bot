@@ -1,0 +1,890 @@
+import type Stripe from "stripe";
+import { StripeClient } from "../../StripeClient";
+import { SessionStore } from "../../../auth/SessionStore";
+import { SettingsStore, BillingActionLevel } from "../../../config/SettingsStore";
+import { BlockService, BlockEntry } from "../BlockService";
+import { BLOCK_KINDS, type BlockKind } from "../BlockStore";
+import { RefundCoreService } from "../RefundCoreService";
+
+// Single source of truth for every canvas/panel billing action: the panel UI,
+// the canvas card, the /config levels panel and the approval executor all
+// resolve actions through this registry. Each action:
+//  - parses+validates its params (hostile input — the panel client is not
+//    trusted),
+//  - revalidates against LIVE Stripe state immediately before execution
+//    (state may have drifted between queue time and approval), including the
+//    OWNERSHIP check: the target object must belong to the conversation's
+//    Stripe customer, so a forged id can never act on another customer,
+//  - executes via the existing StripeClient/BlockService/RefundCoreService
+//    paths with their idempotency conventions.
+
+export type { BillingActionLevel };
+
+export interface ActionActor {
+  kind: "intercom" | "discord";
+  id: string;
+  name: string;
+  isAdmin: boolean;
+}
+
+export interface ActionExecCtx {
+  stripe: StripeClient;
+  sessionStore: SessionStore;
+  settingsStore: SettingsStore;
+  blockService: BlockService;
+  refundCore: RefundCoreService;
+  // Resolved server-side from the conversation link — never client-supplied.
+  stripeCustomerId: string | null;
+  conversationId: string;
+  ticketThreadId: string | null;
+  discordCustomerId: string | null;
+  actor: ActionActor;
+  // Idempotency scope: the approval id (queued path) or a per-request nonce
+  // (direct path) — folded into Stripe idempotency keys.
+  idemScope: string;
+}
+
+export type ActionParse<P> = { ok: true; params: P } | { ok: false; error: string };
+export type ActionResult = { ok: true; text: string } | { ok: false; error: string };
+
+export interface BillingActionDef<P = unknown> {
+  key: string;
+  label: string;
+  group: "Charges" | "Subscriptions" | "Invoices" | "Customer" | "Reviews";
+  // "none" disables the action for EVERYONE including admins — the default
+  // for every action except charge_review (user decision).
+  defaultLevel: BillingActionLevel;
+  // Rendered red + typed-confirm in the panel.
+  dangerous: boolean;
+  parseParams: (raw: unknown) => ActionParse<P>;
+  summarize: (params: P, stripe: StripeClient) => string;
+  // null = still executable; a string = human-readable refusal.
+  revalidate: (ctx: ActionExecCtx, params: P) => Promise<string | null>;
+  execute: (ctx: ActionExecCtx, params: P) => Promise<ActionResult>;
+}
+
+// ---- param helpers (hostile input) ----
+
+function obj(raw: unknown): Record<string, unknown> | null {
+  return raw && typeof raw === "object" && !Array.isArray(raw) ? (raw as Record<string, unknown>) : null;
+}
+function str(v: unknown, maxLen = 200): string | null {
+  return typeof v === "string" && v.trim() && v.length <= maxLen ? v.trim() : null;
+}
+function posInt(v: unknown): number | null {
+  return typeof v === "number" && Number.isSafeInteger(v) && v > 0 ? v : null;
+}
+function intAny(v: unknown): number | null {
+  return typeof v === "number" && Number.isSafeInteger(v) && v !== 0 ? v : null;
+}
+function idWithPrefix(v: unknown, prefix: string): string | null {
+  const s = str(v);
+  return s && s.startsWith(prefix) ? s : null;
+}
+function customerIdOf(target: { customer?: string | Stripe.Customer | Stripe.DeletedCustomer | null }): string | null {
+  const c = target.customer;
+  if (!c) return null;
+  return typeof c === "string" ? c : c.id;
+}
+function errText(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
+}
+
+// Ownership gate shared by every revalidator.
+function requireCustomer(ctx: ActionExecCtx): string | null {
+  return ctx.stripeCustomerId;
+}
+
+function fmt(stripe: StripeClient, amountMinor: number, currency: string): string {
+  return stripe.formatAmount(amountMinor, currency);
+}
+
+// ---- action definitions ----
+
+function defineAction<P>(def: BillingActionDef<P>): BillingActionDef {
+  return def as unknown as BillingActionDef;
+}
+
+interface ChargeReviewParams {
+  decision: "approve" | "deny";
+  reason?: string;
+}
+
+const chargeReview = defineAction<ChargeReviewParams>({
+  key: "charge_review",
+  label: "Charge review approve/deny",
+  group: "Reviews",
+  // User decision: the ONE action that ships enabled (agents queue, admins direct).
+  defaultLevel: "approval",
+  dangerous: true,
+  parseParams: (raw) => {
+    const o = obj(raw);
+    const decision = o && (o.decision === "approve" || o.decision === "deny") ? o.decision : null;
+    if (!decision) return { ok: false, error: "decision must be approve or deny" };
+    return { ok: true, params: { decision, reason: str(o!.reason, 400) ?? undefined } };
+  },
+  summarize: (p) => (p.decision === "approve" ? "Approve the blocked refund (refund + cancel subscription)" : "Deny the blocked refund"),
+  revalidate: async (ctx, p) => {
+    if (!ctx.ticketThreadId) return "No linked Discord ticket for this conversation.";
+    const review = await ctx.sessionStore.getPendingChargeReview(ctx.ticketThreadId);
+    if (!review) return "No pending charge review on this ticket (already resolved?).";
+    if (p.decision === "approve") {
+      const charge = await ctx.stripe.getChargeAmount(review.chargeId);
+      if (charge.refunded) return "Charge is already refunded — use Deny or let it resolve as already processed.";
+    }
+    return null;
+  },
+  execute: async (ctx, p) => {
+    const threadId = ctx.ticketThreadId!;
+    const review = await ctx.sessionStore.getPendingChargeReview(threadId);
+    if (!review) return { ok: false, error: "No pending charge review on this ticket." };
+    const reviewer = `${ctx.actor.kind}:${ctx.actor.id}`;
+    if (p.decision === "deny") {
+      await ctx.sessionStore.resolvePendingChargeReview(threadId, "DENIED", reviewer);
+      return { ok: true, text: `Refund review denied${p.reason ? ` — ${p.reason}` : ""}.` };
+    }
+    // Approve: same path as Discord /charge approve.
+    const charge = await ctx.stripe.getChargeAmount(review.chargeId).catch(() => null);
+    if (charge?.refunded) {
+      await ctx.sessionStore.resolvePendingChargeReview(threadId, "ALREADY_PROCESSED", reviewer);
+      return { ok: true, text: "Charge was already refunded — review resolved as already processed." };
+    }
+    const result = await ctx.refundCore.run({
+      customerId: review.customerId,
+      chargeId: review.chargeId,
+      subscriptionId: review.subscriptionId,
+      threadId,
+    });
+    if (result.outcome === "already_processed") {
+      await ctx.sessionStore.resolvePendingChargeReview(threadId, "ALREADY_PROCESSED", reviewer);
+      return { ok: true, text: "Refund already processed earlier — review resolved." };
+    }
+    if (result.outcome === "refund_failed") {
+      return { ok: false, error: `Refund failed: ${result.error}` };
+    }
+    await ctx.sessionStore.resolvePendingChargeReview(threadId, "APPROVED", reviewer);
+    const cancelNote = result.cancelFailed
+      ? " Subscription cancel FAILED — follow up manually."
+      : result.cancelledSubscriptionId
+        ? ` Subscription ${result.cancelledSubscriptionId} cancelled.`
+        : "";
+    return { ok: true, text: `Refund executed (${result.refundId}).${cancelNote}` };
+  },
+});
+
+interface RefundFullParams {
+  chargeId: string;
+}
+
+const refundFull = defineAction<RefundFullParams>({
+  key: "charge.refund_full",
+  label: "Full refund (+ cancel subscription)",
+  group: "Charges",
+  defaultLevel: "none",
+  dangerous: true,
+  parseParams: (raw) => {
+    const o = obj(raw);
+    const chargeId = o ? idWithPrefix(o.chargeId, "ch_") : null;
+    return chargeId ? { ok: true, params: { chargeId } } : { ok: false, error: "chargeId (ch_…) required" };
+  },
+  summarize: (p) => `Fully refund ${p.chargeId} and cancel the subscription`,
+  revalidate: async (ctx, p) => {
+    const cus = requireCustomer(ctx);
+    if (!cus) return "No linked Stripe customer.";
+    if (!ctx.discordCustomerId) return "No linked Discord customer (the refund core tracks refunds per Discord user).";
+    const charge = await ctx.stripe.getCharge(p.chargeId);
+    if (customerIdOf(charge) !== cus) return "Charge does not belong to this customer.";
+    if (charge.refunded) return "Charge is already fully refunded.";
+    return null;
+  },
+  execute: async (ctx, p) => {
+    const result = await ctx.refundCore.run({
+      customerId: ctx.discordCustomerId!,
+      chargeId: p.chargeId,
+      subscriptionId: null,
+      threadId: ctx.ticketThreadId,
+    });
+    if (result.outcome === "already_processed") return { ok: true, text: "Refund already processed earlier." };
+    if (result.outcome === "refund_failed") return { ok: false, error: `Refund failed: ${result.error}` };
+    const cancelNote = result.cancelFailed
+      ? " Subscription cancel needs manual follow-up (failed or ambiguous)."
+      : result.cancelledSubscriptionId
+        ? ` Subscription ${result.cancelledSubscriptionId} cancelled.`
+        : "";
+    return { ok: true, text: `Refunded ${fmt(ctx.stripe, result.amount, result.currency)} (${result.refundId}).${cancelNote}` };
+  },
+});
+
+interface RefundPartialParams {
+  chargeId: string;
+  amountMinor: number;
+}
+
+async function revalidatePartialRefund(ctx: ActionExecCtx, p: RefundPartialParams): Promise<string | null> {
+  const cus = requireCustomer(ctx);
+  if (!cus) return "No linked Stripe customer.";
+  const charge = await ctx.stripe.getCharge(p.chargeId);
+  if (customerIdOf(charge) !== cus) return "Charge does not belong to this customer.";
+  if (charge.refunded) return "Charge is already fully refunded.";
+  const remaining = charge.amount - (charge.amount_refunded ?? 0);
+  if (p.amountMinor > remaining) return `Amount exceeds the refundable remainder (${remaining} minor units).`;
+  return null;
+}
+
+const refundPartial = defineAction<RefundPartialParams>({
+  key: "charge.refund_partial",
+  label: "Partial refund",
+  group: "Charges",
+  defaultLevel: "none",
+  dangerous: true,
+  parseParams: (raw) => {
+    const o = obj(raw);
+    const chargeId = o ? idWithPrefix(o.chargeId, "ch_") : null;
+    const amountMinor = o ? posInt(o.amountMinor) : null;
+    if (!chargeId || !amountMinor) return { ok: false, error: "chargeId (ch_…) and positive amountMinor required" };
+    return { ok: true, params: { chargeId, amountMinor } };
+  },
+  summarize: (p) => `Partially refund ${p.chargeId} by ${p.amountMinor} minor units`,
+  revalidate: revalidatePartialRefund,
+  execute: async (ctx, p) => {
+    const refund = await ctx.stripe.refundChargeAmount(
+      p.chargeId,
+      p.amountMinor,
+      `panel-refund-${p.chargeId}-${p.amountMinor}-${ctx.idemScope}`
+    );
+    return { ok: true, text: `Refunded ${fmt(ctx.stripe, refund.amount, refund.currency)} of ${p.chargeId} (${refund.refundId}).` };
+  },
+});
+
+const refundFraud = defineAction<RefundPartialParams>({
+  key: "charge.refund_fraud",
+  label: "Refund as fraudulent",
+  group: "Charges",
+  defaultLevel: "none",
+  dangerous: true,
+  parseParams: (raw) => {
+    const o = obj(raw);
+    const chargeId = o ? idWithPrefix(o.chargeId, "ch_") : null;
+    const amountMinor = o ? posInt(o.amountMinor) : null;
+    if (!chargeId || !amountMinor) return { ok: false, error: "chargeId (ch_…) and positive amountMinor required" };
+    return { ok: true, params: { chargeId, amountMinor } };
+  },
+  summarize: (p) => `Refund ${p.amountMinor} minor units of ${p.chargeId} as FRAUDULENT (feeds Radar)`,
+  revalidate: revalidatePartialRefund,
+  execute: async (ctx, p) => {
+    const refund = await ctx.stripe.refundChargeAmount(
+      p.chargeId,
+      p.amountMinor,
+      `panel-fraudrefund-${p.chargeId}-${p.amountMinor}-${ctx.idemScope}`,
+      "fraudulent"
+    );
+    return { ok: true, text: `Refunded ${fmt(ctx.stripe, refund.amount, refund.currency)} of ${p.chargeId} as fraudulent (${refund.refundId}).` };
+  },
+});
+
+interface PaymentIntentCancelParams {
+  paymentIntentId: string;
+}
+
+const CANCELABLE_PI_STATUSES = new Set(["requires_payment_method", "requires_confirmation", "requires_action", "processing", "requires_capture"]);
+
+const paymentIntentCancel = defineAction<PaymentIntentCancelParams>({
+  key: "payment_intent.cancel",
+  label: "Cancel payment intent",
+  group: "Charges",
+  defaultLevel: "none",
+  dangerous: false,
+  parseParams: (raw) => {
+    const o = obj(raw);
+    const paymentIntentId = o ? idWithPrefix(o.paymentIntentId, "pi_") : null;
+    return paymentIntentId ? { ok: true, params: { paymentIntentId } } : { ok: false, error: "paymentIntentId (pi_…) required" };
+  },
+  summarize: (p) => `Cancel payment intent ${p.paymentIntentId}`,
+  revalidate: async (ctx, p) => {
+    const cus = requireCustomer(ctx);
+    if (!cus) return "No linked Stripe customer.";
+    const pi = await ctx.stripe.getPaymentIntent(p.paymentIntentId);
+    if (customerIdOf(pi) !== cus) return "Payment intent does not belong to this customer.";
+    if (!CANCELABLE_PI_STATUSES.has(pi.status)) return `Payment intent is ${pi.status} — not cancelable.`;
+    return null;
+  },
+  execute: async (ctx, p) => {
+    const pi = await ctx.stripe.cancelPaymentIntent(p.paymentIntentId, `panel-picancel-${p.paymentIntentId}-${ctx.idemScope}`);
+    return { ok: true, text: `Payment intent ${pi.id} cancelled (was ${fmt(ctx.stripe, pi.amount, pi.currency)}).` };
+  },
+});
+
+interface SubscriptionCancelParams {
+  subscriptionId: string;
+  when: "now" | "period_end";
+}
+
+const subscriptionCancel = defineAction<SubscriptionCancelParams>({
+  key: "subscription.cancel",
+  label: "Cancel subscription",
+  group: "Subscriptions",
+  defaultLevel: "none",
+  dangerous: true,
+  parseParams: (raw) => {
+    const o = obj(raw);
+    const subscriptionId = o ? idWithPrefix(o.subscriptionId, "sub_") : null;
+    const when = o && (o.when === "now" || o.when === "period_end") ? o.when : null;
+    if (!subscriptionId || !when) return { ok: false, error: "subscriptionId (sub_…) and when (now|period_end) required" };
+    return { ok: true, params: { subscriptionId, when } };
+  },
+  summarize: (p) => `Cancel subscription ${p.subscriptionId} ${p.when === "now" ? "immediately" : "at period end"}`,
+  revalidate: async (ctx, p) => {
+    const cus = requireCustomer(ctx);
+    if (!cus) return "No linked Stripe customer.";
+    const sub = await ctx.stripe.getSubscription(p.subscriptionId);
+    if (customerIdOf(sub) !== cus) return "Subscription does not belong to this customer.";
+    if (sub.status === "canceled") return "Subscription is already canceled.";
+    if (p.when === "period_end" && sub.cancel_at_period_end) return "Subscription is already set to cancel at period end.";
+    return null;
+  },
+  execute: async (ctx, p) => {
+    if (p.when === "now") {
+      await ctx.stripe.cancelSubscription(p.subscriptionId);
+      return { ok: true, text: `Subscription ${p.subscriptionId} cancelled immediately.` };
+    }
+    await ctx.stripe.cancelSubscriptionAtPeriodEnd(p.subscriptionId);
+    return { ok: true, text: `Subscription ${p.subscriptionId} will cancel at period end.` };
+  },
+});
+
+interface SubscriptionPauseResumeParams {
+  subscriptionId: string;
+  op: "pause" | "resume";
+}
+
+const subscriptionPauseResume = defineAction<SubscriptionPauseResumeParams>({
+  key: "subscription.pause_resume",
+  label: "Pause / resume subscription",
+  group: "Subscriptions",
+  defaultLevel: "none",
+  dangerous: false,
+  parseParams: (raw) => {
+    const o = obj(raw);
+    const subscriptionId = o ? idWithPrefix(o.subscriptionId, "sub_") : null;
+    const op = o && (o.op === "pause" || o.op === "resume") ? o.op : null;
+    if (!subscriptionId || !op) return { ok: false, error: "subscriptionId (sub_…) and op (pause|resume) required" };
+    return { ok: true, params: { subscriptionId, op } };
+  },
+  summarize: (p) => `${p.op === "pause" ? "Pause" : "Resume"} collection on ${p.subscriptionId}`,
+  revalidate: async (ctx, p) => {
+    const cus = requireCustomer(ctx);
+    if (!cus) return "No linked Stripe customer.";
+    const sub = await ctx.stripe.getSubscription(p.subscriptionId);
+    if (customerIdOf(sub) !== cus) return "Subscription does not belong to this customer.";
+    if (sub.status === "canceled") return "Subscription is canceled.";
+    if (p.op === "pause" && sub.pause_collection) return "Collection is already paused.";
+    if (p.op === "resume" && !sub.pause_collection) return "Collection is not paused.";
+    return null;
+  },
+  execute: async (ctx, p) => {
+    if (p.op === "pause") {
+      await ctx.stripe.pauseSubscription(p.subscriptionId, "void", `panel-pause-${p.subscriptionId}-${ctx.idemScope}`);
+      return { ok: true, text: `Collection paused on ${p.subscriptionId} (invoices voided while paused).` };
+    }
+    await ctx.stripe.resumeSubscription(p.subscriptionId, `panel-resume-${p.subscriptionId}-${ctx.idemScope}`);
+    return { ok: true, text: `Collection resumed on ${p.subscriptionId}.` };
+  },
+});
+
+interface SubscriptionChangePlanParams {
+  subscriptionId: string;
+  priceId: string;
+}
+
+const subscriptionChangePlan = defineAction<SubscriptionChangePlanParams>({
+  key: "subscription.change_plan",
+  label: "Change plan",
+  group: "Subscriptions",
+  defaultLevel: "none",
+  dangerous: true,
+  parseParams: (raw) => {
+    const o = obj(raw);
+    const subscriptionId = o ? idWithPrefix(o.subscriptionId, "sub_") : null;
+    const priceId = o ? idWithPrefix(o.priceId, "price_") : null;
+    if (!subscriptionId || !priceId) return { ok: false, error: "subscriptionId (sub_…) and priceId (price_…) required" };
+    return { ok: true, params: { subscriptionId, priceId } };
+  },
+  summarize: (p) => `Change ${p.subscriptionId} to price ${p.priceId} (with prorations)`,
+  revalidate: async (ctx, p) => {
+    const cus = requireCustomer(ctx);
+    if (!cus) return "No linked Stripe customer.";
+    const sub = await ctx.stripe.getSubscription(p.subscriptionId);
+    if (customerIdOf(sub) !== cus) return "Subscription does not belong to this customer.";
+    if (sub.status !== "active" && sub.status !== "trialing") return `Subscription is ${sub.status} — not changeable.`;
+    const price = await ctx.stripe.getPrice(p.priceId).catch(() => null);
+    if (!price || !price.recurring) return "Target price does not exist or is not recurring.";
+    const allowlist = ctx.settingsStore.allowedPriceIds();
+    if (allowlist.length > 0 && !allowlist.includes(p.priceId)) return "Target price is not on the plan allowlist (/config → Billing).";
+    return null;
+  },
+  execute: async (ctx, p) => {
+    const sub = await ctx.stripe.getSubscription(p.subscriptionId);
+    const itemId = sub.items.data[0]?.id;
+    if (!itemId) return { ok: false, error: "Subscription has no item to swap." };
+    await ctx.stripe.changeSubscriptionPlan(
+      { subscriptionId: p.subscriptionId, itemId, priceId: p.priceId, prorationBehavior: "create_prorations" },
+      `panel-planchange-${p.subscriptionId}-${p.priceId}-${ctx.idemScope}`
+    );
+    return { ok: true, text: `Subscription ${p.subscriptionId} moved to ${p.priceId} with prorations.` };
+  },
+});
+
+interface SubscriptionTermsParams {
+  subscriptionId: string;
+  trialEndUnix?: number;
+  quantity?: number;
+}
+
+const subscriptionTerms = defineAction<SubscriptionTermsParams>({
+  key: "subscription.terms",
+  label: "Trial end / quantity",
+  group: "Subscriptions",
+  defaultLevel: "none",
+  dangerous: false,
+  parseParams: (raw) => {
+    const o = obj(raw);
+    const subscriptionId = o ? idWithPrefix(o.subscriptionId, "sub_") : null;
+    const trialEndUnix = o ? (posInt(o.trialEndUnix) ?? undefined) : undefined;
+    const quantity = o ? (posInt(o.quantity) ?? undefined) : undefined;
+    if (!subscriptionId || (trialEndUnix == null && quantity == null)) {
+      return { ok: false, error: "subscriptionId (sub_…) and at least one of trialEndUnix/quantity required" };
+    }
+    return { ok: true, params: { subscriptionId, trialEndUnix, quantity } };
+  },
+  summarize: (p) =>
+    `Update ${p.subscriptionId}: ${[
+      p.trialEndUnix != null ? `trial end → ${new Date(p.trialEndUnix * 1000).toISOString().slice(0, 10)}` : null,
+      p.quantity != null ? `quantity → ${p.quantity}` : null,
+    ]
+      .filter(Boolean)
+      .join(", ")}`,
+  revalidate: async (ctx, p) => {
+    const cus = requireCustomer(ctx);
+    if (!cus) return "No linked Stripe customer.";
+    const sub = await ctx.stripe.getSubscription(p.subscriptionId);
+    if (customerIdOf(sub) !== cus) return "Subscription does not belong to this customer.";
+    if (sub.status === "canceled") return "Subscription is canceled.";
+    if (p.trialEndUnix != null && p.trialEndUnix * 1000 <= Date.now()) return "Trial end must be in the future.";
+    return null;
+  },
+  execute: async (ctx, p) => {
+    const done: string[] = [];
+    if (p.trialEndUnix != null) {
+      await ctx.stripe.setTrialEnd(p.subscriptionId, p.trialEndUnix, `panel-trial-${p.subscriptionId}-${p.trialEndUnix}-${ctx.idemScope}`);
+      done.push(`trial end set to ${new Date(p.trialEndUnix * 1000).toISOString().slice(0, 10)}`);
+    }
+    if (p.quantity != null) {
+      const sub = await ctx.stripe.getSubscription(p.subscriptionId);
+      const itemId = sub.items.data[0]?.id;
+      if (!itemId) return { ok: false, error: "Subscription has no item for a quantity change." };
+      await ctx.stripe.setSubscriptionQuantity(p.subscriptionId, itemId, p.quantity, "none", `panel-qty-${p.subscriptionId}-${p.quantity}-${ctx.idemScope}`);
+      done.push(`quantity set to ${p.quantity}`);
+    }
+    return { ok: true, text: `Subscription ${p.subscriptionId}: ${done.join(", ")}.` };
+  },
+});
+
+interface InvoiceCollectParams {
+  invoiceId: string;
+  op: "send" | "pay";
+}
+
+const invoiceCollect = defineAction<InvoiceCollectParams>({
+  key: "invoice.collect",
+  label: "Send / pay invoice",
+  group: "Invoices",
+  defaultLevel: "none",
+  dangerous: false,
+  parseParams: (raw) => {
+    const o = obj(raw);
+    const invoiceId = o ? idWithPrefix(o.invoiceId, "in_") : null;
+    const op = o && (o.op === "send" || o.op === "pay") ? o.op : null;
+    if (!invoiceId || !op) return { ok: false, error: "invoiceId (in_…) and op (send|pay) required" };
+    return { ok: true, params: { invoiceId, op } };
+  },
+  summarize: (p) => `${p.op === "send" ? "Send" : "Collect payment for"} invoice ${p.invoiceId}`,
+  revalidate: async (ctx, p) => {
+    const cus = requireCustomer(ctx);
+    if (!cus) return "No linked Stripe customer.";
+    const invoice = await ctx.stripe.getInvoice(p.invoiceId);
+    if (customerIdOf(invoice) !== cus) return "Invoice does not belong to this customer.";
+    if (invoice.status !== "open") return `Invoice is ${invoice.status} — only open invoices can be ${p.op === "send" ? "sent" : "paid"} (finalize drafts first).`;
+    return null;
+  },
+  execute: async (ctx, p) => {
+    if (p.op === "send") {
+      await ctx.stripe.sendInvoice(p.invoiceId, `panel-invsend-${p.invoiceId}-${ctx.idemScope}`);
+      return { ok: true, text: `Invoice ${p.invoiceId} sent to the customer.` };
+    }
+    const paid = await ctx.stripe.payInvoice(p.invoiceId, `panel-invpay-${p.invoiceId}-${ctx.idemScope}`);
+    return { ok: true, text: `Invoice ${p.invoiceId} payment attempted — status ${paid.status}.` };
+  },
+});
+
+interface InvoiceVoidParams {
+  invoiceId: string;
+  op: "void" | "uncollectible" | "delete_draft";
+}
+
+const invoiceVoid = defineAction<InvoiceVoidParams>({
+  key: "invoice.void",
+  label: "Void / uncollectible / delete draft",
+  group: "Invoices",
+  defaultLevel: "none",
+  dangerous: true,
+  parseParams: (raw) => {
+    const o = obj(raw);
+    const invoiceId = o ? idWithPrefix(o.invoiceId, "in_") : null;
+    const op = o && (o.op === "void" || o.op === "uncollectible" || o.op === "delete_draft") ? o.op : null;
+    if (!invoiceId || !op) return { ok: false, error: "invoiceId (in_…) and op (void|uncollectible|delete_draft) required" };
+    return { ok: true, params: { invoiceId, op } };
+  },
+  summarize: (p) =>
+    p.op === "void"
+      ? `Void invoice ${p.invoiceId}`
+      : p.op === "uncollectible"
+        ? `Mark invoice ${p.invoiceId} uncollectible`
+        : `Delete draft invoice ${p.invoiceId}`,
+  revalidate: async (ctx, p) => {
+    const cus = requireCustomer(ctx);
+    if (!cus) return "No linked Stripe customer.";
+    const invoice = await ctx.stripe.getInvoice(p.invoiceId);
+    if (customerIdOf(invoice) !== cus) return "Invoice does not belong to this customer.";
+    if (p.op === "delete_draft" && invoice.status !== "draft") return `Invoice is ${invoice.status} — only drafts can be deleted.`;
+    if (p.op === "void" && invoice.status !== "open" && invoice.status !== "uncollectible") return `Invoice is ${invoice.status} — only open/uncollectible invoices can be voided.`;
+    if (p.op === "uncollectible" && invoice.status !== "open") return `Invoice is ${invoice.status} — only open invoices can be marked uncollectible.`;
+    return null;
+  },
+  execute: async (ctx, p) => {
+    if (p.op === "void") {
+      await ctx.stripe.voidInvoice(p.invoiceId, `panel-invvoid-${p.invoiceId}-${ctx.idemScope}`);
+      return { ok: true, text: `Invoice ${p.invoiceId} voided.` };
+    }
+    if (p.op === "uncollectible") {
+      await ctx.stripe.markInvoiceUncollectible(p.invoiceId, `panel-invunc-${p.invoiceId}-${ctx.idemScope}`);
+      return { ok: true, text: `Invoice ${p.invoiceId} marked uncollectible.` };
+    }
+    await ctx.stripe.deleteDraftInvoice(p.invoiceId, `panel-invdel-${p.invoiceId}-${ctx.idemScope}`);
+    return { ok: true, text: `Draft invoice ${p.invoiceId} deleted.` };
+  },
+});
+
+interface InvoiceCreateDraftParams {
+  items: Array<{ description: string; amountMinor: number; currency: string }>;
+  daysUntilDue?: number;
+  finalize: boolean;
+}
+
+const invoiceCreateDraft = defineAction<InvoiceCreateDraftParams>({
+  key: "invoice.create_draft",
+  label: "Create draft invoice",
+  group: "Invoices",
+  defaultLevel: "none",
+  dangerous: false,
+  parseParams: (raw) => {
+    const o = obj(raw);
+    const rawItems = o && Array.isArray(o.items) ? o.items : null;
+    if (!rawItems || rawItems.length < 1 || rawItems.length > 10) return { ok: false, error: "items must have 1-10 entries" };
+    const items: InvoiceCreateDraftParams["items"] = [];
+    for (const entry of rawItems) {
+      const io = obj(entry);
+      const description = io ? str(io.description, 300) : null;
+      const amountMinor = io ? posInt(io.amountMinor) : null;
+      const currency = io ? str(io.currency, 3)?.toLowerCase() : null;
+      if (!description || !amountMinor || !currency || !/^[a-z]{3}$/.test(currency)) {
+        return { ok: false, error: "each item needs description, positive amountMinor and a 3-letter currency" };
+      }
+      items.push({ description, amountMinor, currency });
+    }
+    const daysUntilDue = o ? (posInt(o.daysUntilDue) ?? undefined) : undefined;
+    return { ok: true, params: { items, daysUntilDue, finalize: o?.finalize === true } };
+  },
+  summarize: (p) => `Create ${p.finalize ? "and finalize " : ""}a draft invoice with ${p.items.length} item(s)`,
+  revalidate: async (ctx) => {
+    const cus = requireCustomer(ctx);
+    if (!cus) return "No linked Stripe customer.";
+    const customer = await ctx.stripe.getCustomer(cus);
+    if (!customer || customer.deleted) return "Customer no longer exists in Stripe.";
+    return null;
+  },
+  execute: async (ctx, p) => {
+    const cus = ctx.stripeCustomerId!;
+    const invoice = await ctx.stripe.createDraftInvoice(
+      { customerId: cus, collectionMethod: "send_invoice", daysUntilDue: p.daysUntilDue },
+      `panel-invcreate-${ctx.idemScope}`
+    );
+    for (let i = 0; i < p.items.length; i++) {
+      const item = p.items[i];
+      await ctx.stripe.createInvoiceItem(
+        { customerId: cus, invoiceId: invoice.id!, amountMinor: item.amountMinor, currency: item.currency, description: item.description },
+        `panel-invitem-${i}-${ctx.idemScope}`
+      );
+    }
+    if (p.finalize) {
+      await ctx.stripe.finalizeInvoice(invoice.id!, `panel-invfin-${ctx.idemScope}`);
+      return { ok: true, text: `Invoice ${invoice.id} created and finalized (${p.items.length} item(s)).` };
+    }
+    return { ok: true, text: `Draft invoice ${invoice.id} created (${p.items.length} item(s)).` };
+  },
+});
+
+interface InvoiceCreditNoteParams {
+  invoiceId: string;
+  amountMinor: number;
+  mode: "refund" | "credit" | "out_of_band";
+  memo?: string;
+}
+
+const invoiceCreditNote = defineAction<InvoiceCreditNoteParams>({
+  key: "invoice.credit_note",
+  label: "Credit note",
+  group: "Invoices",
+  defaultLevel: "none",
+  dangerous: true,
+  parseParams: (raw) => {
+    const o = obj(raw);
+    const invoiceId = o ? idWithPrefix(o.invoiceId, "in_") : null;
+    const amountMinor = o ? posInt(o.amountMinor) : null;
+    const mode = o && (o.mode === "refund" || o.mode === "credit" || o.mode === "out_of_band") ? o.mode : "credit";
+    if (!invoiceId || !amountMinor) return { ok: false, error: "invoiceId (in_…) and positive amountMinor required" };
+    return { ok: true, params: { invoiceId, amountMinor, mode, memo: str(o!.memo, 400) ?? undefined } };
+  },
+  summarize: (p) => `Credit note on ${p.invoiceId}: ${p.amountMinor} minor units as ${p.mode}`,
+  revalidate: async (ctx, p) => {
+    const cus = requireCustomer(ctx);
+    if (!cus) return "No linked Stripe customer.";
+    const invoice = await ctx.stripe.getInvoice(p.invoiceId);
+    if (customerIdOf(invoice) !== cus) return "Invoice does not belong to this customer.";
+    try {
+      await ctx.stripe.previewCreditNote({
+        invoiceId: p.invoiceId,
+        ...(p.mode === "refund"
+          ? { refundAmountMinor: p.amountMinor }
+          : p.mode === "credit"
+            ? { creditAmountMinor: p.amountMinor }
+            : { outOfBandAmountMinor: p.amountMinor }),
+      });
+    } catch (e) {
+      return `Credit note preview failed: ${errText(e)}`;
+    }
+    return null;
+  },
+  execute: async (ctx, p) => {
+    const note = await ctx.stripe.createCreditNote(
+      { invoiceId: p.invoiceId, amountMinor: p.amountMinor, mode: p.mode, memo: p.memo },
+      `panel-creditnote-${p.invoiceId}-${p.amountMinor}-${ctx.idemScope}`
+    );
+    return { ok: true, text: `Credit note ${note.id} created on ${p.invoiceId} (${fmt(ctx.stripe, note.total, note.currency)}).` };
+  },
+});
+
+interface CustomerCouponParams {
+  subscriptionId: string;
+  promoCode?: string;
+  couponId?: string;
+}
+
+const customerCoupon = defineAction<CustomerCouponParams>({
+  key: "customer.coupon",
+  label: "Apply coupon / promo",
+  group: "Customer",
+  defaultLevel: "none",
+  dangerous: false,
+  parseParams: (raw) => {
+    const o = obj(raw);
+    const subscriptionId = o ? idWithPrefix(o.subscriptionId, "sub_") : null;
+    const promoCode = o ? (str(o.promoCode, 100) ?? undefined) : undefined;
+    const couponId = o ? (str(o.couponId, 100) ?? undefined) : undefined;
+    if (!subscriptionId || (!promoCode && !couponId)) return { ok: false, error: "subscriptionId (sub_…) and promoCode or couponId required" };
+    return { ok: true, params: { subscriptionId, promoCode, couponId } };
+  },
+  summarize: (p) => `Apply ${p.promoCode ? `promo code ${p.promoCode}` : `coupon ${p.couponId}`} to ${p.subscriptionId}`,
+  revalidate: async (ctx, p) => {
+    const cus = requireCustomer(ctx);
+    if (!cus) return "No linked Stripe customer.";
+    const sub = await ctx.stripe.getSubscription(p.subscriptionId);
+    if (customerIdOf(sub) !== cus) return "Subscription does not belong to this customer.";
+    if (sub.status !== "active" && sub.status !== "trialing") return `Subscription is ${sub.status}.`;
+    if (p.promoCode) {
+      const codes = await ctx.stripe.findPromotionCodes(p.promoCode);
+      if (!codes.some((c) => c.active)) return "Promo code not found or inactive.";
+    }
+    return null;
+  },
+  execute: async (ctx, p) => {
+    let couponId = p.couponId;
+    let label = p.couponId ?? "";
+    if (p.promoCode) {
+      const codes = await ctx.stripe.findPromotionCodes(p.promoCode);
+      const active = codes.find((c) => c.active);
+      if (!active) return { ok: false, error: "Promo code not found or inactive." };
+      const coupon = active.promotion.coupon;
+      if (!coupon) return { ok: false, error: "Promo code carries no coupon." };
+      couponId = typeof coupon === "string" ? coupon : coupon.id;
+      label = `promo ${p.promoCode}`;
+    }
+    await ctx.stripe.applyDiscountCoupon(p.subscriptionId, couponId!, `panel-coupon-${p.subscriptionId}-${couponId}-${ctx.idemScope}`);
+    return { ok: true, text: `Applied ${label || `coupon ${couponId}`} to ${p.subscriptionId}.` };
+  },
+});
+
+interface CustomerBalanceParams {
+  deltaMinor: number;
+  currency: string;
+  note?: string;
+}
+
+const customerBalance = defineAction<CustomerBalanceParams>({
+  key: "customer.balance",
+  label: "Adjust customer balance",
+  group: "Customer",
+  defaultLevel: "none",
+  dangerous: true,
+  parseParams: (raw) => {
+    const o = obj(raw);
+    const deltaMinor = o ? intAny(o.deltaMinor) : null;
+    const currency = o ? str(o.currency, 3)?.toLowerCase() : null;
+    if (!deltaMinor || !currency || !/^[a-z]{3}$/.test(currency)) {
+      return { ok: false, error: "non-zero integer deltaMinor and 3-letter currency required" };
+    }
+    return { ok: true, params: { deltaMinor, currency, note: str(o!.note, 300) ?? undefined } };
+  },
+  summarize: (p) =>
+    `${p.deltaMinor < 0 ? "Credit" : "Debit"} the customer balance by ${Math.abs(p.deltaMinor)} minor units ${p.currency.toUpperCase()}` +
+    (p.note ? ` (${p.note})` : ""),
+  revalidate: async (ctx) => {
+    const cus = requireCustomer(ctx);
+    if (!cus) return "No linked Stripe customer.";
+    const customer = await ctx.stripe.getCustomer(cus);
+    if (!customer || customer.deleted) return "Customer no longer exists in Stripe.";
+    return null;
+  },
+  execute: async (ctx, p) => {
+    const txn = await ctx.stripe.adjustCustomerBalance(
+      ctx.stripeCustomerId!,
+      p.deltaMinor,
+      p.currency,
+      p.note ?? `Support adjustment via Intercom panel (${ctx.actor.name})`,
+      `panel-balance-${p.deltaMinor}-${p.currency}-${ctx.idemScope}`
+    );
+    return { ok: true, text: `Balance adjusted by ${fmt(ctx.stripe, p.deltaMinor, p.currency)} (txn ${txn.id}).` };
+  },
+});
+
+interface CustomerPaymentMethodParams {
+  paymentMethodId: string;
+  op: "detach" | "set_default";
+}
+
+const customerPaymentMethod = defineAction<CustomerPaymentMethodParams>({
+  key: "customer.payment_method",
+  label: "Payment methods",
+  group: "Customer",
+  defaultLevel: "none",
+  dangerous: false,
+  parseParams: (raw) => {
+    const o = obj(raw);
+    const paymentMethodId = o ? idWithPrefix(o.paymentMethodId, "pm_") : null;
+    const op = o && (o.op === "detach" || o.op === "set_default") ? o.op : null;
+    if (!paymentMethodId || !op) return { ok: false, error: "paymentMethodId (pm_…) and op (detach|set_default) required" };
+    return { ok: true, params: { paymentMethodId, op } };
+  },
+  summarize: (p) => `${p.op === "detach" ? "Detach" : "Set as default"} payment method ${p.paymentMethodId}`,
+  revalidate: async (ctx, p) => {
+    const cus = requireCustomer(ctx);
+    if (!cus) return "No linked Stripe customer.";
+    const methods = await ctx.stripe.listAllPaymentMethods(cus);
+    if (!methods.some((m) => m.id === p.paymentMethodId)) return "Payment method is not attached to this customer.";
+    return null;
+  },
+  execute: async (ctx, p) => {
+    if (p.op === "detach") {
+      await ctx.stripe.detachPaymentMethod(p.paymentMethodId);
+      return { ok: true, text: `Payment method ${p.paymentMethodId} detached.` };
+    }
+    await ctx.stripe.setDefaultPaymentMethod(ctx.stripeCustomerId!, p.paymentMethodId);
+    return { ok: true, text: `Payment method ${p.paymentMethodId} set as default.` };
+  },
+});
+
+interface CustomerBlockParams {
+  reason: string;
+  cancelSubs: boolean;
+  kinds: BlockKind[];
+}
+
+const customerBlock = defineAction<CustomerBlockParams>({
+  key: "customer.block",
+  label: "Blocklist customer",
+  group: "Customer",
+  defaultLevel: "none",
+  dangerous: true,
+  parseParams: (raw) => {
+    const o = obj(raw);
+    const reason = o ? str(o.reason, 300) : null;
+    if (!reason) return { ok: false, error: "reason required" };
+    const kindsRaw = o && Array.isArray(o.kinds) ? o.kinds : ["customer_id", "email"];
+    const kinds = kindsRaw.filter((k): k is BlockKind => (BLOCK_KINDS as string[]).includes(k as string));
+    if (kinds.length === 0) return { ok: false, error: "at least one valid kind required" };
+    return { ok: true, params: { reason, cancelSubs: o?.cancelSubs === true, kinds } };
+  },
+  summarize: (p) => `Blocklist the customer (${p.kinds.join(", ")})${p.cancelSubs ? " and cancel all subscriptions" : ""} — ${p.reason}`,
+  revalidate: async (ctx) => {
+    const cus = requireCustomer(ctx);
+    if (!cus) return "No linked Stripe customer.";
+    const customer = await ctx.stripe.getCustomer(cus);
+    if (!customer || customer.deleted) return "Customer no longer exists in Stripe.";
+    return null;
+  },
+  execute: async (ctx, p) => {
+    const cus = ctx.stripeCustomerId!;
+    const customer = await ctx.stripe.getCustomer(cus);
+    const entries: BlockEntry[] = [];
+    if (p.kinds.includes("customer_id")) entries.push({ kind: "customer_id", value: cus });
+    if (p.kinds.includes("email") && customer && !customer.deleted && customer.email) {
+      entries.push({ kind: "email", value: customer.email });
+    }
+    if (entries.length === 0) return { ok: false, error: "No blockable identifiers resolved (customer has no email?)." };
+    const results = await ctx.blockService.block(entries, {
+      reason: p.reason,
+      source: "manual",
+      actorId: ctx.actor.id,
+      actorName: ctx.actor.name,
+      customerId: cus,
+      cancelSubs: p.cancelSubs,
+    });
+    const lines = results.map((r) =>
+      r.ok ? `${r.kind}: ${r.alreadyBlocked ? "already blocked" : "blocked"}${r.cancelledSubs?.length ? `, cancelled ${r.cancelledSubs.length} sub(s)` : ""}` : `${r.kind}: FAILED (${r.error})`
+    );
+    return { ok: true, text: `Blocklist result — ${lines.join("; ")}.` };
+  },
+});
+
+export const BILLING_ACTIONS: BillingActionDef[] = [
+  chargeReview,
+  refundFull,
+  refundPartial,
+  refundFraud,
+  paymentIntentCancel,
+  subscriptionCancel,
+  subscriptionPauseResume,
+  subscriptionChangePlan,
+  subscriptionTerms,
+  invoiceCollect,
+  invoiceVoid,
+  invoiceCreateDraft,
+  invoiceCreditNote,
+  customerCoupon,
+  customerBalance,
+  customerPaymentMethod,
+  customerBlock,
+];
+
+export function actionByKey(key: string): BillingActionDef | null {
+  return BILLING_ACTIONS.find((a) => a.key === key) ?? null;
+}

@@ -17,6 +17,11 @@ const EXPECTED_COLUMNS: Record<string, string[]> = {
     "id", "threadId", "chargeId", "subscriptionId", "customerId", "amount", "currency", "reason", "status",
     "reviewerId", "resolvedAt", "createdAt",
   ],
+  billing_approvals: [
+    "id", "actionKey", "paramsJson", "summary", "conversationId", "ticketThreadId", "stripeCustomerId",
+    "requestedById", "requestedByName", "status", "reviewerId", "reviewerName", "claimedAt", "resultText",
+    "errorText", "expiresAt", "resolvedAt", "createdAt",
+  ],
   pending_auths: ["id", "state", "discordUserId", "channelId", "interactionToken", "createdAt"],
   bot_settings: [
     "id", "threadsChannelId", "supportRoleId", "githubRepo", "aiSolveEnabled", "aiCommandsEnabled", "backfillDone",
@@ -48,7 +53,7 @@ const EXPECTED_COLUMNS: Record<string, string[]> = {
     "radarListCardId", "radarListEmailId", "radarListCustomerId", "radarListIpId",
     "inactivityEnabled", "inactivityAgentWaitDays", "inactivityCustomerWaitDays", "inactivityNagsBeforeClose",
     "inactivityNagText", "inactivityAgentNoteText", "refundMaxChargeAgeDays",
-    "agentRipMigratedAt", "updatedAt",
+    "agentRipMigratedAt", "intercomPanelAdminsJson", "billingActionLevelsJson", "panelTokenSecret", "updatedAt",
   ],
   status_tags: [
     "id", "emoji", "label", "isInitial", "closesThread", "reminderEnabled", "reminderDays", "reminderTarget",
@@ -59,7 +64,7 @@ const EXPECTED_COLUMNS: Record<string, string[]> = {
     "id", "threadId", "channelId", "customerId", "customerDisplayName", "categoryId", "statusTagId", "prevStatusTagId",
     "escalationTierId", "lastStatusChangeAt", "lastReminderAt", "reminderCount", "remindersPaused", "closed", "closedAt",
     "recloseAt", "question", "aiAnswer", "firstResponseAt", "csatScore", "csatComment", "csatPromptedAt", "csatRatedAt",
-    "createdAt", "intercomExempt",
+    "createdAt", "intercomExempt", "intercomExemptLiftedAt",
   ],
   ticket_notes: ["id", "ticketThreadId", "authorId", "authorName", "text", "createdAt"],
   ticket_tag_changes: [

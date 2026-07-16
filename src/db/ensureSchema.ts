@@ -627,8 +627,13 @@ const STATEMENTS: string[] = [
   // Discord-only). The UPDATE backfills pre-flag refund threads — the refund
   // flow always stamps question 'Refund request' — and converges to a no-op.
   `ALTER TABLE "tickets" ADD COLUMN IF NOT EXISTS "intercomExempt" BOOLEAN NOT NULL DEFAULT false`,
+  // Flip stamp — must exist BEFORE the guarded backfill UPDATE below. The
+  // IS NULL guard keeps flipped tickets (customer typed → mirrored) from
+  // being re-exempted on every boot.
+  `ALTER TABLE "tickets" ADD COLUMN IF NOT EXISTS "intercomExemptLiftedAt" TIMESTAMP(3)`,
   `UPDATE "tickets" SET "intercomExempt" = true
-    WHERE "categoryId" = 'billing' AND "question" = 'Refund request' AND "intercomExempt" = false`,
+    WHERE "categoryId" = 'billing' AND "question" = 'Refund request' AND "intercomExempt" = false
+      AND "intercomExemptLiftedAt" IS NULL`,
   // Refund eligibility guardrail: max charge age for self-service refunds
   // (DEFAULT backfills the existing settings row → live at 31d on deploy).
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "refundMaxChargeAgeDays" INTEGER DEFAULT 31`,
@@ -640,6 +645,34 @@ const STATEMENTS: string[] = [
   `ALTER TABLE "status_tags" ADD COLUMN IF NOT EXISTS "autoCloseMessage" TEXT`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "inactivityNagText" TEXT`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "inactivityAgentNoteText" TEXT`,
+  // Intercom billing actions (canvas approve/deny + Stripe panel): approval
+  // queue + per-action access levels + panel admin list + panel token key.
+  `CREATE TABLE IF NOT EXISTS "billing_approvals" (
+    "id" TEXT NOT NULL,
+    "actionKey" TEXT NOT NULL,
+    "paramsJson" JSONB NOT NULL,
+    "summary" TEXT NOT NULL,
+    "conversationId" TEXT NOT NULL,
+    "ticketThreadId" TEXT,
+    "stripeCustomerId" TEXT,
+    "requestedById" TEXT NOT NULL,
+    "requestedByName" TEXT NOT NULL,
+    "status" TEXT NOT NULL DEFAULT 'PENDING',
+    "reviewerId" TEXT,
+    "reviewerName" TEXT,
+    "claimedAt" TIMESTAMP(3),
+    "resultText" TEXT,
+    "errorText" TEXT,
+    "expiresAt" TIMESTAMP(3) NOT NULL,
+    "resolvedAt" TIMESTAMP(3),
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT "billing_approvals_pkey" PRIMARY KEY ("id")
+  )`,
+  `CREATE INDEX IF NOT EXISTS "billing_approvals_status_createdAt_idx" ON "billing_approvals"("status", "createdAt")`,
+  `CREATE INDEX IF NOT EXISTS "billing_approvals_conversationId_status_idx" ON "billing_approvals"("conversationId", "status")`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "intercomPanelAdminsJson" JSONB`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "billingActionLevelsJson" JSONB`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "panelTokenSecret" TEXT`,
 ];
 
 export async function ensureSchema(prisma: PrismaClient): Promise<void> {
