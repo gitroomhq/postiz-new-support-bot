@@ -657,6 +657,21 @@ export class SettingsStore {
     return this.settings.panelTokenEpoch;
   }
 
+  // Admin web-panel (/config + /intercom) revocation epoch — a separate lever
+  // from panelTokenEpoch so "Revoke Admin Panel Links" and "Revoke Stripe Panel
+  // Links" are independent. Admin tokens/sessions embed this value.
+  adminPanelEpoch(): number {
+    return this.settings.adminPanelEpoch;
+  }
+
+  async bumpAdminPanelEpoch(): Promise<number> {
+    this.settings = await this.prisma.botSettings.update({
+      where: { id: "global" },
+      data: { adminPanelEpoch: { increment: 1 } },
+    });
+    return this.settings.adminPanelEpoch;
+  }
+
   // ---- SLA manager (/intercom → SLA Manager) ----
   // The bot IS the SLA engine (Advanced tier has no native SLAs): rules pick a
   // target, targets carry business-minute clock durations, and the 5-min

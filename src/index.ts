@@ -28,7 +28,7 @@ import { IntercomEventExecutor } from "./intercom/IntercomEventExecutor";
 import { IntercomWebhookHandler } from "./intercom/IntercomWebhookHandler";
 import { IntercomInboxApp } from "./intercom/IntercomInboxApp";
 import { InactivitySweeper } from "./intercom/InactivitySweeper";
-import { initSentry, shutdownSentry, captureFatal, log } from "./util/logger";
+import { initSentry, shutdownSentry, captureFatal, log, reconfigureSentry } from "./util/logger";
 import { safe, setAiRecordContent } from "./util/instrument";
 import { initInflux, reconfigureInflux, shutdownInflux } from "./metrics/InfluxWriter";
 import { VaultService } from "./vault/VaultService";
@@ -52,6 +52,23 @@ import { SlaSweeper } from "./intercom/SlaSweeper";
 import { SlaEnforcer } from "./intercom/SlaEnforcer";
 import { AssignmentService } from "./intercom/AssignmentService";
 import { IntercomAdmin } from "./bot/IntercomAdmin";
+import { AdminPanelTokens } from "./adminpanel/AdminPanelTokens";
+import { AdminPanelSessions } from "./adminpanel/AdminPanelSessions";
+import { AdminPanel } from "./adminpanel/AdminPanel";
+import { AdminPanelDiscord } from "./adminpanel/AdminPanelDiscord";
+import { GuildSnapshotProvider } from "./adminpanel/guildSnapshot";
+import { generalHub } from "./adminpanel/sections/generalHub";
+import { makeIntegrationsHub } from "./adminpanel/sections/integrationsHub";
+import { makeAiAnalyticsHub } from "./adminpanel/sections/aiAnalyticsHub";
+import { makeInfraHub } from "./adminpanel/sections/infraHub";
+import { makeAuditBillingHub } from "./adminpanel/sections/auditBillingHub";
+import { makeWorkflowHub } from "./adminpanel/sections/workflowHub";
+import { makeAccessHub } from "./adminpanel/sections/accessHub";
+import { makeAutomationHub } from "./adminpanel/sections/automationHub";
+import { makeBridgeHub } from "./adminpanel/sections/bridgeHub";
+import { makeMaintenanceHub } from "./adminpanel/sections/maintenanceHub";
+import { makeSlaHub } from "./adminpanel/sections/slaHub";
+import { makeAssignmentHub } from "./adminpanel/sections/assignmentHub";
 import { CachedRatioEngine } from "./bot/billing/disputeRatio";
 import { DisputeMonitor } from "./bot/billing/DisputeMonitor";
 import { TemporalService } from "./temporal/TemporalService";
@@ -397,6 +414,67 @@ async function main() {
       avatarUrl: user.displayAvatarURL({ extension: "png", size: 128 }),
     };
   });
+  // Admin web panel (/config + /intercom) — mirrors the Stripe-panel pattern.
+  // Built after `bot` because the guild snapshot reads bot.client (created in the
+  // DiscordBot constructor). Bound in before start() so CallbackServer gets the
+  // route and the adminpanel_* interactions dispatch. M0 ships the General hub.
+  const adminPanelTokens = new AdminPanelTokens(settingsStore);
+  const adminPanelSessions = new AdminPanelSessions();
+  const guildSnapshot = new GuildSnapshotProvider(() => bot.client);
+  // Temporal worker-pause is defined after bot.start(); hold it late-bound so the
+  // infra hub's toggle can reach it at request time.
+  const temporalControl: { setEnabled: ((on: boolean) => Promise<void>) | null } = { setEnabled: null };
+  const fmtReport = (r: unknown): string =>
+    r && typeof r === "object" ? Object.entries(r).map(([k, v]) => `${k}: ${v}`).join(", ") : String(r);
+  const listIntercomAdmins = () => intercomClient.listAdmins().then((a) => a.map((x) => ({ id: x.id, name: x.name ?? x.id })));
+  const runInactivityNow = async () => fmtReport(await temporalProducers.inactivityRunNow());
+  const runSlaNow = async () => fmtReport(await temporalProducers.slaEnforceRunNow());
+  const adminHubs = [
+    generalHub,
+    makeWorkflowHub({ tiers: tierStore }),
+    makeIntegrationsHub({
+      listIntercomAdmins,
+      reconfigureSentry: async () => {
+        const r = await reconfigureSentry(settingsStore.sentryConfig());
+        switch (r.status) {
+          case "started": return "Sentry started.";
+          case "updated": return r.restartNeeded.length ? `Applied live; restart needed for: ${r.restartNeeded.join(", ")}.` : "Sentry updated live.";
+          case "stopped": return "Sentry stopped (DSN cleared).";
+          case "restart-required": return "Saved — a restart is required to apply the DSN change.";
+          case "disabled": return "Sentry is disabled (no DSN set).";
+        }
+      },
+    }),
+    makeAiAnalyticsHub({ refreshKbNow: () => kbScheduler.refreshNow() }),
+    makeInfraHub({
+      vaultReconfigure: async () => { await vaultService.reconfigure(); return "Vault client reloaded."; },
+      vaultMigrate: async () => fmtReport(await vaultMigrator.migrate()),
+      vaultReverse: async () => fmtReport(await vaultMigrator.reverse()),
+      setTemporalEnabled: async (on) => { if (temporalControl.setEnabled) await temporalControl.setEnabled(on); },
+    }),
+    makeAuditBillingHub({
+      applyWebhook: async (on) => { if (on) await stripeWebhookHandler.ensureEndpoint(true); else await stripeWebhookHandler.disableEndpoint(); },
+      registerWebhook: async () => { const r = await stripeWebhookHandler.ensureEndpoint(true); return r.detail ? `${r.status}: ${r.detail}` : r.status; },
+      provisionRadar: async () => {
+        const rows = await blockService.ensureRadarLists();
+        return rows.map((x) => `${x.kind}: ${x.created ? "created" : x.listId ? "exists" : "failed"}${x.error ? ` (${x.error})` : ""}`).join("; ");
+      },
+    }),
+    makeAccessHub({ listIntercomAdmins }),
+    makeBridgeHub({ listTeams: () => intercomClient.listTeams(), listTags: () => intercomClient.listTags() }),
+    makeSlaHub({ ruleStore: slaRuleStore }),
+    makeAssignmentHub({ listTeams: () => intercomClient.listTeams(), listIntercomAdmins, runSlaNow }),
+    makeAutomationHub({ runInactivityNow }),
+    makeMaintenanceHub({
+      resetBridgeData: async () => fmtReport(await intercomStore.resetAll()),
+      runInactivityNow,
+      runSlaNow,
+    }),
+  ];
+  const adminPanel = new AdminPanel(settingsStore, adminPanelTokens, adminPanelSessions, guildSnapshot, adminHubs);
+  const adminPanelDiscord = new AdminPanelDiscord(settingsStore, adminPanelTokens, adminPanelSessions);
+  bot.bindAdminPanel({ panel: adminPanel, discord: adminPanelDiscord });
+
   // --worker-only: log the Discord client in (activities need it) but skip
   // slash-command registration + the HTTP surface; the Temporal worker always
   // runs. This is the future split-deployment topology.
@@ -460,6 +538,7 @@ async function main() {
       await workerManager.shutdown();
     }
   };
+  temporalControl.setEnabled = setWorkerActive;
 
   bot.bindTemporal({
     producers: temporalProducers,

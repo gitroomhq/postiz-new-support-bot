@@ -292,6 +292,10 @@ model BotSettings {
   // ("Revoke Stripe Panel Links" in /intercom → Maintenance) invalidates every
   // outstanding link and session instantly.
   panelTokenEpoch         Int     @default(0)
+  // Admin web-panel (/config + /intercom) token epoch — a SEPARATE lever from
+  // panelTokenEpoch so "Revoke Admin Panel Links" doesn't kill Stripe-panel
+  // links (and vice versa). Admin tokens reuse panelTokenSecret as HMAC key.
+  adminPanelEpoch         Int     @default(0)
   // SLA manager (edited via /intercom → SLA Manager). The bot IS the SLA
   // engine (Intercom Advanced has no native SLAs): rules pick a target, the
   // bot writes it to the slaAttributeName conversation attribute (inbox

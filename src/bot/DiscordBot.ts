@@ -59,6 +59,8 @@ import { IntercomInboxApp } from "../intercom/IntercomInboxApp";
 import { IntercomPanel } from "../intercom/panel/IntercomPanel";
 import { BillingAdmin } from "./BillingAdmin";
 import { IntercomAdmin } from "./IntercomAdmin";
+import { AdminPanel } from "../adminpanel/AdminPanel";
+import { AdminPanelDiscord } from "../adminpanel/AdminPanelDiscord";
 import { RADAR_LISTS, type BlockService } from "./billing/BlockService";
 import { backfillDisputeHistory } from "./billing/DisputeMonitor";
 import type { DisputeStore } from "./billing/DisputeStore";
@@ -141,6 +143,8 @@ export class DiscordBot {
   // Bound late from index.ts (the Temporal stack is constructed after the bot).
   private temporalProducers: TemporalProducers | null = null;
   private temporalOps: TemporalOpsBinding | null = null;
+  private adminPanel?: AdminPanel;
+  private adminPanelDiscord?: AdminPanelDiscord;
   // SLA manager — bound late from index.ts; hooks fire-and-forget on ticket
   // creation and customer replies.
   private slaService: {
@@ -219,6 +223,14 @@ export class DiscordBot {
     onTicketTrigger(threadId: string, reason: "created" | "customer_reply"): Promise<void>;
   }): void {
     this.slaService = service;
+  }
+
+  // Late-bound from index.ts: the admin web-panel graph needs bot.client (created
+  // in this constructor). Used by start() (CallbackServer route) and the
+  // adminpanel_* interaction routing.
+  bindAdminPanel(deps: { panel: AdminPanel; discord: AdminPanelDiscord }): void {
+    this.adminPanel = deps.panel;
+    this.adminPanelDiscord = deps.discord;
   }
 
   private setupEventHandlers(): void {
@@ -938,6 +950,13 @@ export class DiscordBot {
       return;
     }
 
+    // adminpanel_ is the web admin panel's Discord surface (link minter +
+    // passcode handshake). Runs before config_ so the entry button routes here.
+    if (interaction.customId.startsWith("adminpanel_")) {
+      await this.adminPanelDiscord?.handleButton(interaction);
+      return;
+    }
+
     if (interaction.customId.startsWith("config_")) {
       await this.handleConfigButton(interaction);
       return;
@@ -1247,6 +1266,11 @@ export class DiscordBot {
   }
 
   private async handleModal(interaction: ModalSubmitInteraction): Promise<void> {
+    if (interaction.customId === "adminpanel_activate_modal") {
+      await this.adminPanelDiscord?.handleModal(interaction);
+      return;
+    }
+
     if (interaction.customId.startsWith("config_")) {
       await this.handleConfigModal(interaction);
       return;
@@ -1692,6 +1716,7 @@ export class DiscordBot {
     ];
     const utility = [
       new ButtonBuilder().setCustomId("config_reverify").setLabel("Re-Verify").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("adminpanel_open").setLabel("Open Web Panel").setStyle(ButtonStyle.Success),
     ];
     if (!s.backfillDone()) {
       utility.push(
@@ -5146,6 +5171,12 @@ export class DiscordBot {
         ? {
             page: (token) => this.intercomPanel!.page(token),
             api: (endpoint, token, body) => this.intercomPanel!.api(endpoint, token, body),
+          }
+        : undefined,
+      this.adminPanel
+        ? {
+            page: (token) => this.adminPanel!.page(token),
+            api: (endpoint, sessionId, body) => this.adminPanel!.api(endpoint, sessionId, body),
           }
         : undefined
     );

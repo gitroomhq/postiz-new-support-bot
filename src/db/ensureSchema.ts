@@ -675,6 +675,9 @@ const STATEMENTS: string[] = [
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "panelTokenSecret" TEXT`,
   // Stripe-panel link/session revocation epoch ("Revoke Stripe Panel Links").
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "panelTokenEpoch" INTEGER NOT NULL DEFAULT 0`,
+  // Admin web-panel (/config + /intercom) revocation epoch — independent of the
+  // Stripe-panel epoch above ("Revoke Admin Panel Links").
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "adminPanelEpoch" INTEGER NOT NULL DEFAULT 0`,
   // SLA manager: rules write the "SLA Target" conversation attribute; an
   // Intercom Workflow branches on it → native Apply SLA. Rules + per-subject
   // state (write dedup + manual pins) + global toggles/registry.

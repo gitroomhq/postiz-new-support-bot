@@ -47,6 +47,14 @@ export interface IntercomPanelRoute {
   api: (endpoint: string, sessionId: string, body: unknown) => Promise<{ status: number; json: object }>;
 }
 
+// Admin web panel (/config + /intercom) — same transport contract as the Stripe
+// panel (token→cookie exchange on GET, cookie-authed API), but a separate route
+// prefix and cookie so the two panels' sessions never collide.
+export interface AdminPanelRoute {
+  page: (token: string) => Promise<{ html: string; nonce: string; sessionCookie: string } | { status: number; message: string }>;
+  api: (endpoint: string, sessionId: string, body: unknown) => Promise<{ status: number; json: object }>;
+}
+
 type RawBodyRequest = Request & { rawBody?: Buffer };
 
 // Applied to every Stripe-panel response (page + API).
@@ -76,7 +84,8 @@ export class CallbackServer {
     private intercomWebhook?: IntercomWebhookRoute,
     private intercomCanvas?: IntercomCanvasRoute,
     private stripeWebhook?: StripeWebhookRoute,
-    private intercomPanel?: IntercomPanelRoute
+    private intercomPanel?: IntercomPanelRoute,
+    private adminPanel?: AdminPanelRoute
   ) {
     this.app = express();
     this.setupRoutes();
@@ -297,6 +306,82 @@ export class CallbackServer {
         }
       }
     );
+
+    // Admin web panel (/config + /intercom). Same belts as the Stripe panel:
+    // single-use link token → HttpOnly __Host-acpanel cookie on GET; the API is
+    // cookie-authed with CSRF checks. The page is served locked and unlocks only
+    // after the Discord-side passcode confirm (handled inside the route object).
+    this.app.get("/admin/panel", async (req, res) => {
+      if (!this.adminPanel) {
+        res.status(404).send("Not found");
+        return;
+      }
+      if (!this.allowPanelIp(req.ip)) {
+        res.status(429).set("Cache-Control", "no-store").send("Too many requests.");
+        return;
+      }
+      const token = typeof req.query.t === "string" ? req.query.t : "";
+      try {
+        const result = await this.adminPanel.page(token);
+        if ("html" in result) {
+          res
+            .status(200)
+            .set({
+              "Content-Type": "text/html; charset=utf-8",
+              "Cache-Control": "no-store",
+              "X-Frame-Options": "DENY",
+              "Content-Security-Policy":
+                `default-src 'none'; style-src 'nonce-${result.nonce}'; script-src 'nonce-${result.nonce}'; ` +
+                "connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; object-src 'none'",
+              "Referrer-Policy": "no-referrer",
+              ...PANEL_SECURITY_HEADERS,
+              "Set-Cookie": result.sessionCookie,
+            })
+            .send(result.html);
+        } else {
+          metricCount("adminpanel.auth_failures", 1, { where: "page" });
+          res.status(result.status).set({ "Cache-Control": "no-store", ...PANEL_SECURITY_HEADERS }).send(result.message);
+        }
+      } catch (e) {
+        httpLog.error("admin panel page failed", e);
+        res.status(500).send("Internal error");
+      }
+    });
+
+    this.app.post("/admin/panel/api/:endpoint", express.json({ limit: "256kb" }), async (req, res) => {
+      if (!this.adminPanel) {
+        res.status(404).json({ error: "not_found" });
+        return;
+      }
+      if (!this.allowPanelIp(req.ip)) {
+        res.status(429).set("Cache-Control", "no-store").json({ error: "rate limited" });
+        return;
+      }
+      // CSRF belts on top of SameSite=Strict — identical to the Stripe panel API.
+      const secFetchSite = req.header("sec-fetch-site");
+      const origin = req.header("origin");
+      let originHostOk = true;
+      if (origin) {
+        try {
+          originHostOk = new URL(origin).host === req.headers.host;
+        } catch {
+          originHostOk = false;
+        }
+      }
+      if (req.header("x-panel-request") !== "1" || (secFetchSite && secFetchSite !== "same-origin") || !originHostOk) {
+        metricCount("adminpanel.auth_failures", 1, { where: "csrf" });
+        res.status(403).set({ "Cache-Control": "no-store", ...PANEL_SECURITY_HEADERS }).json({ error: "forbidden" });
+        return;
+      }
+      const sessionId = parseCookies(req.headers.cookie)["__Host-acpanel"] ?? "";
+      try {
+        const result = await this.adminPanel.api(String(req.params.endpoint), sessionId, req.body);
+        res.status(result.status).set({ "Cache-Control": "no-store", ...PANEL_SECURITY_HEADERS }).json(result.json);
+      } catch (e) {
+        httpLog.error("admin panel api failed", e, { "adminpanel.endpoint": String(req.params.endpoint) });
+        res.status(500).json({ error: "internal" });
+      }
+    });
 
     // Stripe webhook. Stripe signs with `Stripe-Signature` over the RAW body;
     // constructEvent verifies it with the endpoint's signing secret. We 200 fast

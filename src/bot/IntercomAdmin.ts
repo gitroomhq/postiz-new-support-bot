@@ -222,6 +222,7 @@ export class IntercomAdmin {
           btn("icadmin_access_admins", "Intercom Admins", ButtonStyle.Secondary),
           btn("icadmin_access_actions", "Intercom Actions", ButtonStyle.Secondary)
         ),
+        buttonRow(btn("adminpanel_open_intercom", "Open Web Panel", ButtonStyle.Success)),
       ],
     };
   }

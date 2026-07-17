@@ -35,7 +35,7 @@ export function renderPanelShell(ctx: PanelShellCtx): string {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex">
 <title>Stripe panel</title>
-<style>
+<style nonce="${ctx.nonce}">
   :root { color-scheme: light dark; }
   * { box-sizing: border-box; }
   body { margin: 0; font: 14px/1.45 -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
@@ -112,7 +112,7 @@ export function renderPanelShell(ctx: PanelShellCtx): string {
     <button class="btn danger" id="modalGo" type="button">Run</button>
   </div>
 </dialog>
-<script>
+<script nonce="${ctx.nonce}">
 "use strict";
 (function () {
   var SECTIONS = ${JSON.stringify([
