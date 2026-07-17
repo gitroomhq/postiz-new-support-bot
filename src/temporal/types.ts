@@ -26,6 +26,7 @@ export const SINGLETONS = {
   cleanupLoop: "cleanup-loop",
   disputesLoop: "disputes-loop",
   inactivityLoop: "intercom-inactivity-loop",
+  slaSweep: "sla-sweep",
 } as const;
 
 export const VAULT_UPGRADE_WORKFLOW_ID = "vault-upgrade";
@@ -64,6 +65,7 @@ export const LOOPER_GENERATIONS: Record<string, number> = {
   [SINGLETONS.cleanupLoop]: 1,
   [SINGLETONS.disputesLoop]: 1,
   [SINGLETONS.inactivityLoop]: 1,
+  [SINGLETONS.slaSweep]: 1,
 };
 
 // ---- Custom search attributes ----
@@ -104,6 +106,7 @@ export const SIG_INBOUND_EVENT = "inboundEvent";
 export const SIG_KB_REFRESH_NOW = "kbRefreshNow";
 export const SIG_DISPUTES_RUN_NOW = "disputesRunNow";
 export const SIG_INACTIVITY_RUN_NOW = "inactivityRunNow";
+export const SIG_SLA_RUN_NOW = "slaRunNow";
 export const UPD_APPLY_STATUS = "applyStatus";
 export const QRY_TICKET_STATE = "getState";
 
@@ -123,7 +126,12 @@ export type IcEventType =
   // in the Intercom inbox.
   | "agent_reminder"
   | "message_edit"
-  | "message_delete";
+  | "message_delete"
+  // SLA re-evaluation: payload is always null — the target is computed at
+  // delivery time from the then-current rules, so stale queued events
+  // converge. Riding the outbox gives conversation-before-sla ordering for
+  // free (ensure-head synthesis) and the delivery retry machinery.
+  | "sla";
 
 export interface IcEvent {
   seq: number;
@@ -344,6 +352,14 @@ export interface InactivitySweepResult {
   skipped: boolean; // disabled or Intercom unconfigured
 }
 
+export interface SlaSweepResult {
+  scanned: number;
+  written: number;
+  unchanged: number;
+  errors: number;
+  skipped: boolean; // SLA disabled or Intercom unconfigured
+}
+
 // Kept for the publishStatusReport tombstone stub (removed in N+1 with the
 // tombstone workflow).
 export interface ReportTickResult {
@@ -375,6 +391,7 @@ export interface CoreActivities {
   kbTick(force: boolean): Promise<KbTickResult>;
   disputesTick(force: boolean): Promise<DisputesTickResult>;
   inactivitySweepTick(force: boolean): Promise<InactivitySweepResult>;
+  slaSweepTick(force: boolean): Promise<SlaSweepResult>;
   snapshotTick(): Promise<void>;
   cleanupTick(): Promise<void>;
   // Tombstone stubs (agent-rip): in-flight runs at deploy time still proxy

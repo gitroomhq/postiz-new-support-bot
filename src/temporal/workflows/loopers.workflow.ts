@@ -8,7 +8,7 @@ import {
   type Workflow,
 } from "@temporalio/workflow";
 import type { CoreActivities } from "../types";
-import { disputesRunNowSignal, inactivityRunNowSignal, kbRefreshNowSignal } from "./definitions";
+import { disputesRunNowSignal, inactivityRunNowSignal, kbRefreshNowSignal, slaRunNowSignal } from "./definitions";
 
 // Interval-based recurring jobs as eternal looping workflows (user decision:
 // Schedules only for the wall-clock status report). Each iteration reads its
@@ -86,6 +86,26 @@ export async function inactivityLoopWorkflow(): Promise<void> {
     runNow = false;
     await inactivityActs.inactivitySweepTick(force).catch(() => {});
     await canIfDue(() => continueWithMemo<typeof inactivityLoopWorkflow>());
+    await condition(() => runNow, 30 * 60_000);
+  }
+}
+
+// SLA safety sweep: pages the workspace's open conversations and re-runs the
+// SLA rules against each (bridged → via thread id, native → directly). Dedup
+// in SlaService makes a steady-state sweep read-only; this heals missed
+// webhooks (unsubscribed Developer Hub topics), dead-lettered "sla" events,
+// mid-flight rule edits (rule mutations fire the runNow signal) and the
+// refund exempt→mirrored flip edge. Gates re-read from BotSettings each tick.
+export async function slaSweepWorkflow(): Promise<void> {
+  let runNow = false;
+  setHandler(slaRunNowSignal, () => {
+    runNow = true;
+  });
+  for (;;) {
+    const force = runNow;
+    runNow = false;
+    await inactivityActs.slaSweepTick(force).catch(() => {});
+    await canIfDue(() => continueWithMemo<typeof slaSweepWorkflow>());
     await condition(() => runNow, 30 * 60_000);
   }
 }

@@ -27,6 +27,11 @@ const EVENTS: Stripe.WebhookEndpointCreateParams.EnabledEvent[] = [
   "charge.dispute.funds_reinstated",
   "radar.early_fraud_warning.created",
   "radar.early_fraud_warning.updated",
+  // SLA manager triggers only (no alerts): plan changes re-run the SLA rules
+  // for the customer's open tickets. ensureEndpoint reconciles enabled_events
+  // on next boot, so the addition converges without dashboard access.
+  "customer.subscription.updated",
+  "customer.subscription.deleted",
 ];
 
 // Programmatically registers a Stripe webhook endpoint (the full-access key can
@@ -37,6 +42,9 @@ const EVENTS: Stripe.WebhookEndpointCreateParams.EnabledEvent[] = [
 // bindClient().
 export class StripeWebhookHandler {
   private client: Client | null = null;
+  // SLA manager — bound late from index.ts; billing events re-run the SLA
+  // rules for the affected customer's open tickets (fire-and-forget).
+  private slaService: { onStripeCustomerTrigger(stripeCustomerId: string): Promise<void> } | null = null;
 
   constructor(
     private settings: SettingsStore,
@@ -49,6 +57,10 @@ export class StripeWebhookHandler {
 
   bindClient(client: Client): void {
     this.client = client;
+  }
+
+  setSlaService(service: { onStripeCustomerTrigger(stripeCustomerId: string): Promise<void> }): void {
+    this.slaService = service;
   }
 
   // Read per request — the secret lives in BotSettings and can rotate live.
@@ -170,6 +182,15 @@ export class StripeWebhookHandler {
       case "charge.dispute.funds_reinstated":
         await this.onDisputeUpdated(event.type, event.data.object as Stripe.Dispute, firstDelivery);
         return;
+      case "customer.subscription.updated":
+      case "customer.subscription.deleted": {
+        // SLA-only: plan/subscription changes re-run the SLA rules for the
+        // customer's open tickets. No alert, no mirror.
+        const sub = event.data.object as Stripe.Subscription;
+        const cus = typeof sub.customer === "string" ? sub.customer : sub.customer?.id;
+        if (cus) void this.slaService?.onStripeCustomerTrigger(cus);
+        return;
+      }
       case "radar.early_fraud_warning.created":
         if (!firstDelivery) return;
         try {
@@ -197,6 +218,9 @@ export class StripeWebhookHandler {
     } catch (e) {
       hookLog.error("dispute mirror upsert failed", e, { "stripe.dispute_id": dispute.id });
     }
+
+    // SLA manager: a fresh dispute may flip stripe.dispute-conditioned rules.
+    if (customerId) void this.slaService?.onStripeCustomerTrigger(customerId);
 
     // Auto-actions (default-off toggles). Each holds its own claim so a
     // redelivery or activity retry converges; failures rethrow AFTER the alert
@@ -325,6 +349,10 @@ export class StripeWebhookHandler {
     } catch (e) {
       hookLog.error("dispute mirror upsert failed", e, { "stripe.dispute_id": dispute.id });
     }
+
+    // SLA manager: a closing/reopening dispute may flip stripe.dispute rules.
+    if (customerId) void this.slaService?.onStripeCustomerTrigger(customerId);
+
     if (!firstDelivery) return;
 
     try {

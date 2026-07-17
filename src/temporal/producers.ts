@@ -16,6 +16,7 @@ import {
   SIG_DISPUTES_RUN_NOW,
   SIG_HUMAN_MESSAGE,
   SIG_INACTIVITY_RUN_NOW,
+  SIG_SLA_RUN_NOW,
   SIG_INBOUND_EVENT,
   SIG_INTERCOM_CLEAR_OUTBOX,
   SIG_INTERCOM_ENQUEUE,
@@ -260,6 +261,15 @@ export class TemporalProducers {
     });
   }
 
+  async slaRunNow(): Promise<GatewayResult> {
+    return this.temporal.signalWithStart({
+      workflowType: "slaSweepWorkflow",
+      workflowId: SINGLETONS.slaSweep,
+      signalName: SIG_SLA_RUN_NOW,
+      options: looperStartOptions(SINGLETONS.slaSweep),
+    });
+  }
+
   // ---- baseline: retire dead singletons/schedules, then ensure the live ones ----
 
   // Idempotent; runs before the worker starts (boot / toggle ON) and on
@@ -278,6 +288,7 @@ export class TemporalProducers {
       ["cleanupLoopWorkflow", SINGLETONS.cleanupLoop],
       ["disputesLoopWorkflow", SINGLETONS.disputesLoop],
       ["inactivityLoopWorkflow", SINGLETONS.inactivityLoop],
+      ["slaSweepWorkflow", SINGLETONS.slaSweep],
     ];
     for (const [type, id] of singles) {
       if (client) {

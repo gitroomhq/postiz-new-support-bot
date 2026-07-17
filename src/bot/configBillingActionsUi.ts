@@ -27,6 +27,7 @@ export const ADMINS_PAGE_SIZE = 25; // Discord select-menu option cap
 const LEVEL_LABEL: Record<BillingActionLevel, string> = {
   none: "None (disabled for everyone)",
   approval: "Agent Approval",
+  admin: "Admin Only (agents denied)",
   all: "All (agents direct)",
 };
 
@@ -36,7 +37,7 @@ function sortedActions() {
   return [...BILLING_ACTIONS].sort((a, b) => groupOrder.indexOf(a.group) - groupOrder.indexOf(b.group));
 }
 
-export function buildActionLevelsPanel(settings: SettingsStore, page: number) {
+export function buildActionLevelsPanel(settings: SettingsStore, page: number, backTarget = "config_billing") {
   const actions = sortedActions();
   const pages = Math.max(1, Math.ceil(actions.length / ACTIONS_PAGE_SIZE));
   const clamped = Math.min(Math.max(page, 0), pages - 1);
@@ -85,7 +86,7 @@ export function buildActionLevelsPanel(settings: SettingsStore, page: number) {
       .setLabel("Next")
       .setStyle(ButtonStyle.Secondary)
       .setDisabled(clamped >= pages - 1),
-    new ButtonBuilder().setCustomId("config_billing").setLabel("Back").setStyle(ButtonStyle.Secondary)
+    new ButtonBuilder().setCustomId(backTarget).setLabel("Back").setStyle(ButtonStyle.Secondary)
   );
 
   return {
@@ -112,6 +113,7 @@ export function buildActionDetailPanel(settings: SettingsStore, key: string, pag
         "",
         "None — nobody can run it (admins included).",
         "Agent Approval — agents queue for admin approval; admins execute directly.",
+        "Admin Only — admins execute directly; agents get nothing (not even a queue request).",
         "All — agents execute directly too.",
       ]
         .filter(Boolean)
@@ -128,6 +130,7 @@ export function buildActionDetailPanel(settings: SettingsStore, key: string, pag
   const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
     levelButton("none", "None"),
     levelButton("approval", "Agent Approval"),
+    levelButton("admin", "Admin Only"),
     levelButton("all", "All"),
     new ButtonBuilder().setCustomId(`config_bact_page:${page}`).setLabel("Back").setStyle(ButtonStyle.Secondary)
   );
@@ -139,7 +142,7 @@ export function buildIntercomAdminsPanel(
   settings: SettingsStore,
   teammates: IntercomAdmin[] | null, // null = fetch failed
   page: number
-) {
+, backTarget = "config_billing") {
   const marked = settings.intercomPanelAdmins();
   const lines =
     marked.length > 0
@@ -206,7 +209,7 @@ export function buildIntercomAdminsPanel(
             .setDisabled(clamped >= pages - 1),
         ]
       : []),
-    new ButtonBuilder().setCustomId("config_billing").setLabel("Back").setStyle(ButtonStyle.Secondary)
+    new ButtonBuilder().setCustomId(backTarget).setLabel("Back").setStyle(ButtonStyle.Secondary)
   );
   components.push(nav);
 

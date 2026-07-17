@@ -12,8 +12,10 @@ export type IntercomRegion = "us" | "eu" | "au";
 
 // Access level for one canvas/panel billing action: "none" disables it for
 // EVERYONE (admins included), "approval" lets agents queue it for admin
-// approval (admins execute directly), "all" lets agents execute directly too.
-export type BillingActionLevel = "none" | "approval" | "all";
+// approval (admins execute directly), "admin" lets ONLY admins execute
+// (agents get nothing — not even a queue request), "all" lets agents execute
+// directly too.
+export type BillingActionLevel = "none" | "approval" | "admin" | "all";
 
 // `--effort` levels accepted by the Claude CLI. Stored free-text in BotSettings
 // but coerced on read so a bad /config value can never break the spawn.
@@ -593,7 +595,7 @@ export class SettingsStore {
   // access past the registry default).
   billingActionLevel(key: string, registryDefault: BillingActionLevel): BillingActionLevel {
     const v = this.billingActionLevels()[key];
-    return v === "none" || v === "approval" || v === "all" ? v : registryDefault;
+    return v === "none" || v === "approval" || v === "admin" || v === "all" ? v : registryDefault;
   }
 
   async updateBillingActionLevel(key: string, level: BillingActionLevel): Promise<void> {
@@ -623,6 +625,72 @@ export class SettingsStore {
       data: { panelTokenSecret: encryptSecret(secret) },
     });
     return secret;
+  }
+
+  // Panel link/session revocation epoch: minted tokens embed it; bumping it
+  // ("Revoke Stripe Panel Links" in /intercom → Maintenance) invalidates every
+  // outstanding link and session instantly.
+  panelTokenEpoch(): number {
+    return this.settings.panelTokenEpoch;
+  }
+
+  async bumpPanelTokenEpoch(): Promise<number> {
+    this.settings = await this.prisma.botSettings.update({
+      where: { id: "global" },
+      data: { panelTokenEpoch: { increment: 1 } },
+    });
+    return this.settings.panelTokenEpoch;
+  }
+
+  // ---- SLA manager (/intercom → SLA Manager) ----
+
+  slaEnabled(): boolean {
+    return this.settings.slaEnabled;
+  }
+
+  slaNativeEnabled(): boolean {
+    return this.settings.slaNativeEnabled;
+  }
+
+  // No-match value written to the attribute; null = clear a previously-written
+  // value (the Intercom Workflow then has no branch to apply).
+  slaDefaultTarget(): string | null {
+    return this.settings.slaDefaultTarget;
+  }
+
+  slaAttributeName(): string {
+    return this.settings.slaAttributeName || "SLA Target";
+  }
+
+  // Managed target registry: every rule target and the default target must
+  // reference an entry; each value needs a matching Workflow branch in
+  // Intercom (which the API cannot enumerate to validate).
+  slaTargets(): Array<{ value: string; note: string }> {
+    const raw = this.settings.slaTargetsJson as unknown;
+    if (!Array.isArray(raw)) return [];
+    return raw
+      .filter((e): e is { value: string; note?: unknown } => !!e && typeof e === "object" && typeof (e as { value?: unknown }).value === "string")
+      .map((e) => ({ value: e.value, note: typeof e.note === "string" ? e.note : "" }));
+  }
+
+  slaTargetExists(value: string): boolean {
+    return this.slaTargets().some((t) => t.value === value);
+  }
+
+  async updateSla(data: {
+    slaEnabled?: boolean;
+    slaNativeEnabled?: boolean;
+    slaDefaultTarget?: string | null;
+    slaAttributeName?: string;
+  }): Promise<void> {
+    this.settings = await this.prisma.botSettings.update({ where: { id: "global" }, data });
+  }
+
+  async updateSlaTargets(targets: Array<{ value: string; note: string }>): Promise<void> {
+    this.settings = await this.prisma.botSettings.update({
+      where: { id: "global" },
+      data: { slaTargetsJson: targets },
+    });
   }
 
   // ---- Dispute management (/config → Billing → Disputes) ----

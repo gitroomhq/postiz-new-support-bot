@@ -9,13 +9,20 @@
 //   section = { title, columns[], rows[], sectionActions[], nextCursor }
 //   row     = { cells[], actions[] }
 //   action  = { label, actionKey, params, dangerous, mode, inputs[], approvalId?, decision? }
-// The bearer token is scrubbed from the URL immediately and kept in JS memory.
+// Auth: the page carries NO credential at all — GET /intercom/panel exchanged
+// the single-use link token for an HttpOnly SameSite=Strict session cookie,
+// which the browser attaches to the same-origin API calls automatically. The
+// fetch wrapper adds the X-Panel-Request header (CSRF belt: cross-origin forms
+// can't send custom headers without a CORS preflight, which the server never
+// answers). All dynamic rendering uses textContent — never innerHTML with
+// data. The inline style/script blocks are CSP-nonced.
 
 export interface PanelShellCtx {
   adminName: string;
   isAdmin: boolean;
   customerLabel: string; // e.g. "cus_… (mail@x)" or "no linked Stripe customer"
   hasCustomer: boolean;
+  nonce: string; // CSP nonce for the inline <style nonce="${ctx.nonce}"> and <script nonce="${ctx.nonce}">
 }
 
 export function renderPanelShell(ctx: PanelShellCtx): string {
@@ -66,6 +73,7 @@ export function renderPanelShell(ctx: PanelShellCtx): string {
          border: 1px solid #d0d7de; border-radius: 6px; }
   dialog .row { margin-top: 14px; display: flex; gap: 8px; justify-content: flex-end; }
   .confirmWord { border-color: #cf222e !important; }
+  .expiredWrap { padding: 40px 20px; font: 15px sans-serif; }
   @media (prefers-color-scheme: dark) {
     body { background: #0d1117; color: #e6edf3; }
     header, table { background: #161b22; border-color: #30363d; }
@@ -95,7 +103,7 @@ export function renderPanelShell(ctx: PanelShellCtx): string {
   <h2 id="modalTitle"></h2>
   <div class="summary" id="modalSummary"></div>
   <div id="modalInputs"></div>
-  <div id="modalConfirm" style="display:none">
+  <div id="modalConfirm" hidden>
     <label>This action is destructive — type CONFIRM to proceed</label>
     <input type="text" id="confirmWord" class="confirmWord" autocomplete="off">
   </div>
@@ -107,10 +115,6 @@ export function renderPanelShell(ctx: PanelShellCtx): string {
 <script>
 "use strict";
 (function () {
-  // Token: taken from ?t=, scrubbed from the URL, kept only in memory.
-  var token = new URLSearchParams(location.search).get("t") || "";
-  history.replaceState(null, "", location.pathname);
-
   var SECTIONS = ${JSON.stringify([
     { key: "overview", title: "Overview" },
     { key: "charges", title: "Charges" },
@@ -129,7 +133,8 @@ export function renderPanelShell(ctx: PanelShellCtx): string {
   function api(endpoint, body) {
     return fetch("/intercom/panel/api/" + endpoint, {
       method: "POST",
-      headers: { "Content-Type": "application/json", "Authorization": "Bearer " + token },
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json", "X-Panel-Request": "1" },
       body: JSON.stringify(body || {}),
     }).then(function (res) {
       if (res.status === 401) { expired(); throw new Error("expired"); }
@@ -141,8 +146,10 @@ export function renderPanelShell(ctx: PanelShellCtx): string {
   }
 
   function expired() {
-    document.body.innerHTML = '<main style="padding:40px 20px;font:15px sans-serif">' +
-      "<h1>Session expired</h1><p>This panel link was valid for 15 minutes. " +
+    // Static markup only — never data. (Class, not a style attribute: the
+    // CSP nonce covers the <style> block but not inline style attributes.)
+    document.body.innerHTML = '<main class="expiredWrap">' +
+      "<h1>Session expired</h1><p>Panel sessions end after 10 minutes idle (30 minutes max). " +
       "Reopen it from the Intercom conversation (Open Stripe Panel).</p></main>";
   }
 
@@ -181,7 +188,7 @@ export function renderPanelShell(ctx: PanelShellCtx): string {
       inputsBox.appendChild(field);
     });
     var confirmBox = document.getElementById("modalConfirm");
-    confirmBox.style.display = action.dangerous ? "" : "none";
+    confirmBox.hidden = !action.dangerous;
     document.getElementById("confirmWord").value = "";
     document.getElementById("modalGo").textContent = action.mode === "queue" ? "Request approval" : "Run";
     pendingRun = action;
@@ -287,7 +294,11 @@ export function renderPanelShell(ctx: PanelShellCtx): string {
     var stack = cursors[sectionKey] || [];
     api("list", { section: sectionKey, cursor: stack.length ? stack[stack.length - 1] : null })
       .then(renderSection)
-      .catch(function (e) { if (e.message !== "expired") content.innerHTML = '<p class="error">' + e.message + "</p>"; });
+      .catch(function (e) {
+        if (e.message === "expired") return;
+        content.innerHTML = "";
+        content.appendChild(el("p", "error", e.message)); // textContent — server errors can echo request data
+      });
   }
 
   // ---- boot ----
@@ -299,7 +310,6 @@ export function renderPanelShell(ctx: PanelShellCtx): string {
     b.onclick = function () { setFlash(null, null); load(s.key); };
     tabs.appendChild(b);
   });
-  if (!token) { expired(); return; }
   load("overview");
 })();
 </script>

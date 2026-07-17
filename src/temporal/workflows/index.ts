@@ -14,6 +14,7 @@ export { autoAnswerWorkflow, aiRunWorkflow, scoreOneWorkflow } from "./ai.workfl
 export {
   kbRefreshWorkflow,
   inactivityLoopWorkflow,
+  slaSweepWorkflow,
   metricsSnapshotWorkflow,
   cleanupLoopWorkflow,
   disputesLoopWorkflow,

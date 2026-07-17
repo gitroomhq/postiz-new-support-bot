@@ -53,7 +53,9 @@ const EXPECTED_COLUMNS: Record<string, string[]> = {
     "radarListCardId", "radarListEmailId", "radarListCustomerId", "radarListIpId",
     "inactivityEnabled", "inactivityAgentWaitDays", "inactivityCustomerWaitDays", "inactivityNagsBeforeClose",
     "inactivityNagText", "inactivityAgentNoteText", "refundMaxChargeAgeDays",
-    "agentRipMigratedAt", "intercomPanelAdminsJson", "billingActionLevelsJson", "panelTokenSecret", "updatedAt",
+    "agentRipMigratedAt", "intercomPanelAdminsJson", "billingActionLevelsJson", "panelTokenSecret",
+    "panelTokenEpoch", "slaEnabled", "slaNativeEnabled", "slaDefaultTarget", "slaAttributeName", "slaTargetsJson",
+    "updatedAt",
   ],
   status_tags: [
     "id", "emoji", "label", "isInitial", "closesThread", "reminderEnabled", "reminderDays", "reminderTarget",
@@ -114,6 +116,11 @@ const EXPECTED_COLUMNS: Record<string, string[]> = {
   scoring_batches: [
     "id", "anthropicBatchId", "status", "purpose", "model", "requestCount", "succeededCount", "erroredCount",
     "expiredCount", "escalatedCount", "costUsd", "submittedAt", "endedAt",
+  ],
+  sla_rules: ["id", "name", "enabled", "position", "conditions", "expression", "target", "createdAt", "updatedAt"],
+  sla_states: [
+    "id", "kind", "conversationId", "lastTarget", "lastWrittenTarget", "lastRuleId", "lastEvaluatedAt",
+    "lastWriteError", "pinnedTarget", "pinnedById", "pinnedByName", "pinnedAt", "updatedAt",
   ],
 };
 

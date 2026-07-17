@@ -214,6 +214,63 @@ test("workflow suite (time-skipping)", { skip: !ENABLED && "set TEMPORAL_TEST=1 
     });
   });
 
+  // ---- SLA: outbox ordering + safety-sweep looper ----
+
+  await t.test("ticketWorkflow synthesizes an ensure head before a link-less sla event", async () => {
+    const delivered: string[] = [];
+    const activities: AnyRecord = {
+      // No Intercom link yet: the pump must unshift an ensure before the
+      // queued sla event so the attribute write never races bridge creation.
+      loadTicketState: async () => ({ ...baseSnapshot, hasIntercomLink: false }),
+      intercomEnabled: async () => true,
+      checkTicketTimers: async () => ({ statusChange: null, reminded: false, reclosed: false, snapshot: { ...baseSnapshot, hasIntercomLink: false } }),
+      executeIntercomEvent: async (input: { event: { type: string } }) => {
+        delivered.push(input.event.type);
+      },
+      intercomDeadLetterAudit: async () => {},
+    };
+    const worker = await makeWorker(activities);
+    await worker.runUntil(async () => {
+      const handle = await env.client.workflow.start("ticketWorkflow", {
+        taskQueue,
+        workflowId: "ticket-sla-1",
+        args: [{ threadId: "sla1" }],
+      });
+      await handle.signal("intercomEnqueue", { type: "sla", payload: null });
+      await env.sleep("30 minutes");
+      assert.deepEqual(delivered.slice(0, 2), ["ensure", "sla"], `expected ensure-before-sla, saw ${delivered.join(",")}`);
+      await handle.terminate("test done");
+    });
+  });
+
+  await t.test("slaSweepWorkflow ticks on its cadence and slaRunNow forces a sweep", async () => {
+    const forces: boolean[] = [];
+    const activities: AnyRecord = {
+      slaSweepTick: async (force: boolean) => {
+        forces.push(force);
+        return { scanned: 0, written: 0, unchanged: 0, errors: 0, skipped: true };
+      },
+    };
+    const worker = await makeWorker(activities);
+    await worker.runUntil(async () => {
+      const handle = await env.client.workflow.start("slaSweepWorkflow", {
+        taskQueue,
+        workflowId: "sla-sweep-t1",
+      });
+      await env.sleep("1 minute");
+      assert.deepEqual(forces, [false], `expected one immediate unforced tick, saw [${forces.join(",")}]`);
+      // Rule edits fire slaRunNow — the 30-minute wait wakes early, forced.
+      await handle.signal("slaRunNow");
+      await env.sleep("1 minute");
+      assert.deepEqual(forces, [false, true], `run-now must force the next tick, saw [${forces.join(",")}]`);
+      await env.sleep("31 minutes");
+      assert.deepEqual(forces, [false, true, false], `expected the unforced cadence tick, saw [${forces.join(",")}]`);
+      const desc = await handle.describe();
+      assert.equal(desc.status.name, "RUNNING", "the looper must keep running between ticks");
+      await handle.terminate("test done");
+    });
+  });
+
   // ---- looper generation reconcile (terminate + restart on bump) ----
 
   await t.test("reconcileLooperGeneration keeps matching, terminates stale, reports absent", async () => {

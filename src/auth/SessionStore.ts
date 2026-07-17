@@ -19,6 +19,15 @@ export class SessionStore {
     this.vault = vault;
   }
 
+  // SLA-manager hook, late-bound: fires after a pending charge review is
+  // created so stripe.refund_review rules re-evaluate the ticket. Best-effort
+  // fire-and-forget — must never fail the refund guardrail path.
+  private slaHook: ((threadId: string) => Promise<void>) | null = null;
+
+  setSlaHook(fn: (threadId: string) => Promise<void>): void {
+    this.slaHook = fn;
+  }
+
   // Rows leaving the store carry a REDACTED accessToken ("") — no row consumer
   // uses it (they read postizUserId/stripeCustomerId), and running a Transit
   // ciphertext through decryptSecret's legacy-plaintext passthrough would hand
@@ -270,6 +279,7 @@ export class SessionStore {
       update: { ...data, status: "PENDING", reviewerId: null, resolvedAt: null },
       create: data,
     });
+    void this.slaHook?.(data.threadId).catch(() => undefined);
   }
 
   async getPendingChargeReview(threadId: string) {

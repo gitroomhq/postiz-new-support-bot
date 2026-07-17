@@ -47,6 +47,8 @@ export class StatusService {
   // run as workflow updates on the per-ticket workflow (serialized there, one
   // statusChangeWorkflow child per transition) — every call site stays put.
   private producers: TemporalProducers | null = null;
+  // SLA manager — bound late (constructed after StatusService in index.ts).
+  private slaService: { onTicketTrigger(threadId: string, reason: "status"): Promise<void> } | null = null;
 
   constructor(
     private ticketStore: TicketStore,
@@ -57,6 +59,10 @@ export class StatusService {
 
   setTemporalProducers(producers: TemporalProducers): void {
     this.producers = producers;
+  }
+
+  setSlaService(service: { onTicketTrigger(threadId: string, reason: "status"): Promise<void> }): void {
+    this.slaService = service;
   }
 
   // Discord caps thread renames at ~2 per 10 minutes per channel, and discord.js
@@ -154,6 +160,11 @@ export class StatusService {
       "intercom-sync",
       { "ticket.thread_id": ticket.threadId, "sync.event": "status_changed" }
     );
+
+    // SLA manager: every status transition re-runs the rules (same choke
+    // point as the Intercom mirror, so manual, auto-close, reopen and
+    // Intercom-initiated changes are all covered).
+    void this.slaService?.onTicketTrigger(ticket.threadId, "status").catch(() => undefined);
 
     // Boundary wide event for every status transition (doubles as the
     // ticket-closed signal via ticket.closes_thread).

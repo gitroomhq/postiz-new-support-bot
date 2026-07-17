@@ -52,6 +52,12 @@ export const INTERCOM_WEBHOOK_TOPICS = [
   "ticket.state.updated",
   "ticket.admin.replied",
   "ticket.note.created",
+  // SLA manager triggers for NATIVE (unbridged) conversations: creation and
+  // customer replies re-run the SLA rules. Bridged conversations return early
+  // (one indexed link lookup) — the Discord-side hooks own them. Requires the
+  // manual Developer Hub subscription like every other topic here.
+  "conversation.user.created",
+  "conversation.user.replied",
 ] as const;
 
 // Shared with intercomInboxWorkflow's defer loop — see INTERCOM_MAX_ECHO_DEFERS.
@@ -122,6 +128,14 @@ export class IntercomWebhookHandler {
   // and processes on resume. A buffered signal (Temporal down) throws so the
   // route answers 500 and Intercom's single retry redelivers.
   private temporalProducers: TemporalProducers | null = null;
+
+  // SLA manager — bound late from index.ts; handles the native-conversation
+  // trigger topics (conversation.user.created / .replied).
+  private slaService: { applyForNative(conversationId: string, reason: string): Promise<unknown> } | null = null;
+
+  setSlaService(service: { applyForNative(conversationId: string, reason: string): Promise<unknown> }): void {
+    this.slaService = service;
+  }
 
   setTemporalProducers(producers: TemporalProducers): void {
     this.temporalProducers = producers;
@@ -209,9 +223,26 @@ export class IntercomWebhookHandler {
       case "conversation_part.redacted":
         await this.handlePartRedacted(item as IntercomConversationItem | undefined);
         return;
+      case "conversation.user.created":
+      case "conversation.user.replied":
+        await this.handleNativeSlaTrigger(item as IntercomConversationItem | undefined, topic);
+        return;
       default:
         return; // unknown topic — drop
     }
+  }
+
+  // SLA manager trigger for native conversations. Bridged conversations
+  // return early — their Discord-side hooks (creation, customer reply) fire
+  // in the same flow that mirrored the message, and the per-ticket outbox
+  // owns ordering. Transient SlaService failures rethrow → the inbox
+  // scheduler's retry machinery redelivers.
+  private async handleNativeSlaTrigger(item: IntercomConversationItem | undefined, topic: string): Promise<void> {
+    const conversationId = item?.id != null ? String(item.id) : null;
+    if (!conversationId || !this.slaService) return;
+    const link = await this.store.getLinkByConversationId(conversationId).catch(() => null);
+    if (link) return; // bridged — Discord-side hooks own it
+    await this.slaService.applyForNative(conversationId, topic);
   }
 
   // Agent deleted (redacted) a message in Intercom → reflect on the Discord

@@ -859,6 +859,75 @@ export class IntercomClient {
       "ticket type attribute archive"
     );
   }
+
+  // ---- SLA manager support ----
+
+  // Workspace tag list (SLA rule builder picker). Read-only.
+  async listTags(): Promise<Array<{ id: string; name: string }>> {
+    const data = await this.json<{ data?: Array<{ id?: string | number; name?: string }> }>(
+      "/tags",
+      "GET",
+      undefined,
+      "tags list"
+    );
+    return (data.data ?? [])
+      .filter((t) => t.id != null && t.name)
+      .map((t) => ({ id: String(t.id), name: t.name as string }));
+  }
+
+  // Conversation-model data attributes (read-only — the API can list but NOT
+  // create conversation attributes; creation is a manual Settings → Data →
+  // Conversations step). Powers SlaService.verifySetup().
+  async listConversationDataAttributes(): Promise<Array<{ name: string; archived: boolean; dataType: string | null }>> {
+    const data = await this.json<{
+      data?: Array<{ name?: string; archived?: boolean; data_type?: string }>;
+    }>("/data_attributes?model=conversation", "GET", undefined, "conversation data attributes");
+    return (data.data ?? [])
+      .filter((a) => a.name)
+      .map((a) => ({ name: a.name as string, archived: a.archived === true, dataType: a.data_type ?? null }));
+  }
+
+  // Everything the SLA rule evaluator needs about a (native) conversation in
+  // one GET: team, tags, source body, attributes, linked ticket, state — plus
+  // the currently applied SLA (read-only, preview display only).
+  async getConversationSlaFacts(conversationId: string): Promise<{
+    state: string;
+    open: boolean;
+    teamAssigneeId: string | null;
+    tags: string[];
+    sourceBody: string | null;
+    customAttributes: Record<string, unknown>;
+    ticketId: string | null;
+    slaApplied: { name: string; status: string | null } | null;
+  } | null> {
+    try {
+      const data = await this.json<{
+        state?: string;
+        open?: boolean;
+        team_assignee_id?: number | string | null;
+        tags?: { tags?: Array<{ id?: string | number; name?: string }> };
+        source?: { body?: string | null } | null;
+        custom_attributes?: Record<string, unknown> | null;
+        ticket?: { id?: string | number } | null;
+        sla_applied?: { sla_name?: string | null; sla_status?: string | null } | null;
+      }>(`/conversations/${encodeURIComponent(conversationId)}`, "GET", undefined, "conversation get (sla facts)");
+      return {
+        state: data.state ?? "open",
+        open: data.open !== false && data.state !== "closed",
+        teamAssigneeId: data.team_assignee_id != null ? String(data.team_assignee_id) : null,
+        tags: (data.tags?.tags ?? []).map((t) => t.name ?? "").filter(Boolean),
+        sourceBody: data.source?.body ?? null,
+        customAttributes: data.custom_attributes ?? {},
+        ticketId: data.ticket?.id != null ? String(data.ticket.id) : null,
+        slaApplied: data.sla_applied?.sla_name
+          ? { name: data.sla_applied.sla_name, status: data.sla_applied.sla_status ?? null }
+          : null,
+      };
+    } catch (e) {
+      if (e instanceof IntercomHttpError && e.status === 404) return null;
+      throw e;
+    }
+  }
 }
 
 function toUnix(iso: string): number {

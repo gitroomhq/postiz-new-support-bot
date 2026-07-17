@@ -673,6 +673,45 @@ const STATEMENTS: string[] = [
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "intercomPanelAdminsJson" JSONB`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "billingActionLevelsJson" JSONB`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "panelTokenSecret" TEXT`,
+  // Stripe-panel link/session revocation epoch ("Revoke Stripe Panel Links").
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "panelTokenEpoch" INTEGER NOT NULL DEFAULT 0`,
+  // SLA manager: rules write the "SLA Target" conversation attribute; an
+  // Intercom Workflow branches on it → native Apply SLA. Rules + per-subject
+  // state (write dedup + manual pins) + global toggles/registry.
+  `CREATE TABLE IF NOT EXISTS "sla_rules" (
+    "id" TEXT NOT NULL,
+    "name" TEXT NOT NULL,
+    "enabled" BOOLEAN NOT NULL DEFAULT true,
+    "position" INTEGER NOT NULL DEFAULT 0,
+    "conditions" JSONB NOT NULL,
+    "expression" TEXT NOT NULL,
+    "target" TEXT NOT NULL,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updatedAt" TIMESTAMP(3) NOT NULL,
+    CONSTRAINT "sla_rules_pkey" PRIMARY KEY ("id")
+  )`,
+  `CREATE TABLE IF NOT EXISTS "sla_states" (
+    "id" TEXT NOT NULL,
+    "kind" TEXT NOT NULL,
+    "conversationId" TEXT,
+    "lastTarget" TEXT,
+    "lastWrittenTarget" TEXT,
+    "lastRuleId" TEXT,
+    "lastEvaluatedAt" TIMESTAMP(3),
+    "lastWriteError" TEXT,
+    "pinnedTarget" TEXT,
+    "pinnedById" TEXT,
+    "pinnedByName" TEXT,
+    "pinnedAt" TIMESTAMP(3),
+    "updatedAt" TIMESTAMP(3) NOT NULL,
+    CONSTRAINT "sla_states_pkey" PRIMARY KEY ("id")
+  )`,
+  `CREATE INDEX IF NOT EXISTS "sla_states_conversationId_idx" ON "sla_states"("conversationId")`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "slaEnabled" BOOLEAN NOT NULL DEFAULT false`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "slaNativeEnabled" BOOLEAN NOT NULL DEFAULT false`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "slaDefaultTarget" TEXT`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "slaAttributeName" TEXT NOT NULL DEFAULT 'SLA Target'`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "slaTargetsJson" JSONB`,
 ];
 
 export async function ensureSchema(prisma: PrismaClient): Promise<void> {

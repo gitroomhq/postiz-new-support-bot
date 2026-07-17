@@ -50,6 +50,10 @@ export class IntercomEventExecutor {
   // across the fleet would waste real rate-limit budget.
   private contactIdentityPushed = new Map<string, string>();
   private execLog = log.child("intercom:exec");
+  // SLA manager brain — late-bound (constructed after the executor in
+  // index.ts); handles the "sla" outbox event. Same pattern as
+  // IntercomSyncService.setExecutor.
+  private slaService: { applyForBridged(threadId: string, reason: string): Promise<unknown> } | null = null;
 
   constructor(
     private client: IntercomClient,
@@ -59,6 +63,10 @@ export class IntercomEventExecutor {
     private sync: IntercomSyncService,
     private audit: AuditLogger
   ) {}
+
+  setSlaService(service: { applyForBridged(threadId: string, reason: string): Promise<unknown> }): void {
+    this.slaService = service;
+  }
 
   // ---- Author resolution ----
 
@@ -147,6 +155,15 @@ export class IntercomEventExecutor {
         return;
       case "message_delete":
         await this.executeMessageDelete(threadId, payload as MessageDeletePayload);
+        return;
+      case "sla":
+        // Payload is always null — the target is computed NOW from the
+        // current rules (stale queued events converge). Unbridged/exempt
+        // tickets come back as a skipped result, never an error, so the
+        // event drains without dead-lettering. Transient Intercom failures
+        // throw IntercomHttpError → normal delivery retry machinery.
+        if (this.slaService) await this.slaService.applyForBridged(threadId, "outbox");
+        else this.execLog.warn("sla event with no SlaService bound — skipped", { "ticket.thread_id": threadId });
         return;
       default:
         throw new IntercomHttpError(400, `Unknown outbox event type: ${type}`);

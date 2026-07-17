@@ -38,17 +38,36 @@ export interface StripeWebhookRoute {
 }
 
 // Stripe panel (tokenized standalone page opened from the Intercom canvas).
-// Auth is the panel's own HMAC bearer token — verified inside the route
-// object per request, never here.
+// GET exchanges the SINGLE-USE HMAC link token for an HttpOnly session cookie
+// (verified/consumed inside the route object); the API authenticates by that
+// cookie. This layer adds the transport belts: per-IP throttle, security
+// headers with a per-response CSP nonce, and CSRF checks on the API.
 export interface IntercomPanelRoute {
-  page: (token: string) => Promise<{ html: string } | { status: number; message: string }>;
-  api: (endpoint: string, token: string, body: unknown) => Promise<{ status: number; json: object }>;
+  page: (token: string) => Promise<{ html: string; nonce: string; sessionCookie: string } | { status: number; message: string }>;
+  api: (endpoint: string, sessionId: string, body: unknown) => Promise<{ status: number; json: object }>;
 }
 
 type RawBodyRequest = Request & { rawBody?: Buffer };
 
+// Applied to every Stripe-panel response (page + API).
+const PANEL_SECURITY_HEADERS = {
+  "X-Content-Type-Options": "nosniff",
+  "Cross-Origin-Opener-Policy": "same-origin",
+  "Cross-Origin-Resource-Policy": "same-origin",
+  "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
+  // Harmless behind a TLS-terminating proxy; a no-op on plain http.
+  "Strict-Transport-Security": "max-age=31536000",
+} as const;
+
+const PANEL_IP_LIMIT_PER_MIN = 60;
+const PANEL_IP_WINDOW_MS = 60_000;
+const PANEL_IP_MAX_KEYS = 2000;
+
 export class CallbackServer {
   private app: Express;
+  // Pre-authentication throttle for the panel routes: bounds token-guessing /
+  // log-replay bursts before any HMAC or session work happens.
+  private panelIpHits = new Map<string, number[]>();
 
   constructor(
     private config: BotConfig,
@@ -190,11 +209,16 @@ export class CallbackServer {
 
     // Stripe panel: a tokenized standalone page (Canvas Kit sheets are
     // Messenger-only, so the canvas mints a 15-min personal link instead).
-    // The page is served self-contained (inline CSS/JS, no asset routes);
-    // the strict CSP only allows same-origin XHR back to the API below.
+    // The page is served self-contained (inline CSS/JS, no asset routes,
+    // CSP-nonced); GET consumes the single-use link token and sets the
+    // HttpOnly SameSite=Strict session cookie the API authenticates with.
     this.app.get("/intercom/panel", async (req, res) => {
       if (!this.intercomPanel) {
         res.status(404).send("Not found");
+        return;
+      }
+      if (!this.allowPanelIp(req.ip)) {
+        res.status(429).set("Cache-Control", "no-store").send("Too many requests.");
         return;
       }
       const token = typeof req.query.t === "string" ? req.query.t : "";
@@ -208,12 +232,16 @@ export class CallbackServer {
               "Cache-Control": "no-store",
               "X-Frame-Options": "DENY",
               "Content-Security-Policy":
-                "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; img-src data:",
+                `default-src 'none'; style-src 'nonce-${result.nonce}'; script-src 'nonce-${result.nonce}'; ` +
+                "connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; object-src 'none'",
               "Referrer-Policy": "no-referrer",
+              ...PANEL_SECURITY_HEADERS,
+              "Set-Cookie": result.sessionCookie,
             })
             .send(result.html);
         } else {
-          res.status(result.status).set("Cache-Control", "no-store").send(result.message);
+          metricCount("intercom.panel_auth_failures", 1, { where: "page" });
+          res.status(result.status).set({ "Cache-Control": "no-store", ...PANEL_SECURITY_HEADERS }).send(result.message);
         }
       } catch (e) {
         httpLog.error("intercom panel page failed", e);
@@ -229,11 +257,40 @@ export class CallbackServer {
           res.status(404).json({ error: "not_found" });
           return;
         }
-        const auth = req.header("authorization") ?? "";
-        const token = auth.startsWith("Bearer ") ? auth.slice("Bearer ".length) : "";
+        if (!this.allowPanelIp(req.ip)) {
+          res.status(429).set("Cache-Control", "no-store").json({ error: "rate limited" });
+          return;
+        }
+        // CSRF belts on top of SameSite=Strict. (1) Custom header: cross-site
+        // forms can't send one without a CORS preflight, which nothing here
+        // answers. (2) Sec-Fetch-Site, when the browser provides it, must be
+        // same-origin. (3) An Origin header, when present, must match the
+        // request host.
+        const secFetchSite = req.header("sec-fetch-site");
+        const origin = req.header("origin");
+        let originHostOk = true;
+        if (origin) {
+          try {
+            originHostOk = new URL(origin).host === req.headers.host;
+          } catch {
+            originHostOk = false;
+          }
+        }
+        if (req.header("x-panel-request") !== "1" || (secFetchSite && secFetchSite !== "same-origin") || !originHostOk) {
+          httpLog.warn("intercom panel api cross-origin rejected", {
+            "panel.endpoint": String(req.params.endpoint),
+            "http.sec_fetch_site": secFetchSite ?? "",
+            "http.origin": origin ?? "",
+          });
+          metricCount("intercom.panel_auth_failures", 1, { where: "csrf" });
+          res.status(403).set({ "Cache-Control": "no-store", ...PANEL_SECURITY_HEADERS }).json({ error: "forbidden" });
+          return;
+        }
+        const sessionId = parseCookies(req.headers.cookie)["__Host-icpanel"] ?? "";
         try {
-          const result = await this.intercomPanel.api(String(req.params.endpoint), token, req.body);
-          res.status(result.status).set("Cache-Control", "no-store").json(result.json);
+          const result = await this.intercomPanel.api(String(req.params.endpoint), sessionId, req.body);
+          if (result.status === 401) metricCount("intercom.panel_auth_failures", 1, { where: "api" });
+          res.status(result.status).set({ "Cache-Control": "no-store", ...PANEL_SECURITY_HEADERS }).json(result.json);
         } catch (e) {
           httpLog.error("intercom panel api failed", e, { "panel.endpoint": String(req.params.endpoint) });
           res.status(500).json({ error: "internal" });
@@ -298,11 +355,37 @@ export class CallbackServer {
     Sentry.setupExpressErrorHandler(this.app);
   }
 
+  private allowPanelIp(ip: string | undefined): boolean {
+    const key = ip ?? "unknown";
+    const now = Date.now();
+    if (this.panelIpHits.size > PANEL_IP_MAX_KEYS) this.panelIpHits.clear(); // crude cap — throttle state, not audit data
+    const hits = (this.panelIpHits.get(key) ?? []).filter((t) => now - t < PANEL_IP_WINDOW_MS);
+    if (hits.length >= PANEL_IP_LIMIT_PER_MIN) {
+      this.panelIpHits.set(key, hits);
+      return false;
+    }
+    hits.push(now);
+    this.panelIpHits.set(key, hits);
+    return true;
+  }
+
   start(): void {
     this.app.listen(this.config.server.port, () => {
       httpLog.info("callback server listening", { "server.port": this.config.server.port });
     });
   }
+}
+
+// Minimal cookie parse (no dependency): "a=b; c=d" → { a: "b", c: "d" }.
+function parseCookies(header: string | undefined): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (!header) return out;
+  for (const part of header.split(";")) {
+    const eq = part.indexOf("=");
+    if (eq === -1) continue;
+    out[part.slice(0, eq).trim()] = part.slice(eq + 1).trim();
+  }
+  return out;
 }
 
 // Constant-time comparison over hashes so differing lengths don't throw.

@@ -22,7 +22,10 @@ export type OutboxEventType =
   // conversation resurfaces in the Intercom inbox.
   | "agent_reminder"
   | "message_edit"
-  | "message_delete";
+  | "message_delete"
+  // SLA re-evaluation (payload always null — target computed at delivery
+  // time by SlaService.applyForBridged).
+  | "sla";
 
 // Creates (or adopts) the contact, conversation and converted ticket, and
 // writes the IntercomLink. Always the first event for a ticket; later events

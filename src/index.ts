@@ -45,6 +45,11 @@ import { ApprovalStore } from "./bot/billing/ApprovalStore";
 import { BillingActionService } from "./bot/billing/actions/BillingActionService";
 import { PanelTokens } from "./intercom/panel/PanelTokens";
 import { IntercomPanel } from "./intercom/panel/IntercomPanel";
+import { SlaRuleStore } from "./sla/SlaRuleStore";
+import { SlaFactsLoader } from "./sla/facts";
+import { SlaService } from "./sla/SlaService";
+import { SlaSweeper } from "./intercom/SlaSweeper";
+import { IntercomAdmin } from "./bot/IntercomAdmin";
 import { CachedRatioEngine } from "./bot/billing/disputeRatio";
 import { DisputeMonitor } from "./bot/billing/DisputeMonitor";
 import { TemporalService } from "./temporal/TemporalService";
@@ -250,6 +255,56 @@ async function main() {
   stripeWebhookHandler.setTemporalProducers(temporalProducers);
   billingCategory.setTemporalProducers(temporalProducers);
 
+  // ---- SLA manager (rules → "SLA Target" conversation attribute; the
+  // Intercom Workflow applies the native SLAs) ----
+  const slaRuleStore = new SlaRuleStore(prisma, settingsStore, tierStore, () =>
+    categoryRegistry.getAll().map((c) => ({ id: c.id, label: c.label }))
+  );
+  await slaRuleStore.load();
+  const slaFactsLoader = new SlaFactsLoader(
+    ticketStore,
+    intercomStore,
+    intercomClient,
+    sessionStore,
+    disputeStore,
+    stripeClient,
+    settingsStore
+  );
+  const slaService = new SlaService(
+    prisma,
+    settingsStore,
+    slaRuleStore,
+    slaFactsLoader,
+    intercomStore,
+    intercomClient,
+    ticketStore,
+    sessionStore,
+    auditLogger,
+    temporalProducers
+  );
+  slaRuleStore.setOnChange(() => slaService.onRulesChanged());
+  intercomExecutor.setSlaService(slaService);
+  statusService.setSlaService(slaService);
+  stripeWebhookHandler.setSlaService(slaService);
+  intercomWebhookHandler.setSlaService(slaService);
+  sessionStore.setSlaHook((threadId) => slaService.onTicketTrigger(threadId, "refund_review"));
+
+  // /intercom admin panel (bridge/SLA/automation/maintenance hubs).
+  const intercomAdmin = new IntercomAdmin(
+    settingsStore,
+    tierStore,
+    () => categoryRegistry.getAll().map((c) => ({ id: c.id, label: c.label })),
+    ticketStore,
+    intercomStore,
+    intercomClient,
+    intercomSync,
+    intercomWebhookHandler,
+    auditLogger,
+    temporalProducers,
+    slaRuleStore,
+    slaService
+  );
+
   // The bridge resolves category ids to their human labels via the registry
   // ("billing" → "💳 Billing" instead of the raw id in Intercom).
   const categoryLabelResolver = (id: string | null): string | null => {
@@ -292,9 +347,11 @@ async function main() {
     intercomInboxApp,
     { service: vaultService, migrator: vaultMigrator },
     { blockService, stripeClient, disputeStore },
-    intercomPanel
+    intercomPanel,
+    intercomAdmin
   );
   // The client exists as soon as the constructor ran; nothing fires before login.
+  bot.setSlaService(slaService);
   auditLogger.bindClient(bot.client);
   billingActionService.bindClient(bot.client);
   intercomWebhookHandler.bindClient(bot.client);
@@ -337,6 +394,8 @@ async function main() {
   const snapshotScheduler = new SnapshotScheduler(prisma, settingsStore);
   // Workspace inactivity sweeper body (native/unbridged Intercom objects).
   const inactivitySweeper = new InactivitySweeper(intercomClient, intercomStore, settingsStore);
+  // SLA safety-sweep body (slaSweepWorkflow's slaSweepTick).
+  const slaSweeper = new SlaSweeper(intercomClient, intercomStore, settingsStore, slaService);
 
   // ---- Temporal worker (all background work lives in workflows) ----
 
@@ -353,6 +412,7 @@ async function main() {
     intercomExecutor,
     intercomWebhookHandler,
     inactivitySweeper,
+    slaSweeper,
     kbScheduler,
     snapshotScheduler,
     stripeWebhookHandler,

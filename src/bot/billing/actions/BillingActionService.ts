@@ -69,6 +69,8 @@ export class BillingActionService {
     const level = this.settingsStore.billingActionLevel(def.key, def.defaultLevel);
     if (level === "none") return "denied";
     if (level === "all") return "direct";
+    // "admin": only admins act — agents get nothing, not even a queue request.
+    if (level === "admin") return actor.isAdmin ? "direct" : "denied";
     return actor.isAdmin ? "direct" : "queue";
   }
 

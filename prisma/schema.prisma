@@ -288,6 +288,21 @@ model BotSettings {
   // Auto-generated HMAC key for Stripe-panel URL/API tokens (encrypted at
   // rest via crypto.ts; seeded on first use — never user-entered or shown).
   panelTokenSecret        String?
+  // Stripe-panel token epoch: minted links/sessions embed it; bumping it
+  // ("Revoke Stripe Panel Links" in /intercom → Maintenance) invalidates every
+  // outstanding link and session instantly.
+  panelTokenEpoch         Int     @default(0)
+  // SLA manager (edited via /intercom → SLA Manager). The bot writes ONE
+  // custom conversation attribute (slaAttributeName); an Intercom Workflow
+  // branches on it → native "Apply SLA" (the API can't apply SLAs directly).
+  slaEnabled       Boolean @default(false)
+  slaNativeEnabled Boolean @default(false) // also cover native (non-bridged) conversations
+  slaDefaultTarget String?                 // no-match target; null = clear a previously-written value
+  slaAttributeName String  @default("SLA Target")
+  // Managed SLA target registry: JSON array of { value, note }. Rule targets
+  // and slaDefaultTarget must reference an entry; each value needs a matching
+  // Workflow branch in Intercom (the API can't enumerate SLAs to validate).
+  slaTargetsJson   Json?
   updatedAt           DateTime  @updatedAt
 
   @@map("bot_settings")
@@ -741,4 +756,48 @@ model DisputeWatch {
 
   @@unique([disputeId, userId])
   @@map("dispute_watches")
+}
+
+// Ordered SLA rules (position = priority, 0 = highest; first enabled match
+// wins; conditions are AND-ed). `conditions` is the structured form
+// (SlaCondition[], zod-validated); `expression` is the canonical text form,
+// regenerated on every save — the two round-trip. `target` is the value the
+// bot writes to the SLA Target conversation attribute (must exist in
+// BotSettings.slaTargetsJson). Edited via /intercom → SLA Manager.
+model SlaRule {
+  id         String   @id @default(cuid())
+  name       String
+  enabled    Boolean  @default(true)
+  position   Int      @default(0)
+  conditions Json
+  expression String
+  target     String
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@map("sla_rules")
+}
+
+// Per-subject SLA state: write-dedup damper + manual pin. One row per subject,
+// id = "t:<threadId>" (bridged ticket) or "c:<conversationId>" (native
+// conversation) — pins live here rather than on Ticket so native conversations
+// get the same treatment. lastWrittenTarget is the last value actually PUT to
+// Intercom (writes are skipped while the computed target matches it).
+model SlaState {
+  id                String    @id
+  kind              String // "bridged" | "native"
+  conversationId    String? // resolved Intercom conversation (bridged: from the link)
+  lastTarget        String? // last computed winning target
+  lastWrittenTarget String?
+  lastRuleId        String?
+  lastEvaluatedAt   DateTime?
+  lastWriteError    String? // last permanent write failure — surfaced in the SLA hub
+  pinnedTarget      String? // non-null = rules skipped for this subject
+  pinnedById        String?
+  pinnedByName      String?
+  pinnedAt          DateTime?
+  updatedAt         DateTime  @updatedAt
+
+  @@index([conversationId])
+  @@map("sla_states")
 }

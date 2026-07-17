@@ -44,7 +44,7 @@ Almost everything is configured live through the admin-only **`/config`** panel 
 
 Every deploy replays running workflows against the new bundle — a changed command sequence wedges them with nondeterminism task failures. Rules:
 
-- **Loopers** (`kb-refresh`, `metrics-snapshot`, `cleanup-loop`, `disputes-loop`, `intercom-inactivity-loop`): change their bodies freely, but bump the workflow's entry in `LOOPER_GENERATIONS` (`src/temporal/types.ts`) **in the same commit**. `ensureBaseline()` terminates a running singleton whose memo generation differs and starts a fresh run — safe because loopers are stateless between ticks.
+- **Loopers** (`kb-refresh`, `metrics-snapshot`, `cleanup-loop`, `disputes-loop`, `intercom-inactivity-loop`, `sla-sweep`): change their bodies freely, but bump the workflow's entry in `LOOPER_GENERATIONS` (`src/temporal/types.ts`) **in the same commit**. `ensureBaseline()` terminates a running singleton whose memo generation differs and starts a fresh run — safe because loopers are stateless between ticks.
 - **Retiring a singleton/Schedule**: add it to `RETIRED_SINGLETONS` / `RETIRED_WORKFLOW_QUERIES` / `RETIRED_SCHEDULES` (`src/temporal/types.ts`) and remove it from `SINGLETONS` in the same commit — `ensureBaseline()` terminates/deletes retired ids on every boot before the worker polls (the agent-rip release retired `scoring-loop`, its `scoring-batch-*` children and the `status-report` Schedule this way). A retired id must never be re-added.
 - **Stateful long-lived workflows** (`ticketWorkflow` — its outbox carries non-refetchable Discord payloads — and `intercomInboxWorkflow`): any change to the order/type of emitted commands (activities, timers, children) must use `patched('<id>')` dual-path code, removed only after all pre-change runs have completed or continued-as-new (ticket retention is 14 days past close ⇒ two releases minimum). Terminate is NOT acceptable for these.
 - **Short workflows** (stripe/refund/AI/score/status children): same `patched()` rule when in-flight runs matter; the exposure window is only the seconds around a deploy.
@@ -62,6 +62,17 @@ Every deploy replays running workflows against the new bundle — a changed comm
 > **Intercom webhook runbook**: while Temporal is down every `POST /intercom/webhook` answers 500 (deliberate — Intercom's retry redelivers). *Sustained* failures can make Intercom auto-disable the subscription with only an email notice; the bridge then stays inbound-dead after recovery. Alert on the `intercom_webhook` Influx measurement (`outcome=rejected` = bad/rotated client secret, Intercom does NOT retry 4xx; `outcome=error/buffered` = enqueue failures), and after any prolonged outage check Developer Hub → your app → Webhooks and re-enable the subscription if needed. The `/config → Intercom` panel shows the last verified inbound webhook.
 
 > **Secrets at rest** (Postiz OAuth access tokens, Intercom credentials, the Stripe webhook signing secret) are encrypted with AES-256-GCM. The key is derived (HKDF) from `STRIPE_SECRET_KEY` + `DATABASE_URL` + `DISCORD_TOKEN`, so a database dump alone cannot decrypt them. Rotating any of those three orphans existing ciphertext (fail-soft: affected users re-auth / secrets are re-entered).
+
+### SLA manager setup (one-time, manual Intercom steps)
+
+The bot is the **SLA manager**: admin-defined rules (`/intercom → SLA Manager`) decide which native Intercom SLA each conversation gets, by writing ONE custom conversation attribute (default **`SLA Target`**). Intercom's REST API can neither create conversation attributes nor list/apply SLAs, so three steps are manual (also shown live by the **Verify Setup** button):
+
+1. **Attribute**: Intercom → Settings → Data → Conversations → create a **List** attribute named exactly `SLA Target`, one option per registered target value (`/intercom → SLA Manager → Targets`).
+2. **Workflow**: create ONE Workflow — trigger *Conversation data changed* → `SLA Target`, one branch per value, each with a native **Apply SLA** step. Every target value needs a matching branch; the bot cannot validate this.
+3. **Webhooks** (native-conversation rules only): Developer Hub → your app → Webhooks → subscribe `conversation.user.created` + `conversation.user.replied`. Bridged tickets work without them.
+4. Toggle **SLA: on** (and **Native** if wanted) in `/intercom → SLA Manager`.
+
+Rules are priority-ordered (first enabled match wins, conditions AND-ed) over ticket basics, Stripe customer state, Intercom-side data and keywords; no match writes the configurable default target. Evaluation fires on ticket creation, status changes, customer replies, Stripe events and the native webhooks, with a 30-minute safety sweep (`sla-sweep` looper) converging anything missed — attribute writes are deduped against `sla_states.lastWrittenTarget`, so steady-state sweeps are read-only.
 
 ## Setup
 

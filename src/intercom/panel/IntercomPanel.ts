@@ -7,7 +7,9 @@ import { IntercomStore } from "../IntercomStore";
 import { DisputeStore } from "../../bot/billing/DisputeStore";
 import { BillingActionService } from "../../bot/billing/actions/BillingActionService";
 import { actionByKey, ActionActor } from "../../bot/billing/actions/ActionRegistry";
+import { randomBytes } from "node:crypto";
 import { PanelTokens, PanelTokenPayload } from "./PanelTokens";
+import { PanelSessions, PanelSession } from "./PanelSessions";
 import { renderPanelShell } from "./panelHtml";
 import { log } from "../../util/logger";
 
@@ -49,8 +51,12 @@ interface PanelSection {
 // renders — including which buttons exist — is decided HERE; the client is a
 // generic table renderer. The Stripe customer is always re-derived from the
 // token's conversation scope, never accepted from the client.
+const SECTIONS = new Set(["overview", "charges", "subscriptions", "invoices", "payment_methods", "balance", "disputes", "approvals"]);
+const CURSOR_RE = /^[A-Za-z0-9_:.-]{0,120}$/;
+
 export class IntercomPanel {
   private rate = new Map<string, number[]>();
+  private panelSessions = new PanelSessions();
 
   constructor(
     private settingsStore: SettingsStore,
@@ -63,49 +69,75 @@ export class IntercomPanel {
     private tokens: PanelTokens
   ) {}
 
-  // GET /intercom/panel?t=…
-  async page(token: string): Promise<{ html: string } | { status: number; message: string }> {
+  // GET /intercom/panel?t=… — exchanges the SINGLE-USE link token for an
+  // HttpOnly session cookie; the page itself never sees a credential.
+  async page(
+    token: string
+  ): Promise<{ html: string; nonce: string; sessionCookie: string } | { status: number; message: string }> {
     const payload = this.tokens.verify(token);
     if (!payload) return { status: 401, message: "This panel link is invalid or expired. Reopen it from Intercom." };
     if (!this.allow(`page:${payload.aid}`)) return { status: 429, message: "Too many requests." };
-    const scope = await this.resolveScope(payload);
+    if (!this.panelSessions.consumeJti(payload.jti)) {
+      panelLog.warn("panel link replay rejected", { "intercom.admin_id": payload.aid, "intercom.conversation_id": payload.cid });
+      return {
+        status: 401,
+        message: "This panel link was already used — reopen it from the Intercom conversation (Open Stripe Panel).",
+      };
+    }
+    const sessionId = this.panelSessions.create({ aid: payload.aid, an: payload.an, cid: payload.cid, epoch: payload.epo });
+    const scope = await this.resolveScope(payload.cid);
     const actor = this.actorFor(payload);
+    const nonce = randomBytes(16).toString("base64");
+    panelLog.info("panel.opened", { "intercom.admin_id": payload.aid, "intercom.conversation_id": payload.cid });
     return {
       html: renderPanelShell({
         adminName: payload.an,
         isAdmin: actor.isAdmin,
         customerLabel: scope?.stripeCustomerId ?? "no linked Stripe customer",
         hasCustomer: !!scope?.stripeCustomerId,
+        nonce,
       }),
+      nonce,
+      // __Host- prefix: Secure + Path=/ + no Domain, enforced by the browser.
+      sessionCookie: `__Host-icpanel=${sessionId}; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=1800`,
     };
   }
 
-  // POST /intercom/panel/api/:endpoint
-  async api(endpoint: string, token: string, body: unknown): Promise<{ status: number; json: object }> {
-    const payload = this.tokens.verify(token);
-    if (!payload) return { status: 401, json: { error: "expired" } };
-    if (!this.allow(`api:${payload.aid}`)) return { status: 429, json: { error: "rate limited" } };
+  // POST /intercom/panel/api/:endpoint — authenticated by the session cookie
+  // (CallbackServer already enforced the CSRF belts: SameSite cookie,
+  // Sec-Fetch-Site/Origin checks, X-Panel-Request header).
+  async api(endpoint: string, sessionId: string, body: unknown): Promise<{ status: number; json: object }> {
+    const session = sessionId ? this.panelSessions.get(sessionId, this.settingsStore.panelTokenEpoch()) : null;
+    if (!session) return { status: 401, json: { error: "expired" } };
+    if (!this.allow(`api:${session.aid}`)) return { status: 429, json: { error: "rate limited" } };
     const request = (body ?? {}) as Record<string, unknown>;
-    const actor = this.actorFor(payload);
+    if (typeof request !== "object" || Array.isArray(request)) return { status: 400, json: { error: "bad request" } };
+    const actor = this.actorFor(session);
 
     try {
       switch (endpoint) {
         case "list": {
           const section = typeof request.section === "string" ? request.section : "overview";
-          const cursor = typeof request.cursor === "string" ? request.cursor : null;
-          const json = await this.buildSection(payload, actor, section, cursor);
+          if (!SECTIONS.has(section)) return { status: 400, json: { error: "unknown section" } };
+          // cursor flows into Stripe starting_after — shape-check it here.
+          const cursor = typeof request.cursor === "string" && CURSOR_RE.test(request.cursor) ? request.cursor : null;
+          const json = await this.buildSection(session, actor, section, cursor);
           return { status: 200, json };
         }
         case "action": {
-          const actionKey = typeof request.actionKey === "string" ? request.actionKey : "";
+          const actionKey = typeof request.actionKey === "string" ? request.actionKey.slice(0, 64) : "";
+          if (!actionByKey(actionKey)) return { status: 400, json: { ok: false, error: "Unknown action." } };
+          if (request.params != null && (typeof request.params !== "object" || Array.isArray(request.params))) {
+            return { status: 400, json: { ok: false, error: "Bad params." } };
+          }
           const params = this.shapeParams(actionKey, request.params);
-          const outcome = await this.billingActions.request(payload.cid, actor, actionKey, params);
+          const outcome = await this.billingActions.request(session.cid, actor, actionKey, params);
           if (outcome.kind === "executed") return { status: 200, json: { ok: true, text: outcome.text } };
           if (outcome.kind === "queued") return { status: 200, json: { ok: true, text: "Queued for admin approval." } };
           return { status: 200, json: { ok: false, error: outcome.error } };
         }
         case "approval-act": {
-          const approvalId = typeof request.approvalId === "string" ? request.approvalId : "";
+          const approvalId = typeof request.approvalId === "string" ? request.approvalId.slice(0, 64) : "";
           const decision = request.decision === "approve" ? "approve" : "reject";
           const outcome = await this.billingActions.actOnApproval(approvalId, actor, decision);
           if (outcome.kind === "executed") return { status: 200, json: { ok: true, text: outcome.text } };
@@ -116,11 +148,14 @@ export class IntercomPanel {
           return { status: 404, json: { error: "unknown endpoint" } };
       }
     } catch (e) {
+      // Unexpected throws stay in the logs — raw messages (Stripe errors can
+      // echo request data) never reach the client. Curated outcome.error
+      // strings from BillingActionService pass through above.
       panelLog.warn("panel api error", {
         "panel.endpoint": endpoint,
         "error.message": e instanceof Error ? e.message : String(e),
       });
-      return { status: 200, json: { ok: false, error: e instanceof Error ? e.message : "Internal error" } };
+      return { status: 200, json: { ok: false, error: "Internal error — check the bot logs." } };
     }
   }
 
@@ -128,19 +163,19 @@ export class IntercomPanel {
 
   // The admin bit is re-read from settings on EVERY call — marking/unmarking
   // a teammate in /config applies to in-flight tokens immediately.
-  private actorFor(payload: PanelTokenPayload): ActionActor {
+  private actorFor(subject: Pick<PanelTokenPayload, "aid" | "an"> | Pick<PanelSession, "aid" | "an">): ActionActor {
     return {
       kind: "intercom",
-      id: payload.aid,
-      name: payload.an,
-      isAdmin: this.settingsStore.isIntercomPanelAdmin(payload.aid),
+      id: subject.aid,
+      name: subject.an,
+      isAdmin: this.settingsStore.isIntercomPanelAdmin(subject.aid),
     };
   }
 
   private async resolveScope(
-    payload: PanelTokenPayload
+    cid: string
   ): Promise<{ ticketThreadId: string; discordCustomerId: string | null; stripeCustomerId: string | null } | null> {
-    const link = await this.intercomStore.getLinkByConversationId(payload.cid).catch(() => null);
+    const link = await this.intercomStore.getLinkByConversationId(cid).catch(() => null);
     if (!link) return null;
     const ticket = await this.ticketStore.getByThreadId(link.ticketThreadId).catch(() => null);
     const session = ticket?.customerId ? await this.sessionStore.getSession(ticket.customerId).catch(() => null) : null;
@@ -196,12 +231,12 @@ export class IntercomPanel {
   // ---- sections ----
 
   private async buildSection(
-    payload: PanelTokenPayload,
+    session: PanelSession,
     actor: ActionActor,
     section: string,
     cursor: string | null
   ): Promise<PanelSection> {
-    const scope = await this.resolveScope(payload);
+    const scope = await this.resolveScope(session.cid);
     if (!scope) return this.empty("Not a Discord-bridged conversation.");
     const cus = scope.stripeCustomerId;
 
