@@ -372,43 +372,55 @@ export class SlaService {
       return { outcome: pinned ? "pinned" : "unchanged", target, ruleId, reason: "no change" };
     }
 
+    // Two INDEPENDENT writes: the conversation attribute (canonical value,
+    // used by the native-conversations Workflow and visible on every
+    // conversation) and — for converted Customer tickets — the TICKET
+    // attribute mirror (ticket-context Workflow triggers have NO channel
+    // gate, so the bridged-ticket SLA Workflow branches on this one). Either
+    // definition may be missing in Intercom (conversation attributes are
+    // UI-only to create; ticket attributes come from Ensure Ticket
+    // Attributes) — a permanent 4xx on one must not block the other.
+    // Transient failures (5xx/429) rethrow for the retry machinery.
     const attrName = this.settingsStore.slaAttributeName();
+    const isTransient = (e: unknown) => e instanceof IntercomHttpError && (e.status >= 500 || e.status === 429);
+    let convError: string | null = null;
     try {
       await this.intercomClient.setConversationAttributes(conversationId, { [attrName]: effectiveWritten });
-      // Converted Customer tickets: mirror the value onto the TICKET attribute
-      // too — ticket-context Workflow triggers have NO channel gate (API
-      // conversations never match a channel), so the SLA Workflow for bridged
-      // tickets branches on this one. CSAT degrade contract: 400/422 until the
-      // attribute definition exists on the ticket type (Ensure Ticket
-      // Attributes creates it).
-      if (input.ticketId) {
-        const adminId = this.settingsStore.intercomAuthorAdminId();
-        try {
-          await this.intercomClient.updateTicket(input.ticketId, {
-            attributes: { [attrName]: effectiveWritten },
-            ...(adminId ? { adminId } : {}),
-          });
-        } catch (e) {
-          if (!(e instanceof IntercomHttpError && e.status >= 400 && e.status < 500)) throw e;
-          slaLog.warn("sla.ticket_attr.degraded", {
-            "intercom.ticket_id": input.ticketId,
-            "error.message": e instanceof Error ? e.message : String(e),
-          });
-        }
-      }
     } catch (e) {
-      if (e instanceof IntercomHttpError && (e.status >= 500 || e.status === 429)) {
-        throw e; // transient: outbox/activity retry or next sweep owns it
+      if (isTransient(e)) throw e; // outbox/activity retry or next sweep owns it
+      convError = e instanceof Error ? e.message : String(e);
+      slaLog.warn("sla.conversation_attr.degraded", {
+        "intercom.conversation_id": conversationId,
+        "error.message": convError,
+      });
+    }
+    let ticketOk = false;
+    if (input.ticketId) {
+      const adminId = this.settingsStore.intercomAuthorAdminId();
+      try {
+        await this.intercomClient.updateTicket(input.ticketId, {
+          attributes: { [attrName]: effectiveWritten },
+          ...(adminId ? { adminId } : {}),
+        });
+        ticketOk = true;
+      } catch (e) {
+        if (isTransient(e)) throw e;
+        slaLog.warn("sla.ticket_attr.degraded", {
+          "intercom.ticket_id": input.ticketId,
+          "error.message": e instanceof Error ? e.message : String(e),
+        });
       }
-      const message = e instanceof Error ? e.message : String(e);
-      await this.upsertState(stateId, kind, conversationId, target, ruleId, lastWritten, message);
+    }
+    if (convError != null && !ticketOk) {
+      // NOTHING landed — surface it (Verify Setup shows the missing pieces).
+      await this.upsertState(stateId, kind, conversationId, target, ruleId, lastWritten, convError);
       slaLog.warn("sla.write.permanent_failure", {
         "intercom.conversation_id": conversationId,
         "sla.target": effectiveWritten,
-        "error.message": message,
+        "error.message": convError,
       });
       metricCount("sla.writes", 1, { outcome: "permanent_error" });
-      return { outcome: "error", target, ruleId, reason: message };
+      return { outcome: "error", target, ruleId, reason: convError };
     }
 
     await this.upsertState(stateId, kind, conversationId, target, ruleId, effectiveWritten, null);

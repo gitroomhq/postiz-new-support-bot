@@ -806,7 +806,7 @@ export class SlaHub {
     const modal = new ModalBuilder().setCustomId("icadmin_sla_tgt_add_m").setTitle("Add SLA Target");
     modal.addComponents(
       new ActionRowBuilder<TextInputBuilder>().addComponents(
-        textInput("value", "Value (a-z 0-9 - _, max 60)", { required: true, placeholder: "vip-4h", maxLength: 60 })
+        textInput("value", "Value (a-z A-Z 0-9 - _, max 60)", { required: true, placeholder: "SLA-Support-Default", maxLength: 60 })
       ),
       new ActionRowBuilder<TextInputBuilder>().addComponents(
         textInput("note", "Note (which SLA / Workflow branch)", { required: false, placeholder: "VIP first response 4h", maxLength: 100 })
@@ -816,10 +816,12 @@ export class SlaHub {
   }
 
   private async handleTargetAddSubmit(interaction: ModalSubmitInteraction): Promise<void> {
-    const value = interaction.fields.getTextInputValue("value").trim().toLowerCase();
+    // Case preserved: the value must EXACTLY match the Intercom List-attribute
+    // option and the Workflow branch condition.
+    const value = interaction.fields.getTextInputValue("value").trim();
     const note = interaction.fields.getTextInputValue("note").trim();
-    if (!/^[a-z0-9-_]{1,60}$/.test(value)) {
-      await interaction.reply({ embeds: [makeEmbed("Target values are 1-60 chars of a-z, 0-9, - and _.", COLORS.danger)], flags: 64 });
+    if (!/^[A-Za-z0-9-_]{1,60}$/.test(value)) {
+      await interaction.reply({ embeds: [makeEmbed("Target values are 1-60 chars of a-z, A-Z, 0-9, - and _ (case-sensitive — must match the Intercom list option exactly).", COLORS.danger)], flags: 64 });
       return;
     }
     const targets = this.ctx.settingsStore.slaTargets();

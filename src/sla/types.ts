@@ -162,4 +162,6 @@ export interface SlaTargetEntry {
   note: string;
 }
 
-export const SLA_TARGET_VALUE_RE = /^[a-z0-9-_]{1,60}$/;
+// Case-sensitive: the value must EXACTLY match the Intercom List-attribute
+// option and the Workflow branch condition.
+export const SLA_TARGET_VALUE_RE = /^[A-Za-z0-9-_]{1,60}$/;
