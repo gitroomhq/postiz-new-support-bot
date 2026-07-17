@@ -624,7 +624,11 @@ export class BridgeHub {
         [TICKET_ATTR_CSAT, "CSAT rating mirrored from the Discord support bot"],
         [TICKET_ATTR_CSAT_COMMENT, "CSAT comment mirrored from the Discord support bot"],
         [TICKET_ATTR_THREAD, "Discord thread id of the bridged ticket"],
-      ] as const) {
+        // SLA manager: ticket-side mirror of the SLA Target conversation
+        // attribute — ticket-context Workflow triggers have no channel gate,
+        // so the bridged-ticket SLA Workflow branches on THIS one.
+        [this.ctx.settingsStore.slaAttributeName(), "SLA target written by the support bot (SLA rules)"],
+      ] as [string, string][]) {
         if (existing.includes(name)) {
           results.push(`${name} ✓`);
           continue;

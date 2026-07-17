@@ -84,12 +84,12 @@ export class SlaFactsLoader {
   }
 
   // Facts for a bridged Discord ticket. Returns null when the ticket row is
-  // gone. `conversationId` is echoed back so the caller can write without a
-  // second link lookup.
+  // gone. `conversationId`/`ticketId` are echoed back so the caller can write
+  // without a second link lookup.
   async forBridged(
     threadId: string,
     referenced: Set<SlaDim>
-  ): Promise<{ facts: SlaFacts; conversationId: string | null } | null> {
+  ): Promise<{ facts: SlaFacts; conversationId: string | null; ticketId: string | null } | null> {
     const ticket = await this.ticketStore.getByThreadId(threadId);
     if (!ticket) return null;
     const link = await this.intercomStore.getLink(threadId);
@@ -138,7 +138,7 @@ export class SlaFactsLoader {
       facts.intercom = intercom;
     }
 
-    return { facts, conversationId: link?.conversationId ?? null };
+    return { facts, conversationId: link?.conversationId ?? null, ticketId: link?.ticketId ?? null };
   }
 
   // Facts for a native Intercom conversation (no Discord ticket). Returns null

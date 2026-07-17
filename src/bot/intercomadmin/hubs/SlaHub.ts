@@ -95,7 +95,7 @@ export class SlaHub {
         `**Targets registered:** ${s.slaTargets().length} · **Pinned tickets:** ${pinned}`,
         `**Attribute:** \`${status.attributeName}\``,
         "",
-        "Rules write the attribute above on the conversation; **one Intercom Workflow** (trigger: **Teammate adds a note** — no attribute-change trigger exists) branches on its value → native **Apply SLA**. The bot posts a small internal note on every target change as the trigger kick. Every target value needs a matching Workflow branch — the API cannot list or apply SLAs, so run **Verify Setup** after changes.",
+        "Rules write the attribute above onto the conversation AND its converted ticket. Intercom side: a **Customer-tickets Workflow** (trigger: Teammate adds a note — ticket contexts have no channel gate) branches on the ticket attribute → native **Apply SLA**; native conversations get their own conversation-scoped Workflow. The bot posts a small internal note on every target change as the trigger kick. Every target value needs a matching branch — the API cannot list or apply SLAs, so run **Verify Setup** after changes.",
         "Triggers: ticket created/mirrored, status change, customer reply, Stripe/billing events, native conversation webhooks — plus a 30-min safety sweep.",
       ].join("\n")
     );

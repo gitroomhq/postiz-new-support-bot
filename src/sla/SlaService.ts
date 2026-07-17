@@ -126,6 +126,7 @@ export class SlaService {
       kind: "bridged",
       threadId,
       conversationId: loaded.conversationId,
+      ticketId: loaded.ticketId,
       facts: loaded.facts,
       state,
       reason,
@@ -292,14 +293,15 @@ export class SlaService {
       attributeExists
         ? `✅ Conversation attribute **${attributeName}** exists.`
         : `❌ Create a **List** conversation attribute named exactly **${attributeName}** (Intercom → Settings → Data → Conversations — the API cannot create it). Options: ${targets.map((t) => `\`${t.value}\``).join(", ") || "add targets first"}.`,
-      "2. Create ONE Workflow with trigger **Teammate adds a note** (Intercom has NO attribute-change trigger, and customer-message triggers don't fire on API-created conversations). Add one branch per **" +
+      "2. **Bridged tickets Workflow**: trigger **Teammate adds a note**, context **Customer tickets ONLY** (ticket contexts have no channel gate — API conversations never match a channel, so conversation-scoped triggers won't fire for bridged tickets). Branch on the **ticket attribute** `" +
         attributeName +
-        "** value, each with a native **Apply SLA** step. The bot posts a small internal note every time it changes the target" +
-        (noteKick ? "" : " — ⚠️ the note kick is currently OFF here, so nothing fires that trigger") +
-        "; the note always lands AFTER the attribute write, so the branch reads the fresh value.",
-      "3. Test once: change a rule so a target flips on a test conversation and confirm the Workflow ran (conversation side panel shows applied SLA). If Intercom ignores bot-authored notes for the trigger in your workspace, SLAs still converge on the first human agent note/reply — or ask Intercom support to confirm the trigger's API behavior.",
-      "4. Developer Hub → your app → Webhooks: manually subscribe `conversation.user.created` and `conversation.user.replied` (needed for native-conversation rules; bridged tickets work without them).",
-      "5. Enable SLA here (and *Native conversations* if wanted). The 30-min sweep heals anything a webhook misses.",
+        "` (Ensure Ticket Attributes in the Bridge hub creates it; the bot mirrors every target onto it) → native **Apply SLA** per branch.",
+      "3. **Native conversations Workflow** (only if you enable *Native* here): same trigger, context **Conversations**, ALL channels selected — native conversations come from real channels, so the gate is fine there. Branch on the conversation attribute → Apply SLA. The two Workflows cover disjoint subjects (bridged tickets vs native conversations), so SLAs are never double-applied.",
+      "4. The bot posts a small internal note on every target change" +
+        (noteKick ? "" : " — ⚠️ the note kick is currently OFF here, so nothing fires those triggers") +
+        "; it always lands AFTER the attribute writes, so branches read fresh values. Test once: flip a target on a test ticket and confirm the Workflow applied the SLA.",
+      "5. Developer Hub → your app → Webhooks: manually subscribe `conversation.user.created` and `conversation.user.replied` (needed for native-conversation rules; bridged tickets work without them).",
+      "6. Enable SLA here (and *Native conversations* if wanted). The 30-min sweep heals anything a webhook misses.",
     ];
     return { attributeExists, attributeName, runbook };
   }
@@ -339,6 +341,7 @@ export class SlaService {
     kind: "bridged" | "native";
     threadId?: string;
     conversationId: string;
+    ticketId?: string | null;
     facts: SlaFacts;
     state: SlaState | null;
     reason: string;
@@ -372,6 +375,27 @@ export class SlaService {
     const attrName = this.settingsStore.slaAttributeName();
     try {
       await this.intercomClient.setConversationAttributes(conversationId, { [attrName]: effectiveWritten });
+      // Converted Customer tickets: mirror the value onto the TICKET attribute
+      // too — ticket-context Workflow triggers have NO channel gate (API
+      // conversations never match a channel), so the SLA Workflow for bridged
+      // tickets branches on this one. CSAT degrade contract: 400/422 until the
+      // attribute definition exists on the ticket type (Ensure Ticket
+      // Attributes creates it).
+      if (input.ticketId) {
+        const adminId = this.settingsStore.intercomAuthorAdminId();
+        try {
+          await this.intercomClient.updateTicket(input.ticketId, {
+            attributes: { [attrName]: effectiveWritten },
+            ...(adminId ? { adminId } : {}),
+          });
+        } catch (e) {
+          if (!(e instanceof IntercomHttpError && e.status >= 400 && e.status < 500)) throw e;
+          slaLog.warn("sla.ticket_attr.degraded", {
+            "intercom.ticket_id": input.ticketId,
+            "error.message": e instanceof Error ? e.message : String(e),
+          });
+        }
+      }
     } catch (e) {
       if (e instanceof IntercomHttpError && (e.status >= 500 || e.status === 429)) {
         throw e; // transient: outbox/activity retry or next sweep owns it
