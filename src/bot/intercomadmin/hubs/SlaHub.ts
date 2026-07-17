@@ -18,7 +18,7 @@ import { hasClockDurations, type ExpressionError, type SlaTargetEntry } from "..
 import { WEEKDAYS, isValidTimeZone, type OfficeHoursSchedule, type Weekday } from "../../../sla/businessTime";
 import { SINGLETONS } from "../../../temporal/types";
 import { formatDuration } from "../../../util/format";
-import type { SettingsStore } from "../../../config/SettingsStore";
+import { DEFAULT_SETTINGS_SCOPE, type SettingsStore } from "../../../config/SettingsStore";
 import { btn, buttonRow, backRow, selectRow, panelEmbed, textInput } from "../ui";
 import type { IcAdminSession, Panel, RouteEntry, SlaRuleDraft } from "../types";
 import type { HubContext } from "./HubContext";
@@ -80,17 +80,22 @@ export class SlaHub {
     { kind: "button", id: "icadmin_sla_warnpct", match: "exact", handler: (i) => this.handleWarnPctOpen(i) },
     { kind: "modal", id: "icadmin_sla_warnpct_m", match: "exact", handler: (i) => this.handleWarnPctSubmit(i) },
     { kind: "button", id: "icadmin_sla_verify", match: "exact", handler: (i) => this.handleVerify(i) },
-    // office hours
-    { kind: "button", id: "icadmin_sla_hours_toggle", match: "exact", handler: (i) => this.handleHoursToggle(i) },
-    { kind: "button", id: "icadmin_sla_hours_tz", match: "exact", handler: (i) => this.handleHoursTzOpen(i) },
-    { kind: "modal", id: "icadmin_sla_hours_tz_m", match: "exact", handler: (i) => this.handleHoursTzSubmit(i) },
-    { kind: "select", id: "icadmin_sla_hours_day", match: "exact", handler: (i) => this.handleHoursDayPick(i) },
+    // office hours (per-team: picker → scoped panel)
+    { kind: "select", id: "icadmin_sla_hours_pick", match: "exact", handler: (i) => this.handleHoursScopePick(i) },
+    { kind: "button", id: "icadmin_sla_hours_default", match: "exact", handler: (i) => this.handleHoursScopeOpen(i, DEFAULT_SETTINGS_SCOPE) },
+    { kind: "button", id: "icadmin_sla_hours_teams_pg:", match: "prefix", handler: (i) => this.handleHoursTeamsPage(i) },
+    { kind: "button", id: "icadmin_sla_hours_s:", match: "prefix", handler: (i) => this.handleHoursScopeOpen(i, this.scopeSeg(i.customId, 1)) },
+    { kind: "button", id: "icadmin_sla_hours_toggle:", match: "prefix", handler: (i) => this.handleHoursToggle(i) },
+    { kind: "button", id: "icadmin_sla_hours_tz:", match: "prefix", handler: (i) => this.handleHoursTzOpen(i) },
+    { kind: "modal", id: "icadmin_sla_hours_tz_m:", match: "prefix", handler: (i) => this.handleHoursTzSubmit(i) },
+    { kind: "select", id: "icadmin_sla_hours_day:", match: "prefix", handler: (i) => this.handleHoursDayPick(i) },
     { kind: "modal", id: "icadmin_sla_hours_day_m:", match: "prefix", handler: (i) => this.handleHoursDaySubmit(i) },
-    { kind: "button", id: "icadmin_sla_hours_hol_add", match: "exact", handler: (i) => this.handleHolidayAddOpen(i) },
-    { kind: "modal", id: "icadmin_sla_hours_hol_add_m", match: "exact", handler: (i) => this.handleHolidayAddSubmit(i) },
-    { kind: "select", id: "icadmin_sla_hours_hol_rm", match: "exact", handler: (i) => this.handleHolidayRemove(i) },
-    { kind: "button", id: "icadmin_sla_hours_hol_pg:", match: "prefix", handler: (i) => this.handleHoursOpen(i, this.pageFrom(i.customId)) },
-    { kind: "button", id: "icadmin_sla_hours", match: "exact", handler: (i) => this.handleHoursOpen(i, 0) },
+    { kind: "button", id: "icadmin_sla_hours_hol_add:", match: "prefix", handler: (i) => this.handleHolidayAddOpen(i) },
+    { kind: "modal", id: "icadmin_sla_hours_hol_add_m:", match: "prefix", handler: (i) => this.handleHolidayAddSubmit(i) },
+    { kind: "select", id: "icadmin_sla_hours_hol_rm:", match: "prefix", handler: (i) => this.handleHolidayRemove(i) },
+    { kind: "button", id: "icadmin_sla_hours_hol_pg:", match: "prefix", handler: (i) => this.handleHoursScopedPage(i) },
+    { kind: "button", id: "icadmin_sla_hours_reset:", match: "prefix", handler: (i) => this.handleHoursOverrideClear(i) },
+    { kind: "button", id: "icadmin_sla_hours", match: "exact", handler: (i) => this.handleHoursTeamsOpen(i, 0) },
     // pin + preview
     { kind: "button", id: "icadmin_sla_pin", match: "exact", handler: (i) => this.handlePinOpen(i) },
     { kind: "button", id: "icadmin_sla_unpin:", match: "prefix", handler: (i) => this.handleUnpin(i) },
@@ -110,12 +115,14 @@ export class SlaHub {
     const targets = s.slaTargets();
     const withClocks = targets.filter(hasClockDurations).length;
     const oh = s.officeHoursEnabled() ? s.officeHours() : undefined;
+    const teamHours = s.listTeamOverrides().filter((o) => o.entry.officeHoursJson || o.entry.officeHoursEnabled !== undefined).length;
     const ohLine =
-      oh === undefined
-        ? "off — clocks run 24/7"
+      (oh === undefined
+        ? "default off — clocks run 24/7"
         : oh === null
-          ? "⚠️ enabled but INVALID — clocks run 24/7 until fixed"
-          : `on — ${oh.tz}${oh.holidays.length ? ` · ${oh.holidays.length} holiday(s)` : ""}`;
+          ? "⚠️ default enabled but INVALID — clocks run 24/7 until fixed"
+          : `default on — ${oh.tz}${oh.holidays.length ? ` · ${oh.holidays.length} holiday(s)` : ""}`) +
+      (teamHours ? ` · ${teamHours} team override(s)` : "");
     const embed = panelEmbed(
       "SLA Manager",
       [
@@ -1140,14 +1147,49 @@ export class SlaHub {
     });
   }
 
-  // ---- office hours ----
+  // ---- office hours (per-team: picker → scoped schedule editor) ----
+  // Expert's team office hours: each team can pause SLA clocks on its own
+  // schedule; teams without one inherit the workspace default, which is also
+  // the fallback for conversations with no team. customId scope = a team id or
+  // DEFAULT_SETTINGS_SCOPE.
+
+  private scopeSeg(customId: string, idx: number): string {
+    return customId.split(":")[idx] ?? DEFAULT_SETTINGS_SCOPE;
+  }
+
+  private hoursTeamId(scope: string): string | null {
+    return scope === DEFAULT_SETTINGS_SCOPE ? null : scope;
+  }
 
   private emptyWeek(): NonNullable<ReturnType<SettingsStore["officeHours"]>>["week"] {
     return { mon: [], tue: [], wed: [], thu: [], fri: [], sat: [], sun: [] };
   }
 
-  private currentSchedule(): OfficeHoursSchedule {
+  // The schedule to EDIT for a scope: its own stored schedule, else the
+  // workspace default as a starting template, else an empty UTC schedule.
+  private scheduleForScope(scope: string): OfficeHoursSchedule {
+    const teamId = this.hoursTeamId(scope);
+    if (teamId) {
+      const ov = this.ctx.settingsStore.teamOverride(teamId);
+      if (ov?.officeHoursJson) return ov.officeHoursJson;
+    }
     return this.ctx.settingsStore.officeHours() ?? { tz: "UTC", week: this.emptyWeek(), holidays: [] };
+  }
+
+  private enabledForScope(scope: string): boolean {
+    const teamId = this.hoursTeamId(scope);
+    return teamId ? this.ctx.settingsStore.resolveOfficeHoursEnabled(teamId) : this.ctx.settingsStore.officeHoursEnabled();
+  }
+
+  private async saveScopeSchedule(scope: string, schedule: OfficeHoursSchedule): Promise<void> {
+    const name = scope === DEFAULT_SETTINGS_SCOPE ? null : await this.scopeTeamName(scope);
+    await this.ctx.settingsStore.updateOfficeHoursScoped(scope, name, { officeHoursJson: schedule });
+  }
+
+  private async scopeTeamName(scope: string): Promise<string> {
+    if (scope === DEFAULT_SETTINGS_SCOPE) return "Workspace default";
+    const teams = await this.ctx.intercomClient.listTeams().catch(() => []);
+    return teams.find((t) => t.id === scope)?.name ?? this.ctx.settingsStore.teamOverride(scope)?.teamName ?? `Team ${scope}`;
   }
 
   private formatWindows(windows: Array<{ start: string; end: string }>): string {
@@ -1155,20 +1197,94 @@ export class SlaHub {
     return windows.map((w) => `${w.start}–${w.end}${w.end <= w.start ? " (+1d)" : ""}`).join(", ");
   }
 
-  private buildHoursPanel(page: number): Panel {
+  // Team-picker root for office hours.
+  private async buildHoursTeamsPanel(page: number): Promise<Panel> {
     const s = this.ctx.settingsStore;
-    const enabled = s.officeHoursEnabled();
-    const stored = s.officeHours();
-    const schedule = stored ?? { tz: "UTC", week: this.emptyWeek(), holidays: [] };
+    const teams = await this.ctx.intercomClient.listTeams().catch(() => []);
+    const TEAM_OPTS_MAX = 24;
+    const totalPages = Math.max(1, Math.ceil(teams.length / TEAM_OPTS_MAX));
+    const clamped = Math.min(Math.max(0, page), totalPages - 1);
+    const slice = teams.slice(clamped * TEAM_OPTS_MAX, (clamped + 1) * TEAM_OPTS_MAX);
+    const defEnabled = s.officeHoursEnabled();
+    const overrides = new Set(s.listTeamOverrides().filter((o) => o.entry.officeHoursJson || o.entry.officeHoursEnabled !== undefined).map((o) => o.teamId));
+    const embed = panelEmbed(
+      "Office Hours",
+      [
+        `**Workspace default:** ${defEnabled ? `on — \`${(s.officeHours()?.tz) ?? "?"}\`` : "off (clocks run 24/7)"}`,
+        `**Teams with custom hours:** ${overrides.size || "none"}`,
+        "",
+        "SLA clocks count business time only. Each conversation uses **its own team's** office hours; teams without custom hours inherit the workspace default (also the fallback for conversations with no team). Only SLA clocks pause — assignment runs 24/7.",
+        "",
+        "Pick a team below (or the workspace default) to edit its schedule.",
+      ].join("\n")
+    );
+    const components: Panel["components"] = [];
+    if (slice.length) {
+      components.push(
+        selectRow(
+          new StringSelectMenuBuilder()
+            .setCustomId("icadmin_sla_hours_pick")
+            .setPlaceholder("Edit a team's office hours…")
+            .addOptions(
+              slice.map((t) => ({
+                label: t.name.slice(0, 100),
+                value: t.id,
+                description: (overrides.has(t.id) ? "custom hours" : `inherits default (${s.resolveOfficeHoursEnabled(t.id) ? "on" : "off"})`).slice(0, 100),
+              }))
+            )
+        )
+      );
+    }
+    const nav = [
+      btn("icadmin_sla_hours_default", "Workspace Default", ButtonStyle.Primary),
+      btn("icadmin_hub:sla", "Back", ButtonStyle.Secondary),
+    ];
+    if (totalPages > 1) {
+      nav.unshift(
+        btn(`icadmin_sla_hours_teams_pg:${clamped - 1}`, "Prev", ButtonStyle.Secondary, clamped === 0),
+        btn(`icadmin_sla_hours_teams_pg:${clamped + 1}`, "Next", ButtonStyle.Secondary, clamped >= totalPages - 1)
+      );
+    }
+    components.push(buttonRow(...nav));
+    return { embeds: [embed], components };
+  }
+
+  private async handleHoursTeamsOpen(interaction: ButtonInteraction, page: number): Promise<void> {
+    await interaction.deferUpdate();
+    await interaction.editReply(await this.buildHoursTeamsPanel(page));
+  }
+
+  private async handleHoursTeamsPage(interaction: ButtonInteraction): Promise<void> {
+    await interaction.deferUpdate();
+    await interaction.editReply(await this.buildHoursTeamsPanel(Number(interaction.customId.split(":")[1]) || 0));
+  }
+
+  private async handleHoursScopePick(interaction: StringSelectMenuInteraction): Promise<void> {
+    await interaction.deferUpdate();
+    await interaction.editReply(await this.buildHoursPanel(interaction.values[0], 0));
+  }
+
+  private async handleHoursScopeOpen(interaction: ButtonInteraction, scope: string): Promise<void> {
+    await interaction.deferUpdate();
+    await interaction.editReply(await this.buildHoursPanel(scope, 0));
+  }
+
+  private async buildHoursPanel(scope: string, page: number): Promise<Panel> {
+    const teamId = this.hoursTeamId(scope);
+    const name = await this.scopeTeamName(scope);
+    const enabled = this.enabledForScope(scope);
+    const schedule = this.scheduleForScope(scope);
+    const hasOwn = teamId ? !!this.ctx.settingsStore.teamOverride(teamId)?.officeHoursJson : true;
     const dayLines = WEEKDAYS.map((d) => `**${d[0].toUpperCase()}${d.slice(1)}:** ${this.formatWindows(schedule.week[d])}`);
     const holidays = [...schedule.holidays].sort();
     const totalPages = Math.max(1, Math.ceil(holidays.length / PAGE_SIZE));
     const clamped = Math.min(Math.max(0, page), totalPages - 1);
     const slice = holidays.slice(clamped * PAGE_SIZE, (clamped + 1) * PAGE_SIZE);
     const embed = panelEmbed(
-      "Office Hours",
+      `Office Hours — ${name}`,
       [
-        `**Status:** ${enabled ? (stored ? "**on** — SLA clocks count business time only" : "⚠️ on but the stored schedule is INVALID — clocks run 24/7 until fixed") : "off — clocks run 24/7"}`,
+        teamId && !hasOwn ? "_This team currently inherits the workspace-default schedule shown below — editing anything creates a custom schedule._" : "",
+        `**Status:** ${enabled ? "**on** — SLA clocks count business time only" : "off — clocks run 24/7"}`,
         `**Timezone:** \`${schedule.tz}\``,
         "",
         ...dayLines,
@@ -1177,13 +1293,15 @@ export class SlaHub {
         slice.length ? slice.map((h) => `• ${h}`).join("\n") : "_none_",
         ...(totalPages > 1 ? [`Page ${clamped + 1}/${totalPages}`] : []),
         "",
-        "Windows are `HH:MM-HH:MM` in the schedule timezone; `22:00-06:00` crosses midnight; multiple windows per day are comma-separated. Only SLA clocks pause outside office hours — assignment and every other automation run 24/7.",
-      ].join("\n")
+        "Windows are `HH:MM-HH:MM` in the schedule timezone; `22:00-06:00` crosses midnight; multiple windows per day are comma-separated.",
+      ]
+        .filter((l) => l !== "")
+        .join("\n")
     );
     const components: Panel["components"] = [
       selectRow(
         new StringSelectMenuBuilder()
-          .setCustomId("icadmin_sla_hours_day")
+          .setCustomId(`icadmin_sla_hours_day:${scope}`)
           .setPlaceholder("Edit a weekday's windows…")
           .addOptions(
             WEEKDAYS.map((d) => ({
@@ -1198,50 +1316,59 @@ export class SlaHub {
       components.push(
         selectRow(
           new StringSelectMenuBuilder()
-            .setCustomId("icadmin_sla_hours_hol_rm")
+            .setCustomId(`icadmin_sla_hours_hol_rm:${scope}`)
             .setPlaceholder("Remove a holiday…")
             .addOptions(slice.map((h) => ({ label: h, value: h })))
         )
       );
     }
-    const nav = [
-      btn("icadmin_sla_hours_toggle", `Office hours: ${enabled ? "on" : "off"}`, enabled ? ButtonStyle.Success : ButtonStyle.Secondary),
-      btn("icadmin_sla_hours_tz", "Timezone", ButtonStyle.Secondary),
-      btn("icadmin_sla_hours_hol_add", "Add Holiday", ButtonStyle.Secondary),
-      btn("icadmin_hub:sla", "Back", ButtonStyle.Secondary),
+    const row1 = [
+      btn(`icadmin_sla_hours_toggle:${scope}`, `Office hours: ${enabled ? "on" : "off"}`, enabled ? ButtonStyle.Success : ButtonStyle.Secondary),
+      btn(`icadmin_sla_hours_tz:${scope}`, "Timezone", ButtonStyle.Secondary),
+      btn(`icadmin_sla_hours_hol_add:${scope}`, "Add Holiday", ButtonStyle.Secondary),
     ];
+    const row2 = [btn("icadmin_sla_hours", "Back to teams", ButtonStyle.Secondary)];
+    if (teamId && this.ctx.settingsStore.teamOverride(teamId)) {
+      row2.unshift(btn(`icadmin_sla_hours_reset:${scope}`, "Revert to Default", ButtonStyle.Danger));
+    }
     if (totalPages > 1) {
-      nav.unshift(
-        btn(`icadmin_sla_hours_hol_pg:${clamped - 1}`, "Prev", ButtonStyle.Secondary, clamped === 0),
-        btn(`icadmin_sla_hours_hol_pg:${clamped + 1}`, "Next", ButtonStyle.Secondary, clamped >= totalPages - 1)
+      row2.unshift(
+        btn(`icadmin_sla_hours_hol_pg:${scope}:${clamped - 1}`, "Prev", ButtonStyle.Secondary, clamped === 0),
+        btn(`icadmin_sla_hours_hol_pg:${scope}:${clamped + 1}`, "Next", ButtonStyle.Secondary, clamped >= totalPages - 1)
       );
     }
-    components.push(buttonRow(...nav));
+    components.push(buttonRow(...row1), buttonRow(...row2));
     return { embeds: [embed], components };
   }
 
-  private async handleHoursOpen(interaction: ButtonInteraction, page: number): Promise<void> {
-    await interaction.update(this.buildHoursPanel(page));
+  private async handleHoursScopedPage(interaction: ButtonInteraction): Promise<void> {
+    await interaction.deferUpdate();
+    const parts = interaction.customId.split(":");
+    await interaction.editReply(await this.buildHoursPanel(parts[1] ?? DEFAULT_SETTINGS_SCOPE, Number(parts[2]) || 0));
   }
 
   private async handleHoursToggle(interaction: ButtonInteraction): Promise<void> {
-    const next = !this.ctx.settingsStore.officeHoursEnabled();
-    await this.ctx.settingsStore.updateOfficeHours({ officeHoursEnabled: next });
-    this.ctx.auditConfig(interaction, `SLA office hours → ${next ? "on (clocks pause outside the schedule)" : "off (clocks run 24/7)"}`);
-    await interaction.update(this.buildHoursPanel(0));
+    const scope = this.scopeSeg(interaction.customId, 1);
+    const next = !this.enabledForScope(scope);
+    const name = scope === DEFAULT_SETTINGS_SCOPE ? null : await this.scopeTeamName(scope);
+    await this.ctx.settingsStore.updateOfficeHoursScoped(scope, name, { officeHoursEnabled: next });
+    this.ctx.auditConfig(interaction, `Office hours (${name ?? "workspace default"}) → ${next ? "on" : "off"}`);
+    await interaction.update(await this.buildHoursPanel(scope, 0));
   }
 
   private async handleHoursTzOpen(interaction: ButtonInteraction): Promise<void> {
-    const modal = new ModalBuilder().setCustomId("icadmin_sla_hours_tz_m").setTitle("Office hours timezone");
+    const scope = this.scopeSeg(interaction.customId, 1);
+    const modal = new ModalBuilder().setCustomId(`icadmin_sla_hours_tz_m:${scope}`).setTitle("Office hours timezone");
     modal.addComponents(
       new ActionRowBuilder<TextInputBuilder>().addComponents(
-        textInput("tz", "IANA timezone", { required: true, placeholder: "Europe/Berlin", maxLength: 60, value: this.currentSchedule().tz })
+        textInput("tz", "IANA timezone", { required: true, placeholder: "Europe/Berlin", maxLength: 60, value: this.scheduleForScope(scope).tz })
       )
     );
     await interaction.showModal(modal);
   }
 
   private async handleHoursTzSubmit(interaction: ModalSubmitInteraction): Promise<void> {
+    const scope = this.scopeSeg(interaction.customId, 1);
     const tz = interaction.fields.getTextInputValue("tz").trim();
     if (!isValidTimeZone(tz)) {
       await interaction.reply({
@@ -1250,17 +1377,17 @@ export class SlaHub {
       });
       return;
     }
-    const schedule = { ...this.currentSchedule(), tz };
-    await this.ctx.settingsStore.updateOfficeHours({ officeHoursJson: schedule });
-    this.ctx.auditConfig(interaction, `SLA office hours timezone → \`${tz}\``);
+    await this.saveScopeSchedule(scope, { ...this.scheduleForScope(scope), tz });
+    this.ctx.auditConfig(interaction, `Office hours timezone (${await this.scopeTeamName(scope)}) → \`${tz}\``);
     await this.ctx.sessions.ackModal(interaction);
-    await interaction.editReply(this.buildHoursPanel(0));
+    await interaction.editReply(await this.buildHoursPanel(scope, 0));
   }
 
   private async handleHoursDayPick(interaction: StringSelectMenuInteraction): Promise<void> {
+    const scope = this.scopeSeg(interaction.customId, 1);
     const day = interaction.values[0] as Weekday;
-    const current = this.currentSchedule().week[day] ?? [];
-    const modal = new ModalBuilder().setCustomId(`icadmin_sla_hours_day_m:${day}`).setTitle(`${day[0].toUpperCase()}${day.slice(1)} windows`);
+    const current = this.scheduleForScope(scope).week[day] ?? [];
+    const modal = new ModalBuilder().setCustomId(`icadmin_sla_hours_day_m:${scope}:${day}`).setTitle(`${day[0].toUpperCase()}${day.slice(1)} windows`);
     modal.addComponents(
       new ActionRowBuilder<TextInputBuilder>().addComponents(
         textInput("windows", "HH:MM-HH:MM, comma-separated (empty=closed)", {
@@ -1275,7 +1402,9 @@ export class SlaHub {
   }
 
   private async handleHoursDaySubmit(interaction: ModalSubmitInteraction): Promise<void> {
-    const day = interaction.customId.slice("icadmin_sla_hours_day_m:".length) as Weekday;
+    const parts = interaction.customId.split(":"); // icadmin_sla_hours_day_m:<scope>:<day>
+    const scope = parts[1] ?? DEFAULT_SETTINGS_SCOPE;
+    const day = parts[2] as Weekday;
     if (!WEEKDAYS.includes(day)) return;
     const raw = interaction.fields.getTextInputValue("windows").trim();
     const windows: Array<{ start: string; end: string }> = [];
@@ -1298,16 +1427,17 @@ export class SlaHub {
         windows.push({ start, end });
       }
     }
-    const schedule = this.currentSchedule();
+    const schedule = this.scheduleForScope(scope);
     schedule.week = { ...schedule.week, [day]: windows };
-    await this.ctx.settingsStore.updateOfficeHours({ officeHoursJson: schedule });
-    this.ctx.auditConfig(interaction, `SLA office hours ${day} → ${windows.length ? windows.map((w) => `${w.start}-${w.end}`).join(", ") : "closed"}`);
+    await this.saveScopeSchedule(scope, schedule);
+    this.ctx.auditConfig(interaction, `Office hours ${day} (${await this.scopeTeamName(scope)}) → ${windows.length ? windows.map((w) => `${w.start}-${w.end}`).join(", ") : "closed"}`);
     await this.ctx.sessions.ackModal(interaction);
-    await interaction.editReply(this.buildHoursPanel(0));
+    await interaction.editReply(await this.buildHoursPanel(scope, 0));
   }
 
   private async handleHolidayAddOpen(interaction: ButtonInteraction): Promise<void> {
-    const modal = new ModalBuilder().setCustomId("icadmin_sla_hours_hol_add_m").setTitle("Add holiday(s)");
+    const scope = this.scopeSeg(interaction.customId, 1);
+    const modal = new ModalBuilder().setCustomId(`icadmin_sla_hours_hol_add_m:${scope}`).setTitle("Add holiday(s)");
     modal.addComponents(
       new ActionRowBuilder<TextInputBuilder>().addComponents(
         textInput("dates", "YYYY-MM-DD, comma-separated", { required: true, placeholder: "2026-12-25, 2026-12-26", maxLength: 300 })
@@ -1317,6 +1447,7 @@ export class SlaHub {
   }
 
   private async handleHolidayAddSubmit(interaction: ModalSubmitInteraction): Promise<void> {
+    const scope = this.scopeSeg(interaction.customId, 1);
     const raw = interaction.fields.getTextInputValue("dates").trim();
     const dates = raw.split(",").map((p) => p.trim()).filter(Boolean);
     for (const d of dates) {
@@ -1325,21 +1456,30 @@ export class SlaHub {
         return;
       }
     }
-    const schedule = this.currentSchedule();
+    const schedule = this.scheduleForScope(scope);
     schedule.holidays = [...new Set([...schedule.holidays, ...dates])].sort();
-    await this.ctx.settingsStore.updateOfficeHours({ officeHoursJson: schedule });
-    this.ctx.auditConfig(interaction, `SLA office hours holiday(s) added: ${dates.join(", ")}`);
+    await this.saveScopeSchedule(scope, schedule);
+    this.ctx.auditConfig(interaction, `Office hours holiday(s) added (${await this.scopeTeamName(scope)}): ${dates.join(", ")}`);
     await this.ctx.sessions.ackModal(interaction);
-    await interaction.editReply(this.buildHoursPanel(0));
+    await interaction.editReply(await this.buildHoursPanel(scope, 0));
   }
 
   private async handleHolidayRemove(interaction: StringSelectMenuInteraction): Promise<void> {
+    const scope = this.scopeSeg(interaction.customId, 1);
     const date = interaction.values[0];
-    const schedule = this.currentSchedule();
+    const schedule = this.scheduleForScope(scope);
     schedule.holidays = schedule.holidays.filter((h) => h !== date);
-    await this.ctx.settingsStore.updateOfficeHours({ officeHoursJson: schedule });
-    this.ctx.auditConfig(interaction, `SLA office hours holiday removed: ${date}`);
-    await interaction.update(this.buildHoursPanel(0));
+    await this.saveScopeSchedule(scope, schedule);
+    this.ctx.auditConfig(interaction, `Office hours holiday removed (${await this.scopeTeamName(scope)}): ${date}`);
+    await interaction.update(await this.buildHoursPanel(scope, 0));
+  }
+
+  private async handleHoursOverrideClear(interaction: ButtonInteraction): Promise<void> {
+    const scope = this.scopeSeg(interaction.customId, 1);
+    const teamId = this.hoursTeamId(scope);
+    if (teamId) await this.ctx.settingsStore.clearTeamOfficeHoursOverride(teamId);
+    this.ctx.auditConfig(interaction, `Office hours reverted to default (${await this.scopeTeamName(scope)})`);
+    await interaction.update(await this.buildHoursTeamsPanel(0));
   }
 
   // ---- pin lookup ----

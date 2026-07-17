@@ -228,6 +228,7 @@ export interface IntercomConversationItem {
   id?: string | number;
   conversation_parts?: { conversation_parts?: IntercomWebhookPart[] };
   admin_assignee_id?: number | string | null; // balanced assignment + assignee SLA dim
+  team_assignee_id?: number | string | null; // scopes the balanced-assignment pool + per-team config
   snoozed_until?: number | null;
   tags?: { tags?: Array<{ id?: string | number; name?: string | null }> };
   // Native priority level (none/low/medium/high/urgent) — READ-only via the

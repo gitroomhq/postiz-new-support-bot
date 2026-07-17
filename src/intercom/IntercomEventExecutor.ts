@@ -55,7 +55,7 @@ export class IntercomEventExecutor {
   // IntercomSyncService.setExecutor.
   private slaService: { applyForBridged(threadId: string, reason: string): Promise<unknown> } | null = null;
   private assignmentService: {
-    maybeAssignOnCreate(conversationId: string, threadId: string | null, ticketId: string | null): Promise<void>;
+    maybeAssignOnCreate(conversationId: string, teamId: string | null, threadId: string | null, ticketId: string | null): Promise<void>;
   } | null = null;
 
   constructor(
@@ -72,7 +72,7 @@ export class IntercomEventExecutor {
   }
 
   setAssignmentService(service: {
-    maybeAssignOnCreate(conversationId: string, threadId: string | null, ticketId: string | null): Promise<void>;
+    maybeAssignOnCreate(conversationId: string, teamId: string | null, threadId: string | null, ticketId: string | null): Promise<void>;
   }): void {
     this.assignmentService = service;
   }
@@ -330,12 +330,14 @@ export class IntercomEventExecutor {
     }
     beat?.();
 
-    // Balanced assignment (bot-native, Advanced tier): pick a teammate right
-    // after team routing — creation only, so later human reassignment is
-    // never overridden (the enforcement sweep owns strays). Best-effort.
+    // Balanced assignment (bot-native, Advanced tier): pick a teammate WITHIN
+    // the routing team right after team routing — creation only, so later
+    // human reassignment is never overridden (the enforcement sweep owns
+    // strays). Best-effort. Uses the same routing team the bridge just
+    // assigned (teamId), so per-team config resolves correctly.
     if (created && this.assignmentService) {
       await this.assignmentService
-        .maybeAssignOnCreate(link.conversationId, threadId, ticketId)
+        .maybeAssignOnCreate(link.conversationId, teamId ?? null, threadId, ticketId)
         .catch(() => undefined);
       beat?.();
     }

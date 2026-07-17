@@ -101,7 +101,7 @@ export class SlaEnforcer {
     };
     if (!this.settingsStore.intercomConfigured()) return result;
     const doClocks = this.settingsStore.slaEnabled() || force;
-    const doAssign = this.settingsStore.assignEnabled() || force;
+    const doAssign = this.settingsStore.anyAssignmentEnabled() || force;
     if (!doClocks && !doAssign) return result;
     result.skipped = false;
 
@@ -164,8 +164,13 @@ export class SlaEnforcer {
     }
 
     // ---- assignment pass (before clocks: counts are freshest here) ----
-    if (doAssign && this.settingsStore.intercomTeamId()) {
-      const strays = items.filter((c) => notSnoozed(c) && !c.adminAssigneeId);
+    // A stray can only be balanced within its OWN team's pool; per-team enable
+    // is resolved inside assignConversation. Strays with no team are skipped
+    // (nothing to balance them against).
+    if (doAssign) {
+      const strays = items.filter(
+        (c) => notSnoozed(c) && !c.adminAssigneeId && c.teamAssigneeId && this.settingsStore.resolveAssignEnabled(c.teamAssigneeId)
+      );
       for (const stray of strays) {
         if (!budget()) break;
         try {
@@ -173,7 +178,7 @@ export class SlaEnforcer {
           const live = await this.client.getConversationSlaFacts(stray.id);
           if (!live || !live.open || live.adminAssigneeId) continue;
           const link = linkByConv.get(stray.id) ?? null;
-          const assignee = await this.assignment.assignConversation(stray.id, {
+          const assignee = await this.assignment.assignConversation(stray.id, stray.teamAssigneeId, {
             threadId: link?.ticketThreadId ?? null,
             ticketId: link?.ticketId ?? null,
           });
@@ -194,10 +199,17 @@ export class SlaEnforcer {
     // ---- clock pass ----
     if (doClocks) {
       const targets = new Map(this.settingsStore.slaTargets().map((t) => [t.value, t]));
-      const schedule = this.settingsStore.effectiveOfficeHours();
       const warnPct = this.settingsStore.slaWarnPct();
       const attrName = this.settingsStore.slaAttributeName();
       const statusAttrName = this.settingsStore.slaStatusAttributeName();
+      // Office-hours schedule is resolved per conversation from its team
+      // (team override ?? workspace default); cache per team for the tick.
+      const scheduleCache = new Map<string, ReturnType<SettingsStore["resolveOfficeHours"]>>();
+      const scheduleFor = (teamId: string | null) => {
+        const key = teamId ?? "";
+        if (!scheduleCache.has(key)) scheduleCache.set(key, this.settingsStore.resolveOfficeHours(teamId));
+        return scheduleCache.get(key) ?? null;
+      };
       // One warn per tick when the status attribute definition is missing —
       // not one per conversation per tick.
       let statusAttrBroken = false;
@@ -217,6 +229,7 @@ export class SlaEnforcer {
 
         const link = linkByConv.get(conv.id) ?? null;
         const kind: "bridged" | "native" = link ? "bridged" : "native";
+        const schedule = scheduleFor(conv.teamAssigneeId);
         try {
           const outcome = await this.enforceOne(conv, kind, link, state, target, warnPct, schedule, statusAttrName, now, {
             budget,
@@ -282,7 +295,7 @@ export class SlaEnforcer {
     state: StateRow | null,
     target: SlaTargetEntry,
     warnPct: number,
-    schedule: ReturnType<SettingsStore["effectiveOfficeHours"]>,
+    schedule: ReturnType<SettingsStore["resolveOfficeHours"]>,
     statusAttrName: string,
     now: Date,
     ctx: {

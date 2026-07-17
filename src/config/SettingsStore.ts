@@ -6,8 +6,21 @@ import { decryptSecret, encryptSecret, isVaultKvSentinel, VAULT_KV_SENTINEL } fr
 import type { VaultIntegration, VaultRuntimeConfig, VaultService } from "../vault/VaultService";
 import type { SlaTargetEntry } from "../sla/types";
 import { parseOfficeHours, type OfficeHoursSchedule } from "../sla/businessTime";
+import {
+  parseTeamSettingsMap,
+  parseCursorMap,
+  parseExcludedAdmins,
+  mergeEntry,
+  stripFields,
+  type TeamSettingsEntry,
+} from "./teamSettings";
+
+export type { TeamSettingsEntry } from "./teamSettings";
 
 export type ReminderTarget = "SUPPORT" | "CUSTOMER";
+
+// UI scope sentinel for editing the workspace default (vs a real team id).
+export const DEFAULT_SETTINGS_SCOPE = "__default__";
 
 export type IntercomMode = "none" | "push" | "bi";
 export type IntercomRegion = "us" | "eu" | "au";
@@ -729,72 +742,178 @@ export class SettingsStore {
     });
   }
 
-  // ---- Office hours (SLA clocks count business time only; /intercom → SLA Manager → Office Hours) ----
+  // ---- Office hours + balanced assignment (per-team, workspace-default fallback) ----
+  //
+  // Both features were per-team on Intercom Expert. The BotSettings columns
+  // below are the WORKSPACE DEFAULT; teamSettingsJson holds per-team overrides
+  // that layer on per-field (any absent field inherits the default). A
+  // conversation resolves its config from its own team (team_assignee_id);
+  // teamId null or an un-overridden team falls back to the default. The
+  // "__default__" scope sentinel edits the default itself from the UI.
 
+  // Workspace-default getters (also the fallback for un-overridden teams).
   officeHoursEnabled(): boolean {
     return this.settings.officeHoursEnabled;
   }
 
-  // Parsed weekly schedule, or null when unset/invalid (clocks then run on
-  // wall clock; the SLA hub + Verify Setup surface invalid JSON).
   officeHours(): OfficeHoursSchedule | null {
     const raw = this.settings.officeHoursJson as unknown;
-    if (raw == null) return null;
-    return parseOfficeHours(raw);
+    return raw == null ? null : parseOfficeHours(raw);
   }
-
-  // Effective schedule for clock math: null unless enabled AND valid.
-  effectiveOfficeHours(): OfficeHoursSchedule | null {
-    return this.officeHoursEnabled() ? this.officeHours() : null;
-  }
-
-  async updateOfficeHours(data: { officeHoursEnabled?: boolean; officeHoursJson?: OfficeHoursSchedule }): Promise<void> {
-    this.settings = await this.prisma.botSettings.update({
-      where: { id: "global" },
-      data: {
-        ...(data.officeHoursEnabled !== undefined ? { officeHoursEnabled: data.officeHoursEnabled } : {}),
-        ...(data.officeHoursJson !== undefined ? { officeHoursJson: data.officeHoursJson as unknown as Prisma.InputJsonValue } : {}),
-      },
-    });
-  }
-
-  // ---- Balanced assignment (/intercom → Assignment) ----
 
   assignEnabled(): boolean {
     return this.settings.assignEnabled;
   }
 
-  // Admins benched from bot assignment (names snapshotted for display).
   assignExcludedAdmins(): Array<{ id: string; name: string }> {
-    const raw = this.settings.assignExcludedAdminsJson as unknown;
-    if (!Array.isArray(raw)) return [];
-    return raw
-      .filter((e): e is { id: string; name?: unknown } => !!e && typeof e === "object" && typeof (e as { id?: unknown }).id === "string")
-      .map((e) => ({ id: e.id, name: typeof e.name === "string" ? e.name : e.id }));
+    return parseExcludedAdmins(this.settings.assignExcludedAdminsJson);
   }
 
-  assignRotationCursor(): string | null {
-    return this.settings.assignRotationCursor;
+  // Per-team override map (parsed defensively; unknown fields dropped).
+  private teamSettingsMap(): Record<string, TeamSettingsEntry> {
+    return parseTeamSettingsMap(this.settings.teamSettingsJson);
   }
 
-  async updateAssignment(data: { assignEnabled?: boolean; assignExcludedAdmins?: Array<{ id: string; name: string }> }): Promise<void> {
+  teamOverride(teamId: string): TeamSettingsEntry | null {
+    return this.teamSettingsMap()[teamId] ?? null;
+  }
+
+  // Teams that carry an explicit override (for the UI badge + "configured" list).
+  listTeamOverrides(): Array<{ teamId: string; entry: TeamSettingsEntry }> {
+    return Object.entries(this.teamSettingsMap()).map(([teamId, entry]) => ({ teamId, entry }));
+  }
+
+  // ---- runtime resolution (teamId null → default) ----
+
+  resolveAssignEnabled(teamId: string | null): boolean {
+    const e = teamId ? this.teamOverride(teamId) : null;
+    return e?.assignEnabled ?? this.settings.assignEnabled;
+  }
+
+  // Cheap gate for the enforcement tick: is bot assignment on for the default
+  // or ANY team override? False → the stray-assignment pass is skipped wholesale.
+  anyAssignmentEnabled(): boolean {
+    if (this.settings.assignEnabled) return true;
+    return this.listTeamOverrides().some((o) => o.entry.assignEnabled === true);
+  }
+
+  resolveAssignExcludedAdmins(teamId: string | null): Array<{ id: string; name: string }> {
+    const e = teamId ? this.teamOverride(teamId) : null;
+    return e?.assignExcludedAdmins ?? this.assignExcludedAdmins();
+  }
+
+  resolveOfficeHoursEnabled(teamId: string | null): boolean {
+    const e = teamId ? this.teamOverride(teamId) : null;
+    return e?.officeHoursEnabled ?? this.settings.officeHoursEnabled;
+  }
+
+  // Effective office-hours schedule for a conversation's team: null (wall
+  // clock) unless resolved-enabled AND the resolved JSON parses. Per-field:
+  // a team can enable hours and inherit the default schedule, or set its own.
+  resolveOfficeHours(teamId: string | null): OfficeHoursSchedule | null {
+    const e = teamId ? this.teamOverride(teamId) : null;
+    const enabled = e?.officeHoursEnabled ?? this.settings.officeHoursEnabled;
+    if (!enabled) return null;
+    const raw = (e?.officeHoursJson ?? this.settings.officeHoursJson) as unknown;
+    return raw == null ? null : parseOfficeHours(raw);
+  }
+
+  // ---- per-team rotation cursors (operational state, always per-team) ----
+
+  private rotationCursors(): Record<string, string> {
+    return parseCursorMap(this.settings.assignRotationCursorsJson);
+  }
+
+  teamRotationCursor(teamId: string): string | null {
+    return this.rotationCursors()[teamId] ?? null;
+  }
+
+  // Engine-written (every bot assignment advances it). Merges into the map so
+  // the hot path only touches one team's cursor.
+  async setTeamRotationCursor(teamId: string, adminId: string | null): Promise<void> {
+    const map = this.rotationCursors();
+    if (adminId == null) delete map[teamId];
+    else map[teamId] = adminId;
     this.settings = await this.prisma.botSettings.update({
       where: { id: "global" },
-      data: {
-        ...(data.assignEnabled !== undefined ? { assignEnabled: data.assignEnabled } : {}),
-        ...(data.assignExcludedAdmins !== undefined
-          ? { assignExcludedAdminsJson: data.assignExcludedAdmins as unknown as Prisma.InputJsonValue }
-          : {}),
-      },
+      data: { assignRotationCursorsJson: map as unknown as Prisma.InputJsonValue },
     });
   }
 
-  // Engine-written (every bot assignment advances it) — separate from the
-  // UI-driven updaters so the hot path stays a one-column update.
-  async setAssignRotationCursor(adminId: string | null): Promise<void> {
+  // ---- scoped updaters (scope = DEFAULT_SETTINGS_SCOPE or a real team id) ----
+
+  async updateOfficeHoursScoped(
+    scope: string,
+    teamName: string | null,
+    data: { officeHoursEnabled?: boolean; officeHoursJson?: OfficeHoursSchedule }
+  ): Promise<void> {
+    if (scope === DEFAULT_SETTINGS_SCOPE) {
+      this.settings = await this.prisma.botSettings.update({
+        where: { id: "global" },
+        data: {
+          ...(data.officeHoursEnabled !== undefined ? { officeHoursEnabled: data.officeHoursEnabled } : {}),
+          ...(data.officeHoursJson !== undefined ? { officeHoursJson: data.officeHoursJson as unknown as Prisma.InputJsonValue } : {}),
+        },
+      });
+      return;
+    }
+    await this.mergeTeamOverride(scope, teamName, {
+      ...(data.officeHoursEnabled !== undefined ? { officeHoursEnabled: data.officeHoursEnabled } : {}),
+      ...(data.officeHoursJson !== undefined ? { officeHoursJson: data.officeHoursJson } : {}),
+    });
+  }
+
+  async updateAssignmentScoped(
+    scope: string,
+    teamName: string | null,
+    data: { assignEnabled?: boolean; assignExcludedAdmins?: Array<{ id: string; name: string }> }
+  ): Promise<void> {
+    if (scope === DEFAULT_SETTINGS_SCOPE) {
+      this.settings = await this.prisma.botSettings.update({
+        where: { id: "global" },
+        data: {
+          ...(data.assignEnabled !== undefined ? { assignEnabled: data.assignEnabled } : {}),
+          ...(data.assignExcludedAdmins !== undefined
+            ? { assignExcludedAdminsJson: data.assignExcludedAdmins as unknown as Prisma.InputJsonValue }
+            : {}),
+        },
+      });
+      return;
+    }
+    await this.mergeTeamOverride(scope, teamName, {
+      ...(data.assignEnabled !== undefined ? { assignEnabled: data.assignEnabled } : {}),
+      ...(data.assignExcludedAdmins !== undefined ? { assignExcludedAdmins: data.assignExcludedAdmins } : {}),
+    });
+  }
+
+  private async mergeTeamOverride(teamId: string, teamName: string | null, patch: TeamSettingsEntry): Promise<void> {
+    const map = mergeEntry(this.teamSettingsMap(), teamId, teamName, patch);
     this.settings = await this.prisma.botSettings.update({
       where: { id: "global" },
-      data: { assignRotationCursor: adminId },
+      data: { teamSettingsJson: map as unknown as Prisma.InputJsonValue },
+    });
+  }
+
+  // Drop a team's entire override (revert BOTH concerns to the default).
+  async clearTeamOverride(teamId: string): Promise<void> {
+    await this.stripTeamFields(teamId, ["assignEnabled", "assignExcludedAdmins", "officeHoursEnabled", "officeHoursJson"]);
+  }
+
+  // Revert just the assignment concern for a team (keeps any office-hours override).
+  async clearTeamAssignOverride(teamId: string): Promise<void> {
+    await this.stripTeamFields(teamId, ["assignEnabled", "assignExcludedAdmins"]);
+  }
+
+  // Revert just the office-hours concern for a team (keeps any assignment override).
+  async clearTeamOfficeHoursOverride(teamId: string): Promise<void> {
+    await this.stripTeamFields(teamId, ["officeHoursEnabled", "officeHoursJson"]);
+  }
+
+  private async stripTeamFields(teamId: string, fields: Array<keyof TeamSettingsEntry>): Promise<void> {
+    const map = stripFields(this.teamSettingsMap(), teamId, fields);
+    this.settings = await this.prisma.botSettings.update({
+      where: { id: "global" },
+      data: { teamSettingsJson: map as unknown as Prisma.InputJsonValue },
     });
   }
 

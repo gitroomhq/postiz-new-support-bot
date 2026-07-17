@@ -314,16 +314,23 @@ model BotSettings {
   slaStatusAttributeName String  @default("SLA Status")
   slaBreachTagName       String  @default("sla-breached") // tagged on breach, untagged on recovery
   slaWarnPct             Int     @default(80)             // at_risk threshold, % of target (per-target override in slaTargetsJson)
-  // Office hours: SLA clocks count business time only while enabled. JSON:
-  // { tz, week: { mon..sun: [{ start: "HH:MM", end: "HH:MM" }] }, holidays: ["YYYY-MM-DD"] }.
+  // WORKSPACE-DEFAULT office hours + balanced assignment. Per-team overrides
+  // (teamSettingsJson) layer on top per-field; a team with no override inherits
+  // these. Office hours: SLA clocks count business time only while enabled —
+  // JSON { tz, week: { mon..sun: [{ start, end }] }, holidays: ["YYYY-MM-DD"] }.
   officeHoursEnabled Boolean @default(false)
   officeHoursJson    Json?
-  // Balanced assignment (hybrid round-robin over the routing team's members;
-  // edited via /intercom → Assignment). Excluded admins never receive bot
-  // assignments; the rotation cursor is the last bot-assigned admin id.
+  // Balanced assignment: the bot balances a conversation WITHIN its assigned
+  // team's members (hybrid round-robin); excluded admins never receive bot
+  // assignments. Edited via /intercom → Assignment.
   assignEnabled            Boolean @default(false)
   assignExcludedAdminsJson Json?   // [{ id, name }] — names snapshotted for display
-  assignRotationCursor     String?
+  assignRotationCursorsJson Json?  // { [teamId]: adminId } — per-team round-robin cursor
+  // Per-team overrides of the assignment + office-hours defaults above:
+  // { [teamId]: { teamName?, assignEnabled?, assignExcludedAdmins?, officeHoursEnabled?, officeHoursJson? } }.
+  // Any field absent = inherit the workspace default; a team with no entry
+  // inherits everything. Edited via /intercom → Assignment and → SLA → Office Hours.
+  teamSettingsJson         Json?
   updatedAt           DateTime  @updatedAt
 
   @@map("bot_settings")

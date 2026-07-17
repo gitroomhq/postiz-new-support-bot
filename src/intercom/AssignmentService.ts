@@ -7,9 +7,9 @@ import { log } from "../util/logger";
 
 const assignLog = log.child("intercom:assign");
 
-// TTL for the admins/team snapshot used by webhook-path picks (the 5-min
-// enforcement tick refreshes it anyway).
-const POOL_CACHE_TTL_MS = 60_000;
+// TTL for the admins/team snapshots used by webhook-path picks (the 5-min
+// enforcement tick refreshes counts anyway).
+const CACHE_TTL_MS = 60_000;
 // Open-count freshness: counts come from the last enforcement scan. Older
 // than this and the webhook path degrades to count-less round-robin (uniform
 // counts) rather than fetching the whole workspace per webhook.
@@ -18,15 +18,17 @@ const COUNTS_FRESH_MS = 10 * 60_000;
 export type WithAuthor = <T>(fn: (adminId: string) => Promise<T>) => Promise<T>;
 
 // Bot-driven balanced assignment (Intercom Advanced lost native workload
-// management). Hybrid round-robin over the routing team's members — see
-// assignment.ts for the pure balancer. The bot ONLY assigns conversations
-// with no admin assignee (human assignment is never overridden); the single
-// exception is a customer reply landing on an away/no-longer-pooled assignee,
-// which re-routes to the pool. Away teammates receive no new work; their
-// queues are never drained. Runs 24/7 — office hours pause SLA clocks only.
+// management). Assignment is inherently TEAM-scoped — the bot balances a
+// conversation WITHIN its assigned team's members (hybrid round-robin; see
+// assignment.ts). Each team's enable/exclusions/rotation come from
+// SettingsStore's per-team resolution (team override ?? workspace default);
+// a conversation with no team can't be balanced (no pool) and is left alone.
+// The bot only assigns conversations with no admin assignee (human assignment
+// is never overridden); the single exception is a customer reply landing on
+// an away/removed assignee. Runs 24/7 — office hours pause SLA clocks only.
 export class AssignmentService {
   private adminsCache: { fetchedAt: number; admins: IntercomAdmin[] } | null = null;
-  private teamCache: { fetchedAt: number; teamId: string; adminIds: string[] } | null = null;
+  private teamCache = new Map<string, { fetchedAt: number; adminIds: string[] }>();
   private openCounts: { computedAt: number; counts: Map<string, number> } | null = null;
 
   constructor(
@@ -42,57 +44,71 @@ export class AssignmentService {
     this.openCounts = { computedAt: Date.now(), counts };
   }
 
-  // Admins + team membership with a short cache. Never throws — assignment is
-  // always best-effort decoration of the support flow.
-  private async poolMembers(): Promise<PoolMember[] | null> {
-    const teamId = this.settingsStore.intercomTeamId();
-    if (!teamId) return null;
+  private async admins(): Promise<IntercomAdmin[] | null> {
     const now = Date.now();
+    if (this.adminsCache && now - this.adminsCache.fetchedAt < CACHE_TTL_MS) return this.adminsCache.admins;
     try {
-      if (!this.adminsCache || now - this.adminsCache.fetchedAt >= POOL_CACHE_TTL_MS) {
-        this.adminsCache = { fetchedAt: now, admins: await this.client.listAdmins() };
-      }
-      if (!this.teamCache || this.teamCache.teamId !== teamId || now - this.teamCache.fetchedAt >= POOL_CACHE_TTL_MS) {
-        const team = await this.client.getTeam(teamId);
-        if (!team) return null;
-        this.teamCache = { fetchedAt: now, teamId, adminIds: team.adminIds };
-      }
+      const admins = await this.client.listAdmins();
+      this.adminsCache = { fetchedAt: now, admins };
+      return admins;
     } catch (e) {
-      // Stale cache beats no pool — assignment is best-effort.
-      assignLog.warn("assignment pool fetch failed", { error: e instanceof Error ? e.message : String(e) });
+      assignLog.warn("assignment admins fetch failed", { error: e instanceof Error ? e.message : String(e) });
+      return this.adminsCache?.admins ?? null;
     }
-    const admins = this.adminsCache?.admins;
-    const team = this.teamCache;
-    if (!admins || !team || team.teamId !== teamId) return null;
+  }
+
+  private async teamMemberIds(teamId: string): Promise<string[] | null> {
+    const now = Date.now();
+    const cached = this.teamCache.get(teamId);
+    if (cached && now - cached.fetchedAt < CACHE_TTL_MS) return cached.adminIds;
+    try {
+      const team = await this.client.getTeam(teamId);
+      if (!team) return cached?.adminIds ?? null;
+      this.teamCache.set(teamId, { fetchedAt: now, adminIds: team.adminIds });
+      return team.adminIds;
+    } catch (e) {
+      assignLog.warn("assignment team fetch failed", { "intercom.team_id": teamId, error: e instanceof Error ? e.message : String(e) });
+      return cached?.adminIds ?? null;
+    }
+  }
+
+  // The balanced pool for one team: its members minus Operator/Fin minus that
+  // team's resolved exclusion list, with resolved open counts.
+  private async poolForTeam(teamId: string): Promise<PoolMember[] | null> {
+    const [admins, memberIds] = await Promise.all([this.admins(), this.teamMemberIds(teamId)]);
+    if (!admins || !memberIds) return null;
     const counts =
       this.openCounts && Date.now() - this.openCounts.computedAt < COUNTS_FRESH_MS
         ? this.openCounts.counts
         : new Map<string, number>(); // stale → uniform counts → plain round-robin
-    const excluded = new Set(this.settingsStore.assignExcludedAdmins().map((a) => a.id));
-    return buildPool(team.adminIds, admins, this.settingsStore.intercomOperatorAdminId(), excluded, counts);
+    const excluded = new Set(this.settingsStore.resolveAssignExcludedAdmins(teamId).map((a) => a.id));
+    return buildPool(memberIds, admins, this.settingsStore.intercomOperatorAdminId(), excluded, counts);
   }
 
   // Live pool view for the /intercom Assignment hub (no assignment made).
-  async poolPreview(): Promise<{ members: PoolMember[]; cursor: string | null; countsFresh: boolean } | null> {
-    const members = await this.poolMembers();
+  async poolPreview(teamId: string): Promise<{ members: PoolMember[]; cursor: string | null; countsFresh: boolean } | null> {
+    const members = await this.poolForTeam(teamId);
     if (!members) return null;
     return {
       members,
-      cursor: this.settingsStore.assignRotationCursor(),
+      cursor: this.settingsStore.teamRotationCursor(teamId),
       countsFresh: this.openCounts != null && Date.now() - this.openCounts.computedAt < COUNTS_FRESH_MS,
     };
   }
 
-  // Core assignment. Returns the assignee admin id, or null when no pick was
-  // possible. Never throws.
+  // Core assignment for a conversation on `teamId`. Gated by that team's
+  // resolved enable. Returns the assignee admin id, or null. Never throws.
   async assignConversation(
     conversationId: string,
+    teamId: string | null,
     opts: { threadId?: string | null; ticketId?: string | null; bumpCount?: boolean } = {}
   ): Promise<string | null> {
+    if (!teamId) return null; // no team → no pool → cannot balance
+    if (!this.settingsStore.resolveAssignEnabled(teamId)) return null;
     try {
-      const members = await this.poolMembers();
+      const members = await this.poolForTeam(teamId);
       if (!members || members.length === 0) return null;
-      const pick = pickAssignee(members, this.settingsStore.assignRotationCursor());
+      const pick = pickAssignee(members, this.settingsStore.teamRotationCursor(teamId));
       if (!pick) return null;
       // Damper BEFORE the API call: the conversation.admin.assigned webhook can
       // arrive faster than our own bookkeeping.
@@ -104,8 +120,7 @@ export class AssignmentService {
         throw e;
       }
       // Bridged tickets mirror the assignee onto the ticket object so the
-      // Tickets views agree with the conversation. Best-effort: the
-      // conversation assignment is the one that matters.
+      // Tickets views agree with the conversation. Best-effort.
       if (opts.ticketId) {
         await this.withAuthor((a) =>
           this.client.updateTicket(opts.ticketId as string, { assigneeId: pick.adminId, adminId: a })
@@ -116,47 +131,57 @@ export class AssignmentService {
           });
         });
       }
-      await this.settingsStore.setAssignRotationCursor(pick.nextCursor);
+      await this.settingsStore.setTeamRotationCursor(teamId, pick.nextCursor);
       // Keep this tick's counts honest so a burst of strays spreads out.
       if (opts.bumpCount !== false && this.openCounts) {
         this.openCounts.counts.set(pick.adminId, (this.openCounts.counts.get(pick.adminId) ?? 0) + 1);
       }
       assignLog.info("conversation assigned", {
         "intercom.conversation_id": conversationId,
+        "intercom.team_id": teamId,
         "intercom.assignee_id": pick.adminId,
       });
       return pick.adminId;
     } catch (e) {
       assignLog.warn("assignment failed", {
         "intercom.conversation_id": conversationId,
+        "intercom.team_id": teamId,
         error: e instanceof Error ? e.message : String(e),
       });
       return null;
     }
   }
 
-  // Creation-time hook (bridge ensure / native conversation.user.created):
+  // Creation-time hook (bridge ensure = the routing team; native
+  // conversation.user.created = the conversation's team from the webhook):
   // the conversation is definitionally unassigned, no pre-read needed.
-  async maybeAssignOnCreate(conversationId: string, threadId: string | null, ticketId: string | null): Promise<void> {
-    if (!this.settingsStore.assignEnabled()) return;
-    await this.assignConversation(conversationId, { threadId, ticketId });
+  async maybeAssignOnCreate(conversationId: string, teamId: string | null, threadId: string | null, ticketId: string | null): Promise<void> {
+    if (!teamId) return;
+    await this.assignConversation(conversationId, teamId, { threadId, ticketId });
   }
 
   // Customer replied while the current assignee is away or no longer in the
-  // pool (covers reopens): re-route to the pool. A conversation with NO
-  // assignee is left to the stray sweep — this path must stay webhook-cheap.
-  async maybeReassignOnCustomerReply(conversationId: string, currentAssigneeId: string | null, threadId: string | null, ticketId: string | null): Promise<void> {
-    if (!this.settingsStore.assignEnabled()) return;
-    if (!currentAssigneeId) return;
-    const members = await this.poolMembers();
+  // conversation's team pool (covers reopens): re-route within that team. A
+  // conversation with NO assignee is left to the stray sweep.
+  async maybeReassignOnCustomerReply(
+    conversationId: string,
+    currentAssigneeId: string | null,
+    teamId: string | null,
+    threadId: string | null,
+    ticketId: string | null
+  ): Promise<void> {
+    if (!teamId || !currentAssigneeId) return;
+    if (!this.settingsStore.resolveAssignEnabled(teamId)) return;
+    const members = await this.poolForTeam(teamId);
     if (!members) return;
     const current = members.find((m) => m.id === currentAssigneeId);
     const stillWorkable = current != null && !current.away && !current.excluded;
     if (stillWorkable) return;
     assignLog.info("reassigning away/gone assignee on customer reply", {
       "intercom.conversation_id": conversationId,
+      "intercom.team_id": teamId,
       "intercom.previous_assignee_id": currentAssigneeId,
     });
-    await this.assignConversation(conversationId, { threadId, ticketId });
+    await this.assignConversation(conversationId, teamId, { threadId, ticketId });
   }
 }

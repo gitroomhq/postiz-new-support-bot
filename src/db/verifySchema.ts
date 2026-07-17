@@ -56,7 +56,7 @@ const EXPECTED_COLUMNS: Record<string, string[]> = {
     "agentRipMigratedAt", "intercomPanelAdminsJson", "billingActionLevelsJson", "panelTokenSecret",
     "panelTokenEpoch", "slaEnabled", "slaNativeEnabled", "slaDefaultTarget", "slaAttributeName", "slaTargetsJson", "slaNoteKickEnabled", "slaNoteAdminId",
     "slaStatusAttributeName", "slaBreachTagName", "slaWarnPct", "officeHoursEnabled", "officeHoursJson",
-    "assignEnabled", "assignExcludedAdminsJson", "assignRotationCursor",
+    "assignEnabled", "assignExcludedAdminsJson", "assignRotationCursorsJson", "teamSettingsJson",
     "updatedAt",
   ],
   status_tags: [

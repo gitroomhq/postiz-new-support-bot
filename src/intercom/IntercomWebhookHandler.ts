@@ -151,10 +151,11 @@ export class IntercomWebhookHandler {
 
   // Balanced assignment — bound late from index.ts.
   private assignmentService: {
-    maybeAssignOnCreate(conversationId: string, threadId: string | null, ticketId: string | null): Promise<void>;
+    maybeAssignOnCreate(conversationId: string, teamId: string | null, threadId: string | null, ticketId: string | null): Promise<void>;
     maybeReassignOnCustomerReply(
       conversationId: string,
       currentAssigneeId: string | null,
+      teamId: string | null,
       threadId: string | null,
       ticketId: string | null
     ): Promise<void>;
@@ -286,15 +287,20 @@ export class IntercomWebhookHandler {
     const conversationId = item?.id != null ? String(item.id) : null;
     if (!conversationId) return;
     const link = await this.store.getLinkByConversationId(conversationId).catch(() => null);
+    // The conversation's team scopes its balanced-assignment pool + config
+    // (Intercom's own routing rules set team_assignee_id; bridged tickets carry
+    // the bot's routing team).
+    const teamId =
+      item?.team_assignee_id != null && String(item.team_assignee_id) !== "0" ? String(item.team_assignee_id) : null;
     if (this.assignmentService) {
       if (topic === "conversation.user.created" && !link) {
-        await this.assignmentService.maybeAssignOnCreate(conversationId, null, null).catch(() => undefined);
+        await this.assignmentService.maybeAssignOnCreate(conversationId, teamId, null, null).catch(() => undefined);
       } else if (topic === "conversation.user.replied") {
         const assigneeId = item?.admin_assignee_id != null && String(item.admin_assignee_id) !== "0"
           ? String(item.admin_assignee_id)
           : null;
         await this.assignmentService
-          .maybeReassignOnCustomerReply(conversationId, assigneeId, link?.ticketThreadId ?? null, link?.ticketId ?? null)
+          .maybeReassignOnCustomerReply(conversationId, assigneeId, teamId, link?.ticketThreadId ?? null, link?.ticketId ?? null)
           .catch(() => undefined);
       }
     }
