@@ -124,6 +124,7 @@ export class SlaService {
     return this.evaluateAndWrite({
       stateId,
       kind: "bridged",
+      threadId,
       conversationId: loaded.conversationId,
       facts: loaded.facts,
       state,
@@ -286,13 +287,19 @@ export class SlaService {
       slaLog.warn("sla.verify.attr_list_failed", { "error.message": e instanceof Error ? e.message : String(e) });
     }
     const targets = this.settingsStore.slaTargets();
+    const noteKick = this.settingsStore.slaNoteKickEnabled();
     const runbook = [
       attributeExists
         ? `✅ Conversation attribute **${attributeName}** exists.`
         : `❌ Create a **List** conversation attribute named exactly **${attributeName}** (Intercom → Settings → Data → Conversations — the API cannot create it). Options: ${targets.map((t) => `\`${t.value}\``).join(", ") || "add targets first"}.`,
-      "2. Create ONE Workflow: trigger *Conversation data changed* → **" + attributeName + "**, one branch per value, each with a native **Apply SLA** step (the API cannot apply SLAs).",
-      "3. Developer Hub → your app → Webhooks: manually subscribe `conversation.user.created` and `conversation.user.replied` (needed for native-conversation rules; bridged tickets work without them).",
-      "4. Enable SLA here (and *Native conversations* if wanted). The 30-min sweep heals anything a webhook misses.",
+      "2. Create ONE Workflow with trigger **Teammate adds a note** (Intercom has NO attribute-change trigger, and customer-message triggers don't fire on API-created conversations). Add one branch per **" +
+        attributeName +
+        "** value, each with a native **Apply SLA** step. The bot posts a small internal note every time it changes the target" +
+        (noteKick ? "" : " — ⚠️ the note kick is currently OFF here, so nothing fires that trigger") +
+        "; the note always lands AFTER the attribute write, so the branch reads the fresh value.",
+      "3. Test once: change a rule so a target flips on a test conversation and confirm the Workflow ran (conversation side panel shows applied SLA). If Intercom ignores bot-authored notes for the trigger in your workspace, SLAs still converge on the first human agent note/reply — or ask Intercom support to confirm the trigger's API behavior.",
+      "4. Developer Hub → your app → Webhooks: manually subscribe `conversation.user.created` and `conversation.user.replied` (needed for native-conversation rules; bridged tickets work without them).",
+      "5. Enable SLA here (and *Native conversations* if wanted). The 30-min sweep heals anything a webhook misses.",
     ];
     return { attributeExists, attributeName, runbook };
   }
@@ -330,6 +337,7 @@ export class SlaService {
   private async evaluateAndWrite(input: {
     stateId: string;
     kind: "bridged" | "native";
+    threadId?: string;
     conversationId: string;
     facts: SlaFacts;
     state: SlaState | null;
@@ -380,6 +388,7 @@ export class SlaService {
     }
 
     await this.upsertState(stateId, kind, conversationId, target, ruleId, effectiveWritten, null);
+    await this.noteKick(kind, conversationId, input.threadId, target);
     slaLog.info("sla.target.written", {
       "intercom.conversation_id": conversationId,
       "sla.kind": kind,
@@ -390,6 +399,43 @@ export class SlaService {
     });
     metricCount("sla.writes", 1, { outcome: "written" });
     return { outcome: pinned ? "pinned" : "written", target, ruleId };
+  }
+
+  // Internal note on every target CHANGE. Two jobs: agent-visible signal in
+  // the inbox, and the Workflow kick — Intercom has NO attribute-change
+  // trigger, so the SLA Workflow uses trigger "Teammate adds a note" and
+  // branches on the freshly-written attribute (the note delivers AFTER the
+  // attribute write: bridged rides the same FIFO outbox, native posts after
+  // the PUT). Best-effort — never fails the write.
+  private async noteKick(
+    kind: "bridged" | "native",
+    conversationId: string,
+    threadId: string | undefined,
+    target: string | null
+  ): Promise<void> {
+    if (!this.settingsStore.slaNoteKickEnabled()) return;
+    const content = target ? `🎯 SLA target: ${target}` : "🎯 SLA target cleared";
+    try {
+      if (kind === "bridged") {
+        // Outbox note: echo-registered at post time, so it never relays back
+        // into the Discord thread. No Temporal → skip (the next evaluation or
+        // an agent action converges the Workflow).
+        if (threadId && this.producers?.routable()) {
+          await this.producers.intercomEnqueue(threadId, "note", { content });
+        }
+        return;
+      }
+      // Native conversations have no link → the noted-webhook drops them, so
+      // a direct admin note is echo-safe.
+      const adminId = this.settingsStore.intercomAuthorAdminId();
+      if (!adminId) return;
+      await this.intercomClient.replyAsAdmin(conversationId, { adminId, body: content, note: true });
+    } catch (e) {
+      slaLog.warn("sla.note_kick.failed", {
+        "intercom.conversation_id": conversationId,
+        "error.message": e instanceof Error ? e.message : String(e),
+      });
+    }
   }
 
   private async upsertState(

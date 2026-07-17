@@ -54,7 +54,7 @@ const EXPECTED_COLUMNS: Record<string, string[]> = {
     "inactivityEnabled", "inactivityAgentWaitDays", "inactivityCustomerWaitDays", "inactivityNagsBeforeClose",
     "inactivityNagText", "inactivityAgentNoteText", "refundMaxChargeAgeDays",
     "agentRipMigratedAt", "intercomPanelAdminsJson", "billingActionLevelsJson", "panelTokenSecret",
-    "panelTokenEpoch", "slaEnabled", "slaNativeEnabled", "slaDefaultTarget", "slaAttributeName", "slaTargetsJson",
+    "panelTokenEpoch", "slaEnabled", "slaNativeEnabled", "slaDefaultTarget", "slaAttributeName", "slaTargetsJson", "slaNoteKickEnabled",
     "updatedAt",
   ],
   status_tags: [

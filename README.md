@@ -68,9 +68,10 @@ Every deploy replays running workflows against the new bundle — a changed comm
 The bot is the **SLA manager**: admin-defined rules (`/intercom → SLA Manager`) decide which native Intercom SLA each conversation gets, by writing ONE custom conversation attribute (default **`SLA Target`**). Intercom's REST API can neither create conversation attributes nor list/apply SLAs, so three steps are manual (also shown live by the **Verify Setup** button):
 
 1. **Attribute**: Intercom → Settings → Data → Conversations → create a **List** attribute named exactly `SLA Target`, one option per registered target value (`/intercom → SLA Manager → Targets`).
-2. **Workflow**: create ONE Workflow — trigger *Conversation data changed* → `SLA Target`, one branch per value, each with a native **Apply SLA** step. Every target value needs a matching branch; the bot cannot validate this.
-3. **Webhooks** (native-conversation rules only): Developer Hub → your app → Webhooks → subscribe `conversation.user.created` + `conversation.user.replied`. Bridged tickets work without them.
-4. Toggle **SLA: on** (and **Native** if wanted) in `/intercom → SLA Manager`.
+2. **Workflow**: create ONE Workflow — trigger **Teammate adds a note** (Intercom has no attribute-change trigger, and customer-message triggers don't fire on API-created conversations), one branch per `SLA Target` value, each with a native **Apply SLA** step. The bot posts a small internal note on every target change (the "note kick", toggleable in the SLA hub) — it always lands AFTER the attribute write, so the branch reads the fresh value. Every target value needs a matching branch; the bot cannot validate this.
+3. **Test once**: flip a target on a test conversation and confirm the Workflow applied the SLA. If your workspace's trigger ignores bot-authored notes, SLAs still converge on the first human agent note/reply.
+4. **Webhooks** (native-conversation rules only): Developer Hub → your app → Webhooks → subscribe `conversation.user.created` + `conversation.user.replied`. Bridged tickets work without them.
+5. Toggle **SLA: on** (and **Native** if wanted) in `/intercom → SLA Manager`.
 
 Rules are priority-ordered (first enabled match wins, conditions AND-ed) over ticket basics, Stripe customer state, Intercom-side data and keywords; no match writes the configurable default target. Evaluation fires on ticket creation, status changes, customer replies, Stripe events and the native webhooks, with a 30-minute safety sweep (`sla-sweep` looper) converging anything missed — attribute writes are deduped against `sla_states.lastWrittenTarget`, so steady-state sweeps are read-only.
 

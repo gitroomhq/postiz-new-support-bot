@@ -68,6 +68,7 @@ export class SlaHub {
     // toggles + verify
     { kind: "button", id: "icadmin_sla_toggle", match: "exact", handler: (i) => this.handleToggle(i, "slaEnabled") },
     { kind: "button", id: "icadmin_sla_native_toggle", match: "exact", handler: (i) => this.handleToggle(i, "slaNativeEnabled") },
+    { kind: "button", id: "icadmin_sla_notekick_toggle", match: "exact", handler: (i) => this.handleNoteKickToggle(i) },
     { kind: "button", id: "icadmin_sla_verify", match: "exact", handler: (i) => this.handleVerify(i) },
     // pin + preview
     { kind: "button", id: "icadmin_sla_pin", match: "exact", handler: (i) => this.handlePinOpen(i) },
@@ -94,7 +95,7 @@ export class SlaHub {
         `**Targets registered:** ${s.slaTargets().length} · **Pinned tickets:** ${pinned}`,
         `**Attribute:** \`${status.attributeName}\``,
         "",
-        "Rules write the attribute above on the conversation; **one Intercom Workflow** (trigger: *conversation data changed*) branches on its value → native **Apply SLA**. Every target value needs a matching Workflow branch — the API cannot list or apply SLAs, so run **Verify Setup** after changes.",
+        "Rules write the attribute above on the conversation; **one Intercom Workflow** (trigger: **Teammate adds a note** — no attribute-change trigger exists) branches on its value → native **Apply SLA**. The bot posts a small internal note on every target change as the trigger kick. Every target value needs a matching Workflow branch — the API cannot list or apply SLAs, so run **Verify Setup** after changes.",
         "Triggers: ticket created/mirrored, status change, customer reply, Stripe/billing events, native conversation webhooks — plus a 30-min safety sweep.",
       ].join("\n")
     );
@@ -110,6 +111,7 @@ export class SlaHub {
         buttonRow(
           btn("icadmin_sla_toggle", `SLA: ${status.enabled ? "on" : "off"}`, status.enabled ? ButtonStyle.Success : ButtonStyle.Secondary),
           btn("icadmin_sla_native_toggle", `Native: ${status.nativeEnabled ? "on" : "off"}`, status.nativeEnabled ? ButtonStyle.Success : ButtonStyle.Secondary),
+          btn("icadmin_sla_notekick_toggle", `Note kick: ${s.slaNoteKickEnabled() ? "on" : "off"}`, s.slaNoteKickEnabled() ? ButtonStyle.Success : ButtonStyle.Secondary),
           btn("icadmin_sla_verify", "Verify Setup", ButtonStyle.Secondary)
         ),
         buttonRow(
@@ -896,6 +898,13 @@ export class SlaHub {
     await s.updateSla({ [key]: next });
     this.ctx.auditConfig(interaction, `${key === "slaEnabled" ? "SLA manager" : "SLA native conversations"} → ${next ? "on" : "off"}`);
     if (next) this.ctx.slaService.onRulesChanged(); // converge open subjects soon
+    await this.renderHub(interaction);
+  }
+
+  private async handleNoteKickToggle(interaction: ButtonInteraction): Promise<void> {
+    const next = !this.ctx.settingsStore.slaNoteKickEnabled();
+    await this.ctx.settingsStore.updateSla({ slaNoteKickEnabled: next });
+    this.ctx.auditConfig(interaction, `SLA note kick → ${next ? "on" : "off"}${next ? "" : " (⚠️ nothing fires the Workflow's teammate-note trigger while off)"}`);
     await this.renderHub(interaction);
   }
 

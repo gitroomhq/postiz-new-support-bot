@@ -299,6 +299,10 @@ model BotSettings {
   slaNativeEnabled Boolean @default(false) // also cover native (non-bridged) conversations
   slaDefaultTarget String?                 // no-match target; null = clear a previously-written value
   slaAttributeName String  @default("SLA Target")
+  // Post a small internal note whenever the target changes. Doubles as the
+  // Workflow kick: no attribute-change trigger exists, so the recipe is ONE
+  // Workflow with trigger "Teammate adds a note" branching on the attribute.
+  slaNoteKickEnabled Boolean @default(true)
   // Managed SLA target registry: JSON array of { value, note }. Rule targets
   // and slaDefaultTarget must reference an entry; each value needs a matching
   // Workflow branch in Intercom (the API can't enumerate SLAs to validate).

@@ -711,6 +711,7 @@ const STATEMENTS: string[] = [
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "slaNativeEnabled" BOOLEAN NOT NULL DEFAULT false`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "slaDefaultTarget" TEXT`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "slaAttributeName" TEXT NOT NULL DEFAULT 'SLA Target'`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "slaNoteKickEnabled" BOOLEAN NOT NULL DEFAULT true`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "slaTargetsJson" JSONB`,
 ];
 

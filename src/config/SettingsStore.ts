@@ -662,6 +662,13 @@ export class SettingsStore {
     return this.settings.slaAttributeName || "SLA Target";
   }
 
+  // Internal note on every target change — agent-visible signal AND the
+  // Workflow kick (trigger "Teammate adds a note"; there is no
+  // attribute-change trigger in Intercom Workflows).
+  slaNoteKickEnabled(): boolean {
+    return this.settings.slaNoteKickEnabled;
+  }
+
   // Managed target registry: every rule target and the default target must
   // reference an entry; each value needs a matching Workflow branch in
   // Intercom (which the API cannot enumerate to validate).
@@ -682,6 +689,7 @@ export class SettingsStore {
     slaNativeEnabled?: boolean;
     slaDefaultTarget?: string | null;
     slaAttributeName?: string;
+    slaNoteKickEnabled?: boolean;
   }): Promise<void> {
     this.settings = await this.prisma.botSettings.update({ where: { id: "global" }, data });
   }
