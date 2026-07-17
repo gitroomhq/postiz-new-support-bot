@@ -5065,11 +5065,30 @@ export class DiscordBot {
       },
     ];
 
-    await this.rest.put(Routes.applicationCommands(this.config.discord.clientId), {
-      body: commands,
-    });
-
-    this.discordLog.info("slash commands registered", { "commands.count": commands.length });
+    // Bulk overwrite with retry, NON-FATAL on exhaustion: Discord's API
+    // intermittently 500s this PUT, and the commands from the last successful
+    // registration stay live regardless — a transient Discord failure must
+    // not take the whole bot down with it.
+    const delays = [0, 2_000, 10_000];
+    for (let attempt = 0; attempt < delays.length; attempt++) {
+      if (delays[attempt] > 0) await new Promise((r) => setTimeout(r, delays[attempt]));
+      try {
+        await this.rest.put(Routes.applicationCommands(this.config.discord.clientId), {
+          body: commands,
+        });
+        this.discordLog.info("slash commands registered", { "commands.count": commands.length });
+        return;
+      } catch (e) {
+        const last = attempt === delays.length - 1;
+        this.discordLog.error(
+          last
+            ? "slash command registration failed — continuing with previously registered commands"
+            : "slash command registration failed — retrying",
+          e,
+          { "commands.attempt": attempt + 1 }
+        );
+      }
+    }
   }
 
   async start(options?: { workerOnly?: boolean }): Promise<void> {
