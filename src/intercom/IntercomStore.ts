@@ -382,6 +382,18 @@ export class IntercomStore {
     });
   }
 
+  // ---- Assignment echo damper ----
+
+  // Last admin assignee the BOT set (or observed) for this thread's
+  // conversation — the conversation.admin.assigned webhook compares against it
+  // to tell bot echoes from human reassignment.
+  async setLastAssigneeId(ticketThreadId: string, adminId: string | null): Promise<void> {
+    await this.prisma.intercomLink.updateMany({
+      where: { ticketThreadId },
+      data: { lastAssigneeId: adminId },
+    });
+  }
+
   // ---- Inactivity sweeper damper state (native/unbridged objects) ----
 
   async getSweepState(id: string): Promise<{

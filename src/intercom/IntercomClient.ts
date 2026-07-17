@@ -112,7 +112,15 @@ export class IntercomClient {
     // display_avatar=true: without it the endpoint omits avatars entirely
     // (defaults to false); the avatar arrives as a plain URL string here.
     const data = await this.json<{
-      admins?: Array<{ id?: string | number; name?: string; email?: string; avatar?: { image_url?: string | null } | string | null }>;
+      admins?: Array<{
+        id?: string | number;
+        name?: string;
+        email?: string;
+        avatar?: { image_url?: string | null } | string | null;
+        away_mode_enabled?: boolean;
+        away_mode_reassign?: boolean;
+        has_inbox_seat?: boolean;
+      }>;
     }>("/admins?display_avatar=true", "GET", undefined, "admins");
     return (data.admins ?? [])
       .filter((a) => a.id != null)
@@ -121,7 +129,30 @@ export class IntercomClient {
         name: a.name ?? null,
         email: a.email ?? null,
         avatarUrl: typeof a.avatar === "string" ? a.avatar : a.avatar?.image_url ?? null,
+        awayModeEnabled: a.away_mode_enabled === true,
+        hasInboxSeat: a.has_inbox_seat !== false, // absent field = assume seated
       }));
+  }
+
+  // Team membership (admin_ids) — the assignment-pool source.
+  async getTeam(teamId: string): Promise<{ id: string; name: string; adminIds: string[] } | null> {
+    try {
+      const data = await this.json<{ id?: string | number; name?: string; admin_ids?: Array<string | number> }>(
+        `/teams/${encodeURIComponent(teamId)}`,
+        "GET",
+        undefined,
+        "team"
+      );
+      if (data.id == null) return null;
+      return {
+        id: String(data.id),
+        name: data.name ?? `Team ${data.id}`,
+        adminIds: (data.admin_ids ?? []).map((x) => String(x)),
+      };
+    } catch (e) {
+      if (e instanceof IntercomHttpError && e.status === 404) return null;
+      throw e;
+    }
   }
 
   async listTeams(): Promise<Array<{ id: string; name: string }>> {
@@ -503,6 +534,22 @@ export class IntercomClient {
     );
   }
 
+  // The DELETE variant requires the acting admin in the body. 404 = the tag is
+  // already gone — that IS the desired end state, so it's swallowed.
+  async untagConversation(conversationId: string, tagId: string, adminId: string): Promise<void> {
+    try {
+      await this.json(
+        `/conversations/${encodeURIComponent(conversationId)}/tags/${encodeURIComponent(tagId)}`,
+        "DELETE",
+        { admin_id: adminId },
+        "conversation untag"
+      );
+    } catch (e) {
+      if (e instanceof IntercomHttpError && e.status === 404) return;
+      throw e;
+    }
+  }
+
   // Conversation custom attributes must be predefined in Intercom's UI
   // (Settings → Data → Conversations) — the data_attributes API only covers
   // contact/company models, so writes 4xx until the definitions exist.
@@ -527,6 +574,23 @@ export class IntercomClient {
         "POST",
         { message_type: "assignment", type: "team", admin_id: adminId, assignee_id: teamId },
         "conversation assignment"
+      );
+    } catch (e) {
+      if (e instanceof IntercomHttpError && e.status === 422 && /already assigned/i.test(e.message)) return;
+      throw e;
+    }
+  }
+
+  // Manage endpoint: assign the conversation to an individual teammate
+  // (admin_id = acting assigner, assignee_id = recipient). Same idempotent 422
+  // swallow as the team variant.
+  async assignConversationToAdmin(conversationId: string, assigneeAdminId: string, actingAdminId: string): Promise<void> {
+    try {
+      await this.json(
+        `/conversations/${encodeURIComponent(conversationId)}/parts`,
+        "POST",
+        { message_type: "assignment", type: "admin", admin_id: actingAdminId, assignee_id: assigneeAdminId },
+        "conversation admin assignment"
       );
     } catch (e) {
       if (e instanceof IntercomHttpError && e.status === 422 && /already assigned/i.test(e.message)) return;
@@ -687,9 +751,13 @@ export class IntercomClient {
         id?: string | number;
         state?: string;
         created_at?: number;
+        waiting_since?: number | null;
         snoozed_until?: number | null;
         team_assignee_id?: number | string | null;
+        admin_assignee_id?: number | string | null;
+        custom_attributes?: Record<string, unknown> | null;
         statistics?: {
+          first_admin_reply_at?: number | null;
           last_contact_reply_at?: number | null;
           last_admin_reply_at?: number | null;
         } | null;
@@ -711,7 +779,11 @@ export class IntercomClient {
           id: String(c.id),
           state: c.state ?? "open",
           createdAt: c.created_at ? new Date(c.created_at * 1000) : null,
+          waitingSince: c.waiting_since ? new Date(c.waiting_since * 1000) : null,
           snoozedUntil: c.snoozed_until ? new Date(c.snoozed_until * 1000) : null,
+          firstAdminReplyAt: c.statistics?.first_admin_reply_at
+            ? new Date(c.statistics.first_admin_reply_at * 1000)
+            : null,
           lastContactReplyAt: c.statistics?.last_contact_reply_at
             ? new Date(c.statistics.last_contact_reply_at * 1000)
             : null,
@@ -719,6 +791,8 @@ export class IntercomClient {
             ? new Date(c.statistics.last_admin_reply_at * 1000)
             : null,
           teamAssigneeId: c.team_assignee_id != null ? String(c.team_assignee_id) : null,
+          adminAssigneeId: c.admin_assignee_id != null ? String(c.admin_assignee_id) : null,
+          customAttributes: c.custom_attributes ?? {},
         })),
       nextStartingAfter: data.pages?.next?.starting_after ?? null,
     };
@@ -893,6 +967,10 @@ export class IntercomClient {
   async getConversationSlaFacts(conversationId: string): Promise<{
     state: string;
     open: boolean;
+    createdAt: Date | null;
+    waitingSince: Date | null;
+    snoozedUntil: Date | null;
+    firstAdminReplyAt: Date | null;
     teamAssigneeId: string | null;
     adminAssigneeId: string | null;
     tags: string[];
@@ -905,6 +983,9 @@ export class IntercomClient {
       const data = await this.json<{
         state?: string;
         open?: boolean;
+        created_at?: number;
+        waiting_since?: number | null;
+        snoozed_until?: number | null;
         team_assignee_id?: number | string | null;
         admin_assignee_id?: number | string | null;
         tags?: { tags?: Array<{ id?: string | number; name?: string }> };
@@ -912,10 +993,17 @@ export class IntercomClient {
         custom_attributes?: Record<string, unknown> | null;
         ticket?: { id?: string | number } | null;
         sla_applied?: { sla_name?: string | null; sla_status?: string | null } | null;
+        statistics?: { first_admin_reply_at?: number | null } | null;
       }>(`/conversations/${encodeURIComponent(conversationId)}`, "GET", undefined, "conversation get (sla facts)");
       return {
         state: data.state ?? "open",
         open: data.open !== false && data.state !== "closed",
+        createdAt: data.created_at ? new Date(data.created_at * 1000) : null,
+        waitingSince: data.waiting_since ? new Date(data.waiting_since * 1000) : null,
+        snoozedUntil: data.snoozed_until ? new Date(data.snoozed_until * 1000) : null,
+        firstAdminReplyAt: data.statistics?.first_admin_reply_at
+          ? new Date(data.statistics.first_admin_reply_at * 1000)
+          : null,
         teamAssigneeId: data.team_assignee_id != null ? String(data.team_assignee_id) : null,
         adminAssigneeId: data.admin_assignee_id != null ? String(data.admin_assignee_id) : null,
         tags: (data.tags?.tags ?? []).map((t) => t.name ?? "").filter(Boolean),

@@ -58,6 +58,11 @@ export const INTERCOM_WEBHOOK_TOPICS = [
   // manual Developer Hub subscription like every other topic here.
   "conversation.user.created",
   "conversation.user.replied",
+  // Balanced assignment + the intercom.assignee SLA rule dim: keeps the
+  // assignment-echo damper (IntercomLink.lastAssigneeId) fresh and re-runs
+  // SLA rules when a teammate takes over. Manual Developer Hub subscription
+  // required (new since the bot-native SLA engine).
+  "conversation.admin.assigned",
 ] as const;
 
 // Shared with intercomInboxWorkflow's defer loop — see INTERCOM_MAX_ECHO_DEFERS.
@@ -130,11 +135,41 @@ export class IntercomWebhookHandler {
   private temporalProducers: TemporalProducers | null = null;
 
   // SLA manager — bound late from index.ts; handles the native-conversation
-  // trigger topics (conversation.user.created / .replied).
-  private slaService: { applyForNative(conversationId: string, reason: string): Promise<unknown> } | null = null;
+  // trigger topics (conversation.user.created / .replied) and the bridged
+  // assignee-change re-eval (the intercom.assignee rule dim).
+  private slaService: {
+    applyForNative(conversationId: string, reason: string): Promise<unknown>;
+    onTicketTrigger(threadId: string, reason: "assignee"): Promise<void>;
+  } | null = null;
 
-  setSlaService(service: { applyForNative(conversationId: string, reason: string): Promise<unknown> }): void {
+  setSlaService(service: {
+    applyForNative(conversationId: string, reason: string): Promise<unknown>;
+    onTicketTrigger(threadId: string, reason: "assignee"): Promise<void>;
+  }): void {
     this.slaService = service;
+  }
+
+  // Balanced assignment — bound late from index.ts.
+  private assignmentService: {
+    maybeAssignOnCreate(conversationId: string, threadId: string | null, ticketId: string | null): Promise<void>;
+    maybeReassignOnCustomerReply(
+      conversationId: string,
+      currentAssigneeId: string | null,
+      threadId: string | null,
+      ticketId: string | null
+    ): Promise<void>;
+  } | null = null;
+
+  setAssignmentService(service: NonNullable<IntercomWebhookHandler["assignmentService"]>): void {
+    this.assignmentService = service;
+  }
+
+  // SLA enforcement engine — bound late; owns the unsnooze re-anchor for the
+  // next-reply clock.
+  private slaEnforcer: { reanchorAfterUnsnooze(conversationId: string): Promise<void> } | null = null;
+
+  setSlaEnforcer(enforcer: { reanchorAfterUnsnooze(conversationId: string): Promise<void> }): void {
+    this.slaEnforcer = enforcer;
   }
 
   setTemporalProducers(producers: TemporalProducers): void {
@@ -225,24 +260,68 @@ export class IntercomWebhookHandler {
         return;
       case "conversation.user.created":
       case "conversation.user.replied":
-        await this.handleNativeSlaTrigger(item as IntercomConversationItem | undefined, topic);
+        await this.handleInboundConversationActivity(item as IntercomConversationItem | undefined, topic);
+        return;
+      case "conversation.admin.assigned":
+        await this.handleAdminAssigned(item as IntercomConversationItem | undefined);
         return;
       default:
         return; // unknown topic — drop
     }
   }
 
-  // SLA manager trigger for native conversations. Bridged conversations
-  // return early — their Discord-side hooks (creation, customer reply) fire
-  // in the same flow that mirrored the message, and the per-ticket outbox
-  // owns ordering. Transient SlaService failures rethrow → the inbox
-  // scheduler's retry machinery redelivers.
-  private async handleNativeSlaTrigger(item: IntercomConversationItem | undefined, topic: string): Promise<void> {
+  // Inbound customer activity. Two jobs:
+  //  - assignment: creation assigns natives to the pool (bridged creation is
+  //    hooked in ensureBridge); a customer reply landing on an away/gone
+  //    assignee re-routes (bridged AND native — covers reopens).
+  //  - SLA rules for NATIVE conversations. Bridged conversations return early
+  //    — their Discord-side hooks fire in the same flow that mirrored the
+  //    message, and the per-ticket outbox owns ordering.
+  // Transient SlaService failures rethrow → the inbox scheduler's retry
+  // machinery redelivers. Assignment is best-effort by construction.
+  private async handleInboundConversationActivity(
+    item: IntercomConversationItem | undefined,
+    topic: string
+  ): Promise<void> {
     const conversationId = item?.id != null ? String(item.id) : null;
-    if (!conversationId || !this.slaService) return;
+    if (!conversationId) return;
     const link = await this.store.getLinkByConversationId(conversationId).catch(() => null);
-    if (link) return; // bridged — Discord-side hooks own it
+    if (this.assignmentService) {
+      if (topic === "conversation.user.created" && !link) {
+        await this.assignmentService.maybeAssignOnCreate(conversationId, null, null).catch(() => undefined);
+      } else if (topic === "conversation.user.replied") {
+        const assigneeId = item?.admin_assignee_id != null && String(item.admin_assignee_id) !== "0"
+          ? String(item.admin_assignee_id)
+          : null;
+        await this.assignmentService
+          .maybeReassignOnCustomerReply(conversationId, assigneeId, link?.ticketThreadId ?? null, link?.ticketId ?? null)
+          .catch(() => undefined);
+      }
+    }
+    if (link) return; // bridged — Discord-side SLA hooks own it
+    if (!this.slaService) return;
     await this.slaService.applyForNative(conversationId, topic);
+  }
+
+  // Assignee changed (bot or human). Bridged: refresh the lastAssigneeId
+  // damper and — only for HUMAN (non-echo) changes — re-run the SLA rules
+  // (the intercom.assignee dim can flip the target). Native: re-run rules
+  // directly. Never moves the rotation cursor: fairness comes from live load
+  // counts, and a human grab shouldn't skip anyone's turn.
+  private async handleAdminAssigned(item: IntercomConversationItem | undefined): Promise<void> {
+    const conversationId = item?.id != null ? String(item.id) : null;
+    if (!conversationId) return;
+    const assigneeId =
+      item?.admin_assignee_id != null && String(item.admin_assignee_id) !== "0" ? String(item.admin_assignee_id) : null;
+    const link = await this.store.getLinkByConversationId(conversationId).catch(() => null);
+    if (link) {
+      const previous = link.lastAssigneeId ?? null;
+      if (previous === assigneeId) return; // our own assignment echoing back
+      await this.store.setLastAssigneeId(link.ticketThreadId, assigneeId).catch(() => undefined);
+      await this.slaService?.onTicketTrigger(link.ticketThreadId, "assignee").catch(() => undefined);
+      return;
+    }
+    await this.slaService?.applyForNative(conversationId, "conversation.admin.assigned").catch(() => undefined);
   }
 
   // Agent deleted (redacted) a message in Intercom → reflect on the Discord
@@ -1049,8 +1128,14 @@ export class IntercomWebhookHandler {
   // Discord mirrors as a contact reply → Intercom auto-unsnoozes → this
   // handler restores the Discord tag. That is the desired end state.
   private async handleConversationUnsnoozed(item: IntercomConversationItem | undefined): Promise<void> {
-    if (this.settingsStore.intercomMode() !== "bi") return;
     if (!item || item.id == null) return;
+
+    // SLA next-reply re-anchor (bridged AND native, any mode): a snooze is a
+    // deliberate park — the clock restarts from the unsnooze, not from the
+    // customer's original waiting_since.
+    await this.slaEnforcer?.reanchorAfterUnsnooze(String(item.id)).catch(() => undefined);
+
+    if (this.settingsStore.intercomMode() !== "bi") return;
 
     const snoozeTagId = this.settingsStore.intercomSnoozeStatusTagId();
     if (!snoozeTagId) return;
@@ -1100,7 +1185,10 @@ export class IntercomWebhookHandler {
       return;
     }
 
-    const isManaged = (name: string) => name === "Discord";
+    // Managed tags never narrate into the thread: "Discord" (bridge marker)
+    // and the SLA breach tag (the enforcer pre-stamps lastTagsJson, this is
+    // the second belt — SLA alerts are Intercom-only by design).
+    const isManaged = (name: string) => name === "Discord" || name === this.settingsStore.slaBreachTagName();
     const added = current.filter((t) => !previous.includes(t) && !isManaged(t));
     const removed = previous.filter((t) => !current.includes(t) && !isManaged(t));
     if (added.length === 0 && removed.length === 0) return;

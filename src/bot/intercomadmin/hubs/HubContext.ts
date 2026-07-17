@@ -10,6 +10,7 @@ import type { IntercomWebhookHandler } from "../../../intercom/IntercomWebhookHa
 import type { TemporalProducers } from "../../../temporal/producers";
 import type { SlaRuleStore } from "../../../sla/SlaRuleStore";
 import type { SlaService } from "../../../sla/SlaService";
+import type { AssignmentService } from "../../../intercom/AssignmentService";
 import type { BridgeSourceMessage } from "../../../intercom/IntercomSyncService";
 import type { SessionManager } from "../SessionManager";
 
@@ -33,6 +34,7 @@ export interface HubContext {
   producers: TemporalProducers;
   slaRules: SlaRuleStore;
   slaService: SlaService;
+  assignmentService: AssignmentService;
   sessions: SessionManager;
   auditLogger: AuditLogger;
   // "⚙️ Config updated" embed, same shape as DiscordBot.auditConfig.

@@ -14,19 +14,26 @@ import { parseExpression } from "../../../sla/expression";
 import { FIELD_DESCRIPTORS, conditionFor, descriptorFor, type DescriptorDeps, type DescriptorOption } from "../../../sla/descriptors";
 import { SlaValidationError } from "../../../sla/SlaRuleStore";
 import type { SlaSubjectRef } from "../../../sla/SlaService";
-import type { ExpressionError } from "../../../sla/types";
+import { hasClockDurations, type ExpressionError, type SlaTargetEntry } from "../../../sla/types";
+import { WEEKDAYS, isValidTimeZone, type OfficeHoursSchedule, type Weekday } from "../../../sla/businessTime";
+import { SINGLETONS } from "../../../temporal/types";
+import { formatDuration } from "../../../util/format";
+import type { SettingsStore } from "../../../config/SettingsStore";
 import { btn, buttonRow, backRow, selectRow, panelEmbed, textInput } from "../ui";
 import type { IcAdminSession, Panel, RouteEntry, SlaRuleDraft } from "../types";
 import type { HubContext } from "./HubContext";
 
 const PAGE_SIZE = 10;
 
-// /intercom → SLA Manager: the rule engine's admin surface. Rules are a
+// /intercom → SLA Manager: the SLA engine's admin surface. Rules are a
 // priority-ordered list (first match wins) whose winning target is written to
-// the "SLA Target" conversation attribute; ONE Intercom Workflow branches on
-// that attribute → native Apply SLA (the API can neither apply nor list SLAs).
-// Authoring: guided builder (selects/modals) AND a text-expression escape
-// hatch with a validation-error re-prompt loop.
+// the "SLA Target" conversation attribute; the bot IS the SLA engine
+// (Advanced tier has no native SLAs): targets carry business-minute clock
+// durations and the 5-min enforcement looper runs them — at-risk flips the
+// "SLA Status" attribute, breach adds the tag + one internal note. Office
+// hours (weekly schedule + holidays) pause the clocks. Authoring: guided
+// builder (selects/modals) AND a text-expression escape hatch with a
+// validation-error re-prompt loop.
 export class SlaHub {
   constructor(private ctx: HubContext) {}
 
@@ -63,17 +70,27 @@ export class SlaHub {
     { kind: "button", id: "icadmin_sla_targets", match: "exact", handler: (i) => this.handleTargetsOpen(i, 0) },
     { kind: "button", id: "icadmin_sla_tgt_add", match: "exact", handler: (i) => this.handleTargetAddOpen(i) },
     { kind: "select", id: "icadmin_sla_tgt_rm", match: "exact", handler: (i) => this.handleTargetRemove(i) },
+    { kind: "select", id: "icadmin_sla_tgt_edit", match: "exact", handler: (i) => this.handleTargetEditPick(i) },
     { kind: "modal", id: "icadmin_sla_tgt_add_m", match: "exact", handler: (i) => this.handleTargetAddSubmit(i) },
+    { kind: "modal", id: "icadmin_sla_tgt_edit_m:", match: "prefix", handler: (i) => this.handleTargetEditSubmit(i) },
     { kind: "button", id: "icadmin_sla_default", match: "exact", handler: (i) => this.handleDefaultOpen(i) },
     { kind: "select", id: "icadmin_sla_default_pick", match: "exact", handler: (i) => this.handleDefaultPick(i) },
-    // toggles + verify
-    { kind: "button", id: "icadmin_sla_toggle", match: "exact", handler: (i) => this.handleToggle(i, "slaEnabled") },
-    { kind: "button", id: "icadmin_sla_native_toggle", match: "exact", handler: (i) => this.handleToggle(i, "slaNativeEnabled") },
-    { kind: "button", id: "icadmin_sla_notekick_toggle", match: "exact", handler: (i) => this.handleNoteKickToggle(i) },
-    { kind: "button", id: "icadmin_sla_note_admin", match: "exact", handler: (i) => this.handleNoteAdminOpen(i) },
-    { kind: "select", id: "icadmin_sla_note_admin_pick", match: "exact", handler: (i) => this.handleNoteAdminPick(i) },
+    // toggles + warn% + verify
+    { kind: "button", id: "icadmin_sla_toggle", match: "exact", handler: (i) => this.handleToggle(i) },
+    { kind: "button", id: "icadmin_sla_warnpct", match: "exact", handler: (i) => this.handleWarnPctOpen(i) },
+    { kind: "modal", id: "icadmin_sla_warnpct_m", match: "exact", handler: (i) => this.handleWarnPctSubmit(i) },
     { kind: "button", id: "icadmin_sla_verify", match: "exact", handler: (i) => this.handleVerify(i) },
-    { kind: "button", id: "icadmin_sla_clean_notes", match: "exact", handler: (i) => this.handleCleanNotes(i) },
+    // office hours
+    { kind: "button", id: "icadmin_sla_hours_toggle", match: "exact", handler: (i) => this.handleHoursToggle(i) },
+    { kind: "button", id: "icadmin_sla_hours_tz", match: "exact", handler: (i) => this.handleHoursTzOpen(i) },
+    { kind: "modal", id: "icadmin_sla_hours_tz_m", match: "exact", handler: (i) => this.handleHoursTzSubmit(i) },
+    { kind: "select", id: "icadmin_sla_hours_day", match: "exact", handler: (i) => this.handleHoursDayPick(i) },
+    { kind: "modal", id: "icadmin_sla_hours_day_m:", match: "prefix", handler: (i) => this.handleHoursDaySubmit(i) },
+    { kind: "button", id: "icadmin_sla_hours_hol_add", match: "exact", handler: (i) => this.handleHolidayAddOpen(i) },
+    { kind: "modal", id: "icadmin_sla_hours_hol_add_m", match: "exact", handler: (i) => this.handleHolidayAddSubmit(i) },
+    { kind: "select", id: "icadmin_sla_hours_hol_rm", match: "exact", handler: (i) => this.handleHolidayRemove(i) },
+    { kind: "button", id: "icadmin_sla_hours_hol_pg:", match: "prefix", handler: (i) => this.handleHoursOpen(i, this.pageFrom(i.customId)) },
+    { kind: "button", id: "icadmin_sla_hours", match: "exact", handler: (i) => this.handleHoursOpen(i, 0) },
     // pin + preview
     { kind: "button", id: "icadmin_sla_pin", match: "exact", handler: (i) => this.handlePinOpen(i) },
     { kind: "button", id: "icadmin_sla_unpin:", match: "prefix", handler: (i) => this.handleUnpin(i) },
@@ -90,18 +107,28 @@ export class SlaHub {
     const s = this.ctx.settingsStore;
     const status = this.ctx.slaService.status();
     const pinned = await this.ctx.slaService.pinnedCount().catch(() => 0);
+    const targets = s.slaTargets();
+    const withClocks = targets.filter(hasClockDurations).length;
+    const oh = s.officeHoursEnabled() ? s.officeHours() : undefined;
+    const ohLine =
+      oh === undefined
+        ? "off — clocks run 24/7"
+        : oh === null
+          ? "⚠️ enabled but INVALID — clocks run 24/7 until fixed"
+          : `on — ${oh.tz}${oh.holidays.length ? ` · ${oh.holidays.length} holiday(s)` : ""}`;
     const embed = panelEmbed(
       "SLA Manager",
       [
-        `**SLA:** ${status.enabled ? "**on**" : "**off**"} · **Native conversations:** ${status.nativeEnabled ? "on" : "off"}`,
+        `**SLA:** ${status.enabled ? "**on**" : "**off**"} (covers bridged tickets AND native conversations)`,
         `**Rules:** ${status.ruleCount} (${status.enabledRuleCount} enabled, first match wins)`,
         `**Default target:** ${status.defaultTarget ? `\`${status.defaultTarget}\`` : "_none — no-match clears the attribute_"}`,
-        `**Targets registered:** ${s.slaTargets().length} · **Pinned tickets:** ${pinned}`,
-        `**Attribute:** \`${status.attributeName}\``,
-        `**Note kick author:** ${s.slaNoteAdminId() ? `admin \`${s.slaNoteAdminId()}\` (SLA-only)` : s.intercomAdminId() ? `fallback admin \`${s.intercomAdminId()}\`` : "⚠️ _none — pick one (Note Author) or set a fallback admin in /config; Fin-authored notes do NOT fire the Workflow trigger_"}`,
+        `**Targets:** ${targets.length} (${withClocks} with clock durations) · **Pinned:** ${pinned}`,
+        `**Attributes:** \`${status.attributeName}\` (target) · \`${s.slaStatusAttributeName()}\` (ok/at_risk/breached)`,
+        `**At-risk threshold:** ${s.slaWarnPct()}% of target · **Breach tag:** \`${s.slaBreachTagName()}\``,
+        `**Office hours:** ${ohLine}`,
         "",
-        "Rules write the attribute above onto the conversation AND its converted ticket. Intercom side: a **Customer-tickets Workflow** (trigger: Teammate adds a note — ticket contexts have no channel gate) branches on the ticket attribute → native **Apply SLA**; native conversations get their own conversation-scoped Workflow. The bot posts a small internal note on every target change as the trigger kick. Every target value needs a matching branch — the API cannot list or apply SLAs, so run **Verify Setup** after changes.",
-        "Triggers: ticket created/mirrored, status change, customer reply, Stripe/billing events, native conversation webhooks — plus a 30-min safety sweep.",
+        "The bot IS the SLA engine (Advanced tier has no native SLAs): rules pick a target, targets carry business-minute clocks (first reply / next reply / resolution), and a **5-minute enforcement sweep** runs them. **At-risk** flips the status attribute only; **breach** adds the tag + one internal note per clock. All signals stay in Intercom — no Discord pings.",
+        "Triggers: ticket created/mirrored, status change, customer reply, assignee change, Stripe/billing events, native conversation webhooks — plus the 30-min target sweep and the 5-min clock sweep.",
       ].join("\n")
     );
     return {
@@ -115,15 +142,13 @@ export class SlaHub {
         ),
         buttonRow(
           btn("icadmin_sla_toggle", `SLA: ${status.enabled ? "on" : "off"}`, status.enabled ? ButtonStyle.Success : ButtonStyle.Secondary),
-          btn("icadmin_sla_native_toggle", `Native: ${status.nativeEnabled ? "on" : "off"}`, status.nativeEnabled ? ButtonStyle.Success : ButtonStyle.Secondary),
-          btn("icadmin_sla_notekick_toggle", `Note kick: ${s.slaNoteKickEnabled() ? "on" : "off"}`, s.slaNoteKickEnabled() ? ButtonStyle.Success : ButtonStyle.Secondary),
-          btn("icadmin_sla_note_admin", "Note Author", ButtonStyle.Secondary),
+          btn("icadmin_sla_warnpct", `Warn at ${s.slaWarnPct()}%`, ButtonStyle.Secondary),
+          btn("icadmin_sla_hours", "Office Hours", ButtonStyle.Secondary),
           btn("icadmin_sla_verify", "Verify Setup", ButtonStyle.Secondary)
         ),
         buttonRow(
           btn("icadmin_sla_pin", "Pin Lookup", ButtonStyle.Secondary),
           btn("icadmin_sla_test", "Preview Match", ButtonStyle.Secondary),
-          btn("icadmin_sla_clean_notes", "Clean Old Notes", ButtonStyle.Secondary),
           btn("icadmin_root", "Back", ButtonStyle.Secondary)
         ),
       ],
@@ -817,6 +842,15 @@ export class SlaHub {
     return Math.max(0, parseInt(raw, 10) || 0);
   }
 
+  private clockSummary(t: SlaTargetEntry): string {
+    const parts: string[] = [];
+    if (t.firstReplyMins != null) parts.push(`FR ${formatDuration(t.firstReplyMins * 60_000)}`);
+    if (t.nextReplyMins != null) parts.push(`NRT ${formatDuration(t.nextReplyMins * 60_000)}`);
+    if (t.resolveMins != null) parts.push(`RES ${formatDuration(t.resolveMins * 60_000)}`);
+    if (!parts.length) return "⚠️ no clocks";
+    return parts.join(" · ") + (t.warnPct != null ? ` · warn ${t.warnPct}%` : "");
+  }
+
   private buildTargetsPanel(page: number): Panel {
     const targets = this.ctx.settingsStore.slaTargets();
     const totalPages = Math.max(1, Math.ceil(targets.length / PAGE_SIZE));
@@ -827,12 +861,12 @@ export class SlaHub {
     const lines = slice.map((t) => {
       const uses = this.ctx.slaRules.list().filter((r) => r.target === t.value).length;
       const marks = [uses ? `${uses} rule(s)` : null, defaultTarget === t.value ? "default" : null].filter(Boolean).join(" · ");
-      return `• \`${t.value}\`${t.note ? ` — ${t.note}` : ""}${marks ? `  _(${marks})_` : ""}`;
+      return `• \`${t.value}\`${t.note ? ` — ${t.note}` : ""}\n   ⏱️ ${this.clockSummary(t)}${marks ? `  _(${marks})_` : ""}`;
     });
     const embed = panelEmbed(
       "SLA Targets",
       [
-        "Every value the rules can write to the attribute. **Each value needs a matching branch in your Intercom Workflow** (the API can't validate that — Verify Setup lists what it can check).",
+        "Every value the rules can write to the `SLA Target` attribute. Durations are **business minutes** for the bot-native clocks (a clock left blank is disabled for that target; a target with no clocks gets no SLA timing). Pick a target below to edit its durations.",
         "",
         lines.length ? lines.join("\n") : "_no targets yet_",
         ...(totalPages > 1 ? ["", `Page ${clamped + 1}/${totalPages}`] : []),
@@ -840,6 +874,14 @@ export class SlaHub {
     );
     const components: Panel["components"] = [];
     if (targets.length) {
+      components.push(
+        selectRow(
+          new StringSelectMenuBuilder()
+            .setCustomId("icadmin_sla_tgt_edit")
+            .setPlaceholder("Edit a target's clocks…")
+            .addOptions(slice.map((t) => ({ label: t.value, value: t.value, description: this.clockSummary(t).slice(0, 100) })))
+        )
+      );
       components.push(
         selectRow(
           new StringSelectMenuBuilder()
@@ -867,22 +909,49 @@ export class SlaHub {
     await interaction.update(this.buildTargetsPanel(page));
   }
 
+  // Discord modals cap at 5 rows — value + note + the 3 clock durations.
+  private targetModalRows(prefill?: SlaTargetEntry): ActionRowBuilder<TextInputBuilder>[] {
+    const minStr = (n?: number) => (n != null ? String(n) : "");
+    return [
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        textInput("note", "Note (optional)", { required: false, placeholder: "VIP customers", maxLength: 100, value: prefill?.note ?? "" })
+      ),
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        textInput("fr", "First-reply target (business minutes, blank=off)", { required: false, placeholder: "240", maxLength: 7, value: minStr(prefill?.firstReplyMins) })
+      ),
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        textInput("nr", "Next-reply target (business minutes, blank=off)", { required: false, placeholder: "480", maxLength: 7, value: minStr(prefill?.nextReplyMins) })
+      ),
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        textInput("res", "Resolution target (business minutes, blank=off)", { required: false, placeholder: "2880", maxLength: 7, value: minStr(prefill?.resolveMins) })
+      ),
+    ];
+  }
+
+  // Parses a blank-or-positive-integer duration field. Returns { ok:false } on
+  // a non-blank non-integer/negative value.
+  private parseMins(raw: string): { ok: true; value: number | undefined } | { ok: false } {
+    const s = raw.trim();
+    if (!s) return { ok: true, value: undefined };
+    const n = Number(s);
+    if (!Number.isInteger(n) || n <= 0) return { ok: false };
+    return { ok: true, value: n };
+  }
+
   private async handleTargetAddOpen(interaction: ButtonInteraction): Promise<void> {
     const modal = new ModalBuilder().setCustomId("icadmin_sla_tgt_add_m").setTitle("Add SLA Target");
     modal.addComponents(
       new ActionRowBuilder<TextInputBuilder>().addComponents(
-        textInput("value", "Value (a-z A-Z 0-9 - _, max 60)", { required: true, placeholder: "SLA-Support-Default", maxLength: 60 })
+        textInput("value", "Value (a-z A-Z 0-9 - _, max 60)", { required: true, placeholder: "VIP-4h", maxLength: 60 })
       ),
-      new ActionRowBuilder<TextInputBuilder>().addComponents(
-        textInput("note", "Note (which SLA / Workflow branch)", { required: false, placeholder: "VIP first response 4h", maxLength: 100 })
-      )
+      ...this.targetModalRows()
     );
     await interaction.showModal(modal);
   }
 
   private async handleTargetAddSubmit(interaction: ModalSubmitInteraction): Promise<void> {
     // Case preserved: the value must EXACTLY match the Intercom List-attribute
-    // option and the Workflow branch condition.
+    // option.
     const value = interaction.fields.getTextInputValue("value").trim();
     const note = interaction.fields.getTextInputValue("note").trim();
     if (!/^[A-Za-z0-9-_]{1,60}$/.test(value)) {
@@ -894,8 +963,55 @@ export class SlaHub {
       await interaction.reply({ embeds: [makeEmbed(`\`${value}\` is already registered.`, COLORS.warn)], flags: 64 });
       return;
     }
-    await this.ctx.settingsStore.updateSlaTargets([...targets, { value, note }]);
-    this.ctx.auditConfig(interaction, `SLA target added: \`${value}\`${note ? ` (${note})` : ""}`);
+    const durations = this.readDurations(interaction);
+    if (!durations) {
+      await interaction.reply({ embeds: [makeEmbed("Durations must be blank or a whole number of minutes greater than 0.", COLORS.danger)], flags: 64 });
+      return;
+    }
+    await this.ctx.settingsStore.updateSlaTargets([...targets, { value, note, ...durations }]);
+    this.ctx.auditConfig(interaction, `SLA target added: \`${value}\` (${this.clockSummary({ value, note, ...durations })})`);
+    await this.ctx.sessions.ackModal(interaction);
+    await interaction.editReply(this.buildTargetsPanel(0));
+  }
+
+  // Shared duration reader for add + edit. Returns null on any invalid field.
+  private readDurations(interaction: ModalSubmitInteraction): Pick<SlaTargetEntry, "firstReplyMins" | "nextReplyMins" | "resolveMins"> | null {
+    const fr = this.parseMins(interaction.fields.getTextInputValue("fr"));
+    const nr = this.parseMins(interaction.fields.getTextInputValue("nr"));
+    const res = this.parseMins(interaction.fields.getTextInputValue("res"));
+    if (!fr.ok || !nr.ok || !res.ok) return null;
+    return { firstReplyMins: fr.value, nextReplyMins: nr.value, resolveMins: res.value };
+  }
+
+  private async handleTargetEditPick(interaction: StringSelectMenuInteraction): Promise<void> {
+    const value = interaction.values[0];
+    const target = this.ctx.settingsStore.slaTargets().find((t) => t.value === value);
+    if (!target) {
+      await interaction.reply({ embeds: [makeEmbed(`\`${value}\` no longer exists.`, COLORS.warn)], flags: 64 });
+      return;
+    }
+    const modal = new ModalBuilder().setCustomId(`icadmin_sla_tgt_edit_m:${value}`).setTitle(`Edit ${value}`.slice(0, 45));
+    modal.addComponents(...this.targetModalRows(target));
+    await interaction.showModal(modal);
+  }
+
+  private async handleTargetEditSubmit(interaction: ModalSubmitInteraction): Promise<void> {
+    const value = interaction.customId.slice("icadmin_sla_tgt_edit_m:".length);
+    const targets = this.ctx.settingsStore.slaTargets();
+    const existing = targets.find((t) => t.value === value);
+    if (!existing) {
+      await interaction.reply({ embeds: [makeEmbed(`\`${value}\` no longer exists.`, COLORS.warn)], flags: 64 });
+      return;
+    }
+    const note = interaction.fields.getTextInputValue("note").trim();
+    const durations = this.readDurations(interaction);
+    if (!durations) {
+      await interaction.reply({ embeds: [makeEmbed("Durations must be blank or a whole number of minutes greater than 0.", COLORS.danger)], flags: 64 });
+      return;
+    }
+    const updated: SlaTargetEntry = { value, note, ...durations, ...(existing.warnPct != null ? { warnPct: existing.warnPct } : {}) };
+    await this.ctx.settingsStore.updateSlaTargets(targets.map((t) => (t.value === value ? updated : t)));
+    this.ctx.auditConfig(interaction, `SLA target \`${value}\` clocks → ${this.clockSummary(updated)}`);
     await this.ctx.sessions.ackModal(interaction);
     await interaction.editReply(this.buildTargetsPanel(0));
   }
@@ -917,7 +1033,7 @@ export class SlaHub {
       return;
     }
     await this.ctx.settingsStore.updateSlaTargets(this.ctx.settingsStore.slaTargets().filter((t) => t.value !== value));
-    this.ctx.auditConfig(interaction, `SLA target removed: \`${value}\` (remember to remove its Workflow branch in Intercom)`);
+    this.ctx.auditConfig(interaction, `SLA target removed: \`${value}\``);
     await interaction.update(this.buildTargetsPanel(0));
   }
 
@@ -957,126 +1073,273 @@ export class SlaHub {
     await this.renderHub(interaction);
   }
 
-  // ---- toggles + verify ----
+  // ---- toggles + warn% + verify ----
 
-  private async handleToggle(interaction: ButtonInteraction, key: "slaEnabled" | "slaNativeEnabled"): Promise<void> {
+  private async handleToggle(interaction: ButtonInteraction): Promise<void> {
     const s = this.ctx.settingsStore;
-    const next = key === "slaEnabled" ? !s.slaEnabled() : !s.slaNativeEnabled();
-    await s.updateSla({ [key]: next });
-    this.ctx.auditConfig(interaction, `${key === "slaEnabled" ? "SLA manager" : "SLA native conversations"} → ${next ? "on" : "off"}`);
+    const next = !s.slaEnabled();
+    await s.updateSla({ slaEnabled: next });
+    this.ctx.auditConfig(interaction, `SLA manager → ${next ? "on" : "off"}`);
     if (next) this.ctx.slaService.onRulesChanged(); // converge open subjects soon
     await this.renderHub(interaction);
   }
 
-  private async handleNoteKickToggle(interaction: ButtonInteraction): Promise<void> {
-    const next = !this.ctx.settingsStore.slaNoteKickEnabled();
-    await this.ctx.settingsStore.updateSla({ slaNoteKickEnabled: next });
-    this.ctx.auditConfig(interaction, `SLA note kick → ${next ? "on" : "off"}${next ? "" : " (⚠️ nothing fires the Workflow's teammate-note trigger while off)"}`);
-    await this.renderHub(interaction);
+  private async handleWarnPctOpen(interaction: ButtonInteraction): Promise<void> {
+    const modal = new ModalBuilder().setCustomId("icadmin_sla_warnpct_m").setTitle("At-risk threshold");
+    modal.addComponents(
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        textInput("pct", "Warn at % of target (1-99)", {
+          required: true,
+          placeholder: "80",
+          maxLength: 2,
+          value: String(this.ctx.settingsStore.slaWarnPct()),
+        })
+      )
+    );
+    await interaction.showModal(modal);
   }
 
-  // Picker for the SLA-only note author. Must be a HUMAN teammate: the
-  // "Teammate adds a note" trigger ignores Operator/Fin-authored notes
-  // (empirically verified), so the general Operator-first authoring
-  // preference is deliberately not offered here.
-  private async handleNoteAdminOpen(interaction: ButtonInteraction): Promise<void> {
-    await interaction.deferUpdate();
-    try {
-      const admins = await this.ctx.intercomClient.listAdmins();
-      const operator = this.ctx.settingsStore.intercomOperatorAdminId();
-      const current = this.ctx.settingsStore.slaNoteAdminId();
-      const fallback = this.ctx.settingsStore.intercomAdminId();
-      const options = [
-        {
-          label: "— use the general fallback admin —",
-          value: "__none__",
-          description: (fallback ? `currently admin ${fallback}` : "no fallback admin set — pick one in /config").slice(0, 100),
-          default: !current,
-        },
-        ...admins
-          // Exclude the Operator/Fin bot: its notes don't fire the trigger.
-          .filter((a) => a.id !== operator)
-          .slice(0, 24)
-          .map((a) => ({
-            label: (a.name || `Admin ${a.id}`).slice(0, 100),
-            value: a.id,
-            description: (a.email ?? `id ${a.id}`).slice(0, 100),
-            default: a.id === current,
-          })),
-      ];
-      await interaction.editReply({
-        embeds: [
-          makeEmbed(
-            [
-              "Pick the teammate the SLA kick notes are authored as (SLA notes ONLY — the bridge keeps authoring everything else as Operator/Fin).",
-              "",
-              "**Must be a human teammate**: the Workflow trigger *Teammate adds a note* ignores bot-authored notes, so a Fin-authored kick would never apply the SLA.",
-            ].join("\n"),
-            COLORS.neutral
-          ),
-        ],
-        components: [
-          selectRow(
-            new StringSelectMenuBuilder()
-              .setCustomId("icadmin_sla_note_admin_pick")
-              .setPlaceholder("SLA note author")
-              .addOptions(options)
-          ),
-          backRow("icadmin_hub:sla"),
-        ],
-      });
-    } catch (e) {
-      await interaction.followUp({
-        embeds: [makeEmbed(`Could not list Intercom admins: ${e instanceof Error ? e.message : e}`, COLORS.danger)],
-        flags: 64,
-      });
+  private async handleWarnPctSubmit(interaction: ModalSubmitInteraction): Promise<void> {
+    const raw = interaction.fields.getTextInputValue("pct").trim();
+    const pct = Number(raw);
+    if (!Number.isInteger(pct) || pct < 1 || pct > 99) {
+      await interaction.reply({ embeds: [makeEmbed("Enter a whole number between 1 and 99.", COLORS.danger)], flags: 64 });
+      return;
     }
-  }
-
-  private async handleNoteAdminPick(interaction: StringSelectMenuInteraction): Promise<void> {
-    const value = interaction.values[0] === "__none__" ? null : interaction.values[0];
-    await this.ctx.settingsStore.updateSla({ slaNoteAdminId: value });
-    this.ctx.auditConfig(interaction, `SLA note author → ${value ? `admin ${value}` : "general fallback admin"}`);
-    await this.renderHub(interaction, false);
+    await this.ctx.settingsStore.updateSla({ slaWarnPct: pct });
+    this.ctx.auditConfig(interaction, `SLA at-risk threshold → ${pct}% of target`);
+    await this.ctx.sessions.ackModal(interaction);
+    await interaction.editReply(await this.buildPanel());
   }
 
   private async handleVerify(interaction: ButtonInteraction): Promise<void> {
     await interaction.deferReply({ flags: 64 });
     const result = await this.ctx.slaService.verifySetup();
+    // Enforcement-looper liveness — checked here because the hub has the
+    // Temporal producers (SlaService deliberately doesn't).
+    let looperLine = "▫️ Enforcement looper: Temporal not routable — clocks run only while the worker is active.";
+    try {
+      if (this.ctx.producers.routable()) {
+        const client = await this.ctx.producers.service().client();
+        if (client) {
+          const desc = await client.workflow.getHandle(SINGLETONS.slaEnforce).describe();
+          looperLine =
+            desc.status.name === "RUNNING"
+              ? "✅ Enforcement looper `sla-enforce` is running (5-min cadence)."
+              : `❌ Enforcement looper \`sla-enforce\` status: ${desc.status.name} — toggle the Temporal worker off/on to restart it.`;
+        }
+      }
+    } catch {
+      looperLine = "❌ Enforcement looper `sla-enforce` not found — toggle the Temporal worker off/on to start it.";
+    }
+    const ok = result.attributeExists && result.statusAttributeExists;
     await interaction.editReply({
       embeds: [
-        makeEmbed(
-          [`**Setup check for \`${result.attributeName}\`:**`, "", ...result.runbook].join("\n"),
-          result.attributeExists ? COLORS.success : COLORS.warn
-        ),
+        makeEmbed([`**SLA engine setup check:**`, "", ...result.runbook, looperLine].join("\n"), ok ? COLORS.success : COLORS.warn),
       ],
     });
   }
 
-  // One-shot: redact pre-fix (Fin-authored, unmarked) kick notes and re-kick
-  // with the current author/format — which also applies the SLAs those
-  // conversations never got. Intercom can't hard-delete parts, so the old
-  // notes become "message deleted" placeholders.
-  private async handleCleanNotes(interaction: ButtonInteraction): Promise<void> {
-    await interaction.deferReply({ flags: 64 });
-    const result = await this.ctx.slaService.cleanupOldKickNotes();
-    this.ctx.auditConfig(
-      interaction,
-      `SLA note cleanup: ${result.redacted} old note(s) redacted, ${result.rekicked} re-kicked across ${result.subjects} subject(s)${result.failures ? `, ${result.failures} failure(s)` : ""}`
+  // ---- office hours ----
+
+  private emptyWeek(): NonNullable<ReturnType<SettingsStore["officeHours"]>>["week"] {
+    return { mon: [], tue: [], wed: [], thu: [], fri: [], sat: [], sun: [] };
+  }
+
+  private currentSchedule(): OfficeHoursSchedule {
+    return this.ctx.settingsStore.officeHours() ?? { tz: "UTC", week: this.emptyWeek(), holidays: [] };
+  }
+
+  private formatWindows(windows: Array<{ start: string; end: string }>): string {
+    if (!windows.length) return "_closed_";
+    return windows.map((w) => `${w.start}–${w.end}${w.end <= w.start ? " (+1d)" : ""}`).join(", ");
+  }
+
+  private buildHoursPanel(page: number): Panel {
+    const s = this.ctx.settingsStore;
+    const enabled = s.officeHoursEnabled();
+    const stored = s.officeHours();
+    const schedule = stored ?? { tz: "UTC", week: this.emptyWeek(), holidays: [] };
+    const dayLines = WEEKDAYS.map((d) => `**${d[0].toUpperCase()}${d.slice(1)}:** ${this.formatWindows(schedule.week[d])}`);
+    const holidays = [...schedule.holidays].sort();
+    const totalPages = Math.max(1, Math.ceil(holidays.length / PAGE_SIZE));
+    const clamped = Math.min(Math.max(0, page), totalPages - 1);
+    const slice = holidays.slice(clamped * PAGE_SIZE, (clamped + 1) * PAGE_SIZE);
+    const embed = panelEmbed(
+      "Office Hours",
+      [
+        `**Status:** ${enabled ? (stored ? "**on** — SLA clocks count business time only" : "⚠️ on but the stored schedule is INVALID — clocks run 24/7 until fixed") : "off — clocks run 24/7"}`,
+        `**Timezone:** \`${schedule.tz}\``,
+        "",
+        ...dayLines,
+        "",
+        `**Holidays** (${holidays.length}) — full-day closed:`,
+        slice.length ? slice.map((h) => `• ${h}`).join("\n") : "_none_",
+        ...(totalPages > 1 ? [`Page ${clamped + 1}/${totalPages}`] : []),
+        "",
+        "Windows are `HH:MM-HH:MM` in the schedule timezone; `22:00-06:00` crosses midnight; multiple windows per day are comma-separated. Only SLA clocks pause outside office hours — assignment and every other automation run 24/7.",
+      ].join("\n")
     );
-    await interaction.editReply({
-      embeds: [
-        makeEmbed(
-          [
-            `Checked **${result.subjects}** SLA subject(s):`,
-            `• **${result.redacted}** stale kick note(s) redacted (Intercom shows them as "message deleted" — parts can't be hard-deleted)`,
-            `• **${result.rekicked}** fresh kick(s) posted with the current author — their Workflows fire now, applying the missing SLAs`,
-            ...(result.failures ? [`• ⚠️ ${result.failures} subject(s) failed — safe to run again`] : []),
-          ].join("\n"),
-          result.failures ? COLORS.warn : COLORS.success
-        ),
-      ],
-    });
+    const components: Panel["components"] = [
+      selectRow(
+        new StringSelectMenuBuilder()
+          .setCustomId("icadmin_sla_hours_day")
+          .setPlaceholder("Edit a weekday's windows…")
+          .addOptions(
+            WEEKDAYS.map((d) => ({
+              label: d[0].toUpperCase() + d.slice(1),
+              value: d,
+              description: this.formatWindows(schedule.week[d]).replace(/_/g, "").slice(0, 100),
+            }))
+          )
+      ),
+    ];
+    if (holidays.length) {
+      components.push(
+        selectRow(
+          new StringSelectMenuBuilder()
+            .setCustomId("icadmin_sla_hours_hol_rm")
+            .setPlaceholder("Remove a holiday…")
+            .addOptions(slice.map((h) => ({ label: h, value: h })))
+        )
+      );
+    }
+    const nav = [
+      btn("icadmin_sla_hours_toggle", `Office hours: ${enabled ? "on" : "off"}`, enabled ? ButtonStyle.Success : ButtonStyle.Secondary),
+      btn("icadmin_sla_hours_tz", "Timezone", ButtonStyle.Secondary),
+      btn("icadmin_sla_hours_hol_add", "Add Holiday", ButtonStyle.Secondary),
+      btn("icadmin_hub:sla", "Back", ButtonStyle.Secondary),
+    ];
+    if (totalPages > 1) {
+      nav.unshift(
+        btn(`icadmin_sla_hours_hol_pg:${clamped - 1}`, "Prev", ButtonStyle.Secondary, clamped === 0),
+        btn(`icadmin_sla_hours_hol_pg:${clamped + 1}`, "Next", ButtonStyle.Secondary, clamped >= totalPages - 1)
+      );
+    }
+    components.push(buttonRow(...nav));
+    return { embeds: [embed], components };
+  }
+
+  private async handleHoursOpen(interaction: ButtonInteraction, page: number): Promise<void> {
+    await interaction.update(this.buildHoursPanel(page));
+  }
+
+  private async handleHoursToggle(interaction: ButtonInteraction): Promise<void> {
+    const next = !this.ctx.settingsStore.officeHoursEnabled();
+    await this.ctx.settingsStore.updateOfficeHours({ officeHoursEnabled: next });
+    this.ctx.auditConfig(interaction, `SLA office hours → ${next ? "on (clocks pause outside the schedule)" : "off (clocks run 24/7)"}`);
+    await interaction.update(this.buildHoursPanel(0));
+  }
+
+  private async handleHoursTzOpen(interaction: ButtonInteraction): Promise<void> {
+    const modal = new ModalBuilder().setCustomId("icadmin_sla_hours_tz_m").setTitle("Office hours timezone");
+    modal.addComponents(
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        textInput("tz", "IANA timezone", { required: true, placeholder: "Europe/Berlin", maxLength: 60, value: this.currentSchedule().tz })
+      )
+    );
+    await interaction.showModal(modal);
+  }
+
+  private async handleHoursTzSubmit(interaction: ModalSubmitInteraction): Promise<void> {
+    const tz = interaction.fields.getTextInputValue("tz").trim();
+    if (!isValidTimeZone(tz)) {
+      await interaction.reply({
+        embeds: [makeEmbed(`\`${tz}\` is not a valid IANA timezone (e.g. \`Europe/Berlin\`, \`America/New_York\`, \`UTC\`).`, COLORS.danger)],
+        flags: 64,
+      });
+      return;
+    }
+    const schedule = { ...this.currentSchedule(), tz };
+    await this.ctx.settingsStore.updateOfficeHours({ officeHoursJson: schedule });
+    this.ctx.auditConfig(interaction, `SLA office hours timezone → \`${tz}\``);
+    await this.ctx.sessions.ackModal(interaction);
+    await interaction.editReply(this.buildHoursPanel(0));
+  }
+
+  private async handleHoursDayPick(interaction: StringSelectMenuInteraction): Promise<void> {
+    const day = interaction.values[0] as Weekday;
+    const current = this.currentSchedule().week[day] ?? [];
+    const modal = new ModalBuilder().setCustomId(`icadmin_sla_hours_day_m:${day}`).setTitle(`${day[0].toUpperCase()}${day.slice(1)} windows`);
+    modal.addComponents(
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        textInput("windows", "HH:MM-HH:MM, comma-separated (empty=closed)", {
+          required: false,
+          placeholder: "09:00-17:00, 18:00-20:00",
+          maxLength: 200,
+          value: current.map((w) => `${w.start}-${w.end}`).join(", "),
+        })
+      )
+    );
+    await interaction.showModal(modal);
+  }
+
+  private async handleHoursDaySubmit(interaction: ModalSubmitInteraction): Promise<void> {
+    const day = interaction.customId.slice("icadmin_sla_hours_day_m:".length) as Weekday;
+    if (!WEEKDAYS.includes(day)) return;
+    const raw = interaction.fields.getTextInputValue("windows").trim();
+    const windows: Array<{ start: string; end: string }> = [];
+    if (raw) {
+      for (const piece of raw.split(",").map((p) => p.trim()).filter(Boolean)) {
+        const m = piece.match(/^([01]\d|2[0-3]):([0-5]\d)\s*-\s*([01]\d|2[0-3]):([0-5]\d)$/);
+        if (!m) {
+          await interaction.reply({
+            embeds: [makeEmbed(`\`${piece}\` is not \`HH:MM-HH:MM\` (24h). Example: \`09:00-17:00, 18:00-20:00\`; \`22:00-06:00\` crosses midnight.`, COLORS.danger)],
+            flags: 64,
+          });
+          return;
+        }
+        const start = `${m[1]}:${m[2]}`;
+        const end = `${m[3]}:${m[4]}`;
+        if (start === end) {
+          await interaction.reply({ embeds: [makeEmbed("A window's start and end must differ.", COLORS.danger)], flags: 64 });
+          return;
+        }
+        windows.push({ start, end });
+      }
+    }
+    const schedule = this.currentSchedule();
+    schedule.week = { ...schedule.week, [day]: windows };
+    await this.ctx.settingsStore.updateOfficeHours({ officeHoursJson: schedule });
+    this.ctx.auditConfig(interaction, `SLA office hours ${day} → ${windows.length ? windows.map((w) => `${w.start}-${w.end}`).join(", ") : "closed"}`);
+    await this.ctx.sessions.ackModal(interaction);
+    await interaction.editReply(this.buildHoursPanel(0));
+  }
+
+  private async handleHolidayAddOpen(interaction: ButtonInteraction): Promise<void> {
+    const modal = new ModalBuilder().setCustomId("icadmin_sla_hours_hol_add_m").setTitle("Add holiday(s)");
+    modal.addComponents(
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        textInput("dates", "YYYY-MM-DD, comma-separated", { required: true, placeholder: "2026-12-25, 2026-12-26", maxLength: 300 })
+      )
+    );
+    await interaction.showModal(modal);
+  }
+
+  private async handleHolidayAddSubmit(interaction: ModalSubmitInteraction): Promise<void> {
+    const raw = interaction.fields.getTextInputValue("dates").trim();
+    const dates = raw.split(",").map((p) => p.trim()).filter(Boolean);
+    for (const d of dates) {
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(d) || Number.isNaN(Date.parse(`${d}T00:00:00Z`))) {
+        await interaction.reply({ embeds: [makeEmbed(`\`${d}\` is not a valid \`YYYY-MM-DD\` date.`, COLORS.danger)], flags: 64 });
+        return;
+      }
+    }
+    const schedule = this.currentSchedule();
+    schedule.holidays = [...new Set([...schedule.holidays, ...dates])].sort();
+    await this.ctx.settingsStore.updateOfficeHours({ officeHoursJson: schedule });
+    this.ctx.auditConfig(interaction, `SLA office hours holiday(s) added: ${dates.join(", ")}`);
+    await this.ctx.sessions.ackModal(interaction);
+    await interaction.editReply(this.buildHoursPanel(0));
+  }
+
+  private async handleHolidayRemove(interaction: StringSelectMenuInteraction): Promise<void> {
+    const date = interaction.values[0];
+    const schedule = this.currentSchedule();
+    schedule.holidays = schedule.holidays.filter((h) => h !== date);
+    await this.ctx.settingsStore.updateOfficeHours({ officeHoursJson: schedule });
+    this.ctx.auditConfig(interaction, `SLA office hours holiday removed: ${date}`);
+    await interaction.update(this.buildHoursPanel(0));
   }
 
   // ---- pin lookup ----

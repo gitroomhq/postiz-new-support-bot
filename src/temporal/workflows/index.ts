@@ -15,6 +15,7 @@ export {
   kbRefreshWorkflow,
   inactivityLoopWorkflow,
   slaSweepWorkflow,
+  slaEnforceWorkflow,
   metricsSnapshotWorkflow,
   cleanupLoopWorkflow,
   disputesLoopWorkflow,

@@ -27,6 +27,7 @@ export const SINGLETONS = {
   disputesLoop: "disputes-loop",
   inactivityLoop: "intercom-inactivity-loop",
   slaSweep: "sla-sweep",
+  slaEnforce: "sla-enforce",
 } as const;
 
 export const VAULT_UPGRADE_WORKFLOW_ID = "vault-upgrade";
@@ -66,6 +67,7 @@ export const LOOPER_GENERATIONS: Record<string, number> = {
   [SINGLETONS.disputesLoop]: 1,
   [SINGLETONS.inactivityLoop]: 1,
   [SINGLETONS.slaSweep]: 1,
+  [SINGLETONS.slaEnforce]: 1,
 };
 
 // ---- Custom search attributes ----
@@ -107,6 +109,7 @@ export const SIG_KB_REFRESH_NOW = "kbRefreshNow";
 export const SIG_DISPUTES_RUN_NOW = "disputesRunNow";
 export const SIG_INACTIVITY_RUN_NOW = "inactivityRunNow";
 export const SIG_SLA_RUN_NOW = "slaRunNow";
+export const SIG_SLA_ENFORCE_RUN_NOW = "slaEnforceRunNow";
 export const UPD_APPLY_STATUS = "applyStatus";
 export const QRY_TICKET_STATE = "getState";
 
@@ -360,6 +363,20 @@ export interface SlaSweepResult {
   skipped: boolean; // SLA disabled or Intercom unconfigured
 }
 
+// Bot-native SLA enforcement + assignment stray sweep (5-min looper).
+export interface SlaEnforceResult {
+  scanned: number;
+  assigned: number;
+  statusWrites: number;
+  tagged: number;
+  untagged: number;
+  notes: number;
+  verifies: number;
+  errors: number;
+  capped: boolean; // write budget exhausted — later ticks finish
+  skipped: boolean; // both engines disabled or Intercom unconfigured
+}
+
 // Kept for the publishStatusReport tombstone stub (removed in N+1 with the
 // tombstone workflow).
 export interface ReportTickResult {
@@ -392,6 +409,7 @@ export interface CoreActivities {
   disputesTick(force: boolean): Promise<DisputesTickResult>;
   inactivitySweepTick(force: boolean): Promise<InactivitySweepResult>;
   slaSweepTick(force: boolean): Promise<SlaSweepResult>;
+  slaEnforceTick(force: boolean): Promise<SlaEnforceResult>;
   snapshotTick(): Promise<void>;
   cleanupTick(): Promise<void>;
   // Tombstone stubs (agent-rip): in-flight runs at deploy time still proxy

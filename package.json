@@ -5,7 +5,7 @@
   "main": "dist/index.js",
   "scripts": {
     "build": "prisma generate && tsc && node dist/scripts/bundleWorkflows.js",
-    "test": "node --test \"dist/temporal/__tests__/*.test.js\" \"dist/sla/__tests__/*.test.js\" \"dist/intercom/panel/__tests__/*.test.js\"",
+    "test": "node --test \"dist/temporal/__tests__/*.test.js\" \"dist/sla/__tests__/*.test.js\" \"dist/intercom/__tests__/*.test.js\" \"dist/intercom/panel/__tests__/*.test.js\"",
     "test:temporal": "TEMPORAL_TEST=1 node --test \"dist/temporal/__tests__/*.test.js\"",
     "start": "SENTRY_PRELOAD_INTEGRATIONS=Http,Express,Postgres node --require @sentry/node/preload dist/index.js",
     "dev": "prisma generate && SENTRY_PRELOAD_INTEGRATIONS=Http,Express,Postgres ts-node -r @sentry/node/preload src/index.ts",

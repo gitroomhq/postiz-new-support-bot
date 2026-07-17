@@ -55,6 +55,8 @@ const EXPECTED_COLUMNS: Record<string, string[]> = {
     "inactivityNagText", "inactivityAgentNoteText", "refundMaxChargeAgeDays",
     "agentRipMigratedAt", "intercomPanelAdminsJson", "billingActionLevelsJson", "panelTokenSecret",
     "panelTokenEpoch", "slaEnabled", "slaNativeEnabled", "slaDefaultTarget", "slaAttributeName", "slaTargetsJson", "slaNoteKickEnabled", "slaNoteAdminId",
+    "slaStatusAttributeName", "slaBreachTagName", "slaWarnPct", "officeHoursEnabled", "officeHoursJson",
+    "assignEnabled", "assignExcludedAdminsJson", "assignRotationCursor",
     "updatedAt",
   ],
   status_tags: [
@@ -121,6 +123,8 @@ const EXPECTED_COLUMNS: Record<string, string[]> = {
   sla_states: [
     "id", "kind", "conversationId", "lastTarget", "lastWrittenTarget", "lastRuleId", "lastEvaluatedAt",
     "lastWriteError", "lastKickPartId", "pinnedTarget", "pinnedById", "pinnedByName", "pinnedAt", "updatedAt",
+    "frHumanReplyAt", "frVerifyNoneAt", "frWarnedAt", "frBreachedAt", "nrCycleAnchor", "nrWarnedAt", "nrBreachedAt",
+    "resWarnedAt", "resBreachedAt", "lastStatusWritten", "breachTagged", "lastEnforcedAt",
   ],
 };
 

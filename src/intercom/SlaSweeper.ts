@@ -17,7 +17,7 @@ const MAX_WRITES_PER_SWEEP = 100;
 
 // SLA safety sweep: pages every open conversation in the workspace and
 // re-runs the SLA rules against each — bridged via the linked thread id,
-// native directly (when slaNativeEnabled). This is the convergence backstop
+// native directly. This is the convergence backstop
 // behind the event triggers: it heals missed webhooks (unsubscribed Developer
 // Hub topics), dead-lettered "sla" outbox events, mid-flight rule edits
 // (mutations fire the runNow signal) and the refund exempt→mirrored flip
@@ -40,7 +40,6 @@ export class SlaSweeper {
     if (!this.settingsStore.intercomConfigured() || !this.settingsStore.slaEnabled()) return result;
     result.skipped = false;
 
-    const nativeEnabled = this.settingsStore.slaNativeEnabled();
     let cursor: string | null = null;
     let writesCapped = false;
 
@@ -50,7 +49,6 @@ export class SlaSweeper {
         result.scanned++;
         try {
           const link = await this.store.getLinkByConversationId(conv.id).catch(() => null);
-          if (!link && !nativeEnabled) continue;
           const applied = link
             ? await this.slaService.applyForBridged(link.ticketThreadId, force ? "sweep:forced" : "sweep")
             : await this.slaService.applyForNative(conv.id, force ? "sweep:forced" : "sweep");

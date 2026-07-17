@@ -715,6 +715,29 @@ const STATEMENTS: string[] = [
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "slaNoteAdminId" TEXT`,
   `ALTER TABLE "sla_states" ADD COLUMN IF NOT EXISTS "lastKickPartId" TEXT`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "slaTargetsJson" JSONB`,
+  // Bot-native SLA engine + balanced assignment + office hours (Intercom
+  // Expert→Advanced downgrade, 2026-07-17): the bot now runs the clocks the
+  // native Apply-SLA Workflow used to own, and balances assignment itself.
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "slaStatusAttributeName" TEXT NOT NULL DEFAULT 'SLA Status'`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "slaBreachTagName" TEXT NOT NULL DEFAULT 'sla-breached'`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "slaWarnPct" INTEGER NOT NULL DEFAULT 80`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "officeHoursEnabled" BOOLEAN NOT NULL DEFAULT false`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "officeHoursJson" JSONB`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "assignEnabled" BOOLEAN NOT NULL DEFAULT false`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "assignExcludedAdminsJson" JSONB`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "assignRotationCursor" TEXT`,
+  `ALTER TABLE "sla_states" ADD COLUMN IF NOT EXISTS "frHumanReplyAt" TIMESTAMP(3)`,
+  `ALTER TABLE "sla_states" ADD COLUMN IF NOT EXISTS "frVerifyNoneAt" TIMESTAMP(3)`,
+  `ALTER TABLE "sla_states" ADD COLUMN IF NOT EXISTS "frWarnedAt" TIMESTAMP(3)`,
+  `ALTER TABLE "sla_states" ADD COLUMN IF NOT EXISTS "frBreachedAt" TIMESTAMP(3)`,
+  `ALTER TABLE "sla_states" ADD COLUMN IF NOT EXISTS "nrCycleAnchor" TIMESTAMP(3)`,
+  `ALTER TABLE "sla_states" ADD COLUMN IF NOT EXISTS "nrWarnedAt" TIMESTAMP(3)`,
+  `ALTER TABLE "sla_states" ADD COLUMN IF NOT EXISTS "nrBreachedAt" TIMESTAMP(3)`,
+  `ALTER TABLE "sla_states" ADD COLUMN IF NOT EXISTS "resWarnedAt" TIMESTAMP(3)`,
+  `ALTER TABLE "sla_states" ADD COLUMN IF NOT EXISTS "resBreachedAt" TIMESTAMP(3)`,
+  `ALTER TABLE "sla_states" ADD COLUMN IF NOT EXISTS "lastStatusWritten" TEXT`,
+  `ALTER TABLE "sla_states" ADD COLUMN IF NOT EXISTS "breachTagged" BOOLEAN NOT NULL DEFAULT false`,
+  `ALTER TABLE "sla_states" ADD COLUMN IF NOT EXISTS "lastEnforcedAt" TIMESTAMP(3)`,
 ];
 
 export async function ensureSchema(prisma: PrismaClient): Promise<void> {

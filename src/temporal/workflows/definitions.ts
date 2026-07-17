@@ -10,6 +10,7 @@ import {
   SIG_REMINDERS_PAUSED,
   SIG_INACTIVITY_RUN_NOW,
   SIG_SLA_RUN_NOW,
+  SIG_SLA_ENFORCE_RUN_NOW,
   SIG_REQUEST_STATUS_CHANGE,
   SIG_TICKET_CREATED,
   UPD_APPLY_STATUS,
@@ -42,6 +43,7 @@ export const kbRefreshNowSignal = defineSignal(SIG_KB_REFRESH_NOW);
 export const disputesRunNowSignal = defineSignal(SIG_DISPUTES_RUN_NOW);
 export const inactivityRunNowSignal = defineSignal(SIG_INACTIVITY_RUN_NOW);
 export const slaRunNowSignal = defineSignal(SIG_SLA_RUN_NOW);
+export const slaEnforceRunNowSignal = defineSignal(SIG_SLA_ENFORCE_RUN_NOW);
 
 export const applyStatusUpdate = defineUpdate<ApplyStatusResult, [StatusChangeRequest]>(UPD_APPLY_STATUS);
 

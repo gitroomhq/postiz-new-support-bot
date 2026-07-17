@@ -49,6 +49,8 @@ import { SlaRuleStore } from "./sla/SlaRuleStore";
 import { SlaFactsLoader } from "./sla/facts";
 import { SlaService } from "./sla/SlaService";
 import { SlaSweeper } from "./intercom/SlaSweeper";
+import { SlaEnforcer } from "./intercom/SlaEnforcer";
+import { AssignmentService } from "./intercom/AssignmentService";
 import { IntercomAdmin } from "./bot/IntercomAdmin";
 import { CachedRatioEngine } from "./bot/billing/disputeRatio";
 import { DisputeMonitor } from "./bot/billing/DisputeMonitor";
@@ -256,7 +258,8 @@ async function main() {
   billingCategory.setTemporalProducers(temporalProducers);
 
   // ---- SLA manager (rules → "SLA Target" conversation attribute; the
-  // Intercom Workflow applies the native SLAs) ----
+  // bot-native SlaEnforcer looper runs the clocks — Advanced tier has no
+  // native SLAs) ----
   const slaRuleStore = new SlaRuleStore(prisma, settingsStore, () =>
     categoryRegistry.getAll().map((c) => ({ id: c.id, label: c.label }))
   );
@@ -289,6 +292,23 @@ async function main() {
   intercomWebhookHandler.setSlaService(slaService);
   sessionStore.setSlaHook((threadId) => slaService.onTicketTrigger(threadId, "refund_review"));
 
+  // ---- Balanced assignment + bot-native SLA enforcement (Advanced tier:
+  // native SLAs/workload management are gone — the bot owns both) ----
+  const assignmentService = new AssignmentService(intercomClient, intercomStore, settingsStore, (fn) =>
+    intercomExecutor.withAuthor(fn)
+  );
+  intercomExecutor.setAssignmentService(assignmentService);
+  intercomWebhookHandler.setAssignmentService(assignmentService);
+  const slaEnforcer = new SlaEnforcer(
+    prisma,
+    intercomClient,
+    intercomStore,
+    settingsStore,
+    (fn) => intercomExecutor.withAuthor(fn),
+    assignmentService
+  );
+  intercomWebhookHandler.setSlaEnforcer(slaEnforcer);
+
   // /intercom admin panel (bridge/SLA/automation/maintenance hubs).
   const intercomAdmin = new IntercomAdmin(
     settingsStore,
@@ -302,7 +322,8 @@ async function main() {
     auditLogger,
     temporalProducers,
     slaRuleStore,
-    slaService
+    slaService,
+    assignmentService
   );
 
   // The bridge resolves category ids to their human labels via the registry
@@ -413,6 +434,7 @@ async function main() {
     intercomWebhookHandler,
     inactivitySweeper,
     slaSweeper,
+    slaEnforcer,
     kbScheduler,
     snapshotScheduler,
     stripeWebhookHandler,

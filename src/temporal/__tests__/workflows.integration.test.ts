@@ -271,6 +271,34 @@ test("workflow suite (time-skipping)", { skip: !ENABLED && "set TEMPORAL_TEST=1 
     });
   });
 
+  await t.test("slaEnforceWorkflow ticks on its 5-minute cadence and slaEnforceRunNow forces a sweep", async () => {
+    const forces: boolean[] = [];
+    const activities: AnyRecord = {
+      slaEnforceTick: async (force: boolean) => {
+        forces.push(force);
+        return { scanned: 0, assigned: 0, statusWrites: 0, tagged: 0, untagged: 0, notes: 0, verifies: 0, errors: 0, capped: false, skipped: true };
+      },
+    };
+    const worker = await makeWorker(activities);
+    await worker.runUntil(async () => {
+      const handle = await env.client.workflow.start("slaEnforceWorkflow", {
+        taskQueue,
+        workflowId: "sla-enforce-t1",
+      });
+      await env.sleep("1 minute");
+      assert.deepEqual(forces, [false], `expected one immediate unforced tick, saw [${forces.join(",")}]`);
+      // The Assignment hub's Run Now (and any manual trigger) fires slaEnforceRunNow.
+      await handle.signal("slaEnforceRunNow");
+      await env.sleep("1 minute");
+      assert.deepEqual(forces, [false, true], `run-now must force the next tick, saw [${forces.join(",")}]`);
+      await env.sleep("6 minutes");
+      assert.deepEqual(forces, [false, true, false], `expected the unforced 5-minute cadence tick, saw [${forces.join(",")}]`);
+      const desc = await handle.describe();
+      assert.equal(desc.status.name, "RUNNING", "the looper must keep running between ticks");
+      await handle.terminate("test done");
+    });
+  });
+
   // ---- looper generation reconcile (terminate + restart on bump) ----
 
   await t.test("reconcileLooperGeneration keeps matching, terminates stale, reports absent", async () => {

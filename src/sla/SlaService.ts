@@ -3,7 +3,7 @@ import { SettingsStore } from "../config/SettingsStore";
 import { SlaRuleStore } from "./SlaRuleStore";
 import { SlaFactsLoader } from "./facts";
 import { evaluateRules } from "./evaluate";
-import { SlaDim, SlaEvaluation, SlaFacts } from "./types";
+import { SlaDim, SlaEvaluation, SlaFacts, hasClockDurations } from "./types";
 import { IntercomStore } from "../intercom/IntercomStore";
 import { IntercomClient, IntercomHttpError } from "../intercom/IntercomClient";
 import { TicketStore } from "../bot/TicketStore";
@@ -16,11 +16,13 @@ import { metricCount } from "../util/instrument";
 const slaLog = log.child("sla");
 
 // The SLA manager's brain: evaluates the rule list against a subject and
-// keeps the "SLA Target" conversation attribute in sync (the Intercom
-// Workflow does the actual native Apply SLA). Trigger entry points never
-// throw; the apply core throws IntercomHttpError on transient write failures
-// so the caller's retry machinery (per-ticket outbox delivery / inbound
-// activity retry / next sweep) owns redelivery.
+// keeps the "SLA Target" conversation attribute in sync. The bot IS the SLA
+// engine (Intercom Advanced has no native SLAs): the attribute is inbox
+// visibility + Workflow/view branching input, and the 5-min SlaEnforcer
+// looper runs the actual business-time clocks against it. Trigger entry
+// points never throw; the apply core throws IntercomHttpError on transient
+// write failures so the caller's retry machinery (per-ticket outbox delivery
+// / inbound activity retry / next sweep) owns redelivery.
 
 export type SlaSubjectRef = { threadId: string } | { conversationId: string };
 
@@ -31,7 +33,7 @@ export interface SlaApplyResult {
   reason?: string;
 }
 
-export type SlaTriggerReason = "created" | "status" | "customer_reply" | "refund_review" | "stripe" | "manual";
+export type SlaTriggerReason = "created" | "status" | "customer_reply" | "refund_review" | "stripe" | "manual" | "assignee";
 
 const ALL_DIMS: SlaDim[] = [
   "category", "status", "open", "exempt", "mirrored",
@@ -139,7 +141,6 @@ export class SlaService {
   // transient write failure.
   async applyForNative(conversationId: string, reason: string): Promise<SlaApplyResult> {
     if (!this.settingsStore.slaEnabled()) return this.skipped("disabled");
-    if (!this.settingsStore.slaNativeEnabled()) return this.skipped("native-disabled");
     if (!this.settingsStore.intercomConfigured()) return this.skipped("intercom-unconfigured");
 
     const stateId = `c:${conversationId}`;
@@ -255,7 +256,6 @@ export class SlaService {
 
   status(): {
     enabled: boolean;
-    nativeEnabled: boolean;
     attributeName: string;
     defaultTarget: string | null;
     ruleCount: number;
@@ -263,7 +263,6 @@ export class SlaService {
   } {
     return {
       enabled: this.settingsStore.slaEnabled(),
-      nativeEnabled: this.settingsStore.slaNativeEnabled(),
       attributeName: this.settingsStore.slaAttributeName(),
       defaultTarget: this.settingsStore.slaDefaultTarget(),
       ruleCount: this.ruleStore.count(),
@@ -275,100 +274,66 @@ export class SlaService {
     return this.prisma.slaState.count({ where: { pinnedTarget: { not: null } } });
   }
 
-  // One-shot cleanup for the pre-fix era: kick notes were authored as the
-  // Operator/Fin bot (which the Workflow trigger ignores) and lack the
-  // automation marker. For every known SLA subject: redact those stale notes
-  // (Intercom has NO hard-delete for parts — they become "message deleted"
-  // placeholders) and, where a target is currently written, post a fresh
-  // human-authored kick — which also finally fires the Workflow and applies
-  // the SLA those conversations never got.
-  async cleanupOldKickNotes(): Promise<{ subjects: number; redacted: number; rekicked: number; failures: number }> {
-    const result = { subjects: 0, redacted: 0, rekicked: 0, failures: 0 };
-    const pause = () => new Promise((r) => setTimeout(r, 200));
-    const states = await this.prisma.slaState.findMany({ where: { conversationId: { not: null } } });
-    for (const state of states) {
-      const conversationId = state.conversationId!;
-      result.subjects++;
-      try {
-        const parts = await this.intercomClient.getConversationPartsSince(conversationId, 0);
-        const stale = parts.filter(
-          (p) =>
-            p.id != null &&
-            !p.redacted &&
-            (p.part_type === "note" || p.part_type === "comment") &&
-            typeof p.body === "string" &&
-            p.body.includes("SLA target") &&
-            !p.body.includes("automated by the support bot")
-        );
-        let redactedAny = false;
-        for (const part of stale) {
-          await this.intercomClient.redactConversationPart(conversationId, String(part.id));
-          result.redacted++;
-          redactedAny = true;
-          await pause();
-        }
-        // Fresh, correctly-authored kick — only when the subject actually has
-        // a written target (also fires the Workflow the old note couldn't).
-        if (redactedAny && state.lastWrittenTarget) {
-          const threadId = state.id.startsWith("t:") ? state.id.slice(2) : undefined;
-          await this.noteKick(
-            state.id,
-            state.kind === "bridged" ? "bridged" : "native",
-            conversationId,
-            threadId,
-            state.lastWrittenTarget || null,
-            state.lastKickPartId
-          );
-          result.rekicked++;
-        }
-        await pause();
-      } catch (e) {
-        result.failures++;
-        slaLog.warn("sla.note_cleanup.failed", {
-          "intercom.conversation_id": conversationId,
-          "error.message": e instanceof Error ? e.message : String(e),
-        });
-      }
-    }
-    slaLog.info("sla.note_cleanup.completed", {
-      "sla.cleanup_subjects": result.subjects,
-      "sla.cleanup_redacted": result.redacted,
-      "sla.cleanup_rekicked": result.rekicked,
-      "sla.cleanup_failures": result.failures,
-    });
-    return result;
-  }
-
-  // Setup verification for the /intercom Verify Setup button: the API can
-  // LIST conversation attributes but cannot create them, and it cannot see
-  // SLAs/Workflows at all — so this checks what it can and returns the manual
-  // runbook for the rest.
-  async verifySetup(): Promise<{ attributeExists: boolean; attributeName: string; runbook: string[] }> {
+  // Setup verification for the /intercom Verify Setup button. The bot is the
+  // SLA engine now — no Workflows, no kick notes — but two conversation
+  // attributes must exist (the API can LIST conversation attributes yet
+  // cannot create them) and three webhook topics need their manual Developer
+  // Hub subscriptions. Checks what the API can see; returns the manual
+  // runbook for the rest. The enforcement-looper liveness check lives in the
+  // SLA hub's Verify handler (it has the Temporal producers).
+  async verifySetup(): Promise<{ attributeExists: boolean; statusAttributeExists: boolean; attributeName: string; runbook: string[] }> {
     const attributeName = this.settingsStore.slaAttributeName();
+    const statusAttributeName = this.settingsStore.slaStatusAttributeName();
     let attributeExists = false;
+    let statusAttributeExists = false;
     try {
       const attrs = await this.intercomClient.listConversationDataAttributes();
       attributeExists = attrs.some((a) => a.name === attributeName && !a.archived);
+      statusAttributeExists = attrs.some((a) => a.name === statusAttributeName && !a.archived);
     } catch (e) {
       slaLog.warn("sla.verify.attr_list_failed", { "error.message": e instanceof Error ? e.message : String(e) });
     }
+    let breachTagExists = false;
+    try {
+      const tags = await this.intercomClient.listTags();
+      const tagName = this.settingsStore.slaBreachTagName().toLowerCase();
+      breachTagExists = tags.some((t) => t.name.toLowerCase() === tagName);
+    } catch {
+      /* informational only — the enforcer find-or-creates it */
+    }
     const targets = this.settingsStore.slaTargets();
-    const noteKick = this.settingsStore.slaNoteKickEnabled();
+    const withClocks = targets.filter(hasClockDurations);
+    const targetValues = new Set(targets.map((t) => t.value));
+    const rulesMissingClocks = this.ruleStore
+      .snapshot()
+      .filter((r) => r.enabled && (!targetValues.has(r.target) || !withClocks.some((t) => t.value === r.target)))
+      .map((r) => r.target);
+    const oh = this.settingsStore.officeHoursEnabled() ? this.settingsStore.officeHours() : undefined;
     const runbook = [
       attributeExists
         ? `✅ Conversation attribute **${attributeName}** exists.`
         : `❌ Create a **List** conversation attribute named exactly **${attributeName}** (Intercom → Settings → Data → Conversations — the API cannot create it). Options: ${targets.map((t) => `\`${t.value}\``).join(", ") || "add targets first"}.`,
-      "2. **Bridged tickets Workflow**: trigger **Teammate adds a note**, context **Customer tickets ONLY** (ticket contexts have no channel gate — API conversations never match a channel, so conversation-scoped triggers won't fire for bridged tickets). Branch on the **ticket attribute** `" +
-        attributeName +
-        "` (Ensure Ticket Attributes in the Bridge hub creates it; the bot mirrors every target onto it) → native **Apply SLA** per branch.",
-      "3. **Native conversations Workflow** (only if you enable *Native* here): same trigger, context **Conversations**, ALL channels selected — native conversations come from real channels, so the gate is fine there. Branch on the conversation attribute → Apply SLA. The two Workflows cover disjoint subjects (bridged tickets vs native conversations), so SLAs are never double-applied.",
-      "4. The bot posts a small internal note on every target change" +
-        (noteKick ? "" : " — ⚠️ the note kick is currently OFF here, so nothing fires those triggers") +
-        "; it always lands AFTER the attribute writes, so branches read fresh values. Test once: flip a target on a test ticket and confirm the Workflow applied the SLA.",
-      "5. Developer Hub → your app → Webhooks: manually subscribe `conversation.user.created` and `conversation.user.replied` (needed for native-conversation rules; bridged tickets work without them).",
-      "6. Enable SLA here (and *Native conversations* if wanted). The 30-min sweep heals anything a webhook misses.",
+      statusAttributeExists
+        ? `✅ Conversation attribute **${statusAttributeName}** exists.`
+        : `❌ Create a **List** conversation attribute named exactly **${statusAttributeName}** with options \`ok\`, \`at_risk\`, \`breached\` (the enforcement looper writes it; writes 4xx until it exists).`,
+      `${withClocks.length > 0 ? "✅" : "❌"} ${withClocks.length}/${targets.length} target(s) have clock durations` +
+        (withClocks.length === 0 ? " — set durations in Targets, or no clock ever runs." : ".") +
+        (rulesMissingClocks.length > 0
+          ? ` ⚠️ Enabled rule target(s) without clocks: ${[...new Set(rulesMissingClocks)].map((t) => `\`${t}\``).join(", ")}.`
+          : ""),
+      oh === undefined
+        ? "▫️ Office hours disabled — clocks run on wall clock (24/7)."
+        : oh === null
+          ? "❌ Office hours are enabled but the schedule is invalid — clocks fall back to wall clock until fixed."
+          : `✅ Office hours: ${oh.tz}, clocks pause outside the schedule.`,
+      breachTagExists
+        ? `✅ Breach tag **${this.settingsStore.slaBreachTagName()}** exists.`
+        : `▫️ Breach tag **${this.settingsStore.slaBreachTagName()}** will be created on first breach.`,
+      "Developer Hub → your app → Webhooks: manually subscribe `conversation.user.created`, `conversation.user.replied` and `conversation.admin.assigned` (native rules, reopen-reassignment and the assignee dim need them; bridged target evaluation works without them).",
+      "Old Expert-tier leftovers: delete the two Apply-SLA Workflows in Intercom if they still exist — native SLAs are gone on Advanced and the bot no longer posts kick notes.",
+      "Ticket-attribute mirror: /intercom → Bridge → Ensure Ticket Attributes (unchanged — bridged Customer tickets mirror the target attribute).",
     ];
-    return { attributeExists, attributeName, runbook };
+    return { attributeExists, statusAttributeExists, attributeName, runbook };
   }
 
   // ---- internals ----
@@ -489,7 +454,6 @@ export class SlaService {
     }
 
     await this.upsertState(stateId, kind, conversationId, target, ruleId, effectiveWritten, null);
-    await this.noteKick(stateId, kind, conversationId, input.threadId, target, state?.lastKickPartId ?? null);
     slaLog.info("sla.target.written", {
       "intercom.conversation_id": conversationId,
       "sla.kind": kind,
@@ -500,63 +464,6 @@ export class SlaService {
     });
     metricCount("sla.writes", 1, { outcome: "written" });
     return { outcome: pinned ? "pinned" : "written", target, ruleId };
-  }
-
-  // Internal note on every target CHANGE. Two jobs: agent-visible signal in
-  // the inbox, and the Workflow kick — Intercom has NO attribute-change
-  // trigger, so the SLA Workflow uses trigger "Teammate adds a note" and
-  // branches on the freshly-written attribute (the note always lands AFTER
-  // the attribute writes). AUTHORSHIP MATTERS: the trigger ignores notes
-  // authored by the Operator/Fin BOT (empirically verified — "Teammate" means
-  // a human admin), so the kick is authored as the configured HUMAN fallback
-  // admin, never the Operator. Best-effort — never fails the write.
-  private async noteKick(
-    stateId: string,
-    kind: "bridged" | "native",
-    conversationId: string,
-    threadId: string | undefined,
-    target: string | null,
-    previousPartId: string | null
-  ): Promise<void> {
-    if (!this.settingsStore.slaNoteKickEnabled()) return;
-    // Authored as a human teammate (trigger requirement) — the marker keeps
-    // agents from mistaking it for something that teammate wrote themselves.
-    const content = `${target ? `🎯 SLA target: <b>${target}</b>` : "🎯 SLA target cleared"} — <i>automated by the support bot</i>`;
-    // Human admin ONLY — the dedicated SLA note author when set, else the
-    // general fallback admin. Never intercomAuthorAdminId(): that prefers the
-    // Operator/Fin bot, whose notes do NOT fire "Teammate adds a note".
-    const adminId = this.settingsStore.slaNoteAdminId() ?? this.settingsStore.intercomAdminId();
-    if (!adminId) {
-      slaLog.warn("sla.note_kick.no_human_admin", {
-        "intercom.conversation_id": conversationId,
-        "sla.hint": "pick a fallback admin in /config → Integrations → Intercom — the SLA Workflow trigger ignores Fin-authored notes",
-      });
-      return;
-    }
-    try {
-      // Supersede the previous kick: redact it so the conversation only ever
-      // shows the CURRENT target (Intercom has no hard-delete for parts — it
-      // becomes a "message deleted" placeholder). Best-effort: a failed
-      // redaction never blocks the new kick.
-      if (previousPartId) {
-        await this.intercomClient.redactConversationPart(conversationId, previousPartId).catch(() => undefined);
-      }
-      const { partId } = await this.intercomClient.replyAsAdmin(conversationId, { adminId, body: content, note: true });
-      if (kind === "bridged" && threadId && partId) {
-        // Echo-register so the noted-webhook doesn't relay the kick into the
-        // Discord thread. Registered right after the POST returns — the
-        // webhook echo travels through the Temporal inbox, so it can't win
-        // the race in practice. (Native conversations have no link → the
-        // noted-webhook drops them without this.)
-        await this.intercomStore.recordEchoPart("c", partId, threadId).catch(() => undefined);
-      }
-      await this.prisma.slaState.updateMany({ where: { id: stateId }, data: { lastKickPartId: partId ?? null } });
-    } catch (e) {
-      slaLog.warn("sla.note_kick.failed", {
-        "intercom.conversation_id": conversationId,
-        "error.message": e instanceof Error ? e.message : String(e),
-      });
-    }
   }
 
   private async upsertState(

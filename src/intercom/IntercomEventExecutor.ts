@@ -54,6 +54,9 @@ export class IntercomEventExecutor {
   // index.ts); handles the "sla" outbox event. Same pattern as
   // IntercomSyncService.setExecutor.
   private slaService: { applyForBridged(threadId: string, reason: string): Promise<unknown> } | null = null;
+  private assignmentService: {
+    maybeAssignOnCreate(conversationId: string, threadId: string | null, ticketId: string | null): Promise<void>;
+  } | null = null;
 
   constructor(
     private client: IntercomClient,
@@ -66,6 +69,12 @@ export class IntercomEventExecutor {
 
   setSlaService(service: { applyForBridged(threadId: string, reason: string): Promise<unknown> }): void {
     this.slaService = service;
+  }
+
+  setAssignmentService(service: {
+    maybeAssignOnCreate(conversationId: string, threadId: string | null, ticketId: string | null): Promise<void>;
+  }): void {
+    this.assignmentService = service;
   }
 
   // ---- Author resolution ----
@@ -320,6 +329,16 @@ export class IntercomEventExecutor {
       }
     }
     beat?.();
+
+    // Balanced assignment (bot-native, Advanced tier): pick a teammate right
+    // after team routing — creation only, so later human reassignment is
+    // never overridden (the enforcement sweep owns strays). Best-effort.
+    if (created && this.assignmentService) {
+      await this.assignmentService
+        .maybeAssignOnCreate(link.conversationId, threadId, ticketId)
+        .catch(() => undefined);
+      beat?.();
+    }
 
     // Conversation open/close parity: API-created conversations start open.
     // The ticket's own open flag follows suit — resolved state alone leaves it

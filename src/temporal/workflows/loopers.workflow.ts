@@ -8,7 +8,13 @@ import {
   type Workflow,
 } from "@temporalio/workflow";
 import type { CoreActivities } from "../types";
-import { disputesRunNowSignal, inactivityRunNowSignal, kbRefreshNowSignal, slaRunNowSignal } from "./definitions";
+import {
+  disputesRunNowSignal,
+  inactivityRunNowSignal,
+  kbRefreshNowSignal,
+  slaEnforceRunNowSignal,
+  slaRunNowSignal,
+} from "./definitions";
 
 // Interval-based recurring jobs as eternal looping workflows (user decision:
 // Schedules only for the wall-clock status report). Each iteration reads its
@@ -107,6 +113,27 @@ export async function slaSweepWorkflow(): Promise<void> {
     await inactivityActs.slaSweepTick(force).catch(() => {});
     await canIfDue(() => continueWithMemo<typeof slaSweepWorkflow>());
     await condition(() => runNow, 30 * 60_000);
+  }
+}
+
+// Bot-native SLA enforcement + assignment stray sweep (Intercom Advanced has
+// no native SLAs or workload management): one paged open-conversation scan
+// per tick powers the business-time clocks (SLA Status attribute, breach
+// tag + note) AND routes unassigned conversations through the hybrid
+// balancer. 5-minute cadence — clock alerts land within ~5 min of the true
+// threshold. Gates (slaEnabled / assignEnabled) re-read from BotSettings each
+// tick inside the activity.
+export async function slaEnforceWorkflow(): Promise<void> {
+  let runNow = false;
+  setHandler(slaEnforceRunNowSignal, () => {
+    runNow = true;
+  });
+  for (;;) {
+    const force = runNow;
+    runNow = false;
+    await inactivityActs.slaEnforceTick(force).catch(() => {});
+    await canIfDue(() => continueWithMemo<typeof slaEnforceWorkflow>());
+    await condition(() => runNow, 5 * 60_000);
   }
 }
 

@@ -18,6 +18,7 @@ import { isIntercomExempt, type IntercomSyncService } from "../../intercom/Inter
 import type { IntercomEventExecutor } from "../../intercom/IntercomEventExecutor";
 import type { InactivitySweeper } from "../../intercom/InactivitySweeper";
 import type { SlaSweeper } from "../../intercom/SlaSweeper";
+import type { SlaEnforcer } from "../../intercom/SlaEnforcer";
 import { IntercomHttpError } from "../../intercom/IntercomClient";
 import { DeferEchoError, type IntercomWebhookHandler } from "../../intercom/IntercomWebhookHandler";
 import type { EnsurePayload } from "../../intercom/types";
@@ -63,6 +64,7 @@ export interface ActivityDeps {
   intercomWebhookHandler: IntercomWebhookHandler;
   inactivitySweeper: InactivitySweeper;
   slaSweeper: SlaSweeper;
+  slaEnforcer: SlaEnforcer;
   kbScheduler: KnowledgeBaseScheduler;
   snapshotScheduler: SnapshotScheduler;
   stripeWebhookHandler: StripeWebhookHandler;
@@ -91,6 +93,7 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
     intercomWebhookHandler,
     inactivitySweeper,
     slaSweeper,
+    slaEnforcer,
     kbScheduler,
     snapshotScheduler,
     stripeWebhookHandler,
@@ -649,6 +652,23 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
       }, 30_000);
       try {
         return await slaSweeper.sweep(force);
+      } finally {
+        clearInterval(keepalive);
+      }
+    },
+
+    // Bot-native SLA enforcement + assignment stray sweep (5-min looper).
+    async slaEnforceTick(force) {
+      heartbeat();
+      const keepalive = setInterval(() => {
+        try {
+          heartbeat();
+        } catch {
+          /* worker shutting down — the sweep finishes on its own */
+        }
+      }, 30_000);
+      try {
+        return await slaEnforcer.sweep(force);
       } finally {
         clearInterval(keepalive);
       }

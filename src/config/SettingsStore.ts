@@ -4,6 +4,8 @@ import type { SentryRuntimeConfig } from "../util/logger";
 import type { InfluxRuntimeConfig } from "../metrics/InfluxWriter";
 import { decryptSecret, encryptSecret, isVaultKvSentinel, VAULT_KV_SENTINEL } from "../util/crypto";
 import type { VaultIntegration, VaultRuntimeConfig, VaultService } from "../vault/VaultService";
+import type { SlaTargetEntry } from "../sla/types";
+import { parseOfficeHours, type OfficeHoursSchedule } from "../sla/businessTime";
 
 export type ReminderTarget = "SUPPORT" | "CUSTOMER";
 
@@ -643,17 +645,16 @@ export class SettingsStore {
   }
 
   // ---- SLA manager (/intercom → SLA Manager) ----
+  // The bot IS the SLA engine (Advanced tier has no native SLAs): rules pick a
+  // target, targets carry business-minute clock durations, and the 5-min
+  // enforcement looper runs the clocks.
 
   slaEnabled(): boolean {
     return this.settings.slaEnabled;
   }
 
-  slaNativeEnabled(): boolean {
-    return this.settings.slaNativeEnabled;
-  }
-
   // No-match value written to the attribute; null = clear a previously-written
-  // value (the Intercom Workflow then has no branch to apply).
+  // value (no clocks run for a conversation without a target).
   slaDefaultTarget(): string | null {
     return this.settings.slaDefaultTarget;
   }
@@ -662,29 +663,48 @@ export class SettingsStore {
     return this.settings.slaAttributeName || "SLA Target";
   }
 
-  // Internal note on every target change — agent-visible signal AND the
-  // Workflow kick (trigger "Teammate adds a note"; there is no
-  // attribute-change trigger in Intercom Workflows).
-  slaNoteKickEnabled(): boolean {
-    return this.settings.slaNoteKickEnabled;
+  // List conversation attribute the enforcement looper writes ok | at_risk |
+  // breached to. Created manually in Intercom (the API can't create
+  // conversation attributes) — Verify Setup checks it exists.
+  slaStatusAttributeName(): string {
+    return this.settings.slaStatusAttributeName || "SLA Status";
   }
 
-  // Author for SLA kick notes only. Must be a HUMAN teammate (the trigger
-  // ignores Fin-authored notes); null = fall back to the general fallback
-  // admin. Everything else keeps the normal Operator-first authoring.
-  slaNoteAdminId(): string | null {
-    return this.settings.slaNoteAdminId;
+  slaBreachTagName(): string {
+    return this.settings.slaBreachTagName || "sla-breached";
+  }
+
+  // Global at_risk threshold as % of the target duration (per-target override
+  // lives on the registry entry).
+  slaWarnPct(): number {
+    const raw = this.settings.slaWarnPct;
+    if (!Number.isFinite(raw)) return 80;
+    return Math.min(99, Math.max(1, Math.trunc(raw)));
   }
 
   // Managed target registry: every rule target and the default target must
-  // reference an entry; each value needs a matching Workflow branch in
-  // Intercom (which the API cannot enumerate to validate).
-  slaTargets(): Array<{ value: string; note: string }> {
+  // reference an entry. Durations are business minutes; a clock left unset is
+  // disabled for that target.
+  slaTargets(): SlaTargetEntry[] {
     const raw = this.settings.slaTargetsJson as unknown;
     if (!Array.isArray(raw)) return [];
+    const mins = (v: unknown): number | undefined => {
+      const n = typeof v === "number" ? v : typeof v === "string" && v.trim() !== "" ? Number(v) : NaN;
+      return Number.isFinite(n) && Number.isInteger(n) && n > 0 ? n : undefined;
+    };
     return raw
-      .filter((e): e is { value: string; note?: unknown } => !!e && typeof e === "object" && typeof (e as { value?: unknown }).value === "string")
-      .map((e) => ({ value: e.value, note: typeof e.note === "string" ? e.note : "" }));
+      .filter((e): e is Record<string, unknown> => !!e && typeof e === "object" && typeof (e as { value?: unknown }).value === "string")
+      .map((e) => {
+        const warn = mins(e.warnPct);
+        return {
+          value: e.value as string,
+          note: typeof e.note === "string" ? e.note : "",
+          firstReplyMins: mins(e.firstReplyMins),
+          nextReplyMins: mins(e.nextReplyMins),
+          resolveMins: mins(e.resolveMins),
+          warnPct: warn !== undefined ? Math.min(99, Math.max(1, warn)) : undefined,
+        };
+      });
   }
 
   slaTargetExists(value: string): boolean {
@@ -693,19 +713,88 @@ export class SettingsStore {
 
   async updateSla(data: {
     slaEnabled?: boolean;
-    slaNativeEnabled?: boolean;
     slaDefaultTarget?: string | null;
     slaAttributeName?: string;
-    slaNoteKickEnabled?: boolean;
-    slaNoteAdminId?: string | null;
+    slaStatusAttributeName?: string;
+    slaBreachTagName?: string;
+    slaWarnPct?: number;
   }): Promise<void> {
     this.settings = await this.prisma.botSettings.update({ where: { id: "global" }, data });
   }
 
-  async updateSlaTargets(targets: Array<{ value: string; note: string }>): Promise<void> {
+  async updateSlaTargets(targets: SlaTargetEntry[]): Promise<void> {
     this.settings = await this.prisma.botSettings.update({
       where: { id: "global" },
-      data: { slaTargetsJson: targets },
+      data: { slaTargetsJson: targets as unknown as Prisma.InputJsonValue },
+    });
+  }
+
+  // ---- Office hours (SLA clocks count business time only; /intercom → SLA Manager → Office Hours) ----
+
+  officeHoursEnabled(): boolean {
+    return this.settings.officeHoursEnabled;
+  }
+
+  // Parsed weekly schedule, or null when unset/invalid (clocks then run on
+  // wall clock; the SLA hub + Verify Setup surface invalid JSON).
+  officeHours(): OfficeHoursSchedule | null {
+    const raw = this.settings.officeHoursJson as unknown;
+    if (raw == null) return null;
+    return parseOfficeHours(raw);
+  }
+
+  // Effective schedule for clock math: null unless enabled AND valid.
+  effectiveOfficeHours(): OfficeHoursSchedule | null {
+    return this.officeHoursEnabled() ? this.officeHours() : null;
+  }
+
+  async updateOfficeHours(data: { officeHoursEnabled?: boolean; officeHoursJson?: OfficeHoursSchedule }): Promise<void> {
+    this.settings = await this.prisma.botSettings.update({
+      where: { id: "global" },
+      data: {
+        ...(data.officeHoursEnabled !== undefined ? { officeHoursEnabled: data.officeHoursEnabled } : {}),
+        ...(data.officeHoursJson !== undefined ? { officeHoursJson: data.officeHoursJson as unknown as Prisma.InputJsonValue } : {}),
+      },
+    });
+  }
+
+  // ---- Balanced assignment (/intercom → Assignment) ----
+
+  assignEnabled(): boolean {
+    return this.settings.assignEnabled;
+  }
+
+  // Admins benched from bot assignment (names snapshotted for display).
+  assignExcludedAdmins(): Array<{ id: string; name: string }> {
+    const raw = this.settings.assignExcludedAdminsJson as unknown;
+    if (!Array.isArray(raw)) return [];
+    return raw
+      .filter((e): e is { id: string; name?: unknown } => !!e && typeof e === "object" && typeof (e as { id?: unknown }).id === "string")
+      .map((e) => ({ id: e.id, name: typeof e.name === "string" ? e.name : e.id }));
+  }
+
+  assignRotationCursor(): string | null {
+    return this.settings.assignRotationCursor;
+  }
+
+  async updateAssignment(data: { assignEnabled?: boolean; assignExcludedAdmins?: Array<{ id: string; name: string }> }): Promise<void> {
+    this.settings = await this.prisma.botSettings.update({
+      where: { id: "global" },
+      data: {
+        ...(data.assignEnabled !== undefined ? { assignEnabled: data.assignEnabled } : {}),
+        ...(data.assignExcludedAdmins !== undefined
+          ? { assignExcludedAdminsJson: data.assignExcludedAdmins as unknown as Prisma.InputJsonValue }
+          : {}),
+      },
+    });
+  }
+
+  // Engine-written (every bot assignment advances it) — separate from the
+  // UI-driven updaters so the hot path stays a one-column update.
+  async setAssignRotationCursor(adminId: string | null): Promise<void> {
+    this.settings = await this.prisma.botSettings.update({
+      where: { id: "global" },
+      data: { assignRotationCursor: adminId },
     });
   }
 

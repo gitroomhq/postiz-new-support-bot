@@ -292,26 +292,38 @@ model BotSettings {
   // ("Revoke Stripe Panel Links" in /intercom → Maintenance) invalidates every
   // outstanding link and session instantly.
   panelTokenEpoch         Int     @default(0)
-  // SLA manager (edited via /intercom → SLA Manager). The bot writes ONE
-  // custom conversation attribute (slaAttributeName); an Intercom Workflow
-  // branches on it → native "Apply SLA" (the API can't apply SLAs directly).
+  // SLA manager (edited via /intercom → SLA Manager). The bot IS the SLA
+  // engine (Intercom Advanced has no native SLAs): rules pick a target, the
+  // bot writes it to the slaAttributeName conversation attribute (inbox
+  // visibility + Workflow/view branching), and the 5-min enforcement looper
+  // runs the clocks and posts breach signals.
   slaEnabled       Boolean @default(false)
-  slaNativeEnabled Boolean @default(false) // also cover native (non-bridged) conversations
+  slaNativeEnabled Boolean @default(false) // orphaned (kick-note rip 2026-07-17) — native conversations are covered whenever slaEnabled
   slaDefaultTarget String?                 // no-match target; null = clear a previously-written value
   slaAttributeName String  @default("SLA Target")
-  // Post a small internal note whenever the target changes. Doubles as the
-  // Workflow kick: no attribute-change trigger exists, so the recipe is ONE
-  // Workflow with trigger "Teammate adds a note" branching on the attribute.
-  slaNoteKickEnabled Boolean @default(true)
-  // Author for SLA kick notes ONLY. Must be a HUMAN teammate — the trigger
-  // ignores Operator/Fin-authored notes. Null = fall back to the general
-  // fallback admin (intercomAdminId). The normal bridge authoring preference
-  // (Operator/Fin first) is untouched for everything else.
-  slaNoteAdminId String?
-  // Managed SLA target registry: JSON array of { value, note }. Rule targets
-  // and slaDefaultTarget must reference an entry; each value needs a matching
-  // Workflow branch in Intercom (the API can't enumerate SLAs to validate).
+  slaNoteKickEnabled Boolean @default(true) // orphaned (kick-note rip 2026-07-17)
+  slaNoteAdminId String?                    // orphaned (kick-note rip 2026-07-17)
+  // Managed SLA target registry: JSON array of { value, note, firstReplyMins?,
+  // nextReplyMins?, resolveMins?, warnPct? }. Rule targets and slaDefaultTarget
+  // must reference an entry; durations are business-minutes for the bot-native
+  // clocks (a clock left blank is disabled for that target).
   slaTargetsJson   Json?
+  // Bot-native SLA engine (Expert-tier replacement). The enforcement looper
+  // writes ok | at_risk | breached to this List conversation attribute
+  // (created manually in Intercom — the API can't create conversation attrs).
+  slaStatusAttributeName String  @default("SLA Status")
+  slaBreachTagName       String  @default("sla-breached") // tagged on breach, untagged on recovery
+  slaWarnPct             Int     @default(80)             // at_risk threshold, % of target (per-target override in slaTargetsJson)
+  // Office hours: SLA clocks count business time only while enabled. JSON:
+  // { tz, week: { mon..sun: [{ start: "HH:MM", end: "HH:MM" }] }, holidays: ["YYYY-MM-DD"] }.
+  officeHoursEnabled Boolean @default(false)
+  officeHoursJson    Json?
+  // Balanced assignment (hybrid round-robin over the routing team's members;
+  // edited via /intercom → Assignment). Excluded admins never receive bot
+  // assignments; the rotation cursor is the last bot-assigned admin id.
+  assignEnabled            Boolean @default(false)
+  assignExcludedAdminsJson Json?   // [{ id, name }] — names snapshotted for display
+  assignRotationCursor     String?
   updatedAt           DateTime  @updatedAt
 
   @@map("bot_settings")
@@ -801,11 +813,28 @@ model SlaState {
   lastRuleId        String?
   lastEvaluatedAt   DateTime?
   lastWriteError    String? // last permanent write failure — surfaced in the SLA hub
-  lastKickPartId    String? // part id of the last kick note — redacted when a newer target replaces it
+  lastKickPartId    String? // orphaned (kick-note rip 2026-07-17)
   pinnedTarget      String? // non-null = rules skipped for this subject
   pinnedById        String?
   pinnedByName      String?
   pinnedAt          DateTime?
+  // Enforcement clock markers (bot-native SLA engine). Warned/breached stamps
+  // dedup alerts (one warn + one breach per clock per cycle); nrCycleAnchor
+  // identifies the current customer-waiting cycle (a new waiting_since resets
+  // the next-reply markers); frHumanReplyAt caches the parts-verified first
+  // REAL human admin reply for native conversations.
+  frHumanReplyAt    DateTime?
+  frVerifyNoneAt    DateTime? // last parts-verify that found NO human reply (re-check only after a newer admin reply)
+  frWarnedAt        DateTime?
+  frBreachedAt      DateTime?
+  nrCycleAnchor     DateTime?
+  nrWarnedAt        DateTime?
+  nrBreachedAt      DateTime?
+  resWarnedAt       DateTime?
+  resBreachedAt     DateTime?
+  lastStatusWritten String? // last SLA Status attribute value actually PUT (write damper)
+  breachTagged      Boolean   @default(false) // breach tag currently on the conversation
+  lastEnforcedAt    DateTime?
   updatedAt         DateTime  @updatedAt
 
   @@index([conversationId])

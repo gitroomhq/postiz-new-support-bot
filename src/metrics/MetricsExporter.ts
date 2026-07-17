@@ -152,6 +152,32 @@ export function exportIntercomSweep(p: {
   );
 }
 
+// One point per SLA enforcement tick (bot-native clocks + assignment) —
+// errors > 0 is the alertable field; capped = the write budget ran out.
+export function exportSlaEnforce(p: {
+  scanned: number;
+  statusWrites: number;
+  breaches: number;
+  recoveries: number;
+  assigned: number;
+  errors: number;
+  capped: number;
+}): void {
+  writePoint(
+    "sla_enforce",
+    {},
+    {
+      scanned: p.scanned,
+      status_writes: p.statusWrites,
+      breaches: p.breaches,
+      recoveries: p.recoveries,
+      assigned: p.assigned,
+      errors: p.errors,
+      capped: p.capped,
+    }
+  );
+}
+
 // The dispute console's blocked-charge review queue — the one ticket-adjacent
 // gauge that survived the agent-rip (it feeds /charge staffing).
 export function exportPendingChargeReviews(pending: number): void {

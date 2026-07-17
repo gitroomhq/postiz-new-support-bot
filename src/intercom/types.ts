@@ -151,10 +151,14 @@ export interface IntercomSweepConversation {
   id: string;
   state: string; // "open" | "closed" | "snoozed"
   createdAt: Date | null;
+  waitingSince: Date | null; // customer waiting for a teammate since (NRT clock anchor)
   snoozedUntil: Date | null;
+  firstAdminReplyAt: Date | null; // raw statistics — may be Fin/Operator
   lastContactReplyAt: Date | null;
   lastAdminReplyAt: Date | null;
   teamAssigneeId: string | null;
+  adminAssigneeId: string | null;
+  customAttributes: Record<string, unknown>;
 }
 
 export interface IntercomSweepTicket {
@@ -172,6 +176,8 @@ export interface IntercomAdmin {
   name?: string | null;
   email?: string | null;
   avatarUrl?: string | null;
+  awayModeEnabled?: boolean;
+  hasInboxSeat?: boolean;
 }
 
 export interface IntercomTicketType {
@@ -221,6 +227,7 @@ export interface IntercomConversationItem {
   type?: string;
   id?: string | number;
   conversation_parts?: { conversation_parts?: IntercomWebhookPart[] };
+  admin_assignee_id?: number | string | null; // balanced assignment + assignee SLA dim
   snoozed_until?: number | null;
   tags?: { tags?: Array<{ id?: string | number; name?: string | null }> };
   // Native priority level (none/low/medium/high/urgent) — READ-only via the

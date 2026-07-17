@@ -174,12 +174,22 @@ export interface ExpressionError {
 
 export type ParseResult = { ok: true; conditions: SlaCondition[] } | { ok: false; errors: ExpressionError[] };
 
-// Managed target registry entry (BotSettings.slaTargetsJson).
+// Managed target registry entry (BotSettings.slaTargetsJson). Durations are
+// BUSINESS minutes for the bot-native clocks — a clock left unset is disabled
+// for that target; a target with no durations gets no clocks at all.
 export interface SlaTargetEntry {
   value: string;
   note: string;
+  firstReplyMins?: number;
+  nextReplyMins?: number;
+  resolveMins?: number;
+  warnPct?: number; // per-target at_risk threshold override (default: BotSettings.slaWarnPct)
+}
+
+export function hasClockDurations(t: SlaTargetEntry): boolean {
+  return t.firstReplyMins != null || t.nextReplyMins != null || t.resolveMins != null;
 }
 
 // Case-sensitive: the value must EXACTLY match the Intercom List-attribute
-// option and the Workflow branch condition.
+// option.
 export const SLA_TARGET_VALUE_RE = /^[A-Za-z0-9-_]{1,60}$/;

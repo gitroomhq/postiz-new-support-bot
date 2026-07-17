@@ -18,6 +18,7 @@ import type { IntercomWebhookHandler } from "../intercom/IntercomWebhookHandler"
 import type { TemporalProducers } from "../temporal/producers";
 import type { SlaRuleStore } from "../sla/SlaRuleStore";
 import type { SlaService } from "../sla/SlaService";
+import type { AssignmentService } from "../intercom/AssignmentService";
 import { RouteTable, type AdminGateInteraction, type Panel, type RouteEntry } from "./intercomadmin/types";
 import { SessionManager } from "./intercomadmin/SessionManager";
 import { btn, buttonRow, panelEmbed } from "./intercomadmin/ui";
@@ -25,6 +26,7 @@ import { buildActionLevelsPanel, buildIntercomAdminsPanel } from "./configBillin
 import type { DiscordBinding, HubContext } from "./intercomadmin/hubs/HubContext";
 import { BridgeHub } from "./intercomadmin/hubs/BridgeHub";
 import { SlaHub } from "./intercomadmin/hubs/SlaHub";
+import { AssignmentHub } from "./intercomadmin/hubs/AssignmentHub";
 import { AutomationHub } from "./intercomadmin/hubs/AutomationHub";
 import { MaintenanceHub } from "./intercomadmin/hubs/MaintenanceHub";
 
@@ -37,6 +39,7 @@ export class IntercomAdmin {
   private sessions = new SessionManager();
   private bridge: BridgeHub;
   private sla: SlaHub;
+  private assignment: AssignmentHub;
   private automation: AutomationHub;
   private maintenance: MaintenanceHub;
   private discordBinding: DiscordBinding | null = null;
@@ -57,7 +60,8 @@ export class IntercomAdmin {
     private auditLogger: AuditLogger,
     producers: TemporalProducers,
     private slaRules: SlaRuleStore,
-    slaService: SlaService
+    slaService: SlaService,
+    assignmentService: AssignmentService
   ) {
     const ctx: HubContext = {
       settingsStore,
@@ -71,6 +75,7 @@ export class IntercomAdmin {
       producers,
       slaRules,
       slaService,
+      assignmentService,
       sessions: this.sessions,
       auditLogger,
       auditConfig: (interaction, change) => this.auditConfig(interaction, change),
@@ -78,12 +83,14 @@ export class IntercomAdmin {
     };
     this.bridge = new BridgeHub(ctx);
     this.sla = new SlaHub(ctx);
+    this.assignment = new AssignmentHub(ctx);
     this.automation = new AutomationHub(ctx);
     this.maintenance = new MaintenanceHub(ctx);
 
     const sources: { routes: RouteEntry[] }[] = [
       this.bridge,
       this.sla,
+      this.assignment,
       this.automation,
       this.maintenance,
       { routes: this.facadeRoutes() },
@@ -167,6 +174,8 @@ export class IntercomAdmin {
         return this.bridge.buildPanel();
       case "sla":
         return this.sla.buildPanel();
+      case "assign":
+        return this.assignment.buildPanel();
       case "automation":
         return this.automation.buildPanel();
       case "maintenance":
@@ -189,10 +198,11 @@ export class IntercomAdmin {
         `**Bridge mode:** ${mode}${s.intercomConfigured() ? "" : " · ⚠️ setup incomplete (/config → Integrations → Intercom)"}`,
         `**Bridged tickets:** ${links}/${total}`,
         `**SLA:** ${s.slaEnabled() ? "on" : "off"} — ${this.slaRules.count()} rule(s), ${this.slaRules.enabledCount()} enabled → default ${s.slaDefaultTarget() ? `\`${s.slaDefaultTarget()}\`` : "none"}`,
-        `**Inactivity sweeper:** ${s.inactivityEnabled() ? "on" : "off"}`,
+        `**Assignment:** ${s.assignEnabled() ? "on" : "off"}${s.assignExcludedAdmins().length ? ` — ${s.assignExcludedAdmins().length} excluded` : ""} · **Inactivity sweeper:** ${s.inactivityEnabled() ? "on" : "off"}`,
         "",
         "**Bridge** — mode, ticket-type & state maps, team routing, snooze tag.",
-        "**SLA Manager** — rules that decide which native Intercom SLA each conversation gets.",
+        "**SLA Manager** — rules, target clocks (first-reply/next-reply/resolution), office hours; the bot runs the SLAs natively now.",
+        "**Assignment** — balanced (hybrid round-robin) assignment across the routing team, exclusions, stray sweep.",
         "**Automation** — inactivity sweeper + per-tag reminder texts.",
         "**Maintenance** — backfill, heal, re-sync, reset/wipe, panel-link revocation.",
         "**Intercom Admins / Actions** — who counts as admin for canvas/panel billing actions, and each action's access level.",
@@ -204,6 +214,7 @@ export class IntercomAdmin {
         buttonRow(
           btn("icadmin_hub:bridge", "Bridge", ButtonStyle.Primary),
           btn("icadmin_hub:sla", "SLA Manager", ButtonStyle.Primary),
+          btn("icadmin_hub:assign", "Assignment", ButtonStyle.Primary),
           btn("icadmin_hub:automation", "Automation", ButtonStyle.Primary),
           btn("icadmin_hub:maintenance", "Maintenance", ButtonStyle.Primary)
         ),
