@@ -69,6 +69,8 @@ export class SlaHub {
     { kind: "button", id: "icadmin_sla_toggle", match: "exact", handler: (i) => this.handleToggle(i, "slaEnabled") },
     { kind: "button", id: "icadmin_sla_native_toggle", match: "exact", handler: (i) => this.handleToggle(i, "slaNativeEnabled") },
     { kind: "button", id: "icadmin_sla_notekick_toggle", match: "exact", handler: (i) => this.handleNoteKickToggle(i) },
+    { kind: "button", id: "icadmin_sla_note_admin", match: "exact", handler: (i) => this.handleNoteAdminOpen(i) },
+    { kind: "select", id: "icadmin_sla_note_admin_pick", match: "exact", handler: (i) => this.handleNoteAdminPick(i) },
     { kind: "button", id: "icadmin_sla_verify", match: "exact", handler: (i) => this.handleVerify(i) },
     // pin + preview
     { kind: "button", id: "icadmin_sla_pin", match: "exact", handler: (i) => this.handlePinOpen(i) },
@@ -94,6 +96,7 @@ export class SlaHub {
         `**Default target:** ${status.defaultTarget ? `\`${status.defaultTarget}\`` : "_none — no-match clears the attribute_"}`,
         `**Targets registered:** ${s.slaTargets().length} · **Pinned tickets:** ${pinned}`,
         `**Attribute:** \`${status.attributeName}\``,
+        `**Note kick author:** ${s.slaNoteAdminId() ? `admin \`${s.slaNoteAdminId()}\` (SLA-only)` : s.intercomAdminId() ? `fallback admin \`${s.intercomAdminId()}\`` : "⚠️ _none — pick one (Note Author) or set a fallback admin in /config; Fin-authored notes do NOT fire the Workflow trigger_"}`,
         "",
         "Rules write the attribute above onto the conversation AND its converted ticket. Intercom side: a **Customer-tickets Workflow** (trigger: Teammate adds a note — ticket contexts have no channel gate) branches on the ticket attribute → native **Apply SLA**; native conversations get their own conversation-scoped Workflow. The bot posts a small internal note on every target change as the trigger kick. Every target value needs a matching branch — the API cannot list or apply SLAs, so run **Verify Setup** after changes.",
         "Triggers: ticket created/mirrored, status change, customer reply, Stripe/billing events, native conversation webhooks — plus a 30-min safety sweep.",
@@ -112,6 +115,7 @@ export class SlaHub {
           btn("icadmin_sla_toggle", `SLA: ${status.enabled ? "on" : "off"}`, status.enabled ? ButtonStyle.Success : ButtonStyle.Secondary),
           btn("icadmin_sla_native_toggle", `Native: ${status.nativeEnabled ? "on" : "off"}`, status.nativeEnabled ? ButtonStyle.Success : ButtonStyle.Secondary),
           btn("icadmin_sla_notekick_toggle", `Note kick: ${s.slaNoteKickEnabled() ? "on" : "off"}`, s.slaNoteKickEnabled() ? ButtonStyle.Success : ButtonStyle.Secondary),
+          btn("icadmin_sla_note_admin", "Note Author", ButtonStyle.Secondary),
           btn("icadmin_sla_verify", "Verify Setup", ButtonStyle.Secondary)
         ),
         buttonRow(
@@ -908,6 +912,71 @@ export class SlaHub {
     await this.ctx.settingsStore.updateSla({ slaNoteKickEnabled: next });
     this.ctx.auditConfig(interaction, `SLA note kick → ${next ? "on" : "off"}${next ? "" : " (⚠️ nothing fires the Workflow's teammate-note trigger while off)"}`);
     await this.renderHub(interaction);
+  }
+
+  // Picker for the SLA-only note author. Must be a HUMAN teammate: the
+  // "Teammate adds a note" trigger ignores Operator/Fin-authored notes
+  // (empirically verified), so the general Operator-first authoring
+  // preference is deliberately not offered here.
+  private async handleNoteAdminOpen(interaction: ButtonInteraction): Promise<void> {
+    await interaction.deferUpdate();
+    try {
+      const admins = await this.ctx.intercomClient.listAdmins();
+      const operator = this.ctx.settingsStore.intercomOperatorAdminId();
+      const current = this.ctx.settingsStore.slaNoteAdminId();
+      const fallback = this.ctx.settingsStore.intercomAdminId();
+      const options = [
+        {
+          label: "— use the general fallback admin —",
+          value: "__none__",
+          description: (fallback ? `currently admin ${fallback}` : "no fallback admin set — pick one in /config").slice(0, 100),
+          default: !current,
+        },
+        ...admins
+          // Exclude the Operator/Fin bot: its notes don't fire the trigger.
+          .filter((a) => a.id !== operator)
+          .slice(0, 24)
+          .map((a) => ({
+            label: (a.name || `Admin ${a.id}`).slice(0, 100),
+            value: a.id,
+            description: (a.email ?? `id ${a.id}`).slice(0, 100),
+            default: a.id === current,
+          })),
+      ];
+      await interaction.editReply({
+        embeds: [
+          makeEmbed(
+            [
+              "Pick the teammate the SLA kick notes are authored as (SLA notes ONLY — the bridge keeps authoring everything else as Operator/Fin).",
+              "",
+              "**Must be a human teammate**: the Workflow trigger *Teammate adds a note* ignores bot-authored notes, so a Fin-authored kick would never apply the SLA.",
+            ].join("\n"),
+            COLORS.neutral
+          ),
+        ],
+        components: [
+          selectRow(
+            new StringSelectMenuBuilder()
+              .setCustomId("icadmin_sla_note_admin_pick")
+              .setPlaceholder("SLA note author")
+              .addOptions(options)
+          ),
+          backRow("icadmin_hub:sla"),
+        ],
+      });
+    } catch (e) {
+      await interaction.followUp({
+        embeds: [makeEmbed(`Could not list Intercom admins: ${e instanceof Error ? e.message : e}`, COLORS.danger)],
+        flags: 64,
+      });
+    }
+  }
+
+  private async handleNoteAdminPick(interaction: StringSelectMenuInteraction): Promise<void> {
+    const value = interaction.values[0] === "__none__" ? null : interaction.values[0];
+    await this.ctx.settingsStore.updateSla({ slaNoteAdminId: value });
+    this.ctx.auditConfig(interaction, `SLA note author → ${value ? `admin ${value}` : "general fallback admin"}`);
+    await this.renderHub(interaction, false);
   }
 
   private async handleVerify(interaction: ButtonInteraction): Promise<void> {

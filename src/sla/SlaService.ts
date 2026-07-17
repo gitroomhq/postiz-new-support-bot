@@ -453,9 +453,10 @@ export class SlaService {
   ): Promise<void> {
     if (!this.settingsStore.slaNoteKickEnabled()) return;
     const content = target ? `🎯 SLA target: ${target}` : "🎯 SLA target cleared";
-    // Human admin ONLY — intercomAuthorAdminId() prefers the Operator/Fin
-    // bot, whose notes do NOT fire the "Teammate adds a note" trigger.
-    const adminId = this.settingsStore.intercomAdminId();
+    // Human admin ONLY — the dedicated SLA note author when set, else the
+    // general fallback admin. Never intercomAuthorAdminId(): that prefers the
+    // Operator/Fin bot, whose notes do NOT fire "Teammate adds a note".
+    const adminId = this.settingsStore.slaNoteAdminId() ?? this.settingsStore.intercomAdminId();
     if (!adminId) {
       slaLog.warn("sla.note_kick.no_human_admin", {
         "intercom.conversation_id": conversationId,

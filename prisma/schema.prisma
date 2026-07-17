@@ -303,6 +303,11 @@ model BotSettings {
   // Workflow kick: no attribute-change trigger exists, so the recipe is ONE
   // Workflow with trigger "Teammate adds a note" branching on the attribute.
   slaNoteKickEnabled Boolean @default(true)
+  // Author for SLA kick notes ONLY. Must be a HUMAN teammate — the trigger
+  // ignores Operator/Fin-authored notes. Null = fall back to the general
+  // fallback admin (intercomAdminId). The normal bridge authoring preference
+  // (Operator/Fin first) is untouched for everything else.
+  slaNoteAdminId String?
   // Managed SLA target registry: JSON array of { value, note }. Rule targets
   // and slaDefaultTarget must reference an entry; each value needs a matching
   // Workflow branch in Intercom (the API can't enumerate SLAs to validate).

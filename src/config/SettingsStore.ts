@@ -669,6 +669,13 @@ export class SettingsStore {
     return this.settings.slaNoteKickEnabled;
   }
 
+  // Author for SLA kick notes only. Must be a HUMAN teammate (the trigger
+  // ignores Fin-authored notes); null = fall back to the general fallback
+  // admin. Everything else keeps the normal Operator-first authoring.
+  slaNoteAdminId(): string | null {
+    return this.settings.slaNoteAdminId;
+  }
+
   // Managed target registry: every rule target and the default target must
   // reference an entry; each value needs a matching Workflow branch in
   // Intercom (which the API cannot enumerate to validate).
@@ -690,6 +697,7 @@ export class SettingsStore {
     slaDefaultTarget?: string | null;
     slaAttributeName?: string;
     slaNoteKickEnabled?: boolean;
+    slaNoteAdminId?: string | null;
   }): Promise<void> {
     this.settings = await this.prisma.botSettings.update({ where: { id: "global" }, data });
   }
