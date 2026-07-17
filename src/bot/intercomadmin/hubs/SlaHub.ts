@@ -72,6 +72,7 @@ export class SlaHub {
     { kind: "button", id: "icadmin_sla_note_admin", match: "exact", handler: (i) => this.handleNoteAdminOpen(i) },
     { kind: "select", id: "icadmin_sla_note_admin_pick", match: "exact", handler: (i) => this.handleNoteAdminPick(i) },
     { kind: "button", id: "icadmin_sla_verify", match: "exact", handler: (i) => this.handleVerify(i) },
+    { kind: "button", id: "icadmin_sla_clean_notes", match: "exact", handler: (i) => this.handleCleanNotes(i) },
     // pin + preview
     { kind: "button", id: "icadmin_sla_pin", match: "exact", handler: (i) => this.handlePinOpen(i) },
     { kind: "button", id: "icadmin_sla_unpin:", match: "prefix", handler: (i) => this.handleUnpin(i) },
@@ -121,6 +122,7 @@ export class SlaHub {
         buttonRow(
           btn("icadmin_sla_pin", "Pin Lookup", ButtonStyle.Secondary),
           btn("icadmin_sla_test", "Preview Match", ButtonStyle.Secondary),
+          btn("icadmin_sla_clean_notes", "Clean Old Notes", ButtonStyle.Secondary),
           btn("icadmin_root", "Back", ButtonStyle.Secondary)
         ),
       ],
@@ -987,6 +989,32 @@ export class SlaHub {
         makeEmbed(
           [`**Setup check for \`${result.attributeName}\`:**`, "", ...result.runbook].join("\n"),
           result.attributeExists ? COLORS.success : COLORS.warn
+        ),
+      ],
+    });
+  }
+
+  // One-shot: redact pre-fix (Fin-authored, unmarked) kick notes and re-kick
+  // with the current author/format — which also applies the SLAs those
+  // conversations never got. Intercom can't hard-delete parts, so the old
+  // notes become "message deleted" placeholders.
+  private async handleCleanNotes(interaction: ButtonInteraction): Promise<void> {
+    await interaction.deferReply({ flags: 64 });
+    const result = await this.ctx.slaService.cleanupOldKickNotes();
+    this.ctx.auditConfig(
+      interaction,
+      `SLA note cleanup: ${result.redacted} old note(s) redacted, ${result.rekicked} re-kicked across ${result.subjects} subject(s)${result.failures ? `, ${result.failures} failure(s)` : ""}`
+    );
+    await interaction.editReply({
+      embeds: [
+        makeEmbed(
+          [
+            `Checked **${result.subjects}** SLA subject(s):`,
+            `• **${result.redacted}** stale kick note(s) redacted (Intercom shows them as "message deleted" — parts can't be hard-deleted)`,
+            `• **${result.rekicked}** fresh kick(s) posted with the current author — their Workflows fire now, applying the missing SLAs`,
+            ...(result.failures ? [`• ⚠️ ${result.failures} subject(s) failed — safe to run again`] : []),
+          ].join("\n"),
+          result.failures ? COLORS.warn : COLORS.success
         ),
       ],
     });

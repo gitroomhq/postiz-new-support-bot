@@ -274,6 +274,63 @@ export class SlaService {
     return this.prisma.slaState.count({ where: { pinnedTarget: { not: null } } });
   }
 
+  // One-shot cleanup for the pre-fix era: kick notes were authored as the
+  // Operator/Fin bot (which the Workflow trigger ignores) and lack the
+  // automation marker. For every known SLA subject: redact those stale notes
+  // (Intercom has NO hard-delete for parts — they become "message deleted"
+  // placeholders) and, where a target is currently written, post a fresh
+  // human-authored kick — which also finally fires the Workflow and applies
+  // the SLA those conversations never got.
+  async cleanupOldKickNotes(): Promise<{ subjects: number; redacted: number; rekicked: number; failures: number }> {
+    const result = { subjects: 0, redacted: 0, rekicked: 0, failures: 0 };
+    const pause = () => new Promise((r) => setTimeout(r, 200));
+    const states = await this.prisma.slaState.findMany({ where: { conversationId: { not: null } } });
+    for (const state of states) {
+      const conversationId = state.conversationId!;
+      result.subjects++;
+      try {
+        const parts = await this.intercomClient.getConversationPartsSince(conversationId, 0);
+        const stale = parts.filter(
+          (p) =>
+            p.id != null &&
+            !p.redacted &&
+            (p.part_type === "note" || p.part_type === "comment") &&
+            typeof p.body === "string" &&
+            p.body.includes("SLA target") &&
+            !p.body.includes("automated by the support bot")
+        );
+        let redactedAny = false;
+        for (const part of stale) {
+          await this.intercomClient.redactConversationPart(conversationId, String(part.id));
+          result.redacted++;
+          redactedAny = true;
+          await pause();
+        }
+        // Fresh, correctly-authored kick — only when the subject actually has
+        // a written target (also fires the Workflow the old note couldn't).
+        if (redactedAny && state.lastWrittenTarget) {
+          const threadId = state.id.startsWith("t:") ? state.id.slice(2) : undefined;
+          await this.noteKick(state.kind === "bridged" ? "bridged" : "native", conversationId, threadId, state.lastWrittenTarget || null);
+          result.rekicked++;
+        }
+        await pause();
+      } catch (e) {
+        result.failures++;
+        slaLog.warn("sla.note_cleanup.failed", {
+          "intercom.conversation_id": conversationId,
+          "error.message": e instanceof Error ? e.message : String(e),
+        });
+      }
+    }
+    slaLog.info("sla.note_cleanup.completed", {
+      "sla.cleanup_subjects": result.subjects,
+      "sla.cleanup_redacted": result.redacted,
+      "sla.cleanup_rekicked": result.rekicked,
+      "sla.cleanup_failures": result.failures,
+    });
+    return result;
+  }
+
   // Setup verification for the /intercom Verify Setup button: the API can
   // LIST conversation attributes but cannot create them, and it cannot see
   // SLAs/Workflows at all — so this checks what it can and returns the manual
