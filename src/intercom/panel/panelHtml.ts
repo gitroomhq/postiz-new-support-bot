@@ -17,6 +17,8 @@
 // answers). All dynamic rendering uses textContent — never innerHTML with
 // data. The inline style/script blocks are CSP-nonced.
 
+import { panelThemeCss } from "../../util/panelTheme";
+
 export interface PanelShellCtx {
   adminName: string;
   isAdmin: boolean;
@@ -36,59 +38,39 @@ export function renderPanelShell(ctx: PanelShellCtx): string {
 <meta name="robots" content="noindex">
 <title>Stripe panel</title>
 <style nonce="${ctx.nonce}">
-  :root { color-scheme: light dark; }
-  * { box-sizing: border-box; }
-  body { margin: 0; font: 14px/1.45 -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-         background: #f6f8fa; color: #1f2328; }
-  header { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: baseline;
-           padding: 14px 20px; background: #fff; border-bottom: 1px solid #d0d7de; }
-  header h1 { font-size: 16px; margin: 0; }
-  header .who { color: #57606a; }
-  header .cus { margin-left: auto; font-family: ui-monospace, monospace; color: #57606a; }
-  nav { display: flex; gap: 4px; padding: 8px 20px 0; flex-wrap: wrap; }
-  nav button { border: 1px solid #d0d7de; border-bottom: none; background: #eaeef2; padding: 7px 14px;
-               border-radius: 6px 6px 0 0; cursor: pointer; font: inherit; }
-  nav button.active { background: #fff; font-weight: 600; }
-  main { padding: 16px 20px 60px; }
-  .note { color: #57606a; margin: 8px 0; }
-  .error { color: #cf222e; margin: 8px 0; white-space: pre-wrap; }
-  .ok { color: #1a7f37; margin: 8px 0; white-space: pre-wrap; }
-  table { border-collapse: collapse; width: 100%; background: #fff; border: 1px solid #d0d7de;
-          border-radius: 6px; overflow: hidden; }
-  th, td { text-align: left; padding: 8px 12px; border-top: 1px solid #d0d7de; vertical-align: top; }
-  thead th { border-top: none; background: #f6f8fa; font-weight: 600; }
-  td.actions { white-space: nowrap; }
-  .btn { display: inline-block; margin: 2px 4px 2px 0; padding: 4px 10px; font: inherit; font-size: 13px;
-         border: 1px solid #d0d7de; border-radius: 6px; background: #f6f8fa; cursor: pointer; }
-  .btn:hover { background: #eaeef2; }
-  .btn.danger { color: #cf222e; border-color: #cf222e33; }
-  .btn.queue { font-style: italic; }
-  .pager { margin: 10px 0; display: flex; gap: 8px; }
-  .sectionActions { margin: 0 0 12px; }
-  dialog { border: 1px solid #d0d7de; border-radius: 8px; padding: 18px; max-width: 460px; width: 90%; }
-  dialog h2 { margin: 0 0 6px; font-size: 15px; }
-  dialog .summary { color: #57606a; margin-bottom: 12px; white-space: pre-wrap; }
-  dialog label { display: block; margin: 8px 0 2px; font-weight: 600; font-size: 13px; }
-  dialog input[type=text], dialog input[type=number] { width: 100%; padding: 6px 8px; font: inherit;
-         border: 1px solid #d0d7de; border-radius: 6px; }
-  dialog .row { margin-top: 14px; display: flex; gap: 8px; justify-content: flex-end; }
-  .confirmWord { border-color: #cf222e !important; }
-  .expiredWrap { padding: 40px 20px; font: 15px sans-serif; }
-  @media (prefers-color-scheme: dark) {
-    body { background: #0d1117; color: #e6edf3; }
-    header, table { background: #161b22; border-color: #30363d; }
-    thead th { background: #21262d; }
-    th, td { border-color: #30363d; }
-    nav button { background: #21262d; border-color: #30363d; color: #e6edf3; }
-    nav button.active { background: #161b22; }
-    .btn { background: #21262d; border-color: #30363d; color: #e6edf3; }
-    dialog { background: #161b22; color: #e6edf3; border-color: #30363d; }
-    dialog input[type=text], dialog input[type=number] { background: #0d1117; color: #e6edf3; border-color: #30363d; }
-    header .who, header .cus, .note, dialog .summary { color: #8d96a0; }
-  }
+${panelThemeCss()}
+  header { display:flex; flex-wrap:wrap; gap:6px 16px; align-items:center; padding:16px 30px; background:var(--surface); border-bottom:1px solid var(--border); position:sticky; top:0; z-index:5; }
+  header h1 { font-size:15px; margin:0; font-weight:650; letter-spacing:-.01em; }
+  header .who { color:var(--muted); font-size:13px; }
+  header .cus { margin-left:auto; font-family:ui-monospace,monospace; color:var(--accent); font-size:12.5px; background:var(--accent-weak); padding:4px 11px; border-radius:999px; }
+  nav { display:flex; gap:4px; padding:14px 30px 0; flex-wrap:wrap; }
+  nav button { all:unset; padding:8px 14px; border-radius:8px 8px 0 0; cursor:pointer; color:var(--muted); font-weight:500; font-size:13px; }
+  nav button:hover { color:var(--text); background:var(--accent-weak); }
+  nav button.active { color:var(--accent); font-weight:650; box-shadow:inset 0 -2px 0 var(--accent); }
+  main { padding:20px 30px 80px; max-width:1000px; }
+  .sectionActions { margin:0 0 16px; display:flex; flex-wrap:wrap; gap:8px; }
+  table { background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); overflow:hidden; box-shadow:var(--shadow); }
+  thead th { background:var(--bg); }
+  td.actions { text-align:right; white-space:nowrap; }
+  td.actions .btn { margin:0 0 0 5px; padding:5px 10px; font-size:12px; }
+  .btn.queue { font-style:italic; }
+  .pager { margin:16px 0 0; display:flex; gap:8px; }
+  .confirmWord { border-color:var(--danger) !important; }
+  .expiredWrap { max-width:520px; margin:80px auto; text-align:center; padding:0 20px; }
+  .expiredWrap h1 { font-size:20px; }
+  dialog .row { margin-top:18px; display:flex; gap:8px; justify-content:flex-end; }
 </style>
 </head>
 <body>
+<div id="lock" class="overlay">
+  <div class="card">
+    <div class="spinner"></div>
+    <h2>Confirm in Intercom to unlock</h2>
+    <p class="muted">In the Intercom canvas, enter this code and press <strong>Unlock panel</strong>:</p>
+    <div id="lockcode" class="code">••••-••••</div>
+    <p class="muted">Waiting for confirmation…</p>
+  </div>
+</div>
 <header>
   <h1>Stripe panel</h1>
   <span class="who">acting as ${banner}</span>
@@ -301,16 +283,30 @@ export function renderPanelShell(ctx: PanelShellCtx): string {
       });
   }
 
-  // ---- boot ----
-  var tabs = document.getElementById("tabs");
-  SECTIONS.forEach(function (s) {
-    var b = el("button", null, s.title);
-    b.dataset.key = s.key;
-    b.type = "button";
-    b.onclick = function () { setFlash(null, null); load(s.key); };
-    tabs.appendChild(b);
-  });
-  load("overview");
+  // ---- boot (gated on the M10 passcode: confirm the code in the canvas) ----
+  var lockEl = document.getElementById("lock");
+  var lockCodeEl = document.getElementById("lockcode");
+  var booted = false;
+  function boot() {
+    if (booted) return; booted = true;
+    var tabs = document.getElementById("tabs");
+    SECTIONS.forEach(function (s) {
+      var b = el("button", null, s.title);
+      b.dataset.key = s.key;
+      b.type = "button";
+      b.onclick = function () { setFlash(null, null); load(s.key); };
+      tabs.appendChild(b);
+    });
+    load("overview");
+  }
+  function pollActivation() {
+    api("activation-status", {}).then(function (j) {
+      if (j.state === "active") { lockEl.hidden = true; boot(); return; }
+      if (j.state === "locked") { if (j.activationCode) lockCodeEl.textContent = j.activationCode; setTimeout(pollActivation, 3000); return; }
+      expired();
+    }).catch(function (e) { if (e && e.message === "expired") return; setTimeout(pollActivation, 5000); });
+  }
+  pollActivation();
 })();
 </script>
 </body>

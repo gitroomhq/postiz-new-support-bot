@@ -68,6 +68,7 @@ export function makeWorkflowHub(deps: { tiers: EscalationTierStore }): HubModule
         columns: ["Tag", "Flags"],
         rows: tagRows,
         reorderable: true,
+        reorder: { upKey: "tag_up", downKey: "tag_down" },
         addAction: {
           key: "tag_add",
           label: "Add tag",
@@ -96,6 +97,7 @@ export function makeWorkflowHub(deps: { tiers: EscalationTierStore }): HubModule
         columns: ["Tier", "Role"],
         rows: tierRows,
         reorderable: true,
+        reorder: { upKey: "tier_up", downKey: "tier_down" },
         addAction: {
           key: "tier_add",
           label: "Add tier",

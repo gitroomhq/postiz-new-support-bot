@@ -1,19 +1,15 @@
-// Self-contained HTML for the admin web panel (/config + /intercom). Like the
-// Stripe panel it ships as a template string (no build pipeline): inline CSS +
-// vanilla JS, zero external requests (the strict CSP forbids them — only
-// same-origin XHR to /admin/panel/api/* is allowed).
+import { panelThemeCss } from "../util/panelTheme";
+
+// Self-contained HTML for the admin web panel (/config + /intercom). Ships as a
+// template string (no build pipeline): inline CSS + vanilla JS, zero external
+// requests (strict CSP allows only same-origin XHR to /admin/panel/api/*).
 //
 // The page is dumb on purpose: the server (AdminPanel + hub modules) describes
-// every section, field and button; the client renders generically and posts
-// changes back. All dynamic text goes through textContent — never innerHTML with
-// data. Styling is driven by classes + the [hidden] attribute (never inline
-// style attributes / element.style), because the CSP nonces the <style> block
-// but does NOT cover inline style attributes.
-//
-// Auth: the page carries NO credential — GET /admin/panel exchanged the
-// single-use link token for an HttpOnly SameSite=Strict cookie. The fetch
-// wrapper adds X-Panel-Request (CSRF belt). The <style>/<script> tags ARE nonced
-// (unlike the original Stripe panel, whose missing nonce made it inert).
+// every section/field/button; the client renders generically and posts changes
+// back. Dynamic text goes through textContent — never innerHTML with data.
+// Styling is class/attribute driven (never inline style attributes), and the
+// <style>/<script> tags ARE nonced. Visual language comes from panelTheme.ts;
+// this file adds only the app shell (sidebar + topbar) layout.
 
 export interface AdminShellCtx {
   nonce: string;
@@ -28,80 +24,39 @@ export function renderAdminShell(ctx: AdminShellCtx): string {
 <meta name="robots" content="noindex">
 <title>Admin panel</title>
 <style nonce="${ctx.nonce}">
-  :root { color-scheme: light dark; }
-  * { box-sizing: border-box; }
-  body { margin: 0; font: 14px/1.45 -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-         background: #f6f8fa; color: #1f2328; }
-  header { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: baseline;
-           padding: 14px 20px; background: #fff; border-bottom: 1px solid #d0d7de; }
-  header h1 { font-size: 16px; margin: 0; }
-  header .who { color: #57606a; }
-  header .grp { margin-left: auto; font-family: ui-monospace, monospace; color: #57606a; text-transform: uppercase; letter-spacing: .05em; font-size: 12px; }
-  nav { display: flex; gap: 4px; padding: 8px 20px 0; flex-wrap: wrap; }
-  nav button { border: 1px solid #d0d7de; border-bottom: none; background: #eaeef2; padding: 7px 14px;
-               border-radius: 6px 6px 0 0; cursor: pointer; font: inherit; }
-  nav button.active { background: #fff; font-weight: 600; }
-  main { padding: 16px 20px 60px; max-width: 860px; }
-  .note { color: #57606a; margin: 8px 0; }
-  .error { color: #cf222e; margin: 8px 0; white-space: pre-wrap; }
-  .ok { color: #1a7f37; margin: 8px 0; white-space: pre-wrap; }
-  .section { background: #fff; border: 1px solid #d0d7de; border-radius: 8px; padding: 14px 16px; margin: 0 0 16px; }
-  .section h2 { font-size: 15px; margin: 0 0 2px; }
-  .section .desc { color: #57606a; margin: 0 0 10px; }
-  .field { padding: 10px 0; border-top: 1px solid #eaeef2; }
-  .field:first-of-type { border-top: none; }
-  .field label.flabel { display: block; font-weight: 600; margin-bottom: 4px; }
-  .field .help { color: #57606a; font-size: 13px; margin-top: 4px; }
-  .field .ferr { color: #cf222e; font-size: 13px; margin-top: 4px; }
-  input[type=text], input[type=number], input[type=password], select, textarea {
-    width: 100%; padding: 6px 8px; font: inherit; border: 1px solid #d0d7de; border-radius: 6px;
-    background: #fff; color: inherit; }
-  textarea { min-height: 70px; }
-  .row-inline { display: flex; align-items: center; gap: 10px; }
-  .row-inline .grow { flex: 1; }
-  .switch { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; }
-  .switch input { width: auto; }
-  .badge { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; border: 1px solid; }
-  .badge.info { color: #0969da; border-color: #0969da55; }
-  .badge.ok { color: #1a7f37; border-color: #1a7f3755; }
-  .badge.warn { color: #9a6700; border-color: #9a670055; }
-  .badge.error { color: #cf222e; border-color: #cf222e55; }
-  .btn { display: inline-block; margin: 2px 6px 2px 0; padding: 6px 12px; font: inherit; font-size: 13px;
-         border: 1px solid #d0d7de; border-radius: 6px; background: #f6f8fa; cursor: pointer; }
-  .btn:hover { background: #eaeef2; }
-  .btn.primary { background: #1f6feb; color: #fff; border-color: #1f6feb; }
-  .btn.danger { color: #cf222e; border-color: #cf222e55; }
-  table { border-collapse: collapse; width: 100%; }
-  th, td { text-align: left; padding: 8px 10px; border-top: 1px solid #eaeef2; vertical-align: top; }
-  thead th { border-top: none; font-weight: 600; }
-  dialog { border: 1px solid #d0d7de; border-radius: 8px; padding: 18px; max-width: 480px; width: 92%; color: inherit; background: #fff; }
-  dialog h2 { margin: 0 0 6px; font-size: 15px; }
-  dialog .summary { color: #57606a; margin-bottom: 12px; white-space: pre-wrap; }
-  dialog label { display: block; margin: 8px 0 2px; font-weight: 600; font-size: 13px; }
-  dialog .drow { margin-top: 14px; display: flex; gap: 8px; justify-content: flex-end; }
-  .overlay { position: fixed; inset: 0; background: #f6f8fa; display: flex; align-items: center; justify-content: center; padding: 20px; }
-  .overlay .card { background: #fff; border: 1px solid #d0d7de; border-radius: 12px; padding: 28px 32px; max-width: 460px; text-align: center; }
-  .overlay h2 { margin: 0 0 10px; font-size: 18px; }
-  .overlay .code { font-family: ui-monospace, monospace; font-size: 30px; letter-spacing: .12em; font-weight: 700; margin: 16px 0; padding: 12px; border: 1px dashed #d0d7de; border-radius: 8px; }
-  .muted { color: #57606a; }
-  [hidden] { display: none !important; }
-  @media (prefers-color-scheme: dark) {
-    body, .overlay { background: #0d1117; color: #e6edf3; }
-    header, .section, dialog, .overlay .card, input, select, textarea { background: #161b22; border-color: #30363d; color: #e6edf3; }
-    nav button { background: #21262d; border-color: #30363d; color: #e6edf3; }
-    nav button.active { background: #161b22; }
-    .field { border-color: #21262d; }
-    .btn { background: #21262d; border-color: #30363d; color: #e6edf3; }
-    .btn.primary { background: #1f6feb; border-color: #1f6feb; color: #fff; }
-    th, td { border-color: #21262d; }
-    header .who, header .grp, .note, .section .desc, .field .help, dialog .summary, .muted { color: #8d96a0; }
-    .overlay .code { border-color: #30363d; }
+${panelThemeCss()}
+  #app { display:grid; grid-template-columns:236px 1fr; min-height:100vh; }
+  .side { background:var(--surface); border-right:1px solid var(--border); display:flex; flex-direction:column;
+    padding:16px 12px; position:sticky; top:0; height:100vh; }
+  .brand { display:flex; align-items:center; gap:9px; font-weight:700; font-size:15px; padding:6px 8px 18px; letter-spacing:-.01em; }
+  .brand .dot { width:24px; height:24px; border-radius:7px; background:var(--accent); color:#fff;
+    display:inline-flex; align-items:center; justify-content:center; font-size:13px; }
+  #tabs { display:flex; flex-direction:column; gap:2px; overflow-y:auto; }
+  #tabs button { all:unset; display:block; padding:9px 12px; border-radius:8px; cursor:pointer;
+    color:var(--muted); font-weight:500; font-size:13.5px; transition:background .12s,color .12s; }
+  #tabs button:hover { background:var(--accent-weak); color:var(--text); }
+  #tabs button.active { background:var(--accent-weak); color:var(--accent); font-weight:650; box-shadow:inset 2px 0 0 var(--accent); }
+  .side-foot { margin-top:auto; padding:12px 8px 4px; }
+  .chip { display:inline-block; text-transform:uppercase; font-size:10.5px; letter-spacing:.08em; color:var(--muted);
+    border:1px solid var(--border); border-radius:999px; padding:3px 10px; }
+  .mainwrap { display:flex; flex-direction:column; min-width:0; }
+  .topbar { min-height:56px; display:flex; align-items:center; padding:0 30px; border-bottom:1px solid var(--border);
+    color:var(--muted); font-size:13px; position:sticky; top:0; background:var(--bg); z-index:5; }
+  main { padding:26px 30px 90px; width:100%; max-width:1000px; }
+  @media (max-width:760px) {
+    #app { grid-template-columns:1fr; }
+    .side { position:static; height:auto; flex-direction:row; align-items:center; overflow-x:auto; padding:10px 12px; }
+    .brand { padding:6px 8px; }
+    #tabs { flex-direction:row; }
+    .side-foot { display:none; }
+    main { padding:18px 16px 70px; }
   }
 </style>
 </head>
 <body>
 <div id="lock" class="overlay" hidden>
   <div class="card">
+    <div class="spinner"></div>
     <h2>Confirm in Discord to unlock</h2>
     <p class="muted">In Discord, press <strong>Activate session</strong> and enter this code:</p>
     <div id="lockcode" class="code">••••-••••</div>
@@ -115,16 +70,18 @@ export function renderAdminShell(ctx: AdminShellCtx): string {
   </div>
 </div>
 <div id="app" hidden>
-  <header>
-    <h1 id="brand">Admin panel</h1>
-    <span class="who" id="who"></span>
-    <span class="grp" id="grp"></span>
-  </header>
-  <nav id="tabs"></nav>
-  <main>
-    <div id="flash"></div>
-    <div id="content"><p class="note">Loading…</p></div>
-  </main>
+  <aside class="side">
+    <div class="brand"><span class="dot">⚙</span> Admin panel</div>
+    <nav id="tabs"></nav>
+    <div class="side-foot"><span class="chip" id="grp"></span></div>
+  </aside>
+  <div class="mainwrap">
+    <header class="topbar"><span id="who"></span></header>
+    <main>
+      <div id="flash" class="flash"></div>
+      <div id="content"><p class="note">Loading…</p></div>
+    </main>
+  </div>
 </div>
 <dialog id="modal">
   <h2 id="modalTitle"></h2>
@@ -159,6 +116,7 @@ export function renderAdminShell(ctx: AdminShellCtx): string {
   var contentEl = document.getElementById("content");
   var modal = document.getElementById("modal");
   var state = { group: null, hub: null, view: null, scope: null };
+  var dragSrc = null;
 
   function api(endpoint, body) {
     return fetch("/admin/panel/api/" + endpoint, {
@@ -175,7 +133,6 @@ export function renderAdminShell(ctx: AdminShellCtx): string {
   function showExpired() { app.hidden = true; lock.hidden = true; expired.hidden = false; }
 
   function handle(res) {
-    // Returns the json payload, or triggers expiry on a dead session.
     if (res.status === 401 || (res.j && res.j.state === "expired")) { showExpired(); return null; }
     return res.j;
   }
@@ -189,13 +146,12 @@ export function renderAdminShell(ctx: AdminShellCtx): string {
       if (j.state === "locked") {
         lock.hidden = false; app.hidden = true;
         if (j.activationCode) lockcode.textContent = j.activationCode;
-        whoEl.textContent = j.adminName || "";
         pollTimer = setTimeout(poll, 3000);
         return;
       }
       if (j.state === "active") {
         lock.hidden = true; app.hidden = false;
-        whoEl.textContent = "acting as " + (j.adminName || "");
+        whoEl.textContent = "Acting as " + (j.adminName || "");
         grpEl.textContent = j.group || "";
         state.group = j.group;
         loadHub(j.defaultHub);
@@ -206,9 +162,9 @@ export function renderAdminShell(ctx: AdminShellCtx): string {
   }
 
   // ---- flash ----
-  function clearFlash() { flashEl.textContent = ""; flashEl.className = ""; }
-  function flashOk(msg) { flashEl.textContent = msg; flashEl.className = "ok"; setTimeout(function () { if (flashEl.className === "ok") clearFlash(); }, 2500); }
-  function flashErr(msg) { flashEl.textContent = msg; flashEl.className = "error"; }
+  function clearFlash() { flashEl.textContent = ""; flashEl.className = "flash"; }
+  function flashOk(msg) { flashEl.textContent = msg; flashEl.className = "flash ok"; setTimeout(function () { if (flashEl.classList.contains("ok")) clearFlash(); }, 2600); }
+  function flashErr(msg) { flashEl.textContent = msg; flashEl.className = "flash error"; }
 
   // ---- hub load / render ----
   function loadHub(hub, tab, scope) {
@@ -253,7 +209,7 @@ export function renderAdminShell(ctx: AdminShellCtx): string {
       if (sec.description) box.appendChild(el("p", "desc", sec.description));
       if (sec.notice) box.appendChild(badge(sec.notice));
       (sec.fields || []).forEach(function (f) { box.appendChild(renderField(sec, f)); });
-      (sec.actions || []).forEach(function (a) { box.appendChild(actionBtn(v.hub, a)); });
+      (sec.actions || []).forEach(function (a) { var b = actionBtn(v.hub, a); b.classList.add("secfoot"); box.appendChild(b); });
       contentEl.appendChild(box);
     });
   }
@@ -278,6 +234,7 @@ export function renderAdminShell(ctx: AdminShellCtx): string {
       var inp = document.createElement(f.multiline ? "textarea" : "input");
       if (!f.multiline) inp.type = f.secret ? "password" : "text";
       inp.id = id; inp.value = f.value || ""; inp.disabled = !!f.disabled;
+      inp.autocomplete = "off";
       if (f.placeholder) inp.placeholder = f.placeholder;
       if (f.secret && f.secretState) inp.placeholder = secretPlaceholder(f.secretState);
       commitOnBlur(inp, function () { saveField(state.hub, sec.key, f.key, inp.value, wrap); });
@@ -288,6 +245,7 @@ export function renderAdminShell(ctx: AdminShellCtx): string {
       n.value = (f.value === null || f.value === undefined) ? "" : String(f.value);
       if (f.min !== undefined) n.min = String(f.min);
       if (f.max !== undefined) n.max = String(f.max);
+      if (f.step !== undefined) n.step = String(f.step);
       commitOnBlur(n, function () { saveField(state.hub, sec.key, f.key, n.value === "" ? null : Number(n.value), wrap); });
       wrap.appendChild(n);
     } else if (f.type === "select" || f.type === "channel-select" || f.type === "role-select") {
@@ -301,7 +259,7 @@ export function renderAdminShell(ctx: AdminShellCtx): string {
       if ((f.options || []).length === 0) wrap.appendChild(el("div", "help", "No options available (is the bot in the guild?)."));
     } else if (f.type === "multiselect") {
       wrap.appendChild(labelFor(id, f.label));
-      var box2 = el("div", null);
+      var box2 = el("div", "ms");
       (f.options || []).forEach(function (o) {
         var l = el("label", "switch");
         var c = document.createElement("input"); c.type = "checkbox"; c.checked = (f.values || []).indexOf(o.value) >= 0;
@@ -311,13 +269,14 @@ export function renderAdminShell(ctx: AdminShellCtx): string {
           else { vals = vals.filter(function (x) { return x !== o.value; }); }
           f.values = vals; saveField(state.hub, sec.key, f.key, vals, wrap);
         });
-        l.appendChild(c); l.appendChild(document.createTextNode(o.label)); box2.appendChild(l); box2.appendChild(document.createElement("br"));
+        l.appendChild(c); l.appendChild(document.createTextNode(o.label)); box2.appendChild(l);
       });
       wrap.appendChild(box2);
+      if ((f.options || []).length === 0) wrap.appendChild(el("div", "help", "No options available."));
     } else if (f.type === "list") {
       wrap.appendChild(el("div", "flabel", f.label));
       wrap.appendChild(renderList(sec, f));
-      if (f.addAction) wrap.appendChild(actionBtn(state.hub, f.addAction));
+      if (f.addAction) { var ab = actionBtn(state.hub, f.addAction); ab.classList.add("secfoot"); wrap.appendChild(ab); }
     } else if (f.type === "sla-condition-builder") {
       wrap.appendChild(labelFor(id, f.label));
       wrap.appendChild(el("p", "help", "Rule builder loads here (see SLA hub)."));
@@ -327,22 +286,46 @@ export function renderAdminShell(ctx: AdminShellCtx): string {
     return wrap;
   }
 
+  function clearDropMarks(tbody) {
+    Array.prototype.forEach.call(tbody.children, function (tr) { tr.classList.remove("drop-above", "drop-below"); });
+  }
+
+  function reorderRow(f, id, from, to) {
+    var steps = Math.abs(to - from);
+    var key = to < from ? f.reorder.upKey : f.reorder.downKey;
+    var chain = Promise.resolve();
+    for (var i = 0; i < steps; i++) {
+      chain = chain.then(function () { return api("action", { hub: state.hub, key: key, params: { id: id }, scope: state.scope }); });
+    }
+    chain.then(function () { flashOk("Reordered."); loadHub(state.hub); });
+  }
+
   function renderList(sec, f) {
     var table = document.createElement("table");
     var thead = document.createElement("thead"); var htr = document.createElement("tr");
+    if (f.reorder) htr.appendChild(document.createElement("th"));
     (f.columns || []).forEach(function (c) { var th = document.createElement("th"); th.textContent = c; htr.appendChild(th); });
-    htr.appendChild(document.createElement("th")); thead.appendChild(htr); table.appendChild(thead);
+    htr.appendChild(document.createElement("th"));
+    thead.appendChild(htr); table.appendChild(thead);
     var tbody = document.createElement("tbody");
-    (f.rows || []).forEach(function (row) {
+    (f.rows || []).forEach(function (row, idx) {
       var tr = document.createElement("tr");
+      if (f.reorder) {
+        tr.draggable = true;
+        tr.addEventListener("dragstart", function (e) { dragSrc = { f: f, id: row.id, idx: idx }; tr.classList.add("dragging"); if (e.dataTransfer) e.dataTransfer.effectAllowed = "move"; });
+        tr.addEventListener("dragend", function () { tr.classList.remove("dragging"); clearDropMarks(tbody); });
+        tr.addEventListener("dragover", function (e) { if (!dragSrc) return; e.preventDefault(); clearDropMarks(tbody); tr.classList.add(idx < dragSrc.idx ? "drop-above" : "drop-below"); });
+        tr.addEventListener("drop", function (e) { if (!dragSrc) return; e.preventDefault(); var from = dragSrc.idx, id = dragSrc.id, rf = dragSrc.f; dragSrc = null; clearDropMarks(tbody); if (idx !== from) reorderRow(rf, id, from, idx); });
+        var g = document.createElement("td"); g.className = "grip"; var h = el("span", "grip-h", "⠿"); h.title = "Drag to reorder"; g.appendChild(h); tr.appendChild(g);
+      }
       (row.cells || []).forEach(function (cell) {
         var td = document.createElement("td");
         if (cell && typeof cell === "object" && cell.kind) td.appendChild(badge(cell));
         else td.textContent = String(cell);
         tr.appendChild(td);
       });
-      var act = document.createElement("td");
-      (row.rowActions || []).forEach(function (a) { act.appendChild(actionBtn(state.hub, a)); });
+      var act = document.createElement("td"); act.className = "act";
+      (row.rowActions || []).forEach(function (a) { var b = actionBtn(state.hub, a); b.classList.add("sm"); act.appendChild(b); });
       tr.appendChild(act); tbody.appendChild(tr);
     });
     table.appendChild(tbody);
@@ -412,8 +395,9 @@ export function renderAdminShell(ctx: AdminShellCtx): string {
         inputsEl.appendChild(sel);
         return;
       }
-      var ctrl = document.createElement("input");
-      ctrl.type = inp.type === "number" ? "number" : (inp.secret ? "password" : "text"); ctrl.id = "mi_" + inp.key;
+      var ctrl = document.createElement(inp.multiline ? "textarea" : "input");
+      if (!inp.multiline) ctrl.type = inp.type === "number" ? "number" : (inp.secret ? "password" : "text");
+      ctrl.id = "mi_" + inp.key; ctrl.autocomplete = "off";
       if (inp.value != null && inp.value !== "" && !inp.secret) ctrl.value = String(inp.value);
       if (inp.placeholder) ctrl.placeholder = inp.placeholder;
       inputsEl.appendChild(ctrl);
@@ -452,11 +436,12 @@ export function renderAdminShell(ctx: AdminShellCtx): string {
   function el(tag, cls, text) { var e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }
   function labelFor(id, text) { var l = document.createElement("label"); l.className = "flabel"; l.htmlFor = id; l.textContent = text; return l; }
   function opt(value, label) { var o = document.createElement("option"); o.value = value; o.textContent = label; return o; }
-  function badge(b) { var s = el("span", "badge " + (b.kind || "info"), b.text); return s; }
+  function badge(b) { return el("span", "badge " + (b.kind || "info"), b.text); }
   function secretPlaceholder(stateStr) {
     if (stateStr === "local") return "configured — leave blank to keep";
     if (stateStr === "vault") return "configured (vault) — leave blank to keep";
     if (stateStr === "vault-unreachable") return "configured (vault unreachable)";
+    if (stateStr === "local-unreadable") return "configured (unreadable — re-enter)";
     return "not set";
   }
   function commitOnBlur(inp, fn) {

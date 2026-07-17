@@ -9,6 +9,7 @@ import { IntercomStore } from "./IntercomStore";
 import type { BillingActionService } from "../bot/billing/actions/BillingActionService";
 import type { ActionActor } from "../bot/billing/actions/ActionRegistry";
 import type { PanelTokens } from "./panel/PanelTokens";
+import type { PanelSessions } from "./panel/PanelSessions";
 
 // Canvas Kit inbox app: renders a live context card in the Intercom inbox
 // sidebar. Everything is fetched at render time (plan, charges, ticket state)
@@ -41,6 +42,7 @@ interface CanvasRequestBody {
   context?: { conversation_id?: string | number };
   component_id?: string;
   admin?: { id?: string | number; name?: string; email?: string };
+  input_values?: Record<string, unknown>;
 }
 
 export class IntercomInboxApp {
@@ -55,7 +57,8 @@ export class IntercomInboxApp {
     private stripe: StripeClient,
     private categoryLabelResolver: (id: string | null) => string | null,
     private billingActions: BillingActionService,
-    private panelTokens: PanelTokens
+    private panelTokens: PanelTokens,
+    private panelSessions: PanelSessions
   ) {}
 
   bindClient(client: Client): void {
@@ -83,6 +86,18 @@ export class IntercomInboxApp {
     try {
       if (componentId === "open_panel") {
         return await this.handleOpenPanel(body, String(conversationId), actor);
+      }
+      if (componentId === "unlock_panel") {
+        const rawv = request.input_values && typeof request.input_values["panel_code"] === "string" ? String(request.input_values["panel_code"]) : "";
+        const norm = rawv.toUpperCase().replace(/[^0-9A-Z]/g, "");
+        const code = norm.length === 8 ? `${norm.slice(0, 4)}-${norm.slice(4)}` : rawv.toUpperCase();
+        const ok = rawv ? this.panelSessions.activate(actor.id, code, this.settingsStore.panelTokenEpoch()) : false;
+        return this.buildCanvas(
+          body,
+          ok
+            ? "✅ Panel unlocked — return to your browser."
+            : "⚠️ That code didn't match. Open the panel link and enter the exact code shown."
+        );
       }
       if (componentId === "review_approve" || componentId === "review_deny") {
         const decision = componentId === "review_approve" ? "approve" : "deny";
@@ -235,6 +250,9 @@ export class IntercomInboxApp {
         style: "primary",
         action: { type: "url", url: panelLink.url },
       });
+      // M10: the panel opens LOCKED and shows a code — confirm it here to unlock.
+      components.push({ type: "input", id: "panel_code", label: "Panel code (shown on the page)", placeholder: "XXXX-XXXX" });
+      components.push({ type: "button", id: "unlock_panel", label: "Unlock panel", style: "secondary", action: { type: "submit" } });
     } else {
       components.push({
         type: "button",

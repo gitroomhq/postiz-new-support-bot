@@ -44,6 +44,7 @@ import { RefundCoreService } from "./bot/billing/RefundCoreService";
 import { ApprovalStore } from "./bot/billing/ApprovalStore";
 import { BillingActionService } from "./bot/billing/actions/BillingActionService";
 import { PanelTokens } from "./intercom/panel/PanelTokens";
+import { PanelSessions } from "./intercom/panel/PanelSessions";
 import { IntercomPanel } from "./intercom/panel/IntercomPanel";
 import { SlaRuleStore } from "./sla/SlaRuleStore";
 import { SlaFactsLoader } from "./sla/facts";
@@ -234,6 +235,8 @@ async function main() {
     auditLogger
   );
   const panelTokens = new PanelTokens(settingsStore);
+  // Shared between the Stripe panel (web) and the Intercom canvas (M10 passcode).
+  const panelSessions = new PanelSessions();
   const intercomPanel = new IntercomPanel(
     settingsStore,
     intercomStore,
@@ -242,7 +245,8 @@ async function main() {
     stripeClient,
     disputeStore,
     billingActionService,
-    panelTokens
+    panelTokens,
+    panelSessions
   );
   const billingAdmin = new BillingAdmin(config, stripeClient, sessionStore, settingsStore, auditLogger, {
     disputeStore,
@@ -361,7 +365,8 @@ async function main() {
     stripeClient,
     categoryLabelResolver,
     billingActionService,
-    panelTokens
+    panelTokens,
+    panelSessions
   );
 
   const bot = new DiscordBot(

@@ -99,11 +99,13 @@ test("jti is single-use", () => {
 
 test("sessions: create/get, epoch revocation, unknown ids", () => {
   const sessions = new PanelSessions();
-  const id = sessions.create({ aid: "42", an: "Ada", cid: "777", epoch: 0 });
+  const { sessionId: id, activationCode } = sessions.create({ aid: "42", an: "Ada", cid: "777", epoch: 0 });
+  assert.match(activationCode, /^[0-9A-Z]{4}-[0-9A-Z]{4}$/);
   const got = sessions.get(id, 0);
   assert.ok(got);
   assert.equal(got!.aid, "42");
   assert.equal(got!.cid, "777");
+  assert.equal(got!.state, "locked"); // M10: sessions start locked until canvas confirm
   // wrong/unknown id
   assert.equal(sessions.get("nope", 0), null);
   // epoch bump kills it
@@ -116,9 +118,21 @@ test("session ids are unpredictable and unique", () => {
   const sessions = new PanelSessions();
   const seen = new Set<string>();
   for (let i = 0; i < 50; i++) {
-    const id = sessions.create({ aid: "1", an: "x", cid: "1", epoch: 0 });
+    const { sessionId: id } = sessions.create({ aid: "1", an: "x", cid: "1", epoch: 0 });
     assert.ok(id.length >= 40);
     assert.ok(!seen.has(id));
     seen.add(id);
   }
+});
+
+test("M10: session starts locked; canvas activate flips it to active; wrong code fails", () => {
+  const sessions = new PanelSessions();
+  const { sessionId, activationCode } = sessions.create({ aid: "9", an: "T", cid: "c", epoch: 0 });
+  assert.equal(sessions.get(sessionId, 0)!.state, "locked");
+  assert.equal(sessions.activate("9", "WRONG-000", 0), false);
+  assert.equal(sessions.activate("9", activationCode, 0), true);
+  assert.equal(sessions.get(sessionId, 0)!.state, "active");
+  // wrong teammate never matches
+  const b = sessions.create({ aid: "10", an: "U", cid: "d", epoch: 0 });
+  assert.equal(sessions.activate("999", b.activationCode, 0), false);
 });

@@ -56,7 +56,6 @@ const CURSOR_RE = /^[A-Za-z0-9_:.-]{0,120}$/;
 
 export class IntercomPanel {
   private rate = new Map<string, number[]>();
-  private panelSessions = new PanelSessions();
 
   constructor(
     private settingsStore: SettingsStore,
@@ -66,7 +65,8 @@ export class IntercomPanel {
     private stripe: StripeClient,
     private disputeStore: DisputeStore,
     private billingActions: BillingActionService,
-    private tokens: PanelTokens
+    private tokens: PanelTokens,
+    private panelSessions: PanelSessions
   ) {}
 
   // GET /intercom/panel?t=… — exchanges the SINGLE-USE link token for an
@@ -84,7 +84,7 @@ export class IntercomPanel {
         message: "This panel link was already used — reopen it from the Intercom conversation (Open Stripe Panel).",
       };
     }
-    const sessionId = this.panelSessions.create({ aid: payload.aid, an: payload.an, cid: payload.cid, epoch: payload.epo });
+    const { sessionId } = this.panelSessions.create({ aid: payload.aid, an: payload.an, cid: payload.cid, epoch: payload.epo });
     const scope = await this.resolveScope(payload.cid);
     const actor = this.actorFor(payload);
     const nonce = randomBytes(16).toString("base64");
@@ -112,6 +112,21 @@ export class IntercomPanel {
     if (!this.allow(`api:${session.aid}`)) return { status: 429, json: { error: "rate limited" } };
     const request = (body ?? {}) as Record<string, unknown>;
     if (typeof request !== "object" || Array.isArray(request)) return { status: 400, json: { error: "bad request" } };
+
+    // M10 passcode gate: while LOCKED only the poll works; the teammate confirms
+    // the code shown here back in the Intercom canvas ("Unlock panel") to activate.
+    if (endpoint === "activation-status") {
+      return {
+        status: 200,
+        json: {
+          state: session.state,
+          adminName: session.an,
+          ...(session.state === "locked" ? { activationCode: session.activationCode } : {}),
+        },
+      };
+    }
+    if (session.state !== "active") return { status: 403, json: { error: "locked" } };
+
     const actor = this.actorFor(session);
 
     try {

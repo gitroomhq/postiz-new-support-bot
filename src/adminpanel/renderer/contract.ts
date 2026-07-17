@@ -101,6 +101,9 @@ export interface ListField {
   help?: string;
   addAction?: ActionButton;
   reorderable?: boolean;
+  // Enables drag-and-drop reordering: the client calls upKey/downKey (each a
+  // single-step move action `{id}`) the right number of times on drop.
+  reorder?: { upKey: string; downKey: string };
   nextCursor?: string | null;
   prevCursor?: string | null;
 }

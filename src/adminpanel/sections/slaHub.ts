@@ -87,6 +87,7 @@ export function makeSlaHub(deps: { ruleStore: SlaRuleStore }): HubModule {
             label: "SLA rules",
             columns: ["Name", "Target", "Enabled", "Expression"],
             reorderable: true,
+            reorder: { upKey: "rule_up", downKey: "rule_down" },
             rows: rs.list().map((r) => {
               const expr = r.expression || rs.renderExpression((r.conditions as never) ?? []);
               const ruleInputs: ActionButton["inputs"] = [
