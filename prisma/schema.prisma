@@ -801,6 +801,7 @@ model SlaState {
   lastRuleId        String?
   lastEvaluatedAt   DateTime?
   lastWriteError    String? // last permanent write failure — surfaced in the SLA hub
+  lastKickPartId    String? // part id of the last kick note — redacted when a newer target replaces it
   pinnedTarget      String? // non-null = rules skipped for this subject
   pinnedById        String?
   pinnedByName      String?

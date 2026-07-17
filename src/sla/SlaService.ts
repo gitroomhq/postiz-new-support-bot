@@ -34,9 +34,10 @@ export interface SlaApplyResult {
 export type SlaTriggerReason = "created" | "status" | "customer_reply" | "refund_review" | "stripe" | "manual";
 
 const ALL_DIMS: SlaDim[] = [
-  "category", "status", "tier", "open", "exempt", "mirrored",
+  "category", "status", "open", "exempt", "mirrored",
   "stripe.linked", "stripe.paying", "stripe.dispute", "stripe.refund_review", "stripe.plan", "stripe.spend",
-  "intercom.team", "intercom.kind", "intercom.ticket_type", "intercom.tag", "keyword",
+  "intercom.team", "intercom.kind", "intercom.ticket_type", "intercom.tag", "intercom.assignee",
+  "intercom.attribute", "keyword",
 ];
 const MAX_TICKETS_PER_STRIPE_TRIGGER = 25;
 
@@ -310,7 +311,14 @@ export class SlaService {
         // a written target (also fires the Workflow the old note couldn't).
         if (redactedAny && state.lastWrittenTarget) {
           const threadId = state.id.startsWith("t:") ? state.id.slice(2) : undefined;
-          await this.noteKick(state.kind === "bridged" ? "bridged" : "native", conversationId, threadId, state.lastWrittenTarget || null);
+          await this.noteKick(
+            state.id,
+            state.kind === "bridged" ? "bridged" : "native",
+            conversationId,
+            threadId,
+            state.lastWrittenTarget || null,
+            state.lastKickPartId
+          );
           result.rekicked++;
         }
         await pause();
@@ -481,7 +489,7 @@ export class SlaService {
     }
 
     await this.upsertState(stateId, kind, conversationId, target, ruleId, effectiveWritten, null);
-    await this.noteKick(kind, conversationId, input.threadId, target);
+    await this.noteKick(stateId, kind, conversationId, input.threadId, target, state?.lastKickPartId ?? null);
     slaLog.info("sla.target.written", {
       "intercom.conversation_id": conversationId,
       "sla.kind": kind,
@@ -503,10 +511,12 @@ export class SlaService {
   // a human admin), so the kick is authored as the configured HUMAN fallback
   // admin, never the Operator. Best-effort — never fails the write.
   private async noteKick(
+    stateId: string,
     kind: "bridged" | "native",
     conversationId: string,
     threadId: string | undefined,
-    target: string | null
+    target: string | null,
+    previousPartId: string | null
   ): Promise<void> {
     if (!this.settingsStore.slaNoteKickEnabled()) return;
     // Authored as a human teammate (trigger requirement) — the marker keeps
@@ -524,6 +534,13 @@ export class SlaService {
       return;
     }
     try {
+      // Supersede the previous kick: redact it so the conversation only ever
+      // shows the CURRENT target (Intercom has no hard-delete for parts — it
+      // becomes a "message deleted" placeholder). Best-effort: a failed
+      // redaction never blocks the new kick.
+      if (previousPartId) {
+        await this.intercomClient.redactConversationPart(conversationId, previousPartId).catch(() => undefined);
+      }
       const { partId } = await this.intercomClient.replyAsAdmin(conversationId, { adminId, body: content, note: true });
       if (kind === "bridged" && threadId && partId) {
         // Echo-register so the noted-webhook doesn't relay the kick into the
@@ -533,6 +550,7 @@ export class SlaService {
         // noted-webhook drops them without this.)
         await this.intercomStore.recordEchoPart("c", partId, threadId).catch(() => undefined);
       }
+      await this.prisma.slaState.updateMany({ where: { id: stateId }, data: { lastKickPartId: partId ?? null } });
     } catch (e) {
       slaLog.warn("sla.note_kick.failed", {
         "intercom.conversation_id": conversationId,

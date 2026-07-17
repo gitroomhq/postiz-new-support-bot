@@ -25,7 +25,6 @@ const zCondition = z.discriminatedUnion("dim", [
   // Ticket basics (bridged tickets only).
   z.object({ dim: z.literal("category"), op: eqNeq, value: z.string().min(1) }),
   z.object({ dim: z.literal("status"), op: eqNeq, tagId: z.string().min(1) }),
-  z.object({ dim: z.literal("tier"), op: eqNeq, tierId: z.string().min(1) }),
   z.object({ dim: z.literal("open"), op: z.literal("eq"), value: z.boolean() }),
   z.object({ dim: z.literal("exempt"), op: z.literal("eq"), value: z.boolean() }),
   z.object({ dim: z.literal("mirrored"), op: z.literal("eq"), value: z.boolean() }),
@@ -41,6 +40,15 @@ const zCondition = z.discriminatedUnion("dim", [
   z.object({ dim: z.literal("intercom.kind"), op: z.literal("eq"), value: z.enum(["conversation", "ticket"]) }),
   z.object({ dim: z.literal("intercom.ticket_type"), op: eqNeq, value: z.string().min(1) }),
   z.object({ dim: z.literal("intercom.tag"), op: z.enum(["has", "not_has"]), value: z.string().min(1) }),
+  // Conversation custom attribute (any definition, incl. Fin attributes).
+  // "set"/"not_set" ignore `value`; the others require it.
+  z.object({
+    dim: z.literal("intercom.attribute"),
+    name: z.string().min(1),
+    op: z.enum(["eq", "neq", "matches", "set", "not_set"]),
+    value: z.string().optional(),
+  }),
+  z.object({ dim: z.literal("intercom.assignee"), op: eqNeq, value: z.string().min(1) }),
   // Content (ticket question / conversation source body).
   z.object({ dim: z.literal("keyword"), op: z.enum(["matches", "not_matches"]), value: z.string().min(1) }),
 ]);
@@ -50,9 +58,19 @@ export type SlaDim = SlaCondition["dim"];
 
 // Validates one condition, including regex compilability for regex-valued ops.
 export const slaConditionSchema = zCondition.superRefine((cond, ctx) => {
-  const usesRegex = cond.dim === "keyword" || (cond.dim === "stripe.plan" && cond.op === "matches");
+  if (cond.dim === "intercom.attribute") {
+    const needsValue = cond.op === "eq" || cond.op === "neq" || cond.op === "matches";
+    if (needsValue && !cond.value) {
+      ctx.addIssue({ code: "custom", message: `attribute condition with op "${cond.op}" needs a value` });
+      return;
+    }
+  }
+  const usesRegex =
+    cond.dim === "keyword" ||
+    (cond.dim === "stripe.plan" && cond.op === "matches") ||
+    (cond.dim === "intercom.attribute" && cond.op === "matches");
   if (!usesRegex) return;
-  const pattern = (cond as { value: string }).value;
+  const pattern = (cond as { value?: string }).value ?? "";
   if (pattern.length > MAX_REGEX_PATTERN_LENGTH) {
     ctx.addIssue({ code: "custom", message: `pattern longer than ${MAX_REGEX_PATTERN_LENGTH} characters` });
     return;
@@ -84,16 +102,17 @@ export interface SlaStripeFacts {
 export interface SlaIntercomFacts {
   teamId?: string | null;
   teamName?: string | null;
+  adminAssigneeId?: string | null;
   kind?: "conversation" | "ticket";
   ticketTypeId?: string | null;
   tags?: string[];
+  attributes?: Record<string, unknown>;
 }
 
 export interface SlaFacts {
   kind: "bridged" | "native";
   categoryId?: string;
   statusTagId?: string;
-  tierId?: string;
   open?: boolean;
   exempt?: boolean;
   mirrored?: boolean;
@@ -144,7 +163,6 @@ export interface SlaEvaluation {
 export interface ParseContext {
   categories: Array<{ id: string; label?: string }>;
   tags: Array<{ id: string; label: string; emoji: string }>;
-  tiers: Array<{ id: string; name: string }>;
 }
 
 export interface ExpressionError {

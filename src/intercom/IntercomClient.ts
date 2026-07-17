@@ -894,6 +894,7 @@ export class IntercomClient {
     state: string;
     open: boolean;
     teamAssigneeId: string | null;
+    adminAssigneeId: string | null;
     tags: string[];
     sourceBody: string | null;
     customAttributes: Record<string, unknown>;
@@ -905,6 +906,7 @@ export class IntercomClient {
         state?: string;
         open?: boolean;
         team_assignee_id?: number | string | null;
+        admin_assignee_id?: number | string | null;
         tags?: { tags?: Array<{ id?: string | number; name?: string }> };
         source?: { body?: string | null } | null;
         custom_attributes?: Record<string, unknown> | null;
@@ -915,6 +917,7 @@ export class IntercomClient {
         state: data.state ?? "open",
         open: data.open !== false && data.state !== "closed",
         teamAssigneeId: data.team_assignee_id != null ? String(data.team_assignee_id) : null,
+        adminAssigneeId: data.admin_assignee_id != null ? String(data.admin_assignee_id) : null,
         tags: (data.tags?.tags ?? []).map((t) => t.name ?? "").filter(Boolean),
         sourceBody: data.source?.body ?? null,
         customAttributes: data.custom_attributes ?? {},

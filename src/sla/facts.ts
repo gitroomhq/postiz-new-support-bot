@@ -64,7 +64,13 @@ function stripHtml(html: string): string {
 }
 
 const STRIPE_API_DIMS: SlaDim[] = ["stripe.paying", "stripe.plan", "stripe.spend"];
-const INTERCOM_API_DIMS: SlaDim[] = ["intercom.team", "intercom.tag", "intercom.ticket_type"];
+const INTERCOM_API_DIMS: SlaDim[] = [
+  "intercom.team",
+  "intercom.tag",
+  "intercom.ticket_type",
+  "intercom.assignee",
+  "intercom.attribute",
+];
 
 export class SlaFactsLoader {
   private stripeCache = new Map<string, StripeApiCacheEntry>();
@@ -98,7 +104,6 @@ export class SlaFactsLoader {
       kind: "bridged",
       categoryId: ticket.categoryId ?? undefined,
       statusTagId: ticket.statusTagId ?? undefined,
-      tierId: ticket.escalationTierId ?? undefined,
       open: !ticket.closed,
       exempt: ticket.intercomExempt,
       mirrored: !!link,
@@ -125,7 +130,9 @@ export class SlaFactsLoader {
             intercom.teamName = conv.teamAssigneeId
               ? await this.intercomClient.getTeamNameCached(conv.teamAssigneeId).catch(() => null)
               : null;
+            intercom.adminAssigneeId = conv.adminAssigneeId;
             intercom.tags = conv.tags;
+            intercom.attributes = conv.customAttributes;
           }
         } catch (e) {
           factsLog.warn("sla.facts.intercom_fetch_failed", {
@@ -161,9 +168,11 @@ export class SlaFactsLoader {
       intercom: {
         teamId: conv.teamAssigneeId,
         teamName,
+        adminAssigneeId: conv.adminAssigneeId,
         kind: conv.ticketId ? "ticket" : "conversation",
         ticketTypeId: null,
         tags: conv.tags,
+        attributes: conv.customAttributes,
       },
       text: conv.sourceBody ? stripHtml(conv.sourceBody) : undefined,
     };

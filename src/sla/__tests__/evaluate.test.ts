@@ -20,7 +20,6 @@ const bridgedFacts: SlaFacts = {
   kind: "bridged",
   categoryId: "billing",
   statusTagId: "tag_open",
-  tierId: "tier_1",
   open: true,
   exempt: false,
   mirrored: true,
@@ -32,13 +31,21 @@ const bridgedFacts: SlaFacts = {
     openDispute: false,
     refundReview: true,
   },
-  intercom: { teamId: "77", teamName: "Billing", kind: "ticket", ticketTypeId: "9", tags: ["vip"] },
+  intercom: {
+    teamId: "77",
+    teamName: "Billing",
+    adminAssigneeId: "555",
+    kind: "ticket",
+    ticketTypeId: "9",
+    tags: ["vip"],
+    attributes: { Sentiment: "positive", "AI Title": "Refund request", Empty: "" },
+  },
   text: "I want a refund for my subscription",
 };
 
 const nativeFacts: SlaFacts = {
   kind: "native",
-  intercom: { teamId: "88", teamName: "Support", kind: "conversation", ticketTypeId: null, tags: [] },
+  intercom: { teamId: "88", teamName: "Support", kind: "conversation", ticketTypeId: null, tags: [], attributes: {} },
   text: "hello, question about pricing",
 };
 
@@ -82,7 +89,6 @@ test("missing data = false, including negated ops", () => {
     { dim: "category", op: "eq", value: "billing" },
     { dim: "category", op: "neq", value: "billing" }, // still false: no category at all
     { dim: "status", op: "neq", tagId: "x" },
-    { dim: "tier", op: "eq", tierId: "x" },
     { dim: "open", op: "eq", value: true },
     { dim: "exempt", op: "eq", value: false },
     { dim: "mirrored", op: "eq", value: false },
@@ -159,6 +165,33 @@ test("native conversation matches reduced filter set", () => {
   );
   const res = evaluateRules([r], nativeFacts);
   assert.equal(res.winner?.target, "native-target");
+});
+
+test("attribute conditions: eq/neq/matches/set/not_set", () => {
+  const eq = rule([{ dim: "intercom.attribute", name: "Sentiment", op: "eq", value: "POSITIVE" }], { position: 1 });
+  assert.ok(evaluateRules([eq], bridgedFacts).winner, "eq is case-insensitive");
+  const neq = rule([{ dim: "intercom.attribute", name: "Sentiment", op: "neq", value: "negative" }], { position: 1 });
+  assert.ok(evaluateRules([neq], bridgedFacts).winner);
+  const rx = rule([{ dim: "intercom.attribute", name: "AI Title", op: "matches", value: "refund" }], { position: 1 });
+  assert.ok(evaluateRules([rx], bridgedFacts).winner);
+  const set = rule([{ dim: "intercom.attribute", name: "Sentiment", op: "set" }], { position: 1 });
+  assert.ok(evaluateRules([set], bridgedFacts).winner);
+  // empty string counts as not set
+  const emptyNotSet = rule([{ dim: "intercom.attribute", name: "Empty", op: "not_set" }], { position: 1 });
+  assert.ok(evaluateRules([emptyNotSet], bridgedFacts).winner);
+  const missingNotSet = rule([{ dim: "intercom.attribute", name: "Nope", op: "not_set" }], { position: 1 });
+  assert.ok(evaluateRules([missingNotSet], bridgedFacts).winner, "absent attribute is not set (attrs fetched = data)");
+  // no attribute data at all → false even for not_set
+  const noAttrs = { ...bridgedFacts, intercom: { ...bridgedFacts.intercom, attributes: undefined } };
+  assert.equal(evaluateRules([rule([{ dim: "intercom.attribute", name: "X", op: "not_set" }], { position: 1 })], noAttrs).winner, null);
+});
+
+test("assignee matches by admin id", () => {
+  assert.ok(evaluateRules([rule([{ dim: "intercom.assignee", op: "eq", value: "555" }], { position: 1 })], bridgedFacts).winner);
+  assert.equal(evaluateRules([rule([{ dim: "intercom.assignee", op: "eq", value: "1" }], { position: 1 })], bridgedFacts).winner, null);
+  assert.ok(evaluateRules([rule([{ dim: "intercom.assignee", op: "neq", value: "1" }], { position: 1 })], bridgedFacts).winner);
+  // unassigned → false either way
+  assert.equal(evaluateRules([rule([{ dim: "intercom.assignee", op: "neq", value: "1" }], { position: 1 })], nativeFacts).winner, null);
 });
 
 test("trace records reasons for the preview UI", () => {

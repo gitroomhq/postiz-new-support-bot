@@ -19,10 +19,11 @@ export interface DescriptorOption {
 export interface DescriptorDeps {
   categories: () => DescriptorOption[];
   statusTags: () => DescriptorOption[];
-  tiers: () => DescriptorOption[];
   intercomTeams: () => Promise<DescriptorOption[]>;
   intercomTicketTypes: () => Promise<DescriptorOption[]>;
   intercomTags: () => Promise<DescriptorOption[]>;
+  intercomAdmins: () => Promise<DescriptorOption[]>;
+  intercomAttributes: () => Promise<DescriptorOption[]>;
 }
 
 export interface FieldDescriptor {
@@ -55,13 +56,6 @@ export const FIELD_DESCRIPTORS: FieldDescriptor[] = [
     kind: "enum",
     ops: EQ_NEQ,
     options: async (d) => d.statusTags(),
-  },
-  {
-    key: "tier",
-    label: "Escalation tier",
-    kind: "enum",
-    ops: EQ_NEQ,
-    options: async (d) => d.tiers(),
   },
   { key: "open", label: "Ticket open", kind: "boolean", ops: [{ op: "eq", label: "is" }] },
   { key: "exempt", label: "Intercom-exempt (Discord-only)", kind: "boolean", ops: [{ op: "eq", label: "is" }] },
@@ -124,6 +118,30 @@ export const FIELD_DESCRIPTORS: FieldDescriptor[] = [
     options: (d) => d.intercomTags(),
   },
   {
+    key: "intercom.assignee",
+    label: "Assigned teammate",
+    kind: "enum",
+    ops: EQ_NEQ,
+    options: (d) => d.intercomAdmins(),
+  },
+  {
+    // Two-step in the builder: pick the attribute definition (enum), then the
+    // op, then a value modal (skipped for set/not-set). Expression form:
+    // attr:"Name"=value / attr:"Name"~"regex" / attr:"Name"=* (set) / !=* (not set).
+    key: "intercom.attribute",
+    label: "Conversation attribute",
+    kind: "enum",
+    ops: [
+      { op: "eq", label: "is" },
+      { op: "neq", label: "is not" },
+      { op: "matches", label: "matches regex" },
+      { op: "set", label: "is set" },
+      { op: "not_set", label: "is not set" },
+    ],
+    hint: "any conversation data attribute, incl. Fin attributes",
+    options: (d) => d.intercomAttributes(),
+  },
+  {
     key: "keyword",
     label: "Keyword in question/body",
     kind: "text",
@@ -147,8 +165,6 @@ export function conditionFor(key: string, op: string, value: string): SlaConditi
       return { dim: "category", op: op as "eq" | "neq", value };
     case "status":
       return { dim: "status", op: op as "eq" | "neq", tagId: value };
-    case "tier":
-      return { dim: "tier", op: op as "eq" | "neq", tierId: value };
     case "open":
     case "exempt":
     case "mirrored":
@@ -172,6 +188,8 @@ export function conditionFor(key: string, op: string, value: string): SlaConditi
       return { dim: "intercom.ticket_type", op: op as "eq" | "neq", value };
     case "intercom.tag":
       return { dim: "intercom.tag", op: op as "has" | "not_has", value };
+    case "intercom.assignee":
+      return { dim: "intercom.assignee", op: op as "eq" | "neq", value };
     case "keyword":
       return { dim: "keyword", op: op as "matches" | "not_matches", value };
     default:

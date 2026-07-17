@@ -53,6 +53,7 @@ export interface IcAdminSession {
   draft?: SlaRuleDraft; // guided-builder working copy
   pendingKey?: string; // condition dimension awaiting its op/value step
   pendingOp?: string;
+  pendingAttrName?: string; // intercom.attribute: picked definition awaiting its value
   lastExprAttempt?: string; // failed expression text — "Fix Expression" re-prompt
   pinRef?: { threadId: string } | { conversationId: string };
 }

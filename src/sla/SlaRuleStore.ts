@@ -1,6 +1,5 @@
 import { PrismaClient, SlaRule } from "../generated/prisma/client";
 import { SettingsStore } from "../config/SettingsStore";
-import { EscalationTierStore } from "../config/EscalationTierStore";
 import { parseExpression, serializeExpression } from "./expression";
 import { ExpressionError, ParseContext, SlaCondition, SlaDim, SlaRuleLike, slaConditionsSchema } from "./types";
 
@@ -34,7 +33,6 @@ export class SlaRuleStore {
   constructor(
     private prisma: PrismaClient,
     private settingsStore: SettingsStore,
-    private tierStore: EscalationTierStore,
     private categoryIds: () => Array<{ id: string; label?: string }>
   ) {}
 
@@ -93,7 +91,6 @@ export class SlaRuleStore {
     return {
       categories: this.categoryIds(),
       tags: this.settingsStore.tags().map((t) => ({ id: t.id, label: t.label, emoji: t.emoji })),
-      tiers: this.tierStore.list().map((t) => ({ id: t.id, name: t.name })),
     };
   }
 

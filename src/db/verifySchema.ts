@@ -120,7 +120,7 @@ const EXPECTED_COLUMNS: Record<string, string[]> = {
   sla_rules: ["id", "name", "enabled", "position", "conditions", "expression", "target", "createdAt", "updatedAt"],
   sla_states: [
     "id", "kind", "conversationId", "lastTarget", "lastWrittenTarget", "lastRuleId", "lastEvaluatedAt",
-    "lastWriteError", "pinnedTarget", "pinnedById", "pinnedByName", "pinnedAt", "updatedAt",
+    "lastWriteError", "lastKickPartId", "pinnedTarget", "pinnedById", "pinnedByName", "pinnedAt", "updatedAt",
   ],
 };
 

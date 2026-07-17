@@ -53,6 +53,7 @@ export class SlaHub {
     { kind: "button", id: "icadmin_sla_b:", match: "prefix", handler: (i) => this.handleBuilderRender(i) },
     { kind: "select", id: "icadmin_sla_b_dim:", match: "prefix", handler: (i) => this.handleDimPick(i) },
     { kind: "select", id: "icadmin_sla_b_val:", match: "prefix", handler: (i) => this.handleValuePick(i) },
+    { kind: "select", id: "icadmin_sla_b_attr:", match: "prefix", handler: (i) => this.handleAttrNamePick(i) },
     { kind: "select", id: "icadmin_sla_b_rm:", match: "prefix", handler: (i) => this.handleConditionRemove(i) },
     { kind: "modal", id: "icadmin_sla_b_meta_m:", match: "prefix", handler: (i) => this.handleMetaSubmit(i) },
     { kind: "modal", id: "icadmin_sla_b_vm:", match: "prefix", handler: (i) => this.handleValueModal(i) },
@@ -318,7 +319,6 @@ export class SlaHub {
     return {
       categories: () => this.ctx.categories().map((c) => ({ label: c.label, value: c.id })),
       statusTags: () => this.ctx.settingsStore.tags().map((t) => ({ label: `${t.emoji} ${t.label}`, value: t.id })),
-      tiers: () => this.ctx.tierStore.list().map((t) => ({ label: t.name, value: t.id })),
       intercomTeams: async () =>
         (await this.ctx.intercomClient.listTeams().catch(() => [])).map((t) => ({ label: t.name, value: t.id, description: `id ${t.id}` })),
       intercomTicketTypes: async () =>
@@ -329,6 +329,16 @@ export class SlaHub {
         })),
       intercomTags: async () =>
         (await this.ctx.intercomClient.listTags().catch(() => [])).map((t) => ({ label: t.name, value: t.name, description: `id ${t.id}` })),
+      intercomAdmins: async () =>
+        (await this.ctx.intercomClient.listAdmins().catch(() => [])).map((a) => ({
+          label: (a.name || `Admin ${a.id}`).slice(0, 100),
+          value: a.id,
+          description: (a.email ?? `id ${a.id}`).slice(0, 100),
+        })),
+      intercomAttributes: async () =>
+        (await this.ctx.intercomClient.listConversationDataAttributes().catch(() => []))
+          .filter((a) => !a.archived)
+          .map((a) => ({ label: a.name.slice(0, 100), value: a.name.slice(0, 100), description: (a.dataType ?? "attribute").slice(0, 100) })),
     };
   }
 
@@ -529,13 +539,22 @@ export class SlaHub {
       });
       return;
     }
+    // intercom.attribute is two-step: this select picks the attribute NAME
+    // (its own route), then set/not-set completes immediately while the value
+    // ops open a modal.
+    const isAttribute = descriptor.key === "intercom.attribute";
     await interaction.editReply({
-      embeds: [makeEmbed(`**${descriptor.label}** — pick the value:`, COLORS.neutral)],
+      embeds: [
+        makeEmbed(
+          isAttribute ? `**${descriptor.label}** — pick the attribute:` : `**${descriptor.label}** — pick the value:`,
+          COLORS.neutral
+        ),
+      ],
       components: [
         selectRow(
           new StringSelectMenuBuilder()
-            .setCustomId(`icadmin_sla_b_val:${token}`)
-            .setPlaceholder("Pick a value")
+            .setCustomId(`${isAttribute ? "icadmin_sla_b_attr" : "icadmin_sla_b_val"}:${token}`)
+            .setPlaceholder(isAttribute ? "Pick an attribute" : "Pick a value")
             .addOptions(
               options.slice(0, 25).map((o) => ({
                 label: o.label.slice(0, 100),
@@ -546,6 +565,31 @@ export class SlaHub {
         ),
         backRow(`icadmin_sla_b:${token}`, "Cancel"),
       ],
+    });
+  }
+
+  // intercom.attribute step 2: name picked. set/not-set needs no value; the
+  // comparison ops collect it via the shared value modal.
+  private async handleAttrNamePick(interaction: StringSelectMenuInteraction): Promise<void> {
+    await this.withDraft(interaction, "icadmin_sla_b_attr:", async (token, session, draft) => {
+      const name = interaction.values[0];
+      const op = session.pendingOp;
+      if (op === "set" || op === "not_set") {
+        draft.conditions.push({ dim: "intercom.attribute", name, op });
+        session.pendingKey = undefined;
+        session.pendingOp = undefined;
+        session.pendingAttrName = undefined;
+        await interaction.update(this.buildBuilderPanel(token, draft));
+        return;
+      }
+      session.pendingAttrName = name;
+      const modal = new ModalBuilder().setCustomId(`icadmin_sla_b_vm:${token}`).setTitle(`Attribute: ${name}`.slice(0, 45));
+      modal.addComponents(
+        new ActionRowBuilder<TextInputBuilder>().addComponents(
+          textInput("value", op === "matches" ? "Regex (case-insensitive)" : "Value", { required: true, maxLength: 200 })
+        )
+      );
+      await interaction.showModal(modal);
     });
   }
 
@@ -590,7 +634,22 @@ export class SlaHub {
 
   private async handleValueModal(interaction: ModalSubmitInteraction): Promise<void> {
     await this.withDraft(interaction, "icadmin_sla_b_vm:", async (token, session, draft) => {
-      await this.appendCondition(interaction, token, session, draft, interaction.fields.getTextInputValue("value").trim());
+      const value = interaction.fields.getTextInputValue("value").trim();
+      if (session.pendingKey === "intercom.attribute" && session.pendingAttrName) {
+        draft.conditions.push({
+          dim: "intercom.attribute",
+          name: session.pendingAttrName,
+          op: (session.pendingOp ?? "eq") as "eq" | "neq" | "matches",
+          value,
+        });
+        session.pendingKey = undefined;
+        session.pendingOp = undefined;
+        session.pendingAttrName = undefined;
+        await this.ctx.sessions.ackModal(interaction);
+        await interaction.editReply(this.buildBuilderPanel(token, draft));
+        return;
+      }
+      await this.appendCondition(interaction, token, session, draft, value);
     });
   }
 

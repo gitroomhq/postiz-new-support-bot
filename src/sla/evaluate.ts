@@ -42,11 +42,6 @@ function evaluateCondition(cond: SlaCondition, facts: SlaFacts): { pass: boolean
       const eq = facts.statusTagId === cond.tagId;
       return (cond.op === "eq") === eq ? pass("status matches") : fail("status differs");
     }
-    case "tier": {
-      if (facts.tierId == null) return fail("no escalation tier");
-      const eq = facts.tierId === cond.tierId;
-      return (cond.op === "eq") === eq ? pass("tier matches") : fail("tier differs");
-    }
     case "open":
       if (facts.open == null) return fail("open/closed unknown");
       return facts.open === cond.value ? pass(`ticket is ${facts.open ? "open" : "closed"}`) : fail(`ticket is ${facts.open ? "open" : "closed"}`);
@@ -106,6 +101,33 @@ function evaluateCondition(cond: SlaCondition, facts: SlaFacts): { pass: boolean
       if (t == null) return fail("no ticket type");
       const eq = t === cond.value;
       return (cond.op === "eq") === eq ? pass(`ticket_type=${t}`) : fail(`ticket_type=${t}`);
+    }
+    case "intercom.assignee": {
+      const assignee = facts.intercom?.adminAssigneeId;
+      if (assignee == null) return fail("no teammate assigned");
+      const eq = assignee === cond.value;
+      return (cond.op === "eq") === eq ? pass(`assignee=${assignee}`) : fail(`assignee=${assignee}`);
+    }
+    case "intercom.attribute": {
+      const attrs = facts.intercom?.attributes;
+      if (attrs == null) return fail("no attribute data");
+      const raw = attrs[cond.name];
+      const str = raw == null ? null : String(raw);
+      const isSet = str != null && str !== "";
+      switch (cond.op) {
+        case "set":
+          return isSet ? pass(`${cond.name} is set`) : fail(`${cond.name} is not set`);
+        case "not_set":
+          return !isSet ? pass(`${cond.name} is not set`) : fail(`${cond.name} is set (${str})`);
+        case "matches": {
+          const hit = str != null && safeRegexTest(cond.value ?? "", str);
+          return hit ? pass(`${cond.name}=${str}`) : fail(`${cond.name}=${str ?? "unset"}`);
+        }
+        default: {
+          const eq = str != null && ci(str) === ci(cond.value ?? "");
+          return (cond.op === "eq") === eq ? pass(`${cond.name}=${str ?? "unset"}`) : fail(`${cond.name}=${str ?? "unset"}`);
+        }
+      }
     }
     case "intercom.tag": {
       const tags = facts.intercom?.tags;

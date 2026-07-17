@@ -28,7 +28,8 @@ type Token =
   | { kind: "op"; text: string; pos: number };
 
 const OPS = [">=", "<=", "!=", "!~", "=", ">", "<", "~"] as const;
-const WORD_RE = /^[A-Za-z0-9_.:@-]+/;
+// "*" is a word char for the attr set/not-set sugar (attr:"X"=*).
+const WORD_RE = /^[A-Za-z0-9_.:@*-]+/;
 
 function tokenize(text: string): { tokens: Token[] } | { error: ExpressionError } {
   const tokens: Token[] = [];
@@ -168,19 +169,6 @@ const KEY_SPECS: Record<string, KeySpec> = {
       return { dim: "status", op: op as "eq" | "neq", tagId: match.id };
     },
   },
-  tier: {
-    ops: { "=": "eq", "!=": "neq" },
-    build: (op, raw, ctx) => {
-      const match = ctx.tiers.find((t) => ci(t.name) === ci(raw.text) || t.id === raw.text);
-      if (!match) {
-        return {
-          message: `unknown escalation tier "${raw.text}"`,
-          hint: availableHint("tiers", ctx.tiers.map((t) => t.name)),
-        };
-      }
-      return { dim: "tier", op: op as "eq" | "neq", tierId: match.id };
-    },
-  },
   open: boolSpec("open"),
   exempt: boolSpec("exempt"),
   mirrored: boolSpec("mirrored"),
@@ -213,6 +201,11 @@ const KEY_SPECS: Record<string, KeySpec> = {
   "intercom.team": {
     ops: { "=": "eq", "!=": "neq" },
     build: (op, raw) => ({ dim: "intercom.team", op: op as "eq" | "neq", value: raw.text }),
+  },
+  "intercom.assignee": {
+    ops: { "=": "eq", "!=": "neq" },
+    opHint: "intercom.assignee compares the assigned teammate's admin id",
+    build: (op, raw) => ({ dim: "intercom.assignee", op: op as "eq" | "neq", value: raw.text }),
   },
   "intercom.kind": {
     ops: { "=": "eq" },
@@ -260,6 +253,56 @@ export function parseExpression(text: string, ctx: ParseContext): ParseResult {
   const conditions: SlaCondition[] = [];
   let i = 0;
 
+  const parseAttributeCondition = (): boolean => {
+    const key = tokens[i] as Token & { kind: "word" };
+    let name = key.text.slice("attr:".length);
+    let consumed = 1;
+    if (!name) {
+      const nameTok = tokens[i + 1];
+      if (!nameTok || nameTok.kind !== "string") {
+        errors.push({ pos: key.pos, len: tokenLen(key), message: 'attr: needs a name — attr:Sentiment or attr:"AI Title"' });
+        return false;
+      }
+      name = nameTok.text;
+      consumed = 2;
+    }
+    const opTok = tokens[i + consumed];
+    const attrOps: Partial<Record<OpSymbol, string>> = { "=": "eq", "!=": "neq", "~": "matches" };
+    const opName = opTok && opTok.kind === "op" ? attrOps[opTok.text as OpSymbol] : undefined;
+    if (!opName) {
+      errors.push({
+        pos: opTok ? opTok.pos : key.pos + tokenLen(key),
+        len: opTok ? tokenLen(opTok) : 0,
+        message: `attribute conditions support =, != and ~ (regex); "*" as the value means set/not-set`,
+      });
+      return false;
+    }
+    const valTok = tokens[i + consumed + 1];
+    if (!valTok || valTok.kind === "op" || (valTok.kind === "word" && ci(valTok.text) === "and")) {
+      errors.push({
+        pos: valTok ? valTok.pos : opTok!.pos + tokenLen(opTok!),
+        len: valTok ? tokenLen(valTok) : 0,
+        message: `expected a value after attr:"${name}"${opTok!.text}`,
+      });
+      return false;
+    }
+    i += consumed + 2;
+    // "*" = existence check (unquoted only — a quoted "*" is a literal value).
+    if (valTok.kind === "word" && valTok.text === "*" && opName !== "matches") {
+      conditions.push({ dim: "intercom.attribute", name, op: opName === "eq" ? "set" : "not_set" });
+      return true;
+    }
+    if (opName === "matches") {
+      const err = regexError(valTok.text);
+      if (err) {
+        errors.push({ pos: valTok.pos, len: tokenLen(valTok), message: err });
+        return true; // recoverable
+      }
+    }
+    conditions.push({ dim: "intercom.attribute", name, op: opName as "eq" | "neq" | "matches", value: valTok.text });
+    return true;
+  };
+
   const expectCondition = (): boolean => {
     const key = tokens[i];
     if (!key || key.kind !== "word") {
@@ -270,6 +313,12 @@ export function parseExpression(text: string, ctx: ParseContext): ParseResult {
         hint: availableHint("keys", EXPRESSION_KEYS),
       });
       return false;
+    }
+    // Conversation attribute conditions: attr:Name=value / attr:"AI Title"~"x"
+    // (bareword names ride in the key token — ":" is a word char; quoted
+    // names arrive as a separate string token after a bare `attr:`).
+    if (ci(key.text).startsWith("attr:")) {
+      return parseAttributeCondition();
     }
     const spec = KEY_SPECS[ci(key.text)];
     if (!spec) {
@@ -382,10 +431,6 @@ export function serializeCondition(cond: SlaCondition, ctx: ParseContext): strin
       const tag = ctx.tags.find((t) => t.id === cond.tagId);
       return `status${sym}${renderValue(tag ? tag.label : cond.tagId)}`;
     }
-    case "tier": {
-      const tier = ctx.tiers.find((t) => t.id === cond.tierId);
-      return `tier${sym}${renderValue(tier ? tier.name : cond.tierId)}`;
-    }
     case "stripe.spend":
       return `stripe.spend${sym}${cond.value}`;
     case "open":
@@ -396,6 +441,13 @@ export function serializeCondition(cond: SlaCondition, ctx: ParseContext): strin
     case "stripe.dispute":
     case "stripe.refund_review":
       return `${cond.dim}=${cond.value}`;
+    case "intercom.attribute": {
+      const name = `attr:"${cond.name.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+      if (cond.op === "set") return `${name}=*`;
+      if (cond.op === "not_set") return `${name}!=*`;
+      const opSym = cond.op === "matches" ? "~" : cond.op === "eq" ? "=" : "!=";
+      return `${name}${opSym}"${(cond.value ?? "").replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+    }
     // keyword/plan regexes always quote so the pattern survives barewording.
     case "keyword":
       return `keyword${sym}"${cond.value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;

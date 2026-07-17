@@ -257,7 +257,7 @@ async function main() {
 
   // ---- SLA manager (rules → "SLA Target" conversation attribute; the
   // Intercom Workflow applies the native SLAs) ----
-  const slaRuleStore = new SlaRuleStore(prisma, settingsStore, tierStore, () =>
+  const slaRuleStore = new SlaRuleStore(prisma, settingsStore, () =>
     categoryRegistry.getAll().map((c) => ({ id: c.id, label: c.label }))
   );
   await slaRuleStore.load();

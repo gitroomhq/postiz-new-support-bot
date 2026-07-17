@@ -9,10 +9,6 @@ const ctx: ParseContext = {
     { id: "tag_open", label: "Open", emoji: "🟢" },
     { id: "tag_wait", label: "Waiting for Customer", emoji: "⏳" },
   ],
-  tiers: [
-    { id: "tier_1", name: "Frontline" },
-    { id: "tier_2", name: "Developers" },
-  ],
 };
 
 function parseOk(text: string): SlaCondition[] {
@@ -34,8 +30,6 @@ test("parses every dimension and operator", () => {
       "category!=bugs",
       'status="Waiting for Customer"',
       "status!=Open",
-      "tier=Frontline",
-      "tier!=Developers",
       "open=true",
       "exempt=false",
       "mirrored=true",
@@ -56,15 +50,23 @@ test("parses every dimension and operator", () => {
       "intercom.ticket_type=99",
       "intercom.tag=vip",
       "intercom.tag!=spam",
+      "intercom.assignee=42",
+      "intercom.assignee!=99",
+      "attr:Sentiment=positive",
+      'attr:"AI Title"~"refund"',
+      "attr:Sentiment=*",
+      'attr:"AI Title"!=*',
       'keyword~"refund"',
       'keyword!~"newsletter"',
     ].join(" AND ")
   );
-  assert.equal(conditions.length, 28);
+  assert.equal(conditions.length, 32);
   assert.deepEqual(conditions[2], { dim: "status", op: "eq", tagId: "tag_wait" });
-  assert.deepEqual(conditions[4], { dim: "tier", op: "eq", tierId: "tier_1" });
-  assert.deepEqual(conditions[16], { dim: "stripe.spend", op: "gt", value: 100 });
-  assert.deepEqual(conditions[26], { dim: "keyword", op: "matches", value: "refund" });
+  assert.deepEqual(conditions[24], { dim: "intercom.assignee", op: "eq", value: "42" });
+  assert.deepEqual(conditions[26], { dim: "intercom.attribute", name: "Sentiment", op: "eq", value: "positive" });
+  assert.deepEqual(conditions[27], { dim: "intercom.attribute", name: "AI Title", op: "matches", value: "refund" });
+  assert.deepEqual(conditions[28], { dim: "intercom.attribute", name: "Sentiment", op: "set" });
+  assert.deepEqual(conditions[29], { dim: "intercom.attribute", name: "AI Title", op: "not_set" });
 });
 
 test("name resolution is case-insensitive and accepts emoji/id for status", () => {
@@ -73,7 +75,6 @@ test("name resolution is case-insensitive and accepts emoji/id for status", () =
   assert.deepEqual(parseOk("status=tag_open")[0], { dim: "status", op: "eq", tagId: "tag_open" });
   assert.deepEqual(parseOk("category=BILLING")[0], { dim: "category", op: "eq", value: "billing" });
   assert.deepEqual(parseOk('category="How-To"')[0], { dim: "category", op: "eq", value: "howto" });
-  assert.deepEqual(parseOk("tier=frontline")[0], { dim: "tier", op: "eq", tierId: "tier_1" });
 });
 
 test("AND is case-insensitive", () => {
@@ -122,7 +123,6 @@ test("serialize ⇄ parse round-trip for every dimension", () => {
     { dim: "category", op: "eq", value: "billing" },
     { dim: "category", op: "neq", value: "howto" },
     { dim: "status", op: "eq", tagId: "tag_wait" },
-    { dim: "tier", op: "neq", tierId: "tier_2" },
     { dim: "open", op: "eq", value: true },
     { dim: "exempt", op: "eq", value: false },
     { dim: "mirrored", op: "eq", value: true },
@@ -138,6 +138,11 @@ test("serialize ⇄ parse round-trip for every dimension", () => {
     { dim: "intercom.ticket_type", op: "neq", value: "42" },
     { dim: "intercom.tag", op: "has", value: "vip" },
     { dim: "intercom.tag", op: "not_has", value: "spam" },
+    { dim: "intercom.assignee", op: "eq", value: "42" },
+    { dim: "intercom.attribute", name: "Sentiment", op: "eq", value: "positive" },
+    { dim: "intercom.attribute", name: 'Weird "Name"', op: "matches", value: "a|b" },
+    { dim: "intercom.attribute", name: "Sentiment", op: "set" },
+    { dim: "intercom.attribute", name: "AI Title", op: "not_set" },
     { dim: "keyword", op: "matches", value: "refund me \"now\" \\ please" },
     { dim: "keyword", op: "not_matches", value: "unsubscribe" },
   ];
@@ -149,14 +154,14 @@ test("serialize ⇄ parse round-trip for every dimension", () => {
 
 test("serialization renders ids as current labels and quotes when needed", () => {
   assert.equal(serializeCondition({ dim: "status", op: "eq", tagId: "tag_wait" }, ctx), 'status="Waiting for Customer"');
-  assert.equal(serializeCondition({ dim: "tier", op: "eq", tierId: "tier_1" }, ctx), "tier=Frontline");
+  assert.equal(serializeCondition({ dim: "intercom.attribute", name: "AI Title", op: "set" }, ctx), 'attr:"AI Title"=*');
   assert.equal(serializeCondition({ dim: "keyword", op: "matches", value: "refund" }, ctx), 'keyword~"refund"');
   // deleted tag falls back to the raw id (parse will flag it — intended)
   assert.equal(serializeCondition({ dim: "status", op: "eq", tagId: "gone" }, ctx), "status=gone");
 });
 
 test("EXPRESSION_KEYS covers all documented dims", () => {
-  for (const key of ["category", "status", "tier", "open", "exempt", "mirrored", "stripe.linked", "stripe.paying", "stripe.dispute", "stripe.refund_review", "stripe.plan", "stripe.spend", "intercom.team", "intercom.kind", "intercom.ticket_type", "intercom.tag", "keyword"]) {
+  for (const key of ["category", "status", "open", "exempt", "mirrored", "stripe.linked", "stripe.paying", "stripe.dispute", "stripe.refund_review", "stripe.plan", "stripe.spend", "intercom.team", "intercom.assignee", "intercom.kind", "intercom.ticket_type", "intercom.tag", "keyword"]) {
     assert.ok(EXPRESSION_KEYS.includes(key), `missing key ${key}`);
   }
 });
