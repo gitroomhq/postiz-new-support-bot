@@ -452,7 +452,9 @@ export class SlaService {
     target: string | null
   ): Promise<void> {
     if (!this.settingsStore.slaNoteKickEnabled()) return;
-    const content = target ? `🎯 SLA target: ${target}` : "🎯 SLA target cleared";
+    // Authored as a human teammate (trigger requirement) — the marker keeps
+    // agents from mistaking it for something that teammate wrote themselves.
+    const content = `${target ? `🎯 SLA target: <b>${target}</b>` : "🎯 SLA target cleared"} — <i>automated by the support bot</i>`;
     // Human admin ONLY — the dedicated SLA note author when set, else the
     // general fallback admin. Never intercomAuthorAdminId(): that prefers the
     // Operator/Fin bot, whose notes do NOT fire "Teammate adds a note".
