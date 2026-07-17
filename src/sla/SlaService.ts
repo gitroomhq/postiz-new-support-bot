@@ -440,9 +440,11 @@ export class SlaService {
   // Internal note on every target CHANGE. Two jobs: agent-visible signal in
   // the inbox, and the Workflow kick — Intercom has NO attribute-change
   // trigger, so the SLA Workflow uses trigger "Teammate adds a note" and
-  // branches on the freshly-written attribute (the note delivers AFTER the
-  // attribute write: bridged rides the same FIFO outbox, native posts after
-  // the PUT). Best-effort — never fails the write.
+  // branches on the freshly-written attribute (the note always lands AFTER
+  // the attribute writes). AUTHORSHIP MATTERS: the trigger ignores notes
+  // authored by the Operator/Fin BOT (empirically verified — "Teammate" means
+  // a human admin), so the kick is authored as the configured HUMAN fallback
+  // admin, never the Operator. Best-effort — never fails the write.
   private async noteKick(
     kind: "bridged" | "native",
     conversationId: string,
@@ -451,21 +453,26 @@ export class SlaService {
   ): Promise<void> {
     if (!this.settingsStore.slaNoteKickEnabled()) return;
     const content = target ? `🎯 SLA target: ${target}` : "🎯 SLA target cleared";
+    // Human admin ONLY — intercomAuthorAdminId() prefers the Operator/Fin
+    // bot, whose notes do NOT fire the "Teammate adds a note" trigger.
+    const adminId = this.settingsStore.intercomAdminId();
+    if (!adminId) {
+      slaLog.warn("sla.note_kick.no_human_admin", {
+        "intercom.conversation_id": conversationId,
+        "sla.hint": "pick a fallback admin in /config → Integrations → Intercom — the SLA Workflow trigger ignores Fin-authored notes",
+      });
+      return;
+    }
     try {
-      if (kind === "bridged") {
-        // Outbox note: echo-registered at post time, so it never relays back
-        // into the Discord thread. No Temporal → skip (the next evaluation or
-        // an agent action converges the Workflow).
-        if (threadId && this.producers?.routable()) {
-          await this.producers.intercomEnqueue(threadId, "note", { content });
-        }
-        return;
+      const { partId } = await this.intercomClient.replyAsAdmin(conversationId, { adminId, body: content, note: true });
+      if (kind === "bridged" && threadId && partId) {
+        // Echo-register so the noted-webhook doesn't relay the kick into the
+        // Discord thread. Registered right after the POST returns — the
+        // webhook echo travels through the Temporal inbox, so it can't win
+        // the race in practice. (Native conversations have no link → the
+        // noted-webhook drops them without this.)
+        await this.intercomStore.recordEchoPart("c", partId, threadId).catch(() => undefined);
       }
-      // Native conversations have no link → the noted-webhook drops them, so
-      // a direct admin note is echo-safe.
-      const adminId = this.settingsStore.intercomAuthorAdminId();
-      if (!adminId) return;
-      await this.intercomClient.replyAsAdmin(conversationId, { adminId, body: content, note: true });
     } catch (e) {
       slaLog.warn("sla.note_kick.failed", {
         "intercom.conversation_id": conversationId,
