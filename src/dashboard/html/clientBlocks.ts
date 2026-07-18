@@ -137,7 +137,8 @@ D.renderBlocks = function (container, blocks) {
       return;
     }
     chartGrid = null;
-    if (b.type === "header") container.appendChild(D.renderHeader(b));
+    if (b.type === "tabs") container.appendChild(D.renderTabs(b));
+    else if (b.type === "header") container.appendChild(D.renderHeader(b));
     else if (b.type === "stats") container.appendChild(D.renderStats(b));
     else if (b.type === "table") container.appendChild(D.renderTable(b));
     else if (b.type === "kv") container.appendChild(D.renderKv(b));
@@ -145,6 +146,7 @@ D.renderBlocks = function (container, blocks) {
     else if (b.type === "notice") container.appendChild(D.renderNotice(b));
     else if (b.type === "empty") container.appendChild(D.renderEmpty(b));
     else if (b.type === "qr") container.appendChild(D.renderQr(b));
+    else if (b.type === "evidence") container.appendChild(D.renderEvidence(b));
   });
 };
 
@@ -166,6 +168,21 @@ D.renderQr = function (b) {
   box.appendChild(svg);
   if (b.caption) box.appendChild(D.el("p", "note", b.caption));
   return box;
+};
+
+// Stripe tab row: quiet labels, 2px accent underline on the active one.
+D.renderTabs = function (b) {
+  var row = D.el("div", "tabrow");
+  var current = D.state.filters[b.key] || "";
+  (b.items || []).forEach(function (it) {
+    var tab = D.el("button", "tab" + ((it.value || "") === current ? " active" : ""));
+    tab.type = "button";
+    tab.appendChild(D.el("span", null, it.label));
+    if (it.badge) tab.appendChild(D.el("span", "tabcount", it.badge));
+    tab.addEventListener("click", function () { D.applyFilter(b.key, it.value); });
+    row.appendChild(tab);
+  });
+  return row;
 };
 
 D.renderHeader = function (b) {

@@ -135,6 +135,16 @@ export function dashboardCss(): string {
   td .flagset { display:flex; gap:4px; flex-wrap:wrap; }
   th.aright, td.aright { text-align:right; }
 
+  /* Stripe tab row (under the H1): quiet labels, blurple underline. */
+  .tabrow { display:flex; gap:22px; border-bottom:1px solid var(--border); margin:0 0 18px; }
+  .tab { all:unset; display:inline-flex; align-items:center; gap:6px; cursor:pointer; padding:0 2px 9px;
+    font-size:14px; font-weight:500; color:var(--muted); border-bottom:2px solid transparent; margin-bottom:-1px; }
+  .tab:hover { color:var(--heading); }
+  .tab.active { color:var(--accent); font-weight:600; border-bottom-color:var(--accent); }
+  .tab .tabcount { font-size:12px; font-weight:500; color:var(--danger); background:var(--danger-weak);
+    border-radius:999px; padding:0 7px; }
+  .tab:focus-visible { box-shadow:0 0 0 3px var(--ring); border-radius:4px; }
+
   /* Stripe atoms ------------------------------------------------------- */
   .strongname { font-weight:600; color:var(--heading); }
   a.reflink.strongname { color:var(--heading); }
@@ -278,6 +288,35 @@ export function dashboardCss(): string {
   .logincard .error { margin:10px 0 0; }
   .qrbox { text-align:center; }
   .qrbox svg { width:230px; height:230px; border-radius:10px; border:1px solid var(--border); }
+
+  /* ---- dispute evidence workbench ---- */
+  .evgroup { border:1px solid var(--border); border-radius:var(--radius); margin:0 0 10px; background:var(--surface); }
+  .evgroup summary { cursor:pointer; display:flex; align-items:center; gap:10px; padding:10px 14px;
+    font-weight:600; font-size:13.5px; color:var(--heading); list-style:none; }
+  .evgroup summary::-webkit-details-marker { display:none; }
+  .evgroup summary:before { content:"\\203A"; color:var(--faint); transition:transform .12s; }
+  .evgroup[open] summary:before { transform:rotate(90deg); }
+  .evgroup .evgtitle { display:inline-flex; align-items:center; gap:6px; }
+  .evgroup .evstar { font-size:12px; }
+  .evgroup .evgmeta { margin-left:auto; color:var(--faint); font-weight:400; font-size:12.5px; white-space:nowrap; }
+  .evgbody { padding:2px 14px 12px; border-top:1px solid var(--border); }
+  .evfield { margin:12px 0 0; }
+  .evhead { display:flex; align-items:baseline; gap:8px; }
+  .evlabel { font-weight:500; font-size:13px; color:var(--heading); }
+  .evchip { font-size:11px; }
+  .evcount { margin-left:auto; color:var(--faint); font-size:12px; font-variant-numeric:tabular-nums; }
+  .evinput { width:100%; margin-top:5px; font:inherit; font-size:13.5px; color:var(--body);
+    background:var(--surface); border:1px solid var(--border-strong); border-radius:6px; padding:7px 9px; resize:vertical; }
+  .evinput:focus { outline:none; border-color:var(--accent); box-shadow:0 0 0 3px var(--accent-weak); }
+  .evinput:disabled { background:var(--fill); color:var(--muted); }
+  .evgfoot { margin-top:12px; display:flex; justify-content:flex-end; }
+  .evfilehead { font-size:14px; font-weight:600; color:var(--heading); margin:18px 0 2px; }
+  .evslot { display:flex; align-items:center; gap:12px; padding:8px 0; border-bottom:1px solid var(--border);
+    font-size:13px; flex-wrap:wrap; }
+  .evslot:last-child { border-bottom:none; }
+  .evslotlabel { min-width:220px; font-weight:500; color:var(--heading); }
+  .evslotfile { display:inline-flex; align-items:center; gap:4px; }
+  .evfile { font-size:12.5px; color:var(--muted); }
 
   .skel { border-radius:6px; background:linear-gradient(100deg,var(--elev) 40%,var(--hover) 50%,var(--elev) 60%);
     background-size:200% 100%; animation:shimmer 1.2s linear infinite; }

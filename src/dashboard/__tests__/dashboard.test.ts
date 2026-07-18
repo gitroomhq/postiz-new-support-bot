@@ -14,7 +14,16 @@ import { makeHomeSection } from "../sections/homeSection";
 import { makeBalancesSection } from "../sections/balancesSection";
 import { makeSubscriptionsSection } from "../sections/subscriptionsSection";
 import { makeInvoicesSection } from "../sections/invoicesSection";
+import { makeDisputesSection } from "../sections/disputesSection";
 import { makeSecuritySection } from "../sections/securitySection";
+import type { CachedRatioEngine } from "../../bot/billing/disputeRatio";
+import {
+  DisputeEvidenceService,
+  EVIDENCE_FILE_SLOTS,
+  EVIDENCE_GROUPS,
+  recommendedGroupKeys,
+} from "../../bot/billing/DisputeEvidenceService";
+import { TEXT_EVIDENCE_KEYS } from "../../bot/billing/DisputeStore";
 import { GlobalSearch } from "../search/GlobalSearch";
 import { actionByKey, ActionExecCtx } from "../../bot/billing/actions/ActionRegistry";
 import { BillingActionService } from "../../bot/billing/actions/BillingActionService";
@@ -25,13 +34,14 @@ import type { BlockStore } from "../../bot/billing/BlockStore";
 import type { CredentialStore } from "../auth/CredentialStore";
 import type { DashboardDbSessions } from "../auth/DashboardDbSessions";
 import type { DashboardAudit } from "../auth/DashboardAudit";
-import { Block, HeaderBlock, KeyValueBlock, TableBlock } from "../renderer/contract";
+import { Block, EvidenceBlock, HeaderBlock, KeyValueBlock, TableBlock } from "../renderer/contract";
 import { renderDashboardShell } from "../html/shellHtml";
 import { clientCore } from "../html/clientCore";
 import { clientBlocks } from "../html/clientBlocks";
 import { clientModal } from "../html/clientModal";
 import { clientPalette } from "../html/clientPalette";
 import { clientCharts } from "../html/clientCharts";
+import { clientEvidence } from "../html/clientEvidence";
 import { clientLogin } from "../html/clientLogin";
 import { clientApp } from "../html/clientApp";
 import { hashPassphrase, verifyPassphrase, MIN_PASSPHRASE_LENGTH } from "../auth/passphrase";
@@ -420,7 +430,11 @@ test("customer 360: Insights/Details/Linked accounts in the rail, atoms in the m
   const section = makeCustomersSection();
   const page = await section.buildPage(fakeCustomerCtx(), { page: "customers.detail", params: { id: "cus_test1" } });
   assert.ok(page);
-  assert.ok(page!.rail && page!.rail.length === 3, "expected a 3-card rail");
+  // M7 appended the Manage card (edit link) — Insights/Details/Linked + Manage.
+  assert.ok(page!.rail && page!.rail.length === 4, "expected a 4-card rail");
+  const manage = page!.rail![3] as KeyValueBlock;
+  assert.equal(manage.title, "Manage");
+  assert.deepEqual((manage.rows[0].cell as { ref?: unknown }).ref, { page: "customers.edit", params: { id: "cus_test1" } });
   const [insights, details, linked] = page!.rail as KeyValueBlock[];
   assert.equal(insights.title, "Insights");
   assert.equal(insights.big, true);
@@ -464,7 +478,10 @@ test("customers list: strong name cell, search filter, N items footer", async ()
   });
   const section = makeCustomersSection();
   const page = await section.buildPage(ctx, { page: "customers" });
-  const table = page!.blocks[0] as TableBlock;
+  // M7: blocks[0] is now the page header carrying "New customer".
+  const header = page!.blocks[0] as HeaderBlock;
+  assert.equal(header.actions![0].key, "section:customers.create");
+  const table = page!.blocks.find((b) => b.type === "table") as TableBlock;
   assert.deepEqual(table.rows[0].cells[0], { t: "text", v: "Ada Lovelace", strong: true });
   assert.equal(table.filters![0].kind, "search");
   assert.equal(table.footer, "2+ items");
@@ -1597,8 +1614,1035 @@ test("integration refs: change-plan rows self-select via filters; Customer-360 f
   assert.deepEqual(listedIds, ["cus_a"]);
 });
 
+// ---- M6.1/M6.2: disputes overview / workbench ----
+
+// Real service over fakes: the section tests exercise the SAME code path the
+// Discord hub runs (extraction parity is the point of M6.2).
+// Faked AI runners + settings for the M6.3 pipelines. draftJson feeds the
+// Claude CLI fake's final message; reviewText the light model's.
+function fakeAiDeps(opts: { draftJson?: string; reviewText?: string; lightRun?: () => Promise<string[]> } = {}) {
+  const seen = { draftPrompts: [] as string[], reviewAttachments: [] as number[] };
+  return {
+    seen,
+    deps: {
+      claudeRunner: {
+        run: async (prompt: string) => {
+          seen.draftPrompts.push(prompt);
+          return ["research narration…", opts.draftJson ?? "{}"];
+        },
+      },
+      lightAi: {
+        run: async (_prompt: string, _sys: undefined, runOpts: { attachments?: unknown[] }) => {
+          seen.reviewAttachments.push(runOpts.attachments?.length ?? 0);
+          if (opts.lightRun) return opts.lightRun();
+          return [opts.reviewText ?? "Solid package — stage the draft narrative too."];
+        },
+      },
+      intercom: {},
+      settingsStore: {
+        aiModel: () => "claude-fable-5",
+        aiModelLight: () => "claude-haiku-4-5",
+        aiEffortAsk: () => "medium",
+        aiMaxBudgetUsdAsk: () => 2,
+        disputeAutoAttachReceipt: () => false,
+        intercomMode: () => "none",
+      },
+    },
+  };
+}
+
+function evidenceFakes(
+  opts: {
+    dispute?: Record<string, unknown>;
+    row?: Record<string, unknown> | null;
+    claims?: boolean[];
+    ai?: ReturnType<typeof fakeAiDeps>["deps"];
+    fileContents?: () => Promise<Record<string, unknown>>;
+  } = {}
+) {
+  const nowSec = Math.floor(Date.now() / 1000);
+  const dispute = {
+    id: "dp_1",
+    object: "dispute",
+    amount: 4500,
+    currency: "eur",
+    reason: "fraudulent",
+    status: "needs_response",
+    charge: "ch_1",
+    payment_intent: "pi_1",
+    is_charge_refundable: true,
+    created: nowSec - 48 * 3600,
+    evidence: { product_description: "Staged description", uncategorized_file: "file_1" },
+    evidence_details: { due_by: nowSec + 20 * 3600, has_evidence: true, past_due: false, submission_count: 0 },
+    payment_method_details: { card: { network_reason_code: "10.4", case_type: "chargeback" } },
+    balance_transactions: [],
+    ...(opts.dispute ?? {}),
+  };
+  const calls = {
+    update: [] as Array<{ id: string; evidence: Record<string, unknown>; submit: boolean; key: string }>,
+    upload: [] as Array<{ name: string; size: number; type: string }>,
+    close: [] as string[],
+    claims: [] as Array<{ actor: string; id: string; action: string }>,
+    releases: [] as string[],
+    merged: [] as Array<Record<string, string>>,
+    submittedMarks: 0,
+  };
+  const claims = opts.claims ?? [true, true];
+  const stripe = {
+    formatAmount: (a: number, c: string) => `${(a / 100).toFixed(2)} ${c.toUpperCase()}`,
+    getDispute: async () => dispute,
+    getChargeCustomerId: async () => "cus_a",
+    getCharge: async () => ({
+      id: "ch_1",
+      created: Math.floor(Date.now() / 1000) - 30 * 86400,
+      amount: 4500,
+      currency: "eur",
+      customer: "cus_a",
+      description: "Postiz subscription",
+      payment_method_details: { card: { brand: "visa", last4: "4242" } },
+    }),
+    getCustomer: async () => ({
+      id: "cus_a",
+      email: "grace@example.com",
+      name: "Grace Hopper",
+      created: Math.floor(Date.now() / 1000) - 90 * 86400,
+    }),
+    listSubscriptions: async () => [],
+    listCharges: async () => ({ charges: [], hasMore: false }),
+    getEvidenceFileWithContents: async () =>
+      opts.fileContents
+        ? opts.fileContents()
+        : { filename: "proof.png", sizeBytes: 10, mimeType: "image/png", data: Buffer.from("png"), skipped: null },
+    updateDisputeEvidence: async (id: string, evidence: Record<string, unknown>, submit: boolean, key: string) => {
+      calls.update.push({ id, evidence, submit, key });
+      if (submit && dispute.status === "won") throw new Error("stripe says no");
+      return { ...dispute, status: submit ? "under_review" : dispute.status };
+    },
+    uploadDisputeEvidenceFile: async (name: string, data: Buffer, type: string) => {
+      calls.upload.push({ name, size: data.length, type });
+      return { id: "file_new" };
+    },
+    closeDispute: async (id: string) => {
+      calls.close.push(id);
+      return { ...dispute, status: "lost" };
+    },
+  };
+  const rowState = { row: opts.row === undefined ? disputeRow({}) : opts.row };
+  const disputeStore = {
+    get: async () => rowState.row,
+    mergeEvidenceDraft: async (_id: string, patch: Record<string, string>) => {
+      calls.merged.push(patch);
+      if (rowState.row) {
+        rowState.row.evidenceDraft = { ...((rowState.row.evidenceDraft as Record<string, string>) ?? {}), ...patch };
+      }
+    },
+    markSubmitted: async () => {
+      calls.submittedMarks++;
+    },
+    upsertFromStripe: async (d: { status: string }) => disputeRow({ status: d.status }),
+    isWatching: async () => false,
+    watch: async () => {},
+    unwatch: async () => {},
+    countsByStatus: async () => [],
+    wonEvidenceExemplars: async () => [],
+  };
+  const sessionStore = {
+    claimBillingAction: async (actor: string, id: string, action: string) => {
+      calls.claims.push({ actor, id, action });
+      return claims.shift() ?? true;
+    },
+    releaseBillingAction: async (id: string) => {
+      calls.releases.push(id);
+    },
+  };
+  const svc = new DisputeEvidenceService(
+    stripe as unknown as StripeClient,
+    disputeStore as unknown as ConstructorParameters<typeof DisputeEvidenceService>[1],
+    sessionStore as unknown as SessionStore,
+    opts.ai as ConstructorParameters<typeof DisputeEvidenceService>[3]
+  );
+  return { svc, calls, dispute, stripe, disputeStore, sessionStore, rowState };
+}
+
+function disputeRow(over: Record<string, unknown>) {
+  return {
+    id: "dp_1",
+    chargeId: "ch_1",
+    paymentIntentId: "pi_1",
+    customerId: "cus_a",
+    amount: 4500,
+    currency: "eur",
+    reason: "fraudulent",
+    status: "needs_response",
+    evidenceDueBy: new Date(Date.now() + 20 * 3600_000),
+    evidenceDraft: { product_description: "desc" },
+    evidenceFinal: null,
+    evidenceSubmittedAt: null,
+    disputeCreatedAt: new Date(Date.now() - 48 * 3600_000),
+    closedAt: null,
+    ...over,
+  };
+}
+
+function disputesCtx(fakes?: ReturnType<typeof evidenceFakes>): DashboardCtx {
+  return {
+    actor: { id: "42", name: "Ada", role: "admin", isAdmin: true },
+    stripe: {
+      formatAmount: (a: number, c: string) => `${(a / 100).toFixed(2)} ${c.toUpperCase()}`,
+      ...(fakes ? { getDispute: fakes.stripe.getDispute, getChargeCustomerId: fakes.stripe.getChargeCustomerId } : {}),
+    } as unknown as DashboardCtx["stripe"],
+    settings: {
+      disputeRatioWarnPct: () => 0.75,
+      disputeRatioCriticalPct: () => 1.5,
+      aiModel: () => "claude-fable-5",
+      aiModelLight: () => "claude-haiku-4-5",
+      aiEffortAsk: () => "medium",
+      aiMaxBudgetUsdAsk: () => 2,
+    } as never,
+    stores: {
+      dispute: {
+        countsByStatus: async () => [
+          { status: "needs_response", count: 2 },
+          { status: "warning_needs_response", count: 1 },
+          { status: "under_review", count: 1 },
+          { status: "won", count: 5 },
+          { status: "lost", count: 2 },
+        ],
+        listOpen: async () => ({
+          rows: [
+            disputeRow({}),
+            disputeRow({ id: "dp_2", status: "under_review" }), // filtered off the board
+            disputeRow({ id: "dp_3", status: "warning_needs_response", evidenceDueBy: new Date(Date.now() - 3600_000) }),
+          ],
+          total: 3,
+        }),
+        listMirror: async (skip: number, _take: number, filter: { status?: string }, sort: string) => ({
+          rows: [disputeRow({ id: `dp_all_${filter?.status ?? "any"}_${sort}_${skip}` })],
+          total: 60,
+        }),
+        openReasons: async () => [{ reason: "fraudulent", count: 3 }],
+        closedReasons: async () => [{ reason: "product_not_received", count: 2 }],
+        outcomeStats: async () => ({
+          won: 5,
+          lost: 2,
+          other: 1,
+          winRatePct: 71.4,
+          wonAmount: { eur: 12000 },
+          lostAmount: { eur: 4000 },
+          lostUnanswered: 1,
+        }),
+        statsByReason: async () => [{ reason: "fraudulent", won: 4, lost: 1, other: 0, winRatePct: 80 }],
+        listClosed: async () => ({ rows: [disputeRow({ id: "dp_c", status: "won", closedAt: new Date() })], total: 7 }),
+        get: async (id: string) => (fakes ? fakes.rowState.row : id === "dp_1" ? disputeRow({}) : null),
+        ...(fakes
+          ? {
+              upsertFromStripe: fakes.disputeStore.upsertFromStripe,
+              isWatching: fakes.disputeStore.isWatching,
+              watch: fakes.disputeStore.watch,
+              unwatch: fakes.disputeStore.unwatch,
+            }
+          : {}),
+      },
+      qol: {
+        isBookmarked: async () => false,
+        listNotes: async () => ({ rows: [{ authorName: "Ada", createdAt: new Date(), text: "watch this one" }], total: 1 }),
+        addNote: async () => {},
+        toggleBookmark: async () => ({ bookmarked: true }),
+      },
+    } as unknown as DashboardCtx["stores"],
+    billing: { actions: { effectiveMode: () => "direct" } } as never,
+    audit: async () => {},
+    security: { sessionIdHash: "h", authMethod: "passkey", stepUpFresh: () => true },
+  } as unknown as DashboardCtx;
+}
+
+// Deps bundle for makeDisputesSection with the real service over the fakes.
+function disputesDeps(fakes?: ReturnType<typeof evidenceFakes>) {
+  return { ratio: fakeRatio, evidence: (fakes ?? evidenceFakes()).svc };
+}
+
+const fakeRatio = {
+  get: async () => ({
+    computedAt: 1,
+    truncated: false,
+    month: { succeeded: 900, chargebacks: 8, inquiries: 1, fraudDisputes: 5, efws: 3, vampNumerator: 10, plainPct: 0.89, vampPct: 1.11 },
+    d30: { succeeded: 1000, chargebacks: 5, inquiries: 1, fraudDisputes: 3, efws: 2, vampNumerator: 6, plainPct: 0.5, vampPct: 0.6 },
+    d90: { succeeded: 3000, chargebacks: 50, inquiries: 2, fraudDisputes: 30, efws: 10, vampNumerator: 55, plainPct: 1.67, vampPct: 1.83 },
+  }),
+} as unknown as CachedRatioEngine;
+
+test("disputes overview: tabs + level-tinted ratio strip + due-date board (respondable only, urgency badges)", async () => {
+  const section = makeDisputesSection(disputesDeps());
+  const page = await section.buildPage(disputesCtx(), { page: "disputes", filters: {} });
+  const tabs = page!.blocks[0] as { type: string; items: Array<{ label: string; badge?: string }> };
+  assert.equal(tabs.type, "tabs");
+  assert.equal(tabs.items[0].badge, "3"); // 2 needs_response + 1 warning_needs_response
+  const strip = page!.blocks[1] as { items: Array<{ label: string; value: string; badge?: { text: string } }> };
+  const byLabel = Object.fromEntries(strip.items.map((i) => [i.label, i]));
+  assert.equal(byLabel["This month"].value, "0.89%");
+  assert.equal(byLabel["This month"].badge?.text, "warn"); // ≥0.75 warn threshold
+  assert.equal(byLabel["Last 30 days"].badge?.text, "ok");
+  assert.equal(byLabel["Last 90 days"].badge?.text, "critical"); // ≥1.5
+  const board = page!.blocks.find((b) => b.type === "table") as TableBlock;
+  assert.deepEqual(board.rows.map((r) => r.id), ["dp_1", "dp_3"]); // under_review filtered out
+  assert.deepEqual(board.rows[0].ref, { page: "disputes.detail", params: { id: "dp_1" } });
+  const urgency = board.rows[1].cells[4] as { badges: Array<{ text: string }> };
+  assert.equal(urgency.badges[0].text, "OVERDUE");
+  assert.equal(await section.navBadge!(disputesCtx()), "3");
+});
+
+test("disputes all-tab: status count-cards + reason/sort filters flow into listMirror with offset cursors", async () => {
+  const section = makeDisputesSection(disputesDeps());
+  const page = await section.buildPage(disputesCtx(), {
+    page: "disputes",
+    filters: { view: "all", status: "won", sort: "amount" },
+    cursor: "25",
+  });
+  const table = page!.blocks.find((b) => b.type === "table") as TableBlock;
+  const counts = Object.fromEntries(table.counts!.items.map((i) => [i.label, i.count]));
+  assert.equal(counts.All, 11);
+  assert.equal(counts.Won, 5);
+  // The fake encodes its inputs into the row id — proves filter/sort/offset flowed through.
+  assert.equal(table.rows[0].id, "dp_all_won_amount_25");
+  assert.equal(table.nextCursor, "50");
+  assert.ok(table.filters!.some((f) => f.key === "reason"));
+});
+
+test("disputes history-tab: outcome tiles + win-rate-by-reason + closed list; detail is read-only with linked rail", async () => {
+  const section = makeDisputesSection(disputesDeps());
+  const history = await section.buildPage(disputesCtx(), { page: "disputes", filters: { view: "history" } });
+  const tiles = history!.blocks.find((b) => b.type === "stats" && (b as { items: Array<{ label: string }> }).items.some((i) => i.label === "Won")) as {
+    items: Array<{ label: string; value: string; sub?: string }>;
+  };
+  const tile = Object.fromEntries(tiles.items.map((i) => [i.label, i]));
+  assert.equal(tile.Won.value, "5");
+  assert.equal(tile.Won.sub, "120.00 EUR");
+  assert.equal(tile["Win rate"].value, "71%");
+  assert.ok(history!.blocks.some((b) => b.type === "table" && b.key === "byreason"));
+  assert.ok(history!.blocks.some((b) => b.type === "table" && b.key === "closed"));
+});
+
+// ---- M6.2: evidence service extraction parity ----
+
+test("evidence service: catalog covers every TEXT_EVIDENCE_KEY exactly once; recommended groups per reason", () => {
+  const catalogKeys = EVIDENCE_GROUPS.flatMap((g) => g.fields.map((f) => f.key)).sort();
+  assert.deepEqual(catalogKeys, [...TEXT_EVIDENCE_KEYS].sort());
+  assert.equal(new Set(catalogKeys).size, 18);
+  assert.deepEqual(recommendedGroupKeys("duplicate"), ["duplicate", "core"]);
+  assert.deepEqual(recommendedGroupKeys("product_not_received"), ["core", "shipping"]);
+  assert.deepEqual(recommendedGroupKeys("subscription_canceled"), ["core", "policy"]);
+  assert.deepEqual(recommendedGroupKeys("fraudulent"), ["core"]);
+  assert.equal(EVIDENCE_FILE_SLOTS.length, 6);
+});
+
+test("evidence service: saveDraft filters empty/unknown keys; stageFields stages submit:false with the billadmin idempotency prefix", async () => {
+  const f = evidenceFakes();
+  const { saved } = await f.svc.saveDraft("dp_1", {
+    product_description: "  real text  ",
+    bogus_key: "nope",
+    customer_name: "   ",
+  } as Record<string, string>);
+  assert.equal(saved, 1);
+  assert.deepEqual(f.calls.merged, [{ product_description: "real text" }]);
+
+  await f.svc.stageFields("dp_1", { product_description: "real text" }, "abc123");
+  assert.equal(f.calls.update.length, 1);
+  assert.equal(f.calls.update[0].submit, false);
+  assert.equal(f.calls.update[0].key, "billadmin-dpstage-abc123");
+  assert.deepEqual(f.calls.update[0].evidence, { product_description: "real text" });
+});
+
+test("evidence service: uploadProof validates slot/type/size and live status; removeFile covers non-slot keys", async () => {
+  const f = evidenceFakes();
+  const big = Buffer.alloc(4 * 1024 * 1024 + 1);
+  assert.equal((await f.svc.uploadProof("dp_1", "receipt", "a.png", big, "image/png", "x")).kind, "invalid");
+  assert.equal((await f.svc.uploadProof("dp_1", "receipt", "a.gif", Buffer.from("x"), "image/gif", "x")).kind, "invalid");
+  assert.equal((await f.svc.uploadProof("dp_1", "not_a_slot", "a.png", Buffer.from("x"), "image/png", "x")).kind, "invalid");
+  const ok = await f.svc.uploadProof("dp_1", "receipt", "a.png", Buffer.from("png"), "image/png; charset=x", "x");
+  assert.equal(ok.kind, "ok");
+  assert.deepEqual(f.calls.upload, [{ name: "a.png", size: 3, type: "image/png" }]);
+  assert.deepEqual(f.calls.update[0].evidence, { receipt: "file_new" });
+
+  // customer_signature is not an upload slot but IS removable (webhook/Dashboard fills).
+  const rm = await f.svc.removeFile("dp_1", "customer_signature", "y");
+  assert.equal(rm.kind, "ok");
+  assert.deepEqual(f.calls.update[1].evidence, { customer_signature: "" });
+
+  const closed = evidenceFakes({ dispute: { status: "under_review" } });
+  assert.deepEqual(await closed.svc.uploadProof("dp_1", "receipt", "a.png", Buffer.from("x"), "image/png", "x"), {
+    kind: "not_respondable",
+    status: "under_review",
+  });
+});
+
+test("evidence service: submit — status guard, cross-admin claim, markSubmitted, claim release on Stripe failure", async () => {
+  const f = evidenceFakes();
+  const r1 = await f.svc.submit("dp_1", "42", "cus_a");
+  assert.equal(r1.kind, "submitted");
+  assert.deepEqual(f.calls.claims, [{ actor: "42", id: "dispute-submit-dp_1", action: "dispute_submit" }]);
+  assert.equal(f.calls.update[0].submit, true);
+  assert.equal(f.calls.update[0].key, "billadmin-dpsubmit-dp_1");
+  assert.equal(f.calls.submittedMarks, 1);
+
+  const lost = evidenceFakes({ claims: [false] });
+  assert.equal((await lost.svc.submit("dp_1", "42", null)).kind, "already_claimed");
+
+  const closed = evidenceFakes({ dispute: { status: "lost" } });
+  assert.deepEqual(await closed.svc.submit("dp_1", "42", null), { kind: "not_respondable", status: "lost" });
+  assert.equal(closed.calls.claims.length, 0); // no claim burned on a dead dispute
+
+  // Stripe failure releases the claim so a retry stays possible.
+  const failing = evidenceFakes({ dispute: { status: "needs_response" } });
+  failing.stripe.updateDisputeEvidence = async () => {
+    throw new Error("stripe down");
+  };
+  await assert.rejects(() => failing.svc.submit("dp_1", "42", null));
+  assert.deepEqual(failing.calls.releases, ["dispute-submit-dp_1"]);
+});
+
+test("evidence service: accept claims, closes and upserts; packageFrom computes staged/files/unstaged diff", async () => {
+  const f = evidenceFakes();
+  const r = await f.svc.accept("dp_1", "42", "cus_a");
+  assert.equal(r.kind, "accepted");
+  assert.deepEqual(f.calls.claims, [{ actor: "42", id: "dispute-accept-dp_1", action: "dispute_accept" }]);
+  assert.deepEqual(f.calls.close, ["dp_1"]);
+
+  const pkg = f.svc.packageFrom(
+    f.dispute as never,
+    disputeRow({ evidenceDraft: { product_description: "Different draft", customer_name: "Ada" } }) as never
+  );
+  assert.deepEqual(pkg.textFields, [{ key: "product_description", value: "Staged description" }]);
+  assert.deepEqual(pkg.files, [{ slot: "uncategorized_file", fileId: "file_1" }]);
+  assert.deepEqual(pkg.unstagedDraft, ["customer_name", "product_description"]);
+  assert.equal(pkg.respondable, true);
+});
+
+// ---- M6.2: the workbench page + section actions ----
+
+test("dispute workbench: live detail — evidence widget states, submit ceremony, refund-to-prevent baked from the dispute's charge", async () => {
+  const fakes = evidenceFakes();
+  const section = makeDisputesSection(disputesDeps(fakes));
+  const page = await section.buildPage(disputesCtx(fakes), { page: "disputes.detail", params: { id: "dp_1" } });
+
+  const header = page!.blocks[0] as HeaderBlock;
+  const byKey = Object.fromEntries(header.actions!.map((a) => [a.key, a]));
+  const submit = byKey["section:disputes.submit"];
+  assert.ok(submit.dangerous && submit.reverseConfirm);
+  assert.deepEqual(submit.params, { disputeId: "dp_1" });
+  assert.match(submit.summary!, /1 text field/);
+  assert.match(submit.summary!, /exactly one submission/);
+  const refund = byKey["charge.refund_full"];
+  assert.deepEqual(refund.params, { chargeId: "ch_1" });
+  assert.ok(byKey["section:disputes.accept"].reverseConfirm);
+
+  const widget = page!.blocks.find((b) => b.type === "evidence") as EvidenceBlock;
+  assert.equal(widget.editable, true);
+  assert.equal(widget.disputeId, "dp_1");
+  // Recommended (core) group first for reason=fraudulent.
+  assert.equal(widget.groups[0].key, "core");
+  assert.equal(widget.groups[0].recommended, true);
+  const desc = widget.groups[0].fields.find((f) => f.key === "product_description")!;
+  // Local draft "desc" differs from staged "Staged description" → draft state.
+  assert.equal(desc.state, "draft");
+  assert.equal(desc.draft, "desc");
+  assert.equal(desc.staged, "Staged description");
+  const uncategorized = widget.files.find((s) => s.key === "uncategorized_file")!;
+  assert.equal(uncategorized.fileId, "file_1");
+  assert.equal(widget.files.filter((s) => !s.fileId).length, 5); // the other upload slots stay offered
+
+  // Unstaged-draft warning notice present (draft differs from staged).
+  assert.ok(page!.blocks.some((b) => b.type === "notice" && /not staged at Stripe yet/.test((b as { text: string }).text)));
+});
+
+test("dispute workbench: closed dispute renders read-only (submit/accept disabled, widget not editable)", async () => {
+  const fakes = evidenceFakes({ dispute: { status: "lost", is_charge_refundable: false }, row: disputeRow({ status: "lost", closedAt: new Date() }) });
+  const section = makeDisputesSection(disputesDeps(fakes));
+  const page = await section.buildPage(disputesCtx(fakes), { page: "disputes.detail", params: { id: "dp_1" } });
+  const header = page!.blocks[0] as HeaderBlock;
+  const byKey = Object.fromEntries(header.actions!.map((a) => [a.key, a]));
+  assert.ok(byKey["section:disputes.submit"].disabledReason);
+  assert.ok(byKey["section:disputes.accept"].disabledReason);
+  assert.equal(byKey["charge.refund_full"], undefined);
+  const widget = page!.blocks.find((b) => b.type === "evidence") as EvidenceBlock;
+  assert.equal(widget.editable, false);
+});
+
+test("dispute actions: T3 gating — submit/accept demand the Discord reverse code, then run through the shared claims", async () => {
+  const fakes = evidenceFakes();
+  const section = makeDisputesSection(disputesDeps(fakes));
+
+  const noReverse = await section.action!(disputesCtx(fakes), {
+    key: "section:disputes.submit",
+    params: { disputeId: "dp_1" },
+    confirmWord: "CONFIRM",
+  });
+  assert.deepEqual(noReverse, { ok: false, needsReverse: true });
+  assert.equal(fakes.calls.claims.length, 0);
+
+  const noConfirm = await section.action!(disputesCtx(fakes), { key: "section:disputes.submit", params: { disputeId: "dp_1" } });
+  assert.equal(noConfirm.ok, false);
+  assert.match(noConfirm.error ?? "", /CONFIRM/);
+
+  const ctxWithReverse = { ...disputesCtx(fakes), reverse: { satisfied: true } } as DashboardCtx;
+  const ran = await section.action!(ctxWithReverse, {
+    key: "section:disputes.submit",
+    params: { disputeId: "dp_1" },
+    confirmWord: "CONFIRM",
+  });
+  assert.equal(ran.ok, true);
+  assert.deepEqual(fakes.calls.claims, [{ actor: "42", id: "dispute-submit-dp_1", action: "dispute_submit" }]);
+
+  const accept = await section.action!(ctxWithReverse, {
+    key: "section:disputes.accept",
+    params: { disputeId: "dp_1" },
+    confirmWord: "CONFIRM",
+  });
+  assert.equal(accept.ok, true);
+  assert.deepEqual(fakes.calls.close, ["dp_1"]);
+});
+
+test("dispute actions: draft_save validates keys; stage_group stages exactly the drafted group fields", async () => {
+  const fakes = evidenceFakes();
+  const section = makeDisputesSection(disputesDeps(fakes));
+  const ctx = disputesCtx(fakes);
+
+  const bad = await section.action!(ctx, { key: "section:disputes.draft_save", params: { disputeId: "dp_1", key: "not_a_field", value: "x" } });
+  assert.equal(bad.ok, false);
+  const saved = await section.action!(ctx, {
+    key: "section:disputes.draft_save",
+    params: { disputeId: "dp_1", key: "customer_name", value: "Grace" },
+  });
+  assert.equal(saved.ok, true);
+  assert.deepEqual(fakes.calls.merged, [{ customer_name: "Grace" }]);
+
+  // stage_group pulls the saved draft server-side — the client sends only the group key.
+  const staged = await section.action!(ctx, {
+    key: "section:disputes.stage_group",
+    params: { disputeId: "dp_1", group: "customer" },
+    confirmWord: "CONFIRM",
+  });
+  assert.equal(staged.ok, true);
+  assert.equal(fakes.calls.update.length, 1);
+  assert.equal(fakes.calls.update[0].submit, false);
+  assert.deepEqual(fakes.calls.update[0].evidence, { customer_name: "Grace" });
+
+  const emptyGroup = await section.action!(ctx, {
+    key: "section:disputes.stage_group",
+    params: { disputeId: "dp_1", group: "shipping" },
+    confirmWord: "CONFIRM",
+  });
+  assert.equal(emptyGroup.ok, false);
+  assert.match(emptyGroup.error ?? "", /Nothing drafted/);
+});
+
+test("dispute actions: file_upload takes base64 JSON (validated), file_remove clears the slot", async () => {
+  const fakes = evidenceFakes();
+  const section = makeDisputesSection(disputesDeps(fakes));
+  const ctx = disputesCtx(fakes);
+
+  const up = await section.action!(ctx, {
+    key: "section:disputes.file_upload",
+    params: {
+      disputeId: "dp_1",
+      slot: "receipt",
+      filename: "../../proof.png",
+      contentType: "image/png",
+      dataB64: Buffer.from("png-bytes").toString("base64"),
+    },
+    confirmWord: "CONFIRM",
+  });
+  assert.equal(up.ok, true);
+  assert.deepEqual(fakes.calls.upload, [{ name: ".._.._proof.png", size: 9, type: "image/png" }]);
+
+  const noPayload = await section.action!(ctx, {
+    key: "section:disputes.file_upload",
+    params: { disputeId: "dp_1", slot: "receipt", filename: "a.png", contentType: "image/png", dataB64: "" },
+    confirmWord: "CONFIRM",
+  });
+  assert.equal(noPayload.ok, false);
+
+  const rm = await section.action!(ctx, {
+    key: "section:disputes.file_remove",
+    params: { disputeId: "dp_1", slot: "uncategorized_file" },
+    confirmWord: "CONFIRM",
+  });
+  assert.equal(rm.ok, true);
+  assert.deepEqual(fakes.calls.update.at(-1)!.evidence, { uncategorized_file: "" });
+});
+
+test("disputes review page: staged read-back tables, per-file remove actions, unstaged-draft warning", async () => {
+  const fakes = evidenceFakes();
+  fakes.rowState.row = disputeRow({ evidenceDraft: { customer_name: "Unstaged Ada" } });
+  const section = makeDisputesSection(disputesDeps(fakes));
+  const page = await section.buildPage(disputesCtx(fakes), { page: "disputes.review", params: { id: "dp_1" } });
+
+  const fields = page!.blocks.find((b) => b.type === "table" && b.key === "stagedfields") as TableBlock;
+  assert.equal(fields.rows.length, 1);
+  assert.equal((fields.rows[0].cells[0] as { v: string }).v, "product_description");
+  const files = page!.blocks.find((b) => b.type === "table" && b.key === "stagedfiles") as TableBlock;
+  assert.equal(files.rows.length, 1);
+  assert.equal(files.rows[0].actions![0].key, "section:disputes.file_remove");
+  assert.ok(page!.blocks.some((b) => b.type === "notice" && /customer_name/.test((b as { text: string }).text)));
+  // Header carries the same submit ceremony as the workbench.
+  const header = page!.blocks[0] as HeaderBlock;
+  assert.equal(header.actions![0].key, "section:disputes.submit");
+});
+
+// ---- M6.3: AI draft + review via the service seams ----
+
+test("AI draft: faked runner — validators drop misshapen values, Stripe-sourced fields override the model, draft merges locally", async () => {
+  const ai = fakeAiDeps({
+    draftJson: JSON.stringify({
+      product_description: "Postiz is a social scheduler…",
+      uncategorized_text: "Narrative for the bank.",
+      duplicate_charge_id: "the customer paid twice", // not a ch_ id → dropped
+      duplicate_charge_explanation: "grace@example.com", // bare email is no explanation → dropped
+      customer_email_address: "model-hallucinated@example.com", // overridden by Stripe
+    }),
+  });
+  // reason=duplicate → requested fields = duplicate + core groups (the two
+  // validator-guarded duplicate_* fields are in the requested set).
+  const f = evidenceFakes({ ai: ai.deps, dispute: { reason: "duplicate" } });
+  const result = await f.svc.aiDraft("dp_1", null);
+  assert.equal(result.kind, "ok");
+  assert.deepEqual(result.rejected.sort(), ["duplicate_charge_explanation", "duplicate_charge_id"]);
+  assert.equal(result.model, "claude-fable-5");
+  const merged = f.calls.merged[0];
+  // Deterministic email/service_date come from Stripe, not the model.
+  assert.equal(merged.customer_email_address, "grace@example.com");
+  assert.match(merged.service_date, /^\d{4}-\d{2}-\d{2}$/);
+  assert.equal(merged.product_description, "Postiz is a social scheduler…");
+  assert.equal(merged.uncategorized_text, "Narrative for the bank.");
+  assert.equal(merged.duplicate_charge_id, undefined);
+  assert.equal(merged.duplicate_charge_explanation, undefined);
+  // The prompt carried the dispute + charge grounding.
+  assert.match(ai.seen.draftPrompts[0], /dp_1/);
+});
+
+test("AI review: staged text + files go to the light model; skipped files reported; nothing_staged early-out", async () => {
+  const ai = fakeAiDeps({ reviewText: "Weak: no activity log. Stage the draft." });
+  const f = evidenceFakes({ ai: ai.deps });
+  const r = await f.svc.aiReview("dp_1");
+  assert.equal(r.kind, "ok");
+  if (r.kind === "ok") {
+    assert.equal(r.review, "Weak: no activity log. Stage the draft.");
+    assert.equal(r.stagedFieldCount, 1);
+    assert.equal(r.filesAttached, 1);
+    assert.equal(r.filesTotal, 1);
+    assert.equal(r.model, "claude-haiku-4-5");
+  }
+  assert.deepEqual(ai.seen.reviewAttachments, [1]);
+
+  const skippy = evidenceFakes({
+    ai: fakeAiDeps().deps,
+    fileContents: async () => ({ filename: "big.pdf", sizeBytes: 9_999_999, mimeType: "application/pdf", data: null, skipped: "too_large" }),
+  });
+  const r2 = await skippy.svc.aiReview("dp_1");
+  assert.equal(r2.kind, "ok");
+  if (r2.kind === "ok") {
+    assert.equal(r2.filesAttached, 0);
+    assert.deepEqual(r2.skipped, [{ slot: "uncategorized_file", note: "too_large" }]);
+  }
+
+  const empty = evidenceFakes({ ai: fakeAiDeps().deps, dispute: { evidence: {}, evidence_details: { has_evidence: false, submission_count: 0 } } });
+  assert.deepEqual(await empty.svc.aiReview("dp_1"), { kind: "nothing_staged" });
+});
+
+test("dashboard AI actions: per-dispute lock blocks concurrent runs; review verdict renders as kv+notice blocks", async () => {
+  let release: (() => void) | null = null;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const ai = fakeAiDeps({
+    lightRun: async () => {
+      await gate;
+      return ["Verdict: looks fine."];
+    },
+  });
+  const fakes = evidenceFakes({ ai: ai.deps });
+  const section = makeDisputesSection(disputesDeps(fakes));
+  const ctx = disputesCtx(fakes);
+
+  const first = section.action!(ctx, { key: "section:disputes.ai_review", params: { disputeId: "dp_1" } });
+  await new Promise((r) => setImmediate(r)); // let the first run take the lock
+  const second = await section.action!(ctx, { key: "section:disputes.ai_review", params: { disputeId: "dp_1" } });
+  assert.equal(second.ok, false);
+  assert.match(second.error ?? "", /already in progress/);
+  release!();
+  const done = await first;
+  assert.equal(done.ok, true);
+
+  // The verdict survives the reload: detail page renders the AI kv + notice.
+  const page = await section.buildPage(ctx, { page: "disputes.detail", params: { id: "dp_1" } });
+  const kv = page!.blocks.find((b) => b.type === "kv" && b.title === "AI evidence review") as KeyValueBlock;
+  assert.ok(kv);
+  assert.deepEqual(kv.rows.find((r) => r.label === "Model")!.cell, { t: "text", v: "claude-haiku-4-5" });
+  assert.ok(page!.blocks.some((b) => b.type === "notice" && (b as { text: string }).text === "Verdict: looks fine."));
+  // The AI tools row surfaces model + budget from settings.
+  const tools = page!.blocks.find((b) => b.type === "notice" && /AI draft researches/.test((b as { text: string }).text)) as {
+    actions: Array<{ key: string }>;
+    text: string;
+  };
+  assert.match(tools.text, /claude-fable-5.*\$2.*claude-haiku-4-5/);
+  assert.deepEqual(tools.actions.map((a) => a.key), ["section:disputes.ai_draft", "section:disputes.ai_review"]);
+});
+
+// ---- M7: fraud hunts ----
+
+test("FraudHuntService: input validation is hard; fingerprint aggregates per customer w/ Discord links; amount hunt keeps declined PIs", async () => {
+  const { FraudHuntService } = await import("../../bot/billing/FraudHuntService");
+  const stripe = {
+    searchChargesByCardFingerprint: async () => ({
+      charges: [
+        { customer: "cus_a", billing_details: { email: "a@x.com" } },
+        { customer: "cus_a", billing_details: {} },
+        { customer: { id: "cus_b" }, billing_details: { email: "b@x.com" } },
+      ],
+      nextPage: "np",
+    }),
+    searchChargesByCardLast4: async () => ({
+      charges: [
+        {
+          customer: "cus_a",
+          billing_details: { email: "a@x.com" },
+          payment_method_details: { card: { brand: "visa", last4: "4242", exp_month: 4, exp_year: 2027, fingerprint: "fpA" } },
+        },
+        {
+          customer: "cus_b",
+          billing_details: {},
+          payment_method_details: { card: { brand: "visa", last4: "4242", exp_month: 4, exp_year: 2027, fingerprint: "fpA" } },
+        },
+      ],
+      nextPage: null,
+    }),
+    searchPaymentIntentsByAmount: async (amountMinor: number, currency?: string) => ({
+      paymentIntents: [
+        {
+          id: "pi_ok",
+          amount: amountMinor,
+          currency: currency ?? "eur",
+          status: "succeeded",
+          created: 1,
+          customer: "cus_a",
+          latest_charge: { billing_details: { email: "a@x.com" }, payment_method_details: { card: { brand: "visa", last4: "4242" } } },
+        },
+        {
+          id: "pi_declined",
+          amount: amountMinor,
+          currency: currency ?? "eur",
+          status: "requires_payment_method",
+          created: 2,
+          customer: null,
+          last_payment_error: { message: "Your card was declined." },
+          latest_charge: null,
+        },
+      ],
+      nextPage: null,
+    }),
+  } as unknown as StripeClient;
+  const sessionStore = { findDiscordIdsByStripeId: async (id: string) => (id === "cus_a" ? ["111"] : []) } as unknown as SessionStore;
+  const hunts = new FraudHuntService(stripe, sessionStore);
+
+  assert.equal((await hunts.usersByFingerprint("bad fp!")).ok, false);
+  assert.equal((await hunts.cardsByLast4("12a4")).ok, false);
+  assert.equal((await hunts.cardsByLast4("4242", "vi$a")).ok, false);
+  assert.equal((await hunts.paymentsByAmount("25,39")).ok, false);
+  assert.equal((await hunts.paymentsByAmount("25.39", "euro")).ok, false);
+
+  const fp = await hunts.usersByFingerprint("Xt5EWLLDS7FJjR1c");
+  assert.ok(fp.ok);
+  if (fp.ok) {
+    assert.deepEqual(fp.rows, [
+      { customerId: "cus_a", email: "a@x.com", count: 2, discordIds: ["111"] },
+      { customerId: "cus_b", email: "b@x.com", count: 1, discordIds: [] },
+    ]);
+    assert.equal(fp.hasMore, true);
+  }
+
+  const l4 = await hunts.cardsByLast4("4242", "visa");
+  assert.ok(l4.ok);
+  if (l4.ok) {
+    assert.equal(l4.rows.length, 1);
+    assert.equal(l4.rows[0].fingerprint, "fpA");
+    assert.deepEqual(l4.rows[0].customers.map((c) => c.id), ["cus_a", "cus_b"]);
+  }
+
+  const amt = await hunts.paymentsByAmount("25.39", "eur");
+  assert.ok(amt.ok);
+  if (amt.ok) {
+    assert.equal(amt.rows[0].id, "pi_ok");
+    assert.equal(amt.rows[1].status, "requires_payment_method");
+    assert.equal(amt.rows[1].failureReason, "Your card was declined.");
+  }
+});
+
+test("fraud page: EFW tab default with charge refs; card tab feeds the fingerprint filter into the hunt", async () => {
+  const { FraudHuntService } = await import("../../bot/billing/FraudHuntService");
+  const huntCalls: string[] = [];
+  const stripe = {
+    listRecentEarlyFraudWarnings: async () => [
+      { id: "issfr_1", charge: "ch_1", actionable: true, fraud_type: "made_with_stolen_card", created: 1 },
+    ],
+    searchChargesByCardFingerprint: async (fp: string) => {
+      huntCalls.push(fp);
+      return { charges: [], nextPage: null };
+    },
+  } as unknown as StripeClient;
+  const hunts = new FraudHuntService(stripe, { findDiscordIdsByStripeId: async () => [] } as unknown as SessionStore);
+  const { makeFraudSection } = await import("../sections/fraudSection");
+  const section = makeFraudSection({ hunts });
+  const ctx = { stripe } as unknown as DashboardCtx;
+
+  const efw = await section.buildPage(ctx, { page: "fraud", filters: {} });
+  const efwTable = efw!.blocks.find((b) => b.type === "table") as TableBlock;
+  assert.equal(efwTable.key, "efws");
+  assert.deepEqual(efwTable.rows[0].ref, { page: "payments.detail", params: { id: "ch_1" } });
+
+  await section.buildPage(ctx, { page: "fraud", filters: { view: "card", fp: "Xt5EWLLDS7FJjR1c" } });
+  assert.deepEqual(huntCalls, ["Xt5EWLLDS7FJjR1c"]);
+});
+
+// ---- M7: blocklist ----
+
+test("blocklist: raw-value add validates hard and runs BlockService; customer add is registry-only; unblock is T1-gated", async () => {
+  const { makeBlocklistSection } = await import("../sections/blocklistSection");
+  const blockCalls: Array<{ entries: unknown; opts: Record<string, unknown> }> = [];
+  const unblockCalls: string[] = [];
+  const blockService = {
+    block: async (entries: unknown, opts: Record<string, unknown>) => {
+      blockCalls.push({ entries, opts });
+      return [{ kind: "email", value: "bad@x.com", ok: true, alreadyBlocked: false }];
+    },
+    unblock: async (id: string) => {
+      unblockCalls.push(id);
+      return { removed: { kind: "email", value: "bad@x.com", radarItemId: "rsli_1", customerId: null } };
+    },
+  } as never;
+  const section = makeBlocklistSection({ blockService });
+  const ctx = {
+    actor: { id: "42", name: "Ada", isAdmin: true, role: "admin" },
+    billing: { actions: { effectiveMode: () => "direct" } },
+    stores: { block: { listPage: async () => ({ rows: [], total: 0 }) } },
+    audit: async () => {},
+  } as unknown as DashboardCtx;
+
+  const noConfirm = await section.action!(ctx, {
+    key: "section:blocklist.add",
+    params: { kind: "email", value: "bad@x.com", reason: "fraud ring" },
+  });
+  assert.equal(noConfirm.ok, false);
+
+  const badIp = await section.action!(ctx, {
+    key: "section:blocklist.add",
+    params: { kind: "ip_address", value: "999.1.2.3", reason: "r" },
+    confirmWord: "CONFIRM",
+  });
+  assert.equal(badIp.ok, false);
+
+  const customerKind = await section.action!(ctx, {
+    key: "section:blocklist.add",
+    params: { kind: "customer_id", value: "cus_x", reason: "r" },
+    confirmWord: "CONFIRM",
+  });
+  assert.equal(customerKind.ok, false);
+  assert.match(customerKind.error ?? "", /Block customer/);
+
+  const added = await section.action!(ctx, {
+    key: "section:blocklist.add",
+    params: { kind: "email", value: "bad@x.com", reason: "fraud ring" },
+    confirmWord: "CONFIRM",
+  });
+  assert.equal(added.ok, true);
+  assert.equal(blockCalls.length, 1);
+  assert.deepEqual(blockCalls[0].entries, [{ kind: "email", value: "bad@x.com" }]);
+  assert.equal(blockCalls[0].opts.cancelSubs, false);
+
+  const rmNoConfirm = await section.action!(ctx, { key: "section:blocklist.remove", params: { id: "row1" } });
+  assert.equal(rmNoConfirm.ok, false);
+  const rm = await section.action!(ctx, { key: "section:blocklist.remove", params: { id: "row1" }, confirmWord: "CONFIRM" });
+  assert.equal(rm.ok, true);
+  assert.deepEqual(unblockCalls, ["row1"]);
+
+  // The page renders the registry customer.block header button (T2 step-up).
+  const page = await section.buildPage(ctx, { page: "blocklist", filters: {} });
+  const header = page!.blocks[0] as HeaderBlock;
+  const custBtn = header.actions!.find((a) => a.key === "customer.block")!;
+  assert.ok(custBtn.stepUp && custBtn.dangerous);
+});
+
+// ---- M7: catalog ----
+
+test("catalog: products render avatar+default price with cursoring; coupon delete demands CONFIRM; create validates percent XOR amount", async () => {
+  const { makeCatalogSection } = await import("../sections/catalogSection");
+  const deleted: string[] = [];
+  const created: Array<Record<string, unknown>> = [];
+  const ctx = {
+    stripe: {
+      formatAmount: (a: number, c: string) => `${(a / 100).toFixed(2)} ${c.toUpperCase()}`,
+      listProducts: async (opts: { startingAfter?: string }) => ({
+        products: [
+          {
+            id: "prod_1",
+            name: "Postiz Pro",
+            description: "The scheduler",
+            active: true,
+            created: 1,
+            default_price: { unit_amount: 2900, currency: "eur", recurring: { interval: "month", interval_count: 1 } },
+          },
+        ],
+        hasMore: true,
+        _startedAfter: opts.startingAfter,
+      }),
+      listCoupons: async () => [
+        { id: "SUMMER", name: "Summer", percent_off: 25, duration: "once", times_redeemed: 3, valid: true },
+      ],
+      deleteCoupon: async (id: string) => {
+        deleted.push(id);
+      },
+      createCoupon: async (params: Record<string, unknown>) => {
+        created.push(params);
+        return { id: "NEW", duration: "once", percent_off: 10, times_redeemed: 0, valid: true };
+      },
+    },
+    audit: async () => {},
+  } as unknown as DashboardCtx;
+  const section = makeCatalogSection();
+
+  const products = await section.buildPage(ctx, { page: "catalog", filters: {} });
+  const table = products!.blocks.find((b) => b.type === "table") as TableBlock;
+  assert.equal(table.key, "products");
+  assert.deepEqual(table.rows[0].ref, { page: "catalog.detail", params: { id: "prod_1" } });
+  assert.equal((table.rows[0].cells[1] as { v: string }).v, "29.00 EUR / month");
+  assert.equal(table.nextCursor, "prod_1");
+
+  const coupons = await section.buildPage(ctx, { page: "catalog", filters: { view: "coupons" } });
+  const couponTable = coupons!.blocks.find((b) => b.type === "table") as TableBlock;
+  assert.equal(couponTable.rows[0].actions![0].key, "section:catalog.coupon_delete");
+  assert.ok(couponTable.rows[0].actions![0].dangerous);
+
+  const delNoConfirm = await section.action!(ctx, { key: "section:catalog.coupon_delete", params: { id: "SUMMER" } });
+  assert.equal(delNoConfirm.ok, false);
+  assert.deepEqual(deleted, []);
+  const del = await section.action!(ctx, { key: "section:catalog.coupon_delete", params: { id: "SUMMER" }, confirmWord: "CONFIRM" });
+  assert.equal(del.ok, true);
+  assert.deepEqual(deleted, ["SUMMER"]);
+
+  const both = await section.action!(ctx, {
+    key: "section:catalog.coupon_create",
+    params: { percentOff: "25", amountOff: "12.50 eur" },
+  });
+  assert.equal(both.ok, false);
+  const good = await section.action!(ctx, { key: "section:catalog.coupon_create", params: { percentOff: "25", duration: "repeating:3" } });
+  assert.equal(good.ok, true);
+  assert.equal(created[0].percentOff, 25);
+  assert.equal(created[0].durationInMonths, 3);
+});
+
+// ---- M7: customer editing ----
+
+test("customer editing: create/update validation, '-' clears, delete is T1+T3 and unlinks Discord afterwards", async () => {
+  const updates: Array<Record<string, unknown>> = [];
+  const deleted: string[] = [];
+  let unlinked = 0;
+  const ctx = {
+    actor: { id: "42", name: "Ada", isAdmin: true, role: "admin" },
+    stripe: {
+      createCustomer: async (p: Record<string, unknown>) => ({ id: "cus_new", ...p }),
+      updateCustomer: async (_id: string, p: Record<string, unknown>) => {
+        updates.push(p);
+        return {};
+      },
+      deleteCustomer: async (id: string) => {
+        deleted.push(id);
+      },
+    },
+    stores: {
+      session: {
+        updateStripeCustomerId: async () => true,
+        unlinkStripeCustomerEverywhere: async () => {
+          unlinked++;
+          return 2;
+        },
+      },
+    },
+    audit: async () => {},
+  } as unknown as DashboardCtx;
+  const section = makeCustomersSection();
+
+  const noIdentity = await section.action!(ctx, { key: "section:customers.create", params: {} });
+  assert.equal(noIdentity.ok, false);
+  const createdOk = await section.action!(ctx, { key: "section:customers.create", params: { email: "g@x.com" } });
+  assert.equal(createdOk.ok, true);
+  assert.match(createdOk.text ?? "", /cus_new/);
+
+  const upd = await section.action!(ctx, {
+    key: "section:customers.update",
+    params: { customerId: "cus_1", name: "Grace", description: "-" },
+  });
+  assert.equal(upd.ok, true);
+  assert.deepEqual(updates[0], { name: "Grace", description: "" });
+
+  const badLink = await section.action!(ctx, {
+    key: "section:customers.link",
+    params: { customerId: "cus_1", discordUserId: "abc" },
+    confirmWord: "CONFIRM",
+  });
+  assert.equal(badLink.ok, false);
+
+  const delNoReverse = await section.action!(ctx, {
+    key: "section:customers.delete",
+    params: { customerId: "cus_1" },
+    confirmWord: "CONFIRM",
+  });
+  assert.deepEqual(delNoReverse, { ok: false, needsReverse: true });
+  assert.deepEqual(deleted, []);
+
+  const ctxReverse = { ...ctx, reverse: { satisfied: true } } as DashboardCtx;
+  const del = await section.action!(ctxReverse, {
+    key: "section:customers.delete",
+    params: { customerId: "cus_1" },
+    confirmWord: "CONFIRM",
+  });
+  assert.equal(del.ok, true);
+  assert.deepEqual(deleted, ["cus_1"]);
+  assert.equal(unlinked, 1);
+});
+
+// ---- M7: bookmarks board ----
+
+test("bookmarks board: rows deep-link by object type and Remove toggles off", async () => {
+  const { makeBookmarksSection } = await import("../sections/bookmarksSection");
+  const toggles: Array<[string, string]> = [];
+  const ctx = {
+    actor: { id: "42", name: "Ada", isAdmin: true, role: "admin" },
+    stores: {
+      qol: {
+        listBookmarks: async () => ({
+          rows: [
+            { id: "b1", objectType: "dispute", objectId: "dp_1", label: "45.00 EUR · fraudulent", addedByName: "Ada", createdAt: new Date() },
+            { id: "b2", objectType: "charge", objectId: "ch_9", label: null, addedByName: "Bob", createdAt: new Date() },
+          ],
+          total: 2,
+        }),
+        toggleBookmark: async (type: string, id: string) => {
+          toggles.push([type, id]);
+          return { bookmarked: false };
+        },
+      },
+    },
+  } as unknown as DashboardCtx;
+  const section = makeBookmarksSection();
+  const page = await section.buildPage(ctx, { page: "bookmarks", filters: {} });
+  const table = page!.blocks[0] as TableBlock;
+  assert.deepEqual(table.rows[0].ref, { page: "disputes.detail", params: { id: "dp_1" } });
+  assert.deepEqual(table.rows[1].ref, { page: "payments.detail", params: { id: "ch_9" } });
+  const removed = await section.action!(ctx, { key: "section:bookmarks.remove", params: { type: "dispute", id: "dp_1" } });
+  assert.equal(removed.ok, true);
+  assert.deepEqual(toggles, [["dispute", "dp_1"]]);
+});
+
 test("client JS modules parse and the shell embeds them nonced", () => {
-  const combined = `${clientCore}\n${clientBlocks}\n${clientModal}\n${clientPalette}\n${clientCharts}\n${clientLogin}\nD.defaultPage="home";\n${clientApp}`;
+  const combined = `${clientCore}\n${clientBlocks}\n${clientModal}\n${clientPalette}\n${clientCharts}\n${clientEvidence}\n${clientLogin}\nD.defaultPage="home";\n${clientApp}`;
   assert.doesNotThrow(() => new Function(combined));
 
   const html = renderDashboardShell({ nonce: "test-nonce-123" });

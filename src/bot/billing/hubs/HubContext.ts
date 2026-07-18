@@ -6,6 +6,7 @@ import type { SessionManager } from "../SessionManager";
 import type { PriceBook } from "../PriceBook";
 import type { AdminAudit } from "../AdminAudit";
 import type { DisputeStore } from "../DisputeStore";
+import type { DisputeEvidenceService } from "../DisputeEvidenceService";
 import type { BlockStore } from "../BlockStore";
 import type { BlockService } from "../BlockService";
 import type { BillingQolStore } from "../BillingQolStore";
@@ -27,6 +28,9 @@ export interface HubContext {
   settingsStore: SettingsStore;
   // Dispute console + blocklist + QoL (notes/bookmarks/watch) dependencies.
   disputeStore: DisputeStore;
+  // Shared evidence domain core (catalog/staging/files/submit/accept) — the
+  // same instance backs the web dashboard's dispute workbench.
+  disputeEvidence: DisputeEvidenceService;
   blockStore: BlockStore;
   blockService: BlockService;
   qolStore: BillingQolStore;

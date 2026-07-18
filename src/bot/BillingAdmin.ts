@@ -39,6 +39,7 @@ import { ApprovalsHub } from "./billing/hubs/ApprovalsHub";
 import type { ApprovalStore } from "./billing/ApprovalStore";
 import type { BillingActionService } from "./billing/actions/BillingActionService";
 import type { DisputeStore } from "./billing/DisputeStore";
+import type { DisputeEvidenceService } from "./billing/DisputeEvidenceService";
 import type { BlockStore } from "./billing/BlockStore";
 import type { BlockService } from "./billing/BlockService";
 import type { BillingQolStore } from "./billing/BillingQolStore";
@@ -50,6 +51,7 @@ import type { IntercomClient } from "../intercom/IntercomClient";
 // Dispute-console + QoL dependencies handed through to the hubs.
 export interface BillingAdminExtras {
   disputeStore: DisputeStore;
+  disputeEvidence: DisputeEvidenceService;
   blockStore: BlockStore;
   blockService: BlockService;
   qolStore: BillingQolStore;
@@ -131,6 +133,7 @@ export class BillingAdmin {
       sessionStore: this.sessionStore,
       settingsStore: this.settingsStore,
       disputeStore: extras.disputeStore,
+      disputeEvidence: extras.disputeEvidence,
       blockStore: extras.blockStore,
       blockService: extras.blockService,
       qolStore: extras.qolStore,

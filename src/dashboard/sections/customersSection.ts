@@ -18,11 +18,12 @@ import {
   text,
 } from "./cells";
 
-// Customers: account-wide browse/search + the read-only Customer 360. M0 scope
-// is deliberately read-only — write actions (edit/create/link/block) arrive
-// with the action-gateway milestone. Layout follows the Stripe DETAIL
-// archetype: flat tables in the main column, Insights/Details/Linked accounts
-// stacked label-over-value in the right rail.
+// Customers: account-wide browse/search, the Customer 360 and (M7) the edit
+// surface — create, edit details/tax/locale/metadata, Discord↔Stripe
+// link/unlink (T1) and DELETE (typed CONFIRM + Discord reverse code, then
+// unlinkStripeCustomerEverywhere exactly like CustomersHub). Layout follows
+// the Stripe DETAIL archetype: flat tables in the main column,
+// Insights/Details/Linked accounts stacked label-over-value in the right rail.
 
 const PAGE_SIZE = 25;
 
@@ -31,19 +32,150 @@ export function makeCustomersSection(): DashboardSectionModule {
     nav: [{ key: "customers", label: "Customers", page: "customers" }],
 
     ownsPage(page: string): boolean {
-      return page === "customers" || page === "customers.detail";
+      return page === "customers" || page === "customers.detail" || page === "customers.edit";
     },
 
     async buildPage(ctx: DashboardCtx, req): Promise<SectionPage | null> {
       if (req.page === "customers") return list(ctx, req.filters ?? {}, req.cursor ?? null);
-      if (req.page === "customers.detail") {
-        const id = validId("customer", req.params?.id);
-        if (!id) return notFound("That customer id is not valid.");
-        return detail(ctx, id);
-      }
-      return null;
+      const id = validId("customer", req.params?.id);
+      if (!id) return notFound("That customer id is not valid.");
+      if (req.page === "customers.edit") return editPage(ctx, id);
+      return detail(ctx, id);
+    },
+
+    async action(ctx: DashboardCtx, req) {
+      return customerAction(ctx, req.key, req.params ?? {}, req.confirmWord);
     },
   };
+}
+
+// ---- section actions (edit / create / delete / link) ----
+
+async function customerAction(
+  ctx: DashboardCtx,
+  key: string,
+  p: Record<string, unknown>,
+  confirmWord: string | undefined
+): Promise<{ ok: boolean; text?: string; error?: string; fieldErrors?: Record<string, string>; needsReverse?: boolean }> {
+  const confirmed = confirmWord === "CONFIRM";
+
+  // Create has no target id; everything else validates one.
+  if (key === "section:customers.create") {
+    const email = str(p.email, 200).trim();
+    const name = str(p.name, 200).trim();
+    const description = str(p.description, 300).trim();
+    if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return { ok: false, fieldErrors: { email: "That doesn't look like an email address." } };
+    }
+    if (!email && !name) return { ok: false, error: "Give the customer at least a name or an email." };
+    const customer = await ctx.stripe.createCustomer({
+      ...(email ? { email } : {}),
+      ...(name ? { name } : {}),
+      ...(description ? { description } : {}),
+    });
+    await ctx.audit(`Customer created — ${customer.id} (${email || name})`);
+    return { ok: true, text: `Customer ${customer.id} created.` };
+  }
+
+  const customerId = validId("customer", p.customerId);
+  if (!customerId) return { ok: false, error: "Bad customer id." };
+
+  switch (key) {
+    // T0 — core details. Blank = keep as-is; a single "-" clears the field
+    // (web modals can't prefill text inputs, so absent ≠ clear).
+    case "section:customers.update": {
+      const updates: Stripe.CustomerUpdateParams = {};
+      const apply = (field: "name" | "email" | "description", raw: unknown, max: number) => {
+        const v = str(raw, max).trim();
+        if (!v) return;
+        (updates as Record<string, string>)[field] = v === "-" ? "" : v;
+      };
+      apply("name", p.name, 200);
+      apply("email", p.email, 200);
+      apply("description", p.description, 300);
+      if (typeof updates.email === "string" && updates.email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(updates.email)) {
+        return { ok: false, fieldErrors: { email: "That doesn't look like an email address." } };
+      }
+      if (Object.keys(updates).length === 0) return { ok: false, error: "Nothing to change — fill at least one field ('-' clears)." };
+      await ctx.stripe.updateCustomer(customerId, updates);
+      await ctx.audit(`Customer ${customerId} updated — ${Object.keys(updates).join(", ")}`);
+      return { ok: true, text: "Customer updated." };
+    }
+
+    // T0 — tax exemption + preferred locale.
+    case "section:customers.tax_locale": {
+      const taxExempt = str(p.taxExempt, 10);
+      const locale = str(p.locale, 12).trim();
+      const updates: Stripe.CustomerUpdateParams = {};
+      if (taxExempt === "none" || taxExempt === "exempt" || taxExempt === "reverse") updates.tax_exempt = taxExempt;
+      if (locale) updates.preferred_locales = locale === "-" ? [] : [locale];
+      if (Object.keys(updates).length === 0) return { ok: false, error: "Nothing to change." };
+      await ctx.stripe.updateCustomer(customerId, updates);
+      await ctx.audit(`Customer ${customerId} tax/locale updated`);
+      return { ok: true, text: "Tax settings updated." };
+    }
+
+    // T0 — metadata: key=value per line; a single "-" clears everything.
+    case "section:customers.metadata": {
+      const raw = str(p.metadata, 2000).trim();
+      if (!raw) return { ok: false, error: "Enter key=value lines, or '-' to clear all metadata." };
+      if (raw === "-") {
+        await ctx.stripe.updateCustomer(customerId, { metadata: "" });
+        await ctx.audit(`Customer ${customerId} metadata cleared`);
+        return { ok: true, text: "Metadata cleared." };
+      }
+      const metadata: Record<string, string> = {};
+      for (const line of raw.split("\n")) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        const eq = trimmed.indexOf("=");
+        if (eq <= 0) return { ok: false, fieldErrors: { metadata: `"${trimmed.slice(0, 40)}" is not key=value.` } };
+        const k = trimmed.slice(0, eq).trim();
+        const v = trimmed.slice(eq + 1).trim();
+        if (!k || k.length > 40 || v.length > 500) return { ok: false, fieldErrors: { metadata: `"${k.slice(0, 40)}" — keys ≤40 chars, values ≤500.` } };
+        metadata[k] = v;
+      }
+      if (Object.keys(metadata).length === 0) return { ok: false, error: "No key=value lines found." };
+      await ctx.stripe.updateCustomer(customerId, { metadata });
+      await ctx.audit(`Customer ${customerId} metadata updated — ${Object.keys(metadata).length} key(s)`);
+      return { ok: true, text: `Metadata updated (${Object.keys(metadata).length} key(s)).` };
+    }
+
+    // T1 — link a Discord user to this Stripe customer.
+    case "section:customers.link": {
+      if (!confirmed) return { ok: false, error: "Type CONFIRM to run this action." };
+      const discordId = str(p.discordUserId, 32).trim();
+      if (!/^\d{5,32}$/.test(discordId)) return { ok: false, fieldErrors: { discordUserId: "Discord user ids are 5-32 digits." } };
+      const updated = await ctx.stores.session.updateStripeCustomerId(discordId, customerId);
+      if (!updated) {
+        return { ok: false, error: "That Discord user has no session row yet — they need to interact with the bot once first." };
+      }
+      await ctx.audit(`Linked Discord ${discordId} ↔ ${customerId}`);
+      return { ok: true, text: `Linked Discord user ${discordId} to ${customerId}.` };
+    }
+
+    // T1 — clear the link on every Discord user pointing at this customer.
+    case "section:customers.unlink": {
+      if (!confirmed) return { ok: false, error: "Type CONFIRM to run this action." };
+      const cleared = await ctx.stores.session.unlinkStripeCustomerEverywhere(customerId);
+      await ctx.audit(`Unlinked ${customerId} from ${cleared} Discord user session(s)`);
+      return { ok: true, text: cleared ? `Cleared the link on ${cleared} Discord user session(s).` : "No Discord users were linked." };
+    }
+
+    // T1 + T3 — delete the customer in Stripe (permanent, cancels subs),
+    // then clear every Discord link — exactly the CustomersHub sequence.
+    case "section:customers.delete": {
+      if (!confirmed) return { ok: false, error: "Type CONFIRM to run this action." };
+      if (!ctx.reverse?.satisfied) return { ok: false, needsReverse: true };
+      await ctx.stripe.deleteCustomer(customerId);
+      const unlinked = await ctx.stores.session.unlinkStripeCustomerEverywhere(customerId);
+      await ctx.audit(`Customer ${customerId} DELETED in Stripe${unlinked ? ` — cleared the link on ${unlinked} Discord user session(s)` : ""}`);
+      return { ok: true, text: `Customer ${customerId} deleted in Stripe.${unlinked ? ` Cleared ${unlinked} Discord link(s).` : ""}` };
+    }
+
+    default:
+      return { ok: false, error: "Unknown action." };
+  }
 }
 
 async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: string | null): Promise<SectionPage> {
@@ -91,7 +223,25 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
     notice,
   };
 
-  return { title: "Customers", crumbs: [{ label: "Customers" }], blocks: [table] };
+  const header: Block = {
+    type: "header",
+    title: "Customers",
+    actions: [
+      {
+        key: "section:customers.create",
+        label: "New customer",
+        style: "primary",
+        inputs: [
+          { type: "text", key: "email", label: "Email" },
+          { type: "text", key: "name", label: "Name" },
+          { type: "text", key: "description", label: "Description (internal)" },
+        ],
+        summary: "Creates a Stripe customer (at least a name or an email).",
+      },
+    ],
+  };
+
+  return { title: "Customers", crumbs: [{ label: "Customers" }], blocks: [header, table] };
 }
 
 async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
@@ -362,6 +512,7 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
       ],
       rows: disputes.map((d) => ({
         id: d.id,
+        ref: { page: "disputes.detail", params: { id: d.id } },
         cells: [
           amount(ctx.stripe, d.amount, d.currency, {
             kind: d.status.includes("needs_response") ? "error" : d.status === "won" ? "ok" : "info",
@@ -373,7 +524,6 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
         ] as Cell[],
       })),
       footer: `${disputes.length} result${disputes.length === 1 ? "" : "s"}`,
-      notice: "Local mirror — manage disputes in /billing → Disputes until the web console ships.",
     });
   }
 
@@ -391,6 +541,15 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
     });
   }
 
+  // ---- rail: manage (M7 edit surface) ----
+  rail.push({
+    type: "kv",
+    title: "Manage",
+    rows: [
+      { label: "Edit", cell: { t: "link", v: "Edit customer →", ref: { page: "customers.edit", params: { id } } } as Cell },
+    ],
+  });
+
   return {
     title,
     crumbs: [
@@ -399,6 +558,127 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
     ],
     blocks: main,
     rail,
+  };
+}
+
+// ---- EDIT page (M7): current values + the edit/link/delete action set ----
+
+async function editPage(ctx: DashboardCtx, id: string): Promise<SectionPage> {
+  const customer = await ctx.stripe.getCustomer(id).catch(() => null);
+  if (!customer || customer.deleted) return notFound("This customer does not exist (or was deleted).");
+  const discordIds = await ctx.stores.session.findDiscordIdsByStripeId(id).catch(() => [] as string[]);
+
+  const actions = [
+    {
+      key: "section:customers.update",
+      label: "Edit details",
+      style: "primary" as const,
+      params: { customerId: id },
+      inputs: [
+        { type: "text" as const, key: "name", label: `Name (now: ${customer.name ?? "—"}) — blank keeps, '-' clears` },
+        { type: "text" as const, key: "email", label: `Email (now: ${customer.email ?? "—"})` },
+        { type: "text" as const, key: "description", label: `Description (now: ${customer.description?.slice(0, 60) ?? "—"})` },
+      ],
+      summary: "Blank fields stay unchanged; a single '-' clears the field.",
+    },
+    {
+      key: "section:customers.tax_locale",
+      label: "Tax & locale",
+      params: { customerId: id },
+      inputs: [
+        {
+          type: "select" as const,
+          key: "taxExempt",
+          label: "Tax exemption",
+          value: customer.tax_exempt ?? "none",
+          options: [
+            { value: "none", label: "None (taxable)" },
+            { value: "exempt", label: "Exempt" },
+            { value: "reverse", label: "Reverse charge" },
+          ],
+        },
+        { type: "text" as const, key: "locale", label: `Preferred locale (now: ${customer.preferred_locales?.[0] ?? "—"}) — '-' clears` },
+      ],
+    },
+    {
+      key: "section:customers.metadata",
+      label: "Metadata",
+      params: { customerId: id },
+      inputs: [
+        { type: "text" as const, key: "metadata", label: "key=value per line — '-' alone clears ALL metadata", multiline: true, maxLength: 2000 },
+      ],
+      summary: "Replaces the listed keys (other keys survive); '-' wipes everything.",
+    },
+    {
+      key: "section:customers.link",
+      label: "Link Discord user",
+      dangerous: true,
+      params: { customerId: id },
+      inputs: [{ type: "text" as const, key: "discordUserId", label: "Discord user id (digits)" }],
+      summary: "Points that Discord user's session at this Stripe customer — self-service billing then acts on it.",
+    },
+    {
+      key: "section:customers.unlink",
+      label: "Unlink Discord",
+      dangerous: true,
+      params: { customerId: id },
+      summary: `Clears the Stripe link on every Discord user currently pointing at ${id}.`,
+      ...(discordIds.length === 0 ? { disabledReason: "No Discord users are linked to this customer." } : {}),
+    },
+    {
+      key: "section:customers.delete",
+      label: "Delete customer",
+      style: "danger" as const,
+      dangerous: true,
+      reverseConfirm: true,
+      params: { customerId: id },
+      summary: `Permanently deletes ${id} in Stripe — active subscriptions are canceled and this cannot be undone. Discord links are cleared afterwards. Needs the Discord reverse code (/billing → Show destructive-action code).`,
+    },
+  ];
+
+  const metaEntries = Object.entries(customer.metadata ?? {});
+  const blocks: Block[] = [
+    {
+      type: "header",
+      title: customer.name || customer.email || id,
+      sub: "Edit customer",
+      id,
+      actions,
+    },
+    {
+      type: "kv",
+      title: "Current values",
+      rows: [
+        { label: "Name", cell: text(customer.name ?? "—") },
+        { label: "Email", cell: text(customer.email ?? "—") },
+        { label: "Description", cell: text(customer.description ?? "—") },
+        { label: "Tax exemption", cell: text(customer.tax_exempt ?? "none") },
+        { label: "Locale", cell: text(customer.preferred_locales?.[0] ?? "—") },
+        {
+          label: "Discord links",
+          cell: discordIds.length ? text(discordIds.map((d) => `@${d}`).join(", ")) : text("none"),
+        },
+      ],
+    },
+    ...(metaEntries.length
+      ? [
+          {
+            type: "kv",
+            title: `Metadata (${metaEntries.length})`,
+            rows: metaEntries.slice(0, 20).map(([k, v]) => ({ label: k, cell: text(String(v).slice(0, 120)) })),
+          } as Block,
+        ]
+      : []),
+  ];
+
+  return {
+    title: "Edit customer",
+    crumbs: [
+      { label: "Customers", ref: { page: "customers" } },
+      { label: customer.email ?? id, ref: { page: "customers.detail", params: { id } } },
+      { label: "Edit", copyId: id },
+    ],
+    blocks,
   };
 }
 

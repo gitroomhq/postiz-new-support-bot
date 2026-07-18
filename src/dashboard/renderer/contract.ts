@@ -155,6 +155,54 @@ export interface ChartBlock {
   kind: "area" | "bars" | "line";
   window: string; // "7d" | "30d" | "90d" — baked from the page's window filter
 }
+// Stripe tab row under the H1 (active = blurple underline). Tabs write a page
+// filter, exactly like count-cards — value "" is the first/default tab.
+export interface TabsBlock {
+  type: "tabs";
+  key: string; // filter key the tabs steer ("view")
+  value?: string; // active tab value (echoed back; "" = default)
+  items: Array<{ value: string; label: string; badge?: string }>;
+}
+
+// ---- dispute evidence workbench (M6.2) ----
+
+// One text-evidence field with its full lifecycle state. draft carries the
+// LOCAL draft value, staged what Stripe holds; the client shows draft ?? staged
+// in the control and autosaves edits back to the draft on blur.
+export interface EvidenceFieldView {
+  key: string; // the Stripe evidence key ("product_description")
+  label: string;
+  multiline: boolean;
+  state: "empty" | "draft" | "staged" | "submitted"; // draft = local draft differs from staged
+  draft?: string;
+  staged?: string;
+}
+export interface EvidenceGroupView {
+  key: string; // catalog group key ("core")
+  label: string;
+  recommended?: boolean; // ⭐ for this dispute's reason; rendered open
+  fields: EvidenceFieldView[];
+}
+// One FILE evidence slot; fileId present = a proof is staged there.
+export interface EvidenceFileSlotView {
+  key: string;
+  label: string;
+  fileId?: string;
+}
+// The interactive evidence editor. Field edits autosave to the local draft
+// (section action, T0); staging/upload/remove are separate ceremonied actions
+// the client builds from the baked ids. Files travel as base64 JSON on the
+// normal api route — never multipart.
+export interface EvidenceBlock {
+  type: "evidence";
+  disputeId: string;
+  editable: boolean; // respondable: controls + stage/upload enabled
+  submitted: boolean; // at least one past submission
+  groups: EvidenceGroupView[];
+  files: EvidenceFileSlotView[];
+  maxFileBytes: number;
+  fileTypes: string[]; // accepted MIME types for proofs
+}
 
 export type Block =
   | HeaderBlock
@@ -165,7 +213,9 @@ export type Block =
   | NoticeBlock
   | EmptyBlock
   | QrBlock
-  | ChartBlock;
+  | ChartBlock
+  | TabsBlock
+  | EvidenceBlock;
 
 // ---- series endpoint payloads (chart hydration) ----
 

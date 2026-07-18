@@ -15,10 +15,7 @@ import { embed as makeEmbed, COLORS } from "../../../util/embeds";
 import { Logger } from "../../../util/logger";
 import { safeFetch } from "../../../util/safeFetch";
 import { exportBillingEvent } from "../../../metrics/MetricsExporter";
-import { buildDisputeEvidencePrompt, buildDisputeEvidenceReviewPrompt } from "../../aiPrompts";
-import type { LightAiAttachment } from "../../LightAiRunner";
-import { attachReceiptEvidence } from "../receiptEvidence";
-import { btn, buttonRow, selectRow, subPlanLabel, textInput } from "../ui";
+import { btn, buttonRow, selectRow, textInput } from "../ui";
 import { buildNoteModal, renderNotesPanel } from "../qolUi";
 import { showRefundConfirm } from "./ChargesHub";
 import { reconcileDisputes } from "../DisputeMonitor";
@@ -31,6 +28,16 @@ import {
   type ClosedDisputeFilter,
   type OpenDisputeFilter,
 } from "../DisputeStore";
+import {
+  EVIDENCE_FILE_KEYS,
+  EVIDENCE_FILE_SLOTS,
+  EVIDENCE_GROUPS,
+  EVIDENCE_KEY_SET,
+  PROOF_MAX_BYTES,
+  PROOF_TYPES,
+  recommendedGroupKeys,
+  type EvidenceGroup,
+} from "../DisputeEvidenceService";
 import {
   pushNav,
   type BillAdminSession,
@@ -56,138 +63,9 @@ const TERMINAL = new Set(["won", "lost", "prevented", "warning_closed"]);
 
 const PAGE_SIZE = 10;
 
-interface EvidenceFieldSpec {
-  key: string;
-  label: string;
-  style: TextInputStyle;
-}
-
-// Full Stripe TEXT-evidence coverage, split into ≤5-field groups (Discord's
-// modal budget). The evidence editor lists the groups; picking one opens its
-// modal. Field keys ARE the Stripe evidence keys (DisputeUpdateParams.Evidence),
-// so the modals round-trip 1:1 with what's staged.
-interface EvidenceGroup {
-  key: string;
-  label: string;
-  emoji: string;
-  fields: EvidenceFieldSpec[];
-}
-
-const EVIDENCE_GROUPS: EvidenceGroup[] = [
-  {
-    key: "core",
-    label: "Core response",
-    emoji: "📝",
-    fields: [
-      { key: "product_description", label: "Product / service description", style: TextInputStyle.Paragraph },
-      { key: "customer_email_address", label: "Customer email", style: TextInputStyle.Short },
-      { key: "service_date", label: "Service date", style: TextInputStyle.Short },
-      { key: "access_activity_log", label: "Access / usage activity log", style: TextInputStyle.Paragraph },
-      { key: "uncategorized_text", label: "Response narrative", style: TextInputStyle.Paragraph },
-    ],
-  },
-  {
-    key: "policy",
-    label: "Policies & rebuttal",
-    emoji: "📜",
-    fields: [
-      { key: "refund_policy_disclosure", label: "Refund policy disclosure", style: TextInputStyle.Paragraph },
-      { key: "refund_refusal_explanation", label: "Refund refusal explanation", style: TextInputStyle.Paragraph },
-      { key: "cancellation_policy_disclosure", label: "Cancellation policy disclosure", style: TextInputStyle.Paragraph },
-      { key: "cancellation_rebuttal", label: "Cancellation rebuttal", style: TextInputStyle.Paragraph },
-    ],
-  },
-  {
-    key: "customer",
-    label: "Customer identity",
-    emoji: "👤",
-    fields: [
-      { key: "customer_name", label: "Customer name", style: TextInputStyle.Short },
-      { key: "billing_address", label: "Billing address", style: TextInputStyle.Paragraph },
-      { key: "customer_purchase_ip", label: "Customer purchase IP", style: TextInputStyle.Short },
-    ],
-  },
-  {
-    key: "duplicate",
-    label: "Duplicate charge",
-    emoji: "🔁",
-    fields: [
-      { key: "duplicate_charge_id", label: "Original (non-duplicate) charge id", style: TextInputStyle.Short },
-      { key: "duplicate_charge_explanation", label: "Why the charges are distinct", style: TextInputStyle.Paragraph },
-    ],
-  },
-  {
-    key: "shipping",
-    label: "Shipping (physical goods)",
-    emoji: "📦",
-    fields: [
-      { key: "shipping_carrier", label: "Carrier", style: TextInputStyle.Short },
-      { key: "shipping_tracking_number", label: "Tracking number", style: TextInputStyle.Short },
-      { key: "shipping_date", label: "Shipping date", style: TextInputStyle.Short },
-      { key: "shipping_address", label: "Shipping address", style: TextInputStyle.Paragraph },
-    ],
-  },
-];
-
-const POLICY_REASONS = new Set(["subscription_canceled", "credit_not_processed"]);
-const EVIDENCE_KEYS = new Set<string>(TEXT_EVIDENCE_KEYS);
-
-// Which groups matter most for a given dispute reason — the editor lists them
-// first with a ⭐ and the AI draft fills exactly their fields.
-function recommendedGroupKeys(reason: string | null | undefined): string[] {
-  if (POLICY_REASONS.has(reason ?? "")) return ["core", "policy"];
-  if (reason === "duplicate") return ["duplicate", "core"];
-  if (reason === "product_not_received") return ["core", "shipping"];
-  return ["core"];
-}
-
-// FILE evidence slots (Stripe file ids, distinct from the *_disclosure text
-// fields) — where an uploaded screenshot/PDF proof lands.
-const EVIDENCE_FILE_SLOTS: Array<{ key: string; label: string }> = [
-  { key: "uncategorized_file", label: "Uncategorized file (general proof)" },
-  { key: "receipt", label: "Receipt" },
-  { key: "customer_communication", label: "Customer communication" },
-  { key: "service_documentation", label: "Service documentation / usage proof" },
-  { key: "refund_policy", label: "Refund policy (file)" },
-  { key: "cancellation_policy", label: "Cancellation policy (file)" },
-];
-const EVIDENCE_FILE_KEYS = [
-  "receipt",
-  "customer_communication",
-  "customer_signature",
-  "service_documentation",
-  "shipping_documentation",
-  "duplicate_charge_documentation",
-  "refund_policy",
-  "cancellation_policy",
-  "uncategorized_file",
-] as const;
-// Stripe dispute_evidence uploads accept PDF/JPEG/PNG; combined evidence is
-// capped around 4.5MB, so individual proofs are held to 4MB.
-const PROOF_TYPES = new Set(["image/png", "image/jpeg", "application/pdf"]);
-const PROOF_MAX_BYTES = 4 * 1024 * 1024;
-
-// Field keys the AI draft fills: the union of the reason's recommended groups.
-function aiDraftFieldsFor(reason: string | null | undefined): string[] {
-  const groups = recommendedGroupKeys(reason);
-  return EVIDENCE_GROUPS.filter((g) => groups.includes(g.key)).flatMap((g) => g.fields.map((f) => f.key));
-}
-
-// Shape guards for the AI draft's structured fields — the model has spilled
-// narrative text into duplicate_charge_id and an email into the explanation
-// before; values that can't possibly be what the field means are dropped
-// instead of saved (a missing field beats a provably wrong one at the bank).
-const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-const DATEISH_RE = /\d{4}-\d{2}-\d{2}|\d{1,2}[./ ]\d{1,2}[./ ]\d{2,4}/;
-const AI_DRAFT_VALIDATORS: Record<string, (v: string) => boolean> = {
-  duplicate_charge_id: (v) => CHARGE_ID_RE.test(v),
-  // A bare email/id is not an explanation of why two charges are distinct.
-  duplicate_charge_explanation: (v) => !EMAIL_RE.test(v) && !CHARGE_ID_RE.test(v),
-  customer_email_address: (v) => EMAIL_RE.test(v),
-  service_date: (v) => v.length <= 80 && DATEISH_RE.test(v),
-  shipping_date: (v) => v.length <= 80 && DATEISH_RE.test(v),
-  customer_purchase_ip: (v) => IPV4_RE.test(v) || IPV6ISH_RE.test(v),
-};
+// Discord modal input style for a shared (transport-neutral) field spec.
+const fieldStyle = (f: { multiline: boolean }): TextInputStyle =>
+  f.multiline ? TextInputStyle.Paragraph : TextInputStyle.Short;
 
 // Overview filter values round-trip through the select as "all" | "s:<status>"
 // | "r:<reason>"; history uses "all" | "o:<outcome>" | "r:<reason>".
@@ -363,7 +241,7 @@ export class DisputesHub {
             new ActionRowBuilder<TextInputBuilder>().addComponents(
               textInput(field.key, field.label, {
                 required: false,
-                style: field.style,
+                style: fieldStyle(field),
                 maxLength: 4000,
                 value: draft[field.key] ?? stagedValue,
               })
@@ -389,7 +267,7 @@ export class DisputesHub {
         for (const [id, component] of interaction.fields.fields) {
           if (!("value" in component) || typeof component.value !== "string") continue;
           const value = component.value.trim();
-          if (value && EVIDENCE_KEYS.has(id)) evidence[id] = value;
+          if (value && EVIDENCE_KEY_SET.has(id)) evidence[id] = value;
         }
         await this.ctx.sessions.ackModal(interaction);
         await this.ctx.sessions.tryRender(interaction, async () => {
@@ -397,14 +275,9 @@ export class DisputesHub {
             await this.renderEvidenceEditor(interaction, token, "Nothing to save — all evidence fields were empty.");
             return;
           }
-          await this.ctx.disputeStore.mergeEvidenceDraft(disputeId, evidence);
+          await this.ctx.disputeEvidence.saveDraft(disputeId, evidence);
           // submit:false stages at Stripe without sending to the bank.
-          await this.ctx.stripe.updateDisputeEvidence(
-            disputeId,
-            evidence as Stripe.DisputeUpdateParams.Evidence,
-            false,
-            `billadmin-dpstage-${interaction.id}`
-          );
+          await this.ctx.disputeEvidence.stageFields(disputeId, evidence, interaction.id);
           this.ctx.audit.log(interaction, {
             action: "Dispute evidence staged",
             targetCustomerId: session.customerId,
@@ -471,32 +344,18 @@ export class DisputesHub {
         const disputeId = session.disputeId;
         await interaction.deferUpdate();
         await this.ctx.sessions.runExclusive(token, interaction, async () => {
-          // Live re-check right before the irreversible call: another admin (or
-          // the Dashboard) may have submitted/closed while the confirm sat open.
-          const fresh = await this.ctx.stripe.getDispute(disputeId);
-          if (!RESPONDABLE.has(fresh.status)) {
-            await this.renderDetail(interaction, token, `⚠️ Status changed to **${fresh.status}** — nothing was submitted.`);
+          // Live re-check + cross-admin claim + submit live in the shared
+          // service (runExclusive only serializes this panel session).
+          const outcome = await this.ctx.disputeEvidence.submit(disputeId, interaction.user.id, session.customerId ?? null);
+          if (outcome.kind === "not_respondable") {
+            await this.renderDetail(interaction, token, `⚠️ Status changed to **${outcome.status}** — nothing was submitted.`);
             return;
           }
-          // Cross-admin claim (runExclusive only serializes this panel session).
-          const claimed = await this.ctx.sessionStore.claimBillingAction(
-            interaction.user.id,
-            `dispute-submit-${disputeId}`,
-            "dispute_submit"
-          );
-          if (!claimed) {
+          if (outcome.kind === "already_claimed") {
             await this.renderDetail(interaction, token, "⚠️ Evidence for this dispute was already submitted via the bot.");
             return;
           }
-          let result: Stripe.Dispute;
-          try {
-            result = await this.ctx.stripe.updateDisputeEvidence(disputeId, {}, true, `billadmin-dpsubmit-${disputeId}`);
-          } catch (error) {
-            await this.ctx.sessionStore.releaseBillingAction(`dispute-submit-${disputeId}`).catch(() => {});
-            throw error;
-          }
-          await this.ctx.disputeStore.markSubmitted(disputeId);
-          await this.ctx.disputeStore.upsertFromStripe(result, session.customerId ?? null);
+          const result = outcome.dispute;
           this.ctx.audit.log(interaction, {
             action: "Dispute evidence submitted",
             targetCustomerId: session.customerId,
@@ -593,18 +452,17 @@ export class DisputesHub {
         if (!(EVIDENCE_FILE_KEYS as readonly string[]).includes(slot)) return;
         await interaction.deferUpdate();
         await this.ctx.sessions.runExclusive(token, interaction, async () => {
-          const fresh = await this.ctx.stripe.getDispute(disputeId);
-          if (!RESPONDABLE.has(fresh.status)) {
-            await this.renderReviewStaged(interaction, token, 0, `⚠️ Status is **${fresh.status}** — evidence can no longer be changed.`);
+          // Emptyable field: "" detaches the file from the dispute (status
+          // re-check inside the service).
+          const outcome = await this.ctx.disputeEvidence.removeFile(disputeId, slot, interaction.id);
+          if (outcome.kind === "not_respondable") {
+            await this.renderReviewStaged(interaction, token, 0, `⚠️ Status is **${outcome.status}** — evidence can no longer be changed.`);
             return;
           }
-          // Emptyable field: "" detaches the file from the dispute.
-          await this.ctx.stripe.updateDisputeEvidence(
-            disputeId,
-            { [slot]: "" } as Stripe.DisputeUpdateParams.Evidence,
-            false,
-            `billadmin-dpfrm-${interaction.id}`
-          );
+          if (outcome.kind === "invalid") {
+            await this.renderReviewStaged(interaction, token, 0, `⚠️ ${outcome.error}`);
+            return;
+          }
           this.ctx.audit.log(interaction, {
             action: "Dispute evidence file removed",
             targetCustomerId: session.customerId,
@@ -764,23 +622,28 @@ export class DisputesHub {
 
         await this.ctx.sessions.ackModal(interaction);
         await this.ctx.sessions.runExclusive(token, interaction, async () => {
-          // Guard: file evidence is rejected by Stripe once the response window
-          // closed — re-check live before uploading.
-          const fresh = await this.ctx.stripe.getDispute(disputeId);
-          if (!RESPONDABLE.has(fresh.status)) {
-            await this.renderDetail(interaction, token, `⚠️ Status is **${fresh.status}** — evidence files can no longer be attached.`);
-            return;
-          }
           const res = await safeFetch(attachment.url, { allowHosts: [".discordapp.com", ".discordapp.net"] });
           if (!res.ok) throw new Error(`Discord CDN download failed (${res.status})`);
           const data = Buffer.from(await res.arrayBuffer());
-          const file = await this.ctx.stripe.uploadDisputeEvidenceFile(attachment.name, data, contentType);
-          await this.ctx.stripe.updateDisputeEvidence(
+          // Upload + stage via the shared service (live status re-check inside:
+          // Stripe rejects file evidence once the response window closed).
+          const outcome = await this.ctx.disputeEvidence.uploadProof(
             disputeId,
-            { [slot]: file.id } as Stripe.DisputeUpdateParams.Evidence,
-            false,
-            `billadmin-dpfile-${interaction.id}`
+            slot,
+            attachment.name,
+            data,
+            contentType,
+            interaction.id
           );
+          if (outcome.kind === "not_respondable") {
+            await this.renderDetail(interaction, token, `⚠️ Status is **${outcome.status}** — evidence files can no longer be attached.`);
+            return;
+          }
+          if (outcome.kind === "invalid") {
+            await this.renderDetail(interaction, token, `⚠️ ${outcome.error}`);
+            return;
+          }
+          const file = outcome.file!;
           this.ctx.audit.log(interaction, {
             action: "Dispute evidence file staged",
             targetCustomerId: session.customerId,
@@ -842,23 +705,12 @@ export class DisputesHub {
         const disputeId = session.disputeId;
         await interaction.deferUpdate();
         await this.ctx.sessions.runExclusive(token, interaction, async () => {
-          const claimed = await this.ctx.sessionStore.claimBillingAction(
-            interaction.user.id,
-            `dispute-accept-${disputeId}`,
-            "dispute_accept"
-          );
-          if (!claimed) {
+          const outcome = await this.ctx.disputeEvidence.accept(disputeId, interaction.user.id, session.customerId ?? null);
+          if (outcome.kind === "already_claimed") {
             await this.renderDetail(interaction, token, "⚠️ This dispute was already accepted via the bot.");
             return;
           }
-          let result: Stripe.Dispute;
-          try {
-            result = await this.ctx.stripe.closeDispute(disputeId, `billadmin-dpclose-${disputeId}`);
-          } catch (error) {
-            await this.ctx.sessionStore.releaseBillingAction(`dispute-accept-${disputeId}`).catch(() => {});
-            throw error;
-          }
-          await this.ctx.disputeStore.upsertFromStripe(result, session.customerId ?? null);
+          const result = outcome.dispute;
           this.ctx.audit.log(interaction, {
             action: "Dispute accepted",
             targetCustomerId: session.customerId,
@@ -2054,162 +1906,21 @@ export class DisputesHub {
 
   // ---- AI evidence draft (saves a LOCAL draft only) ----
 
+  // The whole pipeline (context gathering, CLI run, validators, receipt
+  // backfill) lives in the shared service — this wrapper only audits + renders.
   private async runAiDraft(interaction: ButtonInteraction, token: string): Promise<void> {
     const session = this.ctx.sessions.get(token);
     if (!session?.disputeId) return;
-    const dispute = await this.ctx.stripe.getDispute(session.disputeId);
-    const chargeId = typeof dispute.charge === "string" ? dispute.charge : (dispute.charge?.id ?? null);
-    const charge = chargeId ? await this.ctx.stripe.getCharge(chargeId).catch(() => null) : null;
-    const customerId = charge
-      ? typeof charge.customer === "string"
-        ? charge.customer
-        : (charge.customer?.id ?? null)
-      : (session.customerId ?? null);
-    const customer = customerId ? await this.ctx.stripe.getCustomer(customerId).catch(() => null) : null;
-    const subs = customerId ? await this.ctx.stripe.listSubscriptions(customerId).catch(() => []) : [];
-
-    // Real customer-communication material + few-shot exemplars from past
-    // wins; both are best-effort — the draft still runs when they're missing.
-    const [intercomHistory, wonExemplars] = await Promise.all([
-      this.collectIntercomHistory(customerId, customer?.email ?? null).catch((error) => {
-        logger.warn("intercom history lookup failed", { error: String(error) });
-        return null;
-      }),
-      this.ctx.disputeStore.wonEvidenceExemplars(dispute.reason || "unknown", 2).catch(() => []),
-    ]);
-
-    const iso = (unix: number) => new Date(unix * 1000).toISOString().slice(0, 10);
-
-    // Fields with exactly one correct value come from Stripe, not the model —
-    // they're removed from the requested set entirely so there is nothing to
-    // hallucinate (the screenshot bug: an email drafted into the duplicate
-    // explanation, narrative text into the charge-id field).
-    const deterministic: Record<string, string> = {};
-    if (customer?.email) deterministic.customer_email_address = customer.email;
-    if (charge) deterministic.service_date = iso(charge.created);
-
-    // reason=duplicate: the only truthful duplicate_charge_id is another REAL
-    // charge on this customer with the same amount — look it up and hand the
-    // candidates to the model (or the explicit "none exist" fact).
-    let duplicateCandidates: Array<{ id: string; amountText: string; created: string; description: string | null }> = [];
-    if (dispute.reason === "duplicate" && customerId && charge) {
-      const { charges } = await this.ctx.stripe.listCharges(customerId, 100).catch(() => ({ charges: [], hasMore: false }));
-      duplicateCandidates = charges
-        .filter((c) => c.id !== charge.id && c.status === "succeeded" && c.currency === charge.currency && c.amount === charge.amount)
-        .slice(0, 3)
-        .map((c) => ({
-          id: c.id,
-          amountText: this.ctx.stripe.formatAmount(c.amount, c.currency),
-          created: iso(c.created),
-          description: c.description ?? null,
-        }));
-    }
-
-    const fields = aiDraftFieldsFor(dispute.reason).filter((f) => !(f in deterministic));
-    const prompt = buildDisputeEvidencePrompt({
-      disputeId: dispute.id,
-      reason: dispute.reason || "unknown",
-      status: dispute.status,
-      amountText: this.ctx.stripe.formatAmount(dispute.amount, dispute.currency),
-      disputeCreated: iso(dispute.created),
-      evidenceDueBy: dispute.evidence_details?.due_by ? iso(dispute.evidence_details.due_by) : null,
-      charge: charge
-        ? {
-            id: charge.id,
-            created: iso(charge.created),
-            amountText: this.ctx.stripe.formatAmount(charge.amount, charge.currency),
-            description: charge.description ?? null,
-            cardBrand: charge.payment_method_details?.card?.brand ?? null,
-            cardLast4: charge.payment_method_details?.card?.last4 ?? null,
-          }
-        : null,
-      customer: customer
-        ? { id: customer.id, email: customer.email ?? null, name: customer.name ?? null, created: iso(customer.created) }
-        : null,
-      subscriptions: subs.slice(0, 5).map((sub) => ({
-        plan: subPlanLabel(this.ctx.stripe, sub),
-        status: sub.status,
-        started: iso(sub.created),
-      })),
-      fields,
-      intercomHistory,
-      wonExemplars,
-      duplicateCandidates,
-    });
-
-    // Claude Code CLI run with Read/Glob/Grep over the cloned Postiz source +
-    // docs (same knowledge base as /ai), bounded by the /config → AI ask
-    // levers. Filling policy fields requires actually finding the terms.
-    const effortRaw = this.ctx.settingsStore.aiEffortAsk();
-    const effort = effortRaw === "low" || effortRaw === "high" || effortRaw === "max" ? effortRaw : "medium";
-    const messages = await this.ctx.claudeRunner.run(prompt, undefined, {
-      promptPrefix: null,
-      model: this.ctx.settingsStore.aiModel(),
-      effort,
-      maxBudgetUsd: this.ctx.settingsStore.aiMaxBudgetUsdAsk(),
-      timeoutMs: 300_000,
-      telemetry: { agentName: "ai-dispute-evidence", kind: "staff_command" },
-    });
-
-    // The final message carries the JSON; earlier ones are research narration.
-    // Scan backwards for the first parseable object; fall back to the raw tail
-    // as the uncategorized narrative rather than losing the run.
-    let draft: Record<string, string> = {};
-    const rejected = new Set<string>();
-    for (let i = messages.length - 1; i >= 0 && Object.keys(draft).length === 0; i--) {
-      const cleaned = messages[i]
-        .trim()
-        .replace(/^```(?:json)?\s*/i, "")
-        .replace(/```\s*$/, "");
-      const start = cleaned.indexOf("{");
-      const end = cleaned.lastIndexOf("}");
-      if (start === -1 || end <= start) continue;
-      try {
-        const parsed = JSON.parse(cleaned.slice(start, end + 1)) as Record<string, unknown>;
-        for (const key of fields) {
-          const value = parsed[key];
-          if (typeof value !== "string" || !value.trim()) continue;
-          const trimmed = value.trim();
-          // Shape guard: a value that can't be what the field means (text in
-          // an id field, an email as an explanation) is dropped, not saved.
-          if (AI_DRAFT_VALIDATORS[key] && !AI_DRAFT_VALIDATORS[key](trimmed)) {
-            rejected.add(key);
-            continue;
-          }
-          draft[key] = trimmed.slice(0, 3800);
-        }
-      } catch {
-        // keep scanning earlier messages
-      }
-    }
-    if (Object.keys(draft).length === 0 && Object.keys(deterministic).length === 0) {
-      draft = { uncategorized_text: (messages[messages.length - 1] ?? "").trim().slice(0, 3800) };
-    }
-    // Stripe-sourced values overwrite whatever the model produced for them.
-    Object.assign(draft, deterministic);
-
-    // Backfill the receipt file slot while we're here (the webhook auto-attach
-    // only covers disputes created after the feature) — best-effort, the draft
-    // itself must land regardless.
-    let receiptNote: string | null = null;
-    if (this.ctx.settingsStore.disputeAutoAttachReceipt()) {
-      try {
-        const receipt = await attachReceiptEvidence(this.ctx.stripe, dispute);
-        if (receipt.attached) receiptNote = "🧾 The charge's receipt PDF was staged in the `receipt` evidence slot.";
-      } catch (error) {
-        logger.warn("receipt auto-attach during AI draft failed", { error: String(error), "stripe.dispute_id": dispute.id });
-      }
-    }
-
-    await this.ctx.disputeStore.mergeEvidenceDraft(dispute.id, draft);
+    const result = await this.ctx.disputeEvidence.aiDraft(session.disputeId, session.customerId ?? null);
+    const receiptNote = result.receiptStaged ? "🧾 The charge's receipt PDF was staged in the `receipt` evidence slot." : null;
     this.ctx.audit.log(interaction, {
       action: "Dispute AI evidence draft",
-      targetCustomerId: customerId ?? undefined,
-      objectId: dispute.id,
-      outcome: `Draft saved locally (${Object.keys(draft).length} field(s)${rejected.size ? `, ${rejected.size} invalid value(s) dropped: ${[...rejected].join(", ")}` : ""}${
-        intercomHistory ? ", with Intercom history" : ""
-      }${wonExemplars.length ? `, ${wonExemplars.length} won-dispute exemplar(s)` : ""}${
-        receiptNote ? ", receipt staged" : ""
+      targetCustomerId: result.customerId ?? undefined,
+      objectId: session.disputeId,
+      outcome: `Draft saved locally (${result.fields} field(s)${result.rejected.length ? `, ${result.rejected.length} invalid value(s) dropped: ${result.rejected.join(", ")}` : ""}${
+        result.usedIntercomHistory ? ", with Intercom history" : ""
+      }${result.exemplars ? `, ${result.exemplars} won-dispute exemplar(s)` : ""}${
+        result.receiptStaged ? ", receipt staged" : ""
       }) — draft text not sent to Stripe`,
       severity: "info",
     });
@@ -2218,8 +1929,8 @@ export class DisputesHub {
       token,
       [
         "🤖 AI draft saved **locally** — open the sections below to review/adjust and **Save** to stage, then Submit. No draft text was sent to Stripe.",
-        rejected.size
-          ? `⚠️ Dropped ${rejected.size} field(s) whose value didn't fit the field's meaning (${[...rejected].join(", ")}) — fill them manually if needed.`
+        result.rejected.length
+          ? `⚠️ Dropped ${result.rejected.length} field(s) whose value didn't fit the field's meaning (${result.rejected.join(", ")}) — fill them manually if needed.`
           : null,
         receiptNote,
       ]
@@ -2228,74 +1939,15 @@ export class DisputesHub {
     );
   }
 
-  // Support-history context for the AI draft: resolve the customer to Intercom
-  // contacts (bridge contacts carry the Discord id as external_id and no email,
-  // so both lookups run), pull their newest conversations and render bounded
-  // plaintext transcripts. Null on any shortfall — the draft works without it.
-  private async collectIntercomHistory(customerId: string | null, email: string | null): Promise<string | null> {
-    if (this.ctx.settingsStore.intercomMode() === "none") return null;
-    const contactIds = new Set<string>();
-    if (customerId) {
-      const discordIds = await this.ctx.sessionStore.findDiscordIdsByStripeId(customerId).catch(() => []);
-      for (const discordId of discordIds.slice(0, 3)) {
-        const contact = await this.ctx.intercom.findContactByExternalId(discordId).catch(() => null);
-        if (contact) contactIds.add(contact.id);
-      }
-    }
-    if (email) {
-      for (const id of await this.ctx.intercom.searchContactIdsByEmail(email).catch(() => [])) contactIds.add(id);
-    }
-    if (contactIds.size === 0) return null;
-
-    const conversations: Array<{ id: string; createdAt: Date | null }> = [];
-    for (const contactId of [...contactIds].slice(0, 3)) {
-      conversations.push(...(await this.ctx.intercom.searchConversationsByContact(contactId, 3).catch(() => [])));
-    }
-    const newest = [...new Map(conversations.map((c) => [c.id, c])).values()]
-      .sort((a, b) => (b.createdAt?.getTime() ?? 0) - (a.createdAt?.getTime() ?? 0))
-      .slice(0, 3);
-
-    const blocks: string[] = [];
-    let budget = 5000; // keep the prompt bounded — transcripts can be huge
-    for (const convo of newest) {
-      const transcript = await this.ctx.intercom.getConversationTranscript(convo.id).catch(() => []);
-      if (!transcript.length) continue;
-      const lines = transcript
-        .slice(0, 12)
-        .map(
-          (m) =>
-            `  - [${m.at ? m.at.toISOString().slice(0, 10) : "?"}] ${m.author}: ${m.text.replace(/\s+/g, " ").slice(0, 300)}`
-        );
-      const block = `- Conversation started ${convo.createdAt ? convo.createdAt.toISOString().slice(0, 10) : "?"}:\n${lines.join("\n")}`;
-      if (block.length > budget) break;
-      budget -= block.length;
-      blocks.push(block);
-    }
-    return blocks.length ? blocks.join("\n") : null;
-  }
-
   // ---- AI evidence review (cheap model, read-only) ----
 
-  // Critiques exactly what the bank would receive: the staged text plus the
-  // staged evidence files, downloaded from Stripe and passed to the light
-  // model as vision/document blocks. Local draft fields that differ from
-  // staged ride along so the review can say "stage this". Renders a verdict
-  // panel and changes nothing — works on closed disputes too (post-mortem).
+  // Progress message + verdict rendering here; the critique pipeline (file
+  // downloads, prompt, light-model run) lives in the shared service.
   private async runAiEvidenceReview(interaction: ButtonInteraction, token: string): Promise<void> {
     const session = this.ctx.sessions.get(token);
     if (!session?.disputeId) return;
-    const [row, dispute] = await Promise.all([
-      this.ctx.disputeStore.get(session.disputeId),
-      this.ctx.stripe.getDispute(session.disputeId),
-    ]);
-    const staged = (dispute.evidence ?? {}) as unknown as Record<string, unknown>;
-    const draft = (row?.evidenceDraft ?? {}) as Record<string, string>;
-
-    const stagedFields = TEXT_EVIDENCE_KEYS.filter(
-      (key) => typeof staged[key] === "string" && (staged[key] as string).trim()
-    ).map((key) => ({ key, text: (staged[key] as string).trim().slice(0, 3800) }));
-    const fileSlots = EVIDENCE_FILE_KEYS.filter((key) => typeof staged[key] === "string" && staged[key]);
-    if (!stagedFields.length && !fileSlots.length) {
+    const pkg = await this.ctx.disputeEvidence.stagedPackage(session.disputeId);
+    if (!pkg.textFields.length && !pkg.files.length) {
       await this.renderReviewStaged(interaction, token, 0, "Nothing staged at Stripe yet — there is nothing to review.");
       return;
     }
@@ -2303,104 +1955,37 @@ export class DisputesHub {
     await interaction.editReply({
       embeds: [
         makeEmbed(
-          `🤖 Reviewing the staged evidence for \`${dispute.id}\`${fileSlots.length ? ` — downloading ${fileSlots.length} evidence file(s)…` : "…"}`,
+          `🤖 Reviewing the staged evidence for \`${pkg.dispute.id}\`${pkg.files.length ? ` — downloading ${pkg.files.length} evidence file(s)…` : "…"}`,
           COLORS.brand
         ),
       ],
       components: [],
     });
 
-    // Pull the staged files back from Stripe; a file that can't be fetched or
-    // fed to the model is reported to the reviewer instead of failing the run.
-    const attachments: LightAiAttachment[] = [];
-    const files: Array<{ slot: string; filename: string; attached: boolean; note: string | null }> = [];
-    for (const slot of fileSlots) {
-      const fileId = staged[slot] as string;
-      try {
-        const res = await this.ctx.stripe.getEvidenceFileWithContents(fileId, PROOF_MAX_BYTES);
-        if (res.data && res.mimeType) {
-          attachments.push({ name: res.filename, mediaType: res.mimeType, data: res.data });
-          files.push({ slot, filename: res.filename, attached: true, note: null });
-        } else {
-          files.push({ slot, filename: res.filename, attached: false, note: res.skipped ?? "unavailable" });
-        }
-      } catch (error) {
-        logger.warn("evidence file download for AI review failed", { error: String(error), "stripe.file_id": fileId });
-        files.push({ slot, filename: fileId, attached: false, note: "download failed" });
-      }
+    const result = await this.ctx.disputeEvidence.aiReview(session.disputeId, {
+      pkg,
+      telemetry: { userId: interaction.user.id, username: interaction.user.username },
+    });
+    if (result.kind === "nothing_staged") {
+      await this.renderReviewStaged(interaction, token, 0, "Nothing staged at Stripe yet — there is nothing to review.");
+      return;
     }
-
-    const unstagedDraft = TEXT_EVIDENCE_KEYS.filter((key) => {
-      const d = draft[key]?.trim();
-      return d && d !== (typeof staged[key] === "string" ? (staged[key] as string).trim() : "");
-    }).map((key) => ({ key, text: draft[key].trim().slice(0, 1500) }));
-
-    const chargeId = typeof dispute.charge === "string" ? dispute.charge : (dispute.charge?.id ?? null);
-    const charge = chargeId ? await this.ctx.stripe.getCharge(chargeId).catch(() => null) : null;
-    const customerId = charge
-      ? typeof charge.customer === "string"
-        ? charge.customer
-        : (charge.customer?.id ?? null)
-      : (session.customerId ?? null);
-    const customer = customerId ? await this.ctx.stripe.getCustomer(customerId).catch(() => null) : null;
-
-    const iso = (unix: number) => new Date(unix * 1000).toISOString().slice(0, 10);
-    const prompt = buildDisputeEvidenceReviewPrompt({
-      disputeId: dispute.id,
-      reason: dispute.reason || "unknown",
-      status: dispute.status,
-      amountText: this.ctx.stripe.formatAmount(dispute.amount, dispute.currency),
-      disputeCreated: iso(dispute.created),
-      evidenceDueBy: dispute.evidence_details?.due_by ? iso(dispute.evidence_details.due_by) : null,
-      submissionCount: dispute.evidence_details?.submission_count ?? 0,
-      charge: charge
-        ? {
-            id: charge.id,
-            created: iso(charge.created),
-            amountText: this.ctx.stripe.formatAmount(charge.amount, charge.currency),
-            description: charge.description ?? null,
-            cardBrand: charge.payment_method_details?.card?.brand ?? null,
-            cardLast4: charge.payment_method_details?.card?.last4 ?? null,
-          }
-        : null,
-      customer: customer
-        ? { id: customer.id, email: customer.email ?? null, name: customer.name ?? null, created: iso(customer.created) }
-        : null,
-      stagedFields,
-      files,
-      unstagedDraft,
-    });
-
-    const messages = await this.ctx.lightAi.run(prompt, undefined, {
-      model: this.ctx.settingsStore.aiModelLight(),
-      maxTokens: 1_500,
-      timeoutMs: 120_000,
-      telemetry: {
-        agentName: "ai-dispute-evidence-review",
-        kind: "staff_command",
-        userId: interaction.user.id,
-        username: interaction.user.username,
-      },
-      attachments,
-    });
-    const review = messages.join("\n\n").trim();
 
     this.ctx.audit.log(interaction, {
       action: "Dispute AI evidence review",
-      targetCustomerId: customerId ?? undefined,
-      objectId: dispute.id,
-      outcome: `Reviewed ${stagedFields.length} staged field(s) + ${attachments.length}/${files.length} file(s) on the light model — read-only`,
+      targetCustomerId: result.customerId ?? undefined,
+      objectId: pkg.dispute.id,
+      outcome: `Reviewed ${result.stagedFieldCount} staged field(s) + ${result.filesAttached}/${result.filesTotal} file(s) on the light model — read-only`,
       severity: "info",
     });
 
-    const skipped = files.filter((f) => !f.attached);
     const embed = new EmbedBuilder()
-      .setTitle(`🧐 AI evidence review — \`${dispute.id}\``)
+      .setTitle(`🧐 AI evidence review — \`${pkg.dispute.id}\``)
       .setColor(COLORS.brand)
-      .setDescription(review.slice(0, 4096) || "The model returned no review text — try again.")
+      .setDescription(result.review.slice(0, 4096) || "The model returned no review text — try again.")
       .setFooter({
-        text: `${this.ctx.settingsStore.aiModelLight()} · ${stagedFields.length} field(s) · ${attachments.length}/${files.length} file(s) reviewed${
-          skipped.length ? ` · skipped: ${skipped.map((f) => `${f.slot} (${f.note})`).join(", ")}` : ""
+        text: `${result.model} · ${result.stagedFieldCount} field(s) · ${result.filesAttached}/${result.filesTotal} file(s) reviewed${
+          result.skipped.length ? ` · skipped: ${result.skipped.map((f) => `${f.slot} (${f.note})`).join(", ")}` : ""
         } · advisory only`.slice(0, 2048),
       });
     await interaction.editReply({
@@ -2409,7 +1994,7 @@ export class DisputesHub {
         buttonRow(
           btn(`billadmin_dp_evai:${token}`, "Run Again", ButtonStyle.Secondary),
           btn(`billadmin_dp_evrev:${token}:0`, "Staged Evidence", ButtonStyle.Secondary),
-          btn(`billadmin_dp_ev_edit:${token}`, "Edit Evidence", ButtonStyle.Secondary, !RESPONDABLE.has(dispute.status)),
+          btn(`billadmin_dp_ev_edit:${token}`, "Edit Evidence", ButtonStyle.Secondary, !RESPONDABLE.has(pkg.dispute.status)),
           btn(`billadmin_dp_det:${token}`, "Back", ButtonStyle.Secondary)
         ),
       ],

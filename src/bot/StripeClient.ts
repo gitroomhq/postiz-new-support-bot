@@ -1125,6 +1125,26 @@ export class StripeClient {
     await this.stripe.coupons.del(couponId);
   }
 
+  // Product catalog (read-only surface for the dashboard). default_price is
+  // expanded so list rows can show the headline price without N+1 reads.
+  async listProducts(opts: { limit?: number; startingAfter?: string } = {}): Promise<{ products: Stripe.Product[]; hasMore: boolean }> {
+    const res = await this.stripe.products.list({
+      limit: opts.limit ?? 25,
+      expand: ["data.default_price"],
+      ...(opts.startingAfter ? { starting_after: opts.startingAfter } : {}),
+    });
+    return { products: res.data, hasMore: res.has_more };
+  }
+
+  async listPricesForProduct(productId: string, limit = 50): Promise<Stripe.Price[]> {
+    const res = await this.stripe.prices.list({ product: productId, limit });
+    return res.data;
+  }
+
+  async getProduct(productId: string): Promise<Stripe.Product> {
+    return this.stripe.products.retrieve(productId);
+  }
+
   async detachPaymentMethod(paymentMethodId: string): Promise<void> {
     await this.stripe.paymentMethods.detach(paymentMethodId);
   }

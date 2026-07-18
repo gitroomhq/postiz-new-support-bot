@@ -253,6 +253,9 @@ export class CallbackServer {
       cookieName: "__Host-billing",
       metricName: "dashboard.auth_failures",
       logLabel: "billing dashboard",
+      // Dispute evidence proofs (≤4MB) travel as base64 JSON on the normal
+      // api route — never multipart — so this panel takes bigger bodies.
+      jsonLimit: "8mb",
       route: () => this.dashboard,
     });
 

@@ -344,6 +344,40 @@ export class DisputeStore {
     });
   }
 
+  // Any-status mirror listing for the dashboard "All disputes" tab (listOpen
+  // is open-statuses-only; this one defaults to EVERYTHING).
+  async listMirror(
+    skip: number,
+    take: number,
+    filter?: { status?: string; reason?: string },
+    sort: DisputeSort = "new"
+  ): Promise<{ rows: StripeDispute[]; total: number }> {
+    const where = {
+      ...(filter?.status ? { status: filter.status } : {}),
+      ...(filter?.reason ? { reason: filter.reason } : {}),
+    };
+    const orderBy: Prisma.StripeDisputeOrderByWithRelationInput[] =
+      sort === "amount"
+        ? [{ amount: "desc" }, { disputeCreatedAt: "desc" }]
+        : sort === "due"
+          ? [{ evidenceDueBy: { sort: "asc", nulls: "last" } }, { disputeCreatedAt: "desc" }]
+          : [{ disputeCreatedAt: "desc" }];
+    const [rows, total] = await Promise.all([
+      this.prisma.stripeDispute.findMany({ where, orderBy, skip, take }),
+      this.prisma.stripeDispute.count({ where }),
+    ]);
+    return { rows, total };
+  }
+
+  // Status histogram for the dashboard count-cards + the nav badge.
+  async countsByStatus(): Promise<Array<{ status: string; count: number }>> {
+    const rows = await this.prisma.stripeDispute.groupBy({
+      by: ["status"],
+      _count: { _all: true },
+    });
+    return rows.map((r) => ({ status: r.status, count: r._count._all }));
+  }
+
   async countOpen(): Promise<number> {
     return this.prisma.stripeDispute.count({ where: { status: { in: [...OPEN_DISPUTE_STATUSES] } } });
   }

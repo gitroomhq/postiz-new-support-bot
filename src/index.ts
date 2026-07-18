@@ -37,6 +37,7 @@ import { SnapshotScheduler } from "./metrics/SnapshotScheduler";
 import { AiRunStore } from "./bot/AiRunStore";
 import { LightAiRunner } from "./bot/LightAiRunner";
 import { DisputeStore } from "./bot/billing/DisputeStore";
+import { DisputeEvidenceService } from "./bot/billing/DisputeEvidenceService";
 import { BlockStore } from "./bot/billing/BlockStore";
 import { BillingQolStore } from "./bot/billing/BillingQolStore";
 import { BlockService } from "./bot/billing/BlockService";
@@ -73,8 +74,14 @@ import { makeCustomersSection } from "./dashboard/sections/customersSection";
 import { makePaymentsSection } from "./dashboard/sections/paymentsSection";
 import { makeSubscriptionsSection } from "./dashboard/sections/subscriptionsSection";
 import { makeInvoicesSection } from "./dashboard/sections/invoicesSection";
+import { makeDisputesSection } from "./dashboard/sections/disputesSection";
+import { makeCatalogSection } from "./dashboard/sections/catalogSection";
 import { makeApprovalsSection } from "./dashboard/sections/approvalsSection";
+import { makeBlocklistSection } from "./dashboard/sections/blocklistSection";
+import { makeFraudSection } from "./dashboard/sections/fraudSection";
+import { makeBookmarksSection } from "./dashboard/sections/bookmarksSection";
 import { makeSecuritySection } from "./dashboard/sections/securitySection";
+import { FraudHuntService } from "./bot/billing/FraudHuntService";
 import { GuildSnapshotProvider } from "./adminpanel/guildSnapshot";
 import { generalHub } from "./adminpanel/sections/generalHub";
 import { makeIntegrationsHub } from "./adminpanel/sections/integrationsHub";
@@ -231,6 +238,14 @@ async function main() {
   // Dispute console: local dispute mirror, blocklist (+ Radar bridge), team
   // notes/bookmarks, the shared ratio cache and the looper tick body.
   const disputeStore = new DisputeStore(prisma);
+  // Shared dispute-evidence core: /billing → Disputes AND the web dashboard's
+  // workbench run this one implementation (catalog, staging, submit claims).
+  const disputeEvidenceService = new DisputeEvidenceService(stripeClient, disputeStore, sessionStore, {
+    claudeRunner,
+    lightAi: lightAiRunner,
+    intercom: intercomClient,
+    settingsStore,
+  });
   const blockStore = new BlockStore(prisma);
   const qolStore = new BillingQolStore(prisma);
   const blockService = new BlockService(settingsStore, stripeClient, blockStore);
@@ -269,6 +284,7 @@ async function main() {
   );
   const billingAdmin = new BillingAdmin(config, stripeClient, sessionStore, settingsStore, auditLogger, {
     disputeStore,
+    disputeEvidence: disputeEvidenceService,
     blockStore,
     blockService,
     qolStore,
@@ -523,6 +539,7 @@ async function main() {
   const dashboardGateway = new DashboardActionGateway(billingActionService, stripeClient, sessionStore);
   const dashboardStores = { session: sessionStore, dispute: disputeStore, block: blockStore, qol: qolStore };
   const dashboardMetrics = new HomeMetrics(stripeClient, settingsStore, disputeStore);
+  const fraudHuntService = new FraudHuntService(stripeClient, sessionStore);
   const dashboardSections = [
     makeHomeSection({ metrics: dashboardMetrics }),
     makeBalancesSection(),
@@ -530,7 +547,12 @@ async function main() {
     makeCustomersSection(),
     makeSubscriptionsSection(),
     makeInvoicesSection(),
+    makeDisputesSection({ ratio: ratioEngine, evidence: disputeEvidenceService }),
+    makeCatalogSection(),
     makeApprovalsSection(),
+    makeBlocklistSection({ blockService }),
+    makeFraudSection({ hunts: fraudHuntService }),
+    makeBookmarksSection(),
     makeSecuritySection({ credentials: dashboardCredentials, sessions: dashboardDbSessions, audit: dashboardAudit }),
   ];
   const dashboard = new Dashboard(settingsStore, dashboardAuth, dashboardSections, {

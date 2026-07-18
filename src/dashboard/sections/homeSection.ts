@@ -50,7 +50,8 @@ export function makeHomeSection(deps: { metrics: HomeMetrics }): DashboardSectio
           { label: "Pending", value: balance ? fmtBuckets(balance.pending) : "—" },
           {
             label: "Active subscriptions",
-            value: subCount ? `${subCount.count}${subCount.truncated ? "+" : ""}` : "—",
+            value: subCount ? `${subCount.count}${subCount.truncated ? "+" : ""}` : "counting…",
+            ...(subCount ? {} : { sub: "full sweep running — refresh in a minute" }),
           },
           {
             label: "Open approvals",
@@ -72,9 +73,9 @@ export function makeHomeSection(deps: { metrics: HomeMetrics }): DashboardSectio
         const overdue = hoursLeft < 0;
         inboxRows.push({
           id: `dispute-${d.id}`,
+          ref: { page: "disputes.detail", params: { id: d.id } },
           cells: [
-            strong(`Dispute ${ctx.stripe.formatAmount(d.amount, d.currency)} — ${d.reason.replace(/_/g, " ")}`,
-              `${d.id} · manage in /billing → Disputes until the web console ships`),
+            strong(`Dispute ${ctx.stripe.formatAmount(d.amount, d.currency)} — ${d.reason.replace(/_/g, " ")}`, d.id),
             badgeCell("error", overdue ? "Evidence OVERDUE" : `Due in ${Math.max(1, Math.round(hoursLeft))}h`),
             isoDateCell(d.evidenceDueBy),
           ],

@@ -430,7 +430,7 @@ async function chargeDetail(ctx: DashboardCtx, id: string): Promise<SectionPage>
   });
 
   // Recent activity: refunds (newest first from Stripe) + dispute + lifecycle.
-  const timeline: Array<{ label: string; iso: string; text?: string; kind?: Badge["kind"] }> = [];
+  const timeline: Array<{ label: string; iso: string; text?: string; kind?: Badge["kind"]; ref?: { page: string; params?: Record<string, string> } }> = [];
   for (const refund of refundsRes.refunds) {
     timeline.push({
       label: `Refunded ${ctx.stripe.formatAmount(refund.amount, refund.currency)}${refund.reason ? ` (${sentence(refund.reason)})` : ""}`,
@@ -443,8 +443,9 @@ async function chargeDetail(ctx: DashboardCtx, id: string): Promise<SectionPage>
     timeline.push({
       label: `Dispute opened (${chargeDispute.reason})`,
       iso: chargeDispute.disputeCreatedAt.toISOString(),
-      text: `${chargeDispute.id} · ${chargeDispute.status} — manage in /billing → Disputes until the web console ships`,
+      text: `${chargeDispute.id} · ${chargeDispute.status}`,
       kind: "error",
+      ref: { page: "disputes.detail", params: { id: chargeDispute.id } },
     });
   }
   // Lifecycle, Stripe-style: "Payment started" always, then the outcome row.
@@ -506,7 +507,16 @@ async function chargeDetail(ctx: DashboardCtx, id: string): Promise<SectionPage>
             : text("—"),
       },
       ...(card?.fingerprint
-        ? [{ label: "Fingerprint", cell: text(card.fingerprint, "same-card hunts arrive with Fraud tools (M7)") }]
+        ? [
+            {
+              label: "Fingerprint",
+              cell: {
+                t: "link",
+                v: `${card.fingerprint} — hunt same card`,
+                ref: { page: "fraud", filters: { view: "card", fp: card.fingerprint } },
+              } as Cell,
+            },
+          ]
         : []),
       ...(card ? [{ label: "Expires", cell: text(`${card.exp_month}/${card.exp_year}`) }] : []),
       ...(card?.funding ? [{ label: "Type", cell: text(`${sentence(card.funding)} card`) }] : []),

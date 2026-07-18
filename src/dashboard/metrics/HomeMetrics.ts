@@ -30,29 +30,30 @@ export class HomeMetrics {
     private disputes: DisputeStore
   ) {}
 
-  // Cached active-subscription count for the Home stat tile (the "100+" fix:
-  // pages up to 1000 subs once per TTL instead of one page per view).
+  // Cached active-subscription count for the Home stat tile. The account has
+  // >1000 active subs, so the sweep is EXHAUSTIVE (10k-page runaway guard) and
+  // always runs in the background: the view never blocks on it — the first
+  // load renders "counting…" (null) and the cached number appears afterwards.
   private subsCache: { at: number; value: { count: number; truncated: boolean } } | null = null;
   private subsInflight: Promise<{ count: number; truncated: boolean }> | null = null;
 
-  async activeSubsCount(): Promise<{ count: number; truncated: boolean }> {
+  async activeSubsCount(): Promise<{ count: number; truncated: boolean } | null> {
     const now = Date.now();
     if (this.subsCache && now - this.subsCache.at < TTL_MS) return this.subsCache.value;
-    if (this.subsInflight) return this.subsCache?.value ?? this.subsInflight;
-    this.subsInflight = this.stripe
-      .countActiveSubscriptions(10)
-      .then((value) => {
-        this.subsCache = { at: Date.now(), value };
-        return value;
-      })
-      .finally(() => {
-        this.subsInflight = null;
-      });
-    if (this.subsCache) {
+    if (!this.subsInflight) {
+      this.subsInflight = this.stripe
+        .countActiveSubscriptions(100)
+        .then((value) => {
+          this.subsCache = { at: Date.now(), value };
+          return value;
+        })
+        .finally(() => {
+          this.subsInflight = null;
+        });
       void this.subsInflight.catch(() => {});
-      return this.subsCache.value;
     }
-    return this.subsInflight;
+    // Stale beats blocking; null on the very first load beats a 30s hang.
+    return this.subsCache?.value ?? null;
   }
 
   // Series entry point (the `series` endpoint). null = unknown key/window.
@@ -156,10 +157,14 @@ export class HomeMetrics {
   // ---- MRR estimate by plan (bars; no history without a mirror) ----
 
   private async mrrByPlan(): Promise<SeriesResponse> {
-    const { rows, truncated } = await this.sweep((startingAfter) =>
-      this.stripe
-        .listAllSubscriptions({ status: "active", limit: 100, startingAfter })
-        .then((r) => ({ items: r.subscriptions, hasMore: r.hasMore }))
+    // >1000 active subs on this account — sweep deep (chart hydration is
+    // async client-side, and the result caches for 10 minutes).
+    const { rows, truncated } = await this.sweep(
+      (startingAfter) =>
+        this.stripe
+          .listAllSubscriptions({ status: "active", limit: 100, startingAfter })
+          .then((r) => ({ items: r.subscriptions, hasMore: r.hasMore })),
+      100
     );
     const byPlan = new Map<string, { monthly: number; currency: string }>();
     for (const sub of rows) {
