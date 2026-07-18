@@ -26,14 +26,21 @@ export interface ObjectRef {
 
 // One rendered table/kv cell.
 export type Cell =
-  | { t: "text"; v: string; sub?: string }
+  | { t: "text"; v: string; sub?: string; strong?: boolean } // strong = Stripe's bold dark object name
   | { t: "money"; v: string; tone?: "pos" | "neg" | "muted" }
+  // Stripe amount atom: bold amount + faint ISO code, optionally the status
+  // pill in the SAME cell ("€29.00 EUR  [Succeeded ✓]" — the Payments look).
+  | { t: "amount"; v: string; cur: string; badge?: Badge }
   | { t: "badge"; b: Badge }
   | { t: "flags"; badges: Badge[] }
   | { t: "date"; v: string; iso: string } // v = preformatted absolute; client renders relative w/ hover
   | { t: "id"; v: string; ref?: ObjectRef; copy?: boolean }
   | { t: "link"; v: string; ref: ObjectRef }
-  | { t: "external"; v: string; href: string }; // explicit external link (Discord/Intercom/Stripe-hosted)
+  | { t: "external"; v: string; href: string } // explicit external link (Discord/Intercom/Stripe-hosted)
+  // Card-brand chip + masked last4 ("VISA ···· 4242").
+  | { t: "card"; brand: string; last4: string; sub?: string }
+  // Object-icon avatar before a bold name (products, subscriptions, customers).
+  | { t: "avatar"; icon: "customer" | "product" | "invoice" | "subscription"; v: string; sub?: string; ref?: ObjectRef };
 
 export type InputField =
   | { type: "text"; key: string; label: string; placeholder?: string; multiline?: boolean; maxLength?: number }
@@ -63,6 +70,9 @@ export interface ActionButton {
 export interface HeaderBlock {
   type: "header";
   title: string;
+  titleSuffix?: string; // faint inline suffix after the title (currency code after an amount)
+  sub?: string; // muted line under the title (customer email, "Charged to …")
+  subCopy?: boolean; // copy affordance on the sub line
   id?: string; // mono object id with a copy button
   badges?: Badge[];
   actions?: ActionButton[];
@@ -74,10 +84,12 @@ export interface StatsBlock {
 export interface FilterDef {
   key: string;
   label: string;
-  kind: "select" | "text";
+  // select/text render as Stripe "⊕ Label" pills with a popover; search renders
+  // as the wide standalone search box (Customers-list style).
+  kind: "select" | "text" | "search";
   options?: Opt[]; // select only
   value?: string; // current value (echoed back by the client)
-  placeholder?: string; // text only
+  placeholder?: string; // text/search only
 }
 export interface TableBlock {
   type: "table";
@@ -85,14 +97,21 @@ export interface TableBlock {
   title?: string;
   columns: Array<{ key: string; label: string; align?: "left" | "right" }>;
   rows: Array<{ id: string; cells: Cell[]; ref?: ObjectRef; actions?: ActionButton[] }>;
+  // Stripe count-card segmented filter (the LIST-archetype status row). A card
+  // click sets filters[counts.key] = value; value "" = the All card.
+  counts?: { key: string; items: Array<{ value: string; label: string; count: number | string }> };
   filters?: FilterDef[];
   nextCursor?: string | null; // opaque Stripe cursor; client keeps its own back-stack
   empty?: string; // shown when rows is empty
   notice?: string; // footnote under the table
+  footer?: string; // Stripe "N items" gray count under the table
+  footerRef?: ObjectRef; // renders the footer as a link ("3 results" → filtered list page)
 }
 export interface KeyValueBlock {
   type: "kv";
   title?: string;
+  // Rail "Insights" variant: bigger, darker values (Spent €152.00 / MRR €29.00).
+  big?: boolean;
   rows: Array<{ label: string; cell: Cell }>;
   actions?: ActionButton[];
 }
@@ -155,6 +174,10 @@ export interface PageView {
   nav: NavItem[];
   activeNav: string; // NavItem.key
   blocks: Block[];
+  // Stripe detail-page pattern: blocks placed in the narrow right rail
+  // (Details / Insights / related-object cards) beside the main column. When
+  // empty the main column spans full width.
+  rail?: Block[];
   testMode: boolean; // Stripe TEST-mode banner
   actorLabel: string; // "Enno · admin"
 }

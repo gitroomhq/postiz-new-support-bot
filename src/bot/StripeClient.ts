@@ -360,6 +360,67 @@ export class StripeClient {
     return res.data;
   }
 
+  // ---- Dashboard account-wide reads (/billing web) ----
+
+  // Account-wide charge browse (dashboard Payments list), newest first.
+  // createdGte narrows the window server-side (the date filter pill).
+  async listAllCharges(opts: {
+    limit?: number;
+    startingAfter?: string;
+    createdGte?: number;
+  }): Promise<{ charges: Stripe.Charge[]; hasMore: boolean }> {
+    const res = await this.stripe.charges.list({
+      limit: opts.limit ?? 25,
+      ...(opts.startingAfter ? { starting_after: opts.startingAfter } : {}),
+      ...(opts.createdGte ? { created: { gte: opts.createdGte } } : {}),
+    });
+    return { charges: res.data, hasMore: res.has_more };
+  }
+
+  // Account-wide PaymentIntent browse — the "Incomplete" payments view
+  // (declined/abandoned attempts that never produced a Charge).
+  async listAllPaymentIntents(opts: {
+    limit?: number;
+    startingAfter?: string;
+    createdGte?: number;
+  }): Promise<{ paymentIntents: Stripe.PaymentIntent[]; hasMore: boolean }> {
+    const res = await this.stripe.paymentIntents.list({
+      limit: opts.limit ?? 25,
+      ...(opts.startingAfter ? { starting_after: opts.startingAfter } : {}),
+      ...(opts.createdGte ? { created: { gte: opts.createdGte } } : {}),
+    });
+    return { paymentIntents: res.data, hasMore: res.has_more };
+  }
+
+  // Refunds of one charge (payment-detail timeline) or account-wide.
+  async listRefunds(opts: {
+    chargeId?: string;
+    limit?: number;
+    startingAfter?: string;
+  }): Promise<{ refunds: Stripe.Refund[]; hasMore: boolean }> {
+    const res = await this.stripe.refunds.list({
+      limit: opts.limit ?? 25,
+      ...(opts.chargeId ? { charge: opts.chargeId } : {}),
+      ...(opts.startingAfter ? { starting_after: opts.startingAfter } : {}),
+    });
+    return { refunds: res.data, hasMore: res.has_more };
+  }
+
+  async getRefund(refundId: string): Promise<Stripe.Refund> {
+    return this.stripe.refunds.retrieve(refundId);
+  }
+
+  async getPaymentMethod(paymentMethodId: string): Promise<Stripe.PaymentMethod> {
+    return this.stripe.paymentMethods.retrieve(paymentMethodId);
+  }
+
+  // Charge with the fee-bearing balance transaction expanded (the dashboard
+  // "Payment breakdown" panel). Kept separate from getCharge so the hot
+  // revalidation paths stay expansion-free.
+  async getChargeDetailed(chargeId: string): Promise<Stripe.Charge> {
+    return this.stripe.charges.retrieve(chargeId, { expand: ["balance_transaction"] });
+  }
+
   // Discounts are expanded so panels can show the coupon behind each discount.
   async listSubscriptions(customerId: string): Promise<Stripe.Subscription[]> {
     const res = await this.stripe.subscriptions.list({

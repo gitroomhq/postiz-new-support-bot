@@ -1,0 +1,146 @@
+import { StripeClient } from "../bot/StripeClient";
+import { SessionStore } from "../auth/SessionStore";
+import {
+  ActionActor,
+  BillingActionService,
+  RequestOutcome,
+  ScopedBinding,
+} from "../bot/billing/actions/BillingActionService";
+import { validId } from "./sections/types";
+
+// The dashboard→registry action gateway. The intercom panel derives its
+// customer scope from the conversation link; here the scope is derived from
+// the TARGET OBJECT server-side (charge/PI/subscription/invoice → .customer),
+// so a hostile client can rename ids all it wants — the binding (and the
+// registry's ownership revalidation) always follows the real object. The
+// client-visible params only carry ids the page itself baked.
+export class DashboardActionGateway {
+  constructor(
+    private actions: BillingActionService,
+    private stripe: StripeClient,
+    private sessionStore: SessionStore
+  ) {}
+
+  async request(actor: ActionActor, key: string, rawParams: Record<string, unknown>): Promise<RequestOutcome> {
+    const resolved = await this.resolve(key, rawParams).catch((e) => ({
+      ok: false as const,
+      error: `Could not resolve the target: ${e instanceof Error ? e.message : String(e)}`,
+    }));
+    if (!resolved.ok) return { kind: "invalid", error: resolved.error };
+    return this.actions.requestScoped(resolved.binding, actor, resolved.key, resolved.params);
+  }
+
+  // Server-side binding table (exposed for tests). May rewrite the action:
+  // a full refund for a customer with no Discord link becomes a partial
+  // refund of the remaining amount (the refund core tracks refunds per
+  // Discord user, so refund_full is structurally Discord-linked).
+  async resolve(
+    key: string,
+    raw: Record<string, unknown>
+  ): Promise<{ ok: true; key: string; params: Record<string, unknown>; binding: ScopedBinding } | { ok: false; error: string }> {
+    const params: Record<string, unknown> = { ...raw };
+
+    switch (key) {
+      case "charge.refund_full":
+      case "charge.refund_partial":
+      case "charge.refund_fraud": {
+        const chargeId = validId("charge", params.chargeId);
+        if (!chargeId) return { ok: false, error: "chargeId (ch_…) required." };
+        const charge = await this.stripe.getCharge(chargeId);
+        const customerId = idOf(charge.customer);
+        if (!customerId) return { ok: false, error: "This charge has no customer attached." };
+        // Modal inputs are in major units; convert with the charge's currency.
+        if (params.amountMinor == null && typeof params.amountMajor === "number" && isFinite(params.amountMajor)) {
+          const factor = StripeClient.isZeroDecimal(charge.currency) ? 1 : 100;
+          params.amountMinor = Math.round(params.amountMajor * factor);
+          delete params.amountMajor;
+        }
+        const binding = await this.bindingFor(customerId);
+        if (key === "charge.refund_full" && !binding.discordCustomerId) {
+          const remaining = charge.amount - (charge.amount_refunded ?? 0);
+          if (remaining <= 0) return { ok: false, error: "Charge is already fully refunded." };
+          return { ok: true, key: "charge.refund_partial", params: { chargeId, amountMinor: remaining }, binding };
+        }
+        return { ok: true, key, params, binding };
+      }
+      case "payment_intent.cancel": {
+        const paymentIntentId = validId("payment_intent", params.paymentIntentId);
+        if (!paymentIntentId) return { ok: false, error: "paymentIntentId (pi_…) required." };
+        const pi = await this.stripe.getPaymentIntent(paymentIntentId);
+        const customerId = idOf(pi.customer);
+        if (!customerId) return { ok: false, error: "This payment intent has no customer attached." };
+        return { ok: true, key, params, binding: await this.bindingFor(customerId) };
+      }
+      case "subscription.cancel":
+      case "subscription.pause_resume":
+      case "subscription.change_plan":
+      case "subscription.terms":
+      case "customer.coupon": {
+        const subscriptionId = validId("subscription", params.subscriptionId);
+        if (!subscriptionId) return { ok: false, error: "subscriptionId (sub_…) required." };
+        const sub = await this.stripe.getSubscription(subscriptionId);
+        const customerId = idOf(sub.customer);
+        if (!customerId) return { ok: false, error: "This subscription has no customer attached." };
+        return { ok: true, key, params, binding: await this.bindingFor(customerId) };
+      }
+      case "invoice.collect":
+      case "invoice.void":
+      case "invoice.credit_note": {
+        const invoiceId = validId("invoice", params.invoiceId);
+        if (!invoiceId) return { ok: false, error: "invoiceId (in_…) required." };
+        const invoice = await this.stripe.getInvoice(invoiceId);
+        const customerId = idOf(invoice.customer);
+        if (!customerId) return { ok: false, error: "This invoice has no customer attached." };
+        return { ok: true, key, params, binding: await this.bindingFor(customerId) };
+      }
+      case "invoice.create_draft":
+      case "customer.balance":
+      case "customer.payment_method":
+      case "customer.block": {
+        // Explicit-customer actions: the page bakes params.customerId; only
+        // its SHAPE is trusted — the registry revalidates existence/ownership.
+        const customerId = validId("customer", params.customerId);
+        if (!customerId) return { ok: false, error: "customerId (cus_…) required." };
+        return { ok: true, key, params, binding: await this.bindingFor(customerId) };
+      }
+      case "charge_review": {
+        // Bound from the PendingChargeReview row, not from a Stripe object.
+        const threadId = typeof params.threadId === "string" && /^\d{5,32}$/.test(params.threadId) ? params.threadId : null;
+        if (!threadId) return { ok: false, error: "threadId required." };
+        const review = await this.sessionStore.getPendingChargeReview(threadId);
+        if (!review) return { ok: false, error: "No pending charge review on that ticket (already resolved?)." };
+        delete params.threadId;
+        return {
+          ok: true,
+          key,
+          params,
+          binding: {
+            stripeCustomerId: null,
+            discordCustomerId: review.customerId,
+            ticketThreadId: threadId,
+            conversationId: null,
+            origin: "dashboard",
+          },
+        };
+      }
+      default:
+        return { ok: false, error: "Unknown action." };
+    }
+  }
+
+  private async bindingFor(stripeCustomerId: string): Promise<ScopedBinding> {
+    const discordIds = await this.sessionStore.findDiscordIdsByStripeId(stripeCustomerId).catch(() => []);
+    return {
+      stripeCustomerId,
+      discordCustomerId: discordIds[0] ?? null,
+      ticketThreadId: null,
+      conversationId: null,
+      origin: "dashboard",
+    };
+  }
+}
+
+function idOf(v: string | { id: string } | null | undefined): string | null {
+  if (!v) return null;
+  return typeof v === "string" ? v : v.id;
+}

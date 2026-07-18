@@ -49,7 +49,7 @@ export interface AuthEndpointResult {
 }
 
 export interface DashboardAuthProvider {
-  // GET /dashboard — resume a cookie session, exchange a break-glass link
+  // GET /billing — resume a cookie session, exchange a break-glass link
   // token, or serve the shell in login mode (standing URL, no credentials yet).
   enter(input: {
     token: string;
@@ -57,7 +57,7 @@ export interface DashboardAuthProvider {
     ip?: string;
     ua?: string;
   }): Promise<{ kind: "page"; sessionCookie?: string } | { kind: "reject"; status: number; message: string }>;
-  // POST /dashboard/api/* — cookie → subject; null = 401/expired.
+  // POST /billing/api/* — cookie → subject; null = 401/expired.
   authenticate(cookie: string, meta?: { ip?: string }): Promise<DashboardAuthResult | null>;
   // Session-LESS endpoints (the login ceremony + the pre-login activation
   // poll). null = unknown endpoint.
@@ -505,7 +505,7 @@ export class StandingDashboardAuth implements DashboardAuthProvider {
     // SameSite=Lax (not Strict): deep links from Discord audit embeds must
     // arrive with the cookie. CSRF never rests on SameSite here — the triple
     // belt + POST-only mutations carry it.
-    return `__Host-dash=${token}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=${COOKIE_MAX_AGE_S}`;
+    return `__Host-billing=${token}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=${COOKIE_MAX_AGE_S}`;
   }
 
   private rp() {

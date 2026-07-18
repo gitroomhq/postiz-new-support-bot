@@ -12,7 +12,7 @@ var D = {
 D.q = function (id) { return document.getElementById(id); };
 
 D.api = function (endpoint, body) {
-  return fetch("/dashboard/api/" + endpoint, {
+  return fetch("/billing/api/" + endpoint, {
     method: "POST",
     credentials: "same-origin",
     headers: { "Content-Type": "application/json", "X-Panel-Request": "1" },
@@ -39,7 +39,7 @@ D.el = function (tag, cls, text) {
   return e;
 };
 
-D.badge = function (b) { return D.el("span", "badge " + (b.kind === "neutral" ? "info" : (b.kind || "info")), b.text); };
+D.badge = function (b) { return D.el("span", "badge " + (b.kind || "info"), b.text); };
 
 // Relative time from an ISO string; absolute local string on hover (title).
 D.fmtRel = function (iso) {

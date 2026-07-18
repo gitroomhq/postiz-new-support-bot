@@ -4,6 +4,8 @@ import { SessionStore } from "../../auth/SessionStore";
 import { DisputeStore } from "../../bot/billing/DisputeStore";
 import { BlockStore } from "../../bot/billing/BlockStore";
 import { BillingQolStore } from "../../bot/billing/BillingQolStore";
+import type { BillingActionService } from "../../bot/billing/actions/BillingActionService";
+import type { DashboardActionGateway } from "../DashboardActions";
 import { DashboardActor } from "../DashboardAuth";
 import { ActionRequest, ActionResult, Block, Crumb, NavItem, ViewRequest } from "../renderer/contract";
 
@@ -20,6 +22,14 @@ export interface DashboardCtx {
     dispute: DisputeStore; // local dispute mirror
     block: BlockStore; // blocklist
     qol: BillingQolStore; // notes + bookmarks
+  };
+  // Registry billing actions: the shared level/queue/execute/audit brain plus
+  // the dashboard's target→customer binding gateway. Sections use `actions`
+  // for approvals + advisory mode maps; registry EXECUTION always flows
+  // through Dashboard.ts → gateway (never section code).
+  billing: {
+    actions: BillingActionService;
+    gateway: DashboardActionGateway;
   };
   audit(change: string): Promise<void>;
   // For destructive (reverseConfirm) actions: whether a valid Discord→web
@@ -39,6 +49,8 @@ export interface SectionPage {
   title: string;
   crumbs: Crumb[];
   blocks: Block[];
+  // Optional Stripe-style right rail (Details / Insights / related objects).
+  rail?: Block[];
 }
 
 // One module per sidebar area. Dashboard.ts registers them, assembles the nav

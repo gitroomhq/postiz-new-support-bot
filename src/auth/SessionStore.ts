@@ -292,6 +292,20 @@ export class SessionStore {
     return this.prisma.pendingChargeReview.findFirst({ where: { threadId, status: "PENDING" } });
   }
 
+  // Account-wide PENDING reviews for the dashboard Approvals page, oldest first.
+  async listPendingChargeReviews(offset: number, limit: number) {
+    const where = { status: "PENDING" };
+    const [rows, total] = await Promise.all([
+      this.prisma.pendingChargeReview.findMany({ where, orderBy: { createdAt: "asc" }, skip: offset, take: limit }),
+      this.prisma.pendingChargeReview.count({ where }),
+    ]);
+    return { rows, total };
+  }
+
+  async countPendingChargeReviews(): Promise<number> {
+    return this.prisma.pendingChargeReview.count({ where: { status: "PENDING" } });
+  }
+
   // Any-status review lookup for the refund-flip context note
   // (getPendingChargeReview filters to PENDING; the note wants resolved
   // outcomes too).

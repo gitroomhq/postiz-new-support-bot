@@ -92,7 +92,29 @@ D.loadPage = function () {
       D.q("who").textContent = "Acting as " + v.actorLabel;
       D.renderNav(v);
       D.renderCrumbs(v);
-      D.renderBlocks(content, v.blocks);
+      // Consistent structure: every page opens with ONE page header. Detail
+      // pages send their own header block (badges/id/actions); list pages get
+      // one synthesized from the title.
+      var blocks = (v.blocks || []).slice();
+      var headerBlock = null;
+      if (blocks.length && blocks[0].type === "header") { headerBlock = blocks.shift(); }
+      else { headerBlock = { type: "header", title: v.title }; }
+      content.textContent = "";
+      D.renderBlocks(content, [headerBlock]);
+      // Stripe detail layout: main column + right rail (Details/Insights).
+      if (v.rail && v.rail.length) {
+        var grid = D.el("div", "detailgrid");
+        var mainCol = D.el("div", "detailmain");
+        var railCol = D.el("aside", "detailrail");
+        D.renderBlocks(mainCol, blocks);
+        D.renderBlocks(railCol, v.rail);
+        grid.appendChild(mainCol); grid.appendChild(railCol);
+        content.appendChild(grid);
+      } else {
+        var wrap = D.el("div", null);
+        D.renderBlocks(wrap, blocks);
+        content.appendChild(wrap);
+      }
     });
 };
 
@@ -118,6 +140,9 @@ D.renderNav = function (v) {
 D.renderCrumbs = function (v) {
   var el = D.q("crumbs");
   el.textContent = "";
+  // A single crumb just repeats the page title — show the trail only when
+  // there is an actual path to walk back.
+  if (!v.crumbs || v.crumbs.length < 2) return;
   (v.crumbs || []).forEach(function (c, i) {
     if (i > 0) el.appendChild(D.el("span", "sep", "/"));
     if (c.ref) {
@@ -206,6 +231,21 @@ D.poll = function () {
   }).catch(function () { D.pollTimer = setTimeout(D.poll, 5000); });
 };
 
+// Activation code: click to copy (pastes straight into the Discord modal).
+D.bindLockCode = function () {
+  var codeEl = D.q("lockcode");
+  codeEl.addEventListener("click", function () {
+    var code = codeEl.textContent || "";
+    if (!code || code.indexOf("•") >= 0) return;
+    var done = function () {
+      codeEl.classList.add("copied");
+      setTimeout(function () { codeEl.classList.remove("copied"); }, 1200);
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(code).then(done, function () {});
+    else done();
+  });
+};
+
 D.started = false;
 D.startApp = function () {
   if (D.started) return;
@@ -222,5 +262,6 @@ D.startApp = function () {
 };
 
 D.bindLogin();
+D.bindLockCode();
 D.poll();
 `;

@@ -12,15 +12,76 @@ D.refHref = function (ref) {
   return "#/" + seg.map(encodeURIComponent).join("/");
 };
 
+// Card-brand chip label (text stand-in for the brand logo — CSP forbids images).
+D.cardLabel = function (brand) {
+  var b = (brand || "").toLowerCase();
+  if (b === "visa") return "VISA";
+  if (b === "mastercard") return "MC";
+  if (b === "amex" || b === "american_express") return "AMEX";
+  if (b === "discover") return "DISC";
+  if (b === "diners" || b === "diners_club") return "DC";
+  if (b === "jcb") return "JCB";
+  if (b === "unionpay") return "UP";
+  return (brand || "CARD").slice(0, 4).toUpperCase();
+};
+
+// Tinted rounded-square object icon (inline SVG silhouettes, geometry only).
+D.OBJ_ICONS = {
+  customer: "M8 7.6a2.8 2.8 0 1 0 0-5.6 2.8 2.8 0 0 0 0 5.6Zm-5.4 6.9a5.4 5.4 0 0 1 10.8 0Z",
+  product: "M8 1.6l5.6 2.8v7.2L8 14.4l-5.6-2.8V4.4Zm0 1.7L4.6 5 8 6.7 11.4 5Zm-4 3.1v4.4L7.2 12.6V8.1Zm8 0L8.8 8.1v4.5l3.2-1.6Z",
+  invoice: "M4.2 1.5h5.3l2.3 2.3v10.7H4.2Zm5 1.2v2h2ZM5.7 7h4.6v1H5.7Zm0 2.4h4.6v1H5.7Zm0 2.4h3v1h-3Z",
+  subscription: "M8 2.2a5.8 5.8 0 1 1-5.7 6.9h1.6A4.2 4.2 0 1 0 8 3.8V6L4.6 3.9 8 1.1Z"
+};
+D.objIcon = function (kind) {
+  var NS = "http://www.w3.org/2000/svg";
+  var box = D.el("span", "objicon");
+  var svg = document.createElementNS(NS, "svg");
+  svg.setAttribute("viewBox", "0 0 16 16");
+  svg.setAttribute("aria-hidden", "true");
+  var path = document.createElementNS(NS, "path");
+  path.setAttribute("d", D.OBJ_ICONS[kind] || D.OBJ_ICONS.product);
+  path.setAttribute("fill", "currentColor");
+  path.setAttribute("fill-rule", "evenodd");
+  svg.appendChild(path);
+  box.appendChild(svg);
+  return box;
+};
+
 D.renderCell = function (td, cell) {
   if (cell == null) { td.textContent = ""; return; }
   if (cell.t === "text") {
-    td.appendChild(document.createTextNode(cell.v));
+    if (cell.strong) td.appendChild(D.el("span", "strongname", cell.v));
+    else td.appendChild(document.createTextNode(cell.v));
     if (cell.sub) td.appendChild(D.el("span", "sub", cell.sub));
   } else if (cell.t === "money") {
     td.classList.add("money");
     if (cell.tone) td.classList.add(cell.tone);
     td.textContent = cell.v;
+  } else if (cell.t === "amount") {
+    td.classList.add("amountcell");
+    td.appendChild(D.el("span", "amt", cell.v));
+    td.appendChild(D.el("span", "cur", cell.cur));
+    if (cell.badge) td.appendChild(D.badge(cell.badge));
+  } else if (cell.t === "card") {
+    var KNOWN = { visa: 1, mastercard: 1, amex: 1, discover: 1, jcb: 1, diners: 1, unionpay: 1 };
+    var bkey = (cell.brand || "").toLowerCase().replace(/[^a-z]/g, "");
+    var ccell = D.el("span", "cardcell");
+    ccell.appendChild(D.el("span", "cardchip" + (KNOWN[bkey] ? " " + bkey : ""), D.cardLabel(cell.brand)));
+    ccell.appendChild(D.el("span", "cardnum", "\\u00b7\\u00b7\\u00b7\\u00b7 " + cell.last4));
+    td.appendChild(ccell);
+    if (cell.sub) td.appendChild(D.el("span", "sub", cell.sub));
+  } else if (cell.t === "avatar") {
+    var av = D.el("span", "avcell");
+    av.appendChild(D.objIcon(cell.icon));
+    if (cell.ref) {
+      var aname = D.el("a", "reflink strongname", cell.v);
+      aname.href = D.refHref(cell.ref);
+      av.appendChild(aname);
+    } else {
+      av.appendChild(D.el("span", "strongname", cell.v));
+    }
+    td.appendChild(av);
+    if (cell.sub) td.appendChild(D.el("span", "sub subindent", cell.sub));
   } else if (cell.t === "badge") {
     td.appendChild(D.badge(cell.b));
   } else if (cell.t === "flags") {
@@ -92,8 +153,15 @@ D.renderHeader = function (b) {
   var head = D.el("div", "pagehead");
   var titles = D.el("div", "titles");
   var h1 = D.el("h1", null, b.title);
+  if (b.titleSuffix) h1.appendChild(D.el("span", "tsuffix", b.titleSuffix));
   (b.badges || []).forEach(function (bd) { h1.appendChild(D.badge(bd)); });
   titles.appendChild(h1);
+  if (b.sub) {
+    var sl = D.el("div", "subline");
+    sl.appendChild(D.el("span", null, b.sub));
+    if (b.subCopy) sl.appendChild(D.copyBtn(b.sub));
+    titles.appendChild(sl);
+  }
   if (b.id) {
     var idl = D.el("div", "objid");
     idl.appendChild(D.el("span", null, b.id));
@@ -127,11 +195,15 @@ D.renderStats = function (b) {
 D.renderTable = function (b) {
   var box = D.el("div", "section");
   if (b.title) box.appendChild(D.el("h2", null, b.title));
-  if (b.filters && b.filters.length) box.appendChild(D.renderFilters(b));
+  if (b.counts) box.appendChild(D.renderCounts(b));
+  var searches = (b.filters || []).filter(function (f) { return f.kind === "search"; });
+  var pills = (b.filters || []).filter(function (f) { return f.kind !== "search"; });
+  searches.forEach(function (f) { box.appendChild(D.renderSearch(f)); });
+  if (pills.length) box.appendChild(D.renderPills(pills));
   if (!b.rows || b.rows.length === 0) {
     box.appendChild(D.el("p", "note", b.empty || "Nothing here."));
     if (b.notice) box.appendChild(D.el("p", "tnotice", b.notice));
-    if (D.state.stack.length > 0) box.appendChild(D.renderPager(b));
+    if (D.state.stack.length > 0) box.appendChild(D.renderFootRow(b, false));
     return box;
   }
   var wrap = D.el("div", "tablewrap");
@@ -179,38 +251,145 @@ D.renderTable = function (b) {
   wrap.appendChild(table);
   box.appendChild(wrap);
   if (b.notice) box.appendChild(D.el("p", "tnotice", b.notice));
-  if (b.nextCursor || D.state.stack.length > 0) box.appendChild(D.renderPager(b));
+  if (b.footer || b.nextCursor || D.state.stack.length > 0) box.appendChild(D.renderFootRow(b, true));
   return box;
 };
 
-D.renderFilters = function (b) {
-  var bar = D.el("div", "filterbar");
-  (b.filters || []).forEach(function (f) {
-    var item = D.el("div", "fitem");
-    item.appendChild(D.el("label", null, f.label));
-    if (f.kind === "select") {
-      var sel = document.createElement("select");
-      sel.appendChild(new Option("All", ""));
-      (f.options || []).forEach(function (o) { sel.appendChild(new Option(o.label, o.value)); });
-      sel.value = f.value || "";
-      sel.addEventListener("change", function () { D.applyFilter(f.key, sel.value); });
-      item.appendChild(sel);
+// "N items" footer + prev/next chevrons on one quiet row under the table.
+D.renderFootRow = function (b, withFooter) {
+  var row = D.el("div", "tfootrow");
+  if (b.nextCursor || D.state.stack.length > 0) row.appendChild(D.renderPager(b));
+  if (withFooter && b.footer) {
+    if (b.footerRef) {
+      var fa = D.el("a", "tfoot link", b.footer);
+      fa.href = D.refHref(b.footerRef);
+      row.appendChild(fa);
     } else {
-      var inp = document.createElement("input");
-      inp.type = "text"; inp.autocomplete = "off";
-      inp.value = f.value || "";
-      if (f.placeholder) inp.placeholder = f.placeholder;
-      inp.addEventListener("keydown", function (e) { if (e.key === "Enter") D.applyFilter(f.key, inp.value.trim()); });
-      inp.addEventListener("blur", function () {
-        if ((f.value || "") !== inp.value.trim()) D.applyFilter(f.key, inp.value.trim());
-      });
-      item.appendChild(inp);
+      row.appendChild(D.el("span", "tfoot", b.footer));
     }
-    bar.appendChild(item);
+  }
+  return row;
+};
+
+// Count-card segmented filter row (the LIST-archetype status filter).
+D.renderCounts = function (b) {
+  var row = D.el("div", "countrow");
+  var current = D.state.filters[b.counts.key] || "";
+  (b.counts.items || []).forEach(function (it) {
+    var card = D.el("button", "countcard" + ((it.value || "") === current ? " active" : ""));
+    card.type = "button";
+    card.appendChild(D.el("span", "clabel", it.label));
+    card.appendChild(D.el("span", "cnum", String(it.count)));
+    card.addEventListener("click", function () { D.applyFilter(b.counts.key, it.value); });
+    row.appendChild(card);
   });
-  var hasValue = (b.filters || []).some(function (f) { return f.value; });
-  if (hasValue) {
-    var clear = D.el("button", "btn", "Clear filters");
+  return row;
+};
+
+// Wide standalone search box (Customers-list style) for kind:"search" filters.
+D.renderSearch = function (f) {
+  var wrap = D.el("div", "tsearch");
+  var NS = "http://www.w3.org/2000/svg";
+  var svg = document.createElementNS(NS, "svg");
+  svg.setAttribute("viewBox", "0 0 16 16");
+  svg.setAttribute("aria-hidden", "true");
+  var c = document.createElementNS(NS, "circle");
+  c.setAttribute("cx", "7"); c.setAttribute("cy", "7"); c.setAttribute("r", "4.4");
+  c.setAttribute("fill", "none"); c.setAttribute("stroke", "currentColor"); c.setAttribute("stroke-width", "1.6");
+  var l = document.createElementNS(NS, "line");
+  l.setAttribute("x1", "10.4"); l.setAttribute("y1", "10.4"); l.setAttribute("x2", "14"); l.setAttribute("y2", "14");
+  l.setAttribute("stroke", "currentColor"); l.setAttribute("stroke-width", "1.6"); l.setAttribute("stroke-linecap", "round");
+  svg.appendChild(c); svg.appendChild(l);
+  wrap.appendChild(svg);
+  var inp = document.createElement("input");
+  inp.type = "text"; inp.autocomplete = "off";
+  inp.value = f.value || "";
+  inp.placeholder = f.placeholder || f.label;
+  inp.setAttribute("aria-label", f.label);
+  inp.addEventListener("keydown", function (e) { if (e.key === "Enter") D.applyFilter(f.key, inp.value.trim()); });
+  inp.addEventListener("blur", function () {
+    if ((f.value || "") !== inp.value.trim()) D.applyFilter(f.key, inp.value.trim());
+  });
+  wrap.appendChild(inp);
+  return wrap;
+};
+
+// Filter pills ("⊕ Label" → popover with the control; set pills show the value
+// + a clear ×). One popover open at a time; outside click closes.
+D.closeAllPops = function () {
+  var pops = document.querySelectorAll(".fpop.open");
+  for (var i = 0; i < pops.length; i++) pops[i].classList.remove("open");
+};
+document.addEventListener("click", function (e) {
+  var t = e.target;
+  while (t) {
+    if (t.classList && t.classList.contains("fpillwrap")) return;
+    t = t.parentNode;
+  }
+  D.closeAllPops();
+});
+
+D.filterPill = function (f) {
+  var wrap = D.el("span", "fpillwrap");
+  var pill = D.el("button", "fpill" + (f.value ? " set" : ""));
+  pill.type = "button";
+  if (!f.value) {
+    pill.appendChild(D.el("span", "pplus", "+"));
+    pill.appendChild(D.el("span", null, f.label));
+  } else {
+    var valLabel = f.value;
+    if (f.kind === "select") {
+      (f.options || []).forEach(function (o) { if (o.value === f.value) valLabel = o.label; });
+    }
+    pill.appendChild(D.el("span", "plab", f.label));
+    pill.appendChild(D.el("span", "psep", "|"));
+    pill.appendChild(D.el("span", "pval", valLabel));
+    var x = D.el("span", "px", "\\u00d7");
+    x.title = "Clear";
+    x.addEventListener("click", function (e) { e.stopPropagation(); D.applyFilter(f.key, ""); });
+    pill.appendChild(x);
+  }
+  var pop = D.el("div", "fpop");
+  pop.appendChild(D.el("label", null, f.label));
+  if (f.kind === "select") {
+    var sel = document.createElement("select");
+    sel.appendChild(new Option("All", ""));
+    (f.options || []).forEach(function (o) { sel.appendChild(new Option(o.label, o.value)); });
+    sel.value = f.value || "";
+    sel.addEventListener("change", function () { D.applyFilter(f.key, sel.value); });
+    pop.appendChild(sel);
+  } else {
+    var inp = document.createElement("input");
+    inp.type = "text"; inp.autocomplete = "off";
+    inp.value = f.value || "";
+    if (f.placeholder) inp.placeholder = f.placeholder;
+    inp.addEventListener("keydown", function (e) { if (e.key === "Enter") D.applyFilter(f.key, inp.value.trim()); });
+    pop.appendChild(inp);
+    var go = D.el("button", "btn sm primary", "Apply");
+    go.type = "button";
+    go.addEventListener("click", function () { D.applyFilter(f.key, inp.value.trim()); });
+    pop.appendChild(go);
+  }
+  pill.addEventListener("click", function (e) {
+    e.stopPropagation();
+    var wasOpen = pop.classList.contains("open");
+    D.closeAllPops();
+    if (!wasOpen) {
+      pop.classList.add("open");
+      var focusable = pop.querySelector("input");
+      if (focusable) focusable.focus();
+    }
+  });
+  wrap.appendChild(pill);
+  wrap.appendChild(pop);
+  return wrap;
+};
+
+D.renderPills = function (pills) {
+  var bar = D.el("div", "pillbar");
+  pills.forEach(function (f) { bar.appendChild(D.filterPill(f)); });
+  if (pills.some(function (f) { return f.value; })) {
+    var clear = D.el("button", "pillclear", "Clear filters");
     clear.type = "button";
     clear.addEventListener("click", function () { D.clearFilters(); });
     bar.appendChild(clear);
@@ -220,15 +399,19 @@ D.renderFilters = function (b) {
 
 D.renderPager = function (b) {
   var pager = D.el("div", "pager");
-  var back = D.el("button", "btn sm", "Back");
+  var back = D.el("button", "pgbtn", "\\u2039");
   back.type = "button";
+  back.title = "Previous page";
+  back.setAttribute("aria-label", "Previous page");
   back.disabled = D.state.stack.length === 0;
   back.addEventListener("click", function () {
     D.state.cursor = D.state.stack.pop() || null;
     D.loadPage();
   });
-  var next = D.el("button", "btn sm", "Next");
+  var next = D.el("button", "pgbtn", "\\u203a");
   next.type = "button";
+  next.title = "Next page";
+  next.setAttribute("aria-label", "Next page");
   next.disabled = !b.nextCursor;
   next.addEventListener("click", function () {
     D.state.stack.push(D.state.cursor);
@@ -240,7 +423,7 @@ D.renderPager = function (b) {
 };
 
 D.renderKv = function (b) {
-  var box = D.el("div", "section kv");
+  var box = D.el("div", "section kv" + (b.big ? " kvbig" : ""));
   if (b.title) box.appendChild(D.el("h2", null, b.title));
   (b.rows || []).forEach(function (r) {
     var row = D.el("div", "kvrow");

@@ -1,7 +1,7 @@
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { SettingsStore } from "../config/SettingsStore";
 
-// Short-lived SINGLE-USE link tokens for the Stripe dashboard (/dashboard).
+// Short-lived SINGLE-USE link tokens for the Stripe dashboard (/billing).
 // Format: "d1.<base64url(JSON payload)>.<hex HMAC-SHA256>".
 //
 // Unlike the Stripe/admin panels (which share panelTokenSecret and rely on the
@@ -12,7 +12,7 @@ import { SettingsStore } from "../config/SettingsStore";
 // auto re-seed).
 //
 // Security model (mirrors AdminPanelTokens):
-//  - The link token is NOT the API credential. GET /dashboard exchanges it
+//  - The link token is NOT the API credential. GET /billing exchanges it
 //    exactly once (jti consumed server-side) for an HttpOnly session cookie.
 //  - Tokens + sessions embed dashboardEpoch; bumping it ("Revoke dashboard
 //    links" / LOCKDOWN) invalidates everything outstanding instantly.

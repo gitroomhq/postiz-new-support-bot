@@ -16,6 +16,8 @@ import { log } from "../../../util/logger";
 
 const actionLog = log.child("billing:actions");
 
+export type { ActionActor };
+
 export type RequestOutcome =
   | { kind: "executed"; text: string }
   | { kind: "queued"; approvalId: string }
@@ -29,6 +31,17 @@ export type ApprovalOutcome =
   | { kind: "already_handled"; error: string }
   | { kind: "denied"; error: string }
   | { kind: "failed"; error: string };
+
+// Server-derived scope for non-Intercom entry points (the web dashboard).
+// The GATEWAY resolves this from the target object — never the client. A
+// non-null ticketThreadId carries charge-review binding (from the review row).
+export interface ScopedBinding {
+  stripeCustomerId: string | null;
+  discordCustomerId: string | null;
+  ticketThreadId: string | null;
+  conversationId: string | null;
+  origin: "dashboard";
+}
 
 // The Discord-independent brain behind every canvas/panel billing action.
 // Level model (per action, /config → Billing → Intercom Actions):
@@ -134,7 +147,58 @@ export class BillingActionService {
     return result.ok ? { kind: "executed", text: result.text } : { kind: "failed", error: result.error };
   }
 
-  // Approve/reject a queued approval (canvas, panel, or Discord /billing hub).
+  // Entry point for the web dashboard: same level/queue/execute/audit
+  // internals as request(), but the scope comes from a server-derived binding
+  // (target object → customer) instead of an Intercom conversation link.
+  async requestScoped(binding: ScopedBinding, actor: ActionActor, actionKey: string, rawParams: unknown): Promise<RequestOutcome> {
+    const def = actionByKey(actionKey);
+    if (!def) return { kind: "invalid", error: "Unknown action." };
+    const parsed = def.parseParams(rawParams);
+    if (!parsed.ok) return { kind: "invalid", error: parsed.error };
+
+    const mode = this.effectiveMode(actionKey, actor);
+    if (mode === "denied") return { kind: "denied", error: "This action is disabled (/config → Billing → Intercom Actions)." };
+
+    const ctx = this.buildScopedCtx(binding, actor, randomUUID());
+    const summary = def.summarize(parsed.params, this.stripe);
+
+    if (mode === "queue") {
+      const approval = await this.approvalStore.create({
+        actionKey: def.key,
+        params: parsed.params,
+        summary,
+        conversationId: binding.conversationId,
+        origin: binding.origin,
+        ticketThreadId: binding.ticketThreadId,
+        stripeCustomerId: binding.stripeCustomerId,
+        requestedById: actor.id,
+        requestedByName: actor.name,
+      });
+      await this.postBillingAudit({
+        title: `Billing: Approval requested (${actor.kind})`,
+        summary,
+        ctx,
+        fields: [
+          { name: "Requested by", value: actor.name, inline: true },
+          { name: "Action", value: def.label, inline: true },
+        ],
+      });
+      actionLog.info("billing.action.queued", {
+        "action.key": def.key,
+        "action.origin": binding.origin,
+        "actor.id": actor.id,
+      });
+      return { kind: "queued", approvalId: approval.id };
+    }
+
+    const result = await this.executeNow(def, ctx, parsed.params, summary);
+    return result.ok ? { kind: "executed", text: result.text } : { kind: "failed", error: result.error };
+  }
+
+  // Approve/reject a queued approval (canvas, panel, dashboard, or Discord
+  // /billing hub). Works cross-surface in both directions: an Intercom-origin
+  // approval can be approved from the dashboard and vice versa — the ctx is
+  // rebuilt per the approval's ORIGIN, not the reviewer's surface.
   async actOnApproval(approvalId: string, reviewer: ActionActor, decision: "approve" | "reject"): Promise<ApprovalOutcome> {
     const approval = await this.approvalStore.get(approvalId);
     if (!approval) return { kind: "already_handled", error: "Approval not found." };
@@ -148,10 +212,10 @@ export class BillingActionService {
       }
       const rejected = await this.approvalStore.reject(approvalId, reviewerId, reviewer.name);
       if (!rejected) return { kind: "already_handled", error: "Approval was already handled." };
-      const ctx = await this.buildCtx(approval.conversationId, reviewer, approvalId);
+      const ctx = await this.ctxForApproval(approval, reviewer, approvalId);
       if (ctx) await this.postNote(ctx, `🚫 **Approval rejected** by ${reviewer.name}: ${approval.summary}`);
       await this.postBillingAudit({
-        title: "Billing: Approval rejected (Intercom)",
+        title: `Billing: Approval rejected (${reviewer.kind})`,
         summary: approval.summary,
         ctx,
         fields: [
@@ -185,8 +249,10 @@ export class BillingActionService {
       return { kind: "failed", error: `Stored params no longer parse: ${parsed.error}` };
     }
 
-    // Rebuild ctx fresh — link/customer may have changed since queueing.
-    const ctx = await this.buildCtx(approval.conversationId, reviewer, approvalId);
+    // Rebuild ctx fresh — link/customer may have changed since queueing. The
+    // rebuild path depends on the approval's ORIGIN (intercom = conversation
+    // link; dashboard = the binding snapshot stored on the row).
+    const ctx = await this.ctxForApproval(approval, reviewer, approvalId);
     if (!ctx) {
       await this.approvalStore.markFailed(approvalId, "Conversation is no longer bridged.");
       return { kind: "failed", error: "Conversation is no longer bridged." };
@@ -213,13 +279,17 @@ export class BillingActionService {
     if (!def) return "Action no longer exists in this build.";
     const parsed = def.parseParams(approval.paramsJson);
     if (!parsed.ok) return `Stored params no longer parse: ${parsed.error}`;
-    const ctx = await this.buildCtx(approval.conversationId, { kind: "discord", id: "preview", name: "preview", isAdmin: true }, "preview");
+    const ctx = await this.ctxForApproval(approval, { kind: "discord", id: "preview", name: "preview", isAdmin: true }, "preview");
     if (!ctx) return "Conversation is no longer bridged.";
     return def.revalidate(ctx, parsed.params).catch((e) => `Revalidation errored: ${e instanceof Error ? e.message : String(e)}`);
   }
 
   async pendingPage(offset: number, limit: number): Promise<{ rows: BillingApproval[]; total: number }> {
     return this.approvalStore.listActionable(offset, limit);
+  }
+
+  async getApproval(id: string): Promise<BillingApproval | null> {
+    return this.approvalStore.get(id);
   }
 
   // ---- internals ----
@@ -247,6 +317,46 @@ export class BillingActionService {
     };
   }
 
+  private buildScopedCtx(binding: ScopedBinding, actor: ActionActor, idemScope: string): ActionExecCtx {
+    return {
+      stripe: this.stripe,
+      sessionStore: this.sessionStore,
+      settingsStore: this.settingsStore,
+      blockService: this.blockService,
+      refundCore: this.refundCore,
+      stripeCustomerId: binding.stripeCustomerId,
+      conversationId: binding.conversationId,
+      ticketThreadId: binding.ticketThreadId,
+      discordCustomerId: binding.discordCustomerId,
+      actor,
+      idemScope,
+    };
+  }
+
+  // Ctx rebuild for an existing approval row, branched by origin. Dashboard
+  // rows carry their binding (customer id, optional review thread) on the row
+  // itself; the Discord link is re-derived fresh (it may have changed since
+  // queue time) and revalidation still re-checks live ownership.
+  private async ctxForApproval(approval: BillingApproval, actor: ActionActor, idemScope: string): Promise<ActionExecCtx | null> {
+    if (approval.origin !== "dashboard" && approval.conversationId) {
+      return this.buildCtx(approval.conversationId, actor, idemScope);
+    }
+    const discordIds = approval.stripeCustomerId
+      ? await this.sessionStore.findDiscordIdsByStripeId(approval.stripeCustomerId).catch(() => [])
+      : [];
+    return this.buildScopedCtx(
+      {
+        stripeCustomerId: approval.stripeCustomerId,
+        discordCustomerId: discordIds[0] ?? null,
+        ticketThreadId: approval.ticketThreadId,
+        conversationId: approval.conversationId,
+        origin: "dashboard",
+      },
+      actor,
+      idemScope
+    );
+  }
+
   // Shared by the direct and approved paths: in-flight guard → revalidate →
   // execute → note + audit. Never throws.
   private async executeNow(
@@ -256,7 +366,9 @@ export class BillingActionService {
     summary: string,
     approval?: BillingApproval
   ): Promise<{ ok: true; text: string } | { ok: false; error: string }> {
-    const flightKey = `${ctx.conversationId}:${def.key}`;
+    // Dashboard requests have no conversation — scope the double-click guard
+    // to the customer (or globally for unscoped actions).
+    const flightKey = `${ctx.conversationId ?? ctx.stripeCustomerId ?? ctx.ticketThreadId ?? "global"}:${def.key}`;
     if (this.inFlight.has(flightKey)) return { ok: false, error: "This action is already running — refresh in a moment." };
     this.inFlight.add(flightKey);
     try {
@@ -279,7 +391,7 @@ export class BillingActionService {
         await this.postNote(ctx, `⚠️ **${def.label}** ${actorLine} FAILED: ${summary}\n${result.error}`);
       }
       await this.postBillingAudit({
-        title: `Billing: ${def.label} (Intercom)`,
+        title: `Billing: ${def.label} (${ctx.actor.kind})`,
         summary,
         ctx,
         fields: [
@@ -291,7 +403,7 @@ export class BillingActionService {
       actionLog.info("billing.action.executed", {
         "action.key": def.key,
         "action.ok": result.ok,
-        "intercom.conversation_id": ctx.conversationId,
+        "intercom.conversation_id": ctx.conversationId ?? "",
         "actor.id": ctx.actor.id,
         "approval.id": approval?.id ?? "",
       });
@@ -302,8 +414,9 @@ export class BillingActionService {
   }
 
   // Best-effort internal note — a note failure must never fail the action.
+  // Dashboard-origin requests have no conversation to note into.
   private async postNote(ctx: ActionExecCtx, body: string): Promise<void> {
-    if (!ctx.ticketThreadId) return;
+    if (!ctx.ticketThreadId || !ctx.conversationId) return;
     await this.intercomExecutor.postPanelNote(ctx.ticketThreadId, ctx.conversationId, body).catch((e) => {
       actionLog.warn("panel note failed", { "error.message": e instanceof Error ? e.message : String(e) });
     });

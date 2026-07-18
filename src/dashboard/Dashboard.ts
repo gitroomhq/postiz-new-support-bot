@@ -1,6 +1,8 @@
 import { randomBytes } from "node:crypto";
 import { SettingsStore } from "../config/SettingsStore";
 import { MountedPanelRoute, PanelRequestMeta } from "../server/panelMount";
+import { actionByKey } from "../bot/billing/actions/ActionRegistry";
+import type { ActionActor } from "../bot/billing/actions/BillingActionService";
 import { DashboardAuthProvider, DashboardAuthResult } from "./DashboardAuth";
 import { DashboardCtx, DashboardSectionModule } from "./sections/types";
 import {
@@ -18,6 +20,24 @@ const dashLog = log.child("dashboard");
 
 const RATE_LIMIT_PER_MIN = 240; // a real dashboard tab is chattier than the mini-panels
 const RATE_WINDOW_MS = 60_000;
+
+// Dashboard ceremony tiers for REGISTRY actions (§C tier map), enforced
+// server-side — the client modal is advisory. Registry defs flagged
+// `dangerous` are T1 automatically; this set adds the not-flagged T1 keys.
+const DASH_T1_EXTRA = new Set([
+  "payment_intent.cancel",
+  "subscription.pause_resume",
+  "subscription.terms",
+  "invoice.collect",
+  "customer.payment_method",
+]);
+// T2 (fresh factor re-assert): fraud refunds, blocklisting, cancel-NOW.
+const DASH_T2 = new Set(["charge.refund_fraud", "customer.block"]);
+
+function needsStepUp(key: string, params: Record<string, unknown> | undefined): boolean {
+  if (DASH_T2.has(key)) return true;
+  return key === "subscription.cancel" && params?.when === "now";
+}
 
 export type DashboardAuditFn = (actor: { id: string; name: string }, change: string) => Promise<void>;
 
@@ -39,7 +59,7 @@ export class Dashboard implements MountedPanelRoute {
     this.buildCtxDeps = deps;
   }
 
-  // GET /dashboard — kill switch, then auth-provider entry (cookie resume,
+  // GET /billing — kill switch, then auth-provider entry (cookie resume,
   // break-glass token exchange, or login mode), then the shell. Nothing
   // session-specific is baked into the HTML except the CSP nonce.
   async page(
@@ -58,7 +78,7 @@ export class Dashboard implements MountedPanelRoute {
     };
   }
 
-  // POST /dashboard/api/:endpoint — cookie-authenticated (panelMount already
+  // POST /billing/api/:endpoint — cookie-authenticated (panelMount already
   // enforced the CSRF belts). Without a session, only the login-ceremony
   // endpoints (auth-*) and the pre-login activation-status poll work; with a
   // LOCKED session only activation-status; everything else needs ACTIVE.
@@ -137,22 +157,24 @@ export class Dashboard implements MountedPanelRoute {
         }
         case "action": {
           const key = typeof request.key === "string" ? request.key.slice(0, 64) : "";
-          if (!key.startsWith("section:")) return { status: 400, json: { ok: false, error: "Unknown action." } };
-          const page = typeof request.page === "string" ? request.page.slice(0, 64) : "";
-          const module = this.modules.find((m) => m.action && m.ownsPage(page));
-          if (!module?.action) return { status: 404, json: { ok: false, error: "Unknown action." } };
-          let reverseSatisfied = false;
-          if (typeof request.reverseCode === "string" && request.reverseCode) {
-            reverseSatisfied = auth.consumeReverse(request.reverseCode);
+          if (key.startsWith("section:")) {
+            const page = typeof request.page === "string" ? request.page.slice(0, 64) : "";
+            const module = this.modules.find((m) => m.action && m.ownsPage(page));
+            if (!module?.action) return { status: 404, json: { ok: false, error: "Unknown action." } };
+            let reverseSatisfied = false;
+            if (typeof request.reverseCode === "string" && request.reverseCode) {
+              reverseSatisfied = auth.consumeReverse(request.reverseCode);
+            }
+            const ctx = this.ctxFor(auth, { satisfied: reverseSatisfied });
+            const result: ActionResult = await module.action(ctx, {
+              key,
+              params: this.obj(request.params),
+              confirmWord: typeof request.confirmWord === "string" ? request.confirmWord : undefined,
+              reverseCode: typeof request.reverseCode === "string" ? request.reverseCode : undefined,
+            });
+            return { status: 200, json: result };
           }
-          const ctx = this.ctxFor(auth, { satisfied: reverseSatisfied });
-          const result: ActionResult = await module.action(ctx, {
-            key,
-            params: this.obj(request.params),
-            confirmWord: typeof request.confirmWord === "string" ? request.confirmWord : undefined,
-            reverseCode: typeof request.reverseCode === "string" ? request.reverseCode : undefined,
-          });
-          return { status: 200, json: result };
+          return { status: 200, json: await this.registryAction(auth, key, request) };
         }
         case "logout": {
           auth.logout();
@@ -172,6 +194,39 @@ export class Dashboard implements MountedPanelRoute {
     }
   }
 
+  // Registry billing action via the gateway (money movement). The ceremony
+  // belts run HERE, server-side: T1 typed-CONFIRM, T2 fresh-factor — the
+  // client modal already asked, but the client is hostile.
+  private async registryAction(auth: DashboardAuthResult, key: string, request: Record<string, unknown>): Promise<ActionResult> {
+    const def = actionByKey(key);
+    if (!def) return { ok: false, error: "Unknown action." };
+    const params = this.obj(request.params) ?? {};
+    if (needsStepUp(key, params) && !auth.stepUpFresh()) {
+      return { ok: false, needsStepUp: true };
+    }
+    if (def.dangerous || DASH_T1_EXTRA.has(key)) {
+      const word = typeof request.confirmWord === "string" ? request.confirmWord : "";
+      if (word !== "CONFIRM") return { ok: false, error: "Type CONFIRM to run this action.", fieldErrors: {} };
+    }
+    const actor: ActionActor = {
+      kind: "dashboard",
+      id: auth.actor.id,
+      name: auth.actor.name,
+      isAdmin: auth.actor.isAdmin,
+    };
+    const outcome = await this.buildCtxDeps.billing.gateway.request(actor, key, params);
+    switch (outcome.kind) {
+      case "executed":
+        return { ok: true, text: outcome.text };
+      case "queued":
+        return { ok: true, queued: true, text: "Queued for admin approval (expires in 7 days)." };
+      case "denied":
+      case "invalid":
+      case "failed":
+        return { ok: false, error: outcome.error };
+    }
+  }
+
   private async buildView(auth: DashboardAuthResult, req: ViewRequest): Promise<PageView | null> {
     const module = this.modules.find((m) => m.ownsPage(req.page));
     if (!module) return null;
@@ -187,6 +242,7 @@ export class Dashboard implements MountedPanelRoute {
       nav,
       activeNav: active?.key ?? "",
       blocks: section.blocks,
+      ...(section.rail && section.rail.length ? { rail: section.rail } : {}),
       testMode: this.buildCtxDeps.stripe.isTestMode(),
       actorLabel: `${auth.actor.name} · ${auth.actor.role}`,
     };

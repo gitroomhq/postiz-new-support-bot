@@ -245,13 +245,14 @@ export class CallbackServer {
       logLabel: "admin panel",
       route: () => this.adminPanel,
     });
-    // Stripe dashboard (account-wide standing surface, /billing → web).
+    // Billing dashboard (account-wide standing surface). Lives at /billing —
+    // it is the BILLING dashboard, not "the" bot dashboard (user decision).
     mountPanel(this.app, allowIp, {
-      pagePath: "/dashboard",
-      apiPath: "/dashboard/api/:endpoint",
-      cookieName: "__Host-dash",
+      pagePath: "/billing",
+      apiPath: "/billing/api/:endpoint",
+      cookieName: "__Host-billing",
       metricName: "dashboard.auth_failures",
-      logLabel: "dashboard",
+      logLabel: "billing dashboard",
       route: () => this.dashboard,
     });
 

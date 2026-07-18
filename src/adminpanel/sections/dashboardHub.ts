@@ -13,7 +13,7 @@ export function makeDashboardHub(deps: { resetCredentials: (userId: string) => P
   return {
     hub: "dashboard",
     group: "config",
-    title: "Dashboard",
+    title: "Billing Dashboard",
 
     async buildSections(ctx): Promise<Section[]> {
       const s = ctx.settings;

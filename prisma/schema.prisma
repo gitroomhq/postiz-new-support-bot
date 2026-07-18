@@ -55,10 +55,11 @@ model BillingApproval {
   actionKey        String
   paramsJson       Json
   summary          String // human-readable summary rendered at queue time
-  conversationId   String // Intercom conversation the request came from
+  conversationId   String? // Intercom conversation the request came from (null for dashboard-origin)
+  origin           String    @default("intercom") // "intercom" | "dashboard" — decides ctx rebuild at approval time
   ticketThreadId   String?
   stripeCustomerId String?
-  requestedById    String // Intercom teammate id
+  requestedById    String // Intercom teammate id (or Discord id for dashboard-origin)
   requestedByName  String
   status           String    @default("PENDING") // PENDING | EXECUTING | EXECUTED | REJECTED | EXPIRED | FAILED
   reviewerId       String? // "intercom:<id>" or "discord:<id>"

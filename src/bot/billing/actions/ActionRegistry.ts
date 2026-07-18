@@ -21,7 +21,7 @@ import { RefundCoreService } from "../RefundCoreService";
 export type { BillingActionLevel };
 
 export interface ActionActor {
-  kind: "intercom" | "discord";
+  kind: "intercom" | "discord" | "dashboard";
   id: string;
   name: string;
   isAdmin: boolean;
@@ -33,9 +33,12 @@ export interface ActionExecCtx {
   settingsStore: SettingsStore;
   blockService: BlockService;
   refundCore: RefundCoreService;
-  // Resolved server-side from the conversation link — never client-supplied.
+  // Resolved server-side — never client-supplied. Intercom entry derives it
+  // from the conversation link; the dashboard gateway derives it from the
+  // TARGET object (charge/PI/sub/invoice → .customer).
   stripeCustomerId: string | null;
-  conversationId: string;
+  // null for dashboard-origin requests (no Intercom conversation involved).
+  conversationId: string | null;
   ticketThreadId: string | null;
   discordCustomerId: string | null;
   actor: ActionActor;
@@ -769,7 +772,7 @@ const customerBalance = defineAction<CustomerBalanceParams>({
       ctx.stripeCustomerId!,
       p.deltaMinor,
       p.currency,
-      p.note ?? `Support adjustment via Intercom panel (${ctx.actor.name})`,
+      p.note ?? `Support adjustment via ${ctx.actor.kind} panel (${ctx.actor.name})`,
       `panel-balance-${p.deltaMinor}-${p.currency}-${ctx.idemScope}`
     );
     return { ok: true, text: `Balance adjusted by ${fmt(ctx.stripe, p.deltaMinor, p.currency)} (txn ${txn.id}).` };

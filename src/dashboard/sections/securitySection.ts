@@ -110,7 +110,10 @@ export function makeSecuritySection(deps: {
       deps.audit.recent(15, ctx.actor.id),
       deps.credentials.hasPassphrase(ctx.actor.id),
     ]);
+    // Stripe detail archetype: tables + activity in the main column, the
+    // factor status card and the emergency levers in the right rail.
     const blocks: Block[] = [];
+    const rail: Block[] = [];
 
     blocks.push({
       type: "header",
@@ -128,7 +131,7 @@ export function makeSecuritySection(deps: {
       blocks.push({
         type: "notice",
         badge: { kind: "warn", text: "SETUP" },
-        text: "No passphrase yet. Set one below, then register a passkey — after that you sign in at this URL directly, no Discord link needed.",
+        text: "No passphrase yet. Set one (right rail), then register a passkey — after that you sign in at this URL directly, no Discord link needed.",
       });
     } else if (!credentials.some((c) => c.kind === "passkey")) {
       blocks.push({
@@ -138,8 +141,8 @@ export function makeSecuritySection(deps: {
       });
     }
 
-    // Passphrase + enrollment.
-    blocks.push({
+    // Passphrase + enrollment (rail card).
+    rail.push({
       type: "kv",
       title: "Sign-in factors",
       rows: [
@@ -181,6 +184,31 @@ export function makeSecuritySection(deps: {
           label: "Register passkey on this device",
           special: "passkey-register",
           disabledReason: hasPassphrase ? undefined : "Set a passphrase first.",
+        },
+      ],
+    });
+
+    // Emergency levers (rail card).
+    rail.push({
+      type: "kv",
+      title: "Emergency",
+      rows: [
+        {
+          label: "Sign out everywhere",
+          cell: { t: "text", v: "Kills every dashboard session and link (including this one)." },
+        },
+        {
+          label: "Lockdown",
+          cell: { t: "text", v: "Full lockdown (disable + revoke) lives in Discord: /config → Open Web Panel → Dashboard — the web can only reduce its own access." },
+        },
+      ],
+      actions: [
+        {
+          key: "section:security.signout_everywhere",
+          label: "Sign out everywhere",
+          style: "danger",
+          dangerous: true,
+          summary: "Bumps the dashboard epoch: every session and outstanding link dies. You sign in again afterwards.",
         },
       ],
     });
@@ -260,31 +288,6 @@ export function makeSecuritySection(deps: {
       notice: "Sessions: 8h idle / 3 days maximum. Revoking a session signs that device out immediately.",
     });
 
-    // Sign out everywhere.
-    blocks.push({
-      type: "kv",
-      title: "Emergency",
-      rows: [
-        {
-          label: "Sign out everywhere",
-          cell: { t: "text", v: "Kills every dashboard session and link (including this one)." },
-        },
-        {
-          label: "Lockdown",
-          cell: { t: "text", v: "Full lockdown (disable + revoke) lives in Discord: /config → Open Web Panel → Dashboard — the web can only reduce its own access." },
-        },
-      ],
-      actions: [
-        {
-          key: "section:security.signout_everywhere",
-          label: "Sign out everywhere",
-          style: "danger",
-          dangerous: true,
-          summary: "Bumps the dashboard epoch: every session and outstanding link dies. You sign in again afterwards.",
-        },
-      ],
-    });
-
     // Recent activity.
     blocks.push({
       type: "timeline",
@@ -301,6 +304,7 @@ export function makeSecuritySection(deps: {
       title: "Security",
       crumbs: [{ label: "Security" }],
       blocks,
+      rail,
     };
   }
 

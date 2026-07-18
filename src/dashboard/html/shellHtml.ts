@@ -1,4 +1,4 @@
-import { panelThemeCss } from "../../util/panelTheme";
+import { stripeBaseCss } from "./stripeTheme";
 import { dashboardCss } from "./styles";
 import { clientCore } from "./clientCore";
 import { clientBlocks } from "./clientBlocks";
@@ -6,9 +6,9 @@ import { clientModal } from "./clientModal";
 import { clientLogin } from "./clientLogin";
 import { clientApp } from "./clientApp";
 
-// Self-contained HTML shell for the Stripe dashboard (/dashboard). Ships as a
+// Self-contained HTML shell for the Stripe dashboard (/billing). Ships as a
 // template string (no build pipeline): inline CSS + vanilla JS, zero external
-// requests (strict CSP allows only same-origin XHR to /dashboard/api/*).
+// requests (strict CSP allows only same-origin XHR to /billing/api/*).
 //
 // The page is dumb on purpose: the server (Dashboard + section modules)
 // describes every block/cell/button; the client renders generically and posts
@@ -30,7 +30,7 @@ export function renderDashboardShell(ctx: DashboardShellCtx): string {
 <meta name="robots" content="noindex">
 <title>Billing</title>
 <style nonce="${ctx.nonce}">
-${panelThemeCss()}
+${stripeBaseCss()}
 ${dashboardCss()}
 </style>
 </head>
@@ -40,7 +40,8 @@ ${dashboardCss()}
     <div class="spinner"></div>
     <h2>Confirm in Discord to unlock</h2>
     <p class="muted">Check your Discord DMs (or /billing → <strong>Activate session</strong>) and enter this code:</p>
-    <div id="lockcode" class="code">••••-••••</div>
+    <div id="lockcode" class="code" title="Click to copy">••••-••••</div>
+    <p class="codehint">Click the code to copy it</p>
     <p class="muted">Waiting for confirmation…</p>
   </div>
 </div>
@@ -81,7 +82,6 @@ ${dashboardCss()}
   <aside class="side">
     <div class="brand"><span class="dot">$</span> Billing</div>
     <nav id="nav"></nav>
-    <div class="side-foot"><span class="chip" id="modechip">dashboard</span></div>
   </aside>
   <div class="mainwrap">
     <header class="topbar">

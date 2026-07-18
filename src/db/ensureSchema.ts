@@ -652,7 +652,8 @@ const STATEMENTS: string[] = [
     "actionKey" TEXT NOT NULL,
     "paramsJson" JSONB NOT NULL,
     "summary" TEXT NOT NULL,
-    "conversationId" TEXT NOT NULL,
+    "conversationId" TEXT,
+    "origin" TEXT NOT NULL DEFAULT 'intercom',
     "ticketThreadId" TEXT,
     "stripeCustomerId" TEXT,
     "requestedById" TEXT NOT NULL,
@@ -670,6 +671,11 @@ const STATEMENTS: string[] = [
   )`,
   `CREATE INDEX IF NOT EXISTS "billing_approvals_status_createdAt_idx" ON "billing_approvals"("status", "createdAt")`,
   `CREATE INDEX IF NOT EXISTS "billing_approvals_conversationId_status_idx" ON "billing_approvals"("conversationId", "status")`,
+  // Dashboard-origin approvals (M2): conversation becomes optional, origin
+  // decides how the execution ctx is rebuilt at approval time. Both statements
+  // are idempotent on already-migrated databases.
+  `ALTER TABLE "billing_approvals" ALTER COLUMN "conversationId" DROP NOT NULL`,
+  `ALTER TABLE "billing_approvals" ADD COLUMN IF NOT EXISTS "origin" TEXT NOT NULL DEFAULT 'intercom'`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "intercomPanelAdminsJson" JSONB`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "billingActionLevelsJson" JSONB`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "panelTokenSecret" TEXT`,

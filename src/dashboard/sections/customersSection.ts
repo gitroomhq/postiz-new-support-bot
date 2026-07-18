@@ -1,10 +1,28 @@
 import type Stripe from "stripe";
 import { Badge, Block, Cell, TableBlock } from "../renderer/contract";
 import { DashboardCtx, DashboardSectionModule, SectionPage, str, validCursor, validId } from "./types";
+import {
+  amount,
+  avatarCell,
+  badgeCell,
+  chargeBadge,
+  dateCell,
+  estimateMrr,
+  formatPerCurrency,
+  idCell,
+  invoiceBadge,
+  isoDateCell,
+  paymentMethodCell,
+  strong,
+  subBadge,
+  text,
+} from "./cells";
 
 // Customers: account-wide browse/search + the read-only Customer 360. M0 scope
 // is deliberately read-only — write actions (edit/create/link/block) arrive
-// with the action-gateway milestone.
+// with the action-gateway milestone. Layout follows the Stripe DETAIL
+// archetype: flat tables in the main column, Insights/Details/Linked accounts
+// stacked label-over-value in the right rail.
 
 const PAGE_SIZE = 25;
 
@@ -42,30 +60,34 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
     hasMore = page.hasMore;
   }
 
+  const n = customers.length;
   const table: TableBlock = {
     type: "table",
     key: "customers",
     columns: [
+      { key: "name", label: "Customer" },
       { key: "email", label: "Email" },
-      { key: "name", label: "Name" },
       { key: "flags", label: "Flags" },
       { key: "created", label: "Created" },
       { key: "id", label: "ID" },
     ],
-    filters: [{ key: "q", label: "Search", kind: "text", value: q || undefined, placeholder: "name or email" }],
+    filters: [
+      { key: "q", label: "Search", kind: "search", value: q || undefined, placeholder: "Search by name or email" },
+    ],
     rows: customers.map((c) => ({
       id: c.id,
       ref: { page: "customers.detail", params: { id: c.id } },
       cells: [
-        { t: "text", v: c.email ?? "—" },
-        { t: "text", v: c.name ?? "—" },
-        { t: "flags", badges: c.delinquent ? [{ kind: "warn", text: "DELINQUENT" }] : [] },
+        strong(c.name ?? "—"),
+        text(c.email ?? "—"),
+        { t: "flags", badges: c.delinquent ? [{ kind: "warn", text: "Delinquent" }] : [] },
         dateCell(c.created),
-        { t: "id", v: c.id, copy: true },
+        idCell(c.id, { copy: true }),
       ] as Cell[],
     })),
     nextCursor: !q && hasMore && customers.length > 0 ? customers[customers.length - 1].id : null,
     empty: q ? "No customers match that search." : "No customers yet.",
+    ...(n > 0 ? { footer: q ? `${n} result${n === 1 ? "" : "s"}` : `${n}${hasMore ? "+" : ""} item${n === 1 ? "" : "s"}` } : {}),
     notice,
   };
 
@@ -89,23 +111,25 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
     ctx.stores.qol.listNotes("customer", id, 0, 5).catch(() => ({ rows: [], total: 0 })),
   ]);
 
-  const out: Block[] = [];
+  const main: Block[] = [];
+  const rail: Block[] = [];
 
-  // Header: name/email + status badges.
+  // Header: big name, email subline, status pills (Stripe detail archetype).
   const headBadges: Badge[] = [];
-  if (customer.delinquent) headBadges.push({ kind: "warn", text: "DELINQUENT" });
-  if (blocks.length > 0) headBadges.push({ kind: "error", text: "BLOCKED" });
-  out.push({
+  if (customer.delinquent) headBadges.push({ kind: "warn", text: "Delinquent" });
+  if (blocks.length > 0) headBadges.push({ kind: "error", text: "Blocked" });
+  const title = customer.name || customer.email || customer.id;
+  main.push({
     type: "header",
-    title: customer.name || customer.email || customer.id,
-    id: customer.id,
+    title,
+    ...(customer.email && customer.email !== title ? { sub: customer.email, subCopy: true } : {}),
     badges: headBadges,
   });
 
   // Blocklist banner (error notice with the first block's context).
   if (blocks.length > 0) {
     const b = blocks[0];
-    out.push({
+    main.push({
       type: "notice",
       badge: { kind: "error", text: "BLOCKED" },
       text:
@@ -116,231 +140,239 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
     });
   }
 
-  // Stat row: lifetime spend, balance, open invoices, disputes.
+  // ---- rail: Insights (big values) ----
   const succeeded = chargesPage.charges.filter((c) => c.status === "succeeded");
   const spendByCurrency = new Map<string, number>();
+  const refundsByCurrency = new Map<string, number>();
   for (const c of succeeded) {
     spendByCurrency.set(c.currency, (spendByCurrency.get(c.currency) ?? 0) + (c.amount - (c.amount_refunded ?? 0)));
   }
-  const lifetime =
-    [...spendByCurrency.entries()].map(([cur, amt]) => ctx.stripe.formatAmount(amt, cur)).join(" + ") || "—";
-  const openInvoices = invoices.invoices.filter((i) => i.status === "open");
-  const openTotal = openInvoices.reduce((sum, i) => sum + (i.amount_due ?? 0), 0);
+  for (const c of chargesPage.charges) {
+    if ((c.amount_refunded ?? 0) > 0) {
+      refundsByCurrency.set(c.currency, (refundsByCurrency.get(c.currency) ?? 0) + (c.amount_refunded ?? 0));
+    }
+  }
   const balance =
-    customer.currency != null
+    customer.balance !== 0 && customer.currency != null
       ? ctx.stripe.formatAmount(customer.balance, customer.currency)
-      : String(customer.balance ?? 0);
-  out.push({
-    type: "stats",
-    items: [
+      : customer.balance !== 0
+        ? String(customer.balance)
+        : null;
+  rail.push({
+    type: "kv",
+    title: "Insights",
+    big: true,
+    rows: [
       {
-        label: "Lifetime spend",
-        value: lifetime,
-        sub: chargesPage.hasMore ? "from the 100 most recent charges" : `${succeeded.length} succeeded charges`,
+        label: "Spent",
+        cell: text(
+          formatPerCurrency(ctx.stripe, spendByCurrency),
+          chargesPage.hasMore ? "from the 100 most recent payments" : undefined
+        ),
       },
-      { label: "Balance", value: balance, sub: customer.balance < 0 ? "negative = customer credit" : undefined },
-      {
-        label: "Open invoices",
-        value: String(openInvoices.length),
-        sub: openInvoices.length
-          ? openInvoices[0].currency
-            ? ctx.stripe.formatAmount(openTotal, openInvoices[0].currency)
-            : undefined
-          : undefined,
-      },
-      {
-        label: "Disputes",
-        value: String(disputes.length),
-        badge: disputes.some((d) => d.status.includes("needs_response"))
-          ? { kind: "error", text: "needs response" }
-          : undefined,
-      },
+      { label: "MRR", cell: text(formatPerCurrency(ctx.stripe, estimateMrr(subs))) },
+      { label: "Refunds", cell: text(formatPerCurrency(ctx.stripe, refundsByCurrency)) },
+      ...(balance
+        ? [{ label: "Balance", cell: text(balance, customer.balance < 0 ? "negative = customer credit" : undefined) }]
+        : []),
     ],
   });
 
-  // Profile.
+  // ---- rail: Details ----
   const defaultPm =
     typeof customer.invoice_settings?.default_payment_method === "string"
       ? customer.invoice_settings.default_payment_method
       : (customer.invoice_settings?.default_payment_method as Stripe.PaymentMethod | null)?.id ?? null;
-  out.push({
+  const defaultPmObj = defaultPm ? methods.find((m) => m.id === defaultPm) ?? null : null;
+  rail.push({
     type: "kv",
-    title: "Profile",
+    title: "Details",
     rows: [
-      { label: "Email", cell: text(customer.email ?? "—") },
-      { label: "Name", cell: text(customer.name ?? "—") },
-      { label: "Created", cell: dateCell(customer.created) },
+      { label: "Customer ID", cell: idCell(customer.id, { copy: true }) },
+      { label: "Customer since", cell: dateCell(customer.created) },
+      { label: "Billing email", cell: text(customer.email ?? "—") },
       { label: "Currency", cell: text(customer.currency?.toUpperCase() ?? "—") },
-      { label: "Delinquent", cell: customer.delinquent ? badge("warn", "yes") : text("no") },
-      { label: "Tax exempt", cell: text(customer.tax_exempt ?? "none") },
-      { label: "Locale", cell: text(customer.preferred_locales?.join(", ") || "—") },
-      { label: "Default payment method", cell: defaultPm ? { t: "id", v: defaultPm, copy: true } : text("—") },
+      ...(customer.delinquent ? [{ label: "Delinquent", cell: badgeCell("warn", "Yes") }] : []),
+      ...(customer.tax_exempt && customer.tax_exempt !== "none"
+        ? [{ label: "Tax exempt", cell: text(customer.tax_exempt) }]
+        : []),
+      ...(customer.preferred_locales?.length
+        ? [{ label: "Locale", cell: text(customer.preferred_locales.join(", ")) }]
+        : []),
+      {
+        label: "Default payment method",
+        cell: defaultPmObj ? paymentMethodCell(defaultPmObj) : defaultPm ? idCell(defaultPm, { copy: true }) : text("—"),
+      },
       ...(customer.description ? [{ label: "Description", cell: text(customer.description) }] : []),
     ],
   });
 
-  // Subscriptions.
-  out.push({
+  // ---- rail: Linked accounts (Discord / Postiz) ----
+  const linkRows: Array<{ label: string; cell: Cell }> = [];
+  for (const discordId of discordIds.slice(0, 5)) {
+    linkRows.push({ label: "Discord user", cell: idCell(discordId, { copy: true }) });
+    const session = await ctx.stores.session.getSession(discordId).catch(() => null);
+    if (session?.postizUserId) {
+      linkRows.push({ label: "Postiz user", cell: idCell(session.postizUserId, { copy: true }) });
+    }
+  }
+  rail.push({
+    type: "kv",
+    title: "Linked accounts",
+    rows: linkRows.length ? linkRows : [{ label: "Discord user", cell: text("not linked") }],
+  });
+
+  // ---- main: Subscriptions ----
+  main.push({
     type: "table",
     key: "subs",
-    title: `Subscriptions (${subs.length})`,
+    title: "Subscriptions",
     columns: [
-      { key: "plan", label: "Plan" },
+      { key: "plan", label: "Product" },
       { key: "status", label: "Status" },
-      { key: "flags", label: "Flags" },
-      { key: "period", label: "Period end" },
+      { key: "period", label: "Next invoice" },
       { key: "id", label: "ID" },
     ],
     rows: subs.slice(0, 25).map((sub) => {
       const item = sub.items.data[0];
       const price = item?.price;
       const plan = price?.nickname ?? (typeof price?.product === "string" ? price.product : price?.id) ?? "plan";
-      const amount =
+      const per =
         price?.unit_amount != null
           ? `${ctx.stripe.formatAmount(price.unit_amount * (item?.quantity ?? 1), price.currency)}/${price.recurring?.interval ?? "?"}`
-          : null;
-      const flags: Badge[] = [];
-      if (sub.pause_collection) flags.push({ kind: "warn", text: "paused" });
-      if (sub.cancel_at_period_end) flags.push({ kind: "warn", text: "cancels at period end" });
+          : undefined;
+      const statusBadges: Badge[] = [subBadge(sub.status)];
+      if (sub.pause_collection) statusBadges.push({ kind: "warn", text: "Paused" });
+      if (sub.cancel_at_period_end) statusBadges.push({ kind: "warn", text: "Cancels at period end" });
       return {
         id: sub.id,
         cells: [
-          { t: "text", v: plan, sub: amount ?? undefined },
-          statusBadge(sub.status),
-          { t: "flags", badges: flags },
+          avatarCell("subscription", plan, { sub: per }),
+          { t: "flags", badges: statusBadges },
           item?.current_period_end ? dateCell(item.current_period_end) : text("—"),
-          { t: "id", v: sub.id, copy: true },
+          idCell(sub.id, { copy: true }),
         ] as Cell[],
       };
     }),
     empty: "No subscriptions.",
+    ...(subs.length > 0
+      ? { footer: `${Math.min(subs.length, 25)} result${subs.length === 1 ? "" : "s"}` }
+      : {}),
     ...(subs.length > 25 ? { notice: `Showing 25 of ${subs.length} subscriptions.` } : {}),
   });
 
-  // Payment methods.
-  out.push({
+  // ---- main: Payments (from the lifetime-spend fetch — no extra API call) ----
+  const recentCharges = chargesPage.charges.slice(0, 10);
+  main.push({
+    type: "table",
+    key: "charges",
+    title: "Payments",
+    columns: [
+      { key: "amount", label: "Amount" },
+      { key: "desc", label: "Description" },
+      { key: "created", label: "Date" },
+      { key: "id", label: "ID" },
+    ],
+    rows: recentCharges.map((charge) => ({
+      id: charge.id,
+      ref: { page: "payments.detail", params: { id: charge.id } },
+      cells: [
+        amount(ctx.stripe, charge.amount, charge.currency, chargeBadge(charge)),
+        text(charge.description ?? pmIntentId(charge) ?? "—"),
+        dateCell(charge.created),
+        idCell(charge.id, { copy: true }),
+      ] as Cell[],
+    })),
+    empty: "No payments.",
+    ...(recentCharges.length > 0
+      ? {
+          footer: `${recentCharges.length}${chargesPage.charges.length > 10 || chargesPage.hasMore ? "+" : ""} result${recentCharges.length === 1 ? "" : "s"}`,
+        }
+      : {}),
+  });
+
+  // ---- main: Payment methods ----
+  main.push({
     type: "table",
     key: "pms",
-    title: `Payment methods (${methods.length})`,
+    title: "Payment methods",
     columns: [
       { key: "method", label: "Method" },
       { key: "default", label: "Default" },
+      { key: "expires", label: "Expires" },
       { key: "id", label: "ID" },
     ],
-    rows: methods.slice(0, 25).map((pm) => {
-      const label =
-        pm.type === "card" && pm.card
-          ? `${pm.card.brand} •••• ${pm.card.last4} (exp ${pm.card.exp_month}/${pm.card.exp_year})`
-          : pm.type;
-      return {
-        id: pm.id,
-        cells: [
-          text(label),
-          pm.id === defaultPm ? badge("ok", "default") : text("—"),
-          { t: "id", v: pm.id, copy: true },
-        ] as Cell[],
-      };
-    }),
+    rows: methods.slice(0, 25).map((pm) => ({
+      id: pm.id,
+      cells: [
+        paymentMethodCell(pm),
+        pm.id === defaultPm ? badgeCell("info", "Default") : text("—"),
+        pm.type === "card" && pm.card ? text(`${pm.card.exp_month}/${pm.card.exp_year}`) : text("—"),
+        idCell(pm.id, { copy: true }),
+      ] as Cell[],
+    })),
     empty: "No saved payment methods.",
+    ...(methods.length > 0 ? { footer: `${Math.min(methods.length, 25)} result${methods.length === 1 ? "" : "s"}` } : {}),
   });
 
-  // Recent invoices.
-  out.push({
+  // ---- main: Invoices ----
+  main.push({
     type: "table",
     key: "invoices",
-    title: "Recent invoices",
+    title: "Invoices",
     columns: [
+      { key: "total", label: "Amount" },
       { key: "number", label: "Invoice" },
-      { key: "status", label: "Status" },
-      { key: "total", label: "Total", align: "right" },
       { key: "created", label: "Created" },
     ],
     rows: invoices.invoices.map((invoice) => ({
       id: invoice.id ?? "draft",
       cells: [
-        { t: "id", v: invoice.number ?? invoice.id ?? "draft", copy: !!invoice.id },
-        invoiceStatusBadge(invoice.status),
-        money(ctx, invoice.total, invoice.currency),
+        amount(ctx.stripe, invoice.total, invoice.currency, invoiceBadge(invoice.status)),
+        idCell(invoice.number ?? invoice.id ?? "draft", { copy: !!invoice.id }),
         dateCell(invoice.created),
       ] as Cell[],
     })),
     empty: "No invoices.",
+    ...(invoices.invoices.length > 0
+      ? {
+          footer: `${invoices.invoices.length}${invoices.hasMore ? "+" : ""} result${invoices.invoices.length === 1 ? "" : "s"}`,
+        }
+      : {}),
   });
 
-  // Recent charges (from the lifetime-spend fetch — no extra API call).
-  out.push({
-    type: "table",
-    key: "charges",
-    title: "Recent payments",
-    columns: [
-      { key: "created", label: "Date" },
-      { key: "amount", label: "Amount", align: "right" },
-      { key: "status", label: "Status" },
-      { key: "id", label: "Charge" },
-    ],
-    rows: chargesPage.charges.slice(0, 10).map((charge) => ({
-      id: charge.id,
-      cells: [
-        dateCell(charge.created),
-        money(ctx, charge.amount, charge.currency),
-        chargeStatusBadge(charge),
-        { t: "id", v: charge.id, copy: true },
-      ] as Cell[],
-    })),
-    empty: "No payments.",
-  });
-
-  // Dispute mirror rows.
+  // ---- main: dispute mirror rows ----
   if (disputes.length > 0) {
-    out.push({
+    main.push({
       type: "table",
       key: "disputes",
-      title: `Disputes (${disputes.length})`,
+      title: "Disputes",
       columns: [
-        { key: "opened", label: "Opened" },
-        { key: "amount", label: "Amount", align: "right" },
-        { key: "status", label: "Status" },
+        { key: "amount", label: "Amount" },
         { key: "reason", label: "Reason" },
+        { key: "opened", label: "Opened" },
         { key: "due", label: "Evidence due" },
       ],
       rows: disputes.map((d) => ({
         id: d.id,
         cells: [
-          d.disputeCreatedAt ? isoDateCell(d.disputeCreatedAt) : text("—"),
-          money(ctx, d.amount, d.currency),
-          {
-            t: "badge",
-            b: {
-              kind: d.status.includes("needs_response") ? "error" : d.status === "won" ? "ok" : "info",
-              text: d.status,
-            },
-          },
+          amount(ctx.stripe, d.amount, d.currency, {
+            kind: d.status.includes("needs_response") ? "error" : d.status === "won" ? "ok" : "info",
+            text: d.status.replace(/_/g, " "),
+          }),
           text(d.reason),
+          d.disputeCreatedAt ? isoDateCell(d.disputeCreatedAt) : text("—"),
           d.evidenceDueBy ? isoDateCell(d.evidenceDueBy) : text("—"),
         ] as Cell[],
       })),
+      footer: `${disputes.length} result${disputes.length === 1 ? "" : "s"}`,
       notice: "Local mirror — manage disputes in /billing → Disputes until the web console ships.",
     });
   }
 
-  // Discord / Postiz links.
-  const linkRows: Array<{ label: string; cell: Cell }> = [];
-  for (const discordId of discordIds.slice(0, 5)) {
-    linkRows.push({ label: "Discord user", cell: { t: "id", v: discordId, copy: true } });
-    const session = await ctx.stores.session.getSession(discordId).catch(() => null);
-    if (session?.postizUserId) {
-      linkRows.push({ label: "Postiz user", cell: { t: "id", v: session.postizUserId, copy: true } });
-    }
-  }
-  out.push({
-    type: "kv",
-    title: "Linked accounts",
-    rows: linkRows.length ? linkRows : [{ label: "Discord user", cell: text("not linked") }],
-  });
-
-  // Team notes (read-only in M0).
+  // ---- main: team notes (read-only in M0) ----
   if (notes.rows.length > 0) {
-    out.push({
+    main.push({
       type: "timeline",
       title: `Team notes (${notes.total})`,
       items: notes.rows.map((n) => ({
@@ -353,13 +385,18 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
   }
 
   return {
-    title: customer.name || customer.email || customer.id,
+    title,
     crumbs: [
       { label: "Customers", ref: { page: "customers" } },
       { label: customer.email ?? customer.id, copyId: customer.id },
     ],
-    blocks: out,
+    blocks: main,
+    rail,
   };
+}
+
+function pmIntentId(charge: Stripe.Charge): string | null {
+  return typeof charge.payment_intent === "string" ? charge.payment_intent : charge.payment_intent?.id ?? null;
 }
 
 function notFound(hint: string): SectionPage {
@@ -368,55 +405,4 @@ function notFound(hint: string): SectionPage {
     crumbs: [{ label: "Customers", ref: { page: "customers" } }, { label: "Not found" }],
     blocks: [{ type: "empty", title: "Customer not found", hint }],
   };
-}
-
-// ---- cell helpers ----
-
-function text(v: string): Cell {
-  return { t: "text", v };
-}
-
-function badge(kind: Badge["kind"], t: string): Cell {
-  return { t: "badge", b: { kind, text: t } };
-}
-
-function money(ctx: DashboardCtx, amount: number, currency: string): Cell {
-  return { t: "money", v: ctx.stripe.formatAmount(amount, currency) };
-}
-
-function dateCell(unixSeconds: number): Cell {
-  const iso = new Date(unixSeconds * 1000).toISOString();
-  return { t: "date", v: iso.slice(0, 10), iso };
-}
-
-function isoDateCell(d: Date): Cell {
-  const iso = d.toISOString();
-  return { t: "date", v: iso.slice(0, 10), iso };
-}
-
-function statusBadge(status: Stripe.Subscription.Status): Cell {
-  const kind: Badge["kind"] =
-    status === "active" || status === "trialing"
-      ? "ok"
-      : status === "past_due" || status === "unpaid" || status === "incomplete"
-        ? "warn"
-        : status === "canceled" || status === "incomplete_expired"
-          ? "neutral"
-          : "info";
-  return { t: "badge", b: { kind, text: status } };
-}
-
-function invoiceStatusBadge(status: Stripe.Invoice.Status | null): Cell {
-  const s = status ?? "—";
-  const kind: Badge["kind"] =
-    s === "paid" ? "ok" : s === "open" ? "warn" : s === "void" || s === "uncollectible" ? "error" : "neutral";
-  return { t: "badge", b: { kind, text: s } };
-}
-
-function chargeStatusBadge(charge: Stripe.Charge): Cell {
-  if (charge.refunded) return { t: "badge", b: { kind: "neutral", text: "refunded" } };
-  if ((charge.amount_refunded ?? 0) > 0) return { t: "badge", b: { kind: "warn", text: "partial refund" } };
-  if (charge.disputed) return { t: "badge", b: { kind: "error", text: "disputed" } };
-  const kind: Badge["kind"] = charge.status === "succeeded" ? "ok" : charge.status === "pending" ? "warn" : "error";
-  return { t: "badge", b: { kind, text: charge.status } };
 }

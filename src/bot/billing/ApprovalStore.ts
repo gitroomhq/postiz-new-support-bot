@@ -18,7 +18,10 @@ export interface CreateApprovalInput {
   actionKey: string;
   params: unknown;
   summary: string;
-  conversationId: string;
+  // null for dashboard-origin requests (no Intercom conversation involved).
+  conversationId: string | null;
+  // Decides how the execution ctx is rebuilt at approval time (default intercom).
+  origin?: "intercom" | "dashboard";
   ticketThreadId: string | null;
   stripeCustomerId: string | null;
   requestedById: string;
@@ -35,6 +38,7 @@ export class ApprovalStore {
         paramsJson: (input.params ?? {}) as Prisma.InputJsonValue,
         summary: input.summary,
         conversationId: input.conversationId,
+        origin: input.origin ?? "intercom",
         ticketThreadId: input.ticketThreadId,
         stripeCustomerId: input.stripeCustomerId,
         requestedById: input.requestedById,

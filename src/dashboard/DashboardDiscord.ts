@@ -134,7 +134,7 @@ export class DashboardDiscord implements LoginNotifier {
       await interaction.reply({ content: "Could not create a dashboard link — check the bot logs.", flags: 64 });
       return;
     }
-    const url = `${base}/dashboard?t=${encodeURIComponent(token)}`;
+    const url = `${base}/billing?t=${encodeURIComponent(token)}`;
     const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder().setStyle(ButtonStyle.Link).setURL(url).setLabel("Open dashboard"),
       new ButtonBuilder().setCustomId("dashpanel_activate").setStyle(ButtonStyle.Primary).setLabel("Activate session"),
@@ -145,7 +145,7 @@ export class DashboardDiscord implements LoginNotifier {
     );
     await interaction.reply({
       content:
-        `**Stripe dashboard** — ${base}/dashboard\n` +
+        `**Billing dashboard** — ${base}/billing\n` +
         `Once you've enrolled a passkey (dashboard → Security), just open that URL and sign in — ` +
         `this one-time link is the break-glass/bootstrap path.\n` +
         `1. Open the dashboard. It shows a code and stays locked.\n` +

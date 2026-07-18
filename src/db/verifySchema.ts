@@ -18,7 +18,7 @@ const EXPECTED_COLUMNS: Record<string, string[]> = {
     "reviewerId", "resolvedAt", "createdAt",
   ],
   billing_approvals: [
-    "id", "actionKey", "paramsJson", "summary", "conversationId", "ticketThreadId", "stripeCustomerId",
+    "id", "actionKey", "paramsJson", "summary", "conversationId", "origin", "ticketThreadId", "stripeCustomerId",
     "requestedById", "requestedByName", "status", "reviewerId", "reviewerName", "claimedAt", "resultText",
     "errorText", "expiresAt", "resolvedAt", "createdAt",
   ],
