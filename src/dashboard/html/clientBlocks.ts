@@ -22,7 +22,11 @@ D.cardLabel = function (brand) {
   if (b === "diners" || b === "diners_club") return "DC";
   if (b === "jcb") return "JCB";
   if (b === "unionpay") return "UP";
-  return (brand || "CARD").slice(0, 4).toUpperCase();
+  if (b === "link") return "LINK";
+  if (b === "paypal") return "PYPL";
+  if (b === "sepa_debit") return "SEPA";
+  if (b === "klarna") return "KLRNA";
+  return (brand || "CARD").slice(0, 5).toUpperCase();
 };
 
 // Tinted rounded-square object icon (inline SVG silhouettes, geometry only).
@@ -63,11 +67,12 @@ D.renderCell = function (td, cell) {
     td.appendChild(D.el("span", "cur", cell.cur));
     if (cell.badge) td.appendChild(D.badge(cell.badge));
   } else if (cell.t === "card") {
-    var KNOWN = { visa: 1, mastercard: 1, amex: 1, discover: 1, jcb: 1, diners: 1, unionpay: 1 };
+    var KNOWN = { visa: 1, mastercard: 1, amex: 1, discover: 1, jcb: 1, diners: 1, unionpay: 1, link: 1 };
     var bkey = (cell.brand || "").toLowerCase().replace(/[^a-z]/g, "");
     var ccell = D.el("span", "cardcell");
     ccell.appendChild(D.el("span", "cardchip" + (KNOWN[bkey] ? " " + bkey : ""), D.cardLabel(cell.brand)));
-    ccell.appendChild(D.el("span", "cardnum", "\\u00b7\\u00b7\\u00b7\\u00b7 " + cell.last4));
+    // Wallet chips (Link, PayPal, SEPA…) have no last4 — chip only.
+    if (cell.last4) ccell.appendChild(D.el("span", "cardnum", "\\u00b7\\u00b7\\u00b7\\u00b7 " + cell.last4));
     td.appendChild(ccell);
     if (cell.sub) td.appendChild(D.el("span", "sub", cell.sub));
   } else if (cell.t === "avatar") {
@@ -171,7 +176,27 @@ D.renderHeader = function (b) {
   head.appendChild(titles);
   if (b.actions && b.actions.length) {
     var acts = D.el("div", "headactions");
-    b.actions.forEach(function (a) { acts.appendChild(D.actionBtn(a)); });
+    // Stripe shows 1–2 named actions + a "···" More menu — never a button row.
+    var inline = b.actions, overflow = [];
+    if (b.actions.length > 3) { inline = b.actions.slice(0, 2); overflow = b.actions.slice(2); }
+    inline.forEach(function (a) { acts.appendChild(D.actionBtn(a)); });
+    if (overflow.length) {
+      var wrap = D.el("span", "morewrap");
+      var more = D.el("button", "btn morebtn", "\\u00b7\\u00b7\\u00b7");
+      more.type = "button";
+      more.title = "More actions";
+      more.setAttribute("aria-label", "More actions");
+      var pop = D.el("div", "morepop");
+      overflow.forEach(function (a) { var mi = D.actionBtn(a); mi.classList.add("menuitem"); pop.appendChild(mi); });
+      more.addEventListener("click", function (e) {
+        e.stopPropagation();
+        var wasOpen = pop.classList.contains("open");
+        D.closeAllPops();
+        if (!wasOpen) pop.classList.add("open");
+      });
+      wrap.appendChild(more); wrap.appendChild(pop);
+      acts.appendChild(wrap);
+    }
     head.appendChild(acts);
   }
   return head;
@@ -315,15 +340,16 @@ D.renderSearch = function (f) {
 };
 
 // Filter pills ("⊕ Label" → popover with the control; set pills show the value
-// + a clear ×). One popover open at a time; outside click closes.
+// + a clear ×) and the header "···" menu. One popover open at a time; outside
+// click closes.
 D.closeAllPops = function () {
-  var pops = document.querySelectorAll(".fpop.open");
+  var pops = document.querySelectorAll(".fpop.open, .morepop.open");
   for (var i = 0; i < pops.length; i++) pops[i].classList.remove("open");
 };
 document.addEventListener("click", function (e) {
   var t = e.target;
   while (t) {
-    if (t.classList && t.classList.contains("fpillwrap")) return;
+    if (t.classList && (t.classList.contains("fpillwrap") || t.classList.contains("morewrap"))) return;
     t = t.parentNode;
   }
   D.closeAllPops();
@@ -423,7 +449,7 @@ D.renderPager = function (b) {
 };
 
 D.renderKv = function (b) {
-  var box = D.el("div", "section kv" + (b.big ? " kvbig" : ""));
+  var box = D.el("div", "section kv" + (b.big ? " kvbig" : "") + (b.amounts ? " amounts" : ""));
   if (b.title) box.appendChild(D.el("h2", null, b.title));
   (b.rows || []).forEach(function (r) {
     var row = D.el("div", "kvrow");

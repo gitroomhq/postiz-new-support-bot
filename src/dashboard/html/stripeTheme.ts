@@ -5,13 +5,36 @@
 // borderless gray cards, flat tables, purple-text active nav. Dark scheme is
 // our adaptation of the same language.
 //
+// Theme selection: LIGHT is the source of truth (it's the actual Stripe
+// capture). The dark tokens apply when the system prefers dark AND the user
+// hasn't forced light, or when the user forces dark — the client stamps
+// data-theme="light"|"dark" on <html> from localStorage (absent = follow the
+// system).
+//
 // CSP-safe: colours/gradients/keyframes only — no url()/data:, no @import,
 // no external fonts (Stripe itself falls back to this system stack).
+
+const DARK_TOKENS = `
+      color-scheme: dark;
+      --bg:#16171d; --surface:#1c1d24; --fill:#21232c; --hover:#23252f;
+      --border:#282a33; --border-strong:#383b46;
+      --text:#a3a8b8; --heading:#eceef2; --muted:#8b91a0; --faint:#666c7a;
+      --accent:#8577ff; --accent-hover:#9a8eff; --accent-fg:#101018; --accent-weak:#272348;
+      --ok:#48c464; --ok-weak:#12291b;
+      --warn:#f0a04c; --warn-weak:#2d2210;
+      --danger:#ff7591; --danger-strong:#ff5c7c; --danger-weak:#331420;
+      --info:#a29bff; --info-weak:#272348;
+      --neutral:#a3a8b8; --neutral-weak:#2a2c36;
+      --track:#383b46; --ring:rgba(133,119,255,.3);
+      --shadow-sm:0 1px 1px rgba(0,0,0,.3);
+      --shadow-card:0 1px 2px rgba(0,0,0,.35),0 2px 6px rgba(0,0,0,.25);
+      --shadow-pop:0 15px 35px rgba(0,0,0,.5),0 5px 15px rgba(0,0,0,.4);
+`;
 
 export function stripeBaseCss(): string {
   return `
   :root {
-    color-scheme: light dark;
+    color-scheme: light;
     --bg:#ffffff; --surface:#ffffff; --fill:#f4f7fa; --hover:#f4f7fa;
     --border:#ecf1f6; --border-strong:#d8dee4;
     --text:#545969; --heading:#30313d; --muted:#687385; --faint:#99a5b2;
@@ -28,21 +51,12 @@ export function stripeBaseCss(): string {
     --radius:12px; --radius-sm:6px;
   }
   @media (prefers-color-scheme: dark) {
-    :root {
-      --bg:#16171d; --surface:#1c1d24; --fill:#21232c; --hover:#23252f;
-      --border:#282a33; --border-strong:#383b46;
-      --text:#a3a8b8; --heading:#eceef2; --muted:#8b91a0; --faint:#666c7a;
-      --accent:#8577ff; --accent-hover:#9a8eff; --accent-fg:#101018; --accent-weak:#272348;
-      --ok:#48c464; --ok-weak:#12291b;
-      --warn:#f0a04c; --warn-weak:#2d2210;
-      --danger:#ff7591; --danger-strong:#ff5c7c; --danger-weak:#331420;
-      --info:#a29bff; --info-weak:#272348;
-      --neutral:#a3a8b8; --neutral-weak:#2a2c36;
-      --track:#383b46; --ring:rgba(133,119,255,.3);
-      --shadow-sm:0 1px 1px rgba(0,0,0,.3);
-      --shadow-card:0 1px 2px rgba(0,0,0,.35),0 2px 6px rgba(0,0,0,.25);
-      --shadow-pop:0 15px 35px rgba(0,0,0,.5),0 5px 15px rgba(0,0,0,.4);
+    :root:not([data-theme=light]) {
+${DARK_TOKENS}
     }
+  }
+  :root[data-theme=dark] {
+${DARK_TOKENS}
   }
   * { box-sizing:border-box; }
   html,body { height:100%; }

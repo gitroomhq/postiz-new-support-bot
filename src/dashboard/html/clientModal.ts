@@ -8,7 +8,9 @@ D.modalState = null;
 D.actionBtn = function (a) {
   var b = document.createElement("button");
   b.type = "button";
-  b.className = "btn" + (a.style === "primary" ? " primary" : "") + (a.dangerous || a.style === "danger" ? " danger" : "");
+  // Color comes from style ONLY — "dangerous" is the typed-CONFIRM ceremony
+  // flag, not a color (a primary Refund button must stay a primary button).
+  b.className = "btn" + (a.style === "primary" ? " primary" : "") + (a.style === "danger" ? " danger" : "");
   b.textContent = a.label;
   if (a.disabledReason) {
     b.disabled = true;
@@ -26,6 +28,7 @@ D.actionBtn = function (a) {
   var simple = !(a.inputs && a.inputs.length) && !a.dangerous && !a.reverseConfirm && a.mode !== "queue";
   b.addEventListener("click", function (e) {
     e.stopPropagation();
+    if (D.closeAllPops) D.closeAllPops();
     if (simple) D.dispatchAction({ key: a.key, params: a.params || {} }, null);
     else D.openModal(a);
   });

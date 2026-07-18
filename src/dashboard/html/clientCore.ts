@@ -58,15 +58,33 @@ D.fmtRel = function (iso) {
   return { rel: future ? "in " + rel : rel + " ago", abs: abs };
 };
 
+// Quiet copy-icon affordance (Stripe's little glyph after every mono id) —
+// an inline SVG, no border, no text.
 D.copyBtn = function (value) {
-  var b = D.el("button", "copybtn", "copy");
+  var b = document.createElement("button");
+  b.className = "copybtn";
   b.type = "button";
   b.title = "Copy " + value;
+  b.setAttribute("aria-label", "Copy " + value);
+  var NS = "http://www.w3.org/2000/svg";
+  var svg = document.createElementNS(NS, "svg");
+  svg.setAttribute("viewBox", "0 0 16 16");
+  svg.setAttribute("aria-hidden", "true");
+  var front = document.createElementNS(NS, "rect");
+  front.setAttribute("x", "2.6"); front.setAttribute("y", "5"); front.setAttribute("width", "8.4"); front.setAttribute("height", "8.4");
+  front.setAttribute("rx", "1.6"); front.setAttribute("fill", "none");
+  front.setAttribute("stroke", "currentColor"); front.setAttribute("stroke-width", "1.5");
+  var back = document.createElementNS(NS, "path");
+  back.setAttribute("d", "M5.6 2.6h6.2a1.6 1.6 0 0 1 1.6 1.6v6.2");
+  back.setAttribute("fill", "none");
+  back.setAttribute("stroke", "currentColor"); back.setAttribute("stroke-width", "1.5"); back.setAttribute("stroke-linecap", "round");
+  svg.appendChild(front); svg.appendChild(back);
+  b.appendChild(svg);
   b.addEventListener("click", function (e) {
     e.stopPropagation();
     var done = function () {
-      b.textContent = "copied"; b.classList.add("copied");
-      setTimeout(function () { b.textContent = "copy"; b.classList.remove("copied"); }, 1200);
+      b.classList.add("copied");
+      setTimeout(function () { b.classList.remove("copied"); }, 1200);
     };
     if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(value).then(done, function () {});
     else done();

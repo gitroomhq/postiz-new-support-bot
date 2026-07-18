@@ -930,6 +930,46 @@ test("payment detail: unlinked customer gets the partial-remaining refund button
   assert.equal((net.cell as { v: string }).v, "23.81 EUR");
 });
 
+test("failed payment: timeline tells the real story (seller message + codes), no breakdown", async () => {
+  const ctx = paymentsCtx();
+  (ctx.stripe as { getChargeDetailed?: unknown }).getChargeDetailed = async () => ({
+    id: "ch_f",
+    status: "failed",
+    captured: false,
+    refunded: false,
+    disputed: false,
+    amount: 2900,
+    amount_refunded: 0,
+    currency: "usd",
+    created: 1_700_000_000,
+    customer: "cus_a",
+    billing_details: { email: "a@x.com" },
+    payment_method_details: { type: "link" },
+    failure_message: "The payment failed.",
+    failure_code: "card_declined",
+    outcome: { seller_message: "The bank declined this payment.", reason: "insufficient_funds" },
+  });
+  (ctx.stripe as { listRefunds?: unknown }).listRefunds = async () => ({ refunds: [], hasMore: false });
+  const section = makePaymentsSection();
+  const page = await section.buildPage(ctx, { page: "payments.detail", params: { id: "ch_f" } });
+  const timeline = page!.blocks.find((b) => b.type === "timeline" && b.title === "Recent activity") as {
+    items: Array<{ label: string; text?: string }>;
+  };
+  assert.deepEqual(
+    timeline.items.map((i) => i.label),
+    ["Payment failed", "Payment started"]
+  );
+  assert.equal(timeline.items[0].text, "The bank declined this payment. (card_declined / insufficient_funds)");
+  // No money moved → no breakdown block, no refund buttons.
+  assert.ok(!page!.blocks.some((b) => b.type === "kv" && b.title === "Payment breakdown"));
+  const header = page!.blocks[0] as HeaderBlock;
+  assert.ok(!header.actions!.some((a) => a.key.startsWith("charge.refund")));
+  // Wallet payment renders as a chip cell, labeled Type.
+  const pm = page!.blocks.find((b) => b.type === "kv" && b.title === "Payment method") as KeyValueBlock;
+  const typeRow = pm.rows.find((r) => r.label === "Type")!;
+  assert.deepEqual(typeRow.cell, { t: "card", brand: "link", last4: "" });
+});
+
 test("client JS modules parse and the shell embeds them nonced", () => {
   const combined = `${clientCore}\n${clientBlocks}\n${clientModal}\n${clientLogin}\nD.defaultPage="customers";\n${clientApp}`;
   assert.doesNotThrow(() => new Function(combined));

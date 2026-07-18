@@ -30,7 +30,8 @@ export function dashboardCss(): string {
   .topbar input#jump:focus { background:var(--surface); border-color:var(--accent); box-shadow:0 0 0 3px var(--ring); }
   .topbar .who { white-space:nowrap; }
   body.testmode .topbar { box-shadow:inset 0 3px 0 #ed6704; }
-  main { padding:24px 32px 90px; width:100%; max-width:1080px; }
+  /* Stripe fills the viewport — no centered column cap. */
+  main { padding:24px 40px 90px; width:100%; }
   #crumbs { display:flex; align-items:center; gap:6px; flex-wrap:wrap; color:var(--muted); font-size:13px; margin:0 0 10px; }
   #crumbs:empty { display:none; }
   #crumbs a { color:var(--accent); text-decoration:none; cursor:pointer; font-weight:500; }
@@ -47,6 +48,18 @@ export function dashboardCss(): string {
   .pagehead .objid { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12.5px; color:var(--muted);
     margin-top:4px; display:flex; align-items:center; gap:6px; }
   .pagehead .headactions { display:flex; gap:8px; flex-wrap:wrap; }
+  .morewrap { position:relative; display:inline-flex; }
+  .morebtn { letter-spacing:.1em; padding:6px 10px; }
+  .morepop { position:absolute; top:calc(100% + 6px); right:0; z-index:20; background:var(--surface);
+    border:1px solid var(--border); border-radius:8px; box-shadow:var(--shadow-pop); padding:6px;
+    min-width:200px; display:none; }
+  .morepop.open { display:flex; flex-direction:column; gap:2px; }
+  .morepop .btn.menuitem { justify-content:flex-start; border:none; box-shadow:none; background:transparent;
+    font-weight:500; width:100%; box-sizing:border-box; padding:7px 10px; border-radius:6px; }
+  .morepop .btn.menuitem:hover { background:var(--hover); }
+  .morepop .btn.menuitem.primary { color:var(--heading); }
+  .morepop .btn.menuitem.danger { color:var(--danger-strong); }
+  .morepop .btn.menuitem.danger:hover { background:var(--danger-weak); }
 
   /* Detail-page layout: main column + Stripe-style right rail. */
   .detailgrid { display:grid; grid-template-columns:minmax(0,1fr) 280px; gap:40px; align-items:start; }
@@ -118,7 +131,8 @@ export function dashboardCss(): string {
   td .sub.subindent { margin-left:30px; }
 
   .countrow { display:flex; gap:12px; flex-wrap:wrap; margin:0 0 14px; }
-  .countcard { all:unset; box-sizing:border-box; flex:0 1 148px; min-width:104px; cursor:pointer;
+  /* Cards stretch evenly across the full row, like Stripe's segmented filter. */
+  .countcard { all:unset; box-sizing:border-box; flex:1 1 0; min-width:110px; max-width:230px; cursor:pointer;
     background:var(--surface); border:1px solid var(--border-strong); border-radius:var(--radius);
     padding:10px 14px; display:flex; flex-direction:column; transition:border-color .1s,background .1s; }
   .countcard:hover { border-color:var(--accent); }
@@ -175,6 +189,15 @@ export function dashboardCss(): string {
   .kv .kvrow:first-of-type { border-top:none; padding-top:4px; }
   .kv .kvlabel { color:var(--muted); font-weight:450; font-size:13.5px; }
   .kv .kvval { min-width:0; overflow-wrap:anywhere; display:flex; align-items:baseline; gap:6px; flex-wrap:wrap; }
+  .kvval .sub { display:block; flex-basis:100%; color:var(--faint); font-size:12px; }
+
+  /* Stripe "Payment breakdown": label left, amount flush right, bold Net row
+     with a hairline above — hairlines between the other rows are dropped. */
+  .kv.amounts .kvrow { grid-template-columns:1fr auto; border-top:none; padding:7px 0; }
+  .kv.amounts .kvval { justify-content:flex-end; text-align:right; font-variant-numeric:tabular-nums; }
+  .kv.amounts .kvrow:last-of-type { border-top:1px solid var(--border); margin-top:6px; padding-top:13px; }
+  .kv.amounts .kvrow:last-of-type .kvlabel { color:var(--heading); font-weight:600; }
+  .kv.amounts .kvrow:last-of-type .kvval { font-weight:600; }
 
   .timeline { list-style:none; margin:0; padding:0; }
   .timeline li { position:relative; padding:0 0 14px 22px; }
@@ -187,7 +210,7 @@ export function dashboardCss(): string {
   .timeline li.error .tdot { background:var(--danger-strong); }
   .timeline li.info .tdot { background:var(--accent); }
   .timeline .ttitle { font-weight:500; font-size:13.5px; display:flex; gap:8px; align-items:baseline; flex-wrap:wrap; }
-  .timeline .twhen { color:var(--faint); font-size:12.5px; font-weight:400; }
+  .timeline .twhen { color:var(--faint); font-size:12.5px; font-weight:400; margin-left:auto; white-space:nowrap; }
   .timeline .ttext { color:var(--muted); font-size:13px; margin-top:1px; }
 
   .noticebar { display:flex; align-items:center; gap:10px; padding:11px 14px; border-radius:var(--radius);
@@ -201,10 +224,11 @@ export function dashboardCss(): string {
   .emptybox .etitle { font-size:15px; font-weight:600; color:var(--heading); }
   .emptybox .ehint { font-size:13.5px; margin-top:4px; }
 
-  .copybtn { all:unset; cursor:pointer; color:var(--muted); font-size:11.5px; border:1px solid var(--border-strong);
-    border-radius:4px; padding:0 6px; line-height:1.6; background:var(--surface); }
-  .copybtn:hover { color:var(--accent); border-color:var(--accent); }
-  .copybtn.copied { color:var(--ok); border-color:var(--ok); }
+  .copybtn { all:unset; cursor:pointer; color:var(--faint); display:inline-flex; align-items:center;
+    padding:2px; border-radius:4px; line-height:0; vertical-align:middle; }
+  .copybtn svg { width:13px; height:13px; }
+  .copybtn:hover { color:var(--accent); background:var(--hover); }
+  .copybtn.copied { color:var(--ok); }
 
   .tnotice { color:var(--faint); font-size:12.5px; margin-top:8px; }
   .overlay .code { cursor:pointer; transition:border-color .12s; }

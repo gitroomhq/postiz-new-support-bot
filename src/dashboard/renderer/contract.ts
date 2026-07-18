@@ -112,6 +112,9 @@ export interface KeyValueBlock {
   title?: string;
   // Rail "Insights" variant: bigger, darker values (Spent €152.00 / MRR €29.00).
   big?: boolean;
+  // Stripe "Payment breakdown" variant: label left, amount flush right, the
+  // LAST row emphasized as the Net/Total line with a hairline above.
+  amounts?: boolean;
   rows: Array<{ label: string; cell: Cell }>;
   actions?: ActionButton[];
 }

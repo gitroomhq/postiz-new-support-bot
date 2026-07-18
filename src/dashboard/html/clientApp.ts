@@ -231,6 +231,35 @@ D.poll = function () {
   }).catch(function () { D.pollTimer = setTimeout(D.poll, 5000); });
 };
 
+// ---- theme (System → Light → Dark cycle; light IS the Stripe capture) ----
+D.THEME_KEY = "billing-theme";
+D.applyTheme = function (mode) {
+  if (mode === "light" || mode === "dark") document.documentElement.setAttribute("data-theme", mode);
+  else document.documentElement.removeAttribute("data-theme");
+  var btn = D.q("themebtn");
+  if (btn) btn.textContent = mode === "light" ? "Light" : mode === "dark" ? "Dark" : "Auto";
+};
+D.storedTheme = function () {
+  try {
+    var v = localStorage.getItem(D.THEME_KEY);
+    return v === "light" || v === "dark" ? v : null;
+  } catch (e) { return null; }
+};
+D.bindTheme = function () {
+  D.applyTheme(D.storedTheme());
+  var btn = D.q("themebtn");
+  if (!btn) return;
+  btn.addEventListener("click", function () {
+    var cur = D.storedTheme();
+    var next = cur === null ? "light" : cur === "light" ? "dark" : null;
+    try {
+      if (next) localStorage.setItem(D.THEME_KEY, next);
+      else localStorage.removeItem(D.THEME_KEY);
+    } catch (e) {}
+    D.applyTheme(next);
+  });
+};
+
 // Activation code: click to copy (pastes straight into the Discord modal).
 D.bindLockCode = function () {
   var codeEl = D.q("lockcode");
@@ -261,6 +290,7 @@ D.startApp = function () {
   D.pollBadges();
 };
 
+D.bindTheme();
 D.bindLogin();
 D.bindLockCode();
 D.poll();

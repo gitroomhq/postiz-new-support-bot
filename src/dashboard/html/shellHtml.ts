@@ -88,6 +88,7 @@ ${dashboardCss()}
       <span class="jumpwrap"><input type="text" id="jump" placeholder="Jump to ID — cus_, ch_, sub_, in_, dp_ …" autocomplete="off"></span>
       <span id="modebadge" class="badge ok">LIVE</span>
       <span class="who" id="who"></span>
+      <button class="btn sm" id="themebtn" type="button" title="Color theme — click to switch">Auto</button>
       <button class="btn sm" id="logout" type="button">End session</button>
     </header>
     <main>

@@ -274,7 +274,9 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
         amount(ctx.stripe, c.amount, c.currency, chargeBadge(c)),
         c.payment_method_details?.card
           ? cardCell(c.payment_method_details.card.brand ?? "card", c.payment_method_details.card.last4 ?? "????")
-          : text(c.payment_method_details?.type ?? "—"),
+          : c.payment_method_details?.type
+            ? cardCell(c.payment_method_details.type, "") // wallet chip (Link, PayPal, SEPA…)
+            : text("—"),
         text(c.description ?? (typeof c.payment_intent === "string" ? c.payment_intent : c.payment_intent?.id) ?? "—"),
         cus
           ? ({ t: "link", v: email ?? cus, ref: { page: "customers.detail", params: { id: cus } } } as Cell)
@@ -434,30 +436,48 @@ async function chargeDetail(ctx: DashboardCtx, id: string): Promise<SectionPage>
       kind: "error",
     });
   }
-  timeline.push({
-    label: charge.status === "failed" ? "Payment failed" : charge.captured ? "Payment succeeded" : "Payment authorized",
-    iso: new Date(charge.created * 1000).toISOString(),
-    ...(charge.failure_message ? { text: charge.failure_message } : {}),
-    kind: charge.status === "failed" ? "error" : "ok",
-  });
-  timeline.sort((a, b) => (a.iso < b.iso ? 1 : -1));
+  // Lifecycle, Stripe-style: "Payment started" always, then the outcome row.
+  // For failures, outcome.seller_message carries the real bank story — the
+  // top-level failure_message is often just "The payment failed."
+  const createdIso = new Date(charge.created * 1000).toISOString();
+  if (charge.status === "failed") {
+    const msg = charge.outcome?.seller_message ?? charge.failure_message ?? "The payment failed.";
+    const codes = [...new Set([charge.failure_code, charge.outcome?.reason].filter((c): c is string => !!c))];
+    timeline.push({
+      label: "Payment failed",
+      iso: createdIso,
+      text: codes.length ? `${msg} (${codes.join(" / ")})` : msg,
+      kind: "error",
+    });
+  } else if (charge.status === "pending") {
+    timeline.push({ label: "Payment processing", iso: createdIso, kind: "warn" });
+  } else {
+    timeline.push({ label: charge.captured ? "Payment succeeded" : "Payment authorized", iso: createdIso, kind: "ok" });
+  }
+  timeline.push({ label: "Payment started", iso: createdIso, kind: "info" });
+  // Stable sort: equal timestamps keep push order (outcome above "started").
+  timeline.sort((a, b) => (a.iso < b.iso ? 1 : a.iso > b.iso ? -1 : 0));
   main.push({ type: "timeline", title: "Recent activity", items: timeline });
 
-  // Payment breakdown (fees come from the expanded balance transaction).
-  const bt = charge.balance_transaction;
-  const fee = bt && typeof bt === "object" ? bt.fee : null;
-  const refunded = charge.amount_refunded ?? 0;
-  const net = charge.amount - (fee ?? 0) - refunded;
-  main.push({
-    type: "kv",
-    title: "Payment breakdown",
-    rows: [
-      { label: "Payment amount", cell: money(ctx.stripe, charge.amount, charge.currency) },
-      ...(fee != null ? [{ label: "Stripe processing fees", cell: money(ctx.stripe, -fee, charge.currency, "muted") }] : []),
-      ...(refunded > 0 ? [{ label: "Refunded amount", cell: money(ctx.stripe, -refunded, charge.currency, "neg") }] : []),
-      { label: "Net amount", cell: money(ctx.stripe, net, charge.currency, net >= 0 ? "pos" : "neg") },
-    ],
-  });
+  // Payment breakdown (fees come from the expanded balance transaction) —
+  // only when money actually moved; a failed attempt has no breakdown.
+  if (charge.status === "succeeded") {
+    const bt = charge.balance_transaction;
+    const fee = bt && typeof bt === "object" ? bt.fee : null;
+    const refunded = charge.amount_refunded ?? 0;
+    const net = charge.amount - (fee ?? 0) - refunded;
+    main.push({
+      type: "kv",
+      title: "Payment breakdown",
+      amounts: true,
+      rows: [
+        { label: "Payment amount", cell: money(ctx.stripe, charge.amount, charge.currency) },
+        ...(fee != null ? [{ label: "Stripe processing fees", cell: money(ctx.stripe, -fee, charge.currency, "muted") }] : []),
+        ...(refunded > 0 ? [{ label: "Refunded amount", cell: money(ctx.stripe, -refunded, charge.currency, "neg") }] : []),
+        { label: "Net amount", cell: money(ctx.stripe, net, charge.currency, net >= 0 ? "pos" : "neg") },
+      ],
+    });
+  }
 
   // Payment method.
   const card = charge.payment_method_details?.card;
@@ -467,8 +487,12 @@ async function chargeDetail(ctx: DashboardCtx, id: string): Promise<SectionPage>
     rows: [
       ...(charge.payment_method ? [{ label: "ID", cell: idCell(charge.payment_method, { copy: true }) }] : []),
       {
-        label: "Card",
-        cell: card ? cardCell(card.brand ?? "card", card.last4 ?? "????") : text(charge.payment_method_details?.type ?? "—"),
+        label: card ? "Card" : "Type",
+        cell: card
+          ? cardCell(card.brand ?? "card", card.last4 ?? "????")
+          : charge.payment_method_details?.type
+            ? cardCell(charge.payment_method_details.type, "")
+            : text("—"),
       },
       ...(card?.fingerprint
         ? [{ label: "Fingerprint", cell: text(card.fingerprint, "same-card hunts arrive with Fraud tools (M7)") }]
