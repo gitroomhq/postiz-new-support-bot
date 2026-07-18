@@ -1,6 +1,7 @@
 import Stripe from "stripe";
 import { BotConfig } from "../config";
 import type { SettingsStore } from "../config/SettingsStore";
+import { safeFetch } from "../util/safeFetch";
 import { countWithSearchCap } from "./billing/disputeRatio";
 
 export interface SubscriptionInvoice {
@@ -624,7 +625,11 @@ export class StripeClient {
     if (!mimeType) return { filename, sizeBytes: file.size, mimeType, data: null, skipped: "unsupported_type" };
     if (file.size > maxBytes) return { filename, sizeBytes: file.size, mimeType, data: null, skipped: "too_large" };
     if (!file.url) return { filename, sizeBytes: file.size, mimeType, data: null, skipped: "no_url" };
-    const res = await fetch(file.url, {
+    // Assert the host before attaching the full-access secret key: safeFetch
+    // refuses anything but files.stripe.com (and blocks redirect-to-internal),
+    // so the Bearer credential can never leak to a third-party host.
+    const res = await safeFetch(file.url, {
+      allowHosts: ["files.stripe.com"],
       headers: { Authorization: `Bearer ${this.resolveKey()}` },
     });
     if (!res.ok) throw new Error(`Stripe file contents download failed (${res.status}) for ${fileId}`);
@@ -648,7 +653,9 @@ export class StripeClient {
     if (charge.receipt_url) urls.push(`${charge.receipt_url.split("?")[0].replace(/\/+$/, "")}/pdf`);
     for (const url of urls) {
       try {
-        const res = await fetch(url);
+        // Stripe-hosted URLs only; redirect:manual so a tokenized link can't be
+        // bounced to an internal address. No credential attached.
+        const res = await safeFetch(url, { allowHosts: [".stripe.com"] });
         if (!res.ok) continue;
         const data = Buffer.from(await res.arrayBuffer());
         if (data.length === 0 || data.length > maxBytes) continue;

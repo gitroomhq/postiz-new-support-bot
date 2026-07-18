@@ -13,6 +13,7 @@ import {
 import type Stripe from "stripe";
 import { embed as makeEmbed, COLORS } from "../../../util/embeds";
 import { Logger } from "../../../util/logger";
+import { safeFetch } from "../../../util/safeFetch";
 import { exportBillingEvent } from "../../../metrics/MetricsExporter";
 import { buildDisputeEvidencePrompt, buildDisputeEvidenceReviewPrompt } from "../../aiPrompts";
 import type { LightAiAttachment } from "../../LightAiRunner";
@@ -770,7 +771,7 @@ export class DisputesHub {
             await this.renderDetail(interaction, token, `⚠️ Status is **${fresh.status}** — evidence files can no longer be attached.`);
             return;
           }
-          const res = await fetch(attachment.url);
+          const res = await safeFetch(attachment.url, { allowHosts: [".discordapp.com", ".discordapp.net"] });
           if (!res.ok) throw new Error(`Discord CDN download failed (${res.status})`);
           const data = Buffer.from(await res.arrayBuffer());
           const file = await this.ctx.stripe.uploadDisputeEvidenceFile(attachment.name, data, contentType);

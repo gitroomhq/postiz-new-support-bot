@@ -8,6 +8,8 @@ export class SessionStore {
   // round-trip per run. Insertion-ordered Map → evict-oldest at the cap.
   private static readonly TOKEN_CACHE_TTL_MS = 15 * 60_000;
   private static readonly TOKEN_CACHE_MAX = 1000;
+  // Max age a pending OAuth state is accepted at callback (matches the sweeper).
+  private static readonly PENDING_AUTH_TTL_MS = 10 * 60_000;
   private tokenCache = new Map<string, { token: string; at: number }>();
   private vault: VaultService | null = null;
 
@@ -179,14 +181,18 @@ export class SessionStore {
   }
 
   async consumePendingAuth(state: string) {
-    const pending = await this.prisma.pendingAuth.findUnique({
-      where: { state },
-    });
-
-    if (pending) {
-      await this.prisma.pendingAuth.delete({ where: { state } });
+    // Atomic single-use: delete on the @unique state either returns the row
+    // (this caller consumed it) or throws P2025 (a concurrent callback already
+    // did) — no read-then-delete TOCTOU window where two callbacks both proceed.
+    let pending: { discordUserId: string; channelId: string; interactionToken: string | null; createdAt: Date };
+    try {
+      pending = await this.prisma.pendingAuth.delete({ where: { state } });
+    } catch (e) {
+      if ((e as { code?: string })?.code === "P2025") return null; // already consumed / unknown state
+      throw e;
     }
-
+    // Reject stale state at consume time rather than trusting only the sweeper.
+    if (Date.now() - pending.createdAt.getTime() > SessionStore.PENDING_AUTH_TTL_MS) return null;
     return pending;
   }
 

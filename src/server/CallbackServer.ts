@@ -88,6 +88,13 @@ export class CallbackServer {
     private adminPanel?: AdminPanelRoute
   ) {
     this.app = express();
+    // req.ip drives the panel per-IP throttle. Without this, req.ip is the
+    // socket peer — behind a reverse proxy that is the proxy, collapsing the
+    // throttle into one global bucket. Trust only proxies on loopback/private
+    // ranges (a same-host or in-VPC LB): a public client's X-Forwarded-For is
+    // never trusted (their source IP isn't in the set), so req.ip can't be
+    // spoofed in either topology.
+    this.app.set("trust proxy", "loopback, linklocal, uniquelocal");
     this.setupRoutes();
   }
 

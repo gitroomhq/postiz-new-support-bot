@@ -12,6 +12,7 @@ import { isPermanent4xx } from "./IntercomEventExecutor";
 import { TemporalBufferedError, type TemporalProducers } from "../temporal/producers";
 import { INTERCOM_MAX_ECHO_DEFERS } from "../temporal/types";
 import { log } from "../util/logger";
+import { safeFetch } from "../util/safeFetch";
 import {
   IntercomConversationItem,
   IntercomTicketItem,
@@ -90,6 +91,26 @@ const MAX_RELAY_FILES = 10;
 // it re-runs as a Temporal retry (the part-id claim drops it, losing the reply).
 const RELAY_DOWNLOAD_TIMEOUT_MS = 10_000;
 const RELAY_DOWNLOAD_BUDGET_MS = 30_000;
+
+// Intercom's attachment / inline-image CDN hosts (suffix match). Relay
+// downloads are restricted to these; an unlisted host degrades to a masked 📎
+// link (safe fallback) rather than a server-side fetch — see safeFetch.
+const INTERCOM_CDN_HOSTS = [
+  ".intercomcdn.com",
+  ".intercomcdn.eu",
+  ".intercomcdn.au",
+  ".intercomusercontent.com",
+  ".intercomassets.com",
+  ".intercom-attachments-1.com",
+  ".intercom-attachments-2.com",
+  ".intercom-attachments-3.com",
+  ".intercom-attachments-4.com",
+  ".intercom-attachments-5.com",
+  ".intercom-attachments-6.com",
+  ".intercom-attachments-7.com",
+  ".intercom-attachments-8.com",
+  ".intercom-attachments-9.com",
+];
 
 // Discord "Unknown Channel" — the thread was deleted, not a transient failure.
 const DISCORD_UNKNOWN_CHANNEL = 10003;
@@ -1275,7 +1296,11 @@ export class IntercomWebhookHandler {
         continue;
       }
       try {
-        const res = await fetch(ref.url, {
+        // SSRF guard: ref.url comes from webhook payload (attachment / inline
+        // <img> src). An off-CDN or internal-address URL degrades to a masked
+        // link via the catch below rather than driving a server-side fetch.
+        const res = await safeFetch(ref.url, {
+          allowHosts: INTERCOM_CDN_HOSTS,
           signal: AbortSignal.timeout(Math.min(RELAY_DOWNLOAD_TIMEOUT_MS, budgetLeft)),
         });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);

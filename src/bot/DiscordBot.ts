@@ -904,6 +904,13 @@ export class DiscordBot {
   }
 
   private async postSupportPanel(interaction: ChatInputCommandInteraction): Promise<void> {
+    // Runtime authz: default_member_permissions only hides the command; a
+    // channel-level permission override can still expose it, and the invoker is
+    // hostile. Re-check like every sibling command.
+    if (!this.isAdmin(interaction)) {
+      await interaction.reply({ embeds: [makeEmbed("Administrator permission required.", COLORS.danger)], flags: 64 });
+      return;
+    }
     const embed = new EmbedBuilder()
       .setTitle("Postiz Support")
       .setDescription("Need help? Click the button below to get started.")
@@ -3582,12 +3589,15 @@ export class DiscordBot {
       const modal = new ModalBuilder().setCustomId("config_sentry_dsn_modal").setTitle("Sentry DSN");
       modal.addComponents(
         new ActionRowBuilder<TextInputBuilder>().addComponents(
+          // No-echo: a DSN is a credential; don't re-render it. Blank = keep.
           new TextInputBuilder()
             .setCustomId("dsn")
-            .setLabel("DSN (blank = disable Sentry)")
+            .setLabel("DSN (blank keeps · 'off' disables)")
             .setStyle(TextInputStyle.Short)
             .setRequired(false)
-            .setValue(this.settingsStore.sentryDsn() ?? "")
+            .setPlaceholder(
+              this.settingsStore.sentryDsn() ? "•••• stored (blank keeps · 'off' disables)" : "https://…@…ingest.sentry.io/…"
+            )
         )
       );
       await interaction.showModal(modal);
@@ -3755,18 +3765,20 @@ export class DiscordBot {
     if (id === "config_intercom_secrets") {
       const s = this.settingsStore;
       const modal = new ModalBuilder().setCustomId("config_intercom_secrets_modal").setTitle("Intercom Secrets");
+      // No-echo: never pre-fill the stored secrets (shoulder-surf / screen-share
+      // / client-cache exposure). Placeholder signals "stored"; blank = keep.
       const accessToken = new TextInputBuilder()
         .setCustomId("access_token")
-        .setLabel("Access token (Developer Hub → your app)")
-        .setStyle(TextInputStyle.Short)
-        .setRequired(true)
-        .setValue(s.intercomAccessToken() ?? "");
-      const clientSecret = new TextInputBuilder()
-        .setCustomId("client_secret")
-        .setLabel("Client secret (blank = inbound webhook off)")
+        .setLabel("Access token (blank = keep current)")
         .setStyle(TextInputStyle.Short)
         .setRequired(false)
-        .setValue(s.intercomClientSecret() ?? "");
+        .setPlaceholder(s.intercomAccessToken() ? "•••• stored (leave blank to keep)" : "Developer Hub → your app → Access token");
+      const clientSecret = new TextInputBuilder()
+        .setCustomId("client_secret")
+        .setLabel("Client secret (blank keeps · 'off' disables)")
+        .setStyle(TextInputStyle.Short)
+        .setRequired(false)
+        .setPlaceholder(s.intercomClientSecret() ? "•••• stored (blank keeps · 'off' disables)" : "blank = inbound webhook stays off");
       modal.addComponents(
         new ActionRowBuilder<TextInputBuilder>().addComponents(accessToken),
         new ActionRowBuilder<TextInputBuilder>().addComponents(clientSecret)
@@ -4158,11 +4170,13 @@ export class DiscordBot {
     }
 
     if (interaction.customId === "config_sentry_dsn_modal") {
-      const dsn = interaction.fields.getTextInputValue("dsn").trim();
-      await this.settingsStore.updateSentry({ sentryDsn: dsn || null });
+      // No-echo: blank means keep current, not clear. 'off' disables Sentry.
+      const dsnInput = interaction.fields.getTextInputValue("dsn").trim();
+      const disableDsn = /^(off|none|disable|-)$/i.test(dsnInput);
+      if (dsnInput) await this.settingsStore.updateSentry({ sentryDsn: disableDsn ? null : dsnInput });
       const { result, note } = await this.applySentrySettings();
       // Deliberately no DSN value in the audit line.
-      this.auditConfig(interaction, `Sentry DSN ${dsn ? "set" : "cleared"}`);
+      this.auditConfig(interaction, `Sentry DSN ${dsnInput ? (disableDsn ? "cleared" : "set") : "unchanged"}`);
       await interaction.reply({
         embeds: [
           makeEmbed(
@@ -4295,17 +4309,24 @@ export class DiscordBot {
     }
 
     if (interaction.customId === "config_intercom_secrets_modal") {
-      const accessToken = interaction.fields.getTextInputValue("access_token").trim();
-      const clientSecret = interaction.fields.getTextInputValue("client_secret").trim();
+      const accessTokenInput = interaction.fields.getTextInputValue("access_token").trim();
+      const clientSecretInput = interaction.fields.getTextInputValue("client_secret").trim();
 
-      await this.settingsStore.updateIntercom({
-        intercomAccessToken: accessToken,
-        intercomClientSecret: clientSecret || null,
-      });
+      // Secrets are never pre-filled (no-echo), so a blank field means "keep
+      // current", not "clear". The client secret is disabled explicitly by
+      // typing off/none/disable/-.
+      const disableSecret = /^(off|none|disable|-)$/i.test(clientSecretInput);
+      const update: { intercomAccessToken?: string; intercomClientSecret?: string | null } = {};
+      if (accessTokenInput) update.intercomAccessToken = accessTokenInput;
+      if (clientSecretInput) update.intercomClientSecret = disableSecret ? null : clientSecretInput;
+      await this.settingsStore.updateIntercom(update);
+      const clientSecret = this.settingsStore.intercomClientSecret();
       // Deliberately no secret values in the audit line.
       this.auditConfig(
         interaction,
-        `Intercom secrets updated (access token ${accessToken ? "set" : "cleared"}, client secret ${clientSecret ? "set" : "off"})`
+        `Intercom secrets updated (access token ${accessTokenInput ? "set" : "unchanged"}, client secret ${
+          clientSecretInput ? (disableSecret ? "disabled" : "set") : "unchanged"
+        })`
       );
       await interaction.reply({
         embeds: [

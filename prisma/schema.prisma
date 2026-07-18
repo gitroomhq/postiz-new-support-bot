@@ -149,7 +149,7 @@ model BotSettings {
   sentryLogsEnabled        Boolean @default(true) // Sentry Logs product + console.* capture
   sentryDebug              Boolean @default(false) // SDK debug to stdout; restart to apply
   sentrySendDefaultPii     Boolean @default(false)
-  sentryAiRecordContent    Boolean @default(true) // AI prompts/responses/tool I/O on gen_ai spans
+  sentryAiRecordContent    Boolean @default(false) // AI prompts/responses/tool I/O on gen_ai spans — off by default (customer PII); opt in via /config
   // Sentry READ access — separate from the write-only DSN above. Lets /ai correlate
   // a ticket with real Postiz product errors. Token is encrypted at rest (crypto.ts);
   // needs an auth token (event:read, project:read) + org/project slugs. Off by default.

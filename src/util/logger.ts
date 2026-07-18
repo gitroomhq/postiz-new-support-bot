@@ -102,6 +102,17 @@ export function initSentry(cfg: SentryRuntimeConfig): void {
       profileSessionSampleRate: cfg.profilesSampleRate,
       profileLifecycle: "trace",
       integrations,
+      // Backstop redaction: scrub credential-shaped substrings + sensitive
+      // query params (single-use panel token in ?t=, oauth code/state) and
+      // secret-keyed headers/fields out of every outgoing event.
+      beforeSend: (event) => {
+        scrubEvent(event as MutableSentryEvent);
+        return event;
+      },
+      beforeSendTransaction: (event) => {
+        scrubEvent(event as MutableSentryEvent);
+        return event;
+      },
     });
     sentryEnabled = true;
     log.info("sentry.initialized", {
@@ -243,6 +254,84 @@ function scalarizeFields(fields: LogFields): Record<string, string | number | bo
   return out;
 }
 
+// --- secret redaction (defense-in-depth for stdout + Sentry) -----------------
+// Nothing here should be the primary defense — the rule is still "never pass a
+// secret into a log field". This is the backstop for the overlooked call and
+// the exception whose message/stack embeds a credential.
+
+// Field/header keys whose values must never be emitted.
+const SECRET_KEY_RE =
+  /(^|[._-])(secret|secrets|token|password|passwd|passcode|api[_-]?key|apikey|authorization|cookie|dsn|bearer|credential|credentials|client[_-]?secret|access[_-]?token|refresh[_-]?token|private[_-]?key|signature|vault[_-]?token)($|[._-])/i;
+
+// Credential-shaped substrings, redacted wherever they appear (messages/stacks).
+const SECRET_VALUE_RE =
+  /(?:sk|rk|pk)_(?:live|test)_[A-Za-z0-9]{6,}|whsec_[A-Za-z0-9]{6,}|xox[baprs]-[A-Za-z0-9-]{6,}|Bearer\s+[A-Za-z0-9._~+/-]{8,}=*/g;
+
+const REDACTED = "[redacted]";
+
+function redactSecretString(s: string): string {
+  return s.replace(SECRET_VALUE_RE, REDACTED);
+}
+
+// Redact by key name; string values also get credential-shape scrubbing.
+function redactFields(fields: LogFields): LogFields {
+  const out: LogFields = {};
+  for (const [k, v] of Object.entries(fields)) {
+    if (SECRET_KEY_RE.test(k)) out[k] = REDACTED;
+    else if (typeof v === "string") out[k] = redactSecretString(v);
+    else out[k] = v;
+  }
+  return out;
+}
+
+// Strip sensitive query params (single-use panel token, oauth code/state) out
+// of a captured URL / query string / transaction name.
+function redactSensitiveParams(s: string): string {
+  return s.replace(/((?:^|[?&])(?:t|token|code|state|access_token)=)[^&\s]*/gi, `$1${REDACTED}`);
+}
+function sanitizeUrl(url: string): string {
+  return redactSecretString(redactSensitiveParams(url));
+}
+
+// Sentry beforeSend/beforeSendTransaction scrubber. Typed loosely against the
+// SDK's event shape so it can mutate URL/message/headers/exception in place.
+interface MutableSentryEvent {
+  message?: string;
+  transaction?: string;
+  request?: { url?: string; query_string?: string; headers?: Record<string, unknown>; cookies?: unknown };
+  exception?: { values?: Array<{ value?: string }> };
+  contexts?: Record<string, Record<string, unknown> | undefined>;
+}
+function scrubEvent(event: MutableSentryEvent): void {
+  try {
+    if (typeof event.message === "string") event.message = redactSecretString(event.message);
+    if (typeof event.transaction === "string") event.transaction = sanitizeUrl(event.transaction);
+    const req = event.request;
+    if (req) {
+      if (typeof req.url === "string") req.url = sanitizeUrl(req.url);
+      if (typeof req.query_string === "string") req.query_string = redactSensitiveParams(req.query_string);
+      if (req.headers && typeof req.headers === "object") {
+        for (const h of Object.keys(req.headers)) {
+          if (SECRET_KEY_RE.test(h)) req.headers[h] = REDACTED;
+        }
+      }
+      if (req.cookies) req.cookies = REDACTED;
+    }
+    for (const val of event.exception?.values ?? []) {
+      if (typeof val.value === "string") val.value = redactSecretString(val.value);
+    }
+    const logCtx = event.contexts?.log;
+    if (logCtx && typeof logCtx === "object") {
+      for (const k of Object.keys(logCtx)) {
+        if (SECRET_KEY_RE.test(k)) logCtx[k] = REDACTED;
+        else if (typeof logCtx[k] === "string") logCtx[k] = redactSecretString(logCtx[k] as string);
+      }
+    }
+  } catch {
+    // Scrubbing must never throw an event off its send path.
+  }
+}
+
 export interface LoggerOptions {
   // MCP servers speak their protocol on stdout — route every level to stderr.
   stream?: "stdout" | "stderr";
@@ -263,9 +352,10 @@ export class Logger {
     );
   }
 
-  private line(level: string, message: string, fields?: LogFields): string {
+  // fields must already be merged + redacted by the caller (write()).
+  private line(level: string, message: string, fields: LogFields): string {
     const scope = this.scope ? ` [${this.scope}]` : "";
-    return `${new Date().toISOString()} ${level.toUpperCase()}${scope} ${message}${stringifyFields({ ...this.base, ...fields })}\n`;
+    return `${new Date().toISOString()} ${level.toUpperCase()}${scope} ${message}${stringifyFields(fields)}\n`;
   }
 
   // stdoutSuffix is appended to the terminal line only (e.g. a stack trace);
@@ -276,14 +366,19 @@ export class Logger {
     fields?: LogFields,
     stdoutSuffix = ""
   ): void {
+    // Redact once, use for both sinks: field keys, string values, and the
+    // message/stack all get the secret backstop before anything is emitted.
+    const merged = redactFields({ ...this.base, ...fields });
+    const safeMessage = redactSecretString(message);
+    const safeSuffix = redactSecretString(stdoutSuffix);
     const stderr = this.options.stream === "stderr" || level === "warn" || level === "error";
-    (stderr ? process.stderr : process.stdout).write(this.line(level, message + stdoutSuffix, fields));
+    (stderr ? process.stderr : process.stdout).write(this.line(level, safeMessage + safeSuffix, merged));
     // isInitialized (not the module flag): the MCP subprocess calls
     // Sentry.init directly rather than through initSentry().
     if (Sentry.isInitialized()) {
-      Sentry.logger[level](message, {
+      Sentry.logger[level](safeMessage, {
         "logger.scope": this.scope,
-        ...scalarizeFields({ ...this.base, ...fields }),
+        ...scalarizeFields(merged),
       });
     }
   }
@@ -312,7 +407,9 @@ export class Logger {
     this.write("error", message, { ...fields, ...errFields }, errText);
     if (Sentry.isInitialized()) {
       Sentry.withScope((scope) => {
-        scope.setContext("log", { scope: this.scope, message, ...this.base, ...fields });
+        // Context fields are redacted here; the raw error/message are scrubbed
+        // by the beforeSend backstop (exception values + event message).
+        scope.setContext("log", redactFields({ scope: this.scope, message, ...this.base, ...fields }));
         if (error instanceof Error) Sentry.captureException(error);
         else Sentry.captureMessage(`${message}${errText}`, "error");
       });

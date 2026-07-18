@@ -362,6 +362,25 @@ export class BillingCategory extends BaseCategory {
       return;
     }
 
+    // Ownership gate: the charge must belong to the invoker's own linked Stripe
+    // customer. The chargeId rides in the button custom_id, so don't trust it
+    // alone — the panel/registry path asserts this on every action
+    // (customerIdOf(charge) !== cus → refuse); the self-service path must too,
+    // or a crafted component interaction could refund another account's charge.
+    const invokerCustomerId = (await this.sessionStore.getSession(interaction.user.id))?.stripeCustomerId ?? null;
+    if (!invokerCustomerId || charge.customerId !== invokerCustomerId) {
+      billingLog.warn("billing.refund.ownership_mismatch", {
+        "stripe.charge_id": chargeId,
+        "discord.user_id": interaction.user.id,
+      });
+      metricCount("billing.refunds", 1, { outcome: "ownership_mismatch" });
+      await this.disableConfirmButtons(interaction);
+      await interaction.editReply({
+        embeds: [makeEmbed("This charge can't be matched to your account. A support agent will take a look.", COLORS.warn)],
+      });
+      return;
+    }
+
     const amountText = this.stripeClient.formatAmount(charge.amount, charge.currency);
 
     // Guardrails: on breach, no Stripe call and no lock row — a human takes over.

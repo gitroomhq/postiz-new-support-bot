@@ -294,7 +294,7 @@ const STATEMENTS: string[] = [
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "sentryLogsEnabled" BOOLEAN NOT NULL DEFAULT true`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "sentryDebug" BOOLEAN NOT NULL DEFAULT false`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "sentrySendDefaultPii" BOOLEAN NOT NULL DEFAULT false`,
-  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "sentryAiRecordContent" BOOLEAN NOT NULL DEFAULT true`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "sentryAiRecordContent" BOOLEAN NOT NULL DEFAULT false`,
   // Sentry READ access for /ai error correlation (token encrypted at rest).
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "sentryReadEnabled" BOOLEAN NOT NULL DEFAULT false`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "sentryReadToken" TEXT`,
