@@ -246,6 +246,7 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
       if (sub.cancel_at_period_end) statusBadges.push({ kind: "warn", text: "Cancels at period end" });
       return {
         id: sub.id,
+        ref: { page: "subscriptions.detail", params: { id: sub.id } },
         cells: [
           avatarCell("subscription", plan, { sub: per }),
           { t: "flags", badges: statusBadges },
@@ -327,6 +328,7 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
     ],
     rows: invoices.invoices.map((invoice) => ({
       id: invoice.id ?? "draft",
+      ...(invoice.id ? { ref: { page: "invoices.detail", params: { id: invoice.id } } } : {}),
       cells: [
         amount(ctx.stripe, invoice.total, invoice.currency, invoiceBadge(invoice.status)),
         idCell(invoice.number ?? invoice.id ?? "draft", { copy: !!invoice.id }),

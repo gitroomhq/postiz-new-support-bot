@@ -70,6 +70,8 @@ import { makeHomeSection } from "./dashboard/sections/homeSection";
 import { makeBalancesSection } from "./dashboard/sections/balancesSection";
 import { makeCustomersSection } from "./dashboard/sections/customersSection";
 import { makePaymentsSection } from "./dashboard/sections/paymentsSection";
+import { makeSubscriptionsSection } from "./dashboard/sections/subscriptionsSection";
+import { makeInvoicesSection } from "./dashboard/sections/invoicesSection";
 import { makeApprovalsSection } from "./dashboard/sections/approvalsSection";
 import { makeSecuritySection } from "./dashboard/sections/securitySection";
 import { GuildSnapshotProvider } from "./adminpanel/guildSnapshot";
@@ -524,6 +526,8 @@ async function main() {
     makeBalancesSection(),
     makePaymentsSection(),
     makeCustomersSection(),
+    makeSubscriptionsSection(),
+    makeInvoicesSection(),
     makeApprovalsSection(),
     makeSecuritySection({ credentials: dashboardCredentials, sessions: dashboardDbSessions, audit: dashboardAudit }),
   ];

@@ -115,6 +115,7 @@ D.renderCell = function (td, cell) {
     var a3 = D.el("a", "reflink", cell.v);
     a3.href = cell.href; a3.target = "_blank"; a3.rel = "noopener noreferrer";
     td.appendChild(a3);
+    if (cell.copy) td.appendChild(D.copyBtn(cell.href));
   } else {
     td.textContent = String(cell.v || "");
   }

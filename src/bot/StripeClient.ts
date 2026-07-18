@@ -482,6 +482,39 @@ export class StripeClient {
     return { count, truncated: true };
   }
 
+  // Account-wide subscription browse (dashboard Subscriptions list). Status
+  // "all" includes canceled; price narrows to one plan.
+  async listAllSubscriptions(opts: {
+    status?: Stripe.SubscriptionListParams.Status;
+    priceId?: string;
+    limit?: number;
+    startingAfter?: string;
+  }): Promise<{ subscriptions: Stripe.Subscription[]; hasMore: boolean }> {
+    const res = await this.stripe.subscriptions.list({
+      status: opts.status ?? "all",
+      ...(opts.priceId ? { price: opts.priceId } : {}),
+      limit: opts.limit ?? 25,
+      ...(opts.startingAfter ? { starting_after: opts.startingAfter } : {}),
+    });
+    return { subscriptions: res.data, hasMore: res.has_more };
+  }
+
+  async listCreditNotes(invoiceId: string, limit = 25): Promise<Stripe.CreditNote[]> {
+    const res = await this.stripe.creditNotes.list({ invoice: invoiceId, limit });
+    return res.data;
+  }
+
+  // Plain upcoming-invoice preview for a live subscription (no plan change) —
+  // the "Upcoming invoice" panel on the subscription detail page.
+  async previewUpcomingInvoice(customerId: string, subscriptionId: string): Promise<Stripe.Invoice | null> {
+    try {
+      return await this.stripe.invoices.createPreview({ customer: customerId, subscription: subscriptionId });
+    } catch {
+      // No upcoming invoice (canceled / fully-ended subs) — not an error.
+      return null;
+    }
+  }
+
   // Free-text charge search for the palette (email/description substring).
   // Search API: eventually consistent (~1min), never used in revalidators.
   async searchChargesByTerm(term: string, limit = 5): Promise<Stripe.Charge[]> {
@@ -1132,14 +1165,15 @@ export class StripeClient {
     return this.stripe.invoices.retrieve(invoiceId, { expand: ["payments"] });
   }
 
+  // customerId null = ACCOUNT-WIDE listing (dashboard Invoices page).
   async listInvoicesByStatus(
-    customerId: string,
+    customerId: string | null,
     status: Stripe.Invoice.Status | undefined,
     limit = 10,
     startingAfter?: string
   ): Promise<Stripe.ApiList<Stripe.Invoice>> {
     return this.stripe.invoices.list({
-      customer: customerId,
+      ...(customerId ? { customer: customerId } : {}),
       ...(status ? { status } : {}),
       limit,
       ...(startingAfter ? { starting_after: startingAfter } : {}),

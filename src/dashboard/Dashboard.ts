@@ -30,14 +30,17 @@ const DASH_T1_EXTRA = new Set([
   "subscription.pause_resume",
   "subscription.terms",
   "invoice.collect",
+  "invoice.finalize",
   "customer.payment_method",
 ]);
-// T2 (fresh factor re-assert): fraud refunds, blocklisting, cancel-NOW.
+// T2 (fresh factor re-assert): fraud refunds, blocklisting, cancel-NOW,
+// off-session invoice pay.
 const DASH_T2 = new Set(["charge.refund_fraud", "customer.block"]);
 
 function needsStepUp(key: string, params: Record<string, unknown> | undefined): boolean {
   if (DASH_T2.has(key)) return true;
-  return key === "subscription.cancel" && params?.when === "now";
+  if (key === "subscription.cancel" && params?.when === "now") return true;
+  return key === "invoice.collect" && params?.op === "pay";
 }
 
 export type DashboardAuditFn = (actor: { id: string; name: string }, change: string) => Promise<void>;

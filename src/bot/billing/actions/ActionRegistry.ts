@@ -529,6 +529,36 @@ const invoiceCollect = defineAction<InvoiceCollectParams>({
   },
 });
 
+interface InvoiceFinalizeParams {
+  invoiceId: string;
+}
+
+const invoiceFinalize = defineAction<InvoiceFinalizeParams>({
+  key: "invoice.finalize",
+  label: "Finalize draft invoice",
+  group: "Invoices",
+  defaultLevel: "none",
+  dangerous: false,
+  parseParams: (raw) => {
+    const o = obj(raw);
+    const invoiceId = o ? idWithPrefix(o.invoiceId, "in_") : null;
+    return invoiceId ? { ok: true, params: { invoiceId } } : { ok: false, error: "invoiceId (in_…) required" };
+  },
+  summarize: (p) => `Finalize draft invoice ${p.invoiceId} (it becomes open and collectible)`,
+  revalidate: async (ctx, p) => {
+    const cus = requireCustomer(ctx);
+    if (!cus) return "No linked Stripe customer.";
+    const invoice = await ctx.stripe.getInvoice(p.invoiceId);
+    if (customerIdOf(invoice) !== cus) return "Invoice does not belong to this customer.";
+    if (invoice.status !== "draft") return `Invoice is ${invoice.status} — only drafts can be finalized.`;
+    return null;
+  },
+  execute: async (ctx, p) => {
+    const finalized = await ctx.stripe.finalizeInvoice(p.invoiceId, `panel-invfinalize-${p.invoiceId}-${ctx.idemScope}`);
+    return { ok: true, text: `Invoice ${p.invoiceId} finalized — status ${finalized.status}.` };
+  },
+});
+
 interface InvoiceVoidParams {
   invoiceId: string;
   op: "void" | "uncollectible" | "delete_draft";
@@ -879,6 +909,7 @@ export const BILLING_ACTIONS: BillingActionDef[] = [
   subscriptionChangePlan,
   subscriptionTerms,
   invoiceCollect,
+  invoiceFinalize,
   invoiceVoid,
   invoiceCreateDraft,
   invoiceCreditNote,

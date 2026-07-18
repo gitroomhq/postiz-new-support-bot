@@ -36,7 +36,7 @@ export type Cell =
   | { t: "date"; v: string; iso: string } // v = preformatted absolute; client renders relative w/ hover
   | { t: "id"; v: string; ref?: ObjectRef; copy?: boolean }
   | { t: "link"; v: string; ref: ObjectRef }
-  | { t: "external"; v: string; href: string } // explicit external link (Discord/Intercom/Stripe-hosted)
+  | { t: "external"; v: string; href: string; copy?: boolean } // explicit external link (Discord/Intercom/Stripe-hosted); copy copies the href
   // Card-brand chip + masked last4 ("VISA ···· 4242").
   | { t: "card"; brand: string; last4: string; sub?: string }
   // Object-icon avatar before a bold name (products, subscriptions, customers).

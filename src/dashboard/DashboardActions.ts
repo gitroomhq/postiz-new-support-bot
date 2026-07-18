@@ -84,6 +84,7 @@ export class DashboardActionGateway {
         return { ok: true, key, params, binding: await this.bindingFor(customerId) };
       }
       case "invoice.collect":
+      case "invoice.finalize":
       case "invoice.void":
       case "invoice.credit_note": {
         const invoiceId = validId("invoice", params.invoiceId);
@@ -91,6 +92,13 @@ export class DashboardActionGateway {
         const invoice = await this.stripe.getInvoice(invoiceId);
         const customerId = idOf(invoice.customer);
         if (!customerId) return { ok: false, error: "This invoice has no customer attached." };
+        // Credit-note modal input is in major units; convert with the
+        // invoice's currency (same idiom as the charge-refund conversion).
+        if (params.amountMinor == null && typeof params.amountMajor === "number" && isFinite(params.amountMajor)) {
+          const factor = StripeClient.isZeroDecimal(invoice.currency) ? 1 : 100;
+          params.amountMinor = Math.round(params.amountMajor * factor);
+          delete params.amountMajor;
+        }
         return { ok: true, key, params, binding: await this.bindingFor(customerId) };
       }
       case "invoice.create_draft":
@@ -101,6 +109,25 @@ export class DashboardActionGateway {
         // its SHAPE is trusted — the registry revalidates existence/ownership.
         const customerId = validId("customer", params.customerId);
         if (!customerId) return { ok: false, error: "customerId (cus_…) required." };
+        // The web draft builder collects ONE line item as flat modal fields;
+        // fold them into the registry's items[] shape (multi-line drafts stay
+        // in /billing).
+        if (key === "invoice.create_draft" && !Array.isArray(params.items)) {
+          const description = typeof params.description === "string" ? params.description.trim() : "";
+          const currency =
+            typeof params.currency === "string" && /^[A-Za-z]{3}$/.test(params.currency.trim())
+              ? params.currency.trim().toLowerCase()
+              : "";
+          const amountMajor = typeof params.amountMajor === "number" && isFinite(params.amountMajor) ? params.amountMajor : null;
+          if (!description || !currency || amountMajor == null || amountMajor <= 0) {
+            return { ok: false, error: "Draft needs a description, a positive amount and a 3-letter currency." };
+          }
+          const factor = StripeClient.isZeroDecimal(currency) ? 1 : 100;
+          params.items = [{ description, amountMinor: Math.round(amountMajor * factor), currency }];
+          delete params.description;
+          delete params.amountMajor;
+          delete params.currency;
+        }
         return { ok: true, key, params, binding: await this.bindingFor(customerId) };
       }
       case "charge_review": {

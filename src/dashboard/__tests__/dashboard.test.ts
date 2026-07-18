@@ -12,8 +12,11 @@ import { makeCustomersSection } from "../sections/customersSection";
 import { makePaymentsSection, buildGuardrailPanel } from "../sections/paymentsSection";
 import { makeHomeSection } from "../sections/homeSection";
 import { makeBalancesSection } from "../sections/balancesSection";
+import { makeSubscriptionsSection } from "../sections/subscriptionsSection";
+import { makeInvoicesSection } from "../sections/invoicesSection";
 import { makeSecuritySection } from "../sections/securitySection";
 import { GlobalSearch } from "../search/GlobalSearch";
+import { actionByKey, ActionExecCtx } from "../../bot/billing/actions/ActionRegistry";
 import { BillingActionService } from "../../bot/billing/actions/BillingActionService";
 import type { ApprovalStore, BillingApproval } from "../../bot/billing/ApprovalStore";
 import type { SessionStore } from "../../auth/SessionStore";
@@ -22,7 +25,7 @@ import type { BlockStore } from "../../bot/billing/BlockStore";
 import type { CredentialStore } from "../auth/CredentialStore";
 import type { DashboardDbSessions } from "../auth/DashboardDbSessions";
 import type { DashboardAudit } from "../auth/DashboardAudit";
-import { HeaderBlock, KeyValueBlock, TableBlock } from "../renderer/contract";
+import { Block, HeaderBlock, KeyValueBlock, TableBlock } from "../renderer/contract";
 import { renderDashboardShell } from "../html/shellHtml";
 import { clientCore } from "../html/clientCore";
 import { clientBlocks } from "../html/clientBlocks";
@@ -1141,6 +1144,307 @@ test("failed payment: timeline tells the real story (seller message + codes), no
   const pm = page!.blocks.find((b) => b.type === "kv" && b.title === "Payment method") as KeyValueBlock;
   const typeRow = pm.rows.find((r) => r.label === "Type")!;
   assert.deepEqual(typeRow.cell, { t: "card", brand: "link", last4: "" });
+});
+
+// ---- M3: subscriptions + invoices ----
+
+function subsCtx(overrides: { previewThrows?: boolean } = {}): DashboardCtx {
+  const sub = {
+    id: "sub_1",
+    status: "active",
+    customer: "cus_a",
+    created: 1_700_000_000,
+    cancel_at: null,
+    cancel_at_period_end: false,
+    pause_collection: null,
+    trial_end: null,
+    collection_method: "charge_automatically",
+    default_payment_method: null,
+    discounts: [],
+    latest_invoice: "in_9",
+    items: {
+      data: [
+        {
+          id: "si_1",
+          quantity: 1,
+          current_period_end: 1_700_900_000,
+          price: {
+            id: "price_old",
+            nickname: "Postiz Pro",
+            product: "prod_1",
+            currency: "eur",
+            unit_amount: 2900,
+            recurring: { interval: "month", interval_count: 1 },
+          },
+        },
+      ],
+    },
+  };
+  return {
+    actor: { id: "42", name: "Ada", role: "admin", isAdmin: true },
+    stripe: {
+      formatAmount: (a: number, c: string) => `${(a / 100).toFixed(2)} ${c.toUpperCase()}`,
+      listAllSubscriptions: async () => ({
+        subscriptions: [
+          sub,
+          { ...sub, id: "sub_2", status: "trialing" },
+          { ...sub, id: "sub_3", status: "past_due" },
+          { ...sub, id: "sub_4", status: "canceled" },
+          { ...sub, id: "sub_5", pause_collection: { behavior: "void" } },
+        ],
+        hasMore: false,
+      }),
+      listRecurringPrices: async () => [
+        { id: "price_old", nickname: "Postiz Pro", currency: "eur", unit_amount: 2900, recurring: { interval: "month", interval_count: 1 } },
+        { id: "price_new", nickname: "Postiz Ultra", currency: "eur", unit_amount: 4900, recurring: { interval: "month", interval_count: 1 } },
+      ],
+      getSubscription: async () => sub,
+      previewUpcomingInvoice: async () => ({
+        amount_due: 2900,
+        currency: "eur",
+        next_payment_attempt: 1_700_900_000,
+        lines: { data: [{ id: "il_1", description: "Postiz Pro", amount: 2900, currency: "eur" }] },
+      }),
+      previewPlanChange: async () => {
+        if (overrides.previewThrows) throw new Error("incompatible");
+        return {
+          amount_due: 1550,
+          currency: "eur",
+          lines: {
+            data: [
+              { id: "il_a", description: "Unused time on Postiz Pro", amount: -1400, currency: "eur" },
+              { id: "il_b", description: "Remaining time on Postiz Ultra", amount: 2950, currency: "eur" },
+            ],
+          },
+        };
+      },
+    } as unknown as DashboardCtx["stripe"],
+    settings: { allowedPriceIds: () => [] } as never,
+    stores: {
+      session: { findDiscordIdsByStripeId: async () => ["disc_1"] },
+    } as unknown as DashboardCtx["stores"],
+    billing: { actions: { effectiveMode: () => "direct" }, gateway: {} as never } as unknown as DashboardCtx["billing"],
+    audit: async () => {},
+    security: { sessionIdHash: "h", authMethod: "passkey", stepUpFresh: () => true },
+  } as unknown as DashboardCtx;
+}
+
+test("subscriptions list: status count-cards incl. paused, avatar rows, customer links", async () => {
+  const section = makeSubscriptionsSection();
+  const page = await section.buildPage(subsCtx(), { page: "subscriptions", filters: {} });
+  const table = page!.blocks.find((b) => b.type === "table") as TableBlock;
+  const counts = Object.fromEntries(table.counts!.items.map((i) => [i.label, i.count]));
+  assert.equal(counts.All, 5);
+  assert.equal(counts.Active, 2); // sub_1 + the paused one (status stays active)
+  assert.equal(counts.Paused, 1);
+  assert.equal(counts.Canceled, 1);
+  assert.equal(table.rows[0].cells[0].t, "avatar");
+  assert.deepEqual(table.rows[0].ref, { page: "subscriptions.detail", params: { id: "sub_1" } });
+  const paused = await section.buildPage(subsCtx(), { page: "subscriptions", filters: { status: "paused" } });
+  assert.equal((paused!.blocks.find((b) => b.type === "table") as TableBlock).rows.length, 1);
+});
+
+test("subscription detail: stat strip, pricing footer → change-plan page, cancel-now is T2, no direct change-plan button", async () => {
+  const section = makeSubscriptionsSection();
+  const page = await section.buildPage(subsCtx(), { page: "subscriptions.detail", params: { id: "sub_1" } });
+  const header = page!.blocks[0] as HeaderBlock;
+  // No change-plan modal anywhere on the detail page — the preview subpage is mandatory.
+  assert.ok(!header.actions!.some((a) => a.key === "subscription.change_plan"));
+  const cancelNow = header.actions!.find((a) => a.label === "Cancel now")!;
+  assert.equal(cancelNow.stepUp, true);
+  const stats = page!.blocks.find((b) => b.type === "stats") as { items: Array<{ label: string; value: string }> };
+  const strip = Object.fromEntries(stats.items.map((i) => [i.label, i.value]));
+  assert.equal(strip["Next invoice"], "29.00 EUR");
+  const pricing = page!.blocks.find((b) => b.type === "table" && b.key === "pricing") as TableBlock;
+  assert.deepEqual(pricing.footerRef, { page: "subscriptions.changeplan", params: { id: "sub_1" } });
+  assert.ok(page!.blocks.some((b) => b.type === "table" && b.key === "upcoming"));
+  assert.equal(page!.rail!.length, 2);
+});
+
+test("change plan: confirm button exists ONLY after a successful proration preview", async () => {
+  const section = makeSubscriptionsSection();
+  const hasChangeButton = (page: { blocks: Block[] }): boolean =>
+    page.blocks.some(
+      (b) => "actions" in b && (b as { actions?: Array<{ key: string }> }).actions?.some((a) => a.key === "subscription.change_plan")
+    );
+  // No target price picked → picker only, no confirm anywhere.
+  const picker = await section.buildPage(subsCtx(), { page: "subscriptions.changeplan", params: { id: "sub_1" }, filters: {} });
+  assert.ok(!hasChangeButton(picker as never));
+  assert.ok(!picker!.blocks.some((b) => b.type === "table" && b.key === "preview"));
+  // Target picked → preview table + confirm with baked params.
+  const previewed = await section.buildPage(subsCtx(), {
+    page: "subscriptions.changeplan",
+    params: { id: "sub_1" },
+    filters: { price: "price_new" },
+  });
+  assert.ok(previewed!.blocks.some((b) => b.type === "table" && b.key === "preview"));
+  const confirmBlock = previewed!.blocks.find(
+    (b) => "actions" in b && (b as { actions?: Array<{ key: string }> }).actions?.some((a) => a.key === "subscription.change_plan")
+  ) as { actions: Array<{ key: string; params?: unknown; dangerous?: boolean }> };
+  assert.ok(confirmBlock);
+  const btn = confirmBlock.actions.find((a) => a.key === "subscription.change_plan")!;
+  assert.deepEqual(btn.params, { subscriptionId: "sub_1", priceId: "price_new" });
+  assert.equal(btn.dangerous, true);
+  // Preview failure → no confirm button.
+  const failed = await makeSubscriptionsSection().buildPage(subsCtx({ previewThrows: true }), {
+    page: "subscriptions.changeplan",
+    params: { id: "sub_1" },
+    filters: { price: "price_new" },
+  });
+  assert.ok(!hasChangeButton(failed as never));
+});
+
+function invoiceCtx(status: string): DashboardCtx {
+  const invoice = {
+    id: "in_1",
+    number: "INV-0001",
+    status,
+    customer: "cus_a",
+    customer_email: "ada@x.com",
+    customer_name: "Ada",
+    currency: "eur",
+    subtotal: 2900,
+    total: 2900,
+    amount_paid: status === "paid" ? 2900 : 0,
+    amount_due: status === "paid" ? 0 : 2900,
+    created: 1_700_000_000,
+    due_date: 1_700_900_000,
+    collection_method: "send_invoice",
+    hosted_invoice_url: "https://invoice.stripe.com/i/xyz",
+    invoice_pdf: "https://pay.stripe.com/invoice/xyz/pdf",
+    total_taxes: [],
+    metadata: { order: "42" },
+    payment_settings: { payment_method_types: ["card", "link"] },
+    parent: { subscription_details: { subscription: "sub_1" } },
+    lines: { data: [{ id: "il_1", description: "Postiz Pro", quantity: 1, amount: 2900, currency: "eur" }], has_more: false },
+  };
+  return {
+    actor: { id: "42", name: "Ada", role: "admin", isAdmin: true },
+    stripe: {
+      formatAmount: (a: number, c: string) => `${(a / 100).toFixed(2)} ${c.toUpperCase()}`,
+      listInvoicesByStatus: async () => ({ data: [invoice, { ...invoice, id: "in_2", status: "draft" }], has_more: false }),
+      getInvoice: async () => invoice,
+      listCreditNotes: async () => [{ id: "cn_1", total: 500, currency: "eur", status: "issued", memo: "goodwill", created: 1_700_100_000 }],
+    } as unknown as DashboardCtx["stripe"],
+    settings: {} as never,
+    stores: { session: { findDiscordIdsByStripeId: async () => [] } } as unknown as DashboardCtx["stores"],
+    billing: { actions: { effectiveMode: () => "direct" }, gateway: {} as never } as unknown as DashboardCtx["billing"],
+    audit: async () => {},
+    security: { sessionIdHash: "h", authMethod: "passkey", stepUpFresh: () => true },
+  } as unknown as DashboardCtx;
+}
+
+test("invoices list: count-cards + draft builder header action; detail: status-gated lifecycle + hosted URL + rail sub link", async () => {
+  const section = makeInvoicesSection();
+  const page = await section.buildPage(invoiceCtx("open"), { page: "invoices", filters: {} });
+  const header = page!.blocks[0] as HeaderBlock;
+  assert.ok(header.actions!.some((a) => a.key === "invoice.create_draft"));
+  const table = page!.blocks.find((b) => b.type === "table") as TableBlock;
+  const counts = Object.fromEntries(table.counts!.items.map((i) => [i.label, i.count]));
+  assert.equal(counts.All, 2);
+  assert.equal(counts.Draft, 1);
+
+  // OPEN invoice: send (T1) + off-session pay (T2) + void/uncollectible + credit note.
+  const open = await section.buildPage(invoiceCtx("open"), { page: "invoices.detail", params: { id: "in_1" } });
+  const openHeader = open!.blocks[0] as HeaderBlock;
+  const labels = openHeader.actions!.map((a) => a.label);
+  assert.deepEqual(labels, ["Send invoice", "Collect payment now", "Void", "Mark uncollectible", "Credit note"]);
+  assert.equal(openHeader.actions!.find((a) => a.label === "Collect payment now")!.stepUp, true);
+  // Hosted URL renders as an external copy-field.
+  const links = open!.blocks.find((b) => b.type === "kv" && b.title === "Links") as KeyValueBlock;
+  assert.deepEqual(links.rows[0].cell, { t: "external", v: "Open payment page", href: "https://invoice.stripe.com/i/xyz", copy: true });
+  // Rail carries the Basil parent.subscription_details link.
+  const details = open!.rail![0] as KeyValueBlock;
+  const subRow = details.rows.find((r) => r.label === "Subscription")!;
+  assert.deepEqual((subRow.cell as { ref?: unknown }).ref, { page: "subscriptions.detail", params: { id: "sub_1" } });
+  // Credit notes + summary + PM chips render.
+  assert.ok(open!.blocks.some((b) => b.type === "table" && b.key === "creditnotes"));
+  const pmChips = open!.blocks.find((b) => b.type === "kv" && b.title === "Enabled payment methods") as KeyValueBlock;
+  assert.deepEqual(pmChips.rows.map((r) => r.cell), [
+    { t: "card", brand: "card", last4: "" },
+    { t: "card", brand: "link", last4: "" },
+  ]);
+
+  // DRAFT invoice: finalize + delete only.
+  const draft = await section.buildPage(invoiceCtx("draft"), { page: "invoices.detail", params: { id: "in_1" } });
+  assert.deepEqual((draft!.blocks[0] as HeaderBlock).actions!.map((a) => a.key), ["invoice.finalize", "invoice.void"]);
+});
+
+test("gateway M3: finalize binds via invoice, credit-note amountMajor converts via invoice currency, draft builder folds items", async () => {
+  const sessionStore = { findDiscordIdsByStripeId: async () => [] } as unknown as SessionStore;
+  const stripe = {
+    getInvoice: async () => ({ id: "in_1", customer: "cus_inv", currency: "eur" }),
+  } as unknown as StripeClient;
+  const gateway = new DashboardActionGateway({} as never, stripe, sessionStore);
+
+  const fin = await gateway.resolve("invoice.finalize", { invoiceId: "in_1" });
+  assert.ok(fin.ok && (fin as { binding: { stripeCustomerId: string } }).binding.stripeCustomerId === "cus_inv");
+
+  const note = await gateway.resolve("invoice.credit_note", { invoiceId: "in_1", amountMajor: 5, mode: "credit" });
+  assert.ok(note.ok);
+  assert.equal((note as { params: { amountMinor?: number } }).params.amountMinor, 500);
+
+  const draft = await gateway.resolve("invoice.create_draft", {
+    customerId: "cus_x",
+    description: "Consulting",
+    amountMajor: 29,
+    currency: "EUR",
+    finalize: true,
+  });
+  assert.ok(draft.ok);
+  assert.deepEqual((draft as { params: { items?: unknown } }).params.items, [
+    { description: "Consulting", amountMinor: 2900, currency: "eur" },
+  ]);
+  const bad = await gateway.resolve("invoice.create_draft", { customerId: "cus_x", description: "", amountMajor: 0, currency: "eur" });
+  assert.equal(bad.ok, false);
+});
+
+test("registry invoice.finalize: draft-only revalidation with ownership", async () => {
+  const def = actionByKey("invoice.finalize")!;
+  assert.equal(def.parseParams({ invoiceId: "nope" }).ok, false);
+  const parsed = def.parseParams({ invoiceId: "in_1" });
+  assert.ok(parsed.ok);
+  const ctx = (status: string, owner: string) =>
+    ({
+      stripe: { getInvoice: async () => ({ id: "in_1", customer: owner, status }) },
+      stripeCustomerId: "cus_1",
+    }) as unknown as ActionExecCtx;
+  assert.equal(await def.revalidate(ctx("draft", "cus_1"), (parsed as { params: unknown }).params), null);
+  assert.match((await def.revalidate(ctx("open", "cus_1"), (parsed as { params: unknown }).params)) ?? "", /only drafts/);
+  assert.match((await def.revalidate(ctx("draft", "cus_OTHER"), (parsed as { params: unknown }).params)) ?? "", /does not belong/);
+});
+
+test("api belts M3: off-session invoice pay demands a fresh factor; send does not", async () => {
+  const fake = fakeSettings();
+  const gatewayCalls: string[] = [];
+  const provider: DashboardAuthProvider = {
+    enter: async () => ({ kind: "page" }),
+    authenticate: async () => fakeAuthResult("active"),
+    publicEndpoint: async () => null,
+    sessionEndpoint: async () => null,
+  };
+  const dashboard = new Dashboard(fake.store, provider, [fakeSection()], {
+    stripe: { isTestMode: () => true } as unknown as StripeClient,
+    settings: fake.store,
+    stores: {} as never,
+    billing: {
+      actions: {} as never,
+      gateway: { request: async (_a: unknown, key: string) => { gatewayCalls.push(key); return { kind: "executed", text: "ok" }; } } as never,
+    },
+  });
+  const pay = await dashboard.api("action", "c", {
+    key: "invoice.collect",
+    params: { invoiceId: "in_1", op: "pay" },
+    confirmWord: "CONFIRM",
+  });
+  assert.equal((pay.json as { needsStepUp?: boolean }).needsStepUp, true);
+  const send = await dashboard.api("action", "c", {
+    key: "invoice.collect",
+    params: { invoiceId: "in_1", op: "send" },
+    confirmWord: "CONFIRM",
+  });
+  assert.deepEqual(send.json, { ok: true, text: "ok" });
+  assert.deepEqual(gatewayCalls, ["invoice.collect"]);
 });
 
 test("client JS modules parse and the shell embeds them nonced", () => {
