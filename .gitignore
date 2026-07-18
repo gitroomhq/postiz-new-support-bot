@@ -4,7 +4,10 @@ node_modules
 .idea
 
 /src/generated/prisma
-search
+# The postinstall-cloned knowledge repos at the REPO ROOT only — an unanchored
+# "search" also swallows source dirs like src/dashboard/search/ (deploy 036f1e1
+# failed exactly this way: GlobalSearch.ts silently never committed).
+/search
 
 .vscode
 
