@@ -61,6 +61,8 @@ import { BillingAdmin } from "./BillingAdmin";
 import { IntercomAdmin } from "./IntercomAdmin";
 import { AdminPanel } from "../adminpanel/AdminPanel";
 import { AdminPanelDiscord } from "../adminpanel/AdminPanelDiscord";
+import { Dashboard } from "../dashboard/Dashboard";
+import { DashboardDiscord } from "../dashboard/DashboardDiscord";
 import { RADAR_LISTS, type BlockService } from "./billing/BlockService";
 import { backfillDisputeHistory } from "./billing/DisputeMonitor";
 import type { DisputeStore } from "./billing/DisputeStore";
@@ -145,6 +147,8 @@ export class DiscordBot {
   private temporalOps: TemporalOpsBinding | null = null;
   private adminPanel?: AdminPanel;
   private adminPanelDiscord?: AdminPanelDiscord;
+  private dashboard?: Dashboard;
+  private dashboardDiscord?: DashboardDiscord;
   // SLA manager — bound late from index.ts; hooks fire-and-forget on ticket
   // creation and customer replies.
   private slaService: {
@@ -231,6 +235,13 @@ export class DiscordBot {
   bindAdminPanel(deps: { panel: AdminPanel; discord: AdminPanelDiscord }): void {
     this.adminPanel = deps.panel;
     this.adminPanelDiscord = deps.discord;
+  }
+
+  // Late-bound from index.ts: the Stripe dashboard (web). Used by start()
+  // (CallbackServer route) and the dashpanel_* interaction routing.
+  bindDashboard(deps: { panel: Dashboard; discord: DashboardDiscord }): void {
+    this.dashboard = deps.panel;
+    this.dashboardDiscord = deps.discord;
   }
 
   private setupEventHandlers(): void {
@@ -964,6 +975,14 @@ export class DiscordBot {
       return;
     }
 
+    // dashpanel_ is the Stripe dashboard's Discord surface (link minter +
+    // passcode handshake). Runs before billadmin_ — the entry button lives on
+    // the /billing root panel.
+    if (interaction.customId.startsWith("dashpanel_")) {
+      await this.dashboardDiscord?.handleButton(interaction);
+      return;
+    }
+
     if (interaction.customId.startsWith("config_")) {
       await this.handleConfigButton(interaction);
       return;
@@ -1275,6 +1294,11 @@ export class DiscordBot {
   private async handleModal(interaction: ModalSubmitInteraction): Promise<void> {
     if (interaction.customId === "adminpanel_activate_modal") {
       await this.adminPanelDiscord?.handleModal(interaction);
+      return;
+    }
+
+    if (interaction.customId === "dashpanel_activate_modal") {
+      await this.dashboardDiscord?.handleModal(interaction);
       return;
     }
 
@@ -5198,6 +5222,12 @@ export class DiscordBot {
         ? {
             page: (token) => this.adminPanel!.page(token),
             api: (endpoint, sessionId, body) => this.adminPanel!.api(endpoint, sessionId, body),
+          }
+        : undefined,
+      this.dashboard
+        ? {
+            page: (token, cookie) => this.dashboard!.page(token, cookie),
+            api: (endpoint, sessionId, body) => this.dashboard!.api(endpoint, sessionId, body),
           }
         : undefined
     );

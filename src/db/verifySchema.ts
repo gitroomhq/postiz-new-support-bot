@@ -23,6 +23,18 @@ const EXPECTED_COLUMNS: Record<string, string[]> = {
     "errorText", "expiresAt", "resolvedAt", "createdAt",
   ],
   pending_auths: ["id", "state", "discordUserId", "channelId", "interactionToken", "createdAt"],
+  dashboard_credentials: [
+    "id", "discordUserId", "kind", "label", "credentialId", "publicKey", "signCount", "transports", "backupState",
+    "secretEnc", "lastUsedStep", "hash", "createdAt", "lastUsedAt", "revokedAt",
+  ],
+  dashboard_sessions: [
+    "id", "discordUserId", "adminName", "epoch", "state", "authMethod", "credentialIdUsed", "activationCode",
+    "activationAttempts", "uaFirst", "ipFirst", "ipLast", "stepUpAt", "createdAt", "lastSeenAt", "absoluteExpiresAt",
+    "revokedAt",
+  ],
+  dashboard_audit_log: [
+    "id", "at", "actorId", "actorName", "kind", "action", "targetId", "summary", "outcome", "ip", "sessionIdHash",
+  ],
   bot_settings: [
     "id", "threadsChannelId", "supportRoleId", "githubRepo", "aiSolveEnabled", "aiCommandsEnabled", "backfillDone",
     "reportChannelId", "reportEnabled", "reportIntervalHours", "reportHour", "reportMinute", "reportTimezone",
@@ -54,7 +66,8 @@ const EXPECTED_COLUMNS: Record<string, string[]> = {
     "inactivityEnabled", "inactivityAgentWaitDays", "inactivityCustomerWaitDays", "inactivityNagsBeforeClose",
     "inactivityNagText", "inactivityAgentNoteText", "refundMaxChargeAgeDays",
     "agentRipMigratedAt", "intercomPanelAdminsJson", "billingActionLevelsJson", "panelTokenSecret",
-    "panelTokenEpoch", "adminPanelEpoch", "slaEnabled", "slaNativeEnabled", "slaDefaultTarget", "slaAttributeName", "slaTargetsJson", "slaNoteKickEnabled", "slaNoteAdminId",
+    "panelTokenEpoch", "adminPanelEpoch", "dashboardEnabled", "dashboardAdminsJson", "dashboardTokenSecret", "dashboardEpoch",
+    "slaEnabled", "slaNativeEnabled", "slaDefaultTarget", "slaAttributeName", "slaTargetsJson", "slaNoteKickEnabled", "slaNoteAdminId",
     "slaStatusAttributeName", "slaBreachTagName", "slaWarnPct", "officeHoursEnabled", "officeHoursJson",
     "assignEnabled", "assignExcludedAdminsJson", "assignRotationCursorsJson", "teamSettingsJson",
     "updatedAt",

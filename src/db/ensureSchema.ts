@@ -678,6 +678,73 @@ const STATEMENTS: string[] = [
   // Admin web-panel (/config + /intercom) revocation epoch — independent of the
   // Stripe-panel epoch above ("Revoke Admin Panel Links").
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "adminPanelEpoch" INTEGER NOT NULL DEFAULT 0`,
+  // Stripe dashboard (/dashboard): kill switch (default OFF), allowlist,
+  // independent token HMAC secret + revocation epoch.
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "dashboardEnabled" BOOLEAN NOT NULL DEFAULT false`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "dashboardAdminsJson" JSONB`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "dashboardTokenSecret" TEXT`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "dashboardEpoch" INTEGER NOT NULL DEFAULT 0`,
+  // Dashboard standing auth: per-admin credentials (passkeys / TOTP /
+  // passphrase), DB-backed sessions (survive deploys; id = SHA-256 of the
+  // cookie token) and the append-only audit trail.
+  `CREATE TABLE IF NOT EXISTS "dashboard_credentials" (
+    "id" TEXT NOT NULL,
+    "discordUserId" TEXT NOT NULL,
+    "kind" TEXT NOT NULL,
+    "label" TEXT,
+    "credentialId" TEXT,
+    "publicKey" TEXT,
+    "signCount" INTEGER,
+    "transports" TEXT,
+    "backupState" BOOLEAN,
+    "secretEnc" TEXT,
+    "lastUsedStep" INTEGER,
+    "hash" TEXT,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "lastUsedAt" TIMESTAMP(3),
+    "revokedAt" TIMESTAMP(3),
+    CONSTRAINT "dashboard_credentials_pkey" PRIMARY KEY ("id")
+  )`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS "dashboard_credentials_credentialId_key" ON "dashboard_credentials"("credentialId")`,
+  `CREATE INDEX IF NOT EXISTS "dashboard_credentials_discordUserId_kind_idx" ON "dashboard_credentials"("discordUserId", "kind")`,
+  `CREATE TABLE IF NOT EXISTS "dashboard_sessions" (
+    "id" TEXT NOT NULL,
+    "discordUserId" TEXT NOT NULL,
+    "adminName" TEXT NOT NULL,
+    "epoch" INTEGER NOT NULL,
+    "state" TEXT NOT NULL,
+    "authMethod" TEXT NOT NULL,
+    "credentialIdUsed" TEXT,
+    "activationCode" TEXT,
+    "activationAttempts" INTEGER NOT NULL DEFAULT 0,
+    "uaFirst" TEXT,
+    "ipFirst" TEXT,
+    "ipLast" TEXT,
+    "stepUpAt" TIMESTAMP(3),
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "lastSeenAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "absoluteExpiresAt" TIMESTAMP(3) NOT NULL,
+    "revokedAt" TIMESTAMP(3),
+    CONSTRAINT "dashboard_sessions_pkey" PRIMARY KEY ("id")
+  )`,
+  `CREATE INDEX IF NOT EXISTS "dashboard_sessions_discordUserId_idx" ON "dashboard_sessions"("discordUserId")`,
+  `CREATE INDEX IF NOT EXISTS "dashboard_sessions_absoluteExpiresAt_idx" ON "dashboard_sessions"("absoluteExpiresAt")`,
+  `CREATE TABLE IF NOT EXISTS "dashboard_audit_log" (
+    "id" TEXT NOT NULL,
+    "at" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "actorId" TEXT NOT NULL,
+    "actorName" TEXT NOT NULL,
+    "kind" TEXT NOT NULL,
+    "action" TEXT NOT NULL,
+    "targetId" TEXT,
+    "summary" TEXT NOT NULL,
+    "outcome" TEXT NOT NULL,
+    "ip" TEXT,
+    "sessionIdHash" TEXT,
+    CONSTRAINT "dashboard_audit_log_pkey" PRIMARY KEY ("id")
+  )`,
+  `CREATE INDEX IF NOT EXISTS "dashboard_audit_log_at_idx" ON "dashboard_audit_log"("at")`,
+  `CREATE INDEX IF NOT EXISTS "dashboard_audit_log_actorId_at_idx" ON "dashboard_audit_log"("actorId", "at")`,
   // SLA manager: rules write the "SLA Target" conversation attribute; an
   // Intercom Workflow branches on it → native Apply SLA. Rules + per-subject
   // state (write dedup + manual pins) + global toggles/registry.

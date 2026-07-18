@@ -342,6 +342,19 @@ export class StripeClient {
     return customer.deleted ? null : (customer as Stripe.Customer);
   }
 
+  // Account-wide customer browse (dashboard Customers list) — plain
+  // customers.list pagination, newest first.
+  async listCustomersPage(opts: {
+    limit?: number;
+    startingAfter?: string;
+  }): Promise<{ customers: Stripe.Customer[]; hasMore: boolean }> {
+    const res = await this.stripe.customers.list({
+      limit: opts.limit ?? 25,
+      ...(opts.startingAfter ? { starting_after: opts.startingAfter } : {}),
+    });
+    return { customers: res.data, hasMore: res.has_more };
+  }
+
   async findCustomersByEmail(email: string): Promise<Stripe.Customer[]> {
     const res = await this.stripe.customers.list({ email, limit: 10 });
     return res.data;

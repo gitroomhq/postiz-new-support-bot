@@ -296,6 +296,21 @@ model BotSettings {
   // panelTokenEpoch so "Revoke Admin Panel Links" doesn't kill Stripe-panel
   // links (and vice versa). Admin tokens reuse panelTokenSecret as HMAC key.
   adminPanelEpoch         Int     @default(0)
+  // Stripe dashboard (account-wide web surface at /dashboard). Default OFF —
+  // routes answer 404 until an admin enables it from the Dashboard hub.
+  dashboardEnabled        Boolean @default(false)
+  // Who may open/enroll into the dashboard: JSON array of { id, name, role }
+  // (Discord user ids are the authority, names snapshotted, role
+  // "admin" | "operator" — default admin). Re-checked on EVERY request.
+  dashboardAdminsJson     Json?
+  // Dashboard token HMAC key — SEPARATE from panelTokenSecret: d1 tokens
+  // include enroll links (credential-planting class), so the dashboard gets an
+  // independent secret + rotation lever. Encrypted at rest via crypto.ts.
+  dashboardTokenSecret    String?
+  // Dashboard token/session epoch — bumping it ("Revoke dashboard links" /
+  // LOCKDOWN) kills every outstanding dashboard link and session instantly,
+  // independent of the other two panels.
+  dashboardEpoch          Int     @default(0)
   // SLA manager (edited via /intercom → SLA Manager). The bot IS the SLA
   // engine (Intercom Advanced has no native SLAs): rules pick a target, the
   // bot writes it to the slaAttributeName conversation attribute (inbox
@@ -850,4 +865,81 @@ model SlaState {
 
   @@index([conversationId])
   @@map("sla_states")
+}
+
+// ---- Stripe dashboard standing auth ----
+
+// Per-admin dashboard credentials: any number of passkey/totp rows plus one
+// passphrase row (upserted). Passkey public keys and scrypt hashes are NOT
+// secrets (rotation-immune); the TOTP secret is encrypted (Vault Transit
+// envelope when active, local enc:v1 otherwise).
+model DashboardCredential {
+  id                 String    @id @default(cuid())
+  discordUserId      String
+  kind               String // "passkey" | "totp" | "passphrase"
+  label              String?
+  // passkey rows
+  credentialId       String?   @unique // base64url
+  publicKey          String? // base64url-encoded COSE public key
+  signCount          Int?
+  transports         String? // comma-joined transport hints
+  backupState        Boolean?
+  // totp rows
+  secretEnc          String?
+  lastUsedStep       Int? // accepted-code replay guard
+  // passphrase rows
+  hash               String? // self-describing scrypt string
+  createdAt          DateTime  @default(now())
+  lastUsedAt         DateTime?
+  revokedAt          DateTime?
+
+  @@index([discordUserId, kind])
+  @@map("dashboard_credentials")
+}
+
+// DB-backed standing sessions (survive deploys). id = SHA-256 hex of the
+// cookie token — a DB dump yields no usable session. 8h idle / 3d absolute.
+model DashboardSession {
+  id                 String    @id
+  discordUserId      String
+  adminName          String
+  epoch              Int
+  state              String // "locked" | "active"
+  authMethod         String // "passkey" | "totp" | "breakglass"
+  credentialIdUsed   String?
+  activationCode     String? // present while locked (useless without the cookie)
+  activationAttempts Int       @default(0)
+  uaFirst            String?
+  ipFirst            String?
+  ipLast             String?
+  stepUpAt           DateTime? // last fresh-factor re-assert (T2 window)
+  createdAt          DateTime  @default(now())
+  lastSeenAt         DateTime  @default(now())
+  absoluteExpiresAt  DateTime
+  revokedAt          DateTime?
+
+  @@index([discordUserId])
+  @@index([absoluteExpiresAt])
+  @@map("dashboard_sessions")
+}
+
+// Append-only dashboard audit trail (auth lifecycle + actions) — doubles as
+// the Security page's recent-activity feed and a forensic record independent
+// of Discord channel retention.
+model DashboardAuditLog {
+  id            String   @id @default(cuid())
+  at            DateTime @default(now())
+  actorId       String
+  actorName     String
+  kind          String // "auth" | "action" | "admin"
+  action        String
+  targetId      String?
+  summary       String
+  outcome       String // "ok" | "denied" | "failed"
+  ip            String?
+  sessionIdHash String?
+
+  @@index([at])
+  @@index([actorId, at])
+  @@map("dashboard_audit_log")
 }

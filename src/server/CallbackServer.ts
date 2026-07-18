@@ -8,6 +8,7 @@ import { log } from "../util/logger";
 import { metricCount } from "../util/instrument";
 import { exportIntercomWebhook } from "../metrics/MetricsExporter";
 import { TemporalBufferedError } from "../temporal/producers";
+import { mountPanel, type MountedPanelRoute } from "./panelMount";
 
 const httpLog = log.child("http");
 
@@ -40,8 +41,9 @@ export interface StripeWebhookRoute {
 // Stripe panel (tokenized standalone page opened from the Intercom canvas).
 // GET exchanges the SINGLE-USE HMAC link token for an HttpOnly session cookie
 // (verified/consumed inside the route object); the API authenticates by that
-// cookie. This layer adds the transport belts: per-IP throttle, security
-// headers with a per-response CSP nonce, and CSRF checks on the API.
+// cookie. The transport belts (per-IP throttle, security headers with a
+// per-response CSP nonce, CSRF checks) live in panelMount.ts, shared by all
+// tokenized panels.
 export interface IntercomPanelRoute {
   page: (token: string) => Promise<{ html: string; nonce: string; sessionCookie: string } | { status: number; message: string }>;
   api: (endpoint: string, sessionId: string, body: unknown) => Promise<{ status: number; json: object }>;
@@ -55,17 +57,12 @@ export interface AdminPanelRoute {
   api: (endpoint: string, sessionId: string, body: unknown) => Promise<{ status: number; json: object }>;
 }
 
-type RawBodyRequest = Request & { rawBody?: Buffer };
+// Stripe dashboard (account-wide, standing web surface). Same transport
+// contract; page() additionally receives the session cookie so a standing
+// session can resume without a fresh link token.
+export type DashboardRoute = MountedPanelRoute;
 
-// Applied to every Stripe-panel response (page + API).
-const PANEL_SECURITY_HEADERS = {
-  "X-Content-Type-Options": "nosniff",
-  "Cross-Origin-Opener-Policy": "same-origin",
-  "Cross-Origin-Resource-Policy": "same-origin",
-  "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
-  // Harmless behind a TLS-terminating proxy; a no-op on plain http.
-  "Strict-Transport-Security": "max-age=31536000",
-} as const;
+type RawBodyRequest = Request & { rawBody?: Buffer };
 
 const PANEL_IP_LIMIT_PER_MIN = 60;
 const PANEL_IP_WINDOW_MS = 60_000;
@@ -85,7 +82,8 @@ export class CallbackServer {
     private intercomCanvas?: IntercomCanvasRoute,
     private stripeWebhook?: StripeWebhookRoute,
     private intercomPanel?: IntercomPanelRoute,
-    private adminPanel?: AdminPanelRoute
+    private adminPanel?: AdminPanelRoute,
+    private dashboard?: DashboardRoute
   ) {
     this.app = express();
     // req.ip drives the panel per-IP throttle. Without this, req.ip is the
@@ -223,171 +221,38 @@ export class CallbackServer {
       );
     }
 
+    // Tokenized web panels — shared transport belt (panelMount.ts): per-IP
+    // pre-auth throttle, CSP-nonced security headers, CSRF triple belt,
+    // cookie-authed API. Panel semantics live in the mounted route objects.
+    const allowIp = (ip: string | undefined) => this.allowPanelIp(ip);
     // Stripe panel: a tokenized standalone page (Canvas Kit sheets are
     // Messenger-only, so the canvas mints a 15-min personal link instead).
-    // The page is served self-contained (inline CSS/JS, no asset routes,
-    // CSP-nonced); GET consumes the single-use link token and sets the
-    // HttpOnly SameSite=Strict session cookie the API authenticates with.
-    this.app.get("/intercom/panel", async (req, res) => {
-      if (!this.intercomPanel) {
-        res.status(404).send("Not found");
-        return;
-      }
-      if (!this.allowPanelIp(req.ip)) {
-        res.status(429).set("Cache-Control", "no-store").send("Too many requests.");
-        return;
-      }
-      const token = typeof req.query.t === "string" ? req.query.t : "";
-      try {
-        const result = await this.intercomPanel.page(token);
-        if ("html" in result) {
-          res
-            .status(200)
-            .set({
-              "Content-Type": "text/html; charset=utf-8",
-              "Cache-Control": "no-store",
-              "X-Frame-Options": "DENY",
-              "Content-Security-Policy":
-                `default-src 'none'; style-src 'nonce-${result.nonce}'; script-src 'nonce-${result.nonce}'; ` +
-                "connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; object-src 'none'",
-              "Referrer-Policy": "no-referrer",
-              ...PANEL_SECURITY_HEADERS,
-              "Set-Cookie": result.sessionCookie,
-            })
-            .send(result.html);
-        } else {
-          metricCount("intercom.panel_auth_failures", 1, { where: "page" });
-          res.status(result.status).set({ "Cache-Control": "no-store", ...PANEL_SECURITY_HEADERS }).send(result.message);
-        }
-      } catch (e) {
-        httpLog.error("intercom panel page failed", e);
-        res.status(500).send("Internal error");
-      }
+    mountPanel(this.app, allowIp, {
+      pagePath: "/intercom/panel",
+      apiPath: "/intercom/panel/api/:endpoint",
+      cookieName: "__Host-icpanel",
+      metricName: "intercom.panel_auth_failures",
+      logLabel: "intercom panel",
+      route: () => this.intercomPanel,
     });
-
-    this.app.post(
-      "/intercom/panel/api/:endpoint",
-      express.json({ limit: "256kb" }),
-      async (req, res) => {
-        if (!this.intercomPanel) {
-          res.status(404).json({ error: "not_found" });
-          return;
-        }
-        if (!this.allowPanelIp(req.ip)) {
-          res.status(429).set("Cache-Control", "no-store").json({ error: "rate limited" });
-          return;
-        }
-        // CSRF belts on top of SameSite=Strict. (1) Custom header: cross-site
-        // forms can't send one without a CORS preflight, which nothing here
-        // answers. (2) Sec-Fetch-Site, when the browser provides it, must be
-        // same-origin. (3) An Origin header, when present, must match the
-        // request host.
-        const secFetchSite = req.header("sec-fetch-site");
-        const origin = req.header("origin");
-        let originHostOk = true;
-        if (origin) {
-          try {
-            originHostOk = new URL(origin).host === req.headers.host;
-          } catch {
-            originHostOk = false;
-          }
-        }
-        if (req.header("x-panel-request") !== "1" || (secFetchSite && secFetchSite !== "same-origin") || !originHostOk) {
-          httpLog.warn("intercom panel api cross-origin rejected", {
-            "panel.endpoint": String(req.params.endpoint),
-            "http.sec_fetch_site": secFetchSite ?? "",
-            "http.origin": origin ?? "",
-          });
-          metricCount("intercom.panel_auth_failures", 1, { where: "csrf" });
-          res.status(403).set({ "Cache-Control": "no-store", ...PANEL_SECURITY_HEADERS }).json({ error: "forbidden" });
-          return;
-        }
-        const sessionId = parseCookies(req.headers.cookie)["__Host-icpanel"] ?? "";
-        try {
-          const result = await this.intercomPanel.api(String(req.params.endpoint), sessionId, req.body);
-          if (result.status === 401) metricCount("intercom.panel_auth_failures", 1, { where: "api" });
-          res.status(result.status).set({ "Cache-Control": "no-store", ...PANEL_SECURITY_HEADERS }).json(result.json);
-        } catch (e) {
-          httpLog.error("intercom panel api failed", e, { "panel.endpoint": String(req.params.endpoint) });
-          res.status(500).json({ error: "internal" });
-        }
-      }
-    );
-
-    // Admin web panel (/config + /intercom). Same belts as the Stripe panel:
-    // single-use link token → HttpOnly __Host-acpanel cookie on GET; the API is
-    // cookie-authed with CSRF checks. The page is served locked and unlocks only
-    // after the Discord-side passcode confirm (handled inside the route object).
-    this.app.get("/admin/panel", async (req, res) => {
-      if (!this.adminPanel) {
-        res.status(404).send("Not found");
-        return;
-      }
-      if (!this.allowPanelIp(req.ip)) {
-        res.status(429).set("Cache-Control", "no-store").send("Too many requests.");
-        return;
-      }
-      const token = typeof req.query.t === "string" ? req.query.t : "";
-      try {
-        const result = await this.adminPanel.page(token);
-        if ("html" in result) {
-          res
-            .status(200)
-            .set({
-              "Content-Type": "text/html; charset=utf-8",
-              "Cache-Control": "no-store",
-              "X-Frame-Options": "DENY",
-              "Content-Security-Policy":
-                `default-src 'none'; style-src 'nonce-${result.nonce}'; script-src 'nonce-${result.nonce}'; ` +
-                "connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; object-src 'none'",
-              "Referrer-Policy": "no-referrer",
-              ...PANEL_SECURITY_HEADERS,
-              "Set-Cookie": result.sessionCookie,
-            })
-            .send(result.html);
-        } else {
-          metricCount("adminpanel.auth_failures", 1, { where: "page" });
-          res.status(result.status).set({ "Cache-Control": "no-store", ...PANEL_SECURITY_HEADERS }).send(result.message);
-        }
-      } catch (e) {
-        httpLog.error("admin panel page failed", e);
-        res.status(500).send("Internal error");
-      }
+    // Admin web panel (/config + /intercom): served locked, unlocks only after
+    // the Discord-side passcode confirm (handled inside the route object).
+    mountPanel(this.app, allowIp, {
+      pagePath: "/admin/panel",
+      apiPath: "/admin/panel/api/:endpoint",
+      cookieName: "__Host-acpanel",
+      metricName: "adminpanel.auth_failures",
+      logLabel: "admin panel",
+      route: () => this.adminPanel,
     });
-
-    this.app.post("/admin/panel/api/:endpoint", express.json({ limit: "256kb" }), async (req, res) => {
-      if (!this.adminPanel) {
-        res.status(404).json({ error: "not_found" });
-        return;
-      }
-      if (!this.allowPanelIp(req.ip)) {
-        res.status(429).set("Cache-Control", "no-store").json({ error: "rate limited" });
-        return;
-      }
-      // CSRF belts on top of SameSite=Strict — identical to the Stripe panel API.
-      const secFetchSite = req.header("sec-fetch-site");
-      const origin = req.header("origin");
-      let originHostOk = true;
-      if (origin) {
-        try {
-          originHostOk = new URL(origin).host === req.headers.host;
-        } catch {
-          originHostOk = false;
-        }
-      }
-      if (req.header("x-panel-request") !== "1" || (secFetchSite && secFetchSite !== "same-origin") || !originHostOk) {
-        metricCount("adminpanel.auth_failures", 1, { where: "csrf" });
-        res.status(403).set({ "Cache-Control": "no-store", ...PANEL_SECURITY_HEADERS }).json({ error: "forbidden" });
-        return;
-      }
-      const sessionId = parseCookies(req.headers.cookie)["__Host-acpanel"] ?? "";
-      try {
-        const result = await this.adminPanel.api(String(req.params.endpoint), sessionId, req.body);
-        res.status(result.status).set({ "Cache-Control": "no-store", ...PANEL_SECURITY_HEADERS }).json(result.json);
-      } catch (e) {
-        httpLog.error("admin panel api failed", e, { "adminpanel.endpoint": String(req.params.endpoint) });
-        res.status(500).json({ error: "internal" });
-      }
+    // Stripe dashboard (account-wide standing surface, /billing → web).
+    mountPanel(this.app, allowIp, {
+      pagePath: "/dashboard",
+      apiPath: "/dashboard/api/:endpoint",
+      cookieName: "__Host-dash",
+      metricName: "dashboard.auth_failures",
+      logLabel: "dashboard",
+      route: () => this.dashboard,
     });
 
     // Stripe webhook. Stripe signs with `Stripe-Signature` over the RAW body;
@@ -466,18 +331,6 @@ export class CallbackServer {
       httpLog.info("callback server listening", { "server.port": this.config.server.port });
     });
   }
-}
-
-// Minimal cookie parse (no dependency): "a=b; c=d" → { a: "b", c: "d" }.
-function parseCookies(header: string | undefined): Record<string, string> {
-  const out: Record<string, string> = {};
-  if (!header) return out;
-  for (const part of header.split(";")) {
-    const eq = part.indexOf("=");
-    if (eq === -1) continue;
-    out[part.slice(0, eq).trim()] = part.slice(eq + 1).trim();
-  }
-  return out;
 }
 
 // Constant-time comparison over hashes so differing lengths don't throw.

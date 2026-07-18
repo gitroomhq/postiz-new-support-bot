@@ -32,6 +32,10 @@ export type IntercomRegion = "us" | "eu" | "au";
 // directly too.
 export type BillingActionLevel = "none" | "approval" | "admin" | "all";
 
+// Dashboard allowlist role: "admin" = full authority (per-action levels still
+// apply), "operator" = read-only + registry actions at their configured level.
+export type DashboardAdminRole = "admin" | "operator";
+
 // `--effort` levels accepted by the Claude CLI. Stored free-text in BotSettings
 // but coerced on read so a bad /config value can never break the spawn.
 export type AiEffort = "low" | "medium" | "high" | "max";
@@ -670,6 +674,90 @@ export class SettingsStore {
       data: { adminPanelEpoch: { increment: 1 } },
     });
     return this.settings.adminPanelEpoch;
+  }
+
+  // ---- Stripe dashboard (/dashboard) ----
+
+  // Kill switch: the /dashboard routes answer 404 while off. Default OFF —
+  // enabling is a deliberate Discord-side act (Dashboard hub). The web surface
+  // itself may only ever DISABLE (ratchet asymmetry: a compromised session can
+  // reduce its own privilege but never restore it).
+  dashboardEnabled(): boolean {
+    return this.settings.dashboardEnabled;
+  }
+
+  async updateDashboardEnabled(enabled: boolean): Promise<void> {
+    this.settings = await this.prisma.botSettings.update({
+      where: { id: "global" },
+      data: { dashboardEnabled: enabled },
+    });
+  }
+
+  // Dashboard allowlist: Discord user ids are the authority (names snapshotted
+  // for display, role defaults to "admin"). Checked at mint AND re-checked on
+  // every authenticated request — removal applies to live sessions immediately.
+  dashboardAdmins(): Array<{ id: string; name: string; role: DashboardAdminRole }> {
+    const raw = this.settings.dashboardAdminsJson as unknown;
+    if (!Array.isArray(raw)) return [];
+    const out: Array<{ id: string; name: string; role: DashboardAdminRole }> = [];
+    for (const entry of raw) {
+      if (entry && typeof entry === "object" && typeof (entry as { id?: unknown }).id === "string") {
+        const id = (entry as { id: string }).id;
+        const name = (entry as { name?: unknown }).name;
+        const role = (entry as { role?: unknown }).role;
+        out.push({
+          id,
+          name: typeof name === "string" && name ? name : id,
+          role: role === "operator" ? "operator" : "admin",
+        });
+      }
+    }
+    return out;
+  }
+
+  // null = not on the allowlist (may not open the dashboard at all).
+  dashboardAdminRole(userId: string): DashboardAdminRole | null {
+    return this.dashboardAdmins().find((a) => a.id === userId)?.role ?? null;
+  }
+
+  async updateDashboardAdmins(admins: Array<{ id: string; name: string; role: DashboardAdminRole }>): Promise<void> {
+    this.settings = await this.prisma.botSettings.update({
+      where: { id: "global" },
+      data: { dashboardAdminsJson: admins },
+    });
+  }
+
+  // Dashboard token HMAC key — separate column from panelTokenSecret so the
+  // dashboard's links (which later include ENROLL links) have an independent
+  // blast radius and rotation lever. Same local-crypto storage idiom.
+  dashboardTokenSecret(): string | null {
+    const raw = this.settings.dashboardTokenSecret;
+    return raw ? decryptSecret(raw) : null;
+  }
+
+  async ensureDashboardTokenSecret(): Promise<string> {
+    const existing = this.dashboardTokenSecret();
+    if (existing) return existing;
+    const secret = randomBytes(32).toString("hex");
+    this.settings = await this.prisma.botSettings.update({
+      where: { id: "global" },
+      data: { dashboardTokenSecret: encryptSecret(secret) },
+    });
+    return secret;
+  }
+
+  // Dashboard revocation epoch: tokens + sessions embed it; bumping ("Revoke
+  // dashboard links" / LOCKDOWN) invalidates everything outstanding instantly.
+  dashboardEpoch(): number {
+    return this.settings.dashboardEpoch;
+  }
+
+  async bumpDashboardEpoch(): Promise<number> {
+    this.settings = await this.prisma.botSettings.update({
+      where: { id: "global" },
+      data: { dashboardEpoch: { increment: 1 } },
+    });
+    return this.settings.dashboardEpoch;
   }
 
   // ---- SLA manager (/intercom → SLA Manager) ----

@@ -57,6 +57,15 @@ import { AdminPanelTokens } from "./adminpanel/AdminPanelTokens";
 import { AdminPanelSessions } from "./adminpanel/AdminPanelSessions";
 import { AdminPanel } from "./adminpanel/AdminPanel";
 import { AdminPanelDiscord } from "./adminpanel/AdminPanelDiscord";
+import { DashboardTokens } from "./dashboard/DashboardTokens";
+import { StandingDashboardAuth } from "./dashboard/DashboardAuth";
+import { CredentialStore } from "./dashboard/auth/CredentialStore";
+import { DashboardDbSessions } from "./dashboard/auth/DashboardDbSessions";
+import { DashboardAudit } from "./dashboard/auth/DashboardAudit";
+import { Dashboard } from "./dashboard/Dashboard";
+import { DashboardDiscord } from "./dashboard/DashboardDiscord";
+import { makeCustomersSection } from "./dashboard/sections/customersSection";
+import { makeSecuritySection } from "./dashboard/sections/securitySection";
 import { GuildSnapshotProvider } from "./adminpanel/guildSnapshot";
 import { generalHub } from "./adminpanel/sections/generalHub";
 import { makeIntegrationsHub } from "./adminpanel/sections/integrationsHub";
@@ -65,6 +74,7 @@ import { makeInfraHub } from "./adminpanel/sections/infraHub";
 import { makeAuditBillingHub } from "./adminpanel/sections/auditBillingHub";
 import { makeWorkflowHub } from "./adminpanel/sections/workflowHub";
 import { makeAccessHub } from "./adminpanel/sections/accessHub";
+import { makeDashboardHub } from "./adminpanel/sections/dashboardHub";
 import { makeAutomationHub } from "./adminpanel/sections/automationHub";
 import { makeBridgeHub } from "./adminpanel/sections/bridgeHub";
 import { makeMaintenanceHub } from "./adminpanel/sections/maintenanceHub";
@@ -429,6 +439,9 @@ async function main() {
   // Temporal worker-pause is defined after bot.start(); hold it late-bound so the
   // infra hub's toggle can reach it at request time.
   const temporalControl: { setEnabled: ((on: boolean) => Promise<void>) | null } = { setEnabled: null };
+  // Dashboard credential reset is defined after the dashboard stack below —
+  // held late-bound so the Dashboard hub's action can reach it at request time.
+  const dashboardOps: { resetCredentials: ((userId: string) => Promise<number>) | null } = { resetCredentials: null };
   const fmtReport = (r: unknown): string =>
     r && typeof r === "object" ? Object.entries(r).map(([k, v]) => `${k}: ${v}`).join(", ") : String(r);
   const listIntercomAdmins = () => intercomClient.listAdmins().then((a) => a.map((x) => ({ id: x.id, name: x.name ?? x.id })));
@@ -465,6 +478,7 @@ async function main() {
         return rows.map((x) => `${x.kind}: ${x.created ? "created" : x.listId ? "exists" : "failed"}${x.error ? ` (${x.error})` : ""}`).join("; ");
       },
     }),
+    makeDashboardHub({ resetCredentials: (userId) => dashboardOps.resetCredentials?.(userId) ?? Promise.resolve(0) }),
     makeAccessHub({ listIntercomAdmins }),
     makeBridgeHub({ listTeams: () => intercomClient.listTeams(), listTags: () => intercomClient.listTags() }),
     makeSlaHub({ ruleStore: slaRuleStore }),
@@ -479,6 +493,37 @@ async function main() {
   const adminPanel = new AdminPanel(settingsStore, adminPanelTokens, adminPanelSessions, guildSnapshot, adminHubs);
   const adminPanelDiscord = new AdminPanelDiscord(settingsStore, adminPanelTokens, adminPanelSessions);
   bot.bindAdminPanel({ panel: adminPanel, discord: adminPanelDiscord });
+
+  // Stripe dashboard (/dashboard) — the account-wide web surface replacing
+  // /billing over time. Third panel on the panelMount substrate. Standing auth:
+  // passkey → passphrase → Discord DM activation, DB-backed 8h/3d sessions;
+  // the Discord-minted link + passcode stays as break-glass/bootstrap.
+  const dashboardTokens = new DashboardTokens(settingsStore);
+  const dashboardCredentials = new CredentialStore(prisma);
+  dashboardCredentials.bindVault(vaultService);
+  const dashboardDbSessions = new DashboardDbSessions(prisma);
+  const dashboardAudit = new DashboardAudit(prisma);
+  const dashboardAuth = new StandingDashboardAuth(
+    settingsStore,
+    dashboardTokens,
+    dashboardDbSessions,
+    dashboardCredentials,
+    dashboardAudit
+  );
+  dashboardOps.resetCredentials = (userId) => dashboardAuth.resetCredentials(userId);
+  const dashboardSections = [
+    makeCustomersSection(),
+    makeSecuritySection({ credentials: dashboardCredentials, sessions: dashboardDbSessions, audit: dashboardAudit }),
+  ];
+  const dashboard = new Dashboard(settingsStore, dashboardAuth, dashboardSections, {
+    stripe: stripeClient,
+    settings: settingsStore,
+    stores: { session: sessionStore, dispute: disputeStore, block: blockStore, qol: qolStore },
+  });
+  const dashboardDiscord = new DashboardDiscord(settingsStore, dashboardTokens, dashboardAuth);
+  dashboardAuth.bindNotifier(dashboardDiscord);
+  dashboardDiscord.bindClient(bot.client);
+  bot.bindDashboard({ panel: dashboard, discord: dashboardDiscord });
 
   // --worker-only: log the Discord client in (activities need it) but skip
   // slash-command registration + the HTTP surface; the Temporal worker always

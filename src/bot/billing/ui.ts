@@ -255,7 +255,12 @@ export function buildRootPanel(stripe: StripeClient): Panel {
         btn("billadmin_jump", "Jump to ID", ButtonStyle.Secondary),
         btn("billadmin_open:promo", "Promos", ButtonStyle.Secondary)
       ),
-      buttonRow(btn("billadmin_hub:business", "Business", ButtonStyle.Secondary)),
+      buttonRow(
+        btn("billadmin_hub:business", "Business", ButtonStyle.Secondary),
+        btn("dashpanel_open", "Open Web Dashboard", ButtonStyle.Success),
+        btn("dashpanel_activate", "Activate session", ButtonStyle.Secondary),
+        btn("dashpanel_revcode", "Show destructive-action code", ButtonStyle.Secondary)
+      ),
     ],
   };
 }
