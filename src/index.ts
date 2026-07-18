@@ -65,6 +65,9 @@ import { DashboardAudit } from "./dashboard/auth/DashboardAudit";
 import { Dashboard } from "./dashboard/Dashboard";
 import { DashboardDiscord } from "./dashboard/DashboardDiscord";
 import { DashboardActionGateway } from "./dashboard/DashboardActions";
+import { GlobalSearch } from "./dashboard/search/GlobalSearch";
+import { makeHomeSection } from "./dashboard/sections/homeSection";
+import { makeBalancesSection } from "./dashboard/sections/balancesSection";
 import { makeCustomersSection } from "./dashboard/sections/customersSection";
 import { makePaymentsSection } from "./dashboard/sections/paymentsSection";
 import { makeApprovalsSection } from "./dashboard/sections/approvalsSection";
@@ -515,17 +518,21 @@ async function main() {
   );
   dashboardOps.resetCredentials = (userId) => dashboardAuth.resetCredentials(userId);
   const dashboardGateway = new DashboardActionGateway(billingActionService, stripeClient, sessionStore);
+  const dashboardStores = { session: sessionStore, dispute: disputeStore, block: blockStore, qol: qolStore };
   const dashboardSections = [
-    makeCustomersSection(),
+    makeHomeSection(),
+    makeBalancesSection(),
     makePaymentsSection(),
+    makeCustomersSection(),
     makeApprovalsSection(),
     makeSecuritySection({ credentials: dashboardCredentials, sessions: dashboardDbSessions, audit: dashboardAudit }),
   ];
   const dashboard = new Dashboard(settingsStore, dashboardAuth, dashboardSections, {
     stripe: stripeClient,
     settings: settingsStore,
-    stores: { session: sessionStore, dispute: disputeStore, block: blockStore, qol: qolStore },
+    stores: dashboardStores,
     billing: { actions: billingActionService, gateway: dashboardGateway },
+    search: new GlobalSearch(stripeClient, dashboardStores),
   });
   const dashboardDiscord = new DashboardDiscord(settingsStore, dashboardTokens, dashboardAuth);
   dashboardAuth.bindNotifier(dashboardDiscord);

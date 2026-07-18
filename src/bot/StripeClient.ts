@@ -421,6 +421,87 @@ export class StripeClient {
     return this.stripe.charges.retrieve(chargeId, { expand: ["balance_transaction"] });
   }
 
+  async getBalance(): Promise<Stripe.Balance> {
+    return this.stripe.balance.retrieve();
+  }
+
+  async listPayouts(opts: {
+    limit?: number;
+    startingAfter?: string;
+  }): Promise<{ payouts: Stripe.Payout[]; hasMore: boolean }> {
+    const res = await this.stripe.payouts.list({
+      limit: opts.limit ?? 25,
+      ...(opts.startingAfter ? { starting_after: opts.startingAfter } : {}),
+    });
+    return { payouts: res.data, hasMore: res.has_more };
+  }
+
+  async getPayout(payoutId: string): Promise<Stripe.Payout> {
+    return this.stripe.payouts.retrieve(payoutId);
+  }
+
+  // ACCOUNT balance transactions (fees/charges/refunds/payouts) — distinct
+  // from the per-customer credit-ledger listCustomerBalanceTransactions.
+  async listAccountBalanceTransactions(opts: {
+    limit?: number;
+    startingAfter?: string;
+    type?: string;
+    payoutId?: string;
+  }): Promise<{ transactions: Stripe.BalanceTransaction[]; hasMore: boolean }> {
+    const res = await this.stripe.balanceTransactions.list({
+      limit: opts.limit ?? 25,
+      ...(opts.startingAfter ? { starting_after: opts.startingAfter } : {}),
+      ...(opts.type ? { type: opts.type } : {}),
+      ...(opts.payoutId ? { payout: opts.payoutId } : {}),
+    });
+    return { transactions: res.data, hasMore: res.has_more };
+  }
+
+  // Recent account events (Home activity feed). Read-only, newest first.
+  async listEvents(limit = 15): Promise<Stripe.Event[]> {
+    const res = await this.stripe.events.list({ limit });
+    return res.data;
+  }
+
+  // Active-subscription count for the Home stat tile. Stripe returns no
+  // totals, so this pages with a hard cap — capped counts report truncated
+  // and render as "N+".
+  async countActiveSubscriptions(maxPages = 2): Promise<{ count: number; truncated: boolean }> {
+    let count = 0;
+    let startingAfter: string | undefined;
+    for (let page = 0; page < maxPages; page++) {
+      const res = await this.stripe.subscriptions.list({
+        status: "active",
+        limit: 100,
+        ...(startingAfter ? { starting_after: startingAfter } : {}),
+      });
+      count += res.data.length;
+      if (!res.has_more || res.data.length === 0) return { count, truncated: false };
+      startingAfter = res.data[res.data.length - 1].id;
+    }
+    return { count, truncated: true };
+  }
+
+  // Free-text charge search for the palette (email/description substring).
+  // Search API: eventually consistent (~1min), never used in revalidators.
+  async searchChargesByTerm(term: string, limit = 5): Promise<Stripe.Charge[]> {
+    const safe = term.replace(/["\\]/g, "").trim();
+    if (safe.length < 2) return [];
+    const res = await this.stripe.charges.search({
+      query: `billing_details.email~"${safe}" OR description~"${safe}"`,
+      limit,
+    });
+    return res.data;
+  }
+
+  // Invoice-number search for the palette ("WLNHKEWS-0002" style).
+  async searchInvoicesByNumber(term: string, limit = 5): Promise<Stripe.Invoice[]> {
+    const safe = term.replace(/["\\]/g, "").trim();
+    if (safe.length < 3) return [];
+    const res = await this.stripe.invoices.search({ query: `number~"${safe}"`, limit });
+    return res.data;
+  }
+
   // Discounts are expanded so panels can show the coupon behind each discount.
   async listSubscriptions(customerId: string): Promise<Stripe.Subscription[]> {
     const res = await this.stripe.subscriptions.list({

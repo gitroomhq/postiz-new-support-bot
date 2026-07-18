@@ -168,39 +168,17 @@ D.pollBadges = function () {
   D.badgeTimer = setTimeout(D.pollBadges, 60000);
 };
 
-// ---- jump-to-ID ----
+// ---- id routes (shared by the palette's fast-path) ----
+// D.bindJump lives in clientPalette.ts — the topbar box IS the palette.
 D.ID_ROUTES = [
   { re: /^cus_[A-Za-z0-9]+$/, page: "customers.detail" },
   { re: /^(ch|py)_[A-Za-z0-9]+$/, page: "payments.detail" },
   { re: /^pi_[A-Za-z0-9]+$/, page: "payments.detail" },
+  { re: /^po_[A-Za-z0-9]+$/, page: "balances.detail" },
   { re: /^sub_[A-Za-z0-9]+$/, page: "subscriptions.detail" },
   { re: /^in_[A-Za-z0-9]+$/, page: "invoices.detail" },
   { re: /^(dp|du)_[A-Za-z0-9]+$/, page: "disputes.detail" }
 ];
-D.bindJump = function () {
-  var jump = D.q("jump");
-  jump.addEventListener("keydown", function (e) {
-    if (e.key !== "Enter") return;
-    var v = jump.value.trim();
-    if (!v) return;
-    for (var i = 0; i < D.ID_ROUTES.length; i++) {
-      if (D.ID_ROUTES[i].re.test(v)) {
-        jump.value = "";
-        D.navigateRef({ page: D.ID_ROUTES[i].page, params: { id: v } });
-        return;
-      }
-    }
-    D.flashErr("Not a recognized Stripe id (cus_, ch_, py_, pi_, sub_, in_, dp_, du_).");
-  });
-  document.addEventListener("keydown", function (e) {
-    if (e.key === "/" && document.activeElement && document.activeElement.tagName !== "INPUT" &&
-        document.activeElement.tagName !== "TEXTAREA" && document.activeElement.tagName !== "SELECT" &&
-        !D.q("modal").open) {
-      e.preventDefault();
-      jump.focus();
-    }
-  });
-};
 
 // ---- activation poll + boot ----
 D.pollTimer = null;

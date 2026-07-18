@@ -10,7 +10,10 @@ import { DashboardCtx, DashboardSectionModule } from "../sections/types";
 import { chargeBadge, estimateMrr, formatPerCurrency, sentence } from "../sections/cells";
 import { makeCustomersSection } from "../sections/customersSection";
 import { makePaymentsSection, buildGuardrailPanel } from "../sections/paymentsSection";
+import { makeHomeSection } from "../sections/homeSection";
+import { makeBalancesSection } from "../sections/balancesSection";
 import { makeSecuritySection } from "../sections/securitySection";
+import { GlobalSearch } from "../search/GlobalSearch";
 import { BillingActionService } from "../../bot/billing/actions/BillingActionService";
 import type { ApprovalStore, BillingApproval } from "../../bot/billing/ApprovalStore";
 import type { SessionStore } from "../../auth/SessionStore";
@@ -24,6 +27,7 @@ import { renderDashboardShell } from "../html/shellHtml";
 import { clientCore } from "../html/clientCore";
 import { clientBlocks } from "../html/clientBlocks";
 import { clientModal } from "../html/clientModal";
+import { clientPalette } from "../html/clientPalette";
 import { clientLogin } from "../html/clientLogin";
 import { clientApp } from "../html/clientApp";
 import { hashPassphrase, verifyPassphrase, MIN_PASSPHRASE_LENGTH } from "../auth/passphrase";
@@ -930,6 +934,175 @@ test("payment detail: unlinked customer gets the partial-remaining refund button
   assert.equal((net.cell as { v: string }).v, "23.81 EUR");
 });
 
+// ---- M4: global search ----
+
+function searchFixture(overrides: { customersThrow?: boolean } = {}) {
+  const stripe = {
+    formatAmount: (a: number, c: string) => `${(a / 100).toFixed(2)} ${c.toUpperCase()}`,
+    searchCustomersByTerm: async () => {
+      if (overrides.customersThrow) throw new Error("stripe down");
+      return [{ id: "cus_1", name: "Ada Lovelace", email: "ada@x.com" }];
+    },
+    searchChargesByTerm: async () => [
+      { id: "ch_1", amount: 2900, currency: "eur", billing_details: { email: "ada@x.com" } },
+    ],
+    searchInvoicesByNumber: async () => [{ id: "in_1", number: "INV-0001", total: 2900, currency: "eur", status: "paid" }],
+    searchChargesByCardLast4: async () => ({
+      charges: [{ id: "ch_44", amount: 100, currency: "eur", billing_details: {} }],
+      nextPage: null,
+    }),
+    searchPaymentIntentsByAmount: async () => ({
+      paymentIntents: [{ id: "pi_9", amount: 2900, currency: "eur", status: "succeeded" }],
+      nextPage: null,
+    }),
+  } as unknown as StripeClient;
+  const stores = {
+    session: { getSession: async () => ({ stripeCustomerId: "cus_disc" }) },
+    dispute: {},
+    block: { listPage: async () => ({ rows: [], total: 0 }) },
+    qol: { searchNotes: async () => [], listBookmarks: async () => ({ rows: [], total: 0 }) },
+  } as unknown as ConstructorParameters<typeof GlobalSearch>[1];
+  return new GlobalSearch(stripe, stores);
+}
+
+test("global search: id fast-path, last4/amount classification, discord link, failure tolerance", async () => {
+  const search = searchFixture();
+  // Pasted id → single go-to hit, no fan-out.
+  const byId = await search.run("ch_3Tuchi");
+  assert.equal(byId.groups.length, 1);
+  assert.deepEqual(byId.groups[0].hits[0].ref, { page: "payments.detail", params: { id: "ch_3Tuchi" } });
+  // Four digits → last4 hunt group.
+  const last4 = await search.run("4242");
+  assert.ok(last4.groups.some((g) => g.label.includes("····4242")));
+  // Amount-like → PI amount group.
+  const amt = await search.run("29.00");
+  assert.ok(amt.groups.some((g) => g.label.includes("amount 29.00")));
+  // Free text → customers + payments + invoices.
+  const free = await search.run("ada");
+  const labels = free.groups.map((g) => g.label);
+  assert.ok(labels.includes("Customers") && labels.includes("Payments") && labels.includes("Invoices"));
+  // Discord id (local DB) → linked-customer hit.
+  const disc = await search.run("123456789012345678");
+  const discGroup = disc.groups.find((g) => g.label === "Discord link")!;
+  assert.deepEqual(discGroup.hits[0].ref, { page: "customers.detail", params: { id: "cus_disc" } });
+  // One Stripe group failing never kills the rest (allSettled).
+  const degraded = await searchFixture({ customersThrow: true }).run("ada");
+  const degradedLabels = degraded.groups.map((g) => g.label);
+  assert.ok(!degradedLabels.includes("Customers") && degradedLabels.includes("Payments"));
+});
+
+// ---- M4: Home v1 + Balances rendering ----
+
+function homeCtx(): DashboardCtx {
+  const now = Math.floor(Date.now() / 1000);
+  return {
+    actor: { id: "42", name: "Ada", role: "admin", isAdmin: true },
+    stripe: {
+      formatAmount: (a: number, c: string) => `${(a / 100).toFixed(2)} ${c.toUpperCase()}`,
+      getBalance: async () => ({ available: [{ amount: 12000, currency: "eur" }], pending: [{ amount: 500, currency: "eur" }] }),
+      countActiveSubscriptions: async () => ({ count: 100, truncated: true }),
+      listEvents: async () => [
+        { type: "charge.succeeded", created: now - 60, data: { object: { id: "ch_1", amount: 2900, currency: "eur" } } },
+      ],
+      listRecentEarlyFraudWarnings: async () => [
+        { id: "issfr_1", charge: "ch_2", created: now - 3600, fraud_type: "made_with_stolen_card", actionable: true },
+      ],
+    } as unknown as DashboardCtx["stripe"],
+    settings: {} as never,
+    stores: {
+      session: { countPendingChargeReviews: async () => 2 },
+      dispute: {
+        listOpen: async () => ({
+          rows: [
+            { id: "dp_1", amount: 4500, currency: "eur", reason: "fraudulent", evidenceDueBy: new Date(Date.now() + 24 * 3600_000) },
+            { id: "dp_2", amount: 100, currency: "eur", reason: "general", evidenceDueBy: new Date(Date.now() + 200 * 3600_000) },
+          ],
+          total: 2,
+        }),
+      },
+      block: {},
+      qol: {},
+    } as unknown as DashboardCtx["stores"],
+    billing: {
+      actions: {
+        pendingPage: async () => ({
+          rows: [{ id: "apr_1", summary: "Cancel sub", requestedByName: "Ola", origin: "dashboard", status: "PENDING", createdAt: new Date() }],
+          total: 1,
+        }),
+      },
+      gateway: {} as never,
+    } as unknown as DashboardCtx["billing"],
+    audit: async () => {},
+    security: { sessionIdHash: "h", authMethod: "passkey", stepUpFresh: () => false },
+  } as unknown as DashboardCtx;
+}
+
+test("home: stat tiles + needs-attention inbox (due dispute, approval, reviews, EFW) + activity feed", async () => {
+  const page = await makeHomeSection().buildPage(homeCtx(), { page: "home" });
+  const stats = page!.blocks.find((b) => b.type === "stats") as { items: Array<{ label: string; value: string }> };
+  const tile = Object.fromEntries(stats.items.map((i) => [i.label, i.value]));
+  assert.equal(tile["Available balance"], "120.00 EUR");
+  assert.equal(tile["Active subscriptions"], "100+");
+  assert.equal(tile["Open approvals"], "3"); // 1 approval + 2 charge reviews
+  const inbox = page!.blocks.find((b) => b.type === "table") as TableBlock;
+  const ids = inbox.rows.map((r) => r.id);
+  // dp_1 due in 24h is in; dp_2 (200h away) is not.
+  assert.ok(ids.includes("dispute-dp_1") && !ids.includes("dispute-dp_2"));
+  assert.ok(ids.includes("approval-apr_1") && ids.includes("charge-reviews") && ids.includes("efw-issfr_1"));
+  const activity = page!.blocks.find((b) => b.type === "timeline") as { items: Array<{ label: string; ref?: unknown }> };
+  assert.equal(activity.items[0].label, "Charge succeeded · 29.00 EUR");
+  assert.deepEqual(activity.items[0].ref, { page: "payments.detail", params: { id: "ch_1" } });
+});
+
+test("balances: buckets, paginated payouts, latest transactions with source links", async () => {
+  const ctx = homeCtx();
+  (ctx.stripe as { listPayouts?: unknown }).listPayouts = async () => ({
+    payouts: [{ id: "po_1", amount: 10000, currency: "eur", status: "in_transit", method: "standard", arrival_date: 1_700_000_000, created: 1_699_900_000 }],
+    hasMore: true,
+  });
+  (ctx.stripe as { listAccountBalanceTransactions?: unknown }).listAccountBalanceTransactions = async () => ({
+    transactions: [
+      { id: "txn_1", amount: 2900, currency: "eur", fee: 119, net: 2781, type: "charge", available_on: 1_700_000_000, source: "ch_1" },
+    ],
+    hasMore: false,
+  });
+  const page = await makeBalancesSection().buildPage(ctx, { page: "balances", filters: {} });
+  const payouts = page!.blocks.find((b) => b.type === "table" && b.key === "payouts") as TableBlock;
+  assert.equal(payouts.nextCursor, "po_1");
+  assert.deepEqual(payouts.rows[0].ref, { page: "balances.detail", params: { id: "po_1" } });
+  assert.equal((payouts.rows[0].cells[0] as { badge?: { text: string } }).badge?.text, "In transit");
+  const txs = page!.blocks.find((b) => b.type === "table" && b.key === "transactions") as TableBlock;
+  assert.deepEqual(txs.rows[0].ref, { page: "payments.detail", params: { id: "ch_1" } });
+  assert.equal((txs.rows[0].cells[2] as { v: string }).v, "27.81 EUR");
+});
+
+test("api search: throttled per actor, delegates to GlobalSearch", async () => {
+  const fake = fakeSettings();
+  const provider: DashboardAuthProvider = {
+    enter: async () => ({ kind: "page" }),
+    authenticate: async () => fakeAuthResult("active"),
+    publicEndpoint: async () => null,
+    sessionEndpoint: async () => null,
+  };
+  const stripe = { isTestMode: () => true } as unknown as StripeClient;
+  let calls = 0;
+  const dashboard = new Dashboard(fake.store, provider, [fakeSection()], {
+    stripe,
+    settings: fake.store,
+    stores: {} as never,
+    billing: {} as never,
+    search: { run: async (term: string) => { calls++; return { groups: [{ label: "Customers", hits: [{ title: term, ref: { page: "customers" } }] }] }; } } as unknown as GlobalSearch,
+  });
+  const first = await dashboard.api("search", "c", { term: "ada" });
+  assert.equal(first.status, 200);
+  assert.equal((first.json as { groups: unknown[] }).groups.length, 1);
+  // 30/min per-actor budget: the 31st call inside the window degrades gracefully.
+  for (let i = 0; i < 30; i++) await dashboard.api("search", "c", { term: "x" });
+  const throttled = await dashboard.api("search", "c", { term: "x" });
+  assert.match((throttled.json as { notice?: string }).notice ?? "", /rate limit/);
+  assert.equal(calls, 30);
+});
+
 test("failed payment: timeline tells the real story (seller message + codes), no breakdown", async () => {
   const ctx = paymentsCtx();
   (ctx.stripe as { getChargeDetailed?: unknown }).getChargeDetailed = async () => ({
@@ -971,7 +1144,7 @@ test("failed payment: timeline tells the real story (seller message + codes), no
 });
 
 test("client JS modules parse and the shell embeds them nonced", () => {
-  const combined = `${clientCore}\n${clientBlocks}\n${clientModal}\n${clientLogin}\nD.defaultPage="customers";\n${clientApp}`;
+  const combined = `${clientCore}\n${clientBlocks}\n${clientModal}\n${clientPalette}\n${clientLogin}\nD.defaultPage="home";\n${clientApp}`;
   assert.doesNotThrow(() => new Function(combined));
 
   const html = renderDashboardShell({ nonce: "test-nonce-123" });

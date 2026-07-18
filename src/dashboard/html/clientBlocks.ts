@@ -211,7 +211,10 @@ D.renderStats = function (b) {
     if (it.badge) val.appendChild(D.badge(it.badge));
     card.appendChild(val);
     if (it.sub) card.appendChild(D.el("div", "ssub", it.sub));
-    if (it.ref) card.addEventListener("click", function () { D.navigateRef(it.ref); });
+    if (it.ref) card.addEventListener("click", function () {
+      if (window.getSelection && String(window.getSelection())) return;
+      D.navigateRef(it.ref);
+    });
     row.appendChild(card);
   });
   return row;
@@ -250,6 +253,9 @@ D.renderTable = function (b) {
     if (row.ref) {
       tr.className = "clickable";
       tr.addEventListener("click", function (e) {
+        // Selecting text in a row must never navigate — copying an email or
+        // id out of a table is a first-class action.
+        if (window.getSelection && String(window.getSelection())) return;
         var t = e.target;
         while (t && t !== tr) {
           if (t.tagName === "A" || t.tagName === "BUTTON" || t.tagName === "INPUT" || t.tagName === "SELECT") return;

@@ -45,6 +45,15 @@ export class BillingQolStore {
     return this.prisma.billingNote.count({ where: { objectType, objectId } });
   }
 
+  // Dashboard global search: notes whose text mentions the term, newest first.
+  async searchNotes(term: string, limit = 5): Promise<BillingNote[]> {
+    return this.prisma.billingNote.findMany({
+      where: { text: { contains: term, mode: "insensitive" } },
+      orderBy: { createdAt: "desc" },
+      take: limit,
+    });
+  }
+
   // ---- Bookmarks ----
 
   // Toggle semantics: returns the new state. The unique (objectType, objectId)

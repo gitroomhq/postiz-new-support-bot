@@ -5,6 +5,7 @@ import { actionByKey } from "../bot/billing/actions/ActionRegistry";
 import type { ActionActor } from "../bot/billing/actions/BillingActionService";
 import { DashboardAuthProvider, DashboardAuthResult } from "./DashboardAuth";
 import { DashboardCtx, DashboardSectionModule } from "./sections/types";
+import type { GlobalSearch } from "./search/GlobalSearch";
 import {
   ActionResult,
   ActivationStatusResponse,
@@ -48,15 +49,17 @@ export type DashboardAuditFn = (actor: { id: string; name: string }, change: str
 export class Dashboard implements MountedPanelRoute {
   private rate = new Map<string, number[]>();
   private buildCtxDeps: Omit<DashboardCtx, "actor" | "audit" | "reverse" | "security">;
+  private search?: GlobalSearch;
 
   constructor(
     private settings: SettingsStore,
     private auth: DashboardAuthProvider,
     private modules: DashboardSectionModule[],
-    deps: Omit<DashboardCtx, "actor" | "audit" | "reverse" | "security">,
+    deps: Omit<DashboardCtx, "actor" | "audit" | "reverse" | "security"> & { search?: GlobalSearch },
     private auditFn?: DashboardAuditFn
   ) {
     this.buildCtxDeps = deps;
+    this.search = deps.search;
   }
 
   // GET /billing — kill switch, then auth-provider entry (cookie resume,
@@ -141,6 +144,17 @@ export class Dashboard implements MountedPanelRoute {
           const view = await this.buildView(auth, req);
           if (!view) return { status: 404, json: { error: "unknown page" } };
           return { status: 200, json: view };
+        }
+        case "search": {
+          if (!this.search) return { status: 404, json: { error: "unknown endpoint" } };
+          // Dedicated per-actor budget: the fan-out hits Stripe's eventually
+          // consistent Search API (~20 req/s account-wide) — the palette
+          // debounces 400ms client-side, this is the server backstop.
+          if (!this.allow(`search:${auth.actor.id}`, 30)) {
+            return { status: 200, json: { groups: [], notice: "Search rate limit reached — give it a few seconds." } };
+          }
+          const term = typeof request.term === "string" ? request.term : "";
+          return { status: 200, json: await this.search.run(term) };
         }
         case "nav-badges": {
           const ctx = this.ctxFor(auth);
@@ -298,10 +312,10 @@ export class Dashboard implements MountedPanelRoute {
     return { page, params, filters, cursor };
   }
 
-  private allow(key: string): boolean {
+  private allow(key: string, limit = RATE_LIMIT_PER_MIN): boolean {
     const now = Date.now();
     const hits = (this.rate.get(key) ?? []).filter((t) => now - t < RATE_WINDOW_MS);
-    if (hits.length >= RATE_LIMIT_PER_MIN) {
+    if (hits.length >= limit) {
       this.rate.set(key, hits);
       return false;
     }

@@ -77,6 +77,7 @@ export const STRIPE_ID_RES: Record<string, RegExp> = {
   subscription: /^sub_[A-Za-z0-9]{1,64}$/,
   invoice: /^in_[A-Za-z0-9]{1,64}$/,
   dispute: /^(dp|du)_[A-Za-z0-9]{1,64}$/,
+  payout: /^po_[A-Za-z0-9]{1,64}$/,
 };
 
 export function validId(kind: keyof typeof STRIPE_ID_RES, v: unknown): string | null {

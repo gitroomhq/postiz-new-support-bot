@@ -3,6 +3,7 @@ import { dashboardCss } from "./styles";
 import { clientCore } from "./clientCore";
 import { clientBlocks } from "./clientBlocks";
 import { clientModal } from "./clientModal";
+import { clientPalette } from "./clientPalette";
 import { clientLogin } from "./clientLogin";
 import { clientApp } from "./clientApp";
 
@@ -85,7 +86,7 @@ ${dashboardCss()}
   </aside>
   <div class="mainwrap">
     <header class="topbar">
-      <span class="jumpwrap"><input type="text" id="jump" placeholder="Jump to ID — cus_, ch_, sub_, in_, dp_ …" autocomplete="off"></span>
+      <span class="jumpwrap"><input type="text" id="jump" placeholder="Search — name, email, amount, last4 or Stripe id (Ctrl+K)" autocomplete="off"><div id="palpop" class="palpop"></div></span>
       <span id="modebadge" class="badge ok">LIVE</span>
       <span class="who" id="who"></span>
       <button class="btn sm" id="themebtn" type="button" title="Color theme — click to switch">Auto</button>
@@ -135,8 +136,9 @@ ${dashboardCss()}
 ${clientCore}
 ${clientBlocks}
 ${clientModal}
+${clientPalette}
 ${clientLogin}
-D.defaultPage = "customers";
+D.defaultPage = "home";
 document.getElementById("expiredReload").addEventListener("click", function () { location.hash = ""; location.reload(); });
 ${clientApp}
 })();
