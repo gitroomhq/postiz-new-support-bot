@@ -257,7 +257,10 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
     }),
     empty: "No subscriptions.",
     ...(subs.length > 0
-      ? { footer: `${Math.min(subs.length, 25)} result${subs.length === 1 ? "" : "s"}` }
+      ? {
+          footer: `${Math.min(subs.length, 25)} result${subs.length === 1 ? "" : "s"} — view all`,
+          footerRef: { page: "subscriptions", filters: { customer: id } },
+        }
       : {}),
     ...(subs.length > 25 ? { notice: `Showing 25 of ${subs.length} subscriptions.` } : {}),
   });
@@ -287,7 +290,8 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
     empty: "No payments.",
     ...(recentCharges.length > 0
       ? {
-          footer: `${recentCharges.length}${chargesPage.charges.length > 10 || chargesPage.hasMore ? "+" : ""} result${recentCharges.length === 1 ? "" : "s"}`,
+          footer: `${recentCharges.length}${chargesPage.charges.length > 10 || chargesPage.hasMore ? "+" : ""} result${recentCharges.length === 1 ? "" : "s"} — view all`,
+          footerRef: { page: "payments", filters: { customer: id } },
         }
       : {}),
   });
@@ -338,7 +342,8 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
     empty: "No invoices.",
     ...(invoices.invoices.length > 0
       ? {
-          footer: `${invoices.invoices.length}${invoices.hasMore ? "+" : ""} result${invoices.invoices.length === 1 ? "" : "s"}`,
+          footer: `${invoices.invoices.length}${invoices.hasMore ? "+" : ""} result${invoices.invoices.length === 1 ? "" : "s"} — view all`,
+          footerRef: { page: "invoices", filters: { customer: id } },
         }
       : {}),
   });

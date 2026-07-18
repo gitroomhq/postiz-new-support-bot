@@ -43,8 +43,9 @@ function registryButton(ctx: DashboardCtx, button: ActionButton): ActionButton {
 
 async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: string | null): Promise<SectionPage> {
   const status = str(filters.status, 16);
+  const customerScope = validId("customer", filters.customer) ?? "";
   const cursorId = validId("invoice", validCursor(cursor) ?? "") ?? undefined;
-  const res = await ctx.stripe.listInvoicesByStatus(null, undefined, WINDOW, cursorId);
+  const res = await ctx.stripe.listInvoicesByStatus(customerScope || null, undefined, WINDOW, cursorId);
   const invoices = res.data;
 
   const counts = {
@@ -112,10 +113,13 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
           { key: "created", label: "Created" },
         ],
         counts,
+        filters: [
+          { key: "customer", label: "Customer", kind: "text", value: customerScope || undefined, placeholder: "cus_…" },
+        ],
         rows,
         nextCursor:
           res.has_more && invoices.length > 0 ? invoices[invoices.length - 1].id ?? null : null,
-        empty: status ? "No invoices match this filter (within this window)." : "No invoices yet.",
+        empty: status || customerScope ? "No invoices match this filter (within this window)." : "No invoices yet.",
         ...(rows.length ? { footer: `${rows.length} item${rows.length === 1 ? "" : "s"}` } : {}),
         notice: `Counts cover the ${WINDOW} most recent invoices per page — use Next for older ones.`,
       },

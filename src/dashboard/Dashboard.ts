@@ -6,6 +6,7 @@ import type { ActionActor } from "../bot/billing/actions/BillingActionService";
 import { DashboardAuthProvider, DashboardAuthResult } from "./DashboardAuth";
 import { DashboardCtx, DashboardSectionModule } from "./sections/types";
 import type { GlobalSearch } from "./search/GlobalSearch";
+import type { HomeMetrics } from "./metrics/HomeMetrics";
 import {
   ActionResult,
   ActivationStatusResponse,
@@ -53,16 +54,18 @@ export class Dashboard implements MountedPanelRoute {
   private rate = new Map<string, number[]>();
   private buildCtxDeps: Omit<DashboardCtx, "actor" | "audit" | "reverse" | "security">;
   private search?: GlobalSearch;
+  private metrics?: HomeMetrics;
 
   constructor(
     private settings: SettingsStore,
     private auth: DashboardAuthProvider,
     private modules: DashboardSectionModule[],
-    deps: Omit<DashboardCtx, "actor" | "audit" | "reverse" | "security"> & { search?: GlobalSearch },
+    deps: Omit<DashboardCtx, "actor" | "audit" | "reverse" | "security"> & { search?: GlobalSearch; metrics?: HomeMetrics },
     private auditFn?: DashboardAuditFn
   ) {
     this.buildCtxDeps = deps;
     this.search = deps.search;
+    this.metrics = deps.metrics;
   }
 
   // GET /billing — kill switch, then auth-provider entry (cookie resume,
@@ -158,6 +161,14 @@ export class Dashboard implements MountedPanelRoute {
           }
           const term = typeof request.term === "string" ? request.term : "";
           return { status: 200, json: await this.search.run(term) };
+        }
+        case "series": {
+          if (!this.metrics) return { status: 404, json: { error: "unknown endpoint" } };
+          const key = typeof request.key === "string" && /^[a-z_]{1,32}$/.test(request.key) ? request.key : "";
+          const window = typeof request.window === "string" && /^\d{1,2}d$/.test(request.window) ? request.window : "30d";
+          const series = key ? await this.metrics.series(key, window) : null;
+          if (!series) return { status: 404, json: { error: "unknown series" } };
+          return { status: 200, json: series };
         }
         case "nav-badges": {
           const ctx = this.ctxFor(auth);

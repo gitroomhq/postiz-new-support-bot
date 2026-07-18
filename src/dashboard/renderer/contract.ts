@@ -17,11 +17,14 @@ export type Badge = { kind: "info" | "warn" | "error" | "ok" | "neutral"; text: 
 export type Opt = { value: string; label: string };
 
 // Internal navigation target — the ONLY thing the client router accepts. The
-// client resolves it to a hash route (#/<page>/<params.id>); free-form URLs
-// never come from the server except explicit external links.
+// client resolves it to a hash route (#/<page>/<params.id>?f_…); free-form
+// URLs never come from the server except explicit external links.
 export interface ObjectRef {
   page: string; // e.g. "customers.detail"
   params?: Record<string, string>; // e.g. { id: "cus_…" }
+  // Pre-applied list filters ("view this customer's payments", the change-plan
+  // row picker) — serialized as f_<key> hash params.
+  filters?: Record<string, string>;
 }
 
 // One rendered table/kv cell.
@@ -143,6 +146,15 @@ export interface QrBlock {
   size: number; // viewBox edge (modules incl. quiet zone)
   caption?: string;
 }
+// Lazily-hydrated chart: the page ships only {key, window}; the client POSTs
+// `series` and draws inline SVG (area/bars/line). Keeps view builds <500ms.
+export interface ChartBlock {
+  type: "chart";
+  key: string; // HomeMetrics series key ("gross_volume", …)
+  title: string;
+  kind: "area" | "bars" | "line";
+  window: string; // "7d" | "30d" | "90d" — baked from the page's window filter
+}
 
 export type Block =
   | HeaderBlock
@@ -152,7 +164,29 @@ export type Block =
   | TimelineBlock
   | NoticeBlock
   | EmptyBlock
-  | QrBlock;
+  | QrBlock
+  | ChartBlock;
+
+// ---- series endpoint payloads (chart hydration) ----
+
+export interface SeriesPoint {
+  label: string; // x label ("07-14", "Jun")
+  v: number; // value in DISPLAY units (major currency units / counts / percent)
+}
+export interface SeriesBand {
+  v: number; // horizontal threshold in display units
+  kind: "warn" | "error";
+  label: string;
+}
+export interface SeriesResponse {
+  key: string;
+  unit: "currency" | "count" | "percent";
+  currency?: string; // ISO code when unit=currency
+  points: SeriesPoint[];
+  bands?: SeriesBand[];
+  note?: string; // truncation/estimate footnote
+  stale?: boolean; // served from an expired cache while refreshing
+}
 
 export interface Crumb {
   label: string;

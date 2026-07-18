@@ -9,7 +9,13 @@ D.refHref = function (ref) {
   var id = ref.params && ref.params.id;
   if (id) seg.push(id);
   if (parts.length > 1 && parts[1] !== "detail") seg.push(parts[1]);
-  return "#/" + seg.map(encodeURIComponent).join("/");
+  var href = "#/" + seg.map(encodeURIComponent).join("/");
+  var fs = [];
+  Object.keys(ref.filters || {}).forEach(function (k) {
+    if (ref.filters[k]) fs.push("f_" + encodeURIComponent(k) + "=" + encodeURIComponent(ref.filters[k]));
+  });
+  if (fs.length) href += "?" + fs.join("&");
+  return href;
 };
 
 // Card-brand chip label (text stand-in for the brand logo — CSP forbids images).
@@ -123,7 +129,14 @@ D.renderCell = function (td, cell) {
 
 D.renderBlocks = function (container, blocks) {
   container.textContent = "";
+  var chartGrid = null; // consecutive chart blocks share a two-up grid
   (blocks || []).forEach(function (b) {
+    if (b.type === "chart") {
+      if (!chartGrid) { chartGrid = D.el("div", "chartgrid"); container.appendChild(chartGrid); }
+      chartGrid.appendChild(D.renderChart(b));
+      return;
+    }
+    chartGrid = null;
     if (b.type === "header") container.appendChild(D.renderHeader(b));
     else if (b.type === "stats") container.appendChild(D.renderStats(b));
     else if (b.type === "table") container.appendChild(D.renderTable(b));

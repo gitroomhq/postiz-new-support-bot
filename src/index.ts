@@ -66,6 +66,7 @@ import { Dashboard } from "./dashboard/Dashboard";
 import { DashboardDiscord } from "./dashboard/DashboardDiscord";
 import { DashboardActionGateway } from "./dashboard/DashboardActions";
 import { GlobalSearch } from "./dashboard/search/GlobalSearch";
+import { HomeMetrics } from "./dashboard/metrics/HomeMetrics";
 import { makeHomeSection } from "./dashboard/sections/homeSection";
 import { makeBalancesSection } from "./dashboard/sections/balancesSection";
 import { makeCustomersSection } from "./dashboard/sections/customersSection";
@@ -521,8 +522,9 @@ async function main() {
   dashboardOps.resetCredentials = (userId) => dashboardAuth.resetCredentials(userId);
   const dashboardGateway = new DashboardActionGateway(billingActionService, stripeClient, sessionStore);
   const dashboardStores = { session: sessionStore, dispute: disputeStore, block: blockStore, qol: qolStore };
+  const dashboardMetrics = new HomeMetrics(stripeClient, settingsStore, disputeStore);
   const dashboardSections = [
-    makeHomeSection(),
+    makeHomeSection({ metrics: dashboardMetrics }),
     makeBalancesSection(),
     makePaymentsSection(),
     makeCustomersSection(),
@@ -537,6 +539,7 @@ async function main() {
     stores: dashboardStores,
     billing: { actions: billingActionService, gateway: dashboardGateway },
     search: new GlobalSearch(stripeClient, dashboardStores),
+    metrics: dashboardMetrics,
   });
   const dashboardDiscord = new DashboardDiscord(settingsStore, dashboardTokens, dashboardAuth);
   dashboardAuth.bindNotifier(dashboardDiscord);

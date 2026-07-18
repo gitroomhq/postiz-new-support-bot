@@ -337,6 +337,13 @@ export class DisputeStore {
     });
   }
 
+  // Monthly buckets for the dashboard dispute-ratio trend chart.
+  async countCreatedBetween(from: Date, to: Date): Promise<number> {
+    return this.prisma.stripeDispute.count({
+      where: { disputeCreatedAt: { gte: from, lt: to } },
+    });
+  }
+
   async countOpen(): Promise<number> {
     return this.prisma.stripeDispute.count({ where: { status: { in: [...OPEN_DISPUTE_STATUSES] } } });
   }

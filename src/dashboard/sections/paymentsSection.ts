@@ -115,11 +115,19 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
   const createdGte = DATE_RANGES[dateKey]
     ? Math.floor(Date.now() / 1000) - DATE_RANGES[dateKey] * 86400
     : undefined;
+  // Customer scope (Customer-360 "view all payments" + the Customer pill):
+  // per-customer Stripe listings replace the account-wide ones.
+  const customerScope = validId("customer", filters.customer) ?? "";
 
   const cursorId = validId("charge", cursor) ?? undefined;
   const [chargeWindow, piWindow, efws, blockPage] = await Promise.all([
-    ctx.stripe.listAllCharges({ limit: WINDOW, createdGte, startingAfter: cursorId }),
-    ctx.stripe.listAllPaymentIntents({ limit: WINDOW, createdGte }).catch(() => ({ paymentIntents: [], hasMore: false })),
+    customerScope
+      ? ctx.stripe.listCharges(customerScope, WINDOW, cursorId)
+      : ctx.stripe.listAllCharges({ limit: WINDOW, createdGte, startingAfter: cursorId }),
+    (customerScope
+      ? ctx.stripe.listPaymentIntents(customerScope, WINDOW).then((paymentIntents) => ({ paymentIntents, hasMore: false }))
+      : ctx.stripe.listAllPaymentIntents({ limit: WINDOW, createdGte })
+    ).catch(() => ({ paymentIntents: [] as Stripe.PaymentIntent[], hasMore: false })),
     ctx.stripe.listRecentEarlyFraudWarnings(100).catch(() => [] as Stripe.Radar.EarlyFraudWarning[]),
     ctx.stores.block.listPage(0, 200).catch(() => ({ rows: [], total: 0 })),
   ]);
@@ -160,6 +168,7 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
   };
 
   const sharedFilters: TableBlock["filters"] = [
+    { key: "customer", label: "Customer", kind: "text", value: customerScope || undefined, placeholder: "cus_…" },
     {
       key: "date",
       label: "Date",
@@ -243,6 +252,8 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
   }
 
   const filtered = charges.filter((c) => {
+    // Per-customer listings can't take a server-side date param — cut here.
+    if (customerScope && createdGte && c.created < createdGte) return false;
     if (status === "succeeded" && c.status !== "succeeded") return false;
     if (status === "refunded" && (c.amount_refunded ?? 0) === 0) return false;
     if (status === "disputed" && !c.disputed) return false;
@@ -459,10 +470,10 @@ async function chargeDetail(ctx: DashboardCtx, id: string): Promise<SectionPage>
   timeline.sort((a, b) => (a.iso < b.iso ? 1 : a.iso > b.iso ? -1 : 0));
   main.push({ type: "timeline", title: "Recent activity", items: timeline });
 
+  const bt = charge.balance_transaction;
   // Payment breakdown (fees come from the expanded balance transaction) —
   // only when money actually moved; a failed attempt has no breakdown.
   if (charge.status === "succeeded") {
-    const bt = charge.balance_transaction;
     const fee = bt && typeof bt === "object" ? bt.fee : null;
     const refunded = charge.amount_refunded ?? 0;
     const net = charge.amount - (fee ?? 0) - refunded;
@@ -561,6 +572,18 @@ async function chargeDetail(ctx: DashboardCtx, id: string): Promise<SectionPage>
         : []),
       ...(charge.receipt_email ? [{ label: "Receipt email", cell: text(charge.receipt_email) }] : []),
       { label: "Created", cell: dateCell(charge.created) },
+      ...(bt && typeof bt === "object" && bt.available_on
+        ? [
+            {
+              label: "Funds available",
+              cell: {
+                t: "link",
+                v: new Date(bt.available_on * 1000).toISOString().slice(0, 10),
+                ref: { page: "balances" },
+              } as Cell,
+            },
+          ]
+        : []),
       {
         label: "Guardrail dry run",
         cell: { t: "link", v: "Run refund guardrails", ref: { page: "payments.guardrails", params: { id: charge.id } } },

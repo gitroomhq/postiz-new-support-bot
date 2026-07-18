@@ -43,6 +43,22 @@ export function dashboardCss(): string {
   .palrow .pid { margin-left:auto; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:11.5px;
     color:var(--faint); flex:0 0 auto; }
   .palnote { color:var(--faint); font-size:12px; padding:8px 10px; }
+
+  /* Home charts: two-up responsive grid, quiet axes, accent marks. */
+  .chartgrid { display:grid; grid-template-columns:repeat(auto-fit,minmax(360px,1fr)); gap:8px 40px; margin:0 0 24px; }
+  .chartbox { margin:0 0 8px; }
+  .chart { width:100%; height:auto; display:block; }
+  .cgrid { stroke:var(--border); stroke-width:1; }
+  .clabel { fill:var(--faint); font-size:10.5px; }
+  .clabel.warn { fill:var(--warn); }
+  .clabel.error { fill:var(--danger-strong); }
+  .cband { stroke-width:1; stroke-dasharray:4 3; }
+  .cband.warn { stroke:var(--warn); }
+  .cband.error { stroke:var(--danger-strong); }
+  .cline { fill:none; stroke:var(--accent); stroke-width:2; stroke-linejoin:round; stroke-linecap:round; }
+  .carea { fill:var(--accent); opacity:.14; }
+  .cbar { fill:var(--accent); opacity:.85; }
+  .cdot { fill:var(--surface); stroke:var(--accent); stroke-width:1.6; }
   .topbar input#jump { padding:7px 12px; font-size:13.5px; background:var(--elev); border-color:transparent;
     box-shadow:none; border-radius:var(--radius); }
   .topbar input#jump:focus { background:var(--surface); border-color:var(--accent); box-shadow:0 0 0 3px var(--ring); }

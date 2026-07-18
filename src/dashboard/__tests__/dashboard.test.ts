@@ -31,6 +31,7 @@ import { clientCore } from "../html/clientCore";
 import { clientBlocks } from "../html/clientBlocks";
 import { clientModal } from "../html/clientModal";
 import { clientPalette } from "../html/clientPalette";
+import { clientCharts } from "../html/clientCharts";
 import { clientLogin } from "../html/clientLogin";
 import { clientApp } from "../html/clientApp";
 import { hashPassphrase, verifyPassphrase, MIN_PASSPHRASE_LENGTH } from "../auth/passphrase";
@@ -447,7 +448,7 @@ test("customer 360: Insights/Details/Linked accounts in the rail, atoms in the m
     cur: "EUR",
     badge: { kind: "warn", text: "Partial refund" },
   });
-  assert.equal(payments.footer, "1 result");
+  assert.equal(payments.footer, "1 result — view all");
   const subsTable = page!.blocks.find((b) => b.type === "table" && b.key === "subs") as TableBlock;
   assert.equal(subsTable.rows[0].cells[0].t, "avatar");
 });
@@ -1040,13 +1041,21 @@ function homeCtx(): DashboardCtx {
   } as unknown as DashboardCtx;
 }
 
-test("home: stat tiles + needs-attention inbox (due dispute, approval, reviews, EFW) + activity feed", async () => {
-  const page = await makeHomeSection().buildPage(homeCtx(), { page: "home" });
+const fakeMetrics = {
+  activeSubsCount: async () => ({ count: 137, truncated: false }),
+} as unknown as import("../metrics/HomeMetrics").HomeMetrics;
+
+test("home: stat tiles + needs-attention inbox (due dispute, approval, reviews, EFW) + activity feed + charts", async () => {
+  const page = await makeHomeSection({ metrics: fakeMetrics }).buildPage(homeCtx(), { page: "home" });
   const stats = page!.blocks.find((b) => b.type === "stats") as { items: Array<{ label: string; value: string }> };
   const tile = Object.fromEntries(stats.items.map((i) => [i.label, i.value]));
   assert.equal(tile["Available balance"], "120.00 EUR");
-  assert.equal(tile["Active subscriptions"], "100+");
+  assert.equal(tile["Active subscriptions"], "137"); // real cached count, not the old per-view "100+"
   assert.equal(tile["Open approvals"], "3"); // 1 approval + 2 charge reviews
+  // The five M5 charts ride along, honoring the window filter.
+  const charts = page!.blocks.filter((b) => b.type === "chart") as Array<{ key: string; window: string }>;
+  assert.deepEqual(charts.map((c) => c.key), ["gross_volume", "new_customers", "failed_payments", "mrr_by_plan", "dispute_ratio"]);
+  assert.ok(charts.every((c) => c.window === "30d"));
   const inbox = page!.blocks.find((b) => b.type === "table") as TableBlock;
   const ids = inbox.rows.map((r) => r.id);
   // dp_1 due in 24h is in; dp_2 (200h away) is not.
@@ -1447,8 +1456,149 @@ test("api belts M3: off-session invoice pay demands a fresh factor; send does no
   assert.deepEqual(gatewayCalls, ["invoice.collect"]);
 });
 
+// ---- M5: HomeMetrics + series endpoint + integration refs ----
+
+test("HomeMetrics: daily bucketing, truncation notes, TTL cache + singleflight, dispute-ratio bands", async () => {
+  const { HomeMetrics } = await import("../metrics/HomeMetrics");
+  const now = Math.floor(Date.now() / 1000);
+  let txCalls = 0;
+  const stripe = {
+    listAccountBalanceTransactions: async () => {
+      txCalls++;
+      return {
+        transactions: [
+          { id: "txn_1", amount: 2900, currency: "eur", created: now - 3600, type: "charge" },
+          { id: "txn_2", amount: 1100, currency: "eur", created: now - 90000, type: "charge" },
+          { id: "txn_3", amount: 500, currency: "usd", created: now - 3600, type: "charge" },
+        ],
+        hasMore: false,
+      };
+    },
+    listAllCharges: async () => ({
+      charges: [
+        { id: "ch_1", status: "failed", created: now - 3600 },
+        { id: "ch_2", status: "succeeded", created: now - 3600 },
+      ],
+      hasMore: false,
+    }),
+    listCustomersPage: async () => ({ customers: [{ id: "cus_1", created: now - 3600 }], hasMore: false }),
+    listAllSubscriptions: async () => ({
+      subscriptions: [
+        {
+          id: "sub_1",
+          items: {
+            data: [
+              { quantity: 2, price: { id: "p1", nickname: "Pro", currency: "eur", unit_amount: 2900, recurring: { interval: "month", interval_count: 1 } } },
+            ],
+          },
+        },
+      ],
+      hasMore: false,
+    }),
+    countActiveSubscriptions: async () => ({ count: 137, truncated: false }),
+    countSucceededCharges: async () => 200,
+  } as unknown as StripeClient;
+  const settings = { disputeRatioWarnPct: () => 0.75, disputeRatioCriticalPct: () => 1.5 } as unknown as SettingsStoreType;
+  const disputes = { countCreatedBetween: async () => 1 } as never;
+  const metrics = new HomeMetrics(stripe, settings, disputes);
+
+  const gross = await metrics.series("gross_volume", "7d");
+  assert.equal(gross!.unit, "currency");
+  assert.equal(gross!.currency, "EUR"); // top-volume currency wins; USD noted
+  assert.match(gross!.note ?? "", /USD/);
+  assert.equal(gross!.points.length, 7);
+  assert.equal(gross!.points[6].v, 29); // today's bucket in major units
+  // Cache: a second read within the TTL does not re-hit Stripe.
+  await metrics.series("gross_volume", "7d");
+  assert.equal(txCalls, 1);
+
+  const failed = await metrics.series("failed_payments", "7d");
+  assert.equal(failed!.points.reduce((s, p) => s + p.v, 0), 1);
+
+  const mrr = await metrics.series("mrr_by_plan", "30d");
+  assert.deepEqual(mrr!.points[0], { label: "Pro", v: 58 }); // 2 × €29
+
+  const ratio = await metrics.series("dispute_ratio", "30d");
+  assert.equal(ratio!.points.length, 6);
+  assert.equal(ratio!.points[5].v, 0.5); // 1/200
+  assert.deepEqual(ratio!.bands!.map((b) => b.v), [0.75, 1.5]);
+
+  assert.equal(await metrics.series("nope", "30d"), null);
+  assert.equal(await metrics.series("gross_volume", "365d"), null);
+});
+
+test("api series: validates key/window and serves HomeMetrics", async () => {
+  const fake = fakeSettings();
+  const provider: DashboardAuthProvider = {
+    enter: async () => ({ kind: "page" }),
+    authenticate: async () => fakeAuthResult("active"),
+    publicEndpoint: async () => null,
+    sessionEndpoint: async () => null,
+  };
+  const dashboard = new Dashboard(fake.store, provider, [fakeSection()], {
+    stripe: { isTestMode: () => true } as unknown as StripeClient,
+    settings: fake.store,
+    stores: {} as never,
+    billing: {} as never,
+    metrics: {
+      series: async (key: string, window: string) =>
+        key === "gross_volume" ? { key, unit: "currency", currency: "EUR", points: [{ label: "07-18", v: 29 }], window } : null,
+    } as never,
+  });
+  const ok = await dashboard.api("series", "c", { key: "gross_volume", window: "7d" });
+  assert.equal(ok.status, 200);
+  assert.equal((ok.json as { points: unknown[] }).points.length, 1);
+  const bad = await dashboard.api("series", "c", { key: "DROP TABLE", window: "7d" });
+  assert.equal(bad.status, 404);
+});
+
+test("integration refs: change-plan rows self-select via filters; Customer-360 footers link filtered lists", async () => {
+  // Change-plan rows navigate to the same page with the price filter applied.
+  const picker = await makeSubscriptionsSection().buildPage(subsCtx(), {
+    page: "subscriptions.changeplan",
+    params: { id: "sub_1" },
+    filters: {},
+  });
+  const prices = picker!.blocks.find((b) => b.type === "table" && b.key === "prices") as TableBlock;
+  assert.deepEqual(prices.rows[0].ref, {
+    page: "subscriptions.changeplan",
+    params: { id: "sub_1" },
+    filters: { price: "price_new" },
+  });
+  assert.ok(!prices.filters?.length); // the "weird pill" is gone
+  // Selected badge appears once a price is picked.
+  const picked = await makeSubscriptionsSection().buildPage(subsCtx(), {
+    page: "subscriptions.changeplan",
+    params: { id: "sub_1" },
+    filters: { price: "price_new" },
+  });
+  const pickedTable = picked!.blocks.find((b) => b.type === "table" && b.key === "prices") as TableBlock;
+  assert.deepEqual(pickedTable.rows[0].cells[1], { t: "badge", b: { kind: "info", text: "Selected" } });
+
+  // Customer 360 footers land on customer-filtered lists.
+  const customer = await makeCustomersSection().buildPage(fakeCustomerCtx(), {
+    page: "customers.detail",
+    params: { id: "cus_test1" },
+  });
+  const payments = customer!.blocks.find((b) => b.type === "table" && b.key === "charges") as TableBlock;
+  assert.deepEqual(payments.footerRef, { page: "payments", filters: { customer: "cus_test1" } });
+  const subsTable = customer!.blocks.find((b) => b.type === "table" && b.key === "subs") as TableBlock;
+  assert.deepEqual(subsTable.footerRef, { page: "subscriptions", filters: { customer: "cus_test1" } });
+
+  // Payments list honors the customer scope via per-customer listings.
+  const listedIds: string[] = [];
+  const pctx = paymentsCtx();
+  (pctx.stripe as { listCharges?: unknown }).listCharges = async (id: string) => {
+    listedIds.push(id);
+    return { charges: [], hasMore: false };
+  };
+  (pctx.stripe as { listPaymentIntents?: unknown }).listPaymentIntents = async () => [];
+  await makePaymentsSection().buildPage(pctx, { page: "payments", filters: { customer: "cus_a" } });
+  assert.deepEqual(listedIds, ["cus_a"]);
+});
+
 test("client JS modules parse and the shell embeds them nonced", () => {
-  const combined = `${clientCore}\n${clientBlocks}\n${clientModal}\n${clientPalette}\n${clientLogin}\nD.defaultPage="home";\n${clientApp}`;
+  const combined = `${clientCore}\n${clientBlocks}\n${clientModal}\n${clientPalette}\n${clientCharts}\n${clientLogin}\nD.defaultPage="home";\n${clientApp}`;
   assert.doesNotThrow(() => new Function(combined));
 
   const html = renderDashboardShell({ nonce: "test-nonce-123" });

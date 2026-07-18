@@ -347,10 +347,12 @@ export class StripeClient {
   async listCustomersPage(opts: {
     limit?: number;
     startingAfter?: string;
+    createdGte?: number;
   }): Promise<{ customers: Stripe.Customer[]; hasMore: boolean }> {
     const res = await this.stripe.customers.list({
       limit: opts.limit ?? 25,
       ...(opts.startingAfter ? { starting_after: opts.startingAfter } : {}),
+      ...(opts.createdGte ? { created: { gte: opts.createdGte } } : {}),
     });
     return { customers: res.data, hasMore: res.has_more };
   }
@@ -447,12 +449,14 @@ export class StripeClient {
     startingAfter?: string;
     type?: string;
     payoutId?: string;
+    createdGte?: number;
   }): Promise<{ transactions: Stripe.BalanceTransaction[]; hasMore: boolean }> {
     const res = await this.stripe.balanceTransactions.list({
       limit: opts.limit ?? 25,
       ...(opts.startingAfter ? { starting_after: opts.startingAfter } : {}),
       ...(opts.type ? { type: opts.type } : {}),
       ...(opts.payoutId ? { payout: opts.payoutId } : {}),
+      ...(opts.createdGte ? { created: { gte: opts.createdGte } } : {}),
     });
     return { transactions: res.data, hasMore: res.has_more };
   }
@@ -487,12 +491,14 @@ export class StripeClient {
   async listAllSubscriptions(opts: {
     status?: Stripe.SubscriptionListParams.Status;
     priceId?: string;
+    customerId?: string;
     limit?: number;
     startingAfter?: string;
   }): Promise<{ subscriptions: Stripe.Subscription[]; hasMore: boolean }> {
     const res = await this.stripe.subscriptions.list({
       status: opts.status ?? "all",
       ...(opts.priceId ? { price: opts.priceId } : {}),
+      ...(opts.customerId ? { customer: opts.customerId } : {}),
       limit: opts.limit ?? 25,
       ...(opts.startingAfter ? { starting_after: opts.startingAfter } : {}),
     });

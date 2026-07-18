@@ -57,10 +57,17 @@ function planLabel(sub: Stripe.Subscription): { name: string; per?: string } {
 async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: string | null): Promise<SectionPage> {
   const status = str(filters.status, 24);
   const priceId = /^price_[A-Za-z0-9]{1,64}$/.test(filters.price ?? "") ? filters.price : "";
+  const customerScope = validId("customer", filters.customer) ?? "";
 
   const cursorId = validId("subscription", validCursor(cursor) ?? "") ?? undefined;
   const [subsRes, prices] = await Promise.all([
-    ctx.stripe.listAllSubscriptions({ status: "all", priceId: priceId || undefined, limit: WINDOW, startingAfter: cursorId }),
+    ctx.stripe.listAllSubscriptions({
+      status: "all",
+      priceId: priceId || undefined,
+      customerId: customerScope || undefined,
+      limit: WINDOW,
+      startingAfter: cursorId,
+    }),
     ctx.stripe.listRecurringPrices(50).catch(() => [] as Stripe.Price[]),
   ]);
   const subs = subsRes.subscriptions;
@@ -123,6 +130,7 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
         ],
         counts,
         filters: [
+          { key: "customer", label: "Customer", kind: "text", value: customerScope || undefined, placeholder: "cus_…" },
           {
             key: "price",
             label: "Price",
@@ -393,12 +401,18 @@ async function changePlan(ctx: DashboardCtx, id: string, filters: Record<string,
 
   const prices = await ctx.stripe.listRecurringPrices(50).catch(() => [] as Stripe.Price[]);
   const allowlist = ctx.settings.allowedPriceIds();
-  const candidates = prices.filter(
-    (p) => p.id !== item.price?.id && (allowlist.length === 0 || allowlist.includes(p.id))
-  );
+  const intervalRank: Record<string, number> = { day: 0, week: 1, month: 2, year: 3 };
+  const candidates = prices
+    .filter((p) => p.id !== item.price?.id && (allowlist.length === 0 || allowlist.includes(p.id)))
+    .sort(
+      (a, b) =>
+        (intervalRank[a.recurring?.interval ?? ""] ?? 9) - (intervalRank[b.recurring?.interval ?? ""] ?? 9) ||
+        (a.unit_amount ?? 0) - (b.unit_amount ?? 0)
+    );
 
   const targetPrice = /^price_[A-Za-z0-9]{1,64}$/.test(filters.price ?? "") ? filters.price : "";
   const plan = planLabel(sub);
+  // Row click = pick: each row navigates to this page with its price applied.
   const blocks: Block[] = [
     {
       type: "header",
@@ -411,23 +425,17 @@ async function changePlan(ctx: DashboardCtx, id: string, filters: Record<string,
       title: "Pick the target price",
       columns: [
         { key: "name", label: "Price" },
+        { key: "picked", label: "" },
         { key: "amount", label: "Amount", align: "right" },
         { key: "interval", label: "Billing" },
         { key: "id", label: "ID" },
       ],
-      filters: [
-        {
-          key: "price",
-          label: "Target price",
-          kind: "select",
-          value: targetPrice || undefined,
-          options: candidates.slice(0, 25).map((p) => ({ value: p.id, label: p.nickname ?? p.id })),
-        },
-      ],
       rows: candidates.slice(0, 25).map((p) => ({
         id: p.id,
+        ref: { page: "subscriptions.changeplan", params: { id }, filters: { price: p.id } },
         cells: [
           avatarCell("subscription", p.nickname ?? p.id),
+          p.id === targetPrice ? badgeCell("info", "Selected") : text(""),
           p.unit_amount != null ? money(ctx.stripe, p.unit_amount, p.currency) : text("—"),
           text(p.recurring ? `every ${p.recurring.interval_count ?? 1} ${p.recurring.interval}` : "—"),
           idCell(p.id, { copy: true }),
@@ -436,7 +444,7 @@ async function changePlan(ctx: DashboardCtx, id: string, filters: Record<string,
       empty: allowlist.length
         ? "No other prices on the plan allowlist (/config → Billing)."
         : "No other recurring prices found.",
-      notice: "Select the target price above (the pill), then review the proration preview before confirming.",
+      notice: "Click a price to preview the proration, then confirm below the preview.",
     },
   ];
 

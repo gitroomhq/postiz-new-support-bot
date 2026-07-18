@@ -46,7 +46,7 @@ D.hashFor = function (page, params, filters) {
 
 D.navigateRef = function (ref) {
   if (!ref) return;
-  location.hash = D.hashFor(ref.page, ref.params || {}, {});
+  location.hash = D.hashFor(ref.page, ref.params || {}, ref.filters || {});
 };
 
 D.applyFilter = function (key, value) {

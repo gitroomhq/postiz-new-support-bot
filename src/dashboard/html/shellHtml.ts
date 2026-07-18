@@ -4,6 +4,7 @@ import { clientCore } from "./clientCore";
 import { clientBlocks } from "./clientBlocks";
 import { clientModal } from "./clientModal";
 import { clientPalette } from "./clientPalette";
+import { clientCharts } from "./clientCharts";
 import { clientLogin } from "./clientLogin";
 import { clientApp } from "./clientApp";
 
@@ -137,6 +138,7 @@ ${clientCore}
 ${clientBlocks}
 ${clientModal}
 ${clientPalette}
+${clientCharts}
 ${clientLogin}
 D.defaultPage = "home";
 document.getElementById("expiredReload").addEventListener("click", function () { location.hash = ""; location.reload(); });

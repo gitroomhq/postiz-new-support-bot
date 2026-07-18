@@ -1,17 +1,22 @@
 import type Stripe from "stripe";
+import type { HomeMetrics } from "../metrics/HomeMetrics";
 import { Badge, Block, Cell, ObjectRef } from "../renderer/contract";
 import { DashboardCtx, DashboardSectionModule, SectionPage } from "./types";
 import { badgeCell, isoDateCell, sentence, strong, text } from "./cells";
 
-// Home v1: the needs-attention inbox (disputes closing in, queued approvals,
-// charge reviews, fresh early-fraud warnings), account stat tiles and the
-// recent-activity feed from Stripe events. Charts arrive with M5 — this page
-// stays ≤4 Stripe calls (balance, active-sub count page, events, EFWs).
+// Home v1+charts: the needs-attention inbox (disputes closing in, queued
+// approvals, charge reviews, fresh early-fraud warnings), account stat tiles,
+// the five M5 charts (lazily hydrated via the series endpoint) and the
+// recent-activity feed from Stripe events. The view build stays ≤4 direct
+// Stripe calls — charts and the active-subs count come from HomeMetrics'
+// 10-minute cache.
 
 const DUE_SOON_HOURS = 72;
 const EFW_WINDOW_HOURS = 72;
 
-export function makeHomeSection(): DashboardSectionModule {
+const CHART_WINDOWS = new Set(["7d", "30d", "90d"]);
+
+export function makeHomeSection(deps: { metrics: HomeMetrics }): DashboardSectionModule {
   return {
     nav: [{ key: "home", label: "Home", page: "home" }],
 
@@ -19,10 +24,11 @@ export function makeHomeSection(): DashboardSectionModule {
       return page === "home";
     },
 
-    async buildPage(ctx: DashboardCtx): Promise<SectionPage | null> {
+    async buildPage(ctx: DashboardCtx, req): Promise<SectionPage | null> {
+      const window = CHART_WINDOWS.has(req.filters?.window ?? "") ? req.filters!.window : "30d";
       const [balance, subCount, events, efws, approvals, reviewCount, openDisputes] = await Promise.all([
         ctx.stripe.getBalance().catch(() => null),
-        ctx.stripe.countActiveSubscriptions(1).catch(() => null),
+        deps.metrics.activeSubsCount().catch(() => null),
         ctx.stripe.listEvents(12).catch(() => [] as Stripe.Event[]),
         ctx.stripe.listRecentEarlyFraudWarnings(50).catch(() => [] as Stripe.Radar.EarlyFraudWarning[]),
         ctx.billing.actions.pendingPage(0, 5).catch(() => ({ rows: [], total: 0 })),
@@ -123,10 +129,33 @@ export function makeHomeSection(): DashboardSectionModule {
           { key: "status", label: "Status" },
           { key: "when", label: "When" },
         ],
+        // The window pill steers the charts below (7d/30d/90d).
+        filters: [
+          {
+            key: "window",
+            label: "Chart window",
+            kind: "select",
+            value: window === "30d" ? undefined : window,
+            options: [
+              { value: "7d", label: "Last 7 days" },
+              { value: "30d", label: "Last 30 days" },
+              { value: "90d", label: "Last 90 days" },
+            ],
+          },
+        ],
         rows: inboxRows,
         empty: "Nothing needs attention — disputes, approvals and fraud warnings show up here.",
         ...(inboxRows.length ? { footer: `${inboxRows.length} item${inboxRows.length === 1 ? "" : "s"}` } : {}),
       });
+
+      // ---- the five M5 charts (hydrated lazily via the series endpoint) ----
+      blocks.push(
+        { type: "chart", key: "gross_volume", title: "Gross volume", kind: "area", window },
+        { type: "chart", key: "new_customers", title: "New customers", kind: "bars", window },
+        { type: "chart", key: "failed_payments", title: "Failed payments", kind: "bars", window },
+        { type: "chart", key: "mrr_by_plan", title: "MRR estimate by plan", kind: "bars", window },
+        { type: "chart", key: "dispute_ratio", title: "Dispute ratio (monthly)", kind: "line", window }
+      );
 
       // ---- recent activity (Stripe events) ----
       blocks.push({
@@ -159,5 +188,7 @@ function refForId(id: string): ObjectRef | null {
   if (/^cus_/.test(id)) return { page: "customers.detail", params: { id } };
   if (/^(ch|py|pi)_/.test(id)) return { page: "payments.detail", params: { id } };
   if (/^po_/.test(id)) return { page: "balances.detail", params: { id } };
+  if (/^sub_/.test(id)) return { page: "subscriptions.detail", params: { id } };
+  if (/^in_/.test(id)) return { page: "invoices.detail", params: { id } };
   return null;
 }
