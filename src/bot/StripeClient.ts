@@ -445,6 +445,44 @@ export class StripeClient {
     return this.stripe.payouts.retrieve(payoutId);
   }
 
+  // ---- payout writes (PA-5): create / cancel / reverse ----
+
+  // Manual payout from the AVAILABLE balance to the default external account.
+  async createPayout(
+    params: { amountMinor: number; currency: string; description?: string; statementDescriptor?: string },
+    idempotencyKey: string
+  ): Promise<Stripe.Payout> {
+    return this.stripe.payouts.create(
+      {
+        amount: params.amountMinor,
+        currency: params.currency,
+        ...(params.description ? { description: params.description } : {}),
+        ...(params.statementDescriptor ? { statement_descriptor: params.statementDescriptor } : {}),
+      },
+      { idempotencyKey }
+    );
+  }
+
+  // Only PENDING payouts can be canceled — the funds return to the available balance.
+  async cancelPayout(payoutId: string, idempotencyKey?: string): Promise<Stripe.Payout> {
+    return this.stripe.payouts.cancel(payoutId, {}, idempotencyKey ? { idempotencyKey } : undefined);
+  }
+
+  // Debits the destination bank account to claw a PAID payout back (Stripe
+  // supports this for US/CA bank accounts only).
+  async reversePayout(payoutId: string, idempotencyKey?: string): Promise<Stripe.Payout> {
+    return this.stripe.payouts.reverse(payoutId, {}, idempotencyKey ? { idempotencyKey } : undefined);
+  }
+
+  // Top-ups: money YOU push into the Stripe balance (bank transfer / API).
+  async listTopUps(opts: { limit?: number; startingAfter?: string } = {}): Promise<{ topups: Stripe.Topup[]; hasMore: boolean }> {
+    const res = await this.stripe.topups.list({
+      limit: opts.limit ?? 25,
+      ...(opts.startingAfter ? { starting_after: opts.startingAfter } : {}),
+    });
+    return { topups: res.data, hasMore: res.has_more };
+  }
+
   // ACCOUNT balance transactions (fees/charges/refunds/payouts) — distinct
   // from the per-customer credit-ledger listCustomerBalanceTransactions.
   async listAccountBalanceTransactions(opts: {

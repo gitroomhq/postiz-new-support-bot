@@ -889,6 +889,24 @@ function paymentsCtx(): DashboardCtx {
       hasMore: false,
     }),
     getCustomer: async () => ({ id: "cus_a", email: "a@x.com", name: "Ada" }),
+    // PA-5 transactions-tab views:
+    getBalance: async () => ({ available: [{ amount: 50000, currency: "eur" }], pending: [{ amount: 1000, currency: "eur" }] }),
+    listPayouts: async () => ({
+      payouts: [
+        { id: "po_1", amount: 10000, currency: "eur", status: "pending", method: "standard", description: null, created: 1_699_900_000, arrival_date: 1_700_000_000 },
+      ],
+      hasMore: false,
+    }),
+    listTopUps: async () => ({
+      topups: [{ id: "tu_1", amount: 5000, currency: "eur", status: "succeeded", description: "wire", created: 1_699_000_000 }],
+      hasMore: false,
+    }),
+    listAccountBalanceTransactions: async () => ({
+      transactions: [
+        { id: "txn_9", amount: 2900, currency: "eur", fee: 119, net: 2781, type: "charge", available_on: 1_700_100_000, source: "ch_1", created: 1_700_000_000 },
+      ],
+      hasMore: false,
+    }),
   } as unknown as DashboardCtx["stripe"];
   return {
     actor: { id: "42", name: "Ada", role: "admin", isAdmin: true },
@@ -2967,14 +2985,15 @@ test("test-clock advance (PA-4): refused on live keys; advances frozen_time by d
   assert.deepEqual(advanced, [["clock_1", 1_700_000_000 + 30 * 86400]]);
 });
 
-test("payments list (PA-4): transactions tab row points forward tabs at Balances; bulk refund rides bulkActions (hidden when denied)", async () => {
+test("payments list (PA-4/5): transactions tab row is a filter-driven view switch; bulk refund rides bulkActions (hidden when denied)", async () => {
   const section = makePaymentsSection();
   const page = await section.buildPage(paymentsCtx(), { page: "payments", filters: {} });
   const tabs = page!.blocks.find((b) => b.type === "tabs") as TabsBlock;
   assert.ok(tabs, "expected a tabs block");
+  assert.equal(tabs.key, "txview");
   assert.deepEqual(tabs.items.map((i) => i.label), ["Payments", "Payouts", "Top-ups", "All activity"]);
-  assert.equal(tabs.items[0].ref, undefined);
-  for (const it of tabs.items.slice(1)) assert.deepEqual(it.ref, { page: "balances" });
+  assert.deepEqual(tabs.items.map((i) => i.value), ["", "payouts", "topups", "activity"]);
+  assert.ok(tabs.items.every((i) => i.ref === undefined)); // PA-5: real views, no forward refs
   const table = page!.blocks.find((b) => b.type === "table") as TableBlock;
   assert.equal(table.bulkActions!.length, 1);
   assert.equal(table.bulkActions![0].key, "section:payments.bulk_refund");
@@ -3199,4 +3218,181 @@ test("dashboard belts (PA-4): charge.create always steps up; subscription.create
   });
   assert.deepEqual(chargeMode.json, { ok: false, needsStepUp: true });
   assert.deepEqual(gatewayCalls, ["subscription.create"]);
+});
+
+// ---- PA-5: Payouts + transactions tab views ----
+
+test("payments tabs (PA-5): payouts view = balance stats + payout rows → detail + T2 create; top-ups and all-activity render their ledgers", async () => {
+  const section = makePaymentsSection();
+  // Payouts view.
+  const payouts = await section.buildPage(paymentsCtx(), { page: "payments", filters: { txview: "payouts" } });
+  const header = payouts!.blocks[0] as HeaderBlock;
+  const create = header.actions!.find((a) => a.key === "section:payments.payout_create")!;
+  assert.equal(create.dangerous, true);
+  assert.equal(create.stepUp, true);
+  assert.ok(create.summary!.includes("500.00 EUR")); // available balance surfaced in the ceremony summary
+  const tabs = payouts!.blocks.find((b) => b.type === "tabs") as TabsBlock;
+  assert.equal(tabs.value, "payouts");
+  assert.ok(payouts!.blocks.some((b) => b.type === "stats"));
+  const potable = payouts!.blocks.find((b) => b.type === "table") as TableBlock;
+  assert.equal(potable.key, "payouts");
+  assert.deepEqual(potable.rows[0].ref, { page: "balances.detail", params: { id: "po_1" } });
+  // Top-ups view.
+  const topups = await section.buildPage(paymentsCtx(), { page: "payments", filters: { txview: "topups" } });
+  const tutable = topups!.blocks.find((b) => b.type === "table") as TableBlock;
+  assert.equal(tutable.key, "topups");
+  assert.equal((tutable.rows[0].cells[0] as { badge?: { text: string } }).badge?.text, "Succeeded");
+  // All-activity view: ledger with type filter + source links.
+  const activity = await section.buildPage(paymentsCtx(), { page: "payments", filters: { txview: "activity" } });
+  const acttable = activity!.blocks.find((b) => b.type === "table") as TableBlock;
+  assert.equal(acttable.key, "activity");
+  assert.ok(acttable.filters!.some((f) => f.key === "type"));
+  assert.deepEqual(acttable.rows[0].ref, { page: "payments.detail", params: { id: "ch_1" } });
+  assert.equal(acttable.nextCursor, null);
+});
+
+test("payout create (PA-5): CONFIRM + fresh factor + available-balance preflight, then createPayout in minor units", async () => {
+  const section = makePaymentsSection();
+  const ctx = paymentsCtx();
+  const created: Array<Record<string, unknown>> = [];
+  (ctx.stripe as unknown as Record<string, unknown>).createPayout = async (params: Record<string, unknown>) => {
+    created.push(params);
+    return { id: "po_new", arrival_date: 1_700_500_000 };
+  };
+  // No CONFIRM.
+  const noConfirm = await section.action!(ctx, {
+    key: "section:payments.payout_create",
+    params: { amountMajor: 100, currency: "eur" },
+  });
+  assert.equal(noConfirm.ok, false);
+  // Stale fresh-factor → needsStepUp before any Stripe call.
+  const stale = paymentsCtx();
+  (stale.security as unknown as Record<string, unknown>).stepUpFresh = () => false;
+  const needsUp = await section.action!(stale, {
+    key: "section:payments.payout_create",
+    params: { amountMajor: 100, currency: "eur" },
+    confirmWord: "CONFIRM",
+  });
+  assert.equal(needsUp.needsStepUp, true);
+  // More than the available bucket → friendly refusal, nothing created.
+  const tooMuch = await section.action!(ctx, {
+    key: "section:payments.payout_create",
+    params: { amountMajor: 9999, currency: "eur" },
+    confirmWord: "CONFIRM",
+  });
+  assert.equal(tooMuch.ok, false);
+  assert.ok(tooMuch.error!.includes("500.00 EUR"));
+  assert.equal(created.length, 0);
+  // Within balance → created with minor units.
+  const ok = await section.action!(ctx, {
+    key: "section:payments.payout_create",
+    params: { amountMajor: 250.5, currency: "EUR", description: "ops sweep" },
+    confirmWord: "CONFIRM",
+  });
+  assert.equal(ok.ok, true);
+  assert.equal(created[0].amountMinor, 25050);
+  assert.equal(created[0].currency, "eur");
+  assert.ok(ok.text!.includes("po_new"));
+});
+
+function payoutWriteCtx(payout: Record<string, unknown>, opts: { stepUpFresh?: boolean; reverseSatisfied?: boolean } = {}) {
+  const calls: Record<string, unknown[]> = { cancel: [], reverse: [] };
+  const ctx = {
+    actor: { id: "42", name: "Ada", role: "admin", isAdmin: true },
+    stripe: {
+      formatAmount: (a: number, c: string) => `${(a / 100).toFixed(2)} ${c.toUpperCase()}`,
+      getPayout: async () => payout,
+      cancelPayout: async (id: string) => {
+        calls.cancel.push(id);
+        return { ...payout, status: "canceled" };
+      },
+      reversePayout: async (id: string) => {
+        calls.reverse.push(id);
+        return { id: "po_rev", original_payout: id };
+      },
+      listAccountBalanceTransactions: async () => ({ transactions: [], hasMore: false }),
+    },
+    settings: {} as never,
+    stores: {} as never,
+    billing: { actions: { effectiveMode: () => "direct" }, gateway: {} as never },
+    audit: async () => {},
+    ...(opts.reverseSatisfied !== undefined ? { reverse: { satisfied: opts.reverseSatisfied } } : {}),
+    security: { sessionIdHash: "h", authMethod: "passkey", stepUpFresh: () => opts.stepUpFresh !== false },
+  } as unknown as DashboardCtx;
+  return { ctx, calls };
+}
+
+test("payout detail (PA-5): pending → T2 Cancel; paid → T3 Reverse; reversed → badge, no actions", async () => {
+  const base = { id: "po_1", amount: 10000, currency: "eur", status: "pending", method: "standard", arrival_date: 1_700_000_000, created: 1_699_900_000, reversed_by: null, original_payout: null, destination: "ba_1" };
+  const pending = await makeBalancesSection().buildPage(payoutWriteCtx(base).ctx, { page: "balances.detail", params: { id: "po_1" } });
+  const pendingHeader = pending!.blocks[0] as HeaderBlock;
+  const cancel = pendingHeader.actions!.find((a) => a.key === "section:balances.payout_cancel")!;
+  assert.equal(cancel.stepUp, true);
+  assert.ok(!pendingHeader.actions!.some((a) => a.key === "section:balances.payout_reverse"));
+  const paid = await makeBalancesSection().buildPage(payoutWriteCtx({ ...base, status: "paid" }).ctx, { page: "balances.detail", params: { id: "po_1" } });
+  const paidHeader = paid!.blocks[0] as HeaderBlock;
+  const reverse = paidHeader.actions!.find((a) => a.key === "section:balances.payout_reverse")!;
+  assert.equal(reverse.reverseConfirm, true);
+  assert.equal(reverse.dangerous, true);
+  const reversed = await makeBalancesSection().buildPage(payoutWriteCtx({ ...base, status: "paid", reversed_by: "po_rev" }).ctx, { page: "balances.detail", params: { id: "po_1" } });
+  const reversedHeader = reversed!.blocks[0] as HeaderBlock;
+  assert.equal(reversedHeader.actions!.length, 0);
+  assert.ok(reversedHeader.badges!.some((b) => b.text === "Reversed"));
+  const details = reversed!.rail![0] as KeyValueBlock;
+  assert.ok(details.rows.some((r) => r.label === "Reversed by"));
+});
+
+test("payout cancel/reverse (PA-5): T2/T3 belts + live status revalidation before any Stripe write", async () => {
+  const pendingPayout = { id: "po_1", amount: 10000, currency: "eur", status: "pending", reversed_by: null };
+  const section = makeBalancesSection();
+  // Cancel: CONFIRM → step-up → pending-only → cancelPayout.
+  const staleCancel = payoutWriteCtx(pendingPayout, { stepUpFresh: false });
+  const staleRes = await section.action!(staleCancel.ctx, {
+    key: "section:balances.payout_cancel",
+    params: { id: "po_1" },
+    confirmWord: "CONFIRM",
+  });
+  assert.equal(staleRes.needsStepUp, true);
+  assert.equal(staleCancel.calls.cancel.length, 0);
+  const okCancel = payoutWriteCtx(pendingPayout);
+  const cancelRes = await section.action!(okCancel.ctx, {
+    key: "section:balances.payout_cancel",
+    params: { id: "po_1" },
+    confirmWord: "CONFIRM",
+  });
+  assert.equal(cancelRes.ok, true);
+  assert.deepEqual(okCancel.calls.cancel, ["po_1"]);
+  const paidCancel = payoutWriteCtx({ ...pendingPayout, status: "paid" });
+  const refused = await section.action!(paidCancel.ctx, {
+    key: "section:balances.payout_cancel",
+    params: { id: "po_1" },
+    confirmWord: "CONFIRM",
+  });
+  assert.equal(refused.ok, false);
+  assert.equal(paidCancel.calls.cancel.length, 0);
+  // Reverse: CONFIRM → reverse code → paid-only + not-already-reversed → reversePayout.
+  const noCode = payoutWriteCtx({ ...pendingPayout, status: "paid" }, { reverseSatisfied: false });
+  const needsReverse = await section.action!(noCode.ctx, {
+    key: "section:balances.payout_reverse",
+    params: { id: "po_1" },
+    confirmWord: "CONFIRM",
+  });
+  assert.equal(needsReverse.needsReverse, true);
+  assert.equal(noCode.calls.reverse.length, 0);
+  const withCode = payoutWriteCtx({ ...pendingPayout, status: "paid" }, { reverseSatisfied: true });
+  const reversedRes = await section.action!(withCode.ctx, {
+    key: "section:balances.payout_reverse",
+    params: { id: "po_1" },
+    confirmWord: "CONFIRM",
+  });
+  assert.equal(reversedRes.ok, true);
+  assert.deepEqual(withCode.calls.reverse, ["po_1"]);
+  const already = payoutWriteCtx({ ...pendingPayout, status: "paid", reversed_by: "po_x" }, { reverseSatisfied: true });
+  const dupe = await section.action!(already.ctx, {
+    key: "section:balances.payout_reverse",
+    params: { id: "po_1" },
+    confirmWord: "CONFIRM",
+  });
+  assert.equal(dupe.ok, false);
+  assert.equal(already.calls.reverse.length, 0);
 });

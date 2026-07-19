@@ -5,7 +5,8 @@ import { SessionStore } from "../../auth/SessionStore";
 import { BlockStore } from "../../bot/billing/BlockStore";
 import type { ActionActor } from "../../bot/billing/actions/BillingActionService";
 import { ActionButton, Badge, Block, Cell, KeyValueBlock, TableBlock } from "../renderer/contract";
-import { DashboardCtx, DashboardSectionModule, SectionPage, str, validId } from "./types";
+import { DashboardCtx, DashboardSectionModule, SectionPage, str, validCursor, validId } from "./types";
+import { payoutBadge, sourceRef, TX_TYPES } from "./balancesSection";
 import {
   amount,
   badgeCell,
@@ -118,6 +119,45 @@ export function makePaymentsSection(): DashboardSectionModule {
           if (executed + queued === 0) return { ok: false, error: `Bulk refund: every charge was skipped${detail}` };
           return { ok: true, text: `Bulk refund: ${parts.join(", ")}${detail}` };
         }
+        case "section:payments.payout_create": {
+          // T2 money movement out of the balance: typed CONFIRM + fresh factor.
+          if (req.confirmWord !== "CONFIRM") return { ok: false, error: "Type CONFIRM to run this action." };
+          if (!ctx.security.stepUpFresh()) return { ok: false, needsStepUp: true };
+          const amountMajor =
+            typeof p.amountMajor === "number" && isFinite(p.amountMajor) && p.amountMajor > 0 ? p.amountMajor : null;
+          const currency = str(p.currency, 3).trim().toLowerCase();
+          if (!amountMajor || !/^[a-z]{3}$/.test(currency)) {
+            return { ok: false, error: "A positive amount and a 3-letter currency are required." };
+          }
+          const factor = StripeClient.isZeroDecimal(currency) ? 1 : 100;
+          const amountMinor = Math.round(amountMajor * factor);
+          // Preflight against the AVAILABLE bucket — Stripe would refuse anyway,
+          // but a friendly error beats a raw API message.
+          const balance = await ctx.stripe.getBalance().catch(() => null);
+          const bucket = balance?.available.find((b) => b.currency === currency);
+          if (!bucket || bucket.amount < amountMinor) {
+            return {
+              ok: false,
+              error: `Available ${currency.toUpperCase()} balance is ${
+                bucket ? ctx.stripe.formatAmount(bucket.amount, currency) : ctx.stripe.formatAmount(0, currency)
+              } — cannot pay out ${ctx.stripe.formatAmount(amountMinor, currency)}.`,
+            };
+          }
+          const payout = await ctx.stripe.createPayout(
+            {
+              amountMinor,
+              currency,
+              description: str(p.description, 200).trim() || undefined,
+              statementDescriptor: str(p.statementDescriptor, 22).trim() || undefined,
+            },
+            `dash-payout-${amountMinor}-${currency}-${Date.now().toString(36)}`
+          );
+          await ctx.audit(`Payout ${payout.id} created — ${ctx.stripe.formatAmount(amountMinor, currency)}`);
+          return {
+            ok: true,
+            text: `Payout ${payout.id} created — ${ctx.stripe.formatAmount(amountMinor, currency)}, arriving ${new Date(payout.arrival_date * 1000).toISOString().slice(0, 10)}.`,
+          };
+        }
         default:
           return { ok: false, error: "Unknown action." };
       }
@@ -142,6 +182,11 @@ function registryButton(ctx: DashboardCtx, button: ActionButton): ActionButton {
 // ---- LIST ----
 
 async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: string | null): Promise<SectionPage> {
+  // PA-5: the transactions tab row is a filter-driven view switch — Payouts /
+  // Top-ups / All activity render here (Stripe's own layout), charges below.
+  const txview =
+    filters.txview === "payouts" || filters.txview === "topups" || filters.txview === "activity" ? filters.txview : "";
+  if (txview) return transactionsView(ctx, txview, filters, cursor);
   const status = str(filters.status, 20);
   const dateKey = str(filters.date, 8);
   const amountFilter = str(filters.amount, 20);
@@ -259,20 +304,7 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
     ],
   };
 
-  // Stripe transactions tab row. Payouts/Top-ups/All-activity become their own
-  // views in PA-5 — until then those tabs land on Balances (payouts + balance
-  // transactions live there today).
-  const tabs: Block = {
-    type: "tabs",
-    key: "txview",
-    value: "",
-    items: [
-      { value: "", label: "Payments" },
-      { value: "payouts", label: "Payouts", ref: { page: "balances" } },
-      { value: "topups", label: "Top-ups", ref: { page: "balances" } },
-      { value: "activity", label: "All activity", ref: { page: "balances" } },
-    ],
-  };
+  const tabs = txTabs("");
 
   // Bulk refund over the selected rows (money-moving bulk → strong ceremony;
   // hidden entirely when the refund action is disabled by /config).
@@ -420,6 +452,206 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
         empty: hasInMemoryFilter ? "No payments match these filters (within this window)." : "No payments yet.",
         ...(rows.length ? { footer: `${rows.length} item${rows.length === 1 ? "" : "s"}` } : {}),
         notice: `Counts and filters cover the ${WINDOW} most recent payments${dateKey ? ` of the ${dateKey} window` : ""} per page — use Next for older ones. EFW matching covers the 100 most recent warnings.`,
+      },
+    ],
+  };
+}
+
+// ---- TRANSACTIONS TABS (PA-5: Payouts / Top-ups / All activity) ----
+
+// Stripe's tab row under the Payments H1 — a filter-driven view switch.
+function txTabs(active: string): Block {
+  return {
+    type: "tabs",
+    key: "txview",
+    value: active || undefined,
+    items: [
+      { value: "", label: "Payments" },
+      { value: "payouts", label: "Payouts" },
+      { value: "topups", label: "Top-ups" },
+      { value: "activity", label: "All activity" },
+    ],
+  };
+}
+
+function topupBadge(status: string): Badge {
+  const kind: Badge["kind"] =
+    status === "succeeded" ? "ok" : status === "failed" || status === "canceled" ? "error" : status === "reversed" ? "neutral" : "warn";
+  return { kind, text: status.charAt(0).toUpperCase() + status.slice(1) };
+}
+
+async function transactionsView(
+  ctx: DashboardCtx,
+  view: "payouts" | "topups" | "activity",
+  filters: Record<string, string>,
+  cursor: string | null
+): Promise<SectionPage> {
+  const crumbs = [{ label: "Payments" }];
+
+  if (view === "payouts") {
+    const payoutCursor = validId("payout", validCursor(cursor) ?? "") ?? undefined;
+    const [balance, payoutsRes] = await Promise.all([
+      ctx.stripe.getBalance().catch(() => null),
+      ctx.stripe.listPayouts({ limit: 25, startingAfter: payoutCursor }),
+    ]);
+    const buckets = (rows: Array<{ amount: number; currency: string }> | undefined) =>
+      (rows ?? []).map((b) => ctx.stripe.formatAmount(b.amount, b.currency)).join(" + ") || "—";
+    return {
+      title: "Payments",
+      crumbs,
+      blocks: [
+        {
+          type: "header",
+          title: "Payments",
+          actions: [
+            {
+              key: "section:payments.payout_create",
+              label: "Create payout",
+              style: "primary",
+              dangerous: true,
+              stepUp: true,
+              inputs: [
+                { type: "number", key: "amountMajor", label: "Amount (major units, e.g. 250.00)", min: 0 },
+                { type: "text", key: "currency", label: "Currency (3 letters)", placeholder: "eur" },
+                { type: "text", key: "description", label: "Description (optional)" },
+                { type: "text", key: "statementDescriptor", label: "Bank statement text (optional, ≤22 chars)", maxLength: 22 },
+              ],
+              summary: `Pays out from the AVAILABLE balance (${balance ? buckets(balance.available) : "—"}) to the default external account. Requires a fresh factor.`,
+            },
+          ],
+        },
+        txTabs(view),
+        {
+          type: "stats",
+          items: [
+            { label: "Available", value: balance ? buckets(balance.available) : "—", sub: "settled, ready to pay out" },
+            { label: "Pending", value: balance ? buckets(balance.pending) : "—", sub: "settling to available" },
+          ],
+        },
+        {
+          type: "table",
+          key: "payouts",
+          exportable: true,
+          columns: [
+            { key: "amount", label: "Amount" },
+            { key: "method", label: "Method" },
+            { key: "desc", label: "Description" },
+            { key: "created", label: "Initiated" },
+            { key: "arrival", label: "Arrival" },
+            { key: "id", label: "ID" },
+          ],
+          rows: payoutsRes.payouts.map((p) => ({
+            id: p.id,
+            ref: { page: "balances.detail", params: { id: p.id } },
+            cells: [
+              amount(ctx.stripe, p.amount, p.currency, payoutBadge(p.status)),
+              text(p.method === "instant" ? "Instant" : "Standard"),
+              text(p.description ?? "—"),
+              dateCell(p.created),
+              dateCell(p.arrival_date),
+              idCell(p.id, { copy: true }),
+            ] as Cell[],
+          })),
+          nextCursor:
+            payoutsRes.hasMore && payoutsRes.payouts.length > 0
+              ? payoutsRes.payouts[payoutsRes.payouts.length - 1].id
+              : null,
+          empty: "No payouts yet.",
+          ...(payoutsRes.payouts.length
+            ? { footer: `${payoutsRes.payouts.length}${payoutsRes.hasMore ? "+" : ""} item${payoutsRes.payouts.length === 1 ? "" : "s"}` }
+            : {}),
+          notice: "Click a payout for its transactions — cancel (pending) and reverse (paid) live on the payout page.",
+        },
+      ],
+    };
+  }
+
+  if (view === "topups") {
+    const rawCursor = validCursor(cursor) ?? "";
+    const topupCursor = /^tu_[A-Za-z0-9]{1,64}$/.test(rawCursor) ? rawCursor : undefined;
+    const topupsRes = await ctx.stripe
+      .listTopUps({ limit: 25, startingAfter: topupCursor })
+      .catch(() => ({ topups: [] as Stripe.Topup[], hasMore: false }));
+    return {
+      title: "Payments",
+      crumbs,
+      blocks: [
+        { type: "header", title: "Payments" },
+        txTabs(view),
+        {
+          type: "table",
+          key: "topups",
+          exportable: true,
+          columns: [
+            { key: "amount", label: "Amount" },
+            { key: "desc", label: "Description" },
+            { key: "created", label: "Date" },
+            { key: "id", label: "ID" },
+          ],
+          rows: topupsRes.topups.map((t) => ({
+            id: t.id,
+            cells: [
+              amount(ctx.stripe, t.amount, t.currency, topupBadge(t.status)),
+              text(t.description ?? "—"),
+              dateCell(t.created),
+              idCell(t.id, { copy: true }),
+            ] as Cell[],
+          })),
+          nextCursor:
+            topupsRes.hasMore && topupsRes.topups.length > 0 ? topupsRes.topups[topupsRes.topups.length - 1].id : null,
+          empty: "No top-ups — fund the balance via bank transfer or the API.",
+          ...(topupsRes.topups.length
+            ? { footer: `${topupsRes.topups.length}${topupsRes.hasMore ? "+" : ""} item${topupsRes.topups.length === 1 ? "" : "s"}` }
+            : {}),
+        },
+      ],
+    };
+  }
+
+  // All activity: the account balance-transaction ledger, cursor-paginated.
+  const txType = TX_TYPES.some((t) => t.value === filters.type) ? filters.type : "";
+  const rawTxCursor = validCursor(cursor) ?? "";
+  const txCursor = /^txn_[A-Za-z0-9]{1,64}$/.test(rawTxCursor) ? rawTxCursor : undefined;
+  const txRes = await ctx.stripe
+    .listAccountBalanceTransactions({ limit: 50, startingAfter: txCursor, ...(txType ? { type: txType } : {}) })
+    .catch(() => ({ transactions: [] as Stripe.BalanceTransaction[], hasMore: false }));
+  return {
+    title: "Payments",
+    crumbs,
+    blocks: [
+      { type: "header", title: "Payments" },
+      txTabs(view),
+      {
+        type: "table",
+        key: "activity",
+        exportable: true,
+        columns: [
+          { key: "amount", label: "Amount" },
+          { key: "fee", label: "Fee", align: "right" },
+          { key: "net", label: "Net", align: "right" },
+          { key: "type", label: "Type" },
+          { key: "available", label: "Available on" },
+          { key: "id", label: "Source" },
+        ],
+        filters: [{ key: "type", label: "Type", kind: "select", value: txType || undefined, options: TX_TYPES }],
+        rows: txRes.transactions.map((t) => ({
+          id: t.id,
+          ...(sourceRef(t) ? { ref: sourceRef(t)! } : {}),
+          cells: [
+            amount(ctx.stripe, t.amount, t.currency),
+            money(ctx.stripe, -t.fee, t.currency, t.fee ? "muted" : undefined),
+            money(ctx.stripe, t.net, t.currency, t.net >= 0 ? "pos" : "neg"),
+            text(sentence(t.type.replace(/_/g, " "))),
+            dateCell(t.available_on),
+            typeof t.source === "string" ? idCell(t.source, { copy: true }) : text("—"),
+          ] as Cell[],
+        })),
+        nextCursor:
+          txRes.hasMore && txRes.transactions.length > 0 ? txRes.transactions[txRes.transactions.length - 1].id : null,
+        empty: "No balance transactions match.",
+        ...(txRes.transactions.length
+          ? { footer: `${txRes.transactions.length}${txRes.hasMore ? "+" : ""} item${txRes.transactions.length === 1 ? "" : "s"}` }
+          : {}),
       },
     ],
   };
