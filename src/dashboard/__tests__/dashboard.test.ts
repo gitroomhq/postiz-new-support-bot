@@ -3657,3 +3657,454 @@ test("registry subscription.items (PA-6): parse + gateway binding from the subsc
   assert.ok(resolved.ok);
   assert.equal((resolved as { binding: { stripeCustomerId: string } }).binding.stripeCustomerId, "cus_sub");
 });
+
+// ---- PA-7a: Payment Links + Tax rates ----
+
+function linksCtx() {
+  const created: Array<Record<string, unknown>> = [];
+  const toggled: Array<[string, boolean]> = [];
+  const link = {
+    id: "plink_1",
+    url: "https://buy.stripe.com/test_abc",
+    active: true,
+    allow_promotion_codes: false,
+    after_completion: { type: "hosted_confirmation" },
+    line_items: {
+      data: [{ id: "li_1", description: "Postiz Pro", quantity: 1, amount_total: 2900, currency: "eur" }],
+    },
+  };
+  const ctx = {
+    actor: { id: "42", name: "Ada", role: "admin", isAdmin: true },
+    stripe: {
+      formatAmount: (a: number, c: string) => `${(a / 100).toFixed(2)} ${c.toUpperCase()}`,
+      listPaymentLinks: async () => ({ links: [link, { ...link, id: "plink_2", active: false }], hasMore: false }),
+      getPaymentLink: async () => link,
+      listAllActivePrices: async () => [
+        { id: "price_1", nickname: "Pro monthly", unit_amount: 2900, currency: "eur", recurring: { interval: "month" } },
+      ],
+      createPaymentLink: async (params: Record<string, unknown>) => {
+        created.push(params);
+        return { id: "plink_new", url: "https://buy.stripe.com/new", active: true };
+      },
+      setPaymentLinkActive: async (id: string, active: boolean) => {
+        toggled.push([id, active]);
+        return { ...link, id, active };
+      },
+    },
+    settings: {} as never,
+    stores: {} as never,
+    billing: { actions: { effectiveMode: () => "direct" }, gateway: {} as never },
+    audit: async () => {},
+    security: { sessionIdHash: "h", authMethod: "passkey", stepUpFresh: () => true },
+  } as unknown as DashboardCtx;
+  return { ctx, created, toggled };
+}
+
+test("payment links (PA-7a): list w/ status counts + copyable URL + toggle; detail line items; create validates the price", async () => {
+  const { makeLinksSection } = await import("../sections/linksSection");
+  const section = makeLinksSection();
+  const { ctx, created, toggled } = linksCtx();
+  const page = await section.buildPage(ctx, { page: "links", filters: {} });
+  const table = page!.blocks.find((b) => b.type === "table") as TableBlock;
+  assert.equal(table.rows.length, 2);
+  const urlCell = table.rows[0].cells[2] as { t: string; href: string; copy?: boolean };
+  assert.equal(urlCell.t, "external");
+  assert.equal(urlCell.href, "https://buy.stripe.com/test_abc");
+  assert.equal(urlCell.copy, true);
+  assert.deepEqual(table.rows[0].ref, { page: "links.detail", params: { id: "plink_1" } });
+  assert.equal(table.rows[0].actions![0].label, "Deactivate");
+  assert.equal(table.rows[1].actions![0].label, "Reactivate");
+  const counts = Object.fromEntries(table.counts!.items.map((i) => [i.label, i.count]));
+  assert.equal(counts.Active, 1);
+  assert.equal(counts.Deactivated, 1);
+  // Detail: line items + external URL in the rail.
+  const detail = await section.buildPage(ctx, { page: "links.detail", params: { id: "plink_1" } });
+  const items = detail!.blocks.find((b) => b.type === "table") as TableBlock;
+  assert.equal((items.rows[0].cells[0] as { v: string }).v, "Postiz Pro");
+  // Create: bad price refused, good one passes quantity + adjustable through.
+  const bad = await section.action!(ctx, { key: "section:links.create", params: { price: "nope" } });
+  assert.equal(bad.ok, false);
+  assert.equal(created.length, 0);
+  const ok = await section.action!(ctx, {
+    key: "section:links.create",
+    params: { price: "price_1", quantity: 3, adjustable: true },
+  });
+  assert.equal(ok.ok, true);
+  assert.deepEqual(created[0], { priceId: "price_1", quantity: 3, adjustableQuantity: true });
+  assert.ok(ok.text!.includes("https://buy.stripe.com/new"));
+  // Toggle.
+  const off = await section.action!(ctx, { key: "section:links.toggle", params: { id: "plink_1", active: false } });
+  assert.equal(off.ok, true);
+  assert.deepEqual(toggled, [["plink_1", false]]);
+});
+
+test("tax rates (PA-7a): catalog tab lists rates w/ archive/restore; create validates name+percentage and archives never delete", async () => {
+  const { makeCatalogSection } = await import("../sections/catalogSection");
+  const createdRates: Array<Record<string, unknown>> = [];
+  const toggledRates: Array<[string, boolean]> = [];
+  const ctx = {
+    stripe: {
+      formatAmount: (a: number, c: string) => `${(a / 100).toFixed(2)} ${c.toUpperCase()}`,
+      listTaxRates: async () => [
+        { id: "txr_1", display_name: "VAT", description: "Germany", percentage: 19, inclusive: true, country: "DE", active: true },
+        { id: "txr_2", display_name: "Old VAT", percentage: 16, inclusive: true, country: "DE", active: false },
+      ],
+      createTaxRate: async (params: Record<string, unknown>) => {
+        createdRates.push(params);
+        return { id: "txr_new", display_name: params.displayName, percentage: params.percentage, inclusive: params.inclusive, active: true };
+      },
+      setTaxRateActive: async (id: string, active: boolean) => {
+        toggledRates.push([id, active]);
+        return { id, display_name: "VAT", active };
+      },
+    },
+    audit: async () => {},
+  } as unknown as DashboardCtx;
+  const section = makeCatalogSection();
+  const page = await section.buildPage(ctx, { page: "catalog", filters: { view: "tax" } });
+  const tabs = page!.blocks.find((b) => b.type === "tabs") as TabsBlock;
+  assert.ok(tabs.items.some((i) => i.value === "tax"));
+  const table = page!.blocks.find((b) => b.type === "table") as TableBlock;
+  assert.equal(table.key, "taxrates");
+  assert.equal((table.rows[0].cells[1] as { v: string }).v, "19% incl.");
+  assert.equal(table.rows[0].actions![0].label, "Archive");
+  assert.equal(table.rows[1].actions![0].label, "Restore");
+  // Create: percentage validation + param mapping.
+  const badPct = await section.action!(ctx, {
+    key: "section:catalog.tax_create",
+    params: { displayName: "VAT", percentage: "190" },
+  });
+  assert.equal(badPct.ok, false);
+  const ok = await section.action!(ctx, {
+    key: "section:catalog.tax_create",
+    params: { displayName: "VAT", percentage: "7.7", inclusive: true, country: "ch" },
+  });
+  assert.equal(ok.ok, true);
+  assert.equal(createdRates[0].percentage, 7.7);
+  assert.equal(createdRates[0].country, "CH");
+  assert.equal(createdRates[0].inclusive, true);
+  // Archive is a toggle, never a delete.
+  const archived = await section.action!(ctx, { key: "section:catalog.tax_toggle", params: { id: "txr_1", active: false } });
+  assert.equal(archived.ok, true);
+  assert.deepEqual(toggledRates, [["txr_1", false]]);
+});
+
+// ---- PA-7b: Quotes + Usage/Meters ----
+
+function quotesCtx(opts: { stepUpFresh?: boolean } = {}) {
+  const created: Array<Record<string, unknown>> = [];
+  const ops: Array<[string, string]> = []; // [op, quoteId]
+  const customer = { id: "cus_q1", name: "Ada Lovelace", email: "ada@example.com" };
+  const quotes: Record<string, Record<string, unknown>> = {
+    qt_draft: {
+      id: "qt_draft",
+      status: "draft",
+      amount_subtotal: 2900,
+      amount_total: 2900,
+      currency: "eur",
+      number: null,
+      customer,
+      expires_at: 1_700_900_000,
+      created: 1_700_000_000,
+      subscription: null,
+      invoice: null,
+      line_items: { data: [{ id: "li_q1", description: "Postiz Pro", quantity: 1, amount_total: 2900, currency: "eur" }] },
+    },
+    qt_open: {
+      id: "qt_open",
+      status: "open",
+      amount_subtotal: 4900,
+      amount_total: 4900,
+      currency: "eur",
+      number: "QT-0002",
+      customer,
+      expires_at: 1_700_900_000,
+      created: 1_700_000_000,
+      subscription: null,
+      invoice: null,
+      line_items: { data: [{ id: "li_q2", description: "Postiz Ultra", quantity: 1, amount_total: 4900, currency: "eur" }] },
+    },
+    qt_done: {
+      id: "qt_done",
+      status: "accepted",
+      amount_subtotal: 4900,
+      amount_total: 4900,
+      currency: "eur",
+      number: "QT-0001",
+      customer: "cus_q1",
+      expires_at: 1_700_900_000,
+      created: 1_700_000_000,
+      subscription: "sub_from_quote",
+      invoice: "in_from_quote",
+      line_items: { data: [] },
+    },
+  };
+  const ctx = {
+    actor: { id: "42", name: "Ada", role: "admin", isAdmin: true },
+    stripe: {
+      formatAmount: (a: number, c: string) => `${(a / 100).toFixed(2)} ${c.toUpperCase()}`,
+      listQuotes: async () => ({ quotes: Object.values(quotes), hasMore: false }),
+      getQuote: async (id: string) => {
+        if (!quotes[id]) throw new Error("no such quote");
+        return quotes[id];
+      },
+      listAllActivePrices: async () => [
+        { id: "price_1", nickname: "Pro monthly", unit_amount: 2900, currency: "eur", recurring: { interval: "month" } },
+      ],
+      createQuote: async (params: Record<string, unknown>) => {
+        created.push(params);
+        return { id: "qt_new", status: "draft" };
+      },
+      finalizeQuote: async (id: string) => {
+        ops.push(["finalize", id]);
+        return { ...quotes[id], status: "open", number: "QT-0009" };
+      },
+      cancelQuote: async (id: string) => {
+        ops.push(["cancel", id]);
+        return { ...quotes[id], status: "canceled" };
+      },
+      acceptQuote: async (id: string) => {
+        ops.push(["accept", id]);
+        return { ...quotes[id], status: "accepted", subscription: "sub_minted", invoice: "in_minted" };
+      },
+    },
+    settings: {} as never,
+    stores: {} as never,
+    billing: { actions: { effectiveMode: () => "direct" }, gateway: {} as never },
+    audit: async () => {},
+    security: { sessionIdHash: "h", authMethod: "passkey", stepUpFresh: () => opts.stepUpFresh !== false },
+  } as unknown as DashboardCtx;
+  return { ctx, created, ops };
+}
+
+test("quotes (PA-7b): list w/ status counts + customer links; detail actions are status-aware; lifecycle ops revalidate live status; accept is T2", async () => {
+  const { makeQuotesSection } = await import("../sections/quotesSection");
+  const section = makeQuotesSection();
+  const { ctx, created, ops } = quotesCtx();
+
+  // List: 3 quotes, count-cards per status, expanded customer renders as a link.
+  const page = await section.buildPage(ctx, { page: "quotes", filters: {} });
+  const table = page!.blocks.find((b) => b.type === "table") as TableBlock;
+  assert.equal(table.rows.length, 3);
+  const counts = Object.fromEntries(table.counts!.items.map((i) => [i.label, i.count]));
+  assert.equal(counts.Draft, 1);
+  assert.equal(counts.Open, 1);
+  assert.equal(counts.Accepted, 1);
+  assert.equal(counts.Canceled, 0);
+  const custCell = table.rows[0].cells[1] as { t: string; v: string; ref: { page: string } };
+  assert.equal(custCell.t, "link");
+  assert.equal(custCell.v, "Ada Lovelace");
+  assert.equal(custCell.ref.page, "customers.detail");
+  assert.deepEqual(table.rows[0].ref, { page: "quotes.detail", params: { id: "qt_draft" } });
+
+  // Detail (draft): Finalize + Cancel, no Accept.
+  const draft = await section.buildPage(ctx, { page: "quotes.detail", params: { id: "qt_draft" } });
+  const draftHeader = draft!.blocks.find((b) => b.type === "header") as HeaderBlock;
+  assert.deepEqual(draftHeader.actions!.map((a) => a.key), ["section:quotes.finalize", "section:quotes.cancel"]);
+  // Detail (open): Accept requires step-up, Cancel still offered.
+  const open = await section.buildPage(ctx, { page: "quotes.detail", params: { id: "qt_open" } });
+  const openHeader = open!.blocks.find((b) => b.type === "header") as HeaderBlock;
+  assert.deepEqual(openHeader.actions!.map((a) => a.key), ["section:quotes.accept", "section:quotes.cancel"]);
+  assert.equal(openHeader.actions![0].stepUp, true);
+  // Detail (accepted): no lifecycle actions; rail links the minted subscription + invoice.
+  const done = await section.buildPage(ctx, { page: "quotes.detail", params: { id: "qt_done" } });
+  const doneHeader = done!.blocks.find((b) => b.type === "header") as HeaderBlock;
+  assert.equal(doneHeader.actions!.length, 0);
+  const doneRail = done!.rail!.find((b) => b.type === "kv") as KeyValueBlock;
+  const railLabels = doneRail.rows.map((r) => r.label);
+  assert.ok(railLabels.includes("Subscription"));
+  assert.ok(railLabels.includes("Invoice"));
+
+  // Create: bad customer/price refused, valid params pass through.
+  const badCust = await section.action!(ctx, { key: "section:quotes.create", params: { customer: "nope", price: "price_1" } });
+  assert.equal(badCust.ok, false);
+  assert.equal(created.length, 0);
+  const okCreate = await section.action!(ctx, {
+    key: "section:quotes.create",
+    params: { customer: "cus_q1", price: "price_1", quantity: 2 },
+  });
+  assert.equal(okCreate.ok, true);
+  assert.deepEqual(created[0], { customerId: "cus_q1", priceId: "price_1", quantity: 2 });
+
+  // Finalize: CONFIRM required; live status revalidated (open quote refused).
+  const noConfirm = await section.action!(ctx, { key: "section:quotes.finalize", params: { id: "qt_draft" } });
+  assert.equal(noConfirm.ok, false);
+  const wrongState = await section.action!(ctx, {
+    key: "section:quotes.finalize",
+    params: { id: "qt_open" },
+    confirmWord: "CONFIRM",
+  });
+  assert.equal(wrongState.ok, false);
+  assert.ok(wrongState.error!.includes("open"));
+  const finalized = await section.action!(ctx, {
+    key: "section:quotes.finalize",
+    params: { id: "qt_draft" },
+    confirmWord: "CONFIRM",
+  });
+  assert.equal(finalized.ok, true);
+
+  // Accept: stale factor → needsStepUp before any Stripe write; fresh factor
+  // accepts OPEN only (draft refused); result names the minted objects.
+  const stale = quotesCtx({ stepUpFresh: false });
+  const needStep = await section.action!(stale.ctx, {
+    key: "section:quotes.accept",
+    params: { id: "qt_open" },
+    confirmWord: "CONFIRM",
+  });
+  assert.equal(needStep.ok, false);
+  assert.equal(needStep.needsStepUp, true);
+  assert.equal(stale.ops.length, 0);
+  const draftAccept = await section.action!(ctx, {
+    key: "section:quotes.accept",
+    params: { id: "qt_draft" },
+    confirmWord: "CONFIRM",
+  });
+  assert.equal(draftAccept.ok, false);
+  const accepted = await section.action!(ctx, {
+    key: "section:quotes.accept",
+    params: { id: "qt_open" },
+    confirmWord: "CONFIRM",
+  });
+  assert.equal(accepted.ok, true);
+  assert.ok(accepted.text!.includes("sub_minted"));
+
+  // Cancel: accepted quotes are immutable history.
+  const cancelDone = await section.action!(ctx, {
+    key: "section:quotes.cancel",
+    params: { id: "qt_done" },
+    confirmWord: "CONFIRM",
+  });
+  assert.equal(cancelDone.ok, false);
+  assert.deepEqual(ops, [["finalize", "qt_draft"], ["accept", "qt_open"]]);
+});
+
+function metersCtx() {
+  const created: Array<Record<string, unknown>> = [];
+  const toggled: Array<[string, boolean]> = [];
+  const summaryQueries: Array<Record<string, unknown>> = [];
+  const meters: Record<string, Record<string, unknown>> = {
+    mtr_1: {
+      id: "mtr_1",
+      display_name: "API requests",
+      status: "active",
+      event_name: "api_requests",
+      default_aggregation: { formula: "sum" },
+      customer_mapping: { event_payload_key: "stripe_customer_id", type: "by_id" },
+      value_settings: { event_payload_key: "value" },
+      event_time_window: null,
+      created: 1_700_000_000,
+      status_transitions: { deactivated_at: null },
+    },
+    mtr_2: {
+      id: "mtr_2",
+      display_name: "Old meter",
+      status: "inactive",
+      event_name: "legacy_units",
+      default_aggregation: { formula: "count" },
+      created: 1_700_000_000,
+      status_transitions: { deactivated_at: 1_700_500_000 },
+    },
+  };
+  const ctx = {
+    actor: { id: "42", name: "Ada", role: "admin", isAdmin: true },
+    stripe: {
+      formatAmount: (a: number, c: string) => `${(a / 100).toFixed(2)} ${c.toUpperCase()}`,
+      listMeters: async () => Object.values(meters),
+      getMeter: async (id: string) => {
+        if (!meters[id]) throw new Error("no such meter");
+        return meters[id];
+      },
+      createMeter: async (params: Record<string, unknown>) => {
+        created.push(params);
+        return { id: "mtr_new", event_name: params.eventName };
+      },
+      setMeterActive: async (id: string, active: boolean) => {
+        toggled.push([id, active]);
+        return { ...meters[id], status: active ? "active" : "inactive" };
+      },
+      listMeterEventSummaries: async (id: string, params: Record<string, unknown>) => {
+        summaryQueries.push({ id, ...params });
+        return [
+          { id: "mtrusg_1", start_time: 1_752_800_400, end_time: 1_752_804_000, aggregated_value: 42 },
+          { id: "mtrusg_2", start_time: 1_752_804_000, end_time: 1_752_807_600, aggregated_value: 7.5 },
+        ];
+      },
+    },
+    settings: {} as never,
+    stores: {} as never,
+    billing: { actions: { effectiveMode: () => "direct" }, gateway: {} as never },
+    audit: async () => {},
+    security: { sessionIdHash: "h", authMethod: "passkey", stepUpFresh: () => true },
+  } as unknown as DashboardCtx;
+  return { ctx, created, toggled, summaryQueries };
+}
+
+test("meters (PA-7b): list w/ toggle; detail summaries REQUIRE a customer scope w/ aligned windows; toggle is T1 + live-status; create validates the event name", async () => {
+  const { makeMetersSection } = await import("../sections/metersSection");
+  const section = makeMetersSection();
+  const { ctx, created, toggled, summaryQueries } = metersCtx();
+
+  // List: rows + status-aware toggle labels.
+  const page = await section.buildPage(ctx, { page: "meters", filters: {} });
+  const table = page!.blocks.find((b) => b.type === "table") as TableBlock;
+  assert.equal(table.rows.length, 2);
+  assert.equal(table.rows[0].actions![0].label, "Deactivate");
+  assert.equal(table.rows[1].actions![0].label, "Reactivate");
+  assert.deepEqual(table.rows[0].ref, { page: "meters.detail", params: { id: "mtr_1" } });
+
+  // Detail without a customer: NO summary API call, hint explains the scoping.
+  const unscoped = await section.buildPage(ctx, { page: "meters.detail", params: { id: "mtr_1" }, filters: {} });
+  const emptyTable = unscoped!.blocks.find((b) => b.type === "table") as TableBlock;
+  assert.equal(emptyTable.rows.length, 0);
+  assert.ok(emptyTable.empty!.includes("cus_"));
+  assert.equal(summaryQueries.length, 0);
+
+  // Detail with customer + 24h window: hour granularity, boundaries aligned to
+  // full hours, exactly 24h span, and summary rows render.
+  const scoped = await section.buildPage(ctx, {
+    page: "meters.detail",
+    params: { id: "mtr_1" },
+    filters: { customer: "cus_q1", window: "24h" },
+  });
+  assert.equal(summaryQueries.length, 1);
+  const q = summaryQueries[0] as { customerId: string; startTime: number; endTime: number; granularity: string };
+  assert.equal(q.customerId, "cus_q1");
+  assert.equal(q.granularity, "hour");
+  assert.equal(q.endTime % 3600, 0);
+  assert.equal(q.endTime - q.startTime, 24 * 3600);
+  const sumTable = scoped!.blocks.find((b) => b.type === "table") as TableBlock;
+  assert.equal(sumTable.rows.length, 2);
+  assert.equal((sumTable.rows[0].cells[2] as { v: string }).v, "42");
+
+  // Toggle: CONFIRM required; live status refuses a no-op; then executes.
+  const noConfirm = await section.action!(ctx, { key: "section:meters.toggle", params: { id: "mtr_1", active: false } });
+  assert.equal(noConfirm.ok, false);
+  const noop = await section.action!(ctx, {
+    key: "section:meters.toggle",
+    params: { id: "mtr_1", active: true },
+    confirmWord: "CONFIRM",
+  });
+  assert.equal(noop.ok, false);
+  assert.ok(noop.error!.includes("already"));
+  const off = await section.action!(ctx, {
+    key: "section:meters.toggle",
+    params: { id: "mtr_1", active: false },
+    confirmWord: "CONFIRM",
+  });
+  assert.equal(off.ok, true);
+  assert.deepEqual(toggled, [["mtr_1", false]]);
+
+  // Create: event name + formula validated, params mapped.
+  const badEvent = await section.action!(ctx, {
+    key: "section:meters.create",
+    params: { displayName: "API", eventName: "bad name!", formula: "sum" },
+  });
+  assert.equal(badEvent.ok, false);
+  assert.equal(created.length, 0);
+  const okCreate = await section.action!(ctx, {
+    key: "section:meters.create",
+    params: { displayName: "API requests", eventName: "api_requests", formula: "sum" },
+  });
+  assert.equal(okCreate.ok, true);
+  assert.deepEqual(created[0], { displayName: "API requests", eventName: "api_requests", formula: "sum" });
+});

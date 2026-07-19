@@ -1279,6 +1279,177 @@ export class StripeClient {
     await this.stripe.coupons.del(couponId);
   }
 
+  // ---- payment links (PA-7a) ----
+
+  // line_items are expanded so the list can show what each link sells
+  // without N+1 reads.
+  async listPaymentLinks(
+    opts: { limit?: number; startingAfter?: string } = {}
+  ): Promise<{ links: Stripe.PaymentLink[]; hasMore: boolean }> {
+    const res = await this.stripe.paymentLinks.list({
+      limit: opts.limit ?? 25,
+      ...(opts.startingAfter ? { starting_after: opts.startingAfter } : {}),
+      expand: ["data.line_items"],
+    });
+    return { links: res.data, hasMore: res.has_more };
+  }
+
+  async getPaymentLink(paymentLinkId: string): Promise<Stripe.PaymentLink> {
+    return this.stripe.paymentLinks.retrieve(paymentLinkId, { expand: ["line_items"] });
+  }
+
+  async createPaymentLink(
+    params: { priceId: string; quantity: number; adjustableQuantity?: boolean },
+    idempotencyKey: string
+  ): Promise<Stripe.PaymentLink> {
+    return this.stripe.paymentLinks.create(
+      {
+        line_items: [
+          {
+            price: params.priceId,
+            quantity: params.quantity,
+            ...(params.adjustableQuantity ? { adjustable_quantity: { enabled: true, minimum: 1 } } : {}),
+          },
+        ],
+      },
+      { idempotencyKey }
+    );
+  }
+
+  // Payment links can't be deleted — deactivation kills the URL (and
+  // reactivation revives the same URL).
+  async setPaymentLinkActive(paymentLinkId: string, active: boolean): Promise<Stripe.PaymentLink> {
+    return this.stripe.paymentLinks.update(paymentLinkId, { active });
+  }
+
+  // ---- tax rates (PA-7a) ----
+
+  async listTaxRates(limit = 25): Promise<Stripe.TaxRate[]> {
+    const res = await this.stripe.taxRates.list({ limit });
+    return res.data;
+  }
+
+  async createTaxRate(
+    params: { displayName: string; percentage: number; inclusive: boolean; country?: string; description?: string },
+    idempotencyKey: string
+  ): Promise<Stripe.TaxRate> {
+    return this.stripe.taxRates.create(
+      {
+        display_name: params.displayName,
+        percentage: params.percentage,
+        inclusive: params.inclusive,
+        ...(params.country ? { country: params.country } : {}),
+        ...(params.description ? { description: params.description } : {}),
+      },
+      { idempotencyKey }
+    );
+  }
+
+  // Tax rates can't be deleted — archiving (active:false) hides them from new
+  // use; already-attached invoices/subscriptions keep them.
+  async setTaxRateActive(taxRateId: string, active: boolean): Promise<Stripe.TaxRate> {
+    return this.stripe.taxRates.update(taxRateId, { active });
+  }
+
+  // ---- quotes (PA-7b) ----
+
+  // data.customer is expanded so the list can show a name/email instead of a
+  // raw cus_ id without N+1 reads.
+  async listQuotes(
+    opts: { limit?: number; startingAfter?: string } = {}
+  ): Promise<{ quotes: Stripe.Quote[]; hasMore: boolean }> {
+    const res = await this.stripe.quotes.list({
+      limit: opts.limit ?? 25,
+      ...(opts.startingAfter ? { starting_after: opts.startingAfter } : {}),
+      expand: ["data.customer"],
+    });
+    return { quotes: res.data, hasMore: res.has_more };
+  }
+
+  async getQuote(quoteId: string): Promise<Stripe.Quote> {
+    return this.stripe.quotes.retrieve(quoteId, { expand: ["line_items", "customer"] });
+  }
+
+  // Minimal draft-quote composer: one price for one customer. Richer quotes
+  // (multi-line, discounts, headers) stay in the real Stripe dashboard.
+  async createQuote(
+    params: { customerId: string; priceId: string; quantity: number },
+    idempotencyKey: string
+  ): Promise<Stripe.Quote> {
+    return this.stripe.quotes.create(
+      {
+        customer: params.customerId,
+        line_items: [{ price: params.priceId, quantity: params.quantity }],
+      },
+      { idempotencyKey }
+    );
+  }
+
+  // draft → open: assigns the quote number and makes it acceptable.
+  async finalizeQuote(quoteId: string, idempotencyKey?: string): Promise<Stripe.Quote> {
+    return this.stripe.quotes.finalizeQuote(quoteId, {}, idempotencyKey ? { idempotencyKey } : undefined);
+  }
+
+  async cancelQuote(quoteId: string, idempotencyKey?: string): Promise<Stripe.Quote> {
+    return this.stripe.quotes.cancel(quoteId, {}, idempotencyKey ? { idempotencyKey } : undefined);
+  }
+
+  // Accepting mints the subscription/invoice the quote describes.
+  async acceptQuote(quoteId: string, idempotencyKey?: string): Promise<Stripe.Quote> {
+    return this.stripe.quotes.accept(quoteId, {}, idempotencyKey ? { idempotencyKey } : undefined);
+  }
+
+  // ---- usage meters (PA-7b) ----
+
+  async listMeters(limit = 25): Promise<Stripe.Billing.Meter[]> {
+    const res = await this.stripe.billing.meters.list({ limit });
+    return res.data;
+  }
+
+  async getMeter(meterId: string): Promise<Stripe.Billing.Meter> {
+    return this.stripe.billing.meters.retrieve(meterId);
+  }
+
+  // Minimal meter create: Stripe defaults the customer mapping to the
+  // stripe_customer_id payload key and (for sum) the value key to "value".
+  async createMeter(
+    params: { displayName: string; eventName: string; formula: "count" | "sum" | "last" },
+    idempotencyKey: string
+  ): Promise<Stripe.Billing.Meter> {
+    return this.stripe.billing.meters.create(
+      {
+        display_name: params.displayName,
+        event_name: params.eventName,
+        default_aggregation: { formula: params.formula },
+      },
+      { idempotencyKey }
+    );
+  }
+
+  // Meters can't be deleted — deactivating stops event ingestion (and blocks
+  // attaching the meter to new prices) until reactivated.
+  async setMeterActive(meterId: string, active: boolean): Promise<Stripe.Billing.Meter> {
+    return active
+      ? this.stripe.billing.meters.reactivate(meterId, {})
+      : this.stripe.billing.meters.deactivate(meterId, {});
+  }
+
+  // Stripe scopes meter event summaries to ONE customer; start/end must align
+  // with hour/day boundaries matching the grouping window.
+  async listMeterEventSummaries(
+    meterId: string,
+    params: { customerId: string; startTime: number; endTime: number; granularity: "hour" | "day" }
+  ): Promise<Stripe.Billing.MeterEventSummary[]> {
+    const res = await this.stripe.billing.meters.listEventSummaries(meterId, {
+      customer: params.customerId,
+      start_time: params.startTime,
+      end_time: params.endTime,
+      value_grouping_window: params.granularity,
+      limit: 100,
+    });
+    return res.data;
+  }
+
   // Product catalog (read-only surface for the dashboard). default_price is
   // expanded so list rows can show the headline price without N+1 reads.
   async listProducts(opts: { limit?: number; startingAfter?: string } = {}): Promise<{ products: Stripe.Product[]; hasMore: boolean }> {

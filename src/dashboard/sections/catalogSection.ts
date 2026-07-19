@@ -27,7 +27,8 @@ export function makeCatalogSection(): DashboardSectionModule {
         return productDetail(ctx, id);
       }
       const filters = req.filters ?? {};
-      const view = filters.view === "coupons" || filters.view === "promos" ? filters.view : "";
+      const view =
+        filters.view === "coupons" || filters.view === "promos" || filters.view === "tax" ? filters.view : "";
       const blocks: Block[] = [];
       blocks.push({
         type: "tabs",
@@ -37,10 +38,12 @@ export function makeCatalogSection(): DashboardSectionModule {
           { value: "", label: "Products & prices" },
           { value: "coupons", label: "Coupons" },
           { value: "promos", label: "Promo codes" },
+          { value: "tax", label: "Tax rates" },
         ],
       });
       if (view === "coupons") blocks.push(...(await couponsBlocks(ctx)));
       else if (view === "promos") blocks.push(...(await promosBlocks(ctx, filters)));
+      else if (view === "tax") blocks.push(...(await taxBlocks(ctx)));
       else blocks.push(await productsTable(ctx, req.cursor ?? null));
       return { title: "Product catalog", crumbs: [{ label: "Product catalog" }], blocks };
     },
@@ -174,6 +177,44 @@ export function makeCatalogSection(): DashboardSectionModule {
           );
           await ctx.audit(`Promo code ${promo.code} (${promo.id}) created on coupon ${coupon}`);
           return { ok: true, text: `Promo code ${promo.code} created.` };
+        }
+
+        // T0 — create a tax rate (PA-7a). Tax rates can't be deleted, only
+        // archived, so creation is the whole write surface besides the toggle.
+        case "section:catalog.tax_create": {
+          const displayName = str(p.displayName, 50).trim();
+          const percentageRaw = str(p.percentage, 10).trim();
+          const country = str(p.country, 2).trim().toUpperCase();
+          const description = str(p.description, 100).trim();
+          if (!displayName) return { ok: false, fieldErrors: { displayName: "A display name is required (shown on invoices)." } };
+          const percentage = Number.parseFloat(percentageRaw);
+          if (!/^\d+(\.\d{1,4})?$/.test(percentageRaw) || !(percentage > 0) || percentage > 100) {
+            return { ok: false, fieldErrors: { percentage: "Percentage must be a number between 0 and 100 (e.g. 19 or 7.7)." } };
+          }
+          if (country && !/^[A-Z]{2}$/.test(country)) {
+            return { ok: false, fieldErrors: { country: "Country must be a 2-letter code (e.g. DE) — or empty." } };
+          }
+          const rate = await ctx.stripe.createTaxRate(
+            {
+              displayName,
+              percentage,
+              inclusive: p.inclusive === true,
+              country: country || undefined,
+              description: description || undefined,
+            },
+            `dash-taxrate-${Date.now().toString(36)}`
+          );
+          await ctx.audit(`Tax rate ${rate.id} created — ${displayName} ${percentage}% (${rate.inclusive ? "inclusive" : "exclusive"})`);
+          return { ok: true, text: `Tax rate ${rate.id} created.` };
+        }
+
+        // T0 — archive/restore a tax rate (delete does not exist).
+        case "section:catalog.tax_toggle": {
+          const id = str(p.id, 64).trim();
+          if (!/^txr_[A-Za-z0-9]{1,64}$/.test(id)) return { ok: false, error: "Bad tax rate id." };
+          const rate = await ctx.stripe.setTaxRateActive(id, p.active === true);
+          await ctx.audit(`Tax rate ${id} ${rate.active ? "restored" : "archived"}`);
+          return { ok: true, text: `${rate.display_name} is now ${rate.active ? "active" : "archived"}.` };
         }
 
         // T0 — toggle a promotion code (Stripe can't edit/delete promos).
@@ -527,6 +568,68 @@ async function promosBlocks(ctx: DashboardCtx, filters: Record<string, string>):
     actions: [createButton],
   });
   return blocks;
+}
+
+// ---- Tax rates (PA-7a: list + create + archive/restore) ----
+
+async function taxBlocks(ctx: DashboardCtx): Promise<Block[]> {
+  const rates = await ctx.stripe.listTaxRates(25).catch(() => [] as Stripe.TaxRate[]);
+  const table: TableBlock = {
+    type: "table",
+    key: "taxrates",
+    title: "Tax rates",
+    columns: [
+      { key: "name", label: "Name" },
+      { key: "rate", label: "Rate", align: "right" },
+      { key: "region", label: "Region" },
+      { key: "status", label: "" },
+      { key: "id", label: "ID" },
+    ],
+    rows: rates.map((r) => ({
+      id: r.id,
+      cells: [
+        { t: "text", v: r.display_name, strong: true, ...(r.description ? { sub: r.description } : {}) } as Cell,
+        text(`${r.percentage}% ${r.inclusive ? "incl." : "excl."}`),
+        text(r.country ?? "—"),
+        badgeCell(r.active ? "ok" : "neutral", r.active ? "Active" : "Archived"),
+        idCell(r.id, { copy: true }),
+      ] as Cell[],
+      actions: [
+        r.active
+          ? {
+              key: "section:catalog.tax_toggle",
+              label: "Archive",
+              params: { id: r.id, active: false },
+              summary: "Hides the rate from new invoices/subscriptions — existing attachments keep it.",
+            }
+          : { key: "section:catalog.tax_toggle", label: "Restore", params: { id: r.id, active: true } },
+      ],
+    })),
+    empty: "No tax rates yet.",
+    ...(rates.length ? { footer: `${rates.length} most recent tax rates` } : {}),
+    notice: "Tax rates can't be deleted or have their percentage edited — archive and create a replacement.",
+  };
+  const create: Block = {
+    type: "notice",
+    badge: { kind: "info", text: "Create" },
+    text: "Tax rates attach to invoices and subscriptions; inclusive = the price already contains the tax.",
+    actions: [
+      {
+        key: "section:catalog.tax_create",
+        label: "New tax rate",
+        style: "primary",
+        inputs: [
+          { type: "text", key: "displayName", label: "Display name (e.g. VAT)" },
+          { type: "text", key: "percentage", label: "Percentage (e.g. 19 or 7.7)" },
+          { type: "toggle", key: "inclusive", label: "Tax-inclusive prices" },
+          { type: "text", key: "country", label: "Country (2 letters, optional)", placeholder: "DE" },
+          { type: "text", key: "description", label: "Internal description (optional)" },
+        ],
+        summary: "Creates the tax rate — the percentage is immutable afterwards.",
+      },
+    ],
+  };
+  return [table, create];
 }
 
 function promoVerdictKv(ctx: DashboardCtx, promo: Stripe.PromotionCode): Block {
