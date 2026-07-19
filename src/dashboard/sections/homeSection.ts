@@ -6,11 +6,11 @@ import { badgeCell, refForId, sentence, strong, text } from "./cells";
 
 // Home v1+charts: the needs-attention inbox (disputes closing in, queued
 // approvals, charge reviews, fresh early-fraud warnings), account stat tiles,
-// the five M5 charts (lazily hydrated via the series endpoint) and the
+// the five home charts (lazily hydrated via the series endpoint) and the
 // recent-activity feed from Stripe events. The view build stays ≤4 direct
 // Stripe calls — charts and the active-subs count come from HomeMetrics'
 // 10-minute cache. The inbox computation is shared with the topbar bell via
-// computeAttention (PA-13) — one implementation feeds both surfaces.
+// computeAttention — one implementation feeds both surfaces.
 
 const DUE_SOON_HOURS = 72;
 const EFW_WINDOW_HOURS = 72;
@@ -107,7 +107,7 @@ export function makeHomeSection(deps: { metrics: HomeMetrics }): DashboardSectio
       return page === "home";
     },
 
-    // Bell feed (PA-13): the SAME inbox entries, newest-first cap applied by
+    // Bell feed: the SAME inbox entries, newest-first cap applied by
     // the Dashboard collector.
     async attention(ctx: DashboardCtx): Promise<AttentionItem[]> {
       const { entries } = await computeAttention(ctx);
@@ -194,7 +194,7 @@ export function makeHomeSection(deps: { metrics: HomeMetrics }): DashboardSectio
         ...(inboxRows.length ? { footer: `${inboxRows.length} item${inboxRows.length === 1 ? "" : "s"}` } : {}),
       });
 
-      // ---- the five M5 charts (hydrated lazily via the series endpoint) ----
+      // ---- the five home charts (hydrated lazily via the series endpoint) ----
       blocks.push(
         { type: "chart", key: "gross_volume", title: "Gross volume", kind: "area", window },
         { type: "chart", key: "new_customers", title: "New customers", kind: "bars", window },

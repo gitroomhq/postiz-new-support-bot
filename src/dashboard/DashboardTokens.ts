@@ -21,9 +21,9 @@ import { SettingsStore } from "../config/SettingsStore";
 const TOKEN_TTL_MS = 15 * 60 * 1000;
 const VERSION = "d1";
 
-// "open" = break-glass panel link (M0 flow); "enroll" = credential-enrollment
-// link for operators without the Discord Administrator bit (standing-auth
-// milestone). Both live in the MAC'd body so one can never verify as the other.
+// "open" = break-glass panel link; "enroll" = credential-enrollment link
+// for operators without the Discord Administrator bit. Both live in the
+// MAC'd body so one can never verify as the other.
 export type DashboardTokenKind = "open" | "enroll";
 
 export interface DashboardTokenPayload {

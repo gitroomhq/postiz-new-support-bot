@@ -435,7 +435,7 @@ test("customer 360: Insights/Details/Linked accounts in the rail, atoms in the m
   const section = makeCustomersSection();
   const page = await section.buildPage(fakeCustomerCtx(), { page: "customers.detail", params: { id: "cus_test1" } });
   assert.ok(page);
-  // PA-8/PA-10 rail: Insights/Details/Tax IDs/Addresses/Linked + Manage.
+  // Rail: Insights/Details/Tax IDs/Addresses/Linked + Manage.
   const railCard = (title: string) =>
     page!.rail!.find((b) => b.type === "kv" && (b as KeyValueBlock).title?.startsWith(title)) as KeyValueBlock;
   assert.ok(page!.rail && page!.rail.length === 6, "expected a 6-card rail");
@@ -475,7 +475,7 @@ test("customer 360: Insights/Details/Linked accounts in the rail, atoms in the m
   assert.equal((header as { sub?: string }).sub, "ada@example.com");
   assert.ok(!page!.blocks.some((b) => b.type === "stats"));
   // Main tables use the atoms: payments amount cell carries the status pill
-  // (+ the PA-4 numeric major value for client-side bulk totals).
+  // (+ the numeric major value for client-side bulk totals).
   const payments = page!.blocks.find((b) => b.type === "table" && b.key === "charges") as TableBlock;
   assert.deepEqual(payments.rows[0].cells[0], {
     t: "amount",
@@ -500,7 +500,7 @@ test("customers list: strong name cell, search filter, N items footer", async ()
   });
   const section = makeCustomersSection();
   const page = await section.buildPage(ctx, { page: "customers" });
-  // M7: blocks[0] is now the page header carrying "New customer".
+  // blocks[0] is now the page header carrying "New customer".
   const header = page!.blocks[0] as HeaderBlock;
   assert.equal(header.actions![0].key, "section:customers.create");
   const table = page!.blocks.find((b) => b.type === "table") as TableBlock;
@@ -539,7 +539,7 @@ test("security page: factors + emergency in the rail, tables in main", async () 
   assert.ok(!page!.blocks.some((b) => b.type === "kv"));
 });
 
-// ---- M2: gateway binding resolver (server-derived customer scope) ----
+// ---- gateway binding resolver (server-derived customer scope) ----
 
 function gatewayFixture(overrides: { discordIds?: string[]; chargeRefunded?: number } = {}) {
   const stripe = {
@@ -621,7 +621,7 @@ test("gateway: charge_review binds the ticket thread from the PENDING review row
   assert.equal(missing.ok, false);
 });
 
-// ---- M2: requestScoped level/queue/execute + idempotency + origin branch ----
+// ---- requestScoped level/queue/execute + idempotency + origin branch ----
 
 function serviceFixture(opts: {
   level: "none" | "approval" | "admin" | "all";
@@ -748,7 +748,7 @@ test("actOnApproval: dashboard-origin approvals rebuild ctx from the row (cross-
   assert.deepEqual(fx.executed, [approvalId]);
 });
 
-// ---- M2: guardrail dry-run panel ----
+// ---- guardrail dry-run panel ----
 
 function guardrailDeps(opts: {
   maxAmount?: number | null;
@@ -806,7 +806,7 @@ test("guardrail panel: trips are counted into the verdict; missing Discord link 
   assert.match((pass.rows[0].cell as { b: { text: string } }).b.text, /would pass/);
 });
 
-// ---- M2: server-side ceremony belts on registry dispatch ----
+// ---- server-side ceremony belts on registry dispatch ----
 
 test("api action: registry keys enforce T1 CONFIRM and T2 fresh-factor server-side", async () => {
   const fake = fakeSettings();
@@ -865,7 +865,7 @@ test("api action: registry keys enforce T1 CONFIRM and T2 fresh-factor server-si
   assert.deepEqual(gatewayCalls, ["charge.refund_full"]);
 });
 
-// ---- M2: payments list/detail rendering ----
+// ---- payments list/detail rendering ----
 
 function paymentsCtx(): DashboardCtx {
   const charge = (over: Record<string, unknown>): Stripe.Charge =>
@@ -911,7 +911,7 @@ function paymentsCtx(): DashboardCtx {
       hasMore: false,
     }),
     getCustomer: async () => ({ id: "cus_a", email: "a@x.com", name: "Ada" }),
-    // PA-5 transactions-tab views:
+    // Transactions-tab views:
     getBalance: async () => ({ available: [{ amount: 50000, currency: "eur" }], pending: [{ amount: 1000, currency: "eur" }] }),
     listPayouts: async () => ({
       payouts: [
@@ -998,7 +998,7 @@ test("payment detail: unlinked customer gets the partial-remaining refund button
   assert.equal((net.cell as { v: string }).v, "23.81 EUR");
 });
 
-// ---- PA-2: list toolbar + dispute-on-charge ----
+// ---- list toolbar + dispute-on-charge ----
 
 test("payments list: Stripe toolbar (select/export/edit-columns) + decline-reason column", async () => {
   const section = makePaymentsSection();
@@ -1063,7 +1063,7 @@ test("charge detail: an open dispute surfaces a banner + Dispute rail card + sin
   assert.equal(respondRef.params.id, "dp_9");
 });
 
-// ---- M4: global search ----
+// ---- global search ----
 
 function searchFixture(overrides: { customersThrow?: boolean } = {}) {
   const stripe = {
@@ -1138,7 +1138,7 @@ test("global search: id fast-path, last4/amount classification, discord link, fa
   assert.ok(!degradedLabels.includes("Customers") && degradedLabels.includes("Payments"));
 });
 
-// ---- M4: Home v1 + Balances rendering ----
+// ---- Home v1 + Balances rendering ----
 
 function homeCtx(): DashboardCtx {
   const now = Math.floor(Date.now() / 1000);
@@ -1195,7 +1195,7 @@ test("home: stat tiles + needs-attention inbox (due dispute, approval, reviews, 
   assert.equal(tile["Available balance"], "120.00 EUR");
   assert.equal(tile["Active subscriptions"], "137"); // real cached count, not the old per-view "100+"
   assert.equal(tile["Open approvals"], "3"); // 1 approval + 2 charge reviews
-  // The five M5 charts ride along, honoring the window filter.
+  // The five home charts ride along, honoring the window filter.
   const charts = page!.blocks.filter((b) => b.type === "chart") as Array<{ key: string; window: string }>;
   assert.deepEqual(charts.map((c) => c.key), ["gross_volume", "new_customers", "failed_payments", "mrr_by_plan", "dispute_ratio"]);
   assert.ok(charts.every((c) => c.window === "30d"));
@@ -1302,7 +1302,7 @@ test("failed payment: timeline tells the real story (seller message + codes), no
   assert.deepEqual(typeRow.cell, { t: "card", brand: "link", last4: "" });
 });
 
-// ---- M3: subscriptions + invoices ----
+// ---- subscriptions + invoices ----
 
 function subsCtx(overrides: { previewThrows?: boolean; testMode?: boolean; testClock?: string } = {}): DashboardCtx {
   const sub = {
@@ -1526,7 +1526,7 @@ test("invoices list: count-cards + draft builder header action; detail: status-g
   const section = makeInvoicesSection();
   const page = await section.buildPage(invoiceCtx("open"), { page: "invoices", filters: {} });
   const header = page!.blocks[0] as HeaderBlock;
-  // PA-8: the one-line modal became a link-button into the multi-line composer.
+  // The one-line modal became a link-button into the multi-line composer.
   assert.deepEqual(header.actions![0].ref, { page: "invoices.new" });
   const table = page!.blocks.find((b) => b.type === "table") as TableBlock;
   const counts = Object.fromEntries(table.counts!.items.map((i) => [i.label, i.count]));
@@ -1559,7 +1559,7 @@ test("invoices list: count-cards + draft builder header action; detail: status-g
   assert.deepEqual((draft!.blocks[0] as HeaderBlock).actions!.map((a) => a.key), ["invoice.finalize", "invoice.void", "section:invoices.bookmark"]);
 });
 
-test("invoice detail (PA-3): Billing details block + Recent activity timeline", async () => {
+test("invoice detail: Billing details block + Recent activity timeline", async () => {
   const section = makeInvoicesSection();
   const page = await section.buildPage(invoiceCtx("paid"), { page: "invoices.detail", params: { id: "in_1" } });
   const billing = page!.blocks.find((b) => b.type === "kv" && b.title === "Billing details") as KeyValueBlock;
@@ -1578,7 +1578,7 @@ test("invoice detail (PA-3): Billing details block + Recent activity timeline", 
   assert.ok(labels.indexOf("Paid") < labels.indexOf("Invoice created"));
 });
 
-test("gateway M3: finalize binds via invoice, credit-note amountMajor converts via invoice currency, draft builder folds items", async () => {
+test("gateway: finalize binds via invoice, credit-note amountMajor converts via invoice currency, draft builder folds items", async () => {
   const sessionStore = { findDiscordIdsByStripeId: async () => [] } as unknown as SessionStore;
   const stripe = {
     getInvoice: async () => ({ id: "in_1", customer: "cus_inv", currency: "eur" }),
@@ -1622,7 +1622,7 @@ test("registry invoice.finalize: draft-only revalidation with ownership", async 
   assert.match((await def.revalidate(ctx("draft", "cus_OTHER"), (parsed as { params: unknown }).params)) ?? "", /does not belong/);
 });
 
-test("api belts M3: off-session invoice pay demands a fresh factor; send does not", async () => {
+test("api belts: off-session invoice pay demands a fresh factor; send does not", async () => {
   const fake = fakeSettings();
   const gatewayCalls: string[] = [];
   const provider: DashboardAuthProvider = {
@@ -1655,7 +1655,7 @@ test("api belts M3: off-session invoice pay demands a fresh factor; send does no
   assert.deepEqual(gatewayCalls, ["invoice.collect"]);
 });
 
-// ---- M5: HomeMetrics + series endpoint + integration refs ----
+// ---- HomeMetrics + series endpoint + integration refs ----
 
 test("HomeMetrics: daily bucketing, truncation notes, TTL cache + singleflight, dispute-ratio bands", async () => {
   const { HomeMetrics } = await import("../metrics/HomeMetrics");
@@ -1759,7 +1759,7 @@ test("integration refs: change-plan rows self-select via filters; Customer-360 f
     filters: {},
   });
   const prices = picker!.blocks.find((b) => b.type === "table" && b.key === "prices") as TableBlock;
-  // PA-4: the picker includes the CURRENT price (row 0, marked) so qty/promo/
+  // The picker includes the CURRENT price (row 0, marked) so qty/promo/
   // cycle-only updates are possible; every row still self-selects via filters.
   assert.deepEqual(prices.rows.map((r) => r.id), ["price_old", "price_new"]);
   assert.deepEqual(prices.rows[1].ref, {
@@ -1801,11 +1801,11 @@ test("integration refs: change-plan rows self-select via filters; Customer-360 f
   assert.deepEqual(listedIds, ["cus_a"]);
 });
 
-// ---- M6.1/M6.2: disputes overview / workbench ----
+// ---- disputes overview / workbench ----
 
 // Real service over fakes: the section tests exercise the SAME code path the
-// Discord hub runs (extraction parity is the point of M6.2).
-// Faked AI runners + settings for the M6.3 pipelines. draftJson feeds the
+// Discord hub runs (extraction parity is the point).
+// Faked AI runners + settings for the pipelines. draftJson feeds the
 // Claude CLI fake's final message; reviewText the light model's.
 function fakeAiDeps(opts: { draftJson?: string; reviewText?: string; lightRun?: () => Promise<string[]> } = {}) {
   const seen = { draftPrompts: [] as string[], reviewAttachments: [] as number[] };
@@ -2109,7 +2109,7 @@ test("disputes history-tab: outcome tiles + win-rate-by-reason + closed list; de
   assert.ok(history!.blocks.some((b) => b.type === "table" && b.key === "closed"));
 });
 
-// ---- M6.2: evidence service extraction parity ----
+// ---- evidence service extraction parity ----
 
 test("evidence service: catalog covers every TEXT_EVIDENCE_KEY exactly once; recommended groups per reason", () => {
   const catalogKeys = EVIDENCE_GROUPS.flatMap((g) => g.fields.map((f) => f.key)).sort();
@@ -2204,7 +2204,7 @@ test("evidence service: accept claims, closes and upserts; packageFrom computes 
   assert.equal(pkg.respondable, true);
 });
 
-// ---- M6.2: the workbench page + section actions ----
+// ---- the workbench page + section actions ----
 
 test("dispute workbench: live detail — evidence widget states, submit ceremony, refund-to-prevent baked from the dispute's charge", async () => {
   const fakes = evidenceFakes();
@@ -2375,7 +2375,7 @@ test("disputes review page: staged read-back tables, per-file remove actions, un
   assert.equal(header.actions![0].key, "section:disputes.submit");
 });
 
-// ---- M6.3: AI draft + review via the service seams ----
+// ---- AI draft + review via the service seams ----
 
 test("AI draft: faked runner — validators drop misshapen values, Stripe-sourced fields override the model, draft merges locally", async () => {
   const ai = fakeAiDeps({
@@ -2474,7 +2474,7 @@ test("dashboard AI actions: per-dispute lock blocks concurrent runs; review verd
   assert.deepEqual(tools.actions.map((a) => a.key), ["section:disputes.ai_draft", "section:disputes.ai_review"]);
 });
 
-// ---- M7: fraud hunts ----
+// ---- fraud hunts ----
 
 test("FraudHuntService: input validation is hard; fingerprint aggregates per customer w/ Discord links; amount hunt keeps declined PIs", async () => {
   const { FraudHuntService } = await import("../../bot/billing/FraudHuntService");
@@ -2627,7 +2627,7 @@ test("fraud page: EFW tab default with charge refs; card tab feeds the fingerpri
   assert.deepEqual(huntCalls, ["Xt5EWLLDS7FJjR1c"]);
 });
 
-// ---- M7: blocklist ----
+// ---- blocklist ----
 
 test("blocklist: raw-value add validates hard and runs BlockService; customer add is registry-only; unblock is T1-gated", async () => {
   const { makeBlocklistSection } = await import("../sections/blocklistSection");
@@ -2695,7 +2695,7 @@ test("blocklist: raw-value add validates hard and runs BlockService; customer ad
   assert.ok(custBtn.stepUp && custBtn.dangerous);
 });
 
-// ---- M7: catalog ----
+// ---- catalog ----
 
 test("catalog: products render avatar+default price with cursoring; coupon delete demands CONFIRM; create validates percent XOR amount", async () => {
   const { makeCatalogSection } = await import("../sections/catalogSection");
@@ -2764,7 +2764,7 @@ test("catalog: products render avatar+default price with cursoring; coupon delet
   assert.equal(created[0].durationInMonths, 3);
 });
 
-test("catalog (PA-3): products without default_price show a grouped price + 'N prices'; product detail gets an Insights/MRR rail + per-price sub counts", async () => {
+test("catalog: products without default_price show a grouped price + 'N prices'; product detail gets an Insights/MRR rail + per-price sub counts", async () => {
   const { makeCatalogSection } = await import("../sections/catalogSection");
   const priceA = { id: "price_a", product: "prod_2", unit_amount: 1500, currency: "eur", active: true, recurring: { interval: "month", interval_count: 1 } };
   const priceB = { id: "price_b", product: "prod_2", unit_amount: 15000, currency: "eur", active: true, recurring: { interval: "year", interval_count: 1 } };
@@ -2799,7 +2799,7 @@ test("catalog (PA-3): products without default_price show a grouped price + 'N p
   assert.equal((priceTable.rows[0].cells[2] as { v: string }).v, "4 active");
 });
 
-// ---- M7: customer editing ----
+// ---- customer editing ----
 
 test("customer editing: create/update validation, '-' clears, delete is T1+T3 and unlinks Discord afterwards", async () => {
   const updates: Array<Record<string, unknown>> = [];
@@ -2869,7 +2869,7 @@ test("customer editing: create/update validation, '-' clears, delete is T1+T3 an
   assert.equal(unlinked, 1);
 });
 
-// ---- M7: bookmarks board ----
+// ---- bookmarks board ----
 
 test("bookmarks board: rows deep-link by object type and Remove toggles off", async () => {
   const { makeBookmarksSection } = await import("../sections/bookmarksSection");
@@ -2913,7 +2913,7 @@ test("client JS modules parse and the shell embeds them nonced", () => {
   assert.ok(html.includes('id="login"'));
   assert.ok(html.includes('id="stepup"'));
   assert.ok(html.includes('id="modal"'));
-  // PA-13 chrome: bell, hamburger + scrim, help dialog, peek module.
+  // Chrome: bell, hamburger + scrim, help dialog, peek module.
   assert.ok(html.includes('id="bellbtn"'));
   assert.ok(html.includes('id="menubtn"'));
   assert.ok(html.includes('id="scrim"'));
@@ -2923,9 +2923,9 @@ test("client JS modules parse and the shell embeds them nonced", () => {
   assert.ok(!html.includes("${"));
 });
 
-// ---- PA-4: subscription writes + enablers ----
+// ---- subscription writes + enablers ----
 
-test("subscription detail (PA-4): 'Customer on Product' title, pm brand+last4, si_ id column, upcoming totals ladder, Simulation only in test mode", async () => {
+test("subscription detail: 'Customer on Product' title, pm brand+last4, si_ id column, upcoming totals ladder, Simulation only in test mode", async () => {
   const section = makeSubscriptionsSection();
   const page = await section.buildPage(subsCtx(), { page: "subscriptions.detail", params: { id: "sub_1" } });
   const header = page!.blocks[0] as HeaderBlock;
@@ -2960,7 +2960,7 @@ test("subscription detail (PA-4): 'Customer on Product' title, pm brand+last4, s
   assert.equal(sim.actions![0].key, "section:subscriptions.clock_advance");
 });
 
-test("subscriptions list (PA-4): header carries a Create-subscription link-button", async () => {
+test("subscriptions list: header carries a Create-subscription link-button", async () => {
   const section = makeSubscriptionsSection();
   const page = await section.buildPage(subsCtx(), { page: "subscriptions", filters: {} });
   const header = page!.blocks[0] as HeaderBlock;
@@ -2968,7 +2968,7 @@ test("subscriptions list (PA-4): header carries a Create-subscription link-butto
   assert.deepEqual(create.ref, { page: "subscriptions.new" });
 });
 
-test("update subscription (PA-4): qty/promo/cycle ride the preview and the confirm params; current price alone is refused", async () => {
+test("update subscription: qty/promo/cycle ride the preview and the confirm params; current price alone is refused", async () => {
   const ctx = subsCtx();
   const seen: { args?: Record<string, unknown> } = {};
   (ctx.stripe as unknown as Record<string, unknown>).previewPlanChange = async (args: Record<string, unknown>) => {
@@ -3016,7 +3016,7 @@ test("update subscription (PA-4): qty/promo/cycle ride the preview and the confi
   assert.deepEqual(qtyConfirm.actions[0].params, { subscriptionId: "sub_1", priceId: "price_old", quantity: 5 });
 });
 
-test("create-subscription composer (PA-4): confirm exists ONLY after a successful first-invoice preview; charge collection is step-up", async () => {
+test("create-subscription composer: confirm exists ONLY after a successful first-invoice preview; charge collection is step-up", async () => {
   const section = makeSubscriptionsSection();
   const hasCreate = (page: { blocks: Block[] }): boolean =>
     page.blocks.some((b) => "actions" in b && (b as { actions?: Array<{ key: string }> }).actions?.some((a) => a.key === "subscription.create"));
@@ -3056,7 +3056,7 @@ test("create-subscription composer (PA-4): confirm exists ONLY after a successfu
   assert.ok(!hasCreate(failed as never));
 });
 
-test("test-clock advance (PA-4): refused on live keys; advances frozen_time by days on test keys", async () => {
+test("test-clock advance: refused on live keys; advances frozen_time by days on test keys", async () => {
   const section = makeSubscriptionsSection();
   const live = await section.action!(subsCtx({ testClock: "clock_1" }), {
     key: "section:subscriptions.clock_advance",
@@ -3074,7 +3074,7 @@ test("test-clock advance (PA-4): refused on live keys; advances frozen_time by d
   assert.deepEqual(advanced, [["clock_1", 1_700_000_000 + 30 * 86400]]);
 });
 
-test("payments list (PA-4/5): transactions tab row is a filter-driven view switch; bulk refund rides bulkActions (hidden when denied)", async () => {
+test("payments list: transactions tab row is a filter-driven view switch; bulk refund rides bulkActions (hidden when denied)", async () => {
   const section = makePaymentsSection();
   const page = await section.buildPage(paymentsCtx(), { page: "payments", filters: {} });
   const tabs = page!.blocks.find((b) => b.type === "tabs") as TabsBlock;
@@ -3082,7 +3082,7 @@ test("payments list (PA-4/5): transactions tab row is a filter-driven view switc
   assert.equal(tabs.key, "txview");
   assert.deepEqual(tabs.items.map((i) => i.label), ["Payments", "Payouts", "Top-ups", "All activity"]);
   assert.deepEqual(tabs.items.map((i) => i.value), ["", "payouts", "topups", "activity"]);
-  assert.ok(tabs.items.every((i) => i.ref === undefined)); // PA-5: real views, no forward refs
+  assert.ok(tabs.items.every((i) => i.ref === undefined)); // real views, no forward refs
   const table = page!.blocks.find((b) => b.type === "table") as TableBlock;
   assert.equal(table.bulkActions!.length, 1);
   assert.equal(table.bulkActions![0].key, "section:payments.bulk_refund");
@@ -3095,7 +3095,7 @@ test("payments list (PA-4/5): transactions tab row is a filter-driven view switc
   assert.equal(deniedTable.bulkActions, undefined);
 });
 
-test("bulk refund (PA-4): typed CONFIRM enforced, ids validated+capped, every charge rides the gateway ladder individually", async () => {
+test("bulk refund: typed CONFIRM enforced, ids validated+capped, every charge rides the gateway ladder individually", async () => {
   const section = makePaymentsSection();
   const ctx = paymentsCtx();
   const calls: Array<[string, Record<string, unknown>]> = [];
@@ -3132,7 +3132,7 @@ test("bulk refund (PA-4): typed CONFIRM enforced, ids validated+capped, every ch
   assert.ok(tooMany.error!.includes("25"));
 });
 
-test("registry (PA-4): subscription.create / charge.create / pm-attach parse hostile input and gate tiers server-side", async () => {
+test("registry: subscription.create / charge.create / pm-attach parse hostile input and gate tiers server-side", async () => {
   // subscription.create parse + revalidate surface.
   const subCreate = actionByKey("subscription.create")!;
   assert.equal(subCreate.dangerous, true);
@@ -3161,7 +3161,7 @@ test("registry (PA-4): subscription.create / charge.create / pm-attach parse hos
   assert.equal((unified as { params: { cycleAnchor: string } }).params.cycleAnchor, "now");
 });
 
-test("gateway (PA-4): subscription.create + charge.create bind from the explicit customer; charge.create converts major→minor via the typed currency", async () => {
+test("gateway: subscription.create + charge.create bind from the explicit customer; charge.create converts major→minor via the typed currency", async () => {
   const { gateway, captured } = gatewayFixture();
   const sub = await gateway.resolve("subscription.create", { customerId: "cus_new", priceId: "price_1", collection: "charge" });
   assert.ok(sub.ok);
@@ -3178,7 +3178,7 @@ test("gateway (PA-4): subscription.create + charge.create bind from the explicit
   assert.equal(captured.length, 0); // resolve() never executes anything
 });
 
-test("catalog (PA-4): coupon restrictions (max redemptions / redeem-by / applies-to) and promo restrictions (min amount / first-time / customer) reach Stripe", async () => {
+test("catalog: coupon restrictions (max redemptions / redeem-by / applies-to) and promo restrictions (min amount / first-time / customer) reach Stripe", async () => {
   const { makeCatalogSection } = await import("../sections/catalogSection");
   const coupons: Array<Record<string, unknown>> = [];
   const promos: Array<Record<string, unknown>> = [];
@@ -3226,7 +3226,7 @@ test("catalog (PA-4): coupon restrictions (max redemptions / redeem-by / applies
   assert.equal(badMin.ok, false);
 });
 
-test("customer 360 (PA-4): attach-PM + SetupIntent header actions; per-card Charge/Set-default/Detach ride the registry", async () => {
+test("customer 360: attach-PM + SetupIntent header actions; per-card Charge/Set-default/Detach ride the registry", async () => {
   const section = makeCustomersSection();
   const page = await section.buildPage(fakeCustomerCtx(), { page: "customers.detail", params: { id: "cus_test1" } });
   const header = page!.blocks[0] as HeaderBlock;
@@ -3255,7 +3255,7 @@ test("customer 360 (PA-4): attach-PM + SetupIntent header actions; per-card Char
   assert.ok(!si.text!.includes("secret_SHOULD_NEVER_APPEAR"));
 });
 
-test("dashboard belts (PA-4): charge.create always steps up; subscription.create steps up only for charge collection", async () => {
+test("dashboard belts: charge.create always steps up; subscription.create steps up only for charge collection", async () => {
   const fake = fakeSettings();
   const gatewayCalls: string[] = [];
   const provider: DashboardAuthProvider = {
@@ -3309,9 +3309,9 @@ test("dashboard belts (PA-4): charge.create always steps up; subscription.create
   assert.deepEqual(gatewayCalls, ["subscription.create"]);
 });
 
-// ---- PA-5: Payouts + transactions tab views ----
+// ---- Payouts + transactions tab views ----
 
-test("payments tabs (PA-5): payouts view = balance stats + payout rows → detail + T2 create; top-ups and all-activity render their ledgers", async () => {
+test("payments tabs: payouts view = balance stats + payout rows → detail + T2 create; top-ups and all-activity render their ledgers", async () => {
   const section = makePaymentsSection();
   // Payouts view.
   const payouts = await section.buildPage(paymentsCtx(), { page: "payments", filters: { txview: "payouts" } });
@@ -3340,7 +3340,7 @@ test("payments tabs (PA-5): payouts view = balance stats + payout rows → detai
   assert.equal(acttable.nextCursor, null);
 });
 
-test("payout create (PA-5): CONFIRM + fresh factor + available-balance preflight, then createPayout in minor units", async () => {
+test("payout create: CONFIRM + fresh factor + available-balance preflight, then createPayout in minor units", async () => {
   const section = makePaymentsSection();
   const ctx = paymentsCtx();
   const created: Array<Record<string, unknown>> = [];
@@ -3411,7 +3411,7 @@ function payoutWriteCtx(payout: Record<string, unknown>, opts: { stepUpFresh?: b
   return { ctx, calls };
 }
 
-test("payout detail (PA-5): pending → T2 Cancel; paid → T3 Reverse; reversed → badge, no actions", async () => {
+test("payout detail: pending → T2 Cancel; paid → T3 Reverse; reversed → badge, no actions", async () => {
   const base = { id: "po_1", amount: 10000, currency: "eur", status: "pending", method: "standard", arrival_date: 1_700_000_000, created: 1_699_900_000, reversed_by: null, original_payout: null, destination: "ba_1" };
   const pending = await makeBalancesSection().buildPage(payoutWriteCtx(base).ctx, { page: "balances.detail", params: { id: "po_1" } });
   const pendingHeader = pending!.blocks[0] as HeaderBlock;
@@ -3432,7 +3432,7 @@ test("payout detail (PA-5): pending → T2 Cancel; paid → T3 Reverse; reversed
   assert.ok(details.rows.some((r) => r.label === "Reversed by"));
 });
 
-test("payout cancel/reverse (PA-5): T2/T3 belts + live status revalidation before any Stripe write", async () => {
+test("payout cancel/reverse: T2/T3 belts + live status revalidation before any Stripe write", async () => {
   const pendingPayout = { id: "po_1", amount: 10000, currency: "eur", status: "pending", reversed_by: null };
   const section = makeBalancesSection();
   // Cancel: CONFIRM → step-up → pending-only → cancelPayout.
@@ -3487,7 +3487,7 @@ test("payout cancel/reverse (PA-5): T2/T3 belts + live status revalidation befor
   assert.equal(already.calls.reverse.length, 0);
 });
 
-// ---- PA-6: Radar reviews + customer portal + item add/remove ----
+// ---- Radar reviews + customer portal + item add/remove ----
 
 function reviewsCtx(overrides: { reviewOpen?: boolean } = {}) {
   const approved: string[] = [];
@@ -3522,7 +3522,7 @@ function reviewsCtx(overrides: { reviewOpen?: boolean } = {}) {
   return { ctx, approved, audits };
 }
 
-test("radar reviews (PA-6): queue tab renders approve + fraud-refund decline path; approve is T1 and refuses closed reviews", async () => {
+test("radar reviews: queue tab renders approve + fraud-refund decline path; approve is T1 and refuses closed reviews", async () => {
   const { makeFraudSection } = await import("../sections/fraudSection");
   const section = makeFraudSection({ hunts: {} as never });
   const { ctx, approved } = reviewsCtx();
@@ -3552,7 +3552,7 @@ test("radar reviews (PA-6): queue tab renders approve + fraud-refund decline pat
   assert.equal(closed.approved.length, 0);
 });
 
-test("customer portal config (PA-6): list w/ feature summary + T1 toggle edits; empty state offers create", async () => {
+test("customer portal config: list w/ feature summary + T1 toggle edits; empty state offers create", async () => {
   const { makePortalSection } = await import("../sections/portalSection");
   const updates: Array<[string, Record<string, unknown>]> = [];
   const creates: Array<Record<string, unknown>> = [];
@@ -3629,7 +3629,7 @@ test("customer portal config (PA-6): list w/ feature summary + T1 toggle edits; 
   });
 });
 
-test("customer portal link (PA-6): the page mints a short-lived session, renders it as a copyable external link, and audits", async () => {
+test("customer portal link: the page mints a short-lived session, renders it as a copyable external link, and audits", async () => {
   const ctx = fakeCustomerCtx();
   const audits: string[] = [];
   (ctx as unknown as Record<string, unknown>).audit = async (line: string) => {
@@ -3654,7 +3654,7 @@ test("customer portal link (PA-6): the page mints a short-lived session, renders
   assert.deepEqual((portalRow.cell as { ref?: unknown }).ref, { page: "customers.portal", params: { id: "cus_test1" } });
 });
 
-test("update page item modes (PA-6): add excludes on-sub prices and confirms op:add; remove picks an item and confirms op:remove", async () => {
+test("update page item modes: add excludes on-sub prices and confirms op:add; remove picks an item and confirms op:remove", async () => {
   const section = makeSubscriptionsSection();
   // ADD: price_old is on the sub → only price_new is offered.
   const addCtx = subsCtx();
@@ -3735,7 +3735,7 @@ test("update page item modes (PA-6): add excludes on-sub prices and confirms op:
   );
 });
 
-test("registry subscription.items (PA-6): parse + gateway binding from the subscription", async () => {
+test("registry subscription.items: parse + gateway binding from the subscription", async () => {
   const def = actionByKey("subscription.items")!;
   assert.equal(def.dangerous, true);
   assert.ok(def.parseParams({ subscriptionId: "sub_1", op: "add", priceId: "price_1", quantity: 2 }).ok);
@@ -3748,7 +3748,7 @@ test("registry subscription.items (PA-6): parse + gateway binding from the subsc
   assert.equal((resolved as { binding: { stripeCustomerId: string } }).binding.stripeCustomerId, "cus_sub");
 });
 
-// ---- PA-7a: Payment Links + Tax rates ----
+// ---- Payment Links + Tax rates ----
 
 function linksCtx() {
   const created: Array<Record<string, unknown>> = [];
@@ -3790,7 +3790,7 @@ function linksCtx() {
   return { ctx, created, toggled };
 }
 
-test("payment links (PA-7a): list w/ status counts + copyable URL + toggle; detail line items; create validates the price", async () => {
+test("payment links: list w/ status counts + copyable URL + toggle; detail line items; create validates the price", async () => {
   const { makeLinksSection } = await import("../sections/linksSection");
   const section = makeLinksSection();
   const { ctx, created, toggled } = linksCtx();
@@ -3828,7 +3828,7 @@ test("payment links (PA-7a): list w/ status counts + copyable URL + toggle; deta
   assert.deepEqual(toggled, [["plink_1", false]]);
 });
 
-test("tax rates (PA-7a): catalog tab lists rates w/ archive/restore; create validates name+percentage and archives never delete", async () => {
+test("tax rates: catalog tab lists rates w/ archive/restore; create validates name+percentage and archives never delete", async () => {
   const { makeCatalogSection } = await import("../sections/catalogSection");
   const createdRates: Array<Record<string, unknown>> = [];
   const toggledRates: Array<[string, boolean]> = [];
@@ -3879,7 +3879,7 @@ test("tax rates (PA-7a): catalog tab lists rates w/ archive/restore; create vali
   assert.deepEqual(toggledRates, [["txr_1", false]]);
 });
 
-// ---- PA-7b: Quotes + Usage/Meters ----
+// ---- Quotes + Usage/Meters ----
 
 function quotesCtx(opts: { stepUpFresh?: boolean } = {}) {
   const created: Array<Record<string, unknown>> = [];
@@ -3967,7 +3967,7 @@ function quotesCtx(opts: { stepUpFresh?: boolean } = {}) {
   return { ctx, created, ops };
 }
 
-test("quotes (PA-7b): list w/ status counts + customer links; detail actions are status-aware; lifecycle ops revalidate live status; accept is T2", async () => {
+test("quotes: list w/ status counts + customer links; detail actions are status-aware; lifecycle ops revalidate live status; accept is T2", async () => {
   const { makeQuotesSection } = await import("../sections/quotesSection");
   const section = makeQuotesSection();
   const { ctx, created, ops } = quotesCtx();
@@ -4129,7 +4129,7 @@ function metersCtx() {
   return { ctx, created, toggled, summaryQueries };
 }
 
-test("meters (PA-7b): list w/ toggle; detail summaries REQUIRE a customer scope w/ aligned windows; toggle is T1 + live-status; create validates the event name", async () => {
+test("meters: list w/ toggle; detail summaries REQUIRE a customer scope w/ aligned windows; toggle is T1 + live-status; create validates the event name", async () => {
   const { makeMetersSection } = await import("../sections/metersSection");
   const section = makeMetersSection();
   const { ctx, created, toggled, summaryQueries } = metersCtx();
@@ -4199,9 +4199,9 @@ test("meters (PA-7b): list w/ toggle; detail summaries REQUIRE a customer scope 
   assert.deepEqual(created[0], { displayName: "API requests", eventName: "api_requests", formula: "sum" });
 });
 
-// ---- PA-9: money-op gaps ----
+// ---- money-op gaps ----
 
-test("payment_intent.capture (PA-9): revalidation matrix + idem key; gateway binds via the PI and folds amountMajor", async () => {
+test("payment_intent.capture: revalidation matrix + idem key; gateway binds via the PI and folds amountMajor", async () => {
   const def = actionByKey("payment_intent.capture")!;
   assert.equal(def.dangerous, true);
   assert.equal(def.parseParams({}).ok, false);
@@ -4246,7 +4246,7 @@ test("payment_intent.capture (PA-9): revalidation matrix + idem key; gateway bin
   assert.equal(rp.binding.stripeCustomerId, "cus_pi");
 });
 
-test("api belts (PA-9): capture is unconditional T2; endTrialNow is param-aware T2; coupon remove is param-aware T1", async () => {
+test("api belts: capture is unconditional T2; endTrialNow is param-aware T2; coupon remove is param-aware T1", async () => {
   const fake = fakeSettings();
   const gatewayCalls: string[] = [];
   const provider: DashboardAuthProvider = {
@@ -4300,7 +4300,7 @@ test("api belts (PA-9): capture is unconditional T2; endTrialNow is param-aware 
   assert.deepEqual(gatewayCalls, ["subscription.terms", "customer.coupon"]);
 });
 
-test("customer.coupon op:remove (PA-9): revalidates discount presence; gateway binds customer-level removes via customerId", async () => {
+test("customer.coupon op:remove: revalidates discount presence; gateway binds customer-level removes via customerId", async () => {
   const def = actionByKey("customer.coupon")!;
   // Legacy apply payload (no op) still parses — Intercom canvas compatibility.
   const legacy = def.parseParams({ subscriptionId: "sub_1", promoCode: "X" });
@@ -4336,7 +4336,7 @@ test("customer.coupon op:remove (PA-9): revalidates discount presence; gateway b
   assert.equal((resolved as { binding: { stripeCustomerId: string } }).binding.stripeCustomerId, "cus_x1");
 });
 
-test("subscription.terms endTrialNow (PA-9): trialing-only revalidation, executes trial_end 'now'", async () => {
+test("subscription.terms endTrialNow: trialing-only revalidation, executes trial_end 'now'", async () => {
   const def = actionByKey("subscription.terms")!;
   assert.equal(def.parseParams({ subscriptionId: "sub_1", endTrialNow: true, trialEndUnix: 999999999999 }).ok, false);
   const parsed = (def.parseParams({ subscriptionId: "sub_1", endTrialNow: true }) as { params: unknown }).params;
@@ -4357,7 +4357,7 @@ test("subscription.terms endTrialNow (PA-9): trialing-only revalidation, execute
   assert.deepEqual(trialCalls, [["sub_1", "now"]]);
 });
 
-test("charge detail (PA-9): uncaptured auth renders Capture/Capture-partial/Cancel-authorization; captured renders refunds instead", async () => {
+test("charge detail: uncaptured auth renders Capture/Capture-partial/Cancel-authorization; captured renders refunds instead", async () => {
   const section = makePaymentsSection();
   const ctx = paymentsCtx();
   (ctx.stripe as unknown as Record<string, unknown>).getChargeDetailed = async () => ({
@@ -4392,7 +4392,7 @@ test("charge detail (PA-9): uncaptured auth renders Capture/Capture-partial/Canc
   assert.ok(capturedLabels.some((l) => l.startsWith("Refund") || l === "Partial refund"));
 });
 
-test("draft invoice editor (PA-9): draft-only + one-off-only gates, foreign-line refusal, T1 remove, details/date validation", async () => {
+test("draft invoice editor: draft-only + one-off-only gates, foreign-line refusal, T1 remove, details/date validation", async () => {
   const section = makeInvoicesSection();
   const created: Array<Record<string, unknown>> = [];
   const updatedItems: Array<[string, Record<string, unknown>]> = [];
@@ -4508,7 +4508,7 @@ test("draft invoice editor (PA-9): draft-only + one-off-only gates, foreign-line
   }
 });
 
-test("payments section actions (PA-9): top-up belts + Stripe error surfacing; instant payout preflights instant_available", async () => {
+test("payments section actions: top-up belts + Stripe error surfacing; instant payout preflights instant_available", async () => {
   const section = makePaymentsSection();
   const base = paymentsCtx();
   // Top-up: CONFIRM first, then a fresh factor.
@@ -4583,9 +4583,9 @@ test("payments section actions (PA-9): top-up belts + Stripe error surfacing; in
   assert.equal(payouts[0].method, "instant");
 });
 
-// ---- PA-10: customer depth ----
+// ---- customer depth ----
 
-test("customer 360 (PA-10): tax IDs + addresses rail cards, balance history, cash balance in Insights", async () => {
+test("customer 360: tax IDs + addresses rail cards, balance history, cash balance in Insights", async () => {
   const section = makeCustomersSection();
   const ctx = fakeCustomerCtx();
   (ctx.stripe as unknown as Record<string, unknown>).listTaxIds = async () => [
@@ -4626,7 +4626,7 @@ test("customer 360 (PA-10): tax IDs + addresses rail cards, balance history, cas
   assert.ok(!(bare!.rail![0] as KeyValueBlock).rows.some((r) => r.label === "Cash balance"));
 });
 
-test("customer tax-id + address actions (PA-10): curated-type spoof refused, live re-list on remove, address parse matrix", async () => {
+test("customer tax-id + address actions: curated-type spoof refused, live re-list on remove, address parse matrix", async () => {
   const section = makeCustomersSection();
   const added: Array<[string, string]> = [];
   const removed: string[] = [];
@@ -4725,9 +4725,9 @@ test("customer tax-id + address actions (PA-10): curated-type spoof refused, liv
   });
 });
 
-// ---- PA-11: subscription schedules ----
+// ---- subscription schedules ----
 
-test("rebuildCurrentPhase (PA-11): preserves trial_end + coupon discounts, flags unsupported settings", async () => {
+test("rebuildCurrentPhase: preserves trial_end + coupon discounts, flags unsupported settings", async () => {
   const { rebuildCurrentPhase } = await import("../../bot/StripeClient");
   const base = {
     phases: [
@@ -4765,7 +4765,7 @@ test("rebuildCurrentPhase (PA-11): preserves trial_end + coupon discounts, flags
   assert.equal(bad.unsupported.length, 3);
 });
 
-test("registry subscription.schedule (PA-11): parse/revalidate matrix; set_phases rebuilds phase 0 and maps durations; cancel is T2", async () => {
+test("registry subscription.schedule: parse/revalidate matrix; set_phases rebuilds phase 0 and maps durations; cancel is T2", async () => {
   const def = actionByKey("subscription.schedule")!;
   assert.equal(def.dangerous, true);
   assert.equal(def.parseParams({ subscriptionId: "sub_1", op: "set_phases", phases: [] }).ok, false);
@@ -4887,7 +4887,7 @@ test("registry subscription.schedule (PA-11): parse/revalidate matrix; set_phase
   assert.deepEqual(gatewayCalls, ["subscription.schedule"]);
 });
 
-test("schedule editor page (PA-11): token grammar, add/remove refs, baked server-parsed confirm, live-schedule panel + detail wiring", async () => {
+test("schedule editor page: token grammar, add/remove refs, baked server-parsed confirm, live-schedule panel + detail wiring", async () => {
   const section = makeSubscriptionsSection();
 
   // No schedule: locked current-phase card, picker adds tokens.
@@ -4957,9 +4957,9 @@ test("schedule editor page (PA-11): token grammar, add/remove refs, baked server
   assert.ok(detailHeader.actions!.some((a) => a.label === "Edit schedule"));
 });
 
-// ---- PA-8: router fix, +Create, invoice composer, Customer-360 writes ----
+// ---- router fix, +Create, invoice composer, Customer-360 writes ----
 
-test("client router (PA-8/13): real /billing paths round-trip (id-less subpages, filters as query params, legacy #/ links) and the shell ships the +Create menu", () => {
+test("client router: real /billing paths round-trip (id-less subpages, filters as query params, legacy #/ links) and the shell ships the +Create menu", () => {
   // Exercise the REAL shipped client code: extract BASE/parseRoute/hrefFor
   // from the clientApp module string and run them with a stubbed location.
   const start = clientApp.indexOf("D.BASE");
@@ -4991,7 +4991,7 @@ test("client router (PA-8/13): real /billing paths round-trip (id-less subpages,
     params: { id: "sub_1" },
     filters: {},
   });
-  // Filters ride real query params — copyable URLs (PA-13 user decision).
+  // Filters ride real query params — copyable URLs (user decision).
   const withFilters = makeD({ pathname: "/billing", search: "", hash: "" }).hrefFor("payments", {}, { status: "failed", date: "7d" });
   assert.equal(withFilters, "/billing/payments?f_status=failed&f_date=7d");
   assert.deepEqual(makeD(locFor(withFilters)).parseRoute().filters, { status: "failed", date: "7d" });
@@ -5027,7 +5027,7 @@ test("client router (PA-8/13): real /billing paths round-trip (id-less subpages,
   }
 });
 
-test("gateway (PA-8): customer.balance folds direction+major into signed deltaMinor; baked invoice items[] pass through untouched", async () => {
+test("gateway: customer.balance folds direction+major into signed deltaMinor; baked invoice items[] pass through untouched", async () => {
   const { gateway } = gatewayFixture();
   const credit = await gateway.resolve("customer.balance", {
     customerId: "cus_1",
@@ -5075,7 +5075,7 @@ function invoiceComposerCtx() {
   return ctx;
 }
 
-test("invoice composer (PA-8): lines accumulate via URL tokens, currency-locks the picker, and bakes registry items[] server-side", async () => {
+test("invoice composer: lines accumulate via URL tokens, currency-locks the picker, and bakes registry items[] server-side", async () => {
   const section = makeInvoicesSection();
   const ctx = invoiceComposerCtx();
 
@@ -5145,7 +5145,7 @@ test("invoice composer (PA-8): lines accumulate via URL tokens, currency-locks t
   assert.deepEqual(listHeader.actions![0].ref, { page: "invoices.new" });
 });
 
-test("customer 360 (PA-8): inline edit on the Details card, row actions on subs/invoices, credit grants table + T1/T2 belts", async () => {
+test("customer 360: inline edit on the Details card, row actions on subs/invoices, credit grants table + T1/T2 belts", async () => {
   const section = makeCustomersSection();
   const ctx = fakeCustomerCtx();
   (ctx.stripe as unknown as Record<string, unknown>).listInvoices = async () => ({
@@ -5378,9 +5378,9 @@ test("count-cards: invoices chips use invoices.search per status; subscriptions 
   assert.equal(subQueries.length, 0); // scoped view never searches
 });
 
-// ---- PA-12: ops & observability ----
+// ---- ops & observability ----
 
-test("groundwork (PA-12): CSV export rides saveBlob (no data: URI); the modal handles ActionResult.file/link; flash links are noopener and survive the reload", () => {
+test("groundwork: CSV export rides saveBlob (no data: URI); the modal handles ActionResult.file/link; flash links are noopener and survive the reload", () => {
   // 12.0 + 13.7 in one implementation: Blob download sink, CSV swapped onto it.
   assert.ok(clientBlocks.includes("D.saveBlob = function"));
   assert.ok(clientBlocks.includes("URL.createObjectURL"));
@@ -5397,7 +5397,7 @@ test("groundwork (PA-12): CSV export rides saveBlob (no data: URI); the modal ha
   assert.ok(clientCore.includes("a.textContent = link.label"));
 });
 
-test("quote PDF (PA-12): open/accepted only, cap/magic failure degrades friendly, success returns ActionResult.file", async () => {
+test("quote PDF: open/accepted only, cap/magic failure degrades friendly, success returns ActionResult.file", async () => {
   const { makeQuotesSection: makeQuotes12 } = await import("../sections/quotesSection");
   const section = makeQuotes12();
   const { ctx } = quotesCtx();
@@ -5420,7 +5420,7 @@ test("quote PDF (PA-12): open/accepted only, cap/magic failure degrades friendly
   assert.match(overCap.error!, /Stripe Dashboard/);
 });
 
-test("events page (PA-12): curated select + validated typeq pill (custom wins, garbage dropped), object refs via shared refForId, evt_ cursor", async () => {
+test("events page: curated select + validated typeq pill (custom wins, garbage dropped), object refs via shared refForId, evt_ cursor", async () => {
   const { makeEventsSection } = await import("../sections/eventsSection");
   const section = makeEventsSection();
   const calls: Array<Record<string, unknown>> = [];
@@ -5454,7 +5454,7 @@ test("events page (PA-12): curated select + validated typeq pill (custom wins, g
   // The select value must come from the curated set.
   await section.buildPage(ctx, { page: "events", filters: { type: "evil.type" } });
   assert.equal(calls[3].type, undefined);
-  // refForId moved to cells.ts and grew the PA-7 object families.
+  // refForId moved to cells.ts and grew the object families.
   assert.equal(refForId("plink_1")!.page, "links.detail");
   assert.equal(refForId("qt_1")!.page, "quotes.detail");
   assert.equal(refForId("prod_1")!.page, "catalog.detail");
@@ -5498,7 +5498,7 @@ function webhooksCtx(opts: { botManagedId?: string | null } = {}) {
   return { ctx, audits, updates, deletes };
 }
 
-test("webhooks (PA-12): bot-managed row is badged + actionless and the SERVER refuses disable/delete on it; whsec_ shows once in text and never in the audit", async () => {
+test("webhooks: bot-managed row is badged + actionless and the SERVER refuses disable/delete on it; whsec_ shows once in text and never in the audit", async () => {
   const { makeWebhooksSection } = await import("../sections/webhooksSection");
   const section = makeWebhooksSection();
   const f = webhooksCtx();
@@ -5572,7 +5572,7 @@ test("webhooks (PA-12): bot-managed row is badged + actionless and the SERVER re
   assert.deepEqual(f.updates, [["we_other", { disabled: true }]]);
 });
 
-test("reports (PA-12): run validates curated type + dates; download link only for succeeded runs (10-min expiry) via ActionResult.link; Refresh is a no-op ok", async () => {
+test("reports: run validates curated type + dates; download link only for succeeded runs (10-min expiry) via ActionResult.link; Refresh is a no-op ok", async () => {
   const { makeReportsSection } = await import("../sections/reportsSection");
   const section = makeReportsSection();
   const links: Array<[string, number]> = [];
@@ -5645,7 +5645,7 @@ test("reports (PA-12): run validates curated type + dates; download link only fo
   assert.equal(refreshed.ok, true);
 });
 
-test("checkout sessions (PA-12): Links page grows tabs; session URL renders only while open; setup-mode amount is a bare status pill; status filter validated", async () => {
+test("checkout sessions: Links page grows tabs; session URL renders only while open; setup-mode amount is a bare status pill; status filter validated", async () => {
   const { makeLinksSection: makeLinks12 } = await import("../sections/linksSection");
   const section = makeLinks12();
   const calls: Array<Record<string, unknown>> = [];
@@ -5725,7 +5725,7 @@ test("checkout sessions (PA-12): Links page grows tabs; session URL renders only
   assert.equal(calls[2].status, undefined);
 });
 
-test("shipping rates (PA-12): 5th Catalog tab; create parses the amount idiom (zero-decimal guard); toggle validates shr_ and archives", async () => {
+test("shipping rates: 5th Catalog tab; create parses the amount idiom (zero-decimal guard); toggle validates shr_ and archives", async () => {
   const { makeCatalogSection: makeCatalog12 } = await import("../sections/catalogSection");
   const section = makeCatalog12();
   const created: Array<Record<string, unknown>> = [];
@@ -5781,7 +5781,7 @@ test("shipping rates (PA-12): 5th Catalog tab; create parses the amount idiom (z
   assert.deepEqual(toggled, [["shr_1", false]]);
 });
 
-test("payout schedule (PA-12): T1+T2 belts run before any write; anchor/manual validation; Stripe refusal maps friendly; read-only card renders", async () => {
+test("payout schedule: T1+T2 belts run before any write; anchor/manual validation; Stripe refusal maps friendly; read-only card renders", async () => {
   const { makeBalancesSection: makeBalances12 } = await import("../sections/balancesSection");
   const section = makeBalances12();
   const updates: Array<Record<string, unknown>> = [];
@@ -5853,9 +5853,9 @@ test("payout schedule (PA-12): T1+T2 belts run before any write; anchor/manual v
   assert.match(refused.error!, /Connect-only/);
 });
 
-// ---- PA-13: design polish ----
+// ---- design polish ----
 
-test("bell (PA-13): nav-badges collects attention items (iso-sorted newest first, capped at 15); home attention() mirrors the inbox", async () => {
+test("bell: nav-badges collects attention items (iso-sorted newest first, capped at 15); home attention() mirrors the inbox", async () => {
   const fake = fakeSettings();
   const provider: DashboardAuthProvider = {
     enter: async () => ({ kind: "page" }),
@@ -5909,7 +5909,7 @@ test("bell (PA-13): nav-badges collects attention items (iso-sorted newest first
   assert.ok(clientApp.includes("res.j.attention || []"));
 });
 
-test("peek (PA-13): endpoint allowlists pages, validates ids per kind, caches 30s; section peeks are last4-only plain text", async () => {
+test("peek: endpoint allowlists pages, validates ids per kind, caches 30s; section peeks are last4-only plain text", async () => {
   const fake = fakeSettings();
   const provider: DashboardAuthProvider = {
     enter: async () => ({ kind: "page" }),
@@ -6007,7 +6007,7 @@ test("peek (PA-13): endpoint allowlists pages, validates ids per kind, caches 30
   assert.ok(!clientPeek.includes("innerHTML"));
 });
 
-test("daterange (PA-13): parse matrix (presets, custom inclusive end, garbage), search upper bound, list threading, client pill", async () => {
+test("daterange: parse matrix (presets, custom inclusive end, garbage), search upper bound, list threading, client pill", async () => {
   const { parseDateFilter: parse13 } = await import("../sections/paymentsSection");
   const now = Math.floor(Date.now() / 1000);
   // Presets → gte only.
@@ -6060,7 +6060,7 @@ test("daterange (PA-13): parse matrix (presets, custom inclusive end, garbage), 
   assert.ok(clientBlocks.includes('d1.value + ".." + d2.value'));
 });
 
-test("polish (PA-13): sticky thead CSS (desktop overflow trade), g-then-key shortcuts + help dialog, mobile drawer bindings", () => {
+test("polish: sticky thead CSS (desktop overflow trade), g-then-key shortcuts + help dialog, mobile drawer bindings", () => {
   const { dashboardCss } = require("../html/styles") as { dashboardCss(): string };
   const css = dashboardCss();
   // Sticky headers: desktop swaps overflow-x for sticky; th background is opaque.
@@ -6080,7 +6080,7 @@ test("polish (PA-13): sticky thead CSS (desktop overflow trade), g-then-key shor
   assert.ok(clientApp.includes("aria-expanded"));
 });
 
-test("bookmark everything (PA-13 user ask): every object family toggles via the shared helper; the board routes rows through refForId", async () => {
+test("bookmark everything (user ask): every object family toggles via the shared helper; the board routes rows through refForId", async () => {
   const { BOOKMARK_ID_RES, toggleBookmarkAction, isBookmarkedSafe } = await import("../sections/bookmarks");
   // Every family has an id shape and a board route.
   const samples: Record<string, string> = {
@@ -6116,9 +6116,9 @@ test("bookmark everything (PA-13 user ask): every object family toggles via the 
   assert.equal(await isBookmarkedSafe(ctx, "quote", "qt_1"), true);
 });
 
-// ---- PA-13 filter expansion (user ask): fingerprint reverse search + Stripe filter parity ----
+// ---- filter expansion (user ask): fingerprint reverse search + Stripe filter parity ----
 
-test("payments filters (PA-13): fingerprint/email flip the rows into a whole-account search sweep; decline reason + invoice slice the window", async () => {
+test("payments filters: fingerprint/email flip the rows into a whole-account search sweep; decline reason + invoice slice the window", async () => {
   const section = makePaymentsSection();
   const searches: string[] = [];
   const countQs: string[] = [];
@@ -6226,7 +6226,7 @@ test("payments filters (PA-13): fingerprint/email flip the rows into a whole-acc
   assert.deepEqual(invoiceTable.rows.map((r) => r.id), ["ch_d2"]);
 });
 
-test("PM fingerprint (PA-13): the 360 payment-methods table exposes the fingerprint and links into the reverse-card hunt", async () => {
+test("PM fingerprint: the 360 payment-methods table exposes the fingerprint and links into the reverse-card hunt", async () => {
   const ctx = fakeCustomerCtx();
   (ctx.stripe as unknown as Record<string, unknown>).listAllPaymentMethods = async () => [
     { id: "pm_1", type: "card", card: { brand: "visa", last4: "4242", exp_month: 7, exp_year: 2027, fingerprint: "Xt5EWLLDS7FJjR1c" } },
@@ -6252,7 +6252,7 @@ test("PM fingerprint (PA-13): the 360 payment-methods table exposes the fingerpr
   assert.equal(sepaCell.ref, undefined);
 });
 
-test("customers list filters (PA-13): created is a server param; delinquent/country/has-subscription slice the page", async () => {
+test("customers list filters: created is a server param; delinquent/country/has-subscription slice the page", async () => {
   const calls: Array<Record<string, unknown>> = [];
   const ctx = {
     stripe: {
@@ -6281,7 +6281,7 @@ test("customers list filters (PA-13): created is a server param; delinquent/coun
   assert.deepEqual((byCountry!.blocks.find((b) => b.type === "table") as TableBlock).rows.map((r) => r.id), ["cus_2"]);
 });
 
-test("invoices + subscriptions filters (PA-13): server params thread through; non-searchable filters force honest windowed chips", async () => {
+test("invoices + subscriptions filters: server params thread through; non-searchable filters force honest windowed chips", async () => {
   // Invoices: collection/subscription/created are SERVER list params;
   // frequency slices; chips skip search when non-searchable filters are set.
   const invOpts: Array<Record<string, unknown>> = [];
@@ -6353,7 +6353,7 @@ test("invoices + subscriptions filters (PA-13): server params thread through; no
   assert.deepEqual(subTable.rows.map((r) => r.id), ["sub_manual"]);
 });
 
-test("search sweep resilience (PA-13.F): a refused charges.search renders an empty table + honest notice, never a 500", async () => {
+test("search sweep resilience: a refused charges.search renders an empty table + honest notice, never a 500", async () => {
   const section = makePaymentsSection();
   const ctx = paymentsCtx();
   const stripe = ctx.stripe as unknown as Record<string, unknown>;

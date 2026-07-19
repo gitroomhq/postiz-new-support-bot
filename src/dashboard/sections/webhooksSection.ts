@@ -3,7 +3,7 @@ import { ActionResult, Badge, Block, Cell } from "../renderer/contract";
 import { DashboardCtx, DashboardSectionModule, SectionPage, str } from "./types";
 import { badgeCell, dateCell, idCell, text } from "./cells";
 
-// Webhooks (#/webhooks, PA-12): endpoint manager. The bot's OWN endpoint
+// Webhooks (#/webhooks): endpoint manager. The bot's OWN endpoint
 // (StripeWebhookHandler.ensureEndpoint owns settings.stripeWebhookEndpointId)
 // is badged "Bot-managed" and rendered without row actions — and the server
 // refuses disable/delete on that id regardless of client input, because

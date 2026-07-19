@@ -35,8 +35,8 @@ import {
 const WINDOW = 100; // in-memory filter/count window per page (documented in the notice)
 const BULK_REFUND_MAX = 25; // blast-radius cap per bulk-refund run
 
-// Daterange parsing lives in cells.ts since every list uses it (PA-13
-// filter expansion); re-exported here for existing importers.
+// Daterange parsing lives in cells.ts since every list uses it;
+// re-exported here for existing importers.
 export { parseDateFilter };
 
 const INCOMPLETE_PI = new Set([
@@ -55,7 +55,7 @@ export function makePaymentsSection(): DashboardSectionModule {
       return page === "payments" || page === "payments.detail" || page === "payments.guardrails";
     },
 
-    // Hover peek card (PA-13): ONE retrieve (charge or PI), plain text only —
+    // Hover peek card: ONE retrieve (charge or PI), plain text only —
     // last4 at most, never full card data.
     async peek(ctx: DashboardCtx, page: string, id: string) {
       if (page !== "payments.detail") return null;
@@ -260,7 +260,7 @@ function pmIntentId(charge: Stripe.Charge): string | null {
   return typeof charge.payment_intent === "string" ? charge.payment_intent : charge.payment_intent?.id ?? null;
 }
 
-// Capture pair for a requires_capture authorization (PA-9): full + partial.
+// Capture pair for a requires_capture authorization: full + partial.
 // T1 (registry dangerous) + T2 (DASH_T2) — capture is the moment the card is
 // actually charged.
 function captureButtons(ctx: DashboardCtx, paymentIntentId: string, capturableMinor: number, currency: string): ActionButton[] {
@@ -296,7 +296,7 @@ function captureButtons(ctx: DashboardCtx, paymentIntentId: string, capturableMi
 // ---- LIST ----
 
 async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: string | null): Promise<SectionPage> {
-  // PA-5: the transactions tab row is a filter-driven view switch — Payouts /
+  // The transactions tab row is a filter-driven view switch — Payouts /
   // Top-ups / All activity render here (Stripe's own layout), charges below.
   const txview =
     filters.txview === "payouts" || filters.txview === "topups" || filters.txview === "activity" ? filters.txview : "";
@@ -308,7 +308,7 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
   const flagged = str(filters.flagged, 12);
   const currencyFilter = str(filters.currency, 8).toLowerCase();
   const pmFilter = str(filters.pm, 24).toLowerCase();
-  // PA-13 filter expansion (user ask — Stripe "More filters" parity):
+  // Filter expansion (user ask — Stripe "More filters" parity):
   // fingerprint = the reverse-card sweep (exact identity across ALL
   // customers, search-backed); email exact-matches via search; decline
   // reason + invoice slice the fetched window.
@@ -317,7 +317,7 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
   const declineFilter = str(filters.declineReason, 40).replace(/["\\]/g, "").trim().toLowerCase();
   const invoiceFilter = validId("invoice", filters.invoice) ?? "";
 
-  // Date filter (PA-13 daterange): a preset token OR a custom
+  // Date filter (daterange): a preset token OR a custom
   // "YYYY-MM-DD..YYYY-MM-DD" range in the same key. The range end is
   // INCLUSIVE — +86400 turns it into the exclusive `lt` Stripe wants.
   const { createdGte, createdLt } = parseDateFilter(dateKey);
@@ -535,7 +535,7 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
         { value: "efw", label: "Early fraud warning" },
       ],
     },
-    // PA-13 "More filters" parity. Fingerprint/email flip the list into a
+    // "More filters" parity. Fingerprint/email flip the list into a
     // whole-account Stripe-Search sweep; decline reason + invoice slice rows.
     {
       key: "fingerprint",
@@ -666,7 +666,7 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
     if (flagged === "efw" && !efwChargeIds.has(c.id)) return false;
     if (currencyFilter && c.currency !== currencyFilter) return false;
     if (pmFilter && (c.payment_method_details?.card?.brand ?? "") !== pmFilter) return false;
-    // PA-13 expansion: the billing-email cut applies when rows came from a
+    // Expansion: the billing-email cut applies when rows came from a
     // window/fingerprint fetch — NOT to the email sweep, whose rows matched
     // via the CUSTOMER email (the charge's billing email may legitimately
     // differ). Decline reason + invoice slice the fetched rows.
@@ -768,7 +768,7 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
   };
 }
 
-// ---- TRANSACTIONS TABS (PA-5: Payouts / Top-ups / All activity) ----
+// ---- TRANSACTIONS TABS (Payouts / Top-ups / All activity) ----
 
 // Stripe's tab row under the Payments H1 — a filter-driven view switch.
 function txTabs(active: string): Block {

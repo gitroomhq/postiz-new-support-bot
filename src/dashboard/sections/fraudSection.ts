@@ -5,7 +5,7 @@ import { ActionButton, ActionResult, Badge, Block, Cell, TableBlock } from "../r
 import { DashboardCtx, DashboardSectionModule, SectionPage, str } from "./types";
 import { amount, cardCell, dateCell, idCell, sentence, text } from "./cells";
 
-// Fraud tools (#/fraud, Operate group): the Radar manual-review queue (PA-6:
+// Fraud tools (#/fraud, Operate group): the Radar manual-review queue (
 // approve closes the review; "decline" = the existing fraud-refund / PI-cancel
 // registry ladder), the recent early-fraud-warning feed, plus the three
 // account-wide hunts extracted into FraudHuntService — by card fingerprint
@@ -82,7 +82,7 @@ function registryButton(ctx: DashboardCtx, button: ActionButton): ActionButton {
   return { ...button, mode: mode === "queue" ? "queue" : "direct" };
 }
 
-// ---- Radar review queue (PA-6) ----
+// ---- Radar review queue ----
 
 async function reviewsTable(ctx: DashboardCtx): Promise<Block> {
   const res = await ctx.stripe.listOpenReviews({ limit: 25 }).catch(() => ({ reviews: [] as Stripe.Review[], hasMore: false }));

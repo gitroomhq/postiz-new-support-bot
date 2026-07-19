@@ -4,11 +4,11 @@ import { DashboardCtx, DashboardSectionModule, SectionPage, str, validCursor } f
 import { bookmarkButton, isBookmarkedSafe, toggleBookmarkAction } from "./bookmarks";
 import { amount, badgeCell, dateCell, idCell, money, sentence, strong, text, windowCount } from "./cells";
 
-// Payment links (#/links, PA-7a): Stripe-hosted checkout URLs. List + detail
+// Payment links (#/links): Stripe-hosted checkout URLs. List + detail
 // + create (price + quantity modal) + activate/deactivate. The URL is the
 // product here, so it renders as a copyable external cell everywhere. Reads
 // expand line_items so the pages show what each link sells without N+1s.
-// PA-12 added a second tab: Checkout sessions (read-only) — the sessions the
+// Added a second tab: Checkout sessions (read-only) — the sessions the
 // links (and the API) actually minted.
 
 const LINK_ID_RE = /^plink_[A-Za-z0-9]{1,64}$/;
@@ -186,7 +186,7 @@ function linksTabs(view: string): Block {
   };
 }
 
-// ---- Checkout sessions (PA-12, read-only) ----
+// ---- Checkout sessions (read-only) ----
 
 function sessionBadge(status: string | null): Badge {
   return status === "complete"

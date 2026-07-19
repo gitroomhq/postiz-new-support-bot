@@ -6,7 +6,7 @@ import { amount, badgeCell, dateCell, idCell, money, sentence, text } from "./ce
 
 // Balances: account balance buckets, the payout ledger (paginated) and recent
 // balance transactions (fees/refunds/charges), plus a payout detail page with
-// the transactions that composed it. PA-5 added payout WRITES: create lives on
+// the transactions that composed it. Payout WRITES: create lives on
 // the Payments → Payouts tab; cancel (pending, T2 fresh-factor) and reverse
 // (paid, T3 Discord reverse-code) live here on the detail page.
 
@@ -41,7 +41,7 @@ export function makeBalancesSection(): DashboardSectionModule {
 
     async action(ctx: DashboardCtx, req): Promise<ActionResult> {
       const confirmed = req.confirmWord === "CONFIRM";
-      // T1+T2 — payout schedule (PA-12; no payout id — it targets the account).
+      // T1+T2 — payout schedule (no payout id — it targets the account).
       // ⚠ Own-account accounts.update may be Connect-only: attempt, and map
       // Stripe's refusal to a friendly error (the read-only card stays right).
       if (req.key === "section:balances.payout_schedule") {
@@ -154,7 +154,7 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
 
   const blocks: Block[] = [];
 
-  // Explicit page header (PA-12): the payout-schedule editor lives here. The
+  // Explicit page header: the payout-schedule editor lives here. The
   // write may be Connect-only on some accounts — the action degrades to a
   // friendly refusal, the card below stays correct either way.
   blocks.push({

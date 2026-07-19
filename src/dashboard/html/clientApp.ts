@@ -1,6 +1,6 @@
 // Client module: path router (History API), nav/crumb rendering, jump-to-ID,
 // activation poll, nav-badge poll and boot. URL convention (mirrors ObjectRef;
-// REAL copyable paths, not hash routes — PA-13 user decision):
+// REAL copyable paths, not hash routes — user decision):
 //   /billing/customers            → page "customers"
 //   /billing/customers/cus_123    → page "customers.detail", params { id }
 //   /billing/customers/cus_1/portal → page "customers.portal", params { id }
@@ -258,7 +258,7 @@ D.pollBadges = function () {
   D.badgeTimer = setTimeout(D.pollBadges, 60000);
 };
 
-// ---- needs-attention bell (PA-13) ----
+// ---- needs-attention bell ----
 D.syncBell = function () {
   var count = D.q("bellcount");
   if (!count) return;
@@ -315,7 +315,7 @@ D.bindBell = function () {
   });
 };
 
-// ---- keyboard shortcuts (PA-13): g-then-key navigation + ? help ----
+// ---- keyboard shortcuts: g-then-key navigation + ? help ----
 D.SHORTCUT_PAGES = { p: "payments", c: "customers", h: "home", b: "balances", i: "invoices", d: "disputes" };
 D.gArmedAt = 0;
 D.bindShortcuts = function () {
@@ -341,7 +341,7 @@ D.bindShortcuts = function () {
   if (close && help) close.addEventListener("click", function () { help.close(); });
 };
 
-// ---- mobile hamburger (PA-13): slides the fixed sidebar in/out ----
+// ---- mobile hamburger: slides the fixed sidebar in/out ----
 D.bindMenu = function () {
   var btn = D.q("menubtn");
   var side = document.querySelector(".side");
@@ -448,7 +448,7 @@ D.bindLockCode = function () {
   });
 };
 
-// Global "+ Create" menu (PA-8): every composer entry point in one place.
+// Global "+ Create" menu: every composer entry point in one place.
 // Items navigate to hash routes — modals stay where their pages define them.
 D.CREATE_ITEMS = [
   { label: "New customer", page: "customers" },

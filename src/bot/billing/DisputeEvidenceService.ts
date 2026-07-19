@@ -193,7 +193,7 @@ export type FileOpResult =
   | { kind: "not_respondable"; status: string }
   | { kind: "invalid"; error: string };
 
-// AI runner seams (M6.3): injected here so both surfaces share the draft and
+// AI runner seams: injected here so both surfaces share the draft and
 // review pipelines once they move in; unused until then.
 export interface DisputeAiDeps {
   claudeRunner: ClaudeCodeRunner;
@@ -374,7 +374,7 @@ export class DisputeEvidenceService {
     return { kind: "accepted", dispute: result };
   }
 
-  // ---- AI pipelines (M6.3): shared by /billing → Disputes and the web workbench ----
+  // ---- AI pipelines: shared by /billing → Disputes and the web workbench ----
 
   private aiDeps(): DisputeAiDeps {
     if (!this.ai) throw new Error("Dispute AI dependencies are not wired.");

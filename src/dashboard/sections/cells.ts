@@ -121,7 +121,7 @@ export function refForId(id: string): ObjectRef | null {
   return null;
 }
 
-// ---- daterange filter parsing (PA-13; shared by every list) ----
+// ---- daterange filter parsing (shared by every list) ----
 
 const DATE_RANGE_PRESETS: Record<string, number> = { "24h": 1, "7d": 7, "30d": 30, "90d": 90 };
 

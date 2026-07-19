@@ -2,7 +2,7 @@ import type { BillingObjectType } from "../../bot/billing/BillingQolStore";
 import { ActionButton, ActionResult } from "../renderer/contract";
 import { DashboardCtx } from "./types";
 
-// Bookmark-everything (PA-13, user ask): one shared button + action handler
+// Bookmark-everything (user ask): one shared button + action handler
 // so every detail page offers the shared-team bookmark. Each section keeps
 // its own "section:<area>.bookmark" key (section actions route by page
 // ownership) but delegates here; the Bookmarks board routes rows back via

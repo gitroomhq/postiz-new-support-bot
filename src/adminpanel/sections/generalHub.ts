@@ -1,7 +1,7 @@
 import { Section, SaveResult } from "../renderer/contract";
 import { AdminHubContext, HubModule, SaveRequest, asBoundedInt, asOptionalId, asString } from "./types";
 
-// General settings — the M0 reference hub that proves the whole spine. Mirrors
+// General settings — the reference hub that proves the whole spine. Mirrors
 // the old /config → General panel (threads channel, GitHub repo, ticket limits).
 // All values read/write through SettingsStore.updateGeneral — zero new logic.
 

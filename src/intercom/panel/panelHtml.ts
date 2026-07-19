@@ -283,7 +283,7 @@ ${panelThemeCss()}
       });
   }
 
-  // ---- boot (gated on the M10 passcode: confirm the code in the canvas) ----
+  // ---- boot (gated on the passcode: confirm the code in the canvas) ----
   var lockEl = document.getElementById("lock");
   var lockCodeEl = document.getElementById("lockcode");
   var booted = false;

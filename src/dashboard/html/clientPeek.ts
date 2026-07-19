@@ -1,4 +1,4 @@
-// Client module: hover peek cards (PA-13). 300ms hover-intent on reflink
+// Client module: hover peek cards. 300ms hover-intent on reflink
 // anchors whose target page is allowlisted; a singleton fixed-position card
 // hydrated from the cached `peek` endpoint. textContent only — never
 // innerHTML. Self-binding (document-level listeners), like clientBlocks'

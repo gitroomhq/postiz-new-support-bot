@@ -14,8 +14,8 @@ export type OutboxEventType =
   | "note"
   | "status"
   // Legacy skip-only member: the priority axis is removed, but durable queued
-  // events may still carry the type — the executor skips it. Drop with the
-  // N+1 cleanup.
+  // events may still carry the type — the executor skips it. Removable once
+  // no queued events can still carry it.
   | "priority"
   | "csat"
   // Agent-idle reminder for a bridged ticket: internal note + reopen so the

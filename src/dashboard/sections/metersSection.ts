@@ -3,7 +3,7 @@ import { ActionResult, Badge, Block, Cell } from "../renderer/contract";
 import { DashboardCtx, DashboardSectionModule, SectionPage, str } from "./types";
 import { badgeCell, dateCell, idCell, sentence, strong, text } from "./cells";
 
-// Usage meters (#/meters, Operate group, PA-7b): the billing.meters config
+// Usage meters (#/meters, Operate group): the billing.meters config
 // surface behind usage-based prices. List + detail (config kv + event
 // summaries) + minimal create + deactivate/reactivate (T1 — deactivating
 // stops event ingestion). Stripe scopes event summaries to ONE customer, so

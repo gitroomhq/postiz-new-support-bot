@@ -713,7 +713,7 @@ interface SubscriptionItemsParams {
   quantity?: number; // add
 }
 
-// Grow/shrink a multi-item subscription (PA-6). Both directions prorate; the
+// Grow/shrink a multi-item subscription. Both directions prorate; the
 // panel gates them behind the same mandatory preview as plan changes.
 const subscriptionItems = defineAction<SubscriptionItemsParams>({
   key: "subscription.items",
@@ -771,7 +771,7 @@ const subscriptionItems = defineAction<SubscriptionItemsParams>({
   },
 });
 
-// ---- subscription schedules (PA-11) ----
+// ---- subscription schedules ----
 
 interface SchedulePhaseParam {
   priceId: string;
@@ -1157,7 +1157,7 @@ const customerCoupon = defineAction<CustomerCouponParams>({
   dangerous: false, // remove is T1 param-aware in Dashboard.ts (needsConfirm)
   parseParams: (raw) => {
     const o = obj(raw);
-    // op defaults to "apply" so pre-PA-9 payloads (Intercom canvas) keep working.
+    // op defaults to "apply" so legacy payloads (Intercom canvas) keep working.
     const op = o?.op === "remove" ? ("remove" as const) : ("apply" as const);
     const subscriptionId = o ? (idWithPrefix(o.subscriptionId, "sub_") ?? undefined) : undefined;
     if (op === "apply") {

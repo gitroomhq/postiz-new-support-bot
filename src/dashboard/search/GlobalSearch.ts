@@ -114,7 +114,7 @@ export class GlobalSearch {
       .filter((b) => b.value.toLowerCase().includes(lower) || (b.customerId ?? "").toLowerCase().includes(lower))
       .slice(0, GROUP_LIMIT)
       .flatMap((b): SearchHit[] => {
-        if (!b.customerId) return []; // navigable hits only — the blocklist page is a later milestone
+        if (!b.customerId) return []; // navigable hits only — raw-value blocks have no customer detail to open
         return [
           {
             title: `Blocked ${b.kind}: ${b.value}`,

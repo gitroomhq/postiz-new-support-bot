@@ -26,7 +26,7 @@ import {
   text,
 } from "./cells";
 
-// Customers: account-wide browse/search, the Customer 360 and (M7) the edit
+// Customers: account-wide browse/search, the Customer 360 and the edit
 // surface — create, edit details/tax/locale/metadata, Discord↔Stripe
 // link/unlink (T1) and DELETE (typed CONFIRM + Discord reverse code, then
 // unlinkStripeCustomerEverywhere exactly like CustomersHub). Layout follows
@@ -35,7 +35,7 @@ import {
 
 const PAGE_SIZE = 25;
 
-// Curated tax-ID types (PA-10) — the Stripe union is 100+ entries; support
+// Curated tax-ID types — the Stripe union is 100+ entries; support
 // workflows need these. Server-side membership check beats trusting the select.
 const TAX_ID_TYPES = [
   { value: "eu_vat", label: "EU VAT" },
@@ -85,7 +85,7 @@ function parseAddressInput(
   return { ok: true, value: shipping ? { name, address } : address };
 }
 
-// PM identity cell (PA-13.F). Stripe exposes `fingerprint` on the types that
+// PM identity cell. Stripe exposes `fingerprint` on the types that
 // carry the instrument directly (cards + bank-debit rails); only CARD
 // fingerprints link into the reverse-card hunt (charges.search indexes only
 // those). Wallets (Link/PayPal…) vault the card on their side and expose NO
@@ -130,7 +130,7 @@ export function makeCustomersSection(): DashboardSectionModule {
       return page === "customers" || page === "customers.detail" || page === "customers.portal";
     },
 
-    // Hover peek card (PA-13): ONE retrieve, plain-text lines only.
+    // Hover peek card: ONE retrieve, plain-text lines only.
     async peek(ctx: DashboardCtx, page: string, id: string) {
       if (page !== "customers.detail") return null;
       const c = await ctx.stripe.getCustomer(id).catch(() => null);
@@ -417,7 +417,7 @@ async function customerAction(
 
 async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: string | null): Promise<SectionPage> {
   const q = str(filters.q, 80);
-  // PA-13 filter expansion (Stripe Customers-filter parity): created is a
+  // Filter expansion (Stripe Customers-filter parity): created is a
   // SERVER param on the plain listing; delinquent/country/has-subscription
   // slice the fetched page (subscriptions ride the list expand).
   const { createdGte, createdLt } = parseDateFilter(str(filters.created, 24));
@@ -546,7 +546,7 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
     return notFound("This customer does not exist (or was deleted).");
   }
 
-  // PA-10 note: 12 parallel STRIPE reads is the ceiling here — consolidate
+  // Note: 12 parallel STRIPE reads is the ceiling here — consolidate
   // before adding more (every new one is .catch-guarded and independent; the
   // bookmark flag is a local DB read, not a Stripe call).
   const [subs, invoices, methods, chargesPage, disputes, blocks, discordIds, notes, creditGrants, taxIds, balanceTxns, cashBalance, bookmarked] =
@@ -655,7 +655,7 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
         ? [{ label: "Balance", cell: text(balance, customer.balance < 0 ? "negative = customer credit" : undefined) }]
         : []),
       ...(() => {
-        // PA-10: bank-transfer funds awaiting reconciliation (usually absent).
+        // Bank-transfer funds awaiting reconciliation (usually absent).
         const buckets = Object.entries(cashBalance?.available ?? {}).filter(([, v]) => v !== 0);
         if (buckets.length === 0) return [];
         const map = new Map(buckets);
@@ -709,7 +709,7 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
         : []),
       ...(customer.description ? [{ label: "Description", cell: text(customer.description) }] : []),
     ],
-    // Inline edit (PA-8, replaces the customers.edit page): the same modals,
+    // Inline edit (replaces the customers.edit page): the same modals,
     // with current values embedded in the labels (web modals can't prefill).
     actions: [
       {
@@ -775,7 +775,7 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
     });
   }
 
-  // ---- rail: Tax IDs (PA-10; print on every invoice → both actions T1) ----
+  // ---- rail: Tax IDs (print on every invoice → both actions T1) ----
   rail.push({
     type: "kv",
     title: taxIds.length ? `Tax IDs (${taxIds.length})` : "Tax IDs",
@@ -819,7 +819,7 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
     ],
   });
 
-  // ---- rail: Addresses (PA-10) ----
+  // ---- rail: Addresses ----
   const billAddr = fmtAddress(customer.address);
   const shipAddr = fmtAddress(customer.shipping?.address ?? null);
   rail.push({
@@ -1042,7 +1042,7 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
         idCell(invoice.number ?? invoice.id ?? "draft", { copy: !!invoice.id }),
         dateCell(invoice.created),
       ] as Cell[],
-      // State actions inline (PA-8): same registry belts as the invoice
+      // State actions inline: same registry belts as the invoice
       // detail; the hybrid renderer puts the first inline, the rest in ···.
       ...(invoice.id ? { actions: invoiceRowActions(ctx, invoice) } : {}),
     })),
@@ -1055,7 +1055,7 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
       : {}),
   });
 
-  // ---- main: credit grants (PA-8; only when any exist — Grant lives in Manage) ----
+  // ---- main: credit grants (only when any exist — Grant lives in Manage) ----
   if (creditGrants.length > 0) {
     const now = Math.floor(Date.now() / 1000);
     const grantBadge = (g: Stripe.Billing.CreditGrant): Badge =>
@@ -1104,7 +1104,7 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
     });
   }
 
-  // ---- main: balance-transaction history (PA-10; glance, not a ledger) ----
+  // ---- main: balance-transaction history (glance, not a ledger) ----
   if (balanceTxns.length > 0) {
     main.push({
       type: "table",
@@ -1159,7 +1159,7 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
     });
   }
 
-  // ---- main: team notes (read-only in M0) ----
+  // ---- main: team notes (read-only) ----
   if (notes.rows.length > 0) {
     main.push({
       type: "timeline",
@@ -1173,7 +1173,7 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
     });
   }
 
-  // ---- rail: manage (PA-8 act-from-customer + money surfaces + links/delete) ----
+  // ---- rail: manage (act-from-customer + money surfaces + links/delete) ----
   rail.push({
     type: "kv",
     title: "Manage",
@@ -1333,7 +1333,7 @@ function invoiceRowActions(ctx: DashboardCtx, invoice: Stripe.Invoice): ActionBu
   return [];
 }
 
-// ---- customer portal login link (PA-6) ----
+// ---- customer portal login link ----
 // Rendering the page MINTS a fresh billing_portal session — the link is
 // short-lived and single-session, so a per-view mint is the safe shape (no
 // stored secret, nothing to revoke). Audited because the link grants the

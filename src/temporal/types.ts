@@ -122,7 +122,7 @@ export type IcEventType =
   | "status"
   // Legacy skip-only member: the priority axis is removed, but events queued
   // in in-flight ticket workflows may still carry the type — the executor
-  // skips them. Drop with the N+1 cleanup.
+  // skips them. Removable once no in-flight workflow can still carry it.
   | "priority"
   | "csat"
   // Agent-idle reminder: internal note + reopen so the conversation resurfaces
@@ -377,7 +377,7 @@ export interface SlaEnforceResult {
   skipped: boolean; // both engines disabled or Intercom unconfigured
 }
 
-// Kept for the publishStatusReport tombstone stub (removed in N+1 with the
+// Kept for the publishStatusReport tombstone stub (goes away with the
 // tombstone workflow).
 export interface ReportTickResult {
   published: boolean;

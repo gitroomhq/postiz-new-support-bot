@@ -181,7 +181,7 @@ export interface TabsBlock {
   items: Array<{ value: string; label: string; badge?: string; ref?: ObjectRef }>;
 }
 
-// ---- dispute evidence workbench (M6.2) ----
+// ---- dispute evidence workbench ----
 
 // One text-evidence field with its full lifecycle state. draft carries the
 // LOCAL draft value, staged what Stripe holds; the client shows draft ?? staged

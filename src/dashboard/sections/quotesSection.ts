@@ -4,7 +4,7 @@ import { DashboardCtx, DashboardSectionModule, SectionPage, str, validCursor } f
 import { bookmarkButton, isBookmarkedSafe, toggleBookmarkAction } from "./bookmarks";
 import { badgeCell, dateCell, idCell, money, sentence, strong, text, windowCount } from "./cells";
 
-// Quotes (#/quotes, PA-7b): price proposals with a lifecycle — draft → open
+// Quotes (#/quotes): price proposals with a lifecycle — draft → open
 // (finalized) → accepted (mints the subscription/invoice) or canceled. Writes
 // are section actions with LIVE status revalidation (payout precedent):
 // finalize/cancel = T1 typed-CONFIRM, accept = T2 (fresh factor) because it

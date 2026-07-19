@@ -113,7 +113,7 @@ export class IntercomPanel {
     const request = (body ?? {}) as Record<string, unknown>;
     if (typeof request !== "object" || Array.isArray(request)) return { status: 400, json: { error: "bad request" } };
 
-    // M10 passcode gate: while LOCKED only the poll works; the teammate confirms
+    // Passcode gate: while LOCKED only the poll works; the teammate confirms
     // the code shown here back in the Intercom canvas ("Unlock panel") to activate.
     if (endpoint === "activation-status") {
       return {

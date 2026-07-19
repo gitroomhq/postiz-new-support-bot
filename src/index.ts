@@ -276,7 +276,7 @@ async function main() {
     auditLogger
   );
   const panelTokens = new PanelTokens(settingsStore);
-  // Shared between the Stripe panel (web) and the Intercom canvas (M10 passcode).
+  // Shared between the Stripe panel (web) and the Intercom canvas (passcode).
   const panelSessions = new PanelSessions();
   const intercomPanel = new IntercomPanel(
     settingsStore,
@@ -464,7 +464,7 @@ async function main() {
   // Admin web panel (/config + /intercom) — mirrors the Stripe-panel pattern.
   // Built after `bot` because the guild snapshot reads bot.client (created in the
   // DiscordBot constructor). Bound in before start() so CallbackServer gets the
-  // route and the adminpanel_* interactions dispatch. M0 ships the General hub.
+  // route and the adminpanel_* interactions dispatch.
   const adminPanelTokens = new AdminPanelTokens(settingsStore);
   const adminPanelSessions = new AdminPanelSessions();
   const guildSnapshot = new GuildSnapshotProvider(() => bot.client);

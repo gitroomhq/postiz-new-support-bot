@@ -62,14 +62,14 @@ export interface DashboardSectionModule {
   ownsPage(page: string): boolean;
   buildPage(ctx: DashboardCtx, req: ViewRequest): Promise<SectionPage | null>;
   // Section-local actions ("section:" keys). Registry billing actions route
-  // through the action gateway instead (M2).
+  // through the action gateway instead.
   action?(ctx: DashboardCtx, req: ActionRequest): Promise<ActionResult>;
   // Live sidebar count for this module's nav badge (Approvals, Disputes).
   navBadge?(ctx: DashboardCtx): Promise<string | null>;
   // Needs-attention items for the topbar bell — collected by the nav-badges
-  // endpoint on the same 60s poll (PA-13).
+  // endpoint on the same 60s poll.
   attention?(ctx: DashboardCtx): Promise<AttentionItem[]>;
-  // Hover peek card for one of this module's detail pages (PA-13). Cached
+  // Hover peek card for one of this module's detail pages. Cached
   // 30s per Dashboard; page is allowlisted and id validated BEFORE this runs.
   peek?(ctx: DashboardCtx, page: string, id: string): Promise<PeekResponse | null>;
 }

@@ -6,7 +6,7 @@ import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 // In-memory by design (single-process bot): a restart just means reopening the
 // panel from the Intercom conversation.
 //
-// M10: sessions now start LOCKED with an activation code shown on the web page;
+// Sessions now start LOCKED with an activation code shown on the web page;
 // the teammate confirms that code back in the Intercom canvas ("Unlock panel")
 // to flip it ACTIVE — the same web→origin passcode binding the admin panel uses.
 

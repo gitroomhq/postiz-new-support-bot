@@ -2,7 +2,7 @@ import { Block, Cell } from "../renderer/contract";
 import { DashboardCtx, DashboardSectionModule, SectionPage, str, validCursor } from "./types";
 import { dateCell, idCell, refForId, sentence, text } from "./cells";
 
-// Events (#/events, PA-12): read-only browse of the account's Stripe event
+// Events (#/events): read-only browse of the account's Stripe event
 // stream — the "what did the API just do" debugging surface. 25/page with a
 // curated type filter plus a free-form `typeq` pill (validated, wins over the
 // select). Stripe retains events for 30 days.

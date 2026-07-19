@@ -182,8 +182,9 @@ const STATEMENTS: string[] = [
   END
   $$`,
   // (The priority axis is removed: existing deployments keep an orphaned
-  // "priority_tags" table + "tickets"."priorityTagId" column until the N+1
-  // destructive drop; fresh installs never create them.)
+  // "priority_tags" table + "tickets"."priorityTagId" column — dropping them
+  // while an older build is still live would break it; fresh installs never
+  // create them.)
   // Append-only status change history (emoji+label snapshotted as text).
   `CREATE TABLE IF NOT EXISTS "ticket_tag_changes" (
     "id" TEXT NOT NULL,
@@ -671,7 +672,7 @@ const STATEMENTS: string[] = [
   )`,
   `CREATE INDEX IF NOT EXISTS "billing_approvals_status_createdAt_idx" ON "billing_approvals"("status", "createdAt")`,
   `CREATE INDEX IF NOT EXISTS "billing_approvals_conversationId_status_idx" ON "billing_approvals"("conversationId", "status")`,
-  // Dashboard-origin approvals (M2): conversation becomes optional, origin
+  // Dashboard-origin approvals: conversation becomes optional, origin
   // decides how the execution ctx is rebuilt at approval time. Both statements
   // are idempotent on already-migrated databases.
   `ALTER TABLE "billing_approvals" ALTER COLUMN "conversationId" DROP NOT NULL`,

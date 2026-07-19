@@ -118,7 +118,7 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
   const status = str(filters.status, 24);
   const priceId = /^price_[A-Za-z0-9]{1,64}$/.test(filters.price ?? "") ? filters.price : "";
   const customerScope = validId("customer", filters.customer) ?? "";
-  // PA-13 filter expansion (Stripe Subscriptions-filter parity): created is
+  // Filter expansion (Stripe Subscriptions-filter parity): created is
   // a SERVER param + searchable; collection method slices the window.
   const createdRaw = str(filters.created, 24);
   const { createdGte, createdLt } = parseDateFilter(createdRaw);
@@ -510,7 +510,7 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
       : {}),
   });
 
-  // Schedule phases panel (PA-11): the live phase timeline when a schedule is
+  // Schedule phases panel: the live phase timeline when a schedule is
   // attached; edits happen on the schedule editor page.
   if (schedule) {
     main.push(schedulePhasesTable(ctx, schedule, { footerRef: { page: "subscriptions.schedule", params: { id } } }));
@@ -695,7 +695,7 @@ async function updatePage(ctx: DashboardCtx, id: string, filters: Record<string,
   const item = itemFilter ? sub.items.data.find((it) => it.id === itemFilter) ?? null : sub.items.data[0] ?? null;
   if (!customerId || !item) return notFound("Subscription has no customer/item to update.");
 
-  // PA-6: the page has three operations — change the selected item's price
+  // The page has three operations — change the selected item's price
   // (default), ADD a new item, REMOVE an item. All behind the same mandatory
   // proration preview.
   const mode = filters.mode === "add" || filters.mode === "remove" ? filters.mode : "";
@@ -903,7 +903,7 @@ function modeFilter(sub: Stripe.Subscription, value: string): FilterDef {
   };
 }
 
-// ---- ADD ITEM (PA-6: grow a subscription, mandatory proration preview) ----
+// ---- ADD ITEM (grow a subscription, mandatory proration preview) ----
 
 async function addItemMode(
   ctx: DashboardCtx,
@@ -1016,7 +1016,7 @@ async function addItemMode(
   };
 }
 
-// ---- REMOVE ITEM (PA-6: shrink a subscription, mandatory proration preview) ----
+// ---- REMOVE ITEM (shrink a subscription, mandatory proration preview) ----
 
 async function removeItemMode(
   ctx: DashboardCtx,
@@ -1312,7 +1312,7 @@ async function composer(ctx: DashboardCtx, filters: Record<string, string>): Pro
   };
 }
 
-// ---- SCHEDULE EDITOR (PA-11, `subscriptions.schedule`) ----
+// ---- SCHEDULE EDITOR (`subscriptions.schedule`) ----
 // Composer idiom: composed future phases live in the `phases` URL filter as
 // tokens `price_<id>*<qty>*<count><d|w|m|y>[*t][*pn]` (t = whole-phase trial,
 // pn = proration none). Confirm bakes the SERVER-parsed phases into the

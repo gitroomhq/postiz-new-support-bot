@@ -9,7 +9,7 @@ import { StripeClient } from "../../bot/StripeClient";
 // Invoices: account-wide LIST archetype (status count-cards) and the DETAIL
 // archetype (copy-field hosted URL + Summary + line items + credit notes +
 // enabled-payment-method chips + Metadata + rail). Lifecycle ops render as
-// registry buttons per status. PA-8 added the multi-line COMPOSER page
+// registry buttons per status. The multi-line COMPOSER page
 // (`invoices.new`): filter-driven like subscriptions.new, lines accumulate in
 // a compact `lines` token filter (price*qty + encoded custom lines) and the
 // confirm bakes the registry `invoice.create_draft` items[] server-side.
@@ -38,7 +38,7 @@ export function makeInvoicesSection(): DashboardSectionModule {
   };
 }
 
-// ---- draft editor actions (PA-9) ----
+// ---- draft editor actions ----
 // Every key re-reads the invoice and refuses unless it is a ONE-OFF draft
 // (subscription-cycle drafts have no invoiceitems and belong to the billing
 // engine). Drafts bill nothing until the T1 `invoice.finalize` gate, so edits
@@ -220,7 +220,7 @@ function registryButton(ctx: DashboardCtx, button: ActionButton): ActionButton {
 async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: string | null): Promise<SectionPage> {
   const status = str(filters.status, 16);
   const customerScope = validId("customer", filters.customer) ?? "";
-  // PA-13 filter expansion (Stripe Invoices-filter parity): collection method,
+  // Filter expansion (Stripe Invoices-filter parity): collection method,
   // subscription and created are SERVER-side list params; frequency
   // (recurring vs one-off) slices the fetched window.
   const collection =
@@ -375,7 +375,7 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
 async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
   const invoice = await ctx.stripe.getInvoice(id).catch(() => null);
   if (!invoice) return notFound("This invoice does not exist.");
-  // One-off drafts are editable (PA-9); subscription-cycle drafts belong to
+  // One-off drafts are editable; subscription-cycle drafts belong to
   // the billing engine and stay read-only.
   const editableDraft = invoice.status === "draft" && !invoice.parent?.subscription_details;
   const [creditNotes, editableItems, editorPrices, bookmarked] = await Promise.all([
@@ -782,7 +782,7 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
   };
 }
 
-// ---- COMPOSER (`invoices.new`, PA-8) ----
+// ---- COMPOSER (`invoices.new`) ----
 // Filter-driven multi-line draft builder. State lives entirely in the URL
 // filters (the subscriptions.new idiom): `customer` scopes it, `lines` holds
 // the accumulated items as tokens, `due`/`qty`/`custom` are knobs. Tokens:

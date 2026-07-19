@@ -105,7 +105,7 @@ test("sessions: create/get, epoch revocation, unknown ids", () => {
   assert.ok(got);
   assert.equal(got!.aid, "42");
   assert.equal(got!.cid, "777");
-  assert.equal(got!.state, "locked"); // M10: sessions start locked until canvas confirm
+  assert.equal(got!.state, "locked"); // Sessions start locked until canvas confirm
   // wrong/unknown id
   assert.equal(sessions.get("nope", 0), null);
   // epoch bump kills it

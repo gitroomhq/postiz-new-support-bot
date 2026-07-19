@@ -33,10 +33,10 @@ export function dashboardCss(): string {
   .topbar .jumpwrap { flex:1; max-width:430px; position:relative; }
   /* Search stays left; identity + session controls pin to the right edge. */
   .topbar .who { margin-left:auto; }
-  /* Global "+ Create" menu (PA-8): reuses the ··· popover chrome. */
+  /* Global "+ Create" menu: reuses the ··· popover chrome. */
   .topbar .createwrap .morepop { right:0; left:auto; min-width:220px; }
 
-  /* Needs-attention bell (PA-13): same popover chrome, wider for the labels. */
+  /* Needs-attention bell: same popover chrome, wider for the labels. */
   .topbar .bellwrap .morepop { right:0; left:auto; min-width:320px; max-width:420px; max-height:60vh; overflow-y:auto; }
   #bellbtn { position:relative; display:inline-flex; align-items:center; gap:4px; padding:6px 8px; }
   #bellbtn svg { width:15px; height:15px; }
@@ -45,7 +45,7 @@ export function dashboardCss(): string {
   .bellitem .belllabel { flex:1; min-width:0; font-size:13px; line-height:1.35; }
   .bellitem .badge { flex:0 0 auto; margin-top:1px; }
 
-  /* Hover peek card (PA-13): singleton fixed card, viewport-clamped. */
+  /* Hover peek card: singleton fixed card, viewport-clamped. */
   .peekcard { position:fixed; z-index:60; background:var(--surface); border:1px solid var(--border);
     border-radius:10px; box-shadow:var(--shadow-pop); padding:12px 14px; max-width:320px; min-width:200px;
     pointer-events:auto; }
@@ -53,11 +53,11 @@ export function dashboardCss(): string {
   .peekcard .peektitle { font-weight:600; color:var(--heading); font-size:14px; }
   .peekcard .peekline { color:var(--muted); font-size:12.5px; line-height:1.5; overflow-wrap:anywhere; }
 
-  /* daterange filter (PA-13): the custom two-date row inside the pill popover. */
+  /* daterange filter: the custom two-date row inside the pill popover. */
   .fpop .rangerow { display:flex; gap:6px; align-items:center; flex-wrap:wrap; }
   .fpop .rangerow input[type=date] { font-size:12.5px; padding:5px 7px; }
 
-  /* ?-help dialog (PA-13). */
+  /* ?-help dialog. */
   .helptable { border-collapse:collapse; margin:8px 0 4px; }
   .helptable td { padding:5px 14px 5px 0; font-size:13.5px; color:var(--muted); }
   .helptable kbd { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:11.5px; color:var(--heading);
@@ -160,7 +160,7 @@ export function dashboardCss(): string {
   .stat.link:hover { border-color:var(--accent); }
 
   .tablewrap { overflow-x:auto; margin:0 -20px; padding:0 20px; }
-  /* Sticky table headers (PA-13, desktop only): overflow-x:auto makes
+  /* Sticky table headers (desktop only): overflow-x:auto makes
      .tablewrap the scroll container and kills sticky — desktop gives up
      h-scroll for pinned headers; mobile keeps the trade the other way.
      Sections are transparent, so the th background is the PAGE token. */
@@ -385,7 +385,7 @@ export function dashboardCss(): string {
   @keyframes shimmer { to { background-position:-200% 0; } }
   @media (prefers-reduced-motion: reduce) { .skel { animation:none; } .spinner { animation:none; } }
 
-  /* Mobile pass (PA-13): hamburger + sliding drawer replaces the old
+  /* Mobile pass: hamburger + sliding drawer replaces the old
      horizontal nav strip; tables keep overflow-x h-scroll. */
   @media (max-width:760px) {
     #app { grid-template-columns:1fr; }

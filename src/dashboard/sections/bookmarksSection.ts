@@ -5,7 +5,7 @@ import { badgeCell, idCell, isoDateCell, refForId, sentence, text } from "./cell
 
 // Team bookmarks (/billing/bookmarks, Operate group): the shared board over
 // BillingQolStore — one list for the whole team, rows deep-link into the
-// typed detail pages (every object family since the PA-13 bookmark-everything
+// typed detail pages (every object family since the bookmark-everything
 // pass; rows route via the shared refForId). Saved filters were considered
 // and SKIPPED (palette recents already cover the cheap version).
 

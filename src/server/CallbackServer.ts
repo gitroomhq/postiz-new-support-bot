@@ -256,7 +256,7 @@ export class CallbackServer {
       // Dispute evidence proofs (≤4MB) travel as base64 JSON on the normal
       // api route — never multipart — so this panel takes bigger bodies.
       jsonLimit: "8mb",
-      // Real path URLs (PA-13): /billing/customers/cus_… serves the shell so
+      // Real path URLs: /billing/customers/cus_… serves the shell so
       // copied links deep-load; the client router owns the path from there.
       spaWildcard: true,
       route: () => this.dashboard,

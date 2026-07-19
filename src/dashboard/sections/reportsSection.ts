@@ -3,7 +3,7 @@ import { ActionResult, Badge, Block, Cell } from "../renderer/contract";
 import { DashboardCtx, DashboardSectionModule, SectionPage, str } from "./types";
 import { badgeCell, dateCell, idCell, sentence, text } from "./cells";
 
-// Reports (#/reports, PA-12): Stripe financial report runs. Runs execute
+// Reports (#/reports): Stripe financial report runs. Runs execute
 // asynchronously; succeeded runs produce a real Stripe File, so downloads
 // mint a short-lived FileLink URL (10 minutes) instead of piping bytes —
 // itemized reports routinely exceed the JSON channel's size cap.

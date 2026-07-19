@@ -188,7 +188,7 @@ export function makeCatalogSection(): DashboardSectionModule {
           return { ok: true, text: `Promo code ${promo.code} created.` };
         }
 
-        // T0 — create a tax rate (PA-7a). Tax rates can't be deleted, only
+        // T0 — create a tax rate. Tax rates can't be deleted, only
         // archived, so creation is the whole write surface besides the toggle.
         case "section:catalog.tax_create": {
           const displayName = str(p.displayName, 50).trim();
@@ -226,7 +226,7 @@ export function makeCatalogSection(): DashboardSectionModule {
           return { ok: true, text: `${rate.display_name} is now ${rate.active ? "active" : "archived"}.` };
         }
 
-        // T0 — create a fixed-amount shipping rate (PA-12; mirror of tax
+        // T0 — create a fixed-amount shipping rate (mirror of tax
         // rates: no delete, no amount edits — archive and recreate).
         case "section:catalog.shipping_create": {
           const displayName = str(p.displayName, 100).trim();
@@ -616,7 +616,7 @@ async function promosBlocks(ctx: DashboardCtx, filters: Record<string, string>):
   return blocks;
 }
 
-// ---- Tax rates (PA-7a: list + create + archive/restore) ----
+// ---- Tax rates (list + create + archive/restore) ----
 
 async function taxBlocks(ctx: DashboardCtx): Promise<Block[]> {
   const rates = await ctx.stripe.listTaxRates(25).catch(() => [] as Stripe.TaxRate[]);
@@ -678,7 +678,7 @@ async function taxBlocks(ctx: DashboardCtx): Promise<Block[]> {
   return [table, create];
 }
 
-// ---- Shipping rates (PA-12: list + create + archive/restore) ----
+// ---- Shipping rates (list + create + archive/restore) ----
 
 async function shippingBlocks(ctx: DashboardCtx): Promise<Block[]> {
   const rates = await ctx.stripe.listShippingRates(25).catch(() => [] as Stripe.ShippingRate[]);

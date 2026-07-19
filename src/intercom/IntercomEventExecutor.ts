@@ -150,7 +150,7 @@ export class IntercomEventExecutor {
         return;
       case "priority":
         // Skip-only: the priority axis is removed, but durable queued events
-        // may still carry the type. Drop with the N+1 cleanup.
+        // may still carry the type. Removable once none can.
         this.execLog.info("priority event skipped (axis removed)", { "ticket.thread_id": threadId });
         return;
       case "csat":

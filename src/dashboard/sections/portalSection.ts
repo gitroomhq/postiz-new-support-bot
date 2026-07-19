@@ -3,7 +3,7 @@ import { ActionResult, Badge, Block, Cell } from "../renderer/contract";
 import { DashboardCtx, DashboardSectionModule, SectionPage } from "./types";
 import { badgeCell, dateCell, idCell, text } from "./cells";
 
-// Customer portal (#/portal, Operate group, PA-6): the billing_portal
+// Customer portal (#/portal, Operate group): the billing_portal
 // configuration surface — which self-serve features customers get (invoice
 // history, payment-method update, cancellation). Per-customer LOGIN LINKS are
 // minted from the Customer 360 (customers.portal), not here. Feature edits are

@@ -2,7 +2,7 @@
 // block; this code just draws it. Dynamic text via textContent only.
 
 export const clientBlocks = `
-// Real copyable path hrefs (PA-13): delegates to the router's D.hrefFor
+// Real copyable path hrefs: delegates to the router's D.hrefFor
 // (defined in clientApp — modules all share one IIFE, calls happen at render
 // time). Anchors carry /billing/… URLs; D.bindLinks SPA-intercepts left
 // clicks while ctrl/middle-click open real tabs.
@@ -608,7 +608,7 @@ D.filterPill = function (f) {
   var pop = D.el("div", "fpop");
   pop.appendChild(D.el("label", null, f.label));
   if (f.kind === "daterange") {
-    // Preset select + a "Custom…" two-date row (PA-13). One filter value:
+    // Preset select + a "Custom…" two-date row. One filter value:
     // preset token or "YYYY-MM-DD..YYYY-MM-DD".
     var isRange = !!f.value && f.value.indexOf("..") > 0;
     var dsel = document.createElement("select");

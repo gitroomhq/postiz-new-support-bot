@@ -236,7 +236,7 @@ export class StripeClient {
     return { subscriptionId: active[0].id };
   }
 
-  // Discount removal (PA-9). Sub-level removal leaves a customer-level
+  // Discount removal. Sub-level removal leaves a customer-level
   // discount (if any) untouched — they are separate objects at Stripe.
   async removeSubscriptionDiscount(subscriptionId: string): Promise<void> {
     await this.stripe.subscriptions.deleteDiscount(subscriptionId);
@@ -546,7 +546,7 @@ export class StripeClient {
     return this.stripe.payouts.retrieve(payoutId);
   }
 
-  // ---- payout writes (PA-5): create / cancel / reverse ----
+  // ---- payout writes: create / cancel / reverse ----
 
   // Manual payout from the AVAILABLE balance to the default external account.
   async createPayout(
@@ -629,7 +629,7 @@ export class StripeClient {
     return { transactions: res.data, hasMore: res.has_more };
   }
 
-  // ---- Radar reviews (PA-6): the manual-review queue ----
+  // ---- Radar reviews: the manual-review queue ----
 
   // reviews.list returns OPEN reviews only; the charge is expanded so the
   // queue can show amount/status without N+1 reads.
@@ -652,7 +652,7 @@ export class StripeClient {
     return this.stripe.reviews.approve(reviewId, {}, idempotencyKey ? { idempotencyKey } : undefined);
   }
 
-  // ---- customer portal (PA-6): configuration + per-customer login links ----
+  // ---- customer portal: configuration + per-customer login links ----
 
   async listPortalConfigurations(limit = 10): Promise<Stripe.BillingPortal.Configuration[]> {
     const res = await this.stripe.billingPortal.configurations.list({ limit });
@@ -1313,7 +1313,7 @@ export class StripeClient {
     return this.stripe.accounts.retrieve();
   }
 
-  // Payout schedule on our OWN account (PA-12). ⚠ accounts.update may be
+  // Payout schedule on our OWN account. ⚠ accounts.update may be
   // Connect-only for some account types — best-effort by design: callers map
   // Stripe's refusal to a friendly error; the read path stays correct.
   async updatePayoutSchedule(schedule: {
@@ -1509,7 +1509,7 @@ export class StripeClient {
     await this.stripe.coupons.del(couponId);
   }
 
-  // ---- payment links (PA-7a) ----
+  // ---- payment links ----
 
   // line_items are expanded so the list can show what each link sells
   // without N+1 reads.
@@ -1552,7 +1552,7 @@ export class StripeClient {
     return this.stripe.paymentLinks.update(paymentLinkId, { active });
   }
 
-  // ---- checkout sessions (PA-12): read-only browse on the Links page ----
+  // ---- checkout sessions: read-only browse on the Links page ----
 
   async listCheckoutSessions(opts: {
     limit?: number;
@@ -1567,7 +1567,7 @@ export class StripeClient {
     return { sessions: res.data, hasMore: res.has_more };
   }
 
-  // ---- tax rates (PA-7a) ----
+  // ---- tax rates ----
 
   async listTaxRates(limit = 25): Promise<Stripe.TaxRate[]> {
     const res = await this.stripe.taxRates.list({ limit });
@@ -1596,7 +1596,7 @@ export class StripeClient {
     return this.stripe.taxRates.update(taxRateId, { active });
   }
 
-  // ---- shipping rates (PA-12): fixed-amount rates, 5th Catalog tab ----
+  // ---- shipping rates: fixed-amount rates, 5th Catalog tab ----
 
   async listShippingRates(limit = 25): Promise<Stripe.ShippingRate[]> {
     const res = await this.stripe.shippingRates.list({ limit });
@@ -1629,7 +1629,7 @@ export class StripeClient {
     return this.stripe.shippingRates.update(shippingRateId, { active });
   }
 
-  // ---- quotes (PA-7b) ----
+  // ---- quotes ----
 
   // data.customer is expanded so the list can show a name/email instead of a
   // raw cus_ id without N+1 reads.
@@ -1677,7 +1677,7 @@ export class StripeClient {
     return this.stripe.quotes.accept(quoteId, {}, idempotencyKey ? { idempotencyKey } : undefined);
   }
 
-  // Quote PDF (PA-12): the API returns a STREAM, not a File object — fileLinks
+  // Quote PDF: the API returns a STREAM, not a File object — fileLinks
   // can't mint URLs for it, so the bytes ride the dashboard's JSON channel as
   // b64. Size-capped accumulation + the %PDF magic-byte check (receipt-PDF
   // idiom) so an error page never gets served as a download. Null = no PDF
@@ -1704,7 +1704,7 @@ export class StripeClient {
     return data;
   }
 
-  // ---- usage meters (PA-7b) ----
+  // ---- usage meters ----
 
   async listMeters(limit = 25): Promise<Stripe.Billing.Meter[]> {
     const res = await this.stripe.billing.meters.list({ limit });
@@ -1755,7 +1755,7 @@ export class StripeClient {
     return res.data;
   }
 
-  // ---- credit grants (PA-8) ----
+  // ---- credit grants ----
 
   async listCreditGrants(customerId: string, limit = 25): Promise<Stripe.Billing.CreditGrant[]> {
     const res = await this.stripe.billing.creditGrants.list({ customer: customerId, limit });
@@ -1895,7 +1895,7 @@ export class StripeClient {
     status: Stripe.Invoice.Status | undefined,
     limit = 10,
     startingAfter?: string,
-    // PA-13 filter expansion: these are all SERVER-side invoices.list params.
+    // Filter expansion: these are all SERVER-side invoices.list params.
     opts: {
       collectionMethod?: "charge_automatically" | "send_invoice";
       subscriptionId?: string;
@@ -2032,7 +2032,7 @@ export class StripeClient {
     );
   }
 
-  // Items WITHOUT an id are ADDED to the subscription (PA-6 grow).
+  // Items WITHOUT an id are ADDED to the subscription (grow).
   async addSubscriptionItem(
     params: { subscriptionId: string; priceId: string; quantity?: number; prorationBehavior: "create_prorations" | "none" },
     idempotencyKey?: string
@@ -2047,7 +2047,7 @@ export class StripeClient {
     );
   }
 
-  // deleted:true removes the item (PA-6 shrink) — Stripe refuses on the last one.
+  // deleted:true removes the item (shrink) — Stripe refuses on the last one.
   async removeSubscriptionItem(
     params: { subscriptionId: string; itemId: string; prorationBehavior: "create_prorations" | "none" },
     idempotencyKey?: string
@@ -2126,7 +2126,7 @@ export class StripeClient {
     );
   }
 
-  // ---- full-phase schedule editor (PA-11) ----
+  // ---- full-phase schedule editor ----
 
   // Replace the schedule's phases wholesale. Callers pass the REBUILT current
   // phase first (rebuildCurrentPhase) — the update API only accepts
@@ -2216,7 +2216,7 @@ export class StripeClient {
 
   // auto_advance stays off: finalizing must not let Stripe auto-collect later —
   // collection happens explicitly via sendInvoice/payInvoice.
-  // ---- draft-invoice editor (PA-9) ----
+  // ---- draft-invoice editor ----
   // invoiceItems.list is the source of truth for EDITABLE rows on a one-off
   // draft — never map Basil invoice.lines back to ii_ ids (fragile parent
   // indirection). Subscription-cycle drafts have no invoiceitems and are not
@@ -2370,7 +2370,7 @@ export class StripeClient {
     );
   }
 
-  // ---- reporting (PA-12): report runs + short-lived file links ----
+  // ---- reporting: report runs + short-lived file links ----
 
   async listReportRuns(limit = 25): Promise<Stripe.Reporting.ReportRun[]> {
     const res = await this.stripe.reporting.reportRuns.list({ limit });

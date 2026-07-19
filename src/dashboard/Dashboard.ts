@@ -205,7 +205,7 @@ export class Dashboard implements MountedPanelRoute {
                 const value = await m.navBadge(ctx).catch(() => null);
                 if (value) for (const item of m.nav) badges[item.key] = value;
               }
-              // Bell feed (PA-13): same 60s poll — one request feeds the nav
+              // Bell feed: same 60s poll — one request feeds the nav
               // pills AND the needs-attention popover.
               if (m.attention) {
                 const items = await m.attention(ctx).catch(() => [] as AttentionItem[]);
@@ -221,7 +221,7 @@ export class Dashboard implements MountedPanelRoute {
           return { status: 200, json };
         }
         case "peek": {
-          // Hover peek cards (PA-13): page allowlist + kind-specific id
+          // Hover peek cards: page allowlist + kind-specific id
           // validation FIRST — the module hook only ever sees clean input.
           const page = typeof request.page === "string" ? request.page : "";
           const rawId = typeof request.id === "string" ? request.id.slice(0, 80) : "";

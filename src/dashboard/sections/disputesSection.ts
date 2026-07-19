@@ -18,8 +18,8 @@ import { ActionButton, Badge, Block, Cell, EvidenceBlock, TableBlock } from "../
 import { DashboardCtx, DashboardSectionModule, SectionPage, str, validId } from "./types";
 import { amount, badgeCell, idCell, isoDateCell, sentence, strong, text } from "./cells";
 
-// Disputes: M6.1 shipped the overview (ratio strip, due-date board, All list,
-// History & stats); M6.2 turns the detail page into the evidence WORKBENCH —
+// Disputes: the overview (ratio strip, due-date board, All list,
+// History & stats); the detail page is the evidence WORKBENCH —
 // the interactive editor widget (draft autosave / stage / proof files), the
 // staged-evidence review subpage and every action: submit (typed CONFIRM +
 // Discord reverse code), accept-as-lost (same ceremony), refund-to-prevent
@@ -629,7 +629,7 @@ async function historyBlocks(ctx: DashboardCtx, cursor: string | null): Promise<
   return blocks;
 }
 
-// ---- DETAIL: the evidence workbench (M6.2) ----
+// ---- DETAIL: the evidence workbench ----
 
 async function detail(ctx: DashboardCtx, deps: DisputesDeps, id: string): Promise<SectionPage> {
   let dispute: Stripe.Dispute | null = null;

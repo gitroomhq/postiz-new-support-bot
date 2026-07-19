@@ -250,7 +250,7 @@ export class IntercomInboxApp {
         style: "primary",
         action: { type: "url", url: panelLink.url },
       });
-      // M10: the panel opens LOCKED and shows a code — confirm it here to unlock.
+      // The panel opens LOCKED and shows a code — confirm it here to unlock.
       components.push({ type: "input", id: "panel_code", label: "Panel code (shown on the page)", placeholder: "XXXX-XXXX" });
       components.push({ type: "button", id: "unlock_panel", label: "Unlock panel", style: "secondary", action: { type: "submit" } });
     } else {
