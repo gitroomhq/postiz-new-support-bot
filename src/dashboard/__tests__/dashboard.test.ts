@@ -6164,10 +6164,23 @@ test("payments filters (PA-13): fingerprint/email flip the rows into a whole-acc
   assert.equal(searches.length, 0);
 
   // Email mode: billing_details.email is NOT a supported charges.search
-  // field (prod-confirmed) — the sweep goes customers-first and merges their
-  // charge histories; chip search is skipped entirely (windowed chips).
+  // field on the CURRENT API version — the sweep runs two legs and merges:
+  // a direct billing-email search under the legacy version pin (guests
+  // included) + customers-first histories. Deduped, newest-first, windowed
+  // chips (email can't scope search counts).
   const emailLookups: string[] = [];
   const chargeLists: string[] = [];
+  const directQueries: string[] = [];
+  stripe.searchChargesByBillingEmail = async (email: string) => {
+    directQueries.push(email);
+    return {
+      charges: [
+        { ...hit, id: "ch_guest", customer: null, created: 1_700_000_900 }, // guest — only the direct leg sees it
+        { ...hit, id: "ch_cus_l1", customer: "cus_l1", created: 1_600_000_000 }, // duped with the customers leg
+      ],
+      totalCount: 2,
+    };
+  };
   stripe.searchCustomersByEmail = async (email: string) => {
     emailLookups.push(email);
     return [{ id: "cus_l1" }, { id: "cus_l2" }];
@@ -6178,14 +6191,24 @@ test("payments filters (PA-13): fingerprint/email flip the rows into a whole-acc
   };
   countQs.length = 0;
   const emailPage = await section.buildPage(ctx, { page: "payments", filters: { email: 'Other@X.com"\\' } });
+  assert.deepEqual(directQueries, ["other@x.com"]);
   assert.deepEqual(emailLookups, ["other@x.com"]);
   assert.deepEqual(chargeLists.sort(), ["cus_l1", "cus_l2"]);
   assert.equal(countQs.length, 0); // email can't scope chip searches — honest windowed chips
   const emailTable = emailPage!.blocks.find((b) => b.type === "table") as TableBlock;
-  // Merged newest-first across both matched customers.
-  assert.deepEqual(emailTable.rows.map((r) => r.id), ["ch_cus_l2", "ch_cus_l1"]);
+  // Guest + both customers, deduped (ch_cus_l1 appears in both legs), newest-first.
+  assert.deepEqual(emailTable.rows.map((r) => r.id), ["ch_guest", "ch_cus_l2", "ch_cus_l1"]);
   assert.equal(emailTable.nextCursor, null);
-  assert.match(emailTable.notice!, /matched 2 customers/);
+  assert.match(emailTable.notice!, /guests included.*2 customers/);
+
+  // The legacy pin being refused someday must NOT kill the sweep — the
+  // customers-first leg still delivers.
+  stripe.searchChargesByBillingEmail = async () => {
+    throw new Error("version rejected");
+  };
+  const degraded = await section.buildPage(ctx, { page: "payments", filters: { email: "other@x.com" } });
+  const degradedTable = degraded!.blocks.find((b) => b.type === "table") as TableBlock;
+  assert.deepEqual(degradedTable.rows.map((r) => r.id), ["ch_cus_l2", "ch_cus_l1"]);
 
   // Window slicers: decline reason (outcome/failure_code contains) + invoice.
   stripe.listAllCharges = async () => ({

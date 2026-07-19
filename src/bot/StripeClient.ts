@@ -361,10 +361,32 @@ export class StripeClient {
     }
   }
 
+  // The Basil-era API version this SDK pins DROPPED billing_details.email
+  // from the charges.search fields (prod-confirmed refusal). The field still
+  // works under older versions, and Stripe honors a per-request version pin —
+  // the charge fields the Payments list renders (amount/currency/created/
+  // status/customer/billing_details/payment_method_details) are shape-stable
+  // across these versions. Callers keep the customers-first merge as the
+  // fallback if this pin is ever refused.
+  private static readonly LEGACY_SEARCH_API_VERSION = "2024-06-20";
+
+  async searchChargesByBillingEmail(
+    email: string,
+    limit = 100
+  ): Promise<{ charges: Stripe.Charge[]; totalCount: number | null }> {
+    const safe = email.replace(/["\\]/g, "").trim();
+    if (safe.length < 3) return { charges: [], totalCount: 0 };
+    const res = await this.stripe.charges.search(
+      { query: `billing_details.email~"${safe}"`, limit, expand: ["total_count"] },
+      { apiVersion: StripeClient.LEGACY_SEARCH_API_VERSION }
+    );
+    return { charges: res.data as unknown as Stripe.Charge[], totalCount: res.total_count ?? null };
+  }
+
   // Customers by (billing/wallet) email, substring match. `email` IS a
-  // supported customers.search field — unlike charges.search, where Stripe
-  // REFUSES billing_details.email (prod-confirmed on this API version), so
-  // email sweeps go customers-first and then merge their charges.
+  // supported customers.search field on the current version — the second leg
+  // of the email sweep (catches customer-record matches whose charges carry
+  // a DIFFERENT billing email).
   async searchCustomersByEmail(email: string, limit = 10): Promise<Stripe.Customer[]> {
     const safe = email.replace(/["\\]/g, "").trim();
     if (safe.length < 3) return [];

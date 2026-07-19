@@ -369,16 +369,41 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
     log.child("dashboard").error(`payments ${what} sweep failed`, e, { "stripe.search_query": searchQ() });
     return { charges: [] as Stripe.Charge[], hasMore: false };
   };
+  // Two complementary legs, merged + deduped: (1) a DIRECT billing-email
+  // charge search under a legacy API-version pin (billing_details.email was
+  // dropped from the current version's search fields) — this is what catches
+  // GUEST charges with no customer record; (2) customers-first — customers
+  // matched by email, their charge histories merged — which catches charges
+  // whose billing email differs from the customer's. Either leg may fail
+  // (e.g. Stripe refusing the legacy pin) without killing the sweep; only
+  // both failing surfaces as a sweep failure.
   const emailSweepCharges = async (): Promise<{ charges: Stripe.Charge[]; hasMore: boolean }> => {
-    const matched = await ctx.stripe.searchCustomersByEmail(emailFilter, 10);
-    emailSweepCustomers = matched.length;
-    const lists = await Promise.all(
-      matched.map((c) => ctx.stripe.listCharges(c.id, WINDOW).catch(() => ({ charges: [] as Stripe.Charge[], hasMore: false })))
-    );
-    const merged = lists
-      .flatMap((l) => l.charges)
+    const [direct, viaCustomers] = await Promise.allSettled([
+      ctx.stripe.searchChargesByBillingEmail(emailFilter, WINDOW),
+      ctx.stripe.searchCustomersByEmail(emailFilter, 10).then(async (matched) => {
+        emailSweepCustomers = matched.length;
+        const lists = await Promise.all(
+          matched.map((c) => ctx.stripe.listCharges(c.id, WINDOW).catch(() => ({ charges: [] as Stripe.Charge[], hasMore: false })))
+        );
+        return { charges: lists.flatMap((l) => l.charges), hasMore: lists.some((l) => l.hasMore) };
+      }),
+    ]);
+    if (direct.status === "rejected" && viaCustomers.status === "rejected") throw direct.reason;
+    if (direct.status === "rejected") {
+      log.child("dashboard").error("legacy billing-email charge search failed (customers-first leg still ran)", direct.reason);
+    }
+    const seen = new Set<string>();
+    const merged = [
+      ...(direct.status === "fulfilled" ? direct.value.charges : []),
+      ...(viaCustomers.status === "fulfilled" ? viaCustomers.value.charges : []),
+    ]
+      .filter((c) => (seen.has(c.id) ? false : (seen.add(c.id), true)))
       .sort((a, b) => b.created - a.created);
-    return { charges: merged.slice(0, WINDOW), hasMore: merged.length > WINDOW || lists.some((l) => l.hasMore) };
+    const more =
+      merged.length > WINDOW ||
+      (direct.status === "fulfilled" && (direct.value.totalCount ?? 0) > direct.value.charges.length) ||
+      (viaCustomers.status === "fulfilled" && viaCustomers.value.hasMore);
+    return { charges: merged.slice(0, WINDOW), hasMore: more };
   };
 
   const [chargeWindow, piWindow, efws, blockPage, searchCounts] = await Promise.all([
@@ -732,7 +757,7 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
             : fingerprintMode
               ? `Card fingerprint sweeps the WHOLE account via Stripe Search (~1 min lag; first ${WINDOW} matches shown). Incomplete attempts aren't searchable by card.`
               : emailSweep
-                ? `Email sweep: matched ${emailSweepCustomers} customer${emailSweepCustomers === 1 ? "" : "s"} by email (up to 10) and merged their charge histories. Guest checkouts without a customer record aren't found; chips count these results.`
+                ? `Email sweep: billing-email charge search (guests included) merged with ${emailSweepCustomers} customer${emailSweepCustomers === 1 ? "" : "s"} matched by email. Chips count these results.`
                 : `Counts and filters cover the ${WINDOW} most recent payments${dateKey ? ` of the ${dateKey} window` : ""} per page — use Next for older ones. EFW matching covers the 100 most recent warnings.`) +
           // The wallet blind spot: Link/PayPal charges expose no card digits.
           (last4 || fingerprint || pmFilter
