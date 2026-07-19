@@ -6165,7 +6165,7 @@ test("payments filters (PA-13): fingerprint/email flip the rows into a whole-acc
 
   // Email mode: exact-match search on billing_details.email.
   await section.buildPage(ctx, { page: "payments", filters: { email: 'Other@X.com"\\' } });
-  assert.ok(searches[0].includes('billing_details.email:"other@x.com"'));
+  assert.ok(searches[0].includes('billing_details.email~"other@x.com"'));
 
   // Window slicers: decline reason (outcome/failure_code contains) + invoice.
   stripe.listAllCharges = async () => ({
@@ -6322,5 +6322,7 @@ test("search sweep resilience (PA-13.F): a refused charges.search renders an emp
   const table = page!.blocks.find((b) => b.type === "table" && (b as TableBlock).key === "payments") as TableBlock;
   assert.equal(table.rows.length, 0);
   assert.match(table.notice!, /Search failed/);
-  assert.match(table.empty!, /refused this query/);
+  // Stripe's exact refusal reaches the operator (deploys have no log access).
+  assert.match(table.notice!, /expand\[0\] cannot be data\.refunds on search/);
+  assert.match(table.empty!, /refused this sweep/);
 });

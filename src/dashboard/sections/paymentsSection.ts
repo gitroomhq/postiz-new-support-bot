@@ -6,6 +6,7 @@ import { BlockStore } from "../../bot/billing/BlockStore";
 import type { ActionActor } from "../../bot/billing/actions/BillingActionService";
 import { ActionButton, Badge, Block, Cell, KeyValueBlock, TableBlock } from "../renderer/contract";
 import { FINGERPRINT_RE } from "../../bot/billing/types";
+import { log } from "../../util/logger";
 import { DashboardCtx, DashboardSectionModule, SectionPage, str, validCursor, validId } from "./types";
 import { payoutBadge, sourceRef, TX_TYPES } from "./balancesSection";
 import {
@@ -337,7 +338,9 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
   // Chip totals must honor the custom range's upper bound too.
   if (createdLt) scopeParts.push(`created<${createdLt}`);
   if (fingerprint) scopeParts.push(`payment_method_details.card.fingerprint:"${fingerprint}"`);
-  if (emailFilter) scopeParts.push(`billing_details.email:"${emailFilter}"`);
+  // Substring operator, same shape as the palette's proven charge search —
+  // also catches +tag address variants.
+  if (emailFilter) scopeParts.push(`billing_details.email~"${emailFilter}"`);
   const searchQ = (extra?: string) => [...scopeParts, ...(extra ? [extra] : [])].join(" AND ") || "created>0";
   const countSearch = (kind: "charges" | "paymentIntents", q: string) =>
     Promise.resolve()
@@ -350,15 +353,18 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
   // refused/failed search degrades to an empty table with an explanatory
   // notice — it must never 500 the whole page.
   const searchMode = Boolean(fingerprint || emailFilter);
-  let searchFailed = false;
+  let searchFailMsg: string | null = null;
 
   const [chargeWindow, piWindow, efws, blockPage, searchCounts] = await Promise.all([
     searchMode
       ? ctx.stripe
           .searchChargesForList(searchQ(), WINDOW)
           .then((r) => ({ charges: r.charges, hasMore: (r.totalCount ?? r.charges.length) > r.charges.length }))
-          .catch(() => {
-            searchFailed = true;
+          .catch((e: unknown) => {
+            // Ship the real refusal to Sentry (log.error captures exceptions)
+            // AND surface it in the page notice — deploys have no log access.
+            searchFailMsg = e instanceof Error ? e.message.slice(0, 200) : "unknown error";
+            log.child("dashboard").error("payments card/email sweep failed", e, { "stripe.search_query": searchQ() });
             return { charges: [] as Stripe.Charge[], hasMore: false };
           })
       : customerScope
@@ -690,15 +696,15 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
         rows,
         // Search mode has no starting_after cursor — one 100-row page.
         nextCursor: !searchMode && chargeWindow.hasMore && charges.length > 0 ? charges[charges.length - 1].id : null,
-        empty: searchFailed
-          ? "Stripe Search refused this query — check the bot logs, or try the email/fingerprint without special characters."
+        empty: searchFailMsg
+          ? "Stripe Search refused this sweep — the notice below carries Stripe's exact message (also sent to Sentry)."
           : hasInMemoryFilter
             ? "No payments match these filters (within this window)."
             : "No payments yet.",
         ...(rows.length ? { footer: `${rows.length} item${rows.length === 1 ? "" : "s"}` } : {}),
         notice:
-          (searchFailed
-            ? "Stripe Search failed for this card/email sweep — the table is empty, NOT a real zero-matches result."
+          (searchFailMsg
+            ? `Stripe Search failed for this card/email sweep — the table is empty, NOT a real zero-matches result. Stripe said: "${searchFailMsg}"`
             : searchMode
               ? `Card/email filters sweep the WHOLE account via Stripe Search (~1 min lag; first ${WINDOW} matches shown). Incomplete attempts aren't searchable by card or email.`
               : `Counts and filters cover the ${WINDOW} most recent payments${dateKey ? ` of the ${dateKey} window` : ""} per page — use Next for older ones. EFW matching covers the 100 most recent warnings.`) +
