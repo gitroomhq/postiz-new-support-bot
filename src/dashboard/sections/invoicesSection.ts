@@ -3,7 +3,7 @@ import type { ActionActor } from "../../bot/billing/actions/BillingActionService
 import { ActionButton, ActionResult, Badge, Block, Cell } from "../renderer/contract";
 import { DashboardCtx, DashboardSectionModule, SectionPage, str, validCursor, validId } from "./types";
 import { bookmarkButton, isBookmarkedSafe, toggleBookmarkAction } from "./bookmarks";
-import { amount, badgeCell, cardCell, chipCount, dateCell, fmtAddress, idCell, invoiceBadge, money, sentence, strong, text } from "./cells";
+import { amount, badgeCell, cardCell, chipCount, dateCell, DATE_RANGE_OPTIONS, fmtAddress, idCell, invoiceBadge, money, parseDateFilter, sentence, strong, text } from "./cells";
 import { StripeClient } from "../../bot/StripeClient";
 
 // Invoices: account-wide LIST archetype (status count-cards) and the DETAIL
@@ -220,23 +220,47 @@ function registryButton(ctx: DashboardCtx, button: ActionButton): ActionButton {
 async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: string | null): Promise<SectionPage> {
   const status = str(filters.status, 16);
   const customerScope = validId("customer", filters.customer) ?? "";
+  // PA-13 filter expansion (Stripe Invoices-filter parity): collection method,
+  // subscription and created are SERVER-side list params; frequency
+  // (recurring vs one-off) slices the fetched window.
+  const collection =
+    filters.collection === "charge_automatically" || filters.collection === "send_invoice" ? filters.collection : "";
+  const subScope = validId("subscription", filters.subscription) ?? "";
+  const createdRaw = str(filters.created, 24);
+  const { createdGte, createdLt } = parseDateFilter(createdRaw);
+  const frequency = filters.frequency === "recurring" || filters.frequency === "oneoff" ? filters.frequency : "";
   const cursorId = validId("invoice", validCursor(cursor) ?? "") ?? undefined;
 
   // Real chip totals via invoices.search total_count (window counts cap at
-  // WINDOW); fallback = honest windowed "N+" when search fails.
-  const scope = customerScope ? `customer:"${customerScope}"` : "";
-  const searchQ = (extra?: string) => [scope, extra].filter(Boolean).join(" AND ") || "created>0";
+  // WINDOW); fallback = honest windowed "N+" when search fails. Search can
+  // express customer + created but NOT collection/subscription/frequency —
+  // those force honest windowed chips.
+  const scopeParts: string[] = [];
+  if (customerScope) scopeParts.push(`customer:"${customerScope}"`);
+  if (createdGte) scopeParts.push(`created>=${createdGte}`);
+  if (createdLt) scopeParts.push(`created<${createdLt}`);
+  const searchQ = (extra?: string) => [...scopeParts, ...(extra ? [extra] : [])].join(" AND ") || "created>0";
+  const searchable = !collection && !subScope && !frequency;
   const countSearch = (q: string) =>
-    Promise.resolve()
-      .then(() => ctx.stripe.countBySearch("invoices", q))
-      .catch(() => null);
+    searchable
+      ? Promise.resolve()
+          .then(() => ctx.stripe.countBySearch("invoices", q))
+          .catch(() => null)
+      : Promise.resolve(null);
   const STATUSES = ["draft", "open", "paid", "void", "uncollectible"] as const;
   const [res, chipTotals] = await Promise.all([
-    ctx.stripe.listInvoicesByStatus(customerScope || null, undefined, WINDOW, cursorId),
+    ctx.stripe.listInvoicesByStatus(customerScope || null, undefined, WINDOW, cursorId, {
+      ...(collection ? { collectionMethod: collection } : {}),
+      ...(subScope ? { subscriptionId: subScope } : {}),
+      createdGte,
+      createdLt,
+    }),
     Promise.all([countSearch(searchQ()), ...STATUSES.map((s) => countSearch(searchQ(`status:"${s}"`)))]),
   ]);
   const [nAll, ...nByStatus] = chipTotals;
-  const invoices = res.data;
+  const invoices = frequency
+    ? res.data.filter((inv) => Boolean(inv.parent?.subscription_details) === (frequency === "recurring"))
+    : res.data;
 
   const over = res.has_more;
   const counts = {
@@ -300,13 +324,46 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
         counts,
         filters: [
           { key: "customer", label: "Customer", kind: "text", value: customerScope || undefined, placeholder: "cus_…" },
+          {
+            key: "created",
+            label: "Created",
+            kind: "daterange",
+            value: createdRaw && (createdGte || createdLt) ? createdRaw : undefined,
+            options: DATE_RANGE_OPTIONS,
+          },
+          {
+            key: "collection",
+            label: "Collection method",
+            kind: "select",
+            value: collection || undefined,
+            options: [
+              { value: "charge_automatically", label: "Charge automatically" },
+              { value: "send_invoice", label: "Send invoice" },
+            ],
+          },
+          {
+            key: "frequency",
+            label: "Frequency",
+            kind: "select",
+            value: frequency || undefined,
+            options: [
+              { value: "recurring", label: "Recurring (subscription)" },
+              { value: "oneoff", label: "One-off" },
+            ],
+          },
+          { key: "subscription", label: "Subscription", kind: "text", value: subScope || undefined, placeholder: "sub_…" },
         ],
         rows,
-        nextCursor:
-          res.has_more && invoices.length > 0 ? invoices[invoices.length - 1].id ?? null : null,
-        empty: status || customerScope ? "No invoices match this filter (within this window)." : "No invoices yet.",
+        // The cursor walks the RAW window — frequency slices rows client-side.
+        nextCursor: res.has_more && res.data.length > 0 ? res.data[res.data.length - 1].id ?? null : null,
+        empty:
+          status || customerScope || collection || subScope || frequency
+            ? "No invoices match this filter (within this window)."
+            : "No invoices yet.",
         ...(rows.length ? { footer: `${rows.length} item${rows.length === 1 ? "" : "s"}` } : {}),
-        notice: `Chip counts are account totals; the table shows ${WINDOW} per page — use Next for older ones.`,
+        notice: searchable
+          ? `Chip counts are account totals; the table shows ${WINDOW} per page — use Next for older ones.`
+          : `Collection/frequency/subscription filters aren't searchable — chip counts cover this window only ("N+" on overflow).`,
       },
     ],
   };

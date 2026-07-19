@@ -5,6 +5,7 @@ import { SessionStore } from "../../auth/SessionStore";
 import { BlockStore } from "../../bot/billing/BlockStore";
 import type { ActionActor } from "../../bot/billing/actions/BillingActionService";
 import { ActionButton, Badge, Block, Cell, KeyValueBlock, TableBlock } from "../renderer/contract";
+import { FINGERPRINT_RE } from "../../bot/billing/types";
 import { DashboardCtx, DashboardSectionModule, SectionPage, str, validCursor, validId } from "./types";
 import { payoutBadge, sourceRef, TX_TYPES } from "./balancesSection";
 import {
@@ -17,6 +18,7 @@ import {
   idCell,
   isoDateCell,
   money,
+  parseDateFilter,
   piBadge,
   sentence,
   text,
@@ -32,22 +34,9 @@ import {
 const WINDOW = 100; // in-memory filter/count window per page (documented in the notice)
 const BULK_REFUND_MAX = 25; // blast-radius cap per bulk-refund run
 
-const DATE_RANGES: Record<string, number> = { "24h": 1, "7d": 7, "30d": 30, "90d": 90 };
-
-// PA-13 daterange: one filter value carries a preset ("7d") or a custom
-// "YYYY-MM-DD..YYYY-MM-DD" range. The custom end date is inclusive → lt is
-// end+86400. Garbage (or inverted ranges) parses to no bounds at all.
-export function parseDateFilter(value: string): { createdGte?: number; createdLt?: number } {
-  if (DATE_RANGES[value]) {
-    return { createdGte: Math.floor(Date.now() / 1000) - DATE_RANGES[value] * 86400 };
-  }
-  const m = value.match(/^(\d{4}-\d{2}-\d{2})\.\.(\d{4}-\d{2}-\d{2})$/);
-  if (!m) return {};
-  const gte = Math.floor(Date.parse(`${m[1]}T00:00:00Z`) / 1000);
-  const lt = Math.floor(Date.parse(`${m[2]}T00:00:00Z`) / 1000) + 86400;
-  if (!Number.isFinite(gte) || !Number.isFinite(lt) || gte >= lt) return {};
-  return { createdGte: gte, createdLt: lt };
-}
+// Daterange parsing lives in cells.ts since every list uses it (PA-13
+// filter expansion); re-exported here for existing importers.
+export { parseDateFilter };
 
 const INCOMPLETE_PI = new Set([
   "requires_payment_method",
@@ -318,6 +307,14 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
   const flagged = str(filters.flagged, 12);
   const currencyFilter = str(filters.currency, 8).toLowerCase();
   const pmFilter = str(filters.pm, 24).toLowerCase();
+  // PA-13 filter expansion (user ask — Stripe "More filters" parity):
+  // fingerprint = the reverse-card sweep (exact identity across ALL
+  // customers, search-backed); email exact-matches via search; decline
+  // reason + invoice slice the fetched window.
+  const fingerprint = FINGERPRINT_RE.test(filters.fingerprint ?? "") ? filters.fingerprint : "";
+  const emailFilter = str(filters.email, 100).replace(/["\\]/g, "").trim().toLowerCase();
+  const declineFilter = str(filters.declineReason, 40).replace(/["\\]/g, "").trim().toLowerCase();
+  const invoiceFilter = validId("invoice", filters.invoice) ?? "";
 
   // Date filter (PA-13 daterange): a preset token OR a custom
   // "YYYY-MM-DD..YYYY-MM-DD" range in the same key. The range end is
@@ -339,19 +336,34 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
   if (createdGte) scopeParts.push(`created>=${createdGte}`);
   // Chip totals must honor the custom range's upper bound too.
   if (createdLt) scopeParts.push(`created<${createdLt}`);
+  if (fingerprint) scopeParts.push(`payment_method_details.card.fingerprint:"${fingerprint}"`);
+  if (emailFilter) scopeParts.push(`billing_details.email:"${emailFilter}"`);
   const searchQ = (extra?: string) => [...scopeParts, ...(extra ? [extra] : [])].join(" AND ") || "created>0";
   const countSearch = (kind: "charges" | "paymentIntents", q: string) =>
     Promise.resolve()
       .then(() => ctx.stripe.countBySearch(kind, q))
       .catch(() => null);
 
+  // Search mode: fingerprint/email aren't list params, so the ROWS come from
+  // charges.search (whole account, not just the recency window) — this is the
+  // reverse-card lookup. No cursor (one 100-row page + exact total).
+  const searchMode = Boolean(fingerprint || emailFilter);
+
   const [chargeWindow, piWindow, efws, blockPage, searchCounts] = await Promise.all([
-    customerScope
-      ? ctx.stripe.listCharges(customerScope, WINDOW, cursorId)
-      : ctx.stripe.listAllCharges({ limit: WINDOW, createdGte, createdLt, startingAfter: cursorId }),
-    (customerScope
-      ? ctx.stripe.listPaymentIntents(customerScope, WINDOW).then((paymentIntents) => ({ paymentIntents, hasMore: false }))
-      : ctx.stripe.listAllPaymentIntents({ limit: WINDOW, createdGte, createdLt })
+    searchMode
+      ? ctx.stripe
+          .searchChargesForList(searchQ(), WINDOW)
+          .then((r) => ({ charges: r.charges, hasMore: (r.totalCount ?? r.charges.length) > r.charges.length }))
+      : customerScope
+        ? ctx.stripe.listCharges(customerScope, WINDOW, cursorId)
+        : ctx.stripe.listAllCharges({ limit: WINDOW, createdGte, createdLt, startingAfter: cursorId }),
+    (searchMode
+      ? // PI search can't express card/email fields — the Incomplete view is
+        // meaningless under these filters; it renders empty with a notice.
+        Promise.resolve({ paymentIntents: [] as Stripe.PaymentIntent[], hasMore: false })
+      : customerScope
+        ? ctx.stripe.listPaymentIntents(customerScope, WINDOW).then((paymentIntents) => ({ paymentIntents, hasMore: false }))
+        : ctx.stripe.listAllPaymentIntents({ limit: WINDOW, createdGte, createdLt })
     ).catch(() => ({ paymentIntents: [] as Stripe.PaymentIntent[], hasMore: false })),
     ctx.stripe.listRecentEarlyFraudWarnings(100).catch(() => [] as Stripe.Radar.EarlyFraudWarning[]),
     ctx.stores.block.listPage(0, 200).catch(() => ({ rows: [], total: 0 })),
@@ -463,6 +475,24 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
         { value: "efw", label: "Early fraud warning" },
       ],
     },
+    // PA-13 "More filters" parity. Fingerprint/email flip the list into a
+    // whole-account Stripe-Search sweep; decline reason + invoice slice rows.
+    {
+      key: "fingerprint",
+      label: "Card fingerprint",
+      kind: "text",
+      value: fingerprint || undefined,
+      placeholder: "Exact card identity — sweeps ALL customers",
+    },
+    { key: "email", label: "Email", kind: "text", value: emailFilter || undefined, placeholder: "ada@example.com" },
+    {
+      key: "declineReason",
+      label: "Decline reason",
+      kind: "text",
+      value: declineFilter || undefined,
+      placeholder: "e.g. insufficient_funds",
+    },
+    { key: "invoice", label: "Invoice", kind: "text", value: invoiceFilter || undefined, placeholder: "in_…" },
   ];
 
   // Currency + payment-method pills, built from what's actually in the window.
@@ -575,6 +605,17 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
     if (flagged === "efw" && !efwChargeIds.has(c.id)) return false;
     if (currencyFilter && c.currency !== currencyFilter) return false;
     if (pmFilter && (c.payment_method_details?.card?.brand ?? "") !== pmFilter) return false;
+    // PA-13 expansion: email/fingerprint re-check what search matched (and cut
+    // the plain window when search was unavailable); decline reason + invoice
+    // slice the fetched rows — the list API can't express them.
+    if (emailFilter && !(c.billing_details?.email ?? c.receipt_email ?? "").toLowerCase().includes(emailFilter)) return false;
+    if (fingerprint && c.payment_method_details?.card?.fingerprint !== fingerprint) return false;
+    if (declineFilter && !`${c.outcome?.reason ?? ""} ${c.failure_code ?? ""}`.toLowerCase().includes(declineFilter)) return false;
+    if (invoiceFilter) {
+      const inv = (c as { invoice?: string | { id: string } | null }).invoice;
+      const invId = typeof inv === "string" ? inv : inv?.id ?? null;
+      if (invId !== invoiceFilter) return false;
+    }
     return true;
   });
 
@@ -610,7 +651,10 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
     };
   });
 
-  const hasInMemoryFilter = !!(status || last4 || amountFilter || flagged || currencyFilter || pmFilter);
+  const hasInMemoryFilter = !!(
+    status || last4 || amountFilter || flagged || currencyFilter || pmFilter ||
+    emailFilter || fingerprint || declineFilter || invoiceFilter
+  );
   return {
     title: "Payments",
     crumbs: [{ label: "Payments" }],
@@ -637,10 +681,13 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
         editableColumns: true,
         ...(bulkActions.length ? { bulkActions } : {}),
         rows,
-        nextCursor: chargeWindow.hasMore && charges.length > 0 ? charges[charges.length - 1].id : null,
+        // Search mode has no starting_after cursor — one 100-row page.
+        nextCursor: !searchMode && chargeWindow.hasMore && charges.length > 0 ? charges[charges.length - 1].id : null,
         empty: hasInMemoryFilter ? "No payments match these filters (within this window)." : "No payments yet.",
         ...(rows.length ? { footer: `${rows.length} item${rows.length === 1 ? "" : "s"}` } : {}),
-        notice: `Counts and filters cover the ${WINDOW} most recent payments${dateKey ? ` of the ${dateKey} window` : ""} per page — use Next for older ones. EFW matching covers the 100 most recent warnings.`,
+        notice: searchMode
+          ? `Card/email filters sweep the WHOLE account via Stripe Search (~1 min lag; first ${WINDOW} matches shown). Incomplete attempts aren't searchable by card or email.`
+          : `Counts and filters cover the ${WINDOW} most recent payments${dateKey ? ` of the ${dateKey} window` : ""} per page — use Next for older ones. EFW matching covers the 100 most recent warnings.`,
       },
     ],
   };

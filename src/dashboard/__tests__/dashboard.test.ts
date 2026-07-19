@@ -6115,3 +6115,188 @@ test("bookmark everything (PA-13 user ask): every object family toggles via the 
   assert.equal(await isBookmarkedSafe({ stores: {} } as unknown as DashboardCtx, "quote", "qt_1"), false);
   assert.equal(await isBookmarkedSafe(ctx, "quote", "qt_1"), true);
 });
+
+// ---- PA-13 filter expansion (user ask): fingerprint reverse search + Stripe filter parity ----
+
+test("payments filters (PA-13): fingerprint/email flip the rows into a whole-account search sweep; decline reason + invoice slice the window", async () => {
+  const section = makePaymentsSection();
+  const searches: string[] = [];
+  const countQs: string[] = [];
+  const ctx = paymentsCtx();
+  const stripe = ctx.stripe as unknown as Record<string, unknown>;
+  const hit = {
+    id: "ch_hit",
+    status: "succeeded",
+    captured: true,
+    refunded: false,
+    disputed: false,
+    amount: 2900,
+    amount_refunded: 0,
+    currency: "eur",
+    created: 1_600_000_000,
+    customer: "cus_other",
+    billing_details: { email: "other@x.com" },
+    payment_method_details: { type: "card", card: { brand: "visa", last4: "4242", fingerprint: "Xt5EWLLDS7FJjR1c" } },
+  };
+  stripe.searchChargesForList = async (query: string) => {
+    searches.push(query);
+    return { charges: [hit], totalCount: 1 };
+  };
+  stripe.countBySearch = async (_k: string, q: string) => {
+    countQs.push(q);
+    return 1;
+  };
+
+  // Fingerprint = the reverse-card sweep: rows come from Stripe Search (whole
+  // account), no cursor, and the chip-count queries carry the same scope.
+  const page = await section.buildPage(ctx, { page: "payments", filters: { fingerprint: "Xt5EWLLDS7FJjR1c" } });
+  const table = page!.blocks.find((b) => b.type === "table" && (b as TableBlock).key === "payments") as TableBlock;
+  assert.equal(table.rows.length, 1);
+  assert.equal(table.rows[0].id, "ch_hit");
+  assert.equal(table.nextCursor, null);
+  assert.ok(searches[0].includes('payment_method_details.card.fingerprint:"Xt5EWLLDS7FJjR1c"'));
+  assert.ok(countQs.some((q) => q.includes('payment_method_details.card.fingerprint:"Xt5EWLLDS7FJjR1c"')));
+  assert.match(table.notice!, /WHOLE account/);
+
+  // Garbage fingerprints are dropped server-side — normal window mode.
+  searches.length = 0;
+  await section.buildPage(ctx, { page: "payments", filters: { fingerprint: "!!nope!!" } });
+  assert.equal(searches.length, 0);
+
+  // Email mode: exact-match search on billing_details.email.
+  await section.buildPage(ctx, { page: "payments", filters: { email: 'Other@X.com"\\' } });
+  assert.ok(searches[0].includes('billing_details.email:"other@x.com"'));
+
+  // Window slicers: decline reason (outcome/failure_code contains) + invoice.
+  stripe.listAllCharges = async () => ({
+    charges: [
+      { ...hit, id: "ch_d1", status: "failed", outcome: { reason: "insufficient_funds" }, failure_code: "card_declined" },
+      { ...hit, id: "ch_d2", invoice: "in_77" },
+    ],
+    hasMore: false,
+  });
+  const declined = await section.buildPage(ctx, { page: "payments", filters: { declineReason: "insufficient" } });
+  const declinedTable = declined!.blocks.find((b) => b.type === "table") as TableBlock;
+  assert.deepEqual(declinedTable.rows.map((r) => r.id), ["ch_d1"]);
+  const byInvoice = await section.buildPage(ctx, { page: "payments", filters: { invoice: "in_77" } });
+  const invoiceTable = byInvoice!.blocks.find((b) => b.type === "table") as TableBlock;
+  assert.deepEqual(invoiceTable.rows.map((r) => r.id), ["ch_d2"]);
+});
+
+test("PM fingerprint (PA-13): the 360 payment-methods table exposes the fingerprint and links into the reverse-card hunt", async () => {
+  const ctx = fakeCustomerCtx();
+  (ctx.stripe as unknown as Record<string, unknown>).listAllPaymentMethods = async () => [
+    { id: "pm_1", type: "card", card: { brand: "visa", last4: "4242", exp_month: 7, exp_year: 2027, fingerprint: "Xt5EWLLDS7FJjR1c" } },
+    { id: "pm_2", type: "link" },
+  ];
+  const page = await makeCustomersSection().buildPage(ctx, { page: "customers.detail", params: { id: "cus_test1" } });
+  const pms = page!.blocks.find((b) => b.type === "table" && (b as TableBlock).key === "pms") as TableBlock;
+  assert.equal(pms.columns.some((c) => c.label === "Fingerprint"), true);
+  const fpCell = pms.rows[0].cells[3] as { t: string; v: string; ref?: { page: string; filters?: Record<string, string> } };
+  assert.equal(fpCell.v, "Xt5EWLLDS7FJjR1c");
+  assert.deepEqual(fpCell.ref, { page: "fraud", filters: { view: "card", fp: "Xt5EWLLDS7FJjR1c" } });
+  // Wallet PMs have no fingerprint — em dash, no dead link.
+  const walletCell = pms.rows[1].cells[3] as { t: string; v: string };
+  assert.equal(walletCell.v, "—");
+});
+
+test("customers list filters (PA-13): created is a server param; delinquent/country/has-subscription slice the page", async () => {
+  const calls: Array<Record<string, unknown>> = [];
+  const ctx = {
+    stripe: {
+      listCustomersPage: async (opts: Record<string, unknown>) => {
+        calls.push(opts);
+        return {
+          customers: [
+            { id: "cus_1", name: "Ada", email: "a@x.com", delinquent: false, created: 1_700_000_000, address: { country: "DE" }, subscriptions: { data: [{ id: "sub_1" }] } },
+            { id: "cus_2", name: "Bob", email: "b@x.com", delinquent: true, created: 1_700_000_100, address: { country: "US" }, subscriptions: { data: [] } },
+          ],
+          hasMore: false,
+        };
+      },
+      searchCustomersByTerm: async () => [],
+    },
+  } as unknown as DashboardCtx;
+  const section = makeCustomersSection();
+  const page = await section.buildPage(ctx, { page: "customers", filters: { created: "2026-06-01..2026-06-30", delinquent: "yes" } });
+  assert.equal(calls[0].createdGte, Math.floor(Date.parse("2026-06-01T00:00:00Z") / 1000));
+  assert.equal(calls[0].createdLt, Math.floor(Date.parse("2026-06-30T00:00:00Z") / 1000) + 86400);
+  const table = page!.blocks.find((b) => b.type === "table") as TableBlock;
+  assert.deepEqual(table.rows.map((r) => r.id), ["cus_2"]);
+  const hasSub = await section.buildPage(ctx, { page: "customers", filters: { hassub: "yes" } });
+  assert.deepEqual((hasSub!.blocks.find((b) => b.type === "table") as TableBlock).rows.map((r) => r.id), ["cus_1"]);
+  const byCountry = await section.buildPage(ctx, { page: "customers", filters: { country: "us" } });
+  assert.deepEqual((byCountry!.blocks.find((b) => b.type === "table") as TableBlock).rows.map((r) => r.id), ["cus_2"]);
+});
+
+test("invoices + subscriptions filters (PA-13): server params thread through; non-searchable filters force honest windowed chips", async () => {
+  // Invoices: collection/subscription/created are SERVER list params;
+  // frequency slices; chips skip search when non-searchable filters are set.
+  const invOpts: Array<Record<string, unknown>> = [];
+  let invSearches = 0;
+  const invCtx = {
+    stripe: {
+      formatAmount: (a: number, c: string) => `${(a / 100).toFixed(2)} ${c.toUpperCase()}`,
+      listInvoicesByStatus: async (...args: unknown[]) => {
+        invOpts.push(args[4] as Record<string, unknown>);
+        return {
+          data: [
+            { id: "in_r", status: "paid", total: 2900, currency: "eur", created: 1_700_000_000, customer: "cus_1", customer_email: "a@x.com", due_date: null, parent: { subscription_details: { subscription: "sub_1" } } },
+            { id: "in_o", status: "open", total: 500, currency: "eur", created: 1_700_000_100, customer: "cus_1", customer_email: "a@x.com", due_date: null, parent: null },
+          ],
+          has_more: false,
+        };
+      },
+      countBySearch: async () => {
+        invSearches++;
+        return 5;
+      },
+    },
+  } as unknown as DashboardCtx;
+  const invSection = makeInvoicesSection();
+  const recurring = await invSection.buildPage(invCtx, {
+    page: "invoices",
+    filters: { frequency: "recurring", collection: "send_invoice", subscription: "sub_1", created: "2026-06-01..2026-06-30" },
+  });
+  assert.equal(invSearches, 0); // non-searchable filters → windowed chips
+  assert.equal(invOpts[0].collectionMethod, "send_invoice");
+  assert.equal(invOpts[0].subscriptionId, "sub_1");
+  assert.equal(invOpts[0].createdGte, Math.floor(Date.parse("2026-06-01T00:00:00Z") / 1000));
+  const invTable = recurring!.blocks.find((b) => b.type === "table") as TableBlock;
+  assert.deepEqual(invTable.rows.map((r) => r.id), ["in_r"]);
+  assert.match(invTable.notice!, /window only/);
+
+  // Subscriptions: created threads into the listing AND the chip searches;
+  // collection method slices the window and turns chips windowed.
+  const subCalls: Array<Record<string, unknown>> = [];
+  const subQs: string[] = [];
+  const subCtx2 = subsCtx();
+  const subStripe = subCtx2.stripe as unknown as Record<string, unknown>;
+  const subRow = (id: string, collection: string) => ({
+    id,
+    status: "active",
+    collection_method: collection,
+    pause_collection: null,
+    cancel_at_period_end: false,
+    customer: "cus_1",
+    created: 1_700_000_000,
+    items: { data: [{ quantity: 1, current_period_end: 1_700_900_000, price: { id: "price_1", nickname: "Pro", currency: "eur", unit_amount: 2900, recurring: { interval: "month", interval_count: 1 } } }] },
+  });
+  subStripe.listAllSubscriptions = async (opts: Record<string, unknown>) => {
+    subCalls.push(opts);
+    return { subscriptions: [subRow("sub_auto", "charge_automatically"), subRow("sub_manual", "send_invoice")], hasMore: false };
+  };
+  subStripe.countBySearch = async (_k: string, q: string) => {
+    subQs.push(q);
+    return 9;
+  };
+  const subSection = makeSubscriptionsSection();
+  await subSection.buildPage(subCtx2, { page: "subscriptions", filters: { created: "7d" } });
+  assert.ok(subCalls[0].createdGte != null);
+  assert.ok(subQs.length > 0 && subQs.every((q) => q.includes("created>=")));
+  subQs.length = 0;
+  const manualOnly = await subSection.buildPage(subCtx2, { page: "subscriptions", filters: { collection: "send_invoice" } });
+  assert.equal(subQs.length, 0); // collection isn't searchable → windowed chips
+  const subTable = manualOnly!.blocks.find((b) => b.type === "table") as TableBlock;
+  assert.deepEqual(subTable.rows.map((r) => r.id), ["sub_manual"]);
+});

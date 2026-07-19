@@ -121,6 +121,33 @@ export function refForId(id: string): ObjectRef | null {
   return null;
 }
 
+// ---- daterange filter parsing (PA-13; shared by every list) ----
+
+const DATE_RANGE_PRESETS: Record<string, number> = { "24h": 1, "7d": 7, "30d": 30, "90d": 90 };
+
+// One filter value carries a preset ("7d") or a custom
+// "YYYY-MM-DD..YYYY-MM-DD" range. The custom end date is inclusive → lt is
+// end+86400. Garbage (or inverted ranges) parses to no bounds at all.
+export function parseDateFilter(value: string): { createdGte?: number; createdLt?: number } {
+  if (DATE_RANGE_PRESETS[value]) {
+    return { createdGte: Math.floor(Date.now() / 1000) - DATE_RANGE_PRESETS[value] * 86400 };
+  }
+  const m = value.match(/^(\d{4}-\d{2}-\d{2})\.\.(\d{4}-\d{2}-\d{2})$/);
+  if (!m) return {};
+  const gte = Math.floor(Date.parse(`${m[1]}T00:00:00Z`) / 1000);
+  const lt = Math.floor(Date.parse(`${m[2]}T00:00:00Z`) / 1000) + 86400;
+  if (!Number.isFinite(gte) || !Number.isFinite(lt) || gte >= lt) return {};
+  return { createdGte: gte, createdLt: lt };
+}
+
+// The preset rows every daterange pill offers (client adds "Custom…").
+export const DATE_RANGE_OPTIONS = [
+  { value: "24h", label: "Last 24 hours" },
+  { value: "7d", label: "Last 7 days" },
+  { value: "30d", label: "Last 30 days" },
+  { value: "90d", label: "Last 90 days" },
+];
+
 // Stripe pills are sentence case ("Past due"), never raw enum values.
 export function sentence(status: string): string {
   const s = status.replace(/_/g, " ");

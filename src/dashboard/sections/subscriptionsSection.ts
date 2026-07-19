@@ -8,8 +8,10 @@ import {
   badgeCell,
   chipCount,
   dateCell,
+  DATE_RANGE_OPTIONS,
   idCell,
   money,
+  parseDateFilter,
   paymentMethodCell,
   sentence,
   strong,
@@ -116,14 +118,24 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
   const status = str(filters.status, 24);
   const priceId = /^price_[A-Za-z0-9]{1,64}$/.test(filters.price ?? "") ? filters.price : "";
   const customerScope = validId("customer", filters.customer) ?? "";
+  // PA-13 filter expansion (Stripe Subscriptions-filter parity): created is
+  // a SERVER param + searchable; collection method slices the window.
+  const createdRaw = str(filters.created, 24);
+  const { createdGte, createdLt } = parseDateFilter(createdRaw);
+  const collection =
+    filters.collection === "charge_automatically" || filters.collection === "send_invoice" ? filters.collection : "";
 
   const cursorId = validId("subscription", validCursor(cursor) ?? "") ?? undefined;
 
   // Real chip totals via subscriptions.search (window counts cap at WINDOW).
   // Subscription search indexes created/metadata/status only — customer- or
-  // price-scoped views and the Paused chip (pause_collection) can't be
+  // price-scoped views, collection method and the Paused chip can't be
   // expressed, so those stay honest windowed counts ("N+" on overflow).
-  const scoped = Boolean(customerScope || priceId);
+  const scoped = Boolean(customerScope || priceId || collection);
+  const scopeParts: string[] = [];
+  if (createdGte) scopeParts.push(`created>=${createdGte}`);
+  if (createdLt) scopeParts.push(`created<${createdLt}`);
+  const searchQ = (extra?: string) => [...scopeParts, ...(extra ? [extra] : [])].join(" AND ") || "created>0";
   const countSearch = (q: string) =>
     scoped
       ? Promise.resolve(null)
@@ -138,9 +150,11 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
       customerId: customerScope || undefined,
       limit: WINDOW,
       startingAfter: cursorId,
+      createdGte,
+      createdLt,
     }),
     ctx.stripe.listRecurringPrices(50).catch(() => [] as Stripe.Price[]),
-    Promise.all([countSearch("created>0"), ...SUB_STATUSES.map((s) => countSearch(`status:"${s}"`))]),
+    Promise.all([countSearch(searchQ()), ...SUB_STATUSES.map((s) => countSearch(searchQ(`status:"${s}"`)))]),
   ]);
   const subs = subsRes.subscriptions;
   const [nAll, nActive, nTrialing, nPastDue, nCanceled] = chipTotals;
@@ -171,6 +185,7 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
   };
 
   const filtered = subs.filter((s) => {
+    if (collection && s.collection_method !== collection) return false;
     if (!status) return true;
     if (status === "paused") return !!s.pause_collection;
     return s.status === status;
@@ -239,12 +254,31 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
               label: p.nickname ?? `${p.id.slice(0, 18)}…`,
             })),
           },
+          {
+            key: "created",
+            label: "Created",
+            kind: "daterange",
+            value: createdRaw && (createdGte || createdLt) ? createdRaw : undefined,
+            options: DATE_RANGE_OPTIONS,
+          },
+          {
+            key: "collection",
+            label: "Collection method",
+            kind: "select",
+            value: collection || undefined,
+            options: [
+              { value: "charge_automatically", label: "Charge automatically" },
+              { value: "send_invoice", label: "Send invoice" },
+            ],
+          },
         ],
         rows,
         nextCursor: subsRes.hasMore && subs.length > 0 ? subs[subs.length - 1].id : null,
-        empty: status ? "No subscriptions match this filter (within this window)." : "No subscriptions yet.",
+        empty: status || collection ? "No subscriptions match this filter (within this window)." : "No subscriptions yet.",
         ...(rows.length ? { footer: `${rows.length} item${rows.length === 1 ? "" : "s"}` } : {}),
-        notice: `Chip counts are account totals (Paused counts this page's window); the table shows ${WINDOW} per page — use Next for older ones.`,
+        notice: scoped
+          ? `Customer/price/collection filters aren't searchable — chip counts cover this window only ("N+" on overflow).`
+          : `Chip counts are account totals (Paused counts this page's window); the table shows ${WINDOW} per page — use Next for older ones.`,
       },
     ],
   };

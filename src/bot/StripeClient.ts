@@ -350,6 +350,9 @@ export class StripeClient {
     const res = await this.stripe.customers.search({
       query: `name~"${safe}" OR email~"${safe}"`,
       limit,
+      // Same expansion as listCustomersPage so the list's has-subscription
+      // filter works on search results too.
+      expand: ["data.subscriptions"],
     });
     return res.data;
   }
@@ -365,11 +368,19 @@ export class StripeClient {
     limit?: number;
     startingAfter?: string;
     createdGte?: number;
+    createdLt?: number;
   }): Promise<{ customers: Stripe.Customer[]; hasMore: boolean }> {
+    const created = {
+      ...(opts.createdGte ? { gte: opts.createdGte } : {}),
+      ...(opts.createdLt ? { lt: opts.createdLt } : {}),
+    };
     const res = await this.stripe.customers.list({
       limit: opts.limit ?? 25,
+      // Subscriptions ride along so the list can filter "has subscription"
+      // without N+1 lookups (Stripe inlines up to 10 per customer).
+      expand: ["data.subscriptions"],
       ...(opts.startingAfter ? { starting_after: opts.startingAfter } : {}),
-      ...(opts.createdGte ? { created: { gte: opts.createdGte } } : {}),
+      ...(Object.keys(created).length ? { created } : {}),
     });
     return { customers: res.data, hasMore: res.has_more };
   }
@@ -423,6 +434,23 @@ export class StripeClient {
       ...(Object.keys(created).length ? { created } : {}),
     });
     return { paymentIntents: res.data, hasMore: res.has_more };
+  }
+
+  // Charge search shaped for the Payments LIST (customer + refunds expanded
+  // like listAllCharges, total_count for the footer). Powers the filters the
+  // list API can't express server-side — card fingerprint (the reverse-card
+  // sweep) and exact email. Queries are BUILT BY CALLERS from validated
+  // values only. Search lags live data by ~1 minute.
+  async searchChargesForList(
+    query: string,
+    limit = 100
+  ): Promise<{ charges: Stripe.Charge[]; totalCount: number | null }> {
+    const res = await this.stripe.charges.search({
+      query,
+      limit,
+      expand: ["data.customer", "data.refunds", "total_count"],
+    });
+    return { charges: res.data, totalCount: res.total_count ?? null };
   }
 
   // Refunds of one charge (payment-detail timeline) or account-wide.
@@ -656,13 +684,20 @@ export class StripeClient {
     customerId?: string;
     limit?: number;
     startingAfter?: string;
+    createdGte?: number;
+    createdLt?: number;
   }): Promise<{ subscriptions: Stripe.Subscription[]; hasMore: boolean }> {
+    const created = {
+      ...(opts.createdGte ? { gte: opts.createdGte } : {}),
+      ...(opts.createdLt ? { lt: opts.createdLt } : {}),
+    };
     const res = await this.stripe.subscriptions.list({
       status: opts.status ?? "all",
       ...(opts.priceId ? { price: opts.priceId } : {}),
       ...(opts.customerId ? { customer: opts.customerId } : {}),
       limit: opts.limit ?? 25,
       ...(opts.startingAfter ? { starting_after: opts.startingAfter } : {}),
+      ...(Object.keys(created).length ? { created } : {}),
     });
     return { subscriptions: res.data, hasMore: res.has_more };
   }
@@ -1810,11 +1845,25 @@ export class StripeClient {
     customerId: string | null,
     status: Stripe.Invoice.Status | undefined,
     limit = 10,
-    startingAfter?: string
+    startingAfter?: string,
+    // PA-13 filter expansion: these are all SERVER-side invoices.list params.
+    opts: {
+      collectionMethod?: "charge_automatically" | "send_invoice";
+      subscriptionId?: string;
+      createdGte?: number;
+      createdLt?: number;
+    } = {}
   ): Promise<Stripe.ApiList<Stripe.Invoice>> {
+    const created = {
+      ...(opts.createdGte ? { gte: opts.createdGte } : {}),
+      ...(opts.createdLt ? { lt: opts.createdLt } : {}),
+    };
     return this.stripe.invoices.list({
       ...(customerId ? { customer: customerId } : {}),
       ...(status ? { status } : {}),
+      ...(opts.collectionMethod ? { collection_method: opts.collectionMethod } : {}),
+      ...(opts.subscriptionId ? { subscription: opts.subscriptionId } : {}),
+      ...(Object.keys(created).length ? { created } : {}),
       limit,
       ...(startingAfter ? { starting_after: startingAfter } : {}),
     });

@@ -10,6 +10,7 @@ import {
   badgeCell,
   chargeBadge,
   dateCell,
+  DATE_RANGE_OPTIONS,
   estimateMrr,
   fmtAddress,
   formatPerCurrency,
@@ -17,6 +18,7 @@ import {
   invoiceBadge,
   isoDateCell,
   money,
+  parseDateFilter,
   paymentMethodCell,
   sentence,
   strong,
@@ -390,6 +392,14 @@ async function customerAction(
 
 async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: string | null): Promise<SectionPage> {
   const q = str(filters.q, 80);
+  // PA-13 filter expansion (Stripe Customers-filter parity): created is a
+  // SERVER param on the plain listing; delinquent/country/has-subscription
+  // slice the fetched page (subscriptions ride the list expand).
+  const { createdGte, createdLt } = parseDateFilter(str(filters.created, 24));
+  const delinquentF = filters.delinquent === "yes" || filters.delinquent === "no" ? filters.delinquent : "";
+  const countryF = /^[A-Za-z]{2}$/.test(filters.country ?? "") ? filters.country.toUpperCase() : "";
+  const hasSubF = filters.hassub === "yes" || filters.hassub === "no" ? filters.hassub : "";
+
   let customers: Stripe.Customer[];
   let hasMore = false;
   let notice: string | undefined;
@@ -397,12 +407,30 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
     customers = await ctx.stripe.searchCustomersByTerm(q, PAGE_SIZE);
     notice = "Search results (name/email fuzzy match) — may lag Stripe by ~1 minute.";
   } else {
-    const page = await ctx.stripe.listCustomersPage({ limit: PAGE_SIZE, startingAfter: validCursor(cursor) ?? undefined });
+    const page = await ctx.stripe.listCustomersPage({
+      limit: PAGE_SIZE,
+      startingAfter: validCursor(cursor) ?? undefined,
+      createdGte,
+      createdLt,
+    });
     customers = page.customers;
     hasMore = page.hasMore;
   }
 
-  const n = customers.length;
+  const sliced = customers.filter((c) => {
+    if (delinquentF && (c.delinquent === true) !== (delinquentF === "yes")) return false;
+    if (countryF && (c.address?.country ?? "").toUpperCase() !== countryF) return false;
+    if (hasSubF) {
+      const has = ((c as { subscriptions?: { data?: unknown[] } }).subscriptions?.data?.length ?? 0) > 0;
+      if (has !== (hasSubF === "yes")) return false;
+    }
+    // Search results can't take a server-side created param — cut here.
+    if (q && createdGte && c.created < createdGte) return false;
+    if (q && createdLt && c.created >= createdLt) return false;
+    return true;
+  });
+
+  const n = sliced.length;
   const table: TableBlock = {
     type: "table",
     key: "customers",
@@ -410,27 +438,60 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
       { key: "name", label: "Customer" },
       { key: "email", label: "Email" },
       { key: "flags", label: "Flags" },
+      { key: "country", label: "Country" },
       { key: "created", label: "Created" },
       { key: "id", label: "ID" },
     ],
     filters: [
       { key: "q", label: "Search", kind: "search", value: q || undefined, placeholder: "Search by name or email" },
+      {
+        key: "created",
+        label: "Created",
+        kind: "daterange",
+        value: str(filters.created, 24) && (createdGte || createdLt) ? str(filters.created, 24) : undefined,
+        options: DATE_RANGE_OPTIONS,
+      },
+      {
+        key: "delinquent",
+        label: "Delinquent",
+        kind: "select",
+        value: delinquentF || undefined,
+        options: [
+          { value: "yes", label: "Delinquent" },
+          { value: "no", label: "Not delinquent" },
+        ],
+      },
+      {
+        key: "hassub",
+        label: "Has subscription",
+        kind: "select",
+        value: hasSubF || undefined,
+        options: [
+          { value: "yes", label: "Has a subscription" },
+          { value: "no", label: "No subscription" },
+        ],
+      },
+      { key: "country", label: "Country", kind: "text", value: countryF || undefined, placeholder: "DE" },
     ],
-    rows: customers.map((c) => ({
+    exportable: true,
+    rows: sliced.map((c) => ({
       id: c.id,
       ref: { page: "customers.detail", params: { id: c.id } },
       cells: [
         strong(c.name ?? "—"),
         text(c.email ?? "—"),
         { t: "flags", badges: c.delinquent ? [{ kind: "warn", text: "Delinquent" }] : [] },
+        text(c.address?.country ?? "—"),
         dateCell(c.created),
         idCell(c.id, { copy: true }),
       ] as Cell[],
     })),
     nextCursor: !q && hasMore && customers.length > 0 ? customers[customers.length - 1].id : null,
-    empty: q ? "No customers match that search." : "No customers yet.",
+    empty: q || delinquentF || countryF || hasSubF ? "No customers match these filters (within this page)." : "No customers yet.",
     ...(n > 0 ? { footer: q ? `${n} result${n === 1 ? "" : "s"}` : `${n}${hasMore ? "+" : ""} item${n === 1 ? "" : "s"}` } : {}),
-    notice,
+    notice:
+      (notice ? `${notice} ` : "") +
+      (delinquentF || countryF || hasSubF ? "Delinquent/country/subscription filters slice the fetched page — page onward for more." : "") || undefined,
   };
 
   const header: Block = {
@@ -888,6 +949,7 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
       { key: "method", label: "Method" },
       { key: "default", label: "Default" },
       { key: "expires", label: "Expires" },
+      { key: "fingerprint", label: "Fingerprint" },
       { key: "id", label: "ID" },
     ],
     rows: methods.slice(0, 25).map((pm) => ({
@@ -896,6 +958,14 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
         paymentMethodCell(pm),
         pm.id === defaultPm ? badgeCell("info", "Default") : text("—"),
         pm.type === "card" && pm.card ? text(`${pm.card.exp_month}/${pm.card.exp_year}`) : text("—"),
+        // Exact card identity — links into the reverse-card hunt (every
+        // customer that ever charged this exact card).
+        pm.type === "card" && pm.card?.fingerprint
+          ? idCell(pm.card.fingerprint, {
+              copy: true,
+              ref: { page: "fraud", filters: { view: "card", fp: pm.card.fingerprint } },
+            })
+          : text("—"),
         idCell(pm.id, { copy: true }),
       ] as Cell[],
       actions: [
