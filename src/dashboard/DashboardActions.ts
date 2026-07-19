@@ -75,6 +75,7 @@ export class DashboardActionGateway {
       case "subscription.pause_resume":
       case "subscription.change_plan":
       case "subscription.terms":
+      case "subscription.items":
       case "customer.coupon": {
         const subscriptionId = validId("subscription", params.subscriptionId);
         if (!subscriptionId) return { ok: false, error: "subscriptionId (sub_…) required." };

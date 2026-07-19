@@ -45,7 +45,7 @@ export function makeCustomersSection(): DashboardSectionModule {
     nav: [{ key: "customers", label: "Customers", page: "customers" }],
 
     ownsPage(page: string): boolean {
-      return page === "customers" || page === "customers.detail" || page === "customers.edit";
+      return page === "customers" || page === "customers.detail" || page === "customers.edit" || page === "customers.portal";
     },
 
     async buildPage(ctx: DashboardCtx, req): Promise<SectionPage | null> {
@@ -53,6 +53,7 @@ export function makeCustomersSection(): DashboardSectionModule {
       const id = validId("customer", req.params?.id);
       if (!id) return notFound("That customer id is not valid.");
       if (req.page === "customers.edit") return editPage(ctx, id);
+      if (req.page === "customers.portal") return portalLinkPage(ctx, id);
       return detail(ctx, id);
     },
 
@@ -619,12 +620,16 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
     });
   }
 
-  // ---- rail: manage (M7 edit surface) ----
+  // ---- rail: manage (M7 edit surface + PA-6 portal link) ----
   rail.push({
     type: "kv",
     title: "Manage",
     rows: [
       { label: "Edit", cell: { t: "link", v: "Edit customer →", ref: { page: "customers.edit", params: { id } } } as Cell },
+      {
+        label: "Customer portal",
+        cell: { t: "link", v: "Mint portal login link →", ref: { page: "customers.portal", params: { id } } } as Cell,
+      },
     ],
   });
 
@@ -762,6 +767,55 @@ async function editPage(ctx: DashboardCtx, id: string): Promise<SectionPage> {
 
 function pmIntentId(charge: Stripe.Charge): string | null {
   return typeof charge.payment_intent === "string" ? charge.payment_intent : charge.payment_intent?.id ?? null;
+}
+
+// ---- customer portal login link (PA-6) ----
+// Rendering the page MINTS a fresh billing_portal session — the link is
+// short-lived and single-session, so a per-view mint is the safe shape (no
+// stored secret, nothing to revoke). Audited because the link grants the
+// customer's self-serve billing access to whoever holds it.
+async function portalLinkPage(ctx: DashboardCtx, id: string): Promise<SectionPage> {
+  const customer = await ctx.stripe.getCustomer(id).catch(() => null);
+  if (!customer) return notFound("This customer does not exist (or was deleted).");
+  const session = await ctx.stripe.createPortalSession(id).catch(() => null);
+  const blocks: Block[] = [
+    {
+      type: "header",
+      title: "Customer portal link",
+      sub: customer.name ?? customer.email ?? id,
+    },
+  ];
+  if (!session) {
+    blocks.push({
+      type: "notice",
+      badge: { kind: "error", text: "FAILED" },
+      text: "Stripe could not create a portal session — is the portal configured? (Operate → Customer portal.)",
+    });
+  } else {
+    await ctx.audit(`Portal login link minted for ${id}`);
+    blocks.push({
+      type: "kv",
+      title: "Login link",
+      rows: [
+        { label: "Customer", cell: idCell(id, { copy: true, ref: { page: "customers.detail", params: { id } } }) },
+        { label: "Portal", cell: { t: "external", v: "Open customer portal ↗", href: session.url, copy: true } as Cell },
+      ],
+    });
+    blocks.push({
+      type: "notice",
+      badge: { kind: "info", text: "Short-lived" },
+      text: "The link expires a few minutes after minting and is meant for ONE hand-off — send it to the customer, don't store it. Reload this page to mint a fresh one.",
+    });
+  }
+  return {
+    title: "Customer portal link",
+    crumbs: [
+      { label: "Customers", ref: { page: "customers" } },
+      { label: customer.email ?? id, ref: { page: "customers.detail", params: { id } } },
+      { label: "Portal link" },
+    ],
+    blocks,
+  };
 }
 
 function notFound(hint: string): SectionPage {

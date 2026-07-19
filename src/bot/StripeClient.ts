@@ -502,6 +502,58 @@ export class StripeClient {
     return { transactions: res.data, hasMore: res.has_more };
   }
 
+  // ---- Radar reviews (PA-6): the manual-review queue ----
+
+  // reviews.list returns OPEN reviews only; the charge is expanded so the
+  // queue can show amount/status without N+1 reads.
+  async listOpenReviews(opts: { limit?: number; startingAfter?: string } = {}): Promise<{ reviews: Stripe.Review[]; hasMore: boolean }> {
+    const res = await this.stripe.reviews.list({
+      limit: opts.limit ?? 25,
+      ...(opts.startingAfter ? { starting_after: opts.startingAfter } : {}),
+      expand: ["data.charge"],
+    });
+    return { reviews: res.data, hasMore: res.has_more };
+  }
+
+  async getReview(reviewId: string): Promise<Stripe.Review> {
+    return this.stripe.reviews.retrieve(reviewId);
+  }
+
+  // Closes the review as approved. "Decline" has no API — declining is a
+  // fraud refund / PI cancel through the normal action ladder.
+  async approveReview(reviewId: string, idempotencyKey?: string): Promise<Stripe.Review> {
+    return this.stripe.reviews.approve(reviewId, {}, idempotencyKey ? { idempotencyKey } : undefined);
+  }
+
+  // ---- customer portal (PA-6): configuration + per-customer login links ----
+
+  async listPortalConfigurations(limit = 10): Promise<Stripe.BillingPortal.Configuration[]> {
+    const res = await this.stripe.billingPortal.configurations.list({ limit });
+    return res.data;
+  }
+
+  async createPortalConfiguration(
+    features: Stripe.BillingPortal.ConfigurationCreateParams.Features,
+    idempotencyKey?: string
+  ): Promise<Stripe.BillingPortal.Configuration> {
+    return this.stripe.billingPortal.configurations.create(
+      { features },
+      idempotencyKey ? { idempotencyKey } : undefined
+    );
+  }
+
+  async updatePortalConfiguration(
+    configurationId: string,
+    features: Stripe.BillingPortal.ConfigurationUpdateParams.Features
+  ): Promise<Stripe.BillingPortal.Configuration> {
+    return this.stripe.billingPortal.configurations.update(configurationId, { features });
+  }
+
+  // Mints a short-lived login link into the customer's self-serve portal.
+  async createPortalSession(customerId: string): Promise<Stripe.BillingPortal.Session> {
+    return this.stripe.billingPortal.sessions.create({ customer: customerId });
+  }
+
   // Recent account events (Home activity feed). Read-only, newest first.
   async listEvents(limit = 15): Promise<Stripe.Event[]> {
     const res = await this.stripe.events.list({ limit });
@@ -1453,6 +1505,52 @@ export class StripeClient {
       { items: [{ id: itemId, quantity }], proration_behavior: prorationBehavior },
       idempotencyKey ? { idempotencyKey } : undefined
     );
+  }
+
+  // Items WITHOUT an id are ADDED to the subscription (PA-6 grow).
+  async addSubscriptionItem(
+    params: { subscriptionId: string; priceId: string; quantity?: number; prorationBehavior: "create_prorations" | "none" },
+    idempotencyKey?: string
+  ): Promise<Stripe.Subscription> {
+    return this.stripe.subscriptions.update(
+      params.subscriptionId,
+      {
+        items: [{ price: params.priceId, ...(params.quantity ? { quantity: params.quantity } : {}) }],
+        proration_behavior: params.prorationBehavior,
+      },
+      idempotencyKey ? { idempotencyKey } : undefined
+    );
+  }
+
+  // deleted:true removes the item (PA-6 shrink) — Stripe refuses on the last one.
+  async removeSubscriptionItem(
+    params: { subscriptionId: string; itemId: string; prorationBehavior: "create_prorations" | "none" },
+    idempotencyKey?: string
+  ): Promise<Stripe.Subscription> {
+    return this.stripe.subscriptions.update(
+      params.subscriptionId,
+      { items: [{ id: params.itemId, deleted: true }], proration_behavior: params.prorationBehavior },
+      idempotencyKey ? { idempotencyKey } : undefined
+    );
+  }
+
+  // Generic proration preview over an item change-set (add = {price}, remove =
+  // {id, deleted}) — the add/remove twin of previewPlanChange.
+  async previewItemsChange(params: {
+    customerId: string;
+    subscriptionId: string;
+    items: Array<{ id?: string; price?: string; quantity?: number; deleted?: boolean }>;
+    prorationDate: number;
+  }): Promise<Stripe.Invoice> {
+    return this.stripe.invoices.createPreview({
+      customer: params.customerId,
+      subscription: params.subscriptionId,
+      subscription_details: {
+        items: params.items,
+        proration_behavior: "create_prorations",
+        proration_date: params.prorationDate,
+      },
+    });
   }
 
   async createScheduleFromSubscription(

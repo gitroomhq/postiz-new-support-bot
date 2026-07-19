@@ -551,6 +551,13 @@ async function updatePage(ctx: DashboardCtx, id: string, filters: Record<string,
   const item = itemFilter ? sub.items.data.find((it) => it.id === itemFilter) ?? null : sub.items.data[0] ?? null;
   if (!customerId || !item) return notFound("Subscription has no customer/item to update.");
 
+  // PA-6: the page has three operations — change the selected item's price
+  // (default), ADD a new item, REMOVE an item. All behind the same mandatory
+  // proration preview.
+  const mode = filters.mode === "add" || filters.mode === "remove" ? filters.mode : "";
+  if (mode === "add") return addItemMode(ctx, sub, id, customerId, filters);
+  if (mode === "remove") return removeItemMode(ctx, sub, id, customerId, filters);
+
   const prices = await ctx.stripe.listRecurringPrices(50).catch(() => [] as Stripe.Price[]);
   const allowlist = ctx.settings.allowedPriceIds();
   const currentPriceId = item.price?.id ?? "";
@@ -584,6 +591,7 @@ async function updatePage(ctx: DashboardCtx, id: string, filters: Record<string,
   };
 
   const pageFilters: FilterDef[] = [
+    modeFilter(sub, ""),
     ...(sub.items.data.length > 1
       ? [
           {
@@ -730,6 +738,245 @@ async function updatePage(ctx: DashboardCtx, id: string, filters: Record<string,
       { label: "Subscriptions", ref: { page: "subscriptions" } },
       { label: sub.id, ref: { page: "subscriptions.detail", params: { id } } },
       { label: "Update" },
+    ],
+    blocks,
+  };
+}
+
+// The operation switch shared by the three update-page modes. "Remove item"
+// only exists on multi-item subscriptions (the last item can't be removed).
+function modeFilter(sub: Stripe.Subscription, value: string): FilterDef {
+  return {
+    key: "mode",
+    label: "Operation",
+    kind: "select",
+    value: value || undefined,
+    options: [
+      { value: "", label: "Change price" },
+      { value: "add", label: "Add item" },
+      ...(sub.items.data.length > 1 ? [{ value: "remove", label: "Remove item" }] : []),
+    ],
+  };
+}
+
+// ---- ADD ITEM (PA-6: grow a subscription, mandatory proration preview) ----
+
+async function addItemMode(
+  ctx: DashboardCtx,
+  sub: Stripe.Subscription,
+  id: string,
+  customerId: string,
+  filters: Record<string, string>
+): Promise<SectionPage> {
+  const prices = await ctx.stripe.listRecurringPrices(50).catch(() => [] as Stripe.Price[]);
+  const allowlist = ctx.settings.allowedPriceIds();
+  const onSub = new Set(sub.items.data.map((it) => it.price?.id).filter(Boolean));
+  const candidates = sortPrices(
+    prices.filter((p) => !onSub.has(p.id) && (allowlist.length === 0 || allowlist.includes(p.id)))
+  );
+  const targetPrice = PRICE_RE.test(filters.price ?? "") ? filters.price : "";
+  const qtyRaw = str(filters.qty, 6).trim();
+  const quantity = /^\d{1,5}$/.test(qtyRaw) && Number.parseInt(qtyRaw, 10) > 1 ? Number.parseInt(qtyRaw, 10) : null;
+  const carried: Record<string, string> = { mode: "add", ...(qtyRaw ? { qty: qtyRaw } : {}) };
+  const plan = planLabel(sub);
+
+  const blocks: Block[] = [
+    { type: "header", title: "Update subscription", sub: `Add item · ${plan.name} · ${sub.id}` },
+    {
+      type: "table",
+      key: "prices",
+      title: "Pick the price to ADD",
+      columns: [
+        { key: "name", label: "Price" },
+        { key: "picked", label: "" },
+        { key: "amount", label: "Amount", align: "right" },
+        { key: "interval", label: "Billing" },
+        { key: "id", label: "ID" },
+      ],
+      filters: [
+        modeFilter(sub, "add"),
+        { key: "qty", label: "Quantity", kind: "text", value: qtyRaw || undefined, placeholder: "1" },
+      ],
+      rows: candidates.slice(0, 25).map((p) => ({
+        id: p.id,
+        ref: { page: "subscriptions.changeplan", params: { id }, filters: { ...carried, price: p.id } },
+        cells: [
+          avatarCell("subscription", p.nickname ?? p.id),
+          p.id === targetPrice ? badgeCell("info", "Selected") : text(""),
+          p.unit_amount != null ? money(ctx.stripe, p.unit_amount, p.currency) : text("—"),
+          text(p.recurring ? `every ${p.recurring.interval_count ?? 1} ${p.recurring.interval}` : "—"),
+          idCell(p.id, { copy: true }),
+        ] as Cell[],
+      })),
+      empty: "No addable prices — every allowlisted recurring price is already on this subscription.",
+      notice: "Prices already on the subscription are hidden. Pick one to preview the proration, then confirm.",
+    },
+  ];
+
+  if (targetPrice) {
+    const preview = await ctx.stripe
+      .previewItemsChange({
+        customerId,
+        subscriptionId: id,
+        items: [{ price: targetPrice, ...(quantity ? { quantity } : {}) }],
+        prorationDate: Math.floor(Date.now() / 1000),
+      })
+      .catch(() => null);
+    if (!preview) {
+      blocks.push({
+        type: "notice",
+        badge: { kind: "error", text: "PREVIEW FAILED" },
+        text: "Stripe could not preview this addition (currency/interval mismatch with the subscription?). Pick a different price.",
+      });
+    } else {
+      blocks.push({
+        type: "table",
+        key: "preview",
+        title: "Proration preview",
+        columns: [
+          { key: "desc", label: "Description" },
+          { key: "amount", label: "Amount", align: "right" },
+        ],
+        rows: preview.lines.data.slice(0, 15).map((line, i) => ({
+          id: line.id ?? String(i),
+          cells: [text(line.description ?? "line"), money(ctx.stripe, line.amount, line.currency)] as Cell[],
+        })),
+        notice: `Next invoice would be ${ctx.stripe.formatAmount(preview.amount_due, preview.currency)}. Estimate — computed again at execution time.`,
+      });
+      blocks.push({
+        type: "notice",
+        badge: { kind: "info", text: "REVIEWED" },
+        text: `Add ${targetPrice}${quantity ? ` ×${quantity}` : ""} to ${sub.id}.`,
+        actions: [
+          registryButton(ctx, {
+            key: "subscription.items",
+            label: "Add item",
+            style: "primary",
+            dangerous: true,
+            params: { subscriptionId: id, op: "add", priceId: targetPrice, ...(quantity ? { quantity } : {}) },
+            summary: `Adds ${targetPrice}${quantity ? ` ×${quantity}` : ""} with create_prorations — you reviewed the preview above.`,
+          }),
+        ],
+      });
+    }
+  }
+
+  return {
+    title: "Update subscription",
+    crumbs: [
+      { label: "Subscriptions", ref: { page: "subscriptions" } },
+      { label: sub.id, ref: { page: "subscriptions.detail", params: { id } } },
+      { label: "Add item" },
+    ],
+    blocks,
+  };
+}
+
+// ---- REMOVE ITEM (PA-6: shrink a subscription, mandatory proration preview) ----
+
+async function removeItemMode(
+  ctx: DashboardCtx,
+  sub: Stripe.Subscription,
+  id: string,
+  customerId: string,
+  filters: Record<string, string>
+): Promise<SectionPage> {
+  const plan = planLabel(sub);
+  const itemSel = ITEM_RE.test(filters.item ?? "") ? filters.item : "";
+  const selected = itemSel ? sub.items.data.find((it) => it.id === itemSel) ?? null : null;
+  const removable = sub.items.data.length > 1;
+
+  const blocks: Block[] = [
+    { type: "header", title: "Update subscription", sub: `Remove item · ${plan.name} · ${sub.id}` },
+    {
+      type: "table",
+      key: "items",
+      title: "Pick the item to REMOVE",
+      columns: [
+        { key: "product", label: "Product" },
+        { key: "picked", label: "" },
+        { key: "qty", label: "Qty", align: "right" },
+        { key: "total", label: "Total", align: "right" },
+        { key: "id", label: "ID" },
+      ],
+      filters: [modeFilter(sub, "remove")],
+      rows: sub.items.data.map((it) => {
+        const p = it.price;
+        const name = p?.nickname ?? (typeof p?.product === "string" ? p.product : p?.id) ?? "item";
+        const qty = it.quantity ?? 1;
+        return {
+          id: it.id,
+          ref: { page: "subscriptions.changeplan", params: { id }, filters: { mode: "remove", item: it.id } },
+          cells: [
+            avatarCell("subscription", name),
+            it.id === itemSel ? badgeCell("error", "Removing") : text(""),
+            text(String(qty)),
+            p?.unit_amount != null ? money(ctx.stripe, p.unit_amount * qty, p.currency) : text("—"),
+            idCell(it.id, { copy: true }),
+          ] as Cell[],
+        };
+      }),
+      empty: "No items.",
+      notice: removable
+        ? "Click an item to preview the removal proration, then confirm below."
+        : "This subscription has a single item — the last item cannot be removed (cancel the subscription instead).",
+    },
+  ];
+
+  if (removable && selected) {
+    const preview = await ctx.stripe
+      .previewItemsChange({
+        customerId,
+        subscriptionId: id,
+        items: [{ id: selected.id, deleted: true }],
+        prorationDate: Math.floor(Date.now() / 1000),
+      })
+      .catch(() => null);
+    if (!preview) {
+      blocks.push({
+        type: "notice",
+        badge: { kind: "error", text: "PREVIEW FAILED" },
+        text: "Stripe could not preview this removal. Pick a different item.",
+      });
+    } else {
+      blocks.push({
+        type: "table",
+        key: "preview",
+        title: "Proration preview",
+        columns: [
+          { key: "desc", label: "Description" },
+          { key: "amount", label: "Amount", align: "right" },
+        ],
+        rows: preview.lines.data.slice(0, 15).map((line, i) => ({
+          id: line.id ?? String(i),
+          cells: [text(line.description ?? "line"), money(ctx.stripe, line.amount, line.currency)] as Cell[],
+        })),
+        notice: `Next invoice would be ${ctx.stripe.formatAmount(preview.amount_due, preview.currency)}. Estimate — computed again at execution time.`,
+      });
+      blocks.push({
+        type: "notice",
+        badge: { kind: "info", text: "REVIEWED" },
+        text: `Remove item ${selected.id} from ${sub.id}.`,
+        actions: [
+          registryButton(ctx, {
+            key: "subscription.items",
+            label: "Remove item",
+            style: "danger",
+            dangerous: true,
+            params: { subscriptionId: id, op: "remove", itemId: selected.id },
+            summary: `Removes ${selected.id} with create_prorations — you reviewed the preview above.`,
+          }),
+        ],
+      });
+    }
+  }
+
+  return {
+    title: "Update subscription",
+    crumbs: [
+      { label: "Subscriptions", ref: { page: "subscriptions" } },
+      { label: sub.id, ref: { page: "subscriptions.detail", params: { id } } },
+      { label: "Remove item" },
     ],
     blocks,
   };

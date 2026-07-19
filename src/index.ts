@@ -79,6 +79,7 @@ import { makeCatalogSection } from "./dashboard/sections/catalogSection";
 import { makeApprovalsSection } from "./dashboard/sections/approvalsSection";
 import { makeBlocklistSection } from "./dashboard/sections/blocklistSection";
 import { makeFraudSection } from "./dashboard/sections/fraudSection";
+import { makePortalSection } from "./dashboard/sections/portalSection";
 import { makeBookmarksSection } from "./dashboard/sections/bookmarksSection";
 import { makeSecuritySection } from "./dashboard/sections/securitySection";
 import { FraudHuntService } from "./bot/billing/FraudHuntService";
@@ -552,6 +553,7 @@ async function main() {
     makeApprovalsSection(),
     makeBlocklistSection({ blockService }),
     makeFraudSection({ hunts: fraudHuntService }),
+    makePortalSection(),
     makeBookmarksSection(),
     makeSecuritySection({ credentials: dashboardCredentials, sessions: dashboardDbSessions, audit: dashboardAudit }),
   ];

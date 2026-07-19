@@ -642,6 +642,72 @@ const subscriptionCreate = defineAction<SubscriptionCreateParams>({
   },
 });
 
+interface SubscriptionItemsParams {
+  subscriptionId: string;
+  op: "add" | "remove";
+  priceId?: string; // add
+  itemId?: string; // remove
+  quantity?: number; // add
+}
+
+// Grow/shrink a multi-item subscription (PA-6). Both directions prorate; the
+// panel gates them behind the same mandatory preview as plan changes.
+const subscriptionItems = defineAction<SubscriptionItemsParams>({
+  key: "subscription.items",
+  label: "Add / remove subscription item",
+  group: "Subscriptions",
+  defaultLevel: "none",
+  dangerous: true,
+  parseParams: (raw) => {
+    const o = obj(raw);
+    const subscriptionId = o ? idWithPrefix(o.subscriptionId, "sub_") : null;
+    const op = o && (o.op === "add" || o.op === "remove") ? o.op : null;
+    if (!subscriptionId || !op) return { ok: false, error: "subscriptionId (sub_…) and op (add|remove) required" };
+    const priceId = idWithPrefix(o!.priceId, "price_") ?? undefined;
+    const itemId = idWithPrefix(o!.itemId, "si_") ?? undefined;
+    if (op === "add" && !priceId) return { ok: false, error: "priceId (price_…) required to add an item" };
+    if (op === "remove" && !itemId) return { ok: false, error: "itemId (si_…) required to remove an item" };
+    return { ok: true, params: { subscriptionId, op, priceId, itemId, quantity: posInt(o!.quantity) ?? undefined } };
+  },
+  summarize: (p) =>
+    p.op === "add"
+      ? `Add ${p.priceId}${p.quantity ? ` ×${p.quantity}` : ""} to ${p.subscriptionId} (with prorations)`
+      : `Remove item ${p.itemId} from ${p.subscriptionId} (with prorations)`,
+  revalidate: async (ctx, p) => {
+    const cus = requireCustomer(ctx);
+    if (!cus) return "No linked Stripe customer.";
+    const sub = await ctx.stripe.getSubscription(p.subscriptionId);
+    if (customerIdOf(sub) !== cus) return "Subscription does not belong to this customer.";
+    if (sub.status !== "active" && sub.status !== "trialing") return `Subscription is ${sub.status} — not changeable.`;
+    if (p.op === "add") {
+      if (sub.items.data.some((it) => it.price?.id === p.priceId)) return "That price is already on this subscription.";
+      const price = await ctx.stripe.getPrice(p.priceId!).catch(() => null);
+      if (!price || !price.recurring) return "Price does not exist or is not recurring.";
+      if (!price.active) return "Price is archived.";
+      const allowlist = ctx.settingsStore.allowedPriceIds();
+      if (allowlist.length > 0 && !allowlist.includes(p.priceId!)) return "Price is not on the plan allowlist (/config → Billing).";
+      return null;
+    }
+    if (!sub.items.data.some((it) => it.id === p.itemId)) return "That item does not exist on this subscription.";
+    if (sub.items.data.length <= 1) return "Cannot remove the last item — cancel the subscription instead.";
+    return null;
+  },
+  execute: async (ctx, p) => {
+    if (p.op === "add") {
+      await ctx.stripe.addSubscriptionItem(
+        { subscriptionId: p.subscriptionId, priceId: p.priceId!, quantity: p.quantity, prorationBehavior: "create_prorations" },
+        `panel-itemadd-${p.subscriptionId}-${p.priceId}-${ctx.idemScope}`
+      );
+      return { ok: true, text: `Added ${p.priceId}${p.quantity ? ` ×${p.quantity}` : ""} to ${p.subscriptionId} with prorations.` };
+    }
+    await ctx.stripe.removeSubscriptionItem(
+      { subscriptionId: p.subscriptionId, itemId: p.itemId!, prorationBehavior: "create_prorations" },
+      `panel-itemrm-${p.subscriptionId}-${p.itemId}-${ctx.idemScope}`
+    );
+    return { ok: true, text: `Removed item ${p.itemId} from ${p.subscriptionId} with prorations.` };
+  },
+});
+
 interface InvoiceCollectParams {
   invoiceId: string;
   op: "send" | "pay";
@@ -1157,6 +1223,7 @@ export const BILLING_ACTIONS: BillingActionDef[] = [
   subscriptionChangePlan,
   subscriptionTerms,
   subscriptionCreate,
+  subscriptionItems,
   invoiceCollect,
   invoiceFinalize,
   invoiceVoid,

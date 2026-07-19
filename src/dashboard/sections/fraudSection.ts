@@ -1,18 +1,22 @@
 import type Stripe from "stripe";
+import type { ActionActor } from "../../bot/billing/actions/BillingActionService";
 import { FraudHuntService } from "../../bot/billing/FraudHuntService";
-import { Badge, Block, Cell, TableBlock } from "../renderer/contract";
+import { ActionButton, ActionResult, Badge, Block, Cell, TableBlock } from "../renderer/contract";
 import { DashboardCtx, DashboardSectionModule, SectionPage, str } from "./types";
 import { amount, cardCell, dateCell, idCell, sentence, text } from "./cells";
 
-// Fraud tools (#/fraud, Operate group): the recent early-fraud-warning feed
-// plus the three account-wide hunts extracted into FraudHuntService — by card
-// fingerprint (multi-account picture), by last4+brand (grouped by fingerprint)
-// and by amount (PaymentIntents — catches DECLINED attempts that never became
-// a charge). Hunt inputs ride the hash filters, validated hard server-side;
-// everything is read-only and NEVER runs inside revalidators (the Search API
-// lags ~1 min and must not gate money movement).
+// Fraud tools (#/fraud, Operate group): the Radar manual-review queue (PA-6:
+// approve closes the review; "decline" = the existing fraud-refund / PI-cancel
+// registry ladder), the recent early-fraud-warning feed, plus the three
+// account-wide hunts extracted into FraudHuntService — by card fingerprint
+// (multi-account picture), by last4+brand (grouped by fingerprint) and by
+// amount (PaymentIntents — catches DECLINED attempts that never became a
+// charge). Hunt inputs ride the hash filters, validated hard server-side;
+// hunts NEVER run inside revalidators (the Search API lags ~1 min and must
+// not gate money movement).
 
 const SEARCH_LAG_NOTICE = "Stripe Search data can lag ~1 minute behind reality.";
+const REVIEW_ID_RE = /^prv_[A-Za-z0-9]{1,64}$/;
 
 export function makeFraudSection(deps: { hunts: FraudHuntService }): DashboardSectionModule {
   return {
@@ -24,7 +28,8 @@ export function makeFraudSection(deps: { hunts: FraudHuntService }): DashboardSe
 
     async buildPage(ctx: DashboardCtx, req): Promise<SectionPage | null> {
       const filters = req.filters ?? {};
-      const view = filters.view === "card" || filters.view === "amount" ? filters.view : "";
+      const view =
+        filters.view === "card" || filters.view === "amount" || filters.view === "reviews" ? filters.view : "";
       const blocks: Block[] = [];
       blocks.push({
         type: "tabs",
@@ -32,15 +37,123 @@ export function makeFraudSection(deps: { hunts: FraudHuntService }): DashboardSe
         value: view || undefined,
         items: [
           { value: "", label: "Early fraud warnings" },
+          { value: "reviews", label: "Reviews" },
           { value: "card", label: "Hunt by card" },
           { value: "amount", label: "Hunt by amount" },
         ],
       });
       if (view === "card") blocks.push(...(await cardHunts(ctx, deps, filters)));
       else if (view === "amount") blocks.push(...(await amountHunt(ctx, deps, filters)));
+      else if (view === "reviews") blocks.push(await reviewsTable(ctx));
       else blocks.push(await efwTable(ctx));
       return { title: "Fraud tools", crumbs: [{ label: "Fraud tools" }], blocks };
     },
+
+    async action(ctx: DashboardCtx, req): Promise<ActionResult> {
+      // T1 — approve (close) a Radar review: "this payment is fine". The
+      // review state is re-read live so an already-closed review is a no-op
+      // refusal, never a silent success.
+      if (req.key === "section:fraud.review_approve") {
+        if (req.confirmWord !== "CONFIRM") return { ok: false, error: "Type CONFIRM to run this action." };
+        const id = typeof req.params?.id === "string" && REVIEW_ID_RE.test(req.params.id) ? req.params.id : null;
+        if (!id) return { ok: false, error: "Bad review id (prv_…)." };
+        const review = await ctx.stripe.getReview(id).catch(() => null);
+        if (!review) return { ok: false, error: "This review does not exist." };
+        if (!review.open) return { ok: false, error: "Review is already closed." };
+        await ctx.stripe.approveReview(id, `dash-review-${id}`);
+        await ctx.audit(`Radar review ${id} approved`);
+        return { ok: true, text: `Review ${id} approved — the payment is released from the queue.` };
+      }
+      return { ok: false, error: "Unknown action." };
+    },
+  };
+}
+
+function actionActor(ctx: DashboardCtx): ActionActor {
+  return { kind: "dashboard", id: ctx.actor.id, name: ctx.actor.name, isAdmin: ctx.actor.isAdmin };
+}
+
+// Advisory render mode for a registry button (decline path) — execution
+// re-checks server-side regardless.
+function registryButton(ctx: DashboardCtx, button: ActionButton): ActionButton {
+  const mode = ctx.billing.actions.effectiveMode(button.key, actionActor(ctx));
+  if (mode === "denied") return { ...button, disabledReason: "Disabled by /config → Billing → Intercom Actions." };
+  return { ...button, mode: mode === "queue" ? "queue" : "direct" };
+}
+
+// ---- Radar review queue (PA-6) ----
+
+async function reviewsTable(ctx: DashboardCtx): Promise<Block> {
+  const res = await ctx.stripe.listOpenReviews({ limit: 25 }).catch(() => ({ reviews: [] as Stripe.Review[], hasMore: false }));
+  const rows = res.reviews.map((review) => {
+    const charge = review.charge && typeof review.charge === "object" ? (review.charge as Stripe.Charge) : null;
+    const chargeId = charge?.id ?? (typeof review.charge === "string" ? review.charge : null);
+    const piId = typeof review.payment_intent === "string" ? review.payment_intent : review.payment_intent?.id ?? null;
+    const remaining = charge ? charge.amount - (charge.amount_refunded ?? 0) : 0;
+    const actions: ActionButton[] = [
+      {
+        key: "section:fraud.review_approve",
+        label: "Approve",
+        style: "primary",
+        dangerous: true,
+        params: { id: review.id },
+        summary: "Closes the review as legitimate — the payment stays as it is.",
+      },
+      ...(charge && !charge.refunded && remaining > 0
+        ? [
+            registryButton(ctx, {
+              key: "charge.refund_fraud",
+              label: "Refund as fraud",
+              style: "danger",
+              dangerous: true,
+              stepUp: true,
+              params: { chargeId: charge.id, amountMinor: remaining },
+              summary: `Refunds the remaining ${ctx.stripe.formatAmount(remaining, charge.currency)} as FRAUDULENT (feeds Radar) — the decline path for this review.`,
+            }),
+          ]
+        : !charge && piId
+          ? [
+              registryButton(ctx, {
+                key: "payment_intent.cancel",
+                label: "Cancel payment",
+                style: "danger",
+                params: { paymentIntentId: piId },
+                summary: "Cancels the uncaptured payment intent — the decline path for this review.",
+              }),
+            ]
+          : []),
+    ];
+    return {
+      id: review.id,
+      ...(chargeId ? { ref: { page: "payments.detail", params: { id: chargeId } } } : {}),
+      cells: [
+        charge
+          ? amount(ctx.stripe, charge.amount, charge.currency, { kind: "warn", text: "In review" })
+          : text(piId ?? "—"),
+        text(sentence((review.opened_reason ?? "rule").replace(/_/g, " "))),
+        chargeId ? idCell(chargeId, { ref: { page: "payments.detail", params: { id: chargeId } } }) : text("—"),
+        dateCell(review.created),
+        idCell(review.id, { copy: true }),
+      ] as Cell[],
+      actions,
+    };
+  });
+  return {
+    type: "table",
+    key: "reviews",
+    title: "Radar review queue",
+    columns: [
+      { key: "amount", label: "Amount" },
+      { key: "reason", label: "Opened by" },
+      { key: "charge", label: "Charge" },
+      { key: "opened", label: "Opened" },
+      { key: "id", label: "Review" },
+    ],
+    rows,
+    empty: "No open reviews. 🎉",
+    ...(rows.length ? { footer: `${rows.length}${res.hasMore ? "+" : ""} open review${rows.length === 1 ? "" : "s"}` } : {}),
+    notice:
+      "Approve releases the payment from the queue; the decline path is a fraud refund (charge) or a payment cancel (uncaptured) through the normal action ladder. Open the charge for full context.",
   };
 }
 

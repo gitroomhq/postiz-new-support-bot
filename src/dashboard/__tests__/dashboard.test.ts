@@ -3396,3 +3396,264 @@ test("payout cancel/reverse (PA-5): T2/T3 belts + live status revalidation befor
   assert.equal(dupe.ok, false);
   assert.equal(already.calls.reverse.length, 0);
 });
+
+// ---- PA-6: Radar reviews + customer portal + item add/remove ----
+
+function reviewsCtx(overrides: { reviewOpen?: boolean } = {}) {
+  const approved: string[] = [];
+  const audits: string[] = [];
+  const review = {
+    id: "prv_1",
+    open: overrides.reviewOpen !== false,
+    opened_reason: "rule",
+    created: 1_700_000_000,
+    charge: { id: "ch_1", amount: 4900, currency: "eur", amount_refunded: 0, refunded: false },
+    payment_intent: "pi_1",
+  };
+  const ctx = {
+    actor: { id: "42", name: "Ada", role: "admin", isAdmin: true },
+    stripe: {
+      formatAmount: (a: number, c: string) => `${(a / 100).toFixed(2)} ${c.toUpperCase()}`,
+      listOpenReviews: async () => ({ reviews: [review], hasMore: false }),
+      getReview: async () => review,
+      approveReview: async (id: string) => {
+        approved.push(id);
+        return { ...review, open: false };
+      },
+    },
+    settings: {} as never,
+    stores: {} as never,
+    billing: { actions: { effectiveMode: () => "direct" }, gateway: {} as never },
+    audit: async (line: string) => {
+      audits.push(line);
+    },
+    security: { sessionIdHash: "h", authMethod: "passkey", stepUpFresh: () => true },
+  } as unknown as DashboardCtx;
+  return { ctx, approved, audits };
+}
+
+test("radar reviews (PA-6): queue tab renders approve + fraud-refund decline path; approve is T1 and refuses closed reviews", async () => {
+  const { makeFraudSection } = await import("../sections/fraudSection");
+  const section = makeFraudSection({ hunts: {} as never });
+  const { ctx, approved } = reviewsCtx();
+  const page = await section.buildPage(ctx, { page: "fraud", filters: { view: "reviews" } });
+  const tabs = page!.blocks.find((b) => b.type === "tabs") as TabsBlock;
+  assert.ok(tabs.items.some((i) => i.value === "reviews"));
+  const table = page!.blocks.find((b) => b.type === "table") as TableBlock;
+  assert.equal(table.key, "reviews");
+  const row = table.rows[0];
+  assert.deepEqual(row.ref, { page: "payments.detail", params: { id: "ch_1" } });
+  const approve = row.actions!.find((a) => a.key === "section:fraud.review_approve")!;
+  assert.equal(approve.dangerous, true);
+  const decline = row.actions!.find((a) => a.key === "charge.refund_fraud")!;
+  assert.equal(decline.stepUp, true);
+  assert.deepEqual(decline.params, { chargeId: "ch_1", amountMinor: 4900 });
+  // Approve: CONFIRM required, then closes via approveReview.
+  const noConfirm = await section.action!(ctx, { key: "section:fraud.review_approve", params: { id: "prv_1" } });
+  assert.equal(noConfirm.ok, false);
+  assert.equal(approved.length, 0);
+  const ok = await section.action!(ctx, { key: "section:fraud.review_approve", params: { id: "prv_1" }, confirmWord: "CONFIRM" });
+  assert.equal(ok.ok, true);
+  assert.deepEqual(approved, ["prv_1"]);
+  // Already closed → refusal, no Stripe write.
+  const closed = reviewsCtx({ reviewOpen: false });
+  const dupe = await section.action!(closed.ctx, { key: "section:fraud.review_approve", params: { id: "prv_1" }, confirmWord: "CONFIRM" });
+  assert.equal(dupe.ok, false);
+  assert.equal(closed.approved.length, 0);
+});
+
+test("customer portal config (PA-6): list w/ feature summary + T1 toggle edits; empty state offers create", async () => {
+  const { makePortalSection } = await import("../sections/portalSection");
+  const updates: Array<[string, Record<string, unknown>]> = [];
+  const creates: Array<Record<string, unknown>> = [];
+  const config = {
+    id: "bpc_1",
+    is_default: true,
+    active: true,
+    updated: 1_700_000_000,
+    features: {
+      invoice_history: { enabled: true },
+      payment_method_update: { enabled: false },
+      subscription_cancel: { enabled: true, mode: "at_period_end" },
+      subscription_update: { enabled: false },
+      customer_update: { enabled: false },
+    },
+  };
+  const mkCtx = (configs: unknown[]) =>
+    ({
+      actor: { id: "42", name: "Ada", role: "admin", isAdmin: true },
+      stripe: {
+        listPortalConfigurations: async () => configs,
+        updatePortalConfiguration: async (id: string, features: Record<string, unknown>) => {
+          updates.push([id, features]);
+          return { ...config, features };
+        },
+        createPortalConfiguration: async (features: Record<string, unknown>) => {
+          creates.push(features);
+          return { ...config, id: "bpc_new", features };
+        },
+      },
+      settings: {} as never,
+      stores: {} as never,
+      billing: { actions: { effectiveMode: () => "direct" }, gateway: {} as never },
+      audit: async () => {},
+      security: { sessionIdHash: "h", authMethod: "passkey", stepUpFresh: () => true },
+    }) as unknown as DashboardCtx;
+  const section = makePortalSection();
+  const page = await section.buildPage(mkCtx([config]), { page: "portal", filters: {} });
+  const table = page!.blocks.find((b) => b.type === "table") as TableBlock;
+  assert.ok((table.rows[0].cells[2] as { v: string }).v.includes("invoice history"));
+  const edit = table.rows[0].actions![0];
+  assert.equal(edit.key, "section:portal.config_update");
+  assert.equal(edit.dangerous, true);
+  // Toggle values reflect the LIVE config in the modal.
+  const inv = edit.inputs!.find((i) => i.key === "invoiceHistory") as { value?: boolean };
+  assert.equal(inv.value, true);
+  // Update action: CONFIRM + features mapped.
+  const upd = await section.action!(mkCtx([config]), {
+    key: "section:portal.config_update",
+    params: { id: "bpc_1", invoiceHistory: true, pmUpdate: true, subCancel: false },
+    confirmWord: "CONFIRM",
+  });
+  assert.equal(upd.ok, true);
+  assert.equal(updates[0][0], "bpc_1");
+  assert.deepEqual(updates[0][1], {
+    invoice_history: { enabled: true },
+    payment_method_update: { enabled: true },
+    subscription_cancel: { enabled: false },
+  });
+  // Empty state → create affordance, and the create action works.
+  const empty = await section.buildPage(mkCtx([]), { page: "portal", filters: {} });
+  const createNotice = empty!.blocks.find((b) => b.type === "notice") as NoticeBlock;
+  assert.equal(createNotice.actions![0].key, "section:portal.config_create");
+  const created = await section.action!(mkCtx([]), {
+    key: "section:portal.config_create",
+    params: { invoiceHistory: true, pmUpdate: true, subCancel: true },
+    confirmWord: "CONFIRM",
+  });
+  assert.equal(created.ok, true);
+  assert.deepEqual(creates[0], {
+    invoice_history: { enabled: true },
+    payment_method_update: { enabled: true },
+    subscription_cancel: { enabled: true, mode: "at_period_end" },
+  });
+});
+
+test("customer portal link (PA-6): the page mints a short-lived session, renders it as a copyable external link, and audits", async () => {
+  const ctx = fakeCustomerCtx();
+  const audits: string[] = [];
+  (ctx as unknown as Record<string, unknown>).audit = async (line: string) => {
+    audits.push(line);
+  };
+  (ctx.stripe as unknown as Record<string, unknown>).createPortalSession = async (id: string) => ({
+    id: "bps_1",
+    url: `https://billing.stripe.com/p/session/${id}`,
+  });
+  const section = makeCustomersSection();
+  const page = await section.buildPage(ctx, { page: "customers.portal", params: { id: "cus_test1" } });
+  const kv = page!.blocks.find((b) => b.type === "kv") as KeyValueBlock;
+  const link = kv.rows.find((r) => r.label === "Portal")!.cell as { t: string; href: string; copy?: boolean };
+  assert.equal(link.t, "external");
+  assert.equal(link.href, "https://billing.stripe.com/p/session/cus_test1");
+  assert.equal(link.copy, true);
+  assert.ok(audits.some((a) => a.includes("Portal login link minted for cus_test1")));
+  // The Customer-360 Manage card links here.
+  const detail = await section.buildPage(fakeCustomerCtx(), { page: "customers.detail", params: { id: "cus_test1" } });
+  const manage = detail!.rail!.find((b) => b.type === "kv" && (b as KeyValueBlock).title === "Manage") as KeyValueBlock;
+  const portalRow = manage.rows.find((r) => r.label === "Customer portal")!;
+  assert.deepEqual((portalRow.cell as { ref?: unknown }).ref, { page: "customers.portal", params: { id: "cus_test1" } });
+});
+
+test("update page item modes (PA-6): add excludes on-sub prices and confirms op:add; remove picks an item and confirms op:remove", async () => {
+  const section = makeSubscriptionsSection();
+  // ADD: price_old is on the sub → only price_new is offered.
+  const addCtx = subsCtx();
+  (addCtx.stripe as unknown as Record<string, unknown>).previewItemsChange = async () => ({
+    amount_due: 4900,
+    currency: "eur",
+    lines: { data: [{ id: "il_1", description: "Remaining time on Postiz Ultra", amount: 4900, currency: "eur" }] },
+  });
+  const addPicker = await section.buildPage(addCtx, {
+    page: "subscriptions.changeplan",
+    params: { id: "sub_1" },
+    filters: { mode: "add" },
+  });
+  const addTable = addPicker!.blocks.find((b) => b.type === "table") as TableBlock;
+  assert.deepEqual(addTable.rows.map((r) => r.id), ["price_new"]);
+  assert.ok(!addPicker!.blocks.some((b) => b.type === "table" && (b as TableBlock).key === "preview"));
+  const addReady = await section.buildPage(addCtx, {
+    page: "subscriptions.changeplan",
+    params: { id: "sub_1" },
+    filters: { mode: "add", price: "price_new", qty: "3" },
+  });
+  const addConfirm = addReady!.blocks.find(
+    (b) => "actions" in b && (b as { actions?: Array<{ key: string }> }).actions?.some((a) => a.key === "subscription.items")
+  ) as { actions: Array<{ key: string; params?: Record<string, unknown> }> };
+  assert.ok(addConfirm, "add confirm only after preview");
+  assert.deepEqual(addConfirm.actions[0].params, { subscriptionId: "sub_1", op: "add", priceId: "price_new", quantity: 3 });
+  // REMOVE: needs a multi-item sub; single-item subs refuse.
+  const rmCtx = subsCtx();
+  const twoItems = {
+    id: "sub_1",
+    status: "active",
+    customer: "cus_a",
+    created: 1_700_000_000,
+    cancel_at: null,
+    cancel_at_period_end: false,
+    pause_collection: null,
+    trial_end: null,
+    collection_method: "charge_automatically",
+    default_payment_method: null,
+    test_clock: null,
+    discounts: [],
+    latest_invoice: "in_9",
+    items: {
+      data: [
+        { id: "si_1", quantity: 1, price: { id: "price_old", nickname: "Pro", currency: "eur", unit_amount: 2900, recurring: { interval: "month", interval_count: 1 } } },
+        { id: "si_2", quantity: 2, price: { id: "price_new", nickname: "Ultra", currency: "eur", unit_amount: 4900, recurring: { interval: "month", interval_count: 1 } } },
+      ],
+    },
+  };
+  (rmCtx.stripe as unknown as Record<string, unknown>).getSubscription = async () => twoItems;
+  (rmCtx.stripe as unknown as Record<string, unknown>).previewItemsChange = async () => ({
+    amount_due: -1200,
+    currency: "eur",
+    lines: { data: [{ id: "il_r", description: "Unused time on Ultra", amount: -1200, currency: "eur" }] },
+  });
+  const rmReady = await section.buildPage(rmCtx, {
+    page: "subscriptions.changeplan",
+    params: { id: "sub_1" },
+    filters: { mode: "remove", item: "si_2" },
+  });
+  const rmTable = rmReady!.blocks.find((b) => b.type === "table" && (b as TableBlock).key === "items") as TableBlock;
+  assert.deepEqual(rmTable.rows.map((r) => r.id), ["si_1", "si_2"]);
+  const rmConfirm = rmReady!.blocks.find(
+    (b) => "actions" in b && (b as { actions?: Array<{ key: string }> }).actions?.some((a) => a.key === "subscription.items")
+  ) as { actions: Array<{ key: string; params?: Record<string, unknown> }> };
+  assert.ok(rmConfirm);
+  assert.deepEqual(rmConfirm.actions[0].params, { subscriptionId: "sub_1", op: "remove", itemId: "si_2" });
+  // Single-item sub: remove mode renders but offers no confirm (last item).
+  const single = await section.buildPage(subsCtx(), {
+    page: "subscriptions.changeplan",
+    params: { id: "sub_1" },
+    filters: { mode: "remove", item: "si_1" },
+  });
+  assert.ok(
+    !single!.blocks.some(
+      (b) => "actions" in b && (b as { actions?: Array<{ key: string }> }).actions?.some((a) => a.key === "subscription.items")
+    )
+  );
+});
+
+test("registry subscription.items (PA-6): parse + gateway binding from the subscription", async () => {
+  const def = actionByKey("subscription.items")!;
+  assert.equal(def.dangerous, true);
+  assert.ok(def.parseParams({ subscriptionId: "sub_1", op: "add", priceId: "price_1", quantity: 2 }).ok);
+  assert.ok(def.parseParams({ subscriptionId: "sub_1", op: "remove", itemId: "si_1" }).ok);
+  assert.equal(def.parseParams({ subscriptionId: "sub_1", op: "add" }).ok, false); // add needs a price
+  assert.equal(def.parseParams({ subscriptionId: "sub_1", op: "remove" }).ok, false); // remove needs an item
+  const { gateway } = gatewayFixture();
+  const resolved = await gateway.resolve("subscription.items", { subscriptionId: "sub_1", op: "remove", itemId: "si_1" });
+  assert.ok(resolved.ok);
+  assert.equal((resolved as { binding: { stripeCustomerId: string } }).binding.stripeCustomerId, "cus_sub");
+});
