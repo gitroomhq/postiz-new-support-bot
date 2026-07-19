@@ -93,9 +93,11 @@ export interface FilterDef {
   key: string;
   label: string;
   // select/text render as Stripe "⊕ Label" pills with a popover; search renders
-  // as the wide standalone search box (Customers-list style).
-  kind: "select" | "text" | "search";
-  options?: Opt[]; // select only
+  // as the wide standalone search box (Customers-list style). daterange is a
+  // preset select plus a "Custom…" two-date picker; its value is either a
+  // preset token ("7d") or "YYYY-MM-DD..YYYY-MM-DD" in ONE filter key.
+  kind: "select" | "text" | "search" | "daterange";
+  options?: Opt[]; // select/daterange (daterange: the preset rows)
   value?: string; // current value (echoed back by the client)
   placeholder?: string; // text/search only
 }
@@ -308,6 +310,12 @@ export interface ActionResult {
   needsReverse?: boolean; // destructive reverseConfirm gate not yet satisfied
   needsStepUp?: boolean; // fresh-factor re-assert (T2) not fresh — client runs step-up, then retries
   queued?: boolean; // routed into the approval queue
+  // Small binary download riding the JSON action channel (quote PDFs). The
+  // client decodes b64 → Blob → <a download>; old clients ignore unknown keys.
+  file?: { name: string; mime: string; b64: string };
+  // Follow-up anchor rendered into the success flash (short-lived report
+  // links). textContent + rel="noopener" on the client — never innerHTML.
+  link?: { href: string; label: string };
 }
 
 export type DashboardUiState = "locked" | "active" | "expired" | "login";
@@ -321,4 +329,24 @@ export interface ActivationStatusResponse {
 
 export interface NavBadgesResponse {
   badges: Record<string, string>; // NavItem.key → count label
+  // Needs-attention items for the topbar bell (collected from module
+  // attention() hooks, newest-first, capped at 15). Rides the same 60s poll
+  // as the badges — one request feeds both.
+  attention?: AttentionItem[];
+}
+
+// One needs-attention row (bell popover): what, how bad, when, where to go.
+export interface AttentionItem {
+  label: string;
+  badge: Badge;
+  iso: string;
+  ref: ObjectRef;
+}
+
+// Hover peek card payload (the `peek` endpoint). Lines are plain text —
+// last4 at most, never full PANs or secrets.
+export interface PeekResponse {
+  title: string;
+  badge?: Badge;
+  lines: string[]; // ≤5
 }

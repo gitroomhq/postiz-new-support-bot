@@ -1,20 +1,103 @@
 import type Stripe from "stripe";
 import type { HomeMetrics } from "../metrics/HomeMetrics";
-import { Badge, Block, Cell, ObjectRef } from "../renderer/contract";
+import { AttentionItem, Badge, Block, Cell, ObjectRef } from "../renderer/contract";
 import { DashboardCtx, DashboardSectionModule, SectionPage } from "./types";
-import { badgeCell, isoDateCell, sentence, strong, text } from "./cells";
+import { badgeCell, refForId, sentence, strong, text } from "./cells";
 
 // Home v1+charts: the needs-attention inbox (disputes closing in, queued
 // approvals, charge reviews, fresh early-fraud warnings), account stat tiles,
 // the five M5 charts (lazily hydrated via the series endpoint) and the
 // recent-activity feed from Stripe events. The view build stays ≤4 direct
 // Stripe calls — charts and the active-subs count come from HomeMetrics'
-// 10-minute cache.
+// 10-minute cache. The inbox computation is shared with the topbar bell via
+// computeAttention (PA-13) — one implementation feeds both surfaces.
 
 const DUE_SOON_HOURS = 72;
 const EFW_WINDOW_HOURS = 72;
 
 const CHART_WINDOWS = new Set(["7d", "30d", "90d"]);
+
+// One needs-attention entry, renderable as an inbox table row (label/sub +
+// badge + when) or a bell AttentionItem. whenUnknown = the entry has no real
+// timestamp (pending charge reviews) — the table shows "—" for it.
+export interface AttentionEntry {
+  id: string;
+  label: string;
+  sub?: string;
+  badge: Badge;
+  iso: string;
+  ref: ObjectRef;
+  whenUnknown?: boolean;
+}
+
+// The shared inbox computation. Also returns the raw counts so Home's stat
+// tiles don't re-fetch what this already read.
+export async function computeAttention(
+  ctx: DashboardCtx
+): Promise<{ entries: AttentionEntry[]; approvalsTotal: number; reviewCount: number }> {
+  const [efws, approvals, reviewCount, openDisputes] = await Promise.all([
+    ctx.stripe.listRecentEarlyFraudWarnings(50).catch(() => [] as Stripe.Radar.EarlyFraudWarning[]),
+    ctx.billing.actions.pendingPage(0, 5).catch(() => ({ rows: [], total: 0 })),
+    ctx.stores.session.countPendingChargeReviews().catch(() => 0),
+    ctx.stores.dispute.listOpen(0, 10).catch(() => ({ rows: [], total: 0 })),
+  ]);
+
+  const now = Date.now();
+  const entries: AttentionEntry[] = [];
+
+  for (const d of openDisputes.rows) {
+    if (!d.evidenceDueBy) continue;
+    const hoursLeft = (d.evidenceDueBy.getTime() - now) / 3_600_000;
+    if (hoursLeft > DUE_SOON_HOURS) continue;
+    const overdue = hoursLeft < 0;
+    entries.push({
+      id: `dispute-${d.id}`,
+      label: `Dispute ${ctx.stripe.formatAmount(d.amount, d.currency)} — ${d.reason.replace(/_/g, " ")}`,
+      sub: d.id,
+      badge: { kind: "error", text: overdue ? "Evidence OVERDUE" : `Due in ${Math.max(1, Math.round(hoursLeft))}h` },
+      iso: d.evidenceDueBy.toISOString(),
+      ref: { page: "disputes.detail", params: { id: d.id } },
+    });
+  }
+
+  for (const a of approvals.rows) {
+    entries.push({
+      id: `approval-${a.id}`,
+      label: a.summary,
+      sub: `requested by ${a.requestedByName} · ${a.origin}`,
+      badge: { kind: a.status === "FAILED" ? "error" : "warn", text: a.status === "FAILED" ? "Failed — retry" : "Awaiting approval" },
+      iso: a.createdAt.toISOString(),
+      ref: { page: "approvals" },
+    });
+  }
+
+  if (reviewCount > 0) {
+    entries.push({
+      id: "charge-reviews",
+      label: `${reviewCount} blocked self-service refund${reviewCount === 1 ? "" : "s"} waiting for review`,
+      badge: { kind: "warn", text: "Charge review" },
+      iso: new Date(now).toISOString(),
+      ref: { page: "approvals" },
+      whenUnknown: true,
+    });
+  }
+
+  for (const w of efws.slice(0, 10)) {
+    const ageHours = (now - w.created * 1000) / 3_600_000;
+    if (ageHours > EFW_WINDOW_HOURS) continue;
+    const chargeId = typeof w.charge === "string" ? w.charge : w.charge.id;
+    entries.push({
+      id: `efw-${w.id}`,
+      label: `Early fraud warning on ${chargeId}`,
+      sub: w.fraud_type.replace(/_/g, " "),
+      badge: { kind: "error", text: w.actionable ? "Actionable" : "EFW" },
+      iso: new Date(w.created * 1000).toISOString(),
+      ref: { page: "payments.detail", params: { id: chargeId } },
+    });
+  }
+
+  return { entries, approvalsTotal: approvals.total, reviewCount };
+}
 
 export function makeHomeSection(deps: { metrics: HomeMetrics }): DashboardSectionModule {
   return {
@@ -24,16 +107,25 @@ export function makeHomeSection(deps: { metrics: HomeMetrics }): DashboardSectio
       return page === "home";
     },
 
+    // Bell feed (PA-13): the SAME inbox entries, newest-first cap applied by
+    // the Dashboard collector.
+    async attention(ctx: DashboardCtx): Promise<AttentionItem[]> {
+      const { entries } = await computeAttention(ctx);
+      return entries.map((e) => ({
+        label: e.sub ? `${e.label} · ${e.sub}` : e.label,
+        badge: e.badge,
+        iso: e.iso,
+        ref: e.ref,
+      }));
+    },
+
     async buildPage(ctx: DashboardCtx, req): Promise<SectionPage | null> {
       const window = CHART_WINDOWS.has(req.filters?.window ?? "") ? req.filters!.window : "30d";
-      const [balance, subCount, events, efws, approvals, reviewCount, openDisputes] = await Promise.all([
+      const [balance, subCount, events, inbox] = await Promise.all([
         ctx.stripe.getBalance().catch(() => null),
         deps.metrics.activeSubsCount().catch(() => null),
         ctx.stripe.listEvents(12).catch(() => [] as Stripe.Event[]),
-        ctx.stripe.listRecentEarlyFraudWarnings(50).catch(() => [] as Stripe.Radar.EarlyFraudWarning[]),
-        ctx.billing.actions.pendingPage(0, 5).catch(() => ({ rows: [], total: 0 })),
-        ctx.stores.session.countPendingChargeReviews().catch(() => 0),
-        ctx.stores.dispute.listOpen(0, 10).catch(() => ({ rows: [], total: 0 })),
+        computeAttention(ctx),
       ]);
 
       const blocks: Block[] = [];
@@ -43,6 +135,7 @@ export function makeHomeSection(deps: { metrics: HomeMetrics }): DashboardSectio
         const parts = (buckets ?? []).filter((b) => b.amount !== 0).map((b) => ctx.stripe.formatAmount(b.amount, b.currency));
         return parts.join(" + ") || (buckets?.length ? ctx.stripe.formatAmount(0, buckets[0].currency) : "—");
       };
+      const openApprovals = inbox.approvalsTotal + inbox.reviewCount;
       blocks.push({
         type: "stats",
         items: [
@@ -55,71 +148,23 @@ export function makeHomeSection(deps: { metrics: HomeMetrics }): DashboardSectio
           },
           {
             label: "Open approvals",
-            value: String(approvals.total + reviewCount),
-            ...(approvals.total + reviewCount > 0 ? { badge: { kind: "warn", text: "action needed" } as Badge } : {}),
+            value: String(openApprovals),
+            ...(openApprovals > 0 ? { badge: { kind: "warn", text: "action needed" } as Badge } : {}),
             ref: { page: "approvals" },
           },
         ],
       });
 
-      // ---- needs-attention inbox ----
-      const now = Date.now();
-      const inboxRows: Array<{ id: string; cells: Cell[]; ref?: ObjectRef }> = [];
-
-      for (const d of openDisputes.rows) {
-        if (!d.evidenceDueBy) continue;
-        const hoursLeft = (d.evidenceDueBy.getTime() - now) / 3_600_000;
-        if (hoursLeft > DUE_SOON_HOURS) continue;
-        const overdue = hoursLeft < 0;
-        inboxRows.push({
-          id: `dispute-${d.id}`,
-          ref: { page: "disputes.detail", params: { id: d.id } },
-          cells: [
-            strong(`Dispute ${ctx.stripe.formatAmount(d.amount, d.currency)} — ${d.reason.replace(/_/g, " ")}`, d.id),
-            badgeCell("error", overdue ? "Evidence OVERDUE" : `Due in ${Math.max(1, Math.round(hoursLeft))}h`),
-            isoDateCell(d.evidenceDueBy),
-          ],
-        });
-      }
-
-      for (const a of approvals.rows) {
-        inboxRows.push({
-          id: `approval-${a.id}`,
-          ref: { page: "approvals" },
-          cells: [
-            strong(a.summary, `requested by ${a.requestedByName} · ${a.origin}`),
-            badgeCell(a.status === "FAILED" ? "error" : "warn", a.status === "FAILED" ? "Failed — retry" : "Awaiting approval"),
-            isoDateCell(a.createdAt),
-          ],
-        });
-      }
-
-      if (reviewCount > 0) {
-        inboxRows.push({
-          id: "charge-reviews",
-          ref: { page: "approvals" },
-          cells: [
-            strong(`${reviewCount} blocked self-service refund${reviewCount === 1 ? "" : "s"} waiting for review`),
-            badgeCell("warn", "Charge review"),
-            text("—"),
-          ],
-        });
-      }
-
-      for (const w of efws.slice(0, 10)) {
-        const ageHours = (now - w.created * 1000) / 3_600_000;
-        if (ageHours > EFW_WINDOW_HOURS) continue;
-        const chargeId = typeof w.charge === "string" ? w.charge : w.charge.id;
-        inboxRows.push({
-          id: `efw-${w.id}`,
-          ref: { page: "payments.detail", params: { id: chargeId } },
-          cells: [
-            strong(`Early fraud warning on ${chargeId}`, w.fraud_type.replace(/_/g, " ")),
-            badgeCell("error", w.actionable ? "Actionable" : "EFW"),
-            isoDateCell(new Date(w.created * 1000)),
-          ],
-        });
-      }
+      // ---- needs-attention inbox (shared with the bell) ----
+      const inboxRows: Array<{ id: string; cells: Cell[]; ref?: ObjectRef }> = inbox.entries.map((e) => ({
+        id: e.id,
+        ref: e.ref,
+        cells: [
+          strong(e.label, e.sub),
+          badgeCell(e.badge.kind, e.badge.text),
+          e.whenUnknown ? text("—") : ({ t: "date", v: e.iso.slice(0, 10), iso: e.iso } as Cell),
+        ],
+      }));
 
       blocks.push({
         type: "table",
@@ -182,14 +227,4 @@ export function makeHomeSection(deps: { metrics: HomeMetrics }): DashboardSectio
       return { title: "Home", crumbs: [{ label: "Home" }], blocks };
     },
   };
-}
-
-// Route a Stripe object id to its dashboard page (subset that exists today).
-function refForId(id: string): ObjectRef | null {
-  if (/^cus_/.test(id)) return { page: "customers.detail", params: { id } };
-  if (/^(ch|py|pi)_/.test(id)) return { page: "payments.detail", params: { id } };
-  if (/^po_/.test(id)) return { page: "balances.detail", params: { id } };
-  if (/^sub_/.test(id)) return { page: "subscriptions.detail", params: { id } };
-  if (/^in_/.test(id)) return { page: "invoices.detail", params: { id } };
-  return null;
 }

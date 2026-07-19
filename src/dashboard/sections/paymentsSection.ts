@@ -34,6 +34,21 @@ const BULK_REFUND_MAX = 25; // blast-radius cap per bulk-refund run
 
 const DATE_RANGES: Record<string, number> = { "24h": 1, "7d": 7, "30d": 30, "90d": 90 };
 
+// PA-13 daterange: one filter value carries a preset ("7d") or a custom
+// "YYYY-MM-DD..YYYY-MM-DD" range. The custom end date is inclusive → lt is
+// end+86400. Garbage (or inverted ranges) parses to no bounds at all.
+export function parseDateFilter(value: string): { createdGte?: number; createdLt?: number } {
+  if (DATE_RANGES[value]) {
+    return { createdGte: Math.floor(Date.now() / 1000) - DATE_RANGES[value] * 86400 };
+  }
+  const m = value.match(/^(\d{4}-\d{2}-\d{2})\.\.(\d{4}-\d{2}-\d{2})$/);
+  if (!m) return {};
+  const gte = Math.floor(Date.parse(`${m[1]}T00:00:00Z`) / 1000);
+  const lt = Math.floor(Date.parse(`${m[2]}T00:00:00Z`) / 1000) + 86400;
+  if (!Number.isFinite(gte) || !Number.isFinite(lt) || gte >= lt) return {};
+  return { createdGte: gte, createdLt: lt };
+}
+
 const INCOMPLETE_PI = new Set([
   "requires_payment_method",
   "requires_confirmation",
@@ -48,6 +63,31 @@ export function makePaymentsSection(): DashboardSectionModule {
 
     ownsPage(page: string): boolean {
       return page === "payments" || page === "payments.detail" || page === "payments.guardrails";
+    },
+
+    // Hover peek card (PA-13): ONE retrieve (charge or PI), plain text only —
+    // last4 at most, never full card data.
+    async peek(ctx: DashboardCtx, page: string, id: string) {
+      if (page !== "payments.detail") return null;
+      if (/^pi_/.test(id)) {
+        const pi = await ctx.stripe.getPaymentIntent(id).catch(() => null);
+        if (!pi) return null;
+        const lines = [
+          `Created ${new Date(pi.created * 1000).toISOString().slice(0, 10)}`,
+          ...(pi.last_payment_error?.message ? [`Last error: ${pi.last_payment_error.message.slice(0, 120)}`] : []),
+        ];
+        return { title: ctx.stripe.formatAmount(pi.amount, pi.currency), badge: piBadge(pi.status), lines: lines.slice(0, 5) };
+      }
+      const c = await ctx.stripe.getChargeDetailed(id).catch(() => null);
+      if (!c) return null;
+      const email = c.billing_details?.email ?? c.receipt_email ?? null;
+      const lines = [
+        ...(email ? [email] : []),
+        `Created ${new Date(c.created * 1000).toISOString().slice(0, 10)}`,
+        ...(c.payment_method_details?.card?.last4 ? [`Card ···· ${c.payment_method_details.card.last4}`] : []),
+        ...(c.outcome?.seller_message && c.status !== "succeeded" ? [c.outcome.seller_message.slice(0, 120)] : []),
+      ];
+      return { title: ctx.stripe.formatAmount(c.amount, c.currency), badge: chargeBadge(c), lines: lines.slice(0, 5) };
     },
 
     async buildPage(ctx: DashboardCtx, req): Promise<SectionPage | null> {
@@ -132,32 +172,78 @@ export function makePaymentsSection(): DashboardSectionModule {
           }
           const factor = StripeClient.isZeroDecimal(currency) ? 1 : 100;
           const amountMinor = Math.round(amountMajor * factor);
-          // Preflight against the AVAILABLE bucket — Stripe would refuse anyway,
-          // but a friendly error beats a raw API message.
+          const instant = p.method === "instant";
+          // Preflight against the right bucket — Stripe would refuse anyway,
+          // but a friendly error beats a raw API message. instant_available is
+          // absent entirely on ineligible accounts (best-effort check; Stripe
+          // stays the final authority).
           const balance = await ctx.stripe.getBalance().catch(() => null);
-          const bucket = balance?.available.find((b) => b.currency === currency);
+          const bucket = instant
+            ? balance?.instant_available?.find((b) => b.currency === currency)
+            : balance?.available.find((b) => b.currency === currency);
           if (!bucket || bucket.amount < amountMinor) {
             return {
               ok: false,
-              error: `Available ${currency.toUpperCase()} balance is ${
-                bucket ? ctx.stripe.formatAmount(bucket.amount, currency) : ctx.stripe.formatAmount(0, currency)
-              } — cannot pay out ${ctx.stripe.formatAmount(amountMinor, currency)}.`,
+              error: instant
+                ? `Instant-available ${currency.toUpperCase()} balance is ${
+                    bucket ? ctx.stripe.formatAmount(bucket.amount, currency) : ctx.stripe.formatAmount(0, currency)
+                  } — instant payouts need an eligible debit destination and instant funds.`
+                : `Available ${currency.toUpperCase()} balance is ${
+                    bucket ? ctx.stripe.formatAmount(bucket.amount, currency) : ctx.stripe.formatAmount(0, currency)
+                  } — cannot pay out ${ctx.stripe.formatAmount(amountMinor, currency)}.`,
             };
           }
-          const payout = await ctx.stripe.createPayout(
-            {
-              amountMinor,
-              currency,
-              description: str(p.description, 200).trim() || undefined,
-              statementDescriptor: str(p.statementDescriptor, 22).trim() || undefined,
-            },
-            `dash-payout-${amountMinor}-${currency}-${Date.now().toString(36)}`
-          );
-          await ctx.audit(`Payout ${payout.id} created — ${ctx.stripe.formatAmount(amountMinor, currency)}`);
-          return {
-            ok: true,
-            text: `Payout ${payout.id} created — ${ctx.stripe.formatAmount(amountMinor, currency)}, arriving ${new Date(payout.arrival_date * 1000).toISOString().slice(0, 10)}.`,
-          };
+          try {
+            const payout = await ctx.stripe.createPayout(
+              {
+                amountMinor,
+                currency,
+                description: str(p.description, 200).trim() || undefined,
+                statementDescriptor: str(p.statementDescriptor, 22).trim() || undefined,
+                ...(instant ? { method: "instant" as const } : {}),
+              },
+              `dash-payout-${amountMinor}-${currency}-${Date.now().toString(36)}`
+            );
+            await ctx.audit(`Payout ${payout.id} created — ${ctx.stripe.formatAmount(amountMinor, currency)}${instant ? " (instant)" : ""}`);
+            return {
+              ok: true,
+              text: `Payout ${payout.id} created — ${ctx.stripe.formatAmount(amountMinor, currency)}${
+                instant ? " (instant)" : `, arriving ${new Date(payout.arrival_date * 1000).toISOString().slice(0, 10)}`
+              }.`,
+            };
+          } catch (e) {
+            // Destination-ineligibility errors are the useful part — surface them.
+            return { ok: false, error: `Stripe refused the payout: ${(e as Error).message?.slice(0, 200) ?? "unknown error"}` };
+          }
+        }
+        case "section:payments.topup_create": {
+          // T2 — pulls money FROM the external bank into the Stripe balance.
+          if (req.confirmWord !== "CONFIRM") return { ok: false, error: "Type CONFIRM to run this action." };
+          if (!ctx.security.stepUpFresh()) return { ok: false, needsStepUp: true };
+          const amountMajor =
+            typeof p.amountMajor === "number" && isFinite(p.amountMajor) && p.amountMajor > 0 ? p.amountMajor : null;
+          const currency = str(p.currency, 3).trim().toLowerCase();
+          if (!amountMajor || !/^[a-z]{3}$/.test(currency)) {
+            return { ok: false, error: "A positive amount and a 3-letter currency are required." };
+          }
+          const amountMinor = Math.round(amountMajor * (StripeClient.isZeroDecimal(currency) ? 1 : 100));
+          try {
+            const topup = await ctx.stripe.createTopUp(
+              {
+                amountMinor,
+                currency,
+                description: str(p.description, 200).trim() || undefined,
+                statementDescriptor: str(p.statementDescriptor, 15).trim() || undefined,
+              },
+              `dash-topup-${amountMinor}-${currency}-${Date.now().toString(36)}`
+            );
+            await ctx.audit(`Top-up ${topup.id} created — ${ctx.stripe.formatAmount(amountMinor, currency)} from the default bank`);
+            return { ok: true, text: `Top-up ${topup.id} created — ${ctx.stripe.formatAmount(amountMinor, currency)} (${topup.status}).` };
+          } catch (e) {
+            // Fails on accounts without a verified default bank / unsupported
+            // countries — Stripe's message is the useful part.
+            return { ok: false, error: `Stripe refused the top-up: ${(e as Error).message?.slice(0, 200) ?? "unknown error"}` };
+          }
         }
         default:
           return { ok: false, error: "Unknown action." };
@@ -180,6 +266,43 @@ function registryButton(ctx: DashboardCtx, button: ActionButton): ActionButton {
   return { ...button, mode: mode === "queue" ? "queue" : "direct" };
 }
 
+function pmIntentId(charge: Stripe.Charge): string | null {
+  return typeof charge.payment_intent === "string" ? charge.payment_intent : charge.payment_intent?.id ?? null;
+}
+
+// Capture pair for a requires_capture authorization (PA-9): full + partial.
+// T1 (registry dangerous) + T2 (DASH_T2) — capture is the moment the card is
+// actually charged.
+function captureButtons(ctx: DashboardCtx, paymentIntentId: string, capturableMinor: number, currency: string): ActionButton[] {
+  return [
+    registryButton(ctx, {
+      key: "payment_intent.capture",
+      label: "Capture",
+      style: "primary",
+      dangerous: true,
+      stepUp: true,
+      params: { paymentIntentId },
+      summary: `Charges the customer's card the full authorized ${ctx.stripe.formatAmount(capturableMinor, currency)} NOW. Requires a fresh factor.`,
+    }),
+    registryButton(ctx, {
+      key: "payment_intent.capture",
+      label: "Capture partial",
+      dangerous: true,
+      stepUp: true,
+      params: { paymentIntentId },
+      inputs: [
+        {
+          type: "number",
+          key: "amountMajor",
+          label: `Amount (${currency.toUpperCase()}, ≤ ${ctx.stripe.formatAmount(capturableMinor, currency)})`,
+          min: 0,
+        },
+      ],
+      summary: "Charges part of the authorization — the uncaptured remainder is RELEASED back to the customer. Requires a fresh factor.",
+    }),
+  ];
+}
+
 // ---- LIST ----
 
 async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: string | null): Promise<SectionPage> {
@@ -189,16 +312,17 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
     filters.txview === "payouts" || filters.txview === "topups" || filters.txview === "activity" ? filters.txview : "";
   if (txview) return transactionsView(ctx, txview, filters, cursor);
   const status = str(filters.status, 20);
-  const dateKey = str(filters.date, 8);
+  const dateKey = str(filters.date, 24);
   const amountFilter = str(filters.amount, 20);
   const last4 = /^\d{4}$/.test(filters.last4 ?? "") ? filters.last4 : "";
   const flagged = str(filters.flagged, 12);
   const currencyFilter = str(filters.currency, 8).toLowerCase();
   const pmFilter = str(filters.pm, 24).toLowerCase();
 
-  const createdGte = DATE_RANGES[dateKey]
-    ? Math.floor(Date.now() / 1000) - DATE_RANGES[dateKey] * 86400
-    : undefined;
+  // Date filter (PA-13 daterange): a preset token OR a custom
+  // "YYYY-MM-DD..YYYY-MM-DD" range in the same key. The range end is
+  // INCLUSIVE — +86400 turns it into the exclusive `lt` Stripe wants.
+  const { createdGte, createdLt } = parseDateFilter(dateKey);
   // Customer scope (Customer-360 "view all payments" + the Customer pill):
   // per-customer Stripe listings replace the account-wide ones.
   const customerScope = validId("customer", filters.customer) ?? "";
@@ -213,6 +337,8 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
   const scopeParts: string[] = [];
   if (customerScope) scopeParts.push(`customer:"${customerScope}"`);
   if (createdGte) scopeParts.push(`created>=${createdGte}`);
+  // Chip totals must honor the custom range's upper bound too.
+  if (createdLt) scopeParts.push(`created<${createdLt}`);
   const searchQ = (extra?: string) => [...scopeParts, ...(extra ? [extra] : [])].join(" AND ") || "created>0";
   const countSearch = (kind: "charges" | "paymentIntents", q: string) =>
     Promise.resolve()
@@ -222,10 +348,10 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
   const [chargeWindow, piWindow, efws, blockPage, searchCounts] = await Promise.all([
     customerScope
       ? ctx.stripe.listCharges(customerScope, WINDOW, cursorId)
-      : ctx.stripe.listAllCharges({ limit: WINDOW, createdGte, startingAfter: cursorId }),
+      : ctx.stripe.listAllCharges({ limit: WINDOW, createdGte, createdLt, startingAfter: cursorId }),
     (customerScope
       ? ctx.stripe.listPaymentIntents(customerScope, WINDOW).then((paymentIntents) => ({ paymentIntents, hasMore: false }))
-      : ctx.stripe.listAllPaymentIntents({ limit: WINDOW, createdGte })
+      : ctx.stripe.listAllPaymentIntents({ limit: WINDOW, createdGte, createdLt })
     ).catch(() => ({ paymentIntents: [] as Stripe.PaymentIntent[], hasMore: false })),
     ctx.stripe.listRecentEarlyFraudWarnings(100).catch(() => [] as Stripe.Radar.EarlyFraudWarning[]),
     ctx.stores.block.listPage(0, 200).catch(() => ({ rows: [], total: 0 })),
@@ -315,7 +441,7 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
     {
       key: "date",
       label: "Date",
-      kind: "select",
+      kind: "daterange",
       value: dateKey || undefined,
       options: [
         { value: "24h", label: "Last 24 hours" },
@@ -429,6 +555,7 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
   const filtered = charges.filter((c) => {
     // Per-customer listings can't take a server-side date param — cut here.
     if (customerScope && createdGte && c.created < createdGte) return false;
+    if (customerScope && createdLt && c.created >= createdLt) return false;
     if (status === "succeeded" && c.status !== "succeeded") return false;
     // Fully refunded — Stripe's own chip definition (searchable as
     // refunded:"true"); partial refunds keep their "Partial refund" badge.
@@ -575,6 +702,15 @@ async function transactionsView(
               inputs: [
                 { type: "number", key: "amountMajor", label: "Amount (major units, e.g. 250.00)", min: 0 },
                 { type: "text", key: "currency", label: "Currency (3 letters)", placeholder: "eur" },
+                {
+                  type: "select",
+                  key: "method",
+                  label: "Payout speed",
+                  options: [
+                    { value: "", label: "Standard (free, 1-3 days)" },
+                    { value: "instant", label: "Instant (fee — eligible debit destinations only)" },
+                  ],
+                },
                 { type: "text", key: "description", label: "Description (optional)" },
                 { type: "text", key: "statementDescriptor", label: "Bank statement text (optional, ≤22 chars)", maxLength: 22 },
               ],
@@ -638,7 +774,27 @@ async function transactionsView(
       title: "Payments",
       crumbs,
       blocks: [
-        { type: "header", title: "Payments" },
+        {
+          type: "header",
+          title: "Payments",
+          actions: [
+            {
+              key: "section:payments.topup_create",
+              label: "Add to balance",
+              style: "primary",
+              dangerous: true,
+              stepUp: true,
+              inputs: [
+                { type: "number", key: "amountMajor", label: "Amount (major units, e.g. 500.00)", min: 0 },
+                { type: "text", key: "currency", label: "Currency (3 letters)", placeholder: "eur" },
+                { type: "text", key: "description", label: "Description (optional)" },
+                { type: "text", key: "statementDescriptor", label: "Bank statement text (optional, ≤15 chars)", maxLength: 15 },
+              ],
+              summary:
+                "Pulls money from the account's DEFAULT VERIFIED BANK into the Stripe balance (takes days, like a payout in reverse). Requires a fresh factor.",
+            },
+          ],
+        },
         txTabs(view),
         {
           type: "table",
@@ -741,10 +897,26 @@ async function chargeDetail(ctx: DashboardCtx, id: string): Promise<SectionPage>
   const chargeDispute = disputes.find((d) => d.chargeId === id) ?? null;
   const remaining = charge.amount - (charge.amount_refunded ?? 0);
   const refundable = charge.status === "succeeded" && charge.captured && !charge.refunded && remaining > 0;
+  const uncaptured = charge.status === "succeeded" && !charge.captured && !charge.refunded;
+  const chargePiId = pmIntentId(charge);
   const linked = discordIds.length > 0;
 
-  // Header actions: refunds (T1/T2) + bookmark/note (T0 section-local).
+  // Header actions: capture (T1+T2, uncaptured auths), refunds (T1/T2),
+  // bookmark/note (T0 section-local).
   const actions: ActionButton[] = [];
+  if (uncaptured && chargePiId) {
+    actions.push(...captureButtons(ctx, chargePiId, charge.amount, charge.currency));
+    actions.push(
+      registryButton(ctx, {
+        key: "payment_intent.cancel",
+        label: "Cancel authorization",
+        style: "danger",
+        dangerous: true, // T1 belt (DASH_T1_EXTRA server-side)
+        params: { paymentIntentId: chargePiId },
+        summary: "Releases the hold — the customer is never charged and the authorization is voided.",
+      })
+    );
+  }
   if (refundable) {
     actions.push(
       registryButton(
@@ -1085,18 +1257,26 @@ async function piDetail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
   const latestChargeId = typeof pi.latest_charge === "string" ? pi.latest_charge : pi.latest_charge?.id ?? null;
 
   const cancelable = INCOMPLETE_PI.has(pi.status);
-  const actions: ActionButton[] = cancelable
-    ? [
-        registryButton(ctx, {
-          key: "payment_intent.cancel",
-          label: "Cancel payment intent",
-          style: "danger",
-          dangerous: true, // T1 belt (typed CONFIRM) — enforced server-side too
-          params: { paymentIntentId: id },
-          summary: `Cancel this ${ctx.stripe.formatAmount(pi.amount, pi.currency)} payment attempt.`,
-        }),
-      ]
-    : [];
+  const actions: ActionButton[] = [
+    ...(pi.status === "requires_capture"
+      ? captureButtons(ctx, id, pi.amount_capturable || pi.amount, pi.currency)
+      : []),
+    ...(cancelable
+      ? [
+          registryButton(ctx, {
+            key: "payment_intent.cancel",
+            label: pi.status === "requires_capture" ? "Cancel authorization" : "Cancel payment intent",
+            style: "danger",
+            dangerous: true, // T1 belt (typed CONFIRM) — enforced server-side too
+            params: { paymentIntentId: id },
+            summary:
+              pi.status === "requires_capture"
+                ? "Releases the hold — the customer is never charged."
+                : `Cancel this ${ctx.stripe.formatAmount(pi.amount, pi.currency)} payment attempt.`,
+          }),
+        ]
+      : []),
+  ];
 
   const main: Block[] = [
     {

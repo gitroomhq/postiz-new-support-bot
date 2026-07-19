@@ -2,6 +2,7 @@ import type Stripe from "stripe";
 import type { ActionActor } from "../../bot/billing/actions/BillingActionService";
 import { ActionButton, ActionResult, Badge, Block, Cell, FilterDef, TableBlock } from "../renderer/contract";
 import { DashboardCtx, DashboardSectionModule, SectionPage, str, validCursor, validId } from "./types";
+import { bookmarkButton, isBookmarkedSafe, toggleBookmarkAction } from "./bookmarks";
 import {
   avatarCell,
   badgeCell,
@@ -36,7 +37,8 @@ export function makeSubscriptionsSection(): DashboardSectionModule {
         page === "subscriptions" ||
         page === "subscriptions.detail" ||
         page === "subscriptions.changeplan" ||
-        page === "subscriptions.new"
+        page === "subscriptions.new" ||
+        page === "subscriptions.schedule"
       );
     },
 
@@ -47,10 +49,15 @@ export function makeSubscriptionsSection(): DashboardSectionModule {
       if (!id) return notFound("That subscription id is not valid (sub_…).");
       if (req.page === "subscriptions.detail") return detail(ctx, id);
       if (req.page === "subscriptions.changeplan") return updatePage(ctx, id, req.filters ?? {});
+      if (req.page === "subscriptions.schedule") return schedulePage(ctx, id, req.filters ?? {});
       return null;
     },
 
     async action(ctx: DashboardCtx, req): Promise<ActionResult> {
+      // T0 — shared team bookmark toggle.
+      if (req.key === "section:subscriptions.bookmark") {
+        return toggleBookmarkAction(ctx, "subscription", req.params ?? {});
+      }
       // Test-mode "Run simulation": advance the customer's test clock. The
       // clock id is derived from the LIVE subscription server-side — the
       // client only names the sub.
@@ -249,7 +256,8 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
   const sub = await ctx.stripe.getSubscription(id).catch(() => null);
   if (!sub) return notFound("This subscription does not exist.");
   const customerId = typeof sub.customer === "string" ? sub.customer : sub.customer?.id ?? null;
-  const [upcoming, discordIds, customer] = await Promise.all([
+  const scheduleId = typeof sub.schedule === "string" ? sub.schedule : sub.schedule?.id ?? null;
+  const [upcoming, discordIds, customer, schedule, bookmarked] = await Promise.all([
     customerId && sub.status !== "canceled"
       ? ctx.stripe.previewUpcomingInvoice(customerId, id)
       : Promise.resolve(null),
@@ -259,6 +267,12 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
           .then(() => ctx.stripe.getCustomer(customerId))
           .catch(() => null)
       : Promise.resolve(null),
+    scheduleId
+      ? Promise.resolve()
+          .then(() => ctx.stripe.getSubscriptionSchedule(scheduleId))
+          .catch(() => null)
+      : Promise.resolve(null),
+    isBookmarkedSafe(ctx, "subscription", id),
   ]);
 
   const plan = planLabel(sub);
@@ -346,11 +360,44 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
         summary: "Applies the promo's coupon to this subscription.",
       })
     );
+    if (sub.discounts?.length) {
+      actions.push(
+        registryButton(ctx, {
+          key: "customer.coupon",
+          label: "Remove discount",
+          dangerous: true, // T1 param-aware (needsConfirmExtra) server-side
+          params: { subscriptionId: id, op: "remove" },
+          summary:
+            "Removes the discount from this subscription — the next invoice bills full price. A customer-level discount (if any) is untouched.",
+        })
+      );
+    }
+    if (sub.status === "trialing") {
+      actions.push(
+        registryButton(ctx, {
+          key: "subscription.terms",
+          label: "End trial now",
+          style: "danger",
+          dangerous: true,
+          stepUp: true,
+          params: { subscriptionId: id, endTrialNow: true },
+          summary: "Ends the trial IMMEDIATELY — the first invoice is generated and charged now. Requires a fresh factor.",
+        })
+      );
+    }
+    if (sub.status === "active" || sub.status === "trialing") {
+      actions.push({
+        key: "nav:subscriptions.schedule",
+        label: schedule ? "Edit schedule" : "Schedule changes",
+        ref: { page: "subscriptions.schedule", params: { id } },
+      });
+    }
   }
 
   const main: Block[] = [];
   const rail: Block[] = [];
 
+  actions.push(bookmarkButton("section:subscriptions.bookmark", bookmarked, sub.id, title));
   main.push({
     type: "header",
     title,
@@ -429,6 +476,12 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
       : {}),
   });
 
+  // Schedule phases panel (PA-11): the live phase timeline when a schedule is
+  // attached; edits happen on the schedule editor page.
+  if (schedule) {
+    main.push(schedulePhasesTable(ctx, schedule, { footerRef: { page: "subscriptions.schedule", params: { id } } }));
+  }
+
   // Upcoming-invoice preview: full breakdown — every line w/ qty, then the
   // subtotal→total→amount-due ladder Stripe shows.
   if (upcoming) {
@@ -498,7 +551,24 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
         cell: text(sub.collection_method === "send_invoice" ? "Email invoice" : "Charge automatically"),
       },
       { label: "Payment method", cell: pmCell ?? text("—") },
-      ...(sub.discounts?.length ? [{ label: "Discounts", cell: text(String(sub.discounts.length)) }] : []),
+      ...(sub.discounts?.length
+        ? [
+            {
+              label: sub.discounts.length === 1 ? "Discount" : "Discounts",
+              // Basil: entries are string | Discount; the coupon moved under
+              // discount.source.coupon (string | Coupon | null).
+              cell: text(
+                sub.discounts
+                  .map((d) => {
+                    if (typeof d === "string") return d;
+                    const coupon = d.source?.coupon;
+                    return typeof coupon === "string" ? coupon : coupon?.name ?? coupon?.id ?? d.id;
+                  })
+                  .join(", ")
+              ),
+            },
+          ]
+        : []),
       ...(typeof sub.latest_invoice === "string"
         ? [
             {
@@ -1204,6 +1274,428 @@ async function composer(ctx: DashboardCtx, filters: Record<string, string>): Pro
   return {
     title: "Create subscription",
     crumbs: [{ label: "Subscriptions", ref: { page: "subscriptions" } }, { label: "New" }],
+    blocks,
+  };
+}
+
+// ---- SCHEDULE EDITOR (PA-11, `subscriptions.schedule`) ----
+// Composer idiom: composed future phases live in the `phases` URL filter as
+// tokens `price_<id>*<qty>*<count><d|w|m|y>[*t][*pn]` (t = whole-phase trial,
+// pn = proration none). Confirm bakes the SERVER-parsed phases into the
+// registry `subscription.schedule` action — the client adds nothing. On
+// confirm the composed phases REPLACE every scheduled future phase (the live
+// ones render read-only above; response phases carry no reconstructible
+// duration, so there is no lossy token pre-seeding).
+
+const SCHEDULE_MAX = 5;
+const UNIT_MAP: Record<string, "day" | "week" | "month" | "year"> = { d: "day", w: "week", m: "month", y: "year" };
+
+interface PhaseToken {
+  token: string;
+  priceId: string;
+  quantity: number;
+  durationCount: number;
+  durationUnit: "day" | "week" | "month" | "year";
+  trial: boolean;
+  prorationNone: boolean;
+}
+
+function parsePhaseTokens(raw: string): { phases: PhaseToken[]; dropped: number } {
+  const phases: PhaseToken[] = [];
+  let dropped = 0;
+  for (const token of raw.split(",").filter(Boolean).slice(0, SCHEDULE_MAX)) {
+    const parts = token.split("*");
+    const m = /^(\d{1,2})([dwmy])$/.exec(parts[2] ?? "");
+    const quantity = Number.parseInt(parts[1] ?? "", 10);
+    const flags = parts.slice(3);
+    if (
+      !PRICE_RE.test(parts[0] ?? "") ||
+      !Number.isSafeInteger(quantity) ||
+      quantity < 1 ||
+      quantity > 999 ||
+      !m ||
+      Number.parseInt(m[1], 10) < 1 ||
+      Number.parseInt(m[1], 10) > 36 ||
+      flags.some((f) => f !== "t" && f !== "pn")
+    ) {
+      dropped++;
+      continue;
+    }
+    phases.push({
+      token,
+      priceId: parts[0],
+      quantity,
+      durationCount: Number.parseInt(m[1], 10),
+      durationUnit: UNIT_MAP[m[2]],
+      trial: flags.includes("t"),
+      prorationNone: flags.includes("pn"),
+    });
+  }
+  return { phases, dropped };
+}
+
+function scheduleBadge(status: Stripe.SubscriptionSchedule.Status): Badge {
+  const kind: Badge["kind"] =
+    status === "active" ? "ok" : status === "not_started" ? "info" : status === "canceled" ? "error" : "neutral";
+  return { kind, text: sentence(status.replace(/_/g, " ")) };
+}
+
+// Live phases table shared by the sub detail and the editor page.
+function schedulePhasesTable(
+  ctx: DashboardCtx,
+  schedule: Stripe.SubscriptionSchedule,
+  opts: { footerRef?: { page: string; params: Record<string, string> } } = {}
+): Block {
+  const now = Math.floor(Date.now() / 1000);
+  const currentStart = schedule.current_phase?.start_date ?? null;
+  return {
+    type: "table",
+    key: "schedulephases",
+    title: "Schedule phases",
+    columns: [
+      { key: "phase", label: "Phase" },
+      { key: "items", label: "Items" },
+      { key: "start", label: "Starts" },
+      { key: "end", label: "Ends" },
+      { key: "flags", label: "" },
+    ],
+    rows: schedule.phases.map((phase, i) => {
+      const labels = phase.items
+        .slice(0, 2)
+        .map((it) => {
+          const price = it.price;
+          const name =
+            typeof price === "string" ? price : ("nickname" in price ? price.nickname : null) ?? price.id;
+          return it.quantity && it.quantity > 1 ? `${name} ×${it.quantity}` : name;
+        })
+        .join(", ");
+      const extra = phase.items.length > 2 ? ` +${phase.items.length - 2}` : "";
+      const flags: Badge[] = [];
+      if (currentStart != null && phase.start_date === currentStart) flags.push({ kind: "ok", text: "Current" });
+      else if (phase.start_date > now) flags.push({ kind: "info", text: "Scheduled" });
+      if (phase.trial_end && phase.trial_end > phase.start_date) flags.push({ kind: "neutral", text: "Trial" });
+      return {
+        id: String(i),
+        cells: [
+          strong(`Phase ${i + 1}`),
+          text(labels + extra),
+          dateCell(phase.start_date),
+          dateCell(phase.end_date),
+          { t: "flags", badges: flags } as Cell,
+        ] as Cell[],
+      };
+    }),
+    empty: "No phases.",
+    notice: `After the last phase the subscription ${schedule.end_behavior === "cancel" ? "CANCELS" : "continues on that phase's terms"}.`,
+    ...(opts.footerRef ? { footer: "Edit schedule", footerRef: opts.footerRef } : {}),
+  };
+}
+
+async function schedulePage(ctx: DashboardCtx, id: string, filters: Record<string, string>): Promise<SectionPage> {
+  const sub = await ctx.stripe.getSubscription(id).catch(() => null);
+  if (!sub) return notFound("This subscription does not exist.");
+  const scheduleId = typeof sub.schedule === "string" ? sub.schedule : sub.schedule?.id ?? null;
+  const [schedule, prices] = await Promise.all([
+    scheduleId
+      ? Promise.resolve()
+          .then(() => ctx.stripe.getSubscriptionSchedule(scheduleId))
+          .catch(() => null)
+      : Promise.resolve(null),
+    ctx.stripe.listRecurringPrices(50).catch(() => [] as Stripe.Price[]),
+  ]);
+  const allowlist = ctx.settings.allowedPriceIds();
+  const candidates = sortPrices(prices.filter((p) => allowlist.length === 0 || allowlist.includes(p.id)));
+
+  const phasesRaw = str(filters.phases, 1000);
+  const { phases, dropped } = parsePhaseTokens(phasesRaw);
+  const endBehavior = filters.end === "cancel" ? "cancel" : "release";
+  const qtyRaw = str(filters.qty, 3).trim();
+  const addQty = /^\d{1,3}$/.test(qtyRaw) && Number.parseInt(qtyRaw, 10) >= 1 ? Math.min(Number.parseInt(qtyRaw, 10), 999) : 1;
+  const durRaw = str(filters.dur, 4).trim();
+  const addDur = /^\d{1,2}[dwmy]$/.test(durRaw) ? durRaw : "1m";
+  const addTrial = filters.trial === "1";
+
+  const editable = sub.status === "active" || sub.status === "trialing";
+  const scheduleActive = schedule && (schedule.status === "active" || schedule.status === "not_started");
+
+  const baseFilters = (over: Record<string, string | null>): Record<string, string> => {
+    const merged: Record<string, string | null> = {
+      phases: phasesRaw || null,
+      end: endBehavior === "cancel" ? "cancel" : null,
+      qty: qtyRaw || null,
+      dur: durRaw || null,
+      trial: addTrial ? "1" : null,
+      ...over,
+    };
+    const f: Record<string, string> = {};
+    for (const [k, v] of Object.entries(merged)) if (v) f[k] = v;
+    return f;
+  };
+
+  const priceById = new Map(prices.map((p) => [p.id, p]));
+  const plan = planLabel(sub);
+
+  const blocks: Block[] = [
+    {
+      type: "header",
+      title: "Subscription schedule",
+      sub: plan.name,
+      badges: schedule ? [scheduleBadge(schedule.status)] : [],
+      actions: scheduleActive
+        ? [
+            registryButton(ctx, {
+              key: "subscription.schedule",
+              label: "Release schedule",
+              dangerous: true,
+              params: { subscriptionId: id, op: "release" },
+              summary: "Removes the schedule — the subscription continues on its CURRENT terms; future phases are discarded.",
+            }),
+            registryButton(ctx, {
+              key: "subscription.schedule",
+              label: "Cancel schedule",
+              style: "danger",
+              dangerous: true,
+              stepUp: true,
+              params: { subscriptionId: id, op: "cancel" },
+              summary: "Cancels the schedule AND the subscription IMMEDIATELY. This is a subscription cancellation. Requires a fresh factor.",
+            }),
+          ]
+        : [],
+    },
+  ];
+
+  if (!editable) {
+    blocks.push({
+      type: "notice",
+      badge: { kind: "warn", text: sentence(sub.status) },
+      text: "Only active or trialing subscriptions can be scheduled.",
+    });
+  }
+
+  // The live schedule (read-only) — composed phases below REPLACE its future.
+  if (schedule) {
+    blocks.push(schedulePhasesTable(ctx, schedule));
+    if (phases.length > 0) {
+      blocks.push({
+        type: "notice",
+        badge: { kind: "warn", text: "Replaces" },
+        text: "Confirming below REPLACES every scheduled future phase with the composed phases.",
+      });
+    }
+  } else {
+    // Locked current-terms card: future phases start at the current period end.
+    const item = sub.items.data[0];
+    blocks.push({
+      type: "kv",
+      title: "Current phase (locked)",
+      rows: [
+        { label: "Items", cell: text(sub.items.data.map((it) => `${planLabel(sub).name}${(it.quantity ?? 1) > 1 ? ` ×${it.quantity}` : ""}`).join(", ")) },
+        ...(item?.current_period_end
+          ? [{ label: "Current period ends", cell: dateCell(item.current_period_end) }]
+          : []),
+      ],
+      actions: [],
+    });
+  }
+
+  // Composed future phases.
+  blocks.push({
+    type: "table",
+    key: "composed",
+    title: "Composed future phases",
+    columns: [
+      { key: "phase", label: "Phase" },
+      { key: "price", label: "Price" },
+      { key: "qty", label: "Qty", align: "right" },
+      { key: "dur", label: "Duration" },
+      { key: "flags", label: "" },
+    ],
+    rows: phases.map((ph, i) => {
+      const price = priceById.get(ph.priceId);
+      const flags: Badge[] = [];
+      if (ph.trial) flags.push({ kind: "neutral", text: "Trial" });
+      if (ph.prorationNone) flags.push({ kind: "info", text: "No proration" });
+      const reordered = (swap: number) => {
+        const next = phases.map((x) => x.token);
+        [next[i], next[swap]] = [next[swap], next[i]];
+        return next.join(",");
+      };
+      return {
+        id: ph.token + i,
+        cells: [
+          strong(`Phase ${i + 1}`),
+          text(price?.nickname ?? ph.priceId, price?.unit_amount != null ? `${ctx.stripe.formatAmount(price.unit_amount * ph.quantity, price.currency)}/${price.recurring?.interval}` : undefined),
+          text(String(ph.quantity)),
+          text(`${ph.durationCount} ${ph.durationUnit}${ph.durationCount > 1 ? "s" : ""}`),
+          { t: "flags", badges: flags } as Cell,
+        ] as Cell[],
+        actions: [
+          ...(i > 0
+            ? [{ key: "nav:sched.up", label: "Up", ref: { page: "subscriptions.schedule", params: { id }, filters: baseFilters({ phases: reordered(i - 1) }) } }]
+            : []),
+          ...(i < phases.length - 1
+            ? [{ key: "nav:sched.down", label: "Down", ref: { page: "subscriptions.schedule", params: { id }, filters: baseFilters({ phases: reordered(i + 1) }) } }]
+            : []),
+          {
+            key: "nav:sched.remove",
+            label: "Remove",
+            ref: {
+              page: "subscriptions.schedule",
+              params: { id },
+              filters: baseFilters({ phases: phases.filter((x) => x !== ph).map((x) => x.token).join(",") || null }),
+            },
+          },
+        ],
+      };
+    }),
+    empty: "No composed phases yet — add prices from the picker below.",
+    ...(dropped ? { notice: `${dropped} invalid phase token(s) were dropped.` } : {}),
+  });
+
+  // Approximate timeline preview (Stripe computes the exact boundaries).
+  if (phases.length > 0) {
+    const item = sub.items.data[0];
+    let cursor = (schedule?.current_phase?.end_date ?? item?.current_period_end ?? Math.floor(Date.now() / 1000)) * 1000;
+    const timeline: Array<{ label: string; iso: string; text?: string; kind?: Badge["kind"] }> = [];
+    const UNIT_MS: Record<string, number> = { day: 86400_000, week: 7 * 86400_000, month: 30 * 86400_000, year: 365 * 86400_000 };
+    for (const [i, ph] of phases.entries()) {
+      const price = priceById.get(ph.priceId);
+      timeline.push({
+        label: `Phase ${i + 1} starts — ${price?.nickname ?? ph.priceId}${ph.trial ? " (trial)" : ""}`,
+        iso: new Date(cursor).toISOString(),
+        kind: "info",
+      });
+      cursor += ph.durationCount * UNIT_MS[ph.durationUnit];
+    }
+    timeline.push({
+      label: endBehavior === "cancel" ? "Subscription CANCELS" : "Continues on the last phase's terms",
+      iso: new Date(cursor).toISOString(),
+      kind: endBehavior === "cancel" ? "error" : "ok",
+    });
+    blocks.push({ type: "timeline", title: "Timeline (approximate)", items: timeline });
+  }
+
+  // Confirm card — params are the SERVER's parse of the tokens.
+  if (editable && phases.length > 0) {
+    blocks.push({
+      type: "kv",
+      title: "Confirm",
+      rows: [
+        { label: "Phases", cell: text(String(phases.length)) },
+        {
+          label: "After the last phase",
+          cell: text(endBehavior === "cancel" ? "Subscription CANCELS" : "Continues on the last phase's terms"),
+        },
+      ],
+      actions: [
+        registryButton(ctx, {
+          key: "subscription.schedule",
+          label: schedule ? "Replace scheduled phases" : "Create schedule",
+          style: "primary",
+          dangerous: true,
+          params: {
+            subscriptionId: id,
+            op: "set_phases",
+            endBehavior,
+            phases: phases.map((ph) => ({
+              priceId: ph.priceId,
+              quantity: ph.quantity,
+              durationCount: ph.durationCount,
+              durationUnit: ph.durationUnit,
+              ...(ph.trial ? { trial: true } : {}),
+              proration: ph.prorationNone ? "none" : "create_prorations",
+            })),
+          },
+          summary: `Applies ${phases.length} future phase(s) after the current one${
+            endBehavior === "cancel" ? ", then CANCELS the subscription" : ""
+          }. The current phase is preserved exactly as-is.`,
+        }),
+      ],
+    });
+  }
+
+  // Price picker (single-item phases: multi-item edits live in Update via
+  // subscription.items — a nested token grammar isn't legible in filter pills).
+  blocks.push({
+    type: "table",
+    key: "schedpicker",
+    title: "Add a phase",
+    columns: [
+      { key: "name", label: "Price" },
+      { key: "amount", label: "Amount", align: "right" },
+      { key: "interval", label: "Billing" },
+    ],
+    filters: [
+      { key: "qty", label: "Qty", kind: "text", value: qtyRaw || undefined, placeholder: "1" },
+      {
+        key: "dur",
+        label: "Duration",
+        kind: "select",
+        value: durRaw || undefined,
+        options: [
+          { value: "1m", label: "1 month" },
+          { value: "3m", label: "3 months" },
+          { value: "6m", label: "6 months" },
+          { value: "12m", label: "12 months" },
+          { value: "1y", label: "1 year" },
+        ],
+      },
+      {
+        key: "trial",
+        label: "Trial",
+        kind: "select",
+        value: addTrial ? "1" : undefined,
+        options: [{ value: "1", label: "Whole phase is a free trial" }],
+      },
+      {
+        key: "end",
+        label: "End behavior",
+        kind: "select",
+        value: endBehavior === "cancel" ? "cancel" : undefined,
+        options: [
+          { value: "", label: "Release — continue on last phase" },
+          { value: "cancel", label: "Cancel the subscription" },
+        ],
+      },
+    ],
+    rows: candidates.slice(0, 25).map((p) => ({
+      id: p.id,
+      cells: [
+        strong(p.nickname ?? p.id, p.id),
+        p.unit_amount != null ? money(ctx.stripe, p.unit_amount, p.currency) : text("—"),
+        text(p.recurring ? `every ${p.recurring.interval_count ?? 1} ${p.recurring.interval}` : "—"),
+      ] as Cell[],
+      actions:
+        phases.length >= SCHEDULE_MAX || !editable
+          ? []
+          : [
+              {
+                key: "nav:sched.add",
+                label: "Add phase",
+                ref: {
+                  page: "subscriptions.schedule",
+                  params: { id },
+                  filters: baseFilters({
+                    phases: [phasesRaw, `${p.id}*${addQty}*${addDur}${addTrial ? "*t" : ""}`].filter(Boolean).join(","),
+                  }),
+                },
+              },
+            ],
+    })),
+    empty: "No recurring prices available (check the plan allowlist).",
+    notice:
+      phases.length >= SCHEDULE_MAX
+        ? `Phase cap reached (${SCHEDULE_MAX}).`
+        : "One price per phase — multi-item changes live in Update subscription. Qty/Duration/Trial apply to the next Add.",
+  });
+
+  return {
+    title: "Subscription schedule",
+    crumbs: [
+      { label: "Subscriptions", ref: { page: "subscriptions" } },
+      { label: id, ref: { page: "subscriptions.detail", params: { id } } },
+      { label: "Schedule" },
+    ],
     blocks,
   };
 }

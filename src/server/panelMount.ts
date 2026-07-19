@@ -56,13 +56,17 @@ export interface PanelMountSpec {
   metricName: string; // auth-failure counter, tagged { where: page|csrf|api }
   logLabel: string; // e.g. "admin panel"
   jsonLimit?: string; // default "256kb"
+  // SPA path routing: ALSO serve the page shell for GET <pagePath>/<anything>
+  // (except <pagePath>/api/…) so copied deep links like /billing/customers/…
+  // load directly — the client router reads location.pathname on boot.
+  spaWildcard?: boolean;
   // Late-bound: CallbackServer receives route objects as optional constructor
   // args, so the getter re-reads per request (404 while absent).
   route: () => MountedPanelRoute | undefined;
 }
 
 export function mountPanel(app: Express, allowIp: (ip: string | undefined) => boolean, spec: PanelMountSpec): void {
-  app.get(spec.pagePath, async (req, res) => {
+  const pageHandler = async (req: express.Request, res: express.Response) => {
     const route = spec.route();
     if (!route) {
       res.status(404).send("Not found");
@@ -99,7 +103,19 @@ export function mountPanel(app: Express, allowIp: (ip: string | undefined) => bo
       httpLog.error(`${spec.logLabel} page failed`, e);
       res.status(500).send("Internal error");
     }
-  });
+  };
+  app.get(spec.pagePath, pageHandler);
+  if (spec.spaWildcard) {
+    // Express 5 wildcard syntax. The API prefix 404s here — its endpoints are
+    // POST-only and a GET must never answer with the HTML shell.
+    app.get(`${spec.pagePath}/*splat`, (req, res) => {
+      if (req.path.startsWith(`${spec.pagePath}/api/`)) {
+        res.status(404).send("Not found");
+        return;
+      }
+      void pageHandler(req, res);
+    });
+  }
 
   app.post(spec.apiPath, express.json({ limit: spec.jsonLimit ?? "256kb" }), async (req, res) => {
     const route = spec.route();

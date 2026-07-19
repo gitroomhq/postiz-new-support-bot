@@ -7,7 +7,7 @@ import { BillingQolStore } from "../../bot/billing/BillingQolStore";
 import type { BillingActionService } from "../../bot/billing/actions/BillingActionService";
 import type { DashboardActionGateway } from "../DashboardActions";
 import { DashboardActor } from "../DashboardAuth";
-import { ActionRequest, ActionResult, Block, Crumb, NavItem, ViewRequest } from "../renderer/contract";
+import { ActionRequest, ActionResult, AttentionItem, Block, Crumb, NavItem, PeekResponse, ViewRequest } from "../renderer/contract";
 
 // Per-request context handed to every dashboard section module. Deliberately
 // Discord-free: sections are thin adapters from the domain services (Stripe
@@ -66,6 +66,12 @@ export interface DashboardSectionModule {
   action?(ctx: DashboardCtx, req: ActionRequest): Promise<ActionResult>;
   // Live sidebar count for this module's nav badge (Approvals, Disputes).
   navBadge?(ctx: DashboardCtx): Promise<string | null>;
+  // Needs-attention items for the topbar bell — collected by the nav-badges
+  // endpoint on the same 60s poll (PA-13).
+  attention?(ctx: DashboardCtx): Promise<AttentionItem[]>;
+  // Hover peek card for one of this module's detail pages (PA-13). Cached
+  // 30s per Dashboard; page is allowlisted and id validated BEFORE this runs.
+  peek?(ctx: DashboardCtx, page: string, id: string): Promise<PeekResponse | null>;
 }
 
 // ---- shared param validators (hostile client) ----

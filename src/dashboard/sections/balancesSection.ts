@@ -1,6 +1,7 @@
 import type Stripe from "stripe";
 import { ActionButton, ActionResult, Badge, Block, Cell } from "../renderer/contract";
 import { DashboardCtx, DashboardSectionModule, SectionPage, validCursor, validId } from "./types";
+import { bookmarkButton, isBookmarkedSafe, toggleBookmarkAction } from "./bookmarks";
 import { amount, badgeCell, dateCell, idCell, money, sentence, text } from "./cells";
 
 // Balances: account balance buckets, the payout ledger (paginated) and recent
@@ -39,10 +40,66 @@ export function makeBalancesSection(): DashboardSectionModule {
     },
 
     async action(ctx: DashboardCtx, req): Promise<ActionResult> {
+      const confirmed = req.confirmWord === "CONFIRM";
+      // T1+T2 — payout schedule (PA-12; no payout id — it targets the account).
+      // ⚠ Own-account accounts.update may be Connect-only: attempt, and map
+      // Stripe's refusal to a friendly error (the read-only card stays right).
+      if (req.key === "section:balances.payout_schedule") {
+        if (!confirmed) return { ok: false, error: "Type CONFIRM to run this action." };
+        if (!ctx.security.stepUpFresh()) return { ok: false, needsStepUp: true };
+        const p = req.params ?? {};
+        const interval =
+          p.interval === "manual" || p.interval === "daily" || p.interval === "weekly" || p.interval === "monthly"
+            ? p.interval
+            : null;
+        if (!interval) return { ok: false, fieldErrors: { interval: "Pick an interval." } };
+        const WEEKDAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"];
+        const weeklyAnchor = typeof p.weeklyAnchor === "string" && WEEKDAYS.includes(p.weeklyAnchor) ? p.weeklyAnchor : undefined;
+        if (interval === "weekly" && !weeklyAnchor) {
+          return { ok: false, fieldErrors: { weeklyAnchor: "Weekly payouts need an anchor day." } };
+        }
+        const monthlyAnchor =
+          typeof p.monthlyAnchor === "number" && Number.isSafeInteger(p.monthlyAnchor) && p.monthlyAnchor >= 1 && p.monthlyAnchor <= 31
+            ? p.monthlyAnchor
+            : undefined;
+        if (interval === "monthly" && monthlyAnchor == null) {
+          return { ok: false, fieldErrors: { monthlyAnchor: "Monthly payouts need an anchor day (1–31)." } };
+        }
+        const delayDays =
+          typeof p.delayDays === "number" && Number.isSafeInteger(p.delayDays) && p.delayDays >= 2 && p.delayDays <= 30
+            ? p.delayDays
+            : undefined;
+        if (interval === "manual" && typeof p.delayDays === "number") {
+          return { ok: false, fieldErrors: { delayDays: "Delay days don't apply to manual payouts." } };
+        }
+        const before = await ctx.stripe.getAccount().catch(() => null);
+        const old = before?.settings?.payouts?.schedule;
+        try {
+          await ctx.stripe.updatePayoutSchedule({
+            interval,
+            ...(interval === "weekly" && weeklyAnchor ? { weeklyAnchor } : {}),
+            ...(interval === "monthly" && monthlyAnchor != null ? { monthlyAnchor } : {}),
+            ...(interval !== "manual" && delayDays != null ? { delayDays } : {}),
+          });
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : "Stripe refused the update.";
+          return {
+            ok: false,
+            error: `Stripe refused the schedule change (this API can be Connect-only): ${msg.slice(0, 250)}`,
+          };
+        }
+        await ctx.audit(
+          `Payout schedule changed ${old ? scheduleLabel(old) : "?"} → ${scheduleLabel({ interval, weekly_anchor: weeklyAnchor, monthly_anchor: monthlyAnchor, delay_days: delayDays ?? old?.delay_days ?? 0 })}`
+        );
+        return { ok: true, text: "Payout schedule updated." };
+      }
+
       const id = validId("payout", req.params?.id);
       if (!id) return { ok: false, error: "Bad payout id." };
-      const confirmed = req.confirmWord === "CONFIRM";
       switch (req.key) {
+        // T0 — shared team bookmark toggle.
+        case "section:balances.bookmark":
+          return toggleBookmarkAction(ctx, "payout", req.params ?? {});
         // T2 — cancel a PENDING payout; the funds return to the available balance.
         case "section:balances.payout_cancel": {
           if (!confirmed) return { ok: false, error: "Type CONFIRM to run this action." };
@@ -85,15 +142,67 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
   // table shows the latest window (one paginating table per page).
   const payoutCursor = validId("payout", validCursor(cursor) ?? "") ?? undefined;
 
-  const [balance, payoutsRes, txRes] = await Promise.all([
+  const [balance, payoutsRes, txRes, account] = await Promise.all([
     ctx.stripe.getBalance().catch(() => null),
     ctx.stripe.listPayouts({ limit: PAGE_SIZE, startingAfter: payoutCursor }),
     ctx.stripe
       .listAccountBalanceTransactions({ limit: PAGE_SIZE, ...(txType ? { type: txType } : {}) })
       .catch(() => ({ transactions: [] as Stripe.BalanceTransaction[], hasMore: false })),
+    ctx.stripe.getAccount().catch(() => null),
   ]);
+  const schedule = account?.settings?.payouts?.schedule ?? null;
 
   const blocks: Block[] = [];
+
+  // Explicit page header (PA-12): the payout-schedule editor lives here. The
+  // write may be Connect-only on some accounts — the action degrades to a
+  // friendly refusal, the card below stays correct either way.
+  blocks.push({
+    type: "header",
+    title: "Balances",
+    actions: [
+      {
+        key: "section:balances.payout_schedule",
+        label: "Edit payout schedule",
+        dangerous: true,
+        stepUp: true,
+        inputs: [
+          {
+            type: "select",
+            key: "interval",
+            label: "Interval",
+            value: schedule?.interval ?? "daily",
+            options: [
+              { value: "daily", label: "Daily" },
+              { value: "weekly", label: "Weekly" },
+              { value: "monthly", label: "Monthly" },
+              { value: "manual", label: "Manual (API-only payouts)" },
+            ],
+          },
+          {
+            type: "select",
+            key: "weeklyAnchor",
+            label: "Weekly anchor (weekly only)",
+            ...(schedule?.weekly_anchor ? { value: schedule.weekly_anchor } : {}),
+            options: [
+              { value: "", label: "—" },
+              { value: "monday", label: "Monday" },
+              { value: "tuesday", label: "Tuesday" },
+              { value: "wednesday", label: "Wednesday" },
+              { value: "thursday", label: "Thursday" },
+              { value: "friday", label: "Friday" },
+              { value: "saturday", label: "Saturday" },
+              { value: "sunday", label: "Sunday" },
+            ],
+          },
+          { type: "number", key: "monthlyAnchor", label: "Monthly anchor day 1–31 (monthly only)", min: 1, max: 31 },
+          { type: "number", key: "delayDays", label: "Delay days 2–30 (empty = keep current)", min: 2, max: 30 },
+        ],
+        summary:
+          "Changes when Stripe pays your balance out to the bank. Manual stops automatic payouts entirely. Requires a fresh factor.",
+      },
+    ],
+  });
 
   const buckets = (rows: Array<{ amount: number; currency: string }> | undefined) =>
     (rows ?? []).map((b) => ctx.stripe.formatAmount(b.amount, b.currency)).join(" + ") || "—";
@@ -107,6 +216,25 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
         : []),
     ],
   });
+
+  // Read-only schedule card — always renders when the account read worked,
+  // even if the write path is unavailable for this account type.
+  if (schedule) {
+    blocks.push({
+      type: "kv",
+      title: "Payout schedule",
+      rows: [
+        { label: "Interval", cell: text(sentence(schedule.interval)) },
+        ...(schedule.interval === "weekly" && schedule.weekly_anchor
+          ? [{ label: "Anchor", cell: text(sentence(schedule.weekly_anchor)) }]
+          : []),
+        ...(schedule.interval === "monthly" && schedule.monthly_anchor != null
+          ? [{ label: "Anchor", cell: text(`Day ${schedule.monthly_anchor}`) }]
+          : []),
+        { label: "Delay", cell: text(`${schedule.delay_days} day${schedule.delay_days === 1 ? "" : "s"}`) },
+      ],
+    });
+  }
 
   blocks.push({
     type: "table",
@@ -176,9 +304,12 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
 async function payoutDetail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
   const payout = await ctx.stripe.getPayout(id).catch(() => null);
   if (!payout) return notFound("This payout does not exist.");
-  const txRes = await ctx.stripe
-    .listAccountBalanceTransactions({ limit: 50, payoutId: id })
-    .catch(() => ({ transactions: [] as Stripe.BalanceTransaction[], hasMore: false }));
+  const [txRes, bookmarked] = await Promise.all([
+    ctx.stripe
+      .listAccountBalanceTransactions({ limit: 50, payoutId: id })
+      .catch(() => ({ transactions: [] as Stripe.BalanceTransaction[], hasMore: false })),
+    isBookmarkedSafe(ctx, "payout", id),
+  ]);
 
   // Status-aware writes: cancel while pending (T2), reverse once paid (T3).
   const reversedBy = typeof payout.reversed_by === "string" ? payout.reversed_by : payout.reversed_by?.id ?? null;
@@ -206,6 +337,9 @@ async function payoutDetail(ctx: DashboardCtx, id: string): Promise<SectionPage>
         "Debits the destination bank account to pull this payout back (US/CA bank accounts only). Requires the Discord reverse code.",
     });
   }
+  actions.push(
+    bookmarkButton("section:balances.bookmark", bookmarked, payout.id, ctx.stripe.formatAmount(payout.amount, payout.currency))
+  );
 
   const main: Block[] = [
     {
@@ -277,6 +411,12 @@ async function payoutDetail(ctx: DashboardCtx, id: string): Promise<SectionPage>
     blocks: main,
     rail,
   };
+}
+
+// "daily (delay 2d)" / "weekly@monday (delay 7d)" — the audit old→new label.
+function scheduleLabel(s: { interval: string; weekly_anchor?: string | null; monthly_anchor?: number | null; delay_days: number | string }): string {
+  const anchor = s.interval === "weekly" && s.weekly_anchor ? `@${s.weekly_anchor}` : s.interval === "monthly" && s.monthly_anchor != null ? `@day${s.monthly_anchor}` : "";
+  return `${s.interval}${anchor} (delay ${s.delay_days}d)`;
 }
 
 export function payoutBadge(status: string): Badge {

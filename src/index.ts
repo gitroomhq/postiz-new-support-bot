@@ -81,6 +81,9 @@ import { makeBlocklistSection } from "./dashboard/sections/blocklistSection";
 import { makeFraudSection } from "./dashboard/sections/fraudSection";
 import { makeLinksSection } from "./dashboard/sections/linksSection";
 import { makeQuotesSection } from "./dashboard/sections/quotesSection";
+import { makeEventsSection } from "./dashboard/sections/eventsSection";
+import { makeWebhooksSection } from "./dashboard/sections/webhooksSection";
+import { makeReportsSection } from "./dashboard/sections/reportsSection";
 import { makeMetersSection } from "./dashboard/sections/metersSection";
 import { makePortalSection } from "./dashboard/sections/portalSection";
 import { makeBookmarksSection } from "./dashboard/sections/bookmarksSection";
@@ -560,6 +563,9 @@ async function main() {
     makeFraudSection({ hunts: fraudHuntService }),
     makePortalSection(),
     makeMetersSection(),
+    makeEventsSection(),
+    makeWebhooksSection(),
+    makeReportsSection(),
     makeBookmarksSection(),
     makeSecuritySection({ credentials: dashboardCredentials, sessions: dashboardDbSessions, audit: dashboardAudit }),
   ];

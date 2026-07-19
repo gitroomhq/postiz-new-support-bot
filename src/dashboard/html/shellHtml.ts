@@ -4,6 +4,7 @@ import { clientCore } from "./clientCore";
 import { clientBlocks } from "./clientBlocks";
 import { clientModal } from "./clientModal";
 import { clientPalette } from "./clientPalette";
+import { clientPeek } from "./clientPeek";
 import { clientCharts } from "./clientCharts";
 import { clientEvidence } from "./clientEvidence";
 import { clientLogin } from "./clientLogin";
@@ -88,8 +89,10 @@ ${dashboardCss()}
   </aside>
   <div class="mainwrap">
     <header class="topbar">
+      <button class="btn sm" id="menubtn" type="button" aria-label="Menu" aria-expanded="false">☰</button>
       <span class="jumpwrap"><input type="text" id="jump" placeholder="Search — name, email, amount, last4 or Stripe id (Ctrl+K)" autocomplete="off"><div id="palpop" class="palpop"></div></span>
       <span class="who" id="who"></span>
+      <span class="morewrap bellwrap"><button class="btn sm" id="bellbtn" type="button" title="Needs attention" aria-label="Needs attention"></button><div id="bellpop" class="morepop"></div></span>
       <span class="morewrap createwrap"><button class="btn sm primary" id="createbtn" type="button">+ Create</button><div id="createmenu" class="morepop"></div></span>
       <button class="btn sm" id="themebtn" type="button" title="Color theme — click to switch">Auto</button>
       <button class="btn sm" id="logout" type="button">End session</button>
@@ -100,7 +103,24 @@ ${dashboardCss()}
       <div id="content"><p class="note">Loading…</p></div>
     </main>
   </div>
+  <div id="scrim"></div>
 </div>
+<dialog id="helpmodal">
+  <h2>Keyboard shortcuts</h2>
+  <table class="helptable">
+    <tr><td><kbd>Ctrl</kbd>+<kbd>K</kbd></td><td>Search</td></tr>
+    <tr><td><kbd>g</kbd> then <kbd>h</kbd></td><td>Home</td></tr>
+    <tr><td><kbd>g</kbd> then <kbd>p</kbd></td><td>Payments</td></tr>
+    <tr><td><kbd>g</kbd> then <kbd>c</kbd></td><td>Customers</td></tr>
+    <tr><td><kbd>g</kbd> then <kbd>b</kbd></td><td>Balances</td></tr>
+    <tr><td><kbd>g</kbd> then <kbd>i</kbd></td><td>Invoices</td></tr>
+    <tr><td><kbd>g</kbd> then <kbd>d</kbd></td><td>Disputes</td></tr>
+    <tr><td><kbd>?</kbd></td><td>This help</td></tr>
+  </table>
+  <div class="drow">
+    <button class="btn" id="helpClose" type="button">Close</button>
+  </div>
+</dialog>
 <dialog id="modal">
   <h2 id="modalTitle"></h2>
   <div class="summary" id="modalSummary"></div>
@@ -139,11 +159,12 @@ ${clientCore}
 ${clientBlocks}
 ${clientModal}
 ${clientPalette}
+${clientPeek}
 ${clientCharts}
 ${clientEvidence}
 ${clientLogin}
 D.defaultPage = "home";
-document.getElementById("expiredReload").addEventListener("click", function () { location.hash = ""; location.reload(); });
+document.getElementById("expiredReload").addEventListener("click", function () { location.reload(); });
 ${clientApp}
 })();
 </script>

@@ -7,7 +7,7 @@ import { DashboardAuthProvider, DashboardAuthResult } from "../DashboardAuth";
 import { Dashboard } from "../Dashboard";
 import { DashboardActionGateway } from "../DashboardActions";
 import { DashboardCtx, DashboardSectionModule } from "../sections/types";
-import { chargeBadge, estimateMrr, formatPerCurrency, sentence } from "../sections/cells";
+import { chargeBadge, estimateMrr, formatPerCurrency, refForId, sentence } from "../sections/cells";
 import { makeCustomersSection } from "../sections/customersSection";
 import { makePaymentsSection, buildGuardrailPanel } from "../sections/paymentsSection";
 import { makeHomeSection } from "../sections/homeSection";
@@ -40,6 +40,7 @@ import { clientCore } from "../html/clientCore";
 import { clientBlocks } from "../html/clientBlocks";
 import { clientModal } from "../html/clientModal";
 import { clientPalette } from "../html/clientPalette";
+import { clientPeek } from "../html/clientPeek";
 import { clientCharts } from "../html/clientCharts";
 import { clientEvidence } from "../html/clientEvidence";
 import { clientLogin } from "../html/clientLogin";
@@ -392,6 +393,9 @@ function fakeCustomerCtx(): DashboardCtx {
       { id: "pm_1", type: "card", card: { brand: "visa", last4: "4242", exp_month: 7, exp_year: 2027 } },
     ],
     listCreditGrants: async () => [],
+    listTaxIds: async () => [],
+    listBalanceTransactions: async () => ({ data: [] }),
+    getCashBalance: async () => null,
     listCharges: async () => ({
       charges: [
         {
@@ -431,9 +435,11 @@ test("customer 360: Insights/Details/Linked accounts in the rail, atoms in the m
   const section = makeCustomersSection();
   const page = await section.buildPage(fakeCustomerCtx(), { page: "customers.detail", params: { id: "cus_test1" } });
   assert.ok(page);
-  // PA-8: Insights/Details/Linked + Manage (edit is inline now, no edit page).
-  assert.ok(page!.rail && page!.rail.length === 4, "expected a 4-card rail");
-  const manage = page!.rail![3] as KeyValueBlock;
+  // PA-8/PA-10 rail: Insights/Details/Tax IDs/Addresses/Linked + Manage.
+  const railCard = (title: string) =>
+    page!.rail!.find((b) => b.type === "kv" && (b as KeyValueBlock).title?.startsWith(title)) as KeyValueBlock;
+  assert.ok(page!.rail && page!.rail.length === 6, "expected a 6-card rail");
+  const manage = railCard("Manage");
   assert.equal(manage.title, "Manage");
   // Act-from-customer entries carry the customer into the composers.
   assert.deepEqual((manage.rows[0].cell as { ref?: unknown }).ref, { page: "subscriptions.new", filters: { customer: "cus_test1" } });
@@ -448,7 +454,8 @@ test("customer 360: Insights/Details/Linked accounts in the rail, atoms in the m
     "section:customers.delete",
   ]);
   assert.equal(manage.actions![0].stepUp, true);
-  const [insights, details, linked] = page!.rail as KeyValueBlock[];
+  const [insights, details] = page!.rail as KeyValueBlock[];
+  const linked = railCard("Linked accounts");
   assert.equal(insights.title, "Insights");
   assert.equal(insights.big, true);
   // Spent = 2900 - 500 refunded; MRR from the active monthly sub; Refunds = 500.
@@ -543,7 +550,7 @@ function gatewayFixture(overrides: { discordIds?: string[]; chargeRefunded?: num
       amount_refunded: overrides.chargeRefunded ?? 0,
       currency: "eur",
     }),
-    getPaymentIntent: async (id: string) => ({ id, customer: "cus_pi" }),
+    getPaymentIntent: async (id: string) => ({ id, customer: "cus_pi", currency: "eur" }),
     getSubscription: async (id: string) => ({ id, customer: "cus_sub" }),
     getInvoice: async (id: string) => ({ id, customer: "cus_inv" }),
   } as unknown as StripeClient;
@@ -1069,8 +1076,20 @@ function searchFixture(overrides: { customersThrow?: boolean } = {}) {
       { id: "ch_1", amount: 2900, currency: "eur", billing_details: { email: "ada@x.com" } },
     ],
     searchInvoicesByNumber: async () => [{ id: "in_1", number: "INV-0001", total: 2900, currency: "eur", status: "paid" }],
-    searchChargesByCardLast4: async () => ({
-      charges: [{ id: "ch_44", amount: 100, currency: "eur", billing_details: {} }],
+    searchChargesByCardLast4: async (_l4: string, _brand?: string, _limit?: number, _page?: string, status?: string) => ({
+      charges:
+        status === "failed"
+          ? [
+              {
+                id: "ch_45",
+                amount: 100,
+                currency: "eur",
+                payment_intent: "pi_fail",
+                outcome: { seller_message: "Card declined." },
+                billing_details: {},
+              },
+            ]
+          : [{ id: "ch_44", amount: 100, currency: "eur", billing_details: {} }],
       nextPage: null,
     }),
     searchPaymentIntentsByAmount: async () => ({
@@ -1093,9 +1112,15 @@ test("global search: id fast-path, last4/amount classification, discord link, fa
   const byId = await search.run("ch_3Tuchi");
   assert.equal(byId.groups.length, 1);
   assert.deepEqual(byId.groups[0].hits[0].ref, { page: "payments.detail", params: { id: "ch_3Tuchi" } });
-  // Four digits → last4 hunt group.
+  // Four digits → last4 hunt group + a failed-only group whose hits carry the
+  // PaymentIntent id and decline reason.
   const last4 = await search.run("4242");
-  assert.ok(last4.groups.some((g) => g.label.includes("····4242")));
+  assert.ok(last4.groups.some((g) => g.label === "Payments · card ····4242"));
+  const failedGroup = last4.groups.find((g) => g.label === "Failed payments · card ····4242")!;
+  assert.ok(failedGroup);
+  assert.equal(failedGroup.hits[0].id, "pi_fail");
+  assert.equal(failedGroup.hits[0].sub, "Card declined.");
+  assert.deepEqual(failedGroup.hits[0].ref, { page: "payments.detail", params: { id: "pi_fail" } });
   // Amount-like → PI amount group.
   const amt = await search.run("29.00");
   assert.ok(amt.groups.some((g) => g.label.includes("amount 29.00")));
@@ -1195,6 +1220,10 @@ test("balances: buckets, paginated payouts, latest transactions with source link
       { id: "txn_1", amount: 2900, currency: "eur", fee: 119, net: 2781, type: "charge", available_on: 1_700_000_000, source: "ch_1" },
     ],
     hasMore: false,
+  });
+  (ctx.stripe as { getAccount?: unknown }).getAccount = async () => ({
+    id: "acct_1",
+    settings: { payouts: { schedule: { interval: "daily", delay_days: 2 } } },
   });
   const page = await makeBalancesSection().buildPage(ctx, { page: "balances", filters: {} });
   const payouts = page!.blocks.find((b) => b.type === "table" && b.key === "payouts") as TableBlock;
@@ -1508,7 +1537,7 @@ test("invoices list: count-cards + draft builder header action; detail: status-g
   const open = await section.buildPage(invoiceCtx("open"), { page: "invoices.detail", params: { id: "in_1" } });
   const openHeader = open!.blocks[0] as HeaderBlock;
   const labels = openHeader.actions!.map((a) => a.label);
-  assert.deepEqual(labels, ["Send invoice", "Collect payment now", "Void", "Mark uncollectible", "Credit note"]);
+  assert.deepEqual(labels, ["Send invoice", "Collect payment now", "Void", "Mark uncollectible", "Credit note", "Bookmark"]);
   assert.equal(openHeader.actions!.find((a) => a.label === "Collect payment now")!.stepUp, true);
   // Hosted URL renders as an external copy-field.
   const links = open!.blocks.find((b) => b.type === "kv" && b.title === "Links") as KeyValueBlock;
@@ -1527,7 +1556,7 @@ test("invoices list: count-cards + draft builder header action; detail: status-g
 
   // DRAFT invoice: finalize + delete only.
   const draft = await section.buildPage(invoiceCtx("draft"), { page: "invoices.detail", params: { id: "in_1" } });
-  assert.deepEqual((draft!.blocks[0] as HeaderBlock).actions!.map((a) => a.key), ["invoice.finalize", "invoice.void"]);
+  assert.deepEqual((draft!.blocks[0] as HeaderBlock).actions!.map((a) => a.key), ["invoice.finalize", "invoice.void", "section:invoices.bookmark"]);
 });
 
 test("invoice detail (PA-3): Billing details block + Recent activity timeline", async () => {
@@ -2449,6 +2478,7 @@ test("dashboard AI actions: per-dispute lock blocks concurrent runs; review verd
 
 test("FraudHuntService: input validation is hard; fingerprint aggregates per customer w/ Discord links; amount hunt keeps declined PIs", async () => {
   const { FraudHuntService } = await import("../../bot/billing/FraudHuntService");
+  const last4Statuses: Array<string | undefined> = [];
   const stripe = {
     searchChargesByCardFingerprint: async () => ({
       charges: [
@@ -2458,21 +2488,38 @@ test("FraudHuntService: input validation is hard; fingerprint aggregates per cus
       ],
       nextPage: "np",
     }),
-    searchChargesByCardLast4: async () => ({
-      charges: [
-        {
-          customer: "cus_a",
-          billing_details: { email: "a@x.com" },
-          payment_method_details: { card: { brand: "visa", last4: "4242", exp_month: 4, exp_year: 2027, fingerprint: "fpA" } },
-        },
-        {
-          customer: "cus_b",
-          billing_details: {},
-          payment_method_details: { card: { brand: "visa", last4: "4242", exp_month: 4, exp_year: 2027, fingerprint: "fpA" } },
-        },
-      ],
-      nextPage: null,
-    }),
+    searchChargesByCardLast4: async (_l4: string, _brand?: string, _limit?: number, _page?: string, status?: string) => {
+      last4Statuses.push(status);
+      const failedCharge = {
+        id: "ch_fail",
+        status: "failed",
+        created: 99,
+        payment_intent: "pi_fail",
+        outcome: { seller_message: "Your card was declined." },
+        customer: "cus_a",
+        billing_details: {},
+        payment_method_details: { card: { brand: "visa", last4: "4242", exp_month: 4, exp_year: 2027, fingerprint: "fpA" } },
+      };
+      return {
+        charges:
+          status === "failed"
+            ? [failedCharge]
+            : [
+                {
+                  customer: "cus_a",
+                  billing_details: { email: "a@x.com" },
+                  payment_method_details: { card: { brand: "visa", last4: "4242", exp_month: 4, exp_year: 2027, fingerprint: "fpA" } },
+                },
+                {
+                  customer: "cus_b",
+                  billing_details: {},
+                  payment_method_details: { card: { brand: "visa", last4: "4242", exp_month: 4, exp_year: 2027, fingerprint: "fpA" } },
+                },
+                failedCharge,
+              ],
+        nextPage: null,
+      };
+    },
     searchPaymentIntentsByAmount: async (amountMinor: number, currency?: string) => ({
       paymentIntents: [
         {
@@ -2504,6 +2551,7 @@ test("FraudHuntService: input validation is hard; fingerprint aggregates per cus
   assert.equal((await hunts.usersByFingerprint("bad fp!")).ok, false);
   assert.equal((await hunts.cardsByLast4("12a4")).ok, false);
   assert.equal((await hunts.cardsByLast4("4242", "vi$a")).ok, false);
+  assert.equal((await hunts.cardsByLast4("4242", undefined, "declined")).ok, false);
   assert.equal((await hunts.paymentsByAmount("25,39")).ok, false);
   assert.equal((await hunts.paymentsByAmount("25.39", "euro")).ok, false);
 
@@ -2523,7 +2571,26 @@ test("FraudHuntService: input validation is hard; fingerprint aggregates per cus
     assert.equal(l4.rows.length, 1);
     assert.equal(l4.rows[0].fingerprint, "fpA");
     assert.deepEqual(l4.rows[0].customers.map((c) => c.id), ["cus_a", "cus_b"]);
+    // Failed charges are counted per group and the freshest one is kept with
+    // its PaymentIntent + decline reason.
+    assert.equal(l4.rows[0].count, 3);
+    assert.equal(l4.rows[0].failed, 1);
+    assert.deepEqual(l4.rows[0].lastFailure, {
+      chargeId: "ch_fail",
+      piId: "pi_fail",
+      reason: "Your card was declined.",
+      created: 99,
+    });
   }
+
+  // The status filter reaches the Stripe query (undefined when blank).
+  const l4Failed = await hunts.cardsByLast4("4242", undefined, "failed");
+  assert.ok(l4Failed.ok);
+  if (l4Failed.ok) {
+    assert.equal(l4Failed.rows[0].count, 1);
+    assert.equal(l4Failed.rows[0].failed, 1);
+  }
+  assert.deepEqual(last4Statuses, [undefined, "failed"]);
 
   const amt = await hunts.paymentsByAmount("25.39", "eur");
   assert.ok(amt.ok);
@@ -2836,7 +2903,7 @@ test("bookmarks board: rows deep-link by object type and Remove toggles off", as
 });
 
 test("client JS modules parse and the shell embeds them nonced", () => {
-  const combined = `${clientCore}\n${clientBlocks}\n${clientModal}\n${clientPalette}\n${clientCharts}\n${clientEvidence}\n${clientLogin}\nD.defaultPage="home";\n${clientApp}`;
+  const combined = `${clientCore}\n${clientBlocks}\n${clientModal}\n${clientPalette}\n${clientPeek}\n${clientCharts}\n${clientEvidence}\n${clientLogin}\nD.defaultPage="home";\n${clientApp}`;
   assert.doesNotThrow(() => new Function(combined));
 
   const html = renderDashboardShell({ nonce: "test-nonce-123" });
@@ -2846,6 +2913,12 @@ test("client JS modules parse and the shell embeds them nonced", () => {
   assert.ok(html.includes('id="login"'));
   assert.ok(html.includes('id="stepup"'));
   assert.ok(html.includes('id="modal"'));
+  // PA-13 chrome: bell, hamburger + scrim, help dialog, peek module.
+  assert.ok(html.includes('id="bellbtn"'));
+  assert.ok(html.includes('id="menubtn"'));
+  assert.ok(html.includes('id="scrim"'));
+  assert.ok(html.includes('id="helpmodal"'));
+  assert.ok(html.includes("D.peekTarget"));
   // No unresolved template interpolations leaked into the page.
   assert.ok(!html.includes("${"));
 });
@@ -3352,7 +3425,8 @@ test("payout detail (PA-5): pending → T2 Cancel; paid → T3 Reverse; reversed
   assert.equal(reverse.dangerous, true);
   const reversed = await makeBalancesSection().buildPage(payoutWriteCtx({ ...base, status: "paid", reversed_by: "po_rev" }).ctx, { page: "balances.detail", params: { id: "po_1" } });
   const reversedHeader = reversed!.blocks[0] as HeaderBlock;
-  assert.equal(reversedHeader.actions!.length, 0);
+  // Only the (always-present) Bookmark action remains — no money actions.
+  assert.deepEqual(reversedHeader.actions!.map((a) => a.key), ["section:balances.bookmark"]);
   assert.ok(reversedHeader.badges!.some((b) => b.text === "Reversed"));
   const details = reversed!.rail![0] as KeyValueBlock;
   assert.ok(details.rows.some((r) => r.label === "Reversed by"));
@@ -3916,16 +3990,16 @@ test("quotes (PA-7b): list w/ status counts + customer links; detail actions are
   // Detail (draft): Finalize + Cancel, no Accept.
   const draft = await section.buildPage(ctx, { page: "quotes.detail", params: { id: "qt_draft" } });
   const draftHeader = draft!.blocks.find((b) => b.type === "header") as HeaderBlock;
-  assert.deepEqual(draftHeader.actions!.map((a) => a.key), ["section:quotes.finalize", "section:quotes.cancel"]);
-  // Detail (open): Accept requires step-up, Cancel still offered.
+  assert.deepEqual(draftHeader.actions!.map((a) => a.key), ["section:quotes.finalize", "section:quotes.cancel", "section:quotes.bookmark"]);
+  // Detail (open): PDF download offered; Accept requires step-up, Cancel still offered.
   const open = await section.buildPage(ctx, { page: "quotes.detail", params: { id: "qt_open" } });
   const openHeader = open!.blocks.find((b) => b.type === "header") as HeaderBlock;
-  assert.deepEqual(openHeader.actions!.map((a) => a.key), ["section:quotes.accept", "section:quotes.cancel"]);
-  assert.equal(openHeader.actions![0].stepUp, true);
-  // Detail (accepted): no lifecycle actions; rail links the minted subscription + invoice.
+  assert.deepEqual(openHeader.actions!.map((a) => a.key), ["section:quotes.pdf", "section:quotes.accept", "section:quotes.cancel", "section:quotes.bookmark"]);
+  assert.equal(openHeader.actions![1].stepUp, true);
+  // Detail (accepted): no lifecycle actions (PDF only); rail links the minted subscription + invoice.
   const done = await section.buildPage(ctx, { page: "quotes.detail", params: { id: "qt_done" } });
   const doneHeader = done!.blocks.find((b) => b.type === "header") as HeaderBlock;
-  assert.equal(doneHeader.actions!.length, 0);
+  assert.deepEqual(doneHeader.actions!.map((a) => a.key), ["section:quotes.pdf", "section:quotes.bookmark"]);
   const doneRail = done!.rail!.find((b) => b.type === "kv") as KeyValueBlock;
   const railLabels = doneRail.rows.map((r) => r.label);
   assert.ok(railLabels.includes("Subscription"));
@@ -4125,25 +4199,788 @@ test("meters (PA-7b): list w/ toggle; detail summaries REQUIRE a customer scope 
   assert.deepEqual(created[0], { displayName: "API requests", eventName: "api_requests", formula: "sum" });
 });
 
+// ---- PA-9: money-op gaps ----
+
+test("payment_intent.capture (PA-9): revalidation matrix + idem key; gateway binds via the PI and folds amountMajor", async () => {
+  const def = actionByKey("payment_intent.capture")!;
+  assert.equal(def.dangerous, true);
+  assert.equal(def.parseParams({}).ok, false);
+  assert.equal(def.parseParams({ paymentIntentId: "pi_1", amountMinor: -5 }).ok, false);
+  const full = def.parseParams({ paymentIntentId: "pi_1" });
+  assert.ok(full.ok);
+  const partial = def.parseParams({ paymentIntentId: "pi_1", amountMinor: 500 });
+  assert.ok(partial.ok);
+
+  const captures: Array<[string, number | undefined, string | undefined]> = [];
+  const ctx = (status: string, owner: string, capturable = 2900) =>
+    ({
+      stripe: {
+        getPaymentIntent: async () => ({ id: "pi_1", customer: owner, status, amount: 2900, amount_capturable: capturable, currency: "eur" }),
+        capturePaymentIntent: async (id: string, amt?: number, idem?: string) => {
+          captures.push([id, amt, idem]);
+          return { id, amount: 2900, amount_received: amt ?? 2900, currency: "eur" };
+        },
+        formatAmount: (a: number, c: string) => `${(a / 100).toFixed(2)} ${c.toUpperCase()}`,
+      },
+      stripeCustomerId: "cus_1",
+      idemScope: "scope1",
+    }) as unknown as ActionExecCtx;
+  const p = (partial as { params: unknown }).params as Record<string, unknown>;
+  assert.match((await def.revalidate(ctx("requires_capture", "cus_OTHER"), p)) ?? "", /does not belong/);
+  assert.match((await def.revalidate(ctx("succeeded", "cus_1"), p)) ?? "", /only requires_capture/);
+  assert.match((await def.revalidate(ctx("requires_capture", "cus_1", 400), p)) ?? "", /capturable remainder/);
+  assert.equal(await def.revalidate(ctx("requires_capture", "cus_1"), p), null);
+  const done = await def.execute(ctx("requires_capture", "cus_1"), p);
+  assert.equal(done.ok, true);
+  assert.equal(captures[0][0], "pi_1");
+  assert.equal(captures[0][1], 500);
+  assert.ok(captures[0][2]!.startsWith("panel-picapture-pi_1-"));
+
+  // Gateway: binds from the PI's customer and folds major→minor via pi.currency.
+  const { gateway } = gatewayFixture();
+  const resolved = await gateway.resolve("payment_intent.capture", { paymentIntentId: "pi_1", amountMajor: 5 });
+  assert.ok(resolved.ok);
+  const rp = (resolved as { params: Record<string, unknown>; binding: { stripeCustomerId: string } });
+  assert.equal(rp.params.amountMinor, 500);
+  assert.ok(!("amountMajor" in rp.params));
+  assert.equal(rp.binding.stripeCustomerId, "cus_pi");
+});
+
+test("api belts (PA-9): capture is unconditional T2; endTrialNow is param-aware T2; coupon remove is param-aware T1", async () => {
+  const fake = fakeSettings();
+  const gatewayCalls: string[] = [];
+  const provider: DashboardAuthProvider = {
+    enter: async () => ({ kind: "page" }),
+    authenticate: async () => fakeAuthResult("active"),
+    publicEndpoint: async () => null,
+    sessionEndpoint: async () => null,
+  };
+  const dashboard = new Dashboard(fake.store, provider, [fakeSection()], {
+    stripe: { isTestMode: () => true } as unknown as StripeClient,
+    settings: fake.store,
+    stores: {} as never,
+    billing: {
+      actions: {} as never,
+      gateway: { request: async (_a: unknown, key: string) => { gatewayCalls.push(key); return { kind: "executed", text: "ok" }; } } as never,
+    },
+  });
+  // Capture: CONFIRM given, factor stale → needsStepUp (belt before the gateway).
+  const cap = await dashboard.api("action", "c", {
+    key: "payment_intent.capture",
+    params: { paymentIntentId: "pi_1" },
+    confirmWord: "CONFIRM",
+  });
+  assert.equal((cap.json as { needsStepUp?: boolean }).needsStepUp, true);
+  // Terms WITHOUT endTrialNow: no step-up (T1 only) → reaches the gateway.
+  const terms = await dashboard.api("action", "c", {
+    key: "subscription.terms",
+    params: { subscriptionId: "sub_1", quantity: 2 },
+    confirmWord: "CONFIRM",
+  });
+  assert.deepEqual(terms.json, { ok: true, text: "ok" });
+  // Terms WITH endTrialNow: T2.
+  const trialNow = await dashboard.api("action", "c", {
+    key: "subscription.terms",
+    params: { subscriptionId: "sub_1", endTrialNow: true },
+    confirmWord: "CONFIRM",
+  });
+  assert.equal((trialNow.json as { needsStepUp?: boolean }).needsStepUp, true);
+  // Coupon apply: T0 — no CONFIRM needed.
+  const apply = await dashboard.api("action", "c", {
+    key: "customer.coupon",
+    params: { subscriptionId: "sub_1", promoCode: "X" },
+  });
+  assert.deepEqual(apply.json, { ok: true, text: "ok" });
+  // Coupon remove: T1 param-aware — refused without CONFIRM.
+  const removeNoConfirm = await dashboard.api("action", "c", {
+    key: "customer.coupon",
+    params: { subscriptionId: "sub_1", op: "remove" },
+  });
+  assert.match((removeNoConfirm.json as { error?: string }).error ?? "", /CONFIRM/);
+  assert.deepEqual(gatewayCalls, ["subscription.terms", "customer.coupon"]);
+});
+
+test("customer.coupon op:remove (PA-9): revalidates discount presence; gateway binds customer-level removes via customerId", async () => {
+  const def = actionByKey("customer.coupon")!;
+  // Legacy apply payload (no op) still parses — Intercom canvas compatibility.
+  const legacy = def.parseParams({ subscriptionId: "sub_1", promoCode: "X" });
+  assert.ok(legacy.ok);
+  assert.equal((legacy as { params: { op: string } }).params.op, "apply");
+  assert.equal(def.parseParams({ op: "remove" }).ok, false); // needs exactly one target
+  assert.equal(def.parseParams({ op: "remove", subscriptionId: "sub_1", customerId: "cus_1" }).ok, false);
+  const subRemove = (def.parseParams({ op: "remove", subscriptionId: "sub_1" }) as { params: unknown }).params;
+  const cusRemove = (def.parseParams({ op: "remove", customerId: "cus_1" }) as { params: unknown }).params;
+  const removed: string[] = [];
+  const mkCtx = (discounts: unknown[], customerDiscount: unknown) =>
+    ({
+      stripe: {
+        getSubscription: async () => ({ id: "sub_1", customer: "cus_1", status: "active", discounts }),
+        getCustomer: async () => ({ id: "cus_1", discount: customerDiscount }),
+        removeSubscriptionDiscount: async (id: string) => removed.push(`sub:${id}`),
+        removeCustomerDiscount: async (id: string) => removed.push(`cus:${id}`),
+      },
+      stripeCustomerId: "cus_1",
+      idemScope: "s",
+    }) as unknown as ActionExecCtx;
+  assert.match((await def.revalidate(mkCtx([], null), subRemove)) ?? "", /No discount on this subscription/);
+  assert.equal(await def.revalidate(mkCtx(["di_1"], null), subRemove), null);
+  assert.match((await def.revalidate(mkCtx([], null), cusRemove)) ?? "", /No customer-level discount/);
+  assert.equal(await def.revalidate(mkCtx([], { id: "di_2" }), cusRemove), null);
+  await def.execute(mkCtx(["di_1"], null), subRemove);
+  await def.execute(mkCtx([], { id: "di_2" }), cusRemove);
+  assert.deepEqual(removed, ["sub:sub_1", "cus:cus_1"]);
+  // Gateway: customer-level remove binds via the explicit customerId.
+  const { gateway } = gatewayFixture();
+  const resolved = await gateway.resolve("customer.coupon", { op: "remove", customerId: "cus_x1" });
+  assert.ok(resolved.ok);
+  assert.equal((resolved as { binding: { stripeCustomerId: string } }).binding.stripeCustomerId, "cus_x1");
+});
+
+test("subscription.terms endTrialNow (PA-9): trialing-only revalidation, executes trial_end 'now'", async () => {
+  const def = actionByKey("subscription.terms")!;
+  assert.equal(def.parseParams({ subscriptionId: "sub_1", endTrialNow: true, trialEndUnix: 999999999999 }).ok, false);
+  const parsed = (def.parseParams({ subscriptionId: "sub_1", endTrialNow: true }) as { params: unknown }).params;
+  const trialCalls: Array<[string, unknown]> = [];
+  const mkCtx = (status: string) =>
+    ({
+      stripe: {
+        getSubscription: async () => ({ id: "sub_1", customer: "cus_1", status, items: { data: [{ id: "si_1" }] } }),
+        setTrialEnd: async (id: string, end: unknown) => trialCalls.push([id, end]),
+      },
+      stripeCustomerId: "cus_1",
+      idemScope: "s",
+    }) as unknown as ActionExecCtx;
+  assert.match((await def.revalidate(mkCtx("active"), parsed)) ?? "", /no trial to end/);
+  assert.equal(await def.revalidate(mkCtx("trialing"), parsed), null);
+  const done = await def.execute(mkCtx("trialing"), parsed);
+  assert.equal(done.ok, true);
+  assert.deepEqual(trialCalls, [["sub_1", "now"]]);
+});
+
+test("charge detail (PA-9): uncaptured auth renders Capture/Capture-partial/Cancel-authorization; captured renders refunds instead", async () => {
+  const section = makePaymentsSection();
+  const ctx = paymentsCtx();
+  (ctx.stripe as unknown as Record<string, unknown>).getChargeDetailed = async () => ({
+    id: "ch_1",
+    status: "succeeded",
+    captured: false,
+    refunded: false,
+    disputed: false,
+    amount: 2900,
+    amount_refunded: 0,
+    currency: "eur",
+    created: 1_700_000_000,
+    customer: "cus_a",
+    payment_intent: "pi_9",
+    billing_details: { email: "a@x.com" },
+    payment_method_details: { type: "card", card: { brand: "visa", last4: "4242" } },
+  });
+  const page = await section.buildPage(ctx, { page: "payments.detail", params: { id: "ch_1" } });
+  const header = page!.blocks[0] as HeaderBlock;
+  const labels = header.actions!.map((a) => a.label);
+  assert.ok(labels.includes("Capture"));
+  assert.ok(labels.includes("Capture partial"));
+  assert.ok(labels.includes("Cancel authorization"));
+  assert.ok(!labels.some((l) => l.startsWith("Refund")));
+  const capture = header.actions!.find((a) => a.label === "Capture")!;
+  assert.equal(capture.stepUp, true);
+  assert.deepEqual(capture.params, { paymentIntentId: "pi_9" });
+  // Captured charge (default fixture): refunds render, capture does not.
+  const captured = await section.buildPage(paymentsCtx(), { page: "payments.detail", params: { id: "ch_1" } });
+  const capturedLabels = (captured!.blocks[0] as HeaderBlock).actions!.map((a) => a.label);
+  assert.ok(!capturedLabels.includes("Capture"));
+  assert.ok(capturedLabels.some((l) => l.startsWith("Refund") || l === "Partial refund"));
+});
+
+test("draft invoice editor (PA-9): draft-only + one-off-only gates, foreign-line refusal, T1 remove, details/date validation", async () => {
+  const section = makeInvoicesSection();
+  const created: Array<Record<string, unknown>> = [];
+  const updatedItems: Array<[string, Record<string, unknown>]> = [];
+  const deletedItems: string[] = [];
+  const detailUpdates: Array<Record<string, unknown>> = [];
+  const mkCtx = (invoiceOver: Record<string, unknown> = {}) =>
+    ({
+      actor: { id: "42", name: "Ada", role: "admin", isAdmin: true },
+      billing: { actions: { effectiveMode: () => "direct" } },
+      stripe: {
+        formatAmount: (a: number, c: string) => `${(a / 100).toFixed(2)} ${c.toUpperCase()}`,
+        getInvoice: async () => ({ id: "in_1", status: "draft", currency: "eur", customer: "cus_1", parent: null, ...invoiceOver }),
+        getPrice: async () => ({ id: "price_1", nickname: "Pro", unit_amount: 2900, currency: "eur", product: "prod_1" }),
+        createInvoiceItem: async (p: Record<string, unknown>) => created.push(p),
+        getInvoiceItem: async (id: string) =>
+          id === "ii_mine"
+            ? { id, invoice: "in_1", amount: 2900, quantity: 1, pricing: null }
+            : { id, invoice: "in_OTHER", amount: 100, quantity: 1, pricing: null },
+        updateInvoiceItem: async (id: string, p: Record<string, unknown>) => updatedItems.push([id, p]),
+        deleteInvoiceItem: async (id: string) => deletedItems.push(id),
+        updateInvoiceDetails: async (_id: string, p: Record<string, unknown>) => detailUpdates.push(p),
+      },
+      audit: async () => {},
+    }) as unknown as DashboardCtx;
+
+  // Non-draft and subscription-cycle drafts are refused for every key.
+  const open = await section.action!(mkCtx({ status: "open" }), { key: "section:invoices.line_add_custom", params: { invoiceId: "in_1" } });
+  assert.match(open.error ?? "", /only drafts/);
+  const cycle = await section.action!(mkCtx({ parent: { subscription_details: { subscription: "sub_1" } } }), {
+    key: "section:invoices.line_add_custom",
+    params: { invoiceId: "in_1" },
+  });
+  assert.match(cycle.error ?? "", /subscription cycle/);
+
+  // Price line add flattens price × qty into an amount.
+  const ctx = mkCtx();
+  const added = await section.action!(ctx, {
+    key: "section:invoices.line_add",
+    params: { invoiceId: "in_1", price: "price_1", quantity: 3 },
+  });
+  assert.equal(added.ok, true);
+  assert.equal(created[0].amountMinor, 8700);
+  assert.equal(created[0].description, "Pro ×3");
+
+  // Foreign line refused for edit AND remove; remove demands CONFIRM.
+  const foreignEdit = await section.action!(ctx, {
+    key: "section:invoices.line_edit",
+    params: { invoiceId: "in_1", itemId: "ii_foreign", amountMajor: 5 },
+  });
+  assert.match(foreignEdit.error ?? "", /does not belong/);
+  const noConfirm = await section.action!(ctx, { key: "section:invoices.line_remove", params: { invoiceId: "in_1", itemId: "ii_mine" } });
+  assert.match(noConfirm.error ?? "", /CONFIRM/);
+  const removed = await section.action!(ctx, {
+    key: "section:invoices.line_remove",
+    params: { invoiceId: "in_1", itemId: "ii_mine" },
+    confirmWord: "CONFIRM",
+  });
+  assert.equal(removed.ok, true);
+  assert.deepEqual(deletedItems, ["ii_mine"]);
+
+  // Amount-based line refuses qty edits; amount edit folds major→minor.
+  const qtyOnAmount = await section.action!(ctx, {
+    key: "section:invoices.line_edit",
+    params: { invoiceId: "in_1", itemId: "ii_mine", quantity: 2 },
+  });
+  assert.equal(qtyOnAmount.ok, false);
+  const amountEdit = await section.action!(ctx, {
+    key: "section:invoices.line_edit",
+    params: { invoiceId: "in_1", itemId: "ii_mine", amountMajor: 12.5 },
+  });
+  assert.equal(amountEdit.ok, true);
+  assert.deepEqual(updatedItems[0], ["ii_mine", { amountMinor: 1250 }]);
+
+  // Details: past due date refused; memo '-' clears.
+  const pastDue = await section.action!(ctx, {
+    key: "section:invoices.details_edit",
+    params: { invoiceId: "in_1", dueDate: "2020-01-01" },
+  });
+  assert.equal(pastDue.ok, false);
+  const cleared = await section.action!(ctx, { key: "section:invoices.details_edit", params: { invoiceId: "in_1", memo: "-" } });
+  assert.equal(cleared.ok, true);
+  assert.deepEqual(detailUpdates[0], { memo: null });
+
+  // Detail page: editable drafts render the invoiceItems table with row actions.
+  (ctx.stripe as unknown as Record<string, unknown>).listCreditNotes = async () => [];
+  (ctx.stripe as unknown as Record<string, unknown>).listInvoiceItems = async () => [
+    { id: "ii_mine", amount: 2900, quantity: 1, currency: "eur", description: "Pro", pricing: null },
+  ];
+  (ctx.stripe as unknown as Record<string, unknown>).listAllActivePrices = async () => [
+    { id: "price_1", nickname: "Pro", unit_amount: 2900, currency: "eur" },
+  ];
+  (ctx.stripe as unknown as Record<string, unknown>).getInvoice = async () => ({
+    id: "in_1",
+    status: "draft",
+    currency: "eur",
+    customer: "cus_1",
+    parent: null,
+    total: 2900,
+    amount_paid: 0,
+    amount_due: 2900,
+    subtotal: 2900,
+    created: 1_700_000_000,
+    lines: { data: [] },
+  });
+  (ctx as unknown as { billing: unknown }).billing = { actions: { effectiveMode: () => "direct" } };
+  const page = await section.buildPage(ctx, { page: "invoices.detail", params: { id: "in_1" } });
+  const linesTable = page!.blocks.find((b) => b.type === "table" && (b as TableBlock).key === "lines") as TableBlock;
+  assert.ok(linesTable.title!.includes("editable"));
+  assert.deepEqual(linesTable.rows[0].actions!.map((a) => a.label), ["Edit", "Remove"]);
+  const headerLabels = (page!.blocks[0] as HeaderBlock).actions!.map((a) => a.label);
+  for (const l of ["Add line", "Add custom line", "Edit details", "Metadata", "Finalize"]) {
+    assert.ok(headerLabels.includes(l), `missing ${l}`);
+  }
+});
+
+test("payments section actions (PA-9): top-up belts + Stripe error surfacing; instant payout preflights instant_available", async () => {
+  const section = makePaymentsSection();
+  const base = paymentsCtx();
+  // Top-up: CONFIRM first, then a fresh factor.
+  const noConfirm = await section.action!(base, {
+    key: "section:payments.topup_create",
+    params: { amountMajor: 100, currency: "eur" },
+  });
+  assert.match(noConfirm.error ?? "", /CONFIRM/);
+  const staleCtx = paymentsCtx();
+  (staleCtx as unknown as { security: Record<string, unknown> }).security = {
+    sessionIdHash: "h",
+    authMethod: "passkey",
+    stepUpFresh: () => false,
+  };
+  const stale = await section.action!(staleCtx, {
+    key: "section:payments.topup_create",
+    params: { amountMajor: 100, currency: "eur" },
+    confirmWord: "CONFIRM",
+  });
+  assert.equal(stale.needsStepUp, true);
+  const fresh = paymentsCtx();
+  (fresh as unknown as { security: Record<string, unknown> }).security = { sessionIdHash: "h", authMethod: "passkey", stepUpFresh: () => true };
+  (fresh.stripe as unknown as Record<string, unknown>).createTopUp = async () => {
+    throw new Error("Top-ups to this account are not allowed (no verified bank).");
+  };
+  const refused = await section.action!(fresh, {
+    key: "section:payments.topup_create",
+    params: { amountMajor: 100, currency: "eur" },
+    confirmWord: "CONFIRM",
+  });
+  assert.match(refused.error ?? "", /no verified bank/);
+  const okTopup = paymentsCtx();
+  (okTopup as unknown as { security: Record<string, unknown> }).security = { sessionIdHash: "h", authMethod: "passkey", stepUpFresh: () => true };
+  const topups: Array<Record<string, unknown>> = [];
+  (okTopup.stripe as unknown as Record<string, unknown>).createTopUp = async (p: Record<string, unknown>) => {
+    topups.push(p);
+    return { id: "tu_1", status: "pending" };
+  };
+  const made = await section.action!(okTopup, {
+    key: "section:payments.topup_create",
+    params: { amountMajor: 100, currency: "eur", statementDescriptor: "POSTIZ TOPUP" },
+    confirmWord: "CONFIRM",
+  });
+  assert.equal(made.ok, true);
+  assert.equal(topups[0].amountMinor, 10000);
+
+  // Instant payout: missing instant_available bucket → friendly refusal.
+  const instant = paymentsCtx();
+  (instant as unknown as { security: Record<string, unknown> }).security = { sessionIdHash: "h", authMethod: "passkey", stepUpFresh: () => true };
+  const noBucket = await section.action!(instant, {
+    key: "section:payments.payout_create",
+    params: { amountMajor: 10, currency: "eur", method: "instant" },
+    confirmWord: "CONFIRM",
+  });
+  assert.match(noBucket.error ?? "", /Instant/);
+  (instant.stripe as unknown as Record<string, unknown>).getBalance = async () => ({
+    available: [{ amount: 50000, currency: "eur" }],
+    pending: [],
+    instant_available: [{ amount: 20000, currency: "eur" }],
+  });
+  const payouts: Array<Record<string, unknown>> = [];
+  (instant.stripe as unknown as Record<string, unknown>).createPayout = async (p: Record<string, unknown>) => {
+    payouts.push(p);
+    return { id: "po_9", arrival_date: 1_700_900_000 };
+  };
+  const instantOk = await section.action!(instant, {
+    key: "section:payments.payout_create",
+    params: { amountMajor: 10, currency: "eur", method: "instant" },
+    confirmWord: "CONFIRM",
+  });
+  assert.equal(instantOk.ok, true);
+  assert.equal(payouts[0].method, "instant");
+});
+
+// ---- PA-10: customer depth ----
+
+test("customer 360 (PA-10): tax IDs + addresses rail cards, balance history, cash balance in Insights", async () => {
+  const section = makeCustomersSection();
+  const ctx = fakeCustomerCtx();
+  (ctx.stripe as unknown as Record<string, unknown>).listTaxIds = async () => [
+    { id: "txi_1", type: "eu_vat", value: "DE123456789", verification: { status: "verified" } },
+    { id: "txi_2", type: "gb_vat", value: "GB999999973", verification: null },
+  ];
+  (ctx.stripe as unknown as Record<string, unknown>).listBalanceTransactions = async () => ({
+    data: [
+      { id: "cbtxn_1", amount: -1000, currency: "eur", created: 1_700_000_000, description: "Support credit", ending_balance: -1000, type: "adjustment" },
+    ],
+  });
+  (ctx.stripe as unknown as Record<string, unknown>).getCashBalance = async () => ({ available: { eur: 5000 } });
+  const page = await section.buildPage(ctx, { page: "customers.detail", params: { id: "cus_test1" } });
+  const card = (title: string) =>
+    page!.rail!.find((b) => b.type === "kv" && (b as KeyValueBlock).title?.startsWith(title)) as KeyValueBlock;
+
+  const taxCard = card("Tax IDs");
+  assert.equal(taxCard.rows.length, 2);
+  assert.deepEqual(taxCard.rows[0].cell, { t: "text", v: "DE123456789", sub: "Verified" });
+  const removeAction = taxCard.actions!.find((a) => a.key === "section:customers.tax_id_remove")!;
+  const removeOptions = (removeAction.inputs![0] as { options: Array<{ value: string }> }).options;
+  assert.deepEqual(removeOptions.map((o) => o.value), ["txi_1", "txi_2"]);
+
+  const addrCard = card("Addresses");
+  assert.deepEqual(addrCard.actions!.map((a) => a.key), ["section:customers.address_billing", "section:customers.address_shipping"]);
+
+  const history = page!.blocks.find((b) => b.type === "table" && (b as TableBlock).key === "balancehistory") as TableBlock;
+  assert.equal(history.rows.length, 1);
+
+  const insights = page!.rail![0] as KeyValueBlock;
+  const cashRow = insights.rows.find((r) => r.label === "Cash balance");
+  assert.ok(cashRow);
+  assert.equal((cashRow!.cell as { v: string }).v, "50.00 EUR");
+
+  // Without any of it: no history table, no cash row, tax card shows "none".
+  const bare = await section.buildPage(fakeCustomerCtx(), { page: "customers.detail", params: { id: "cus_test1" } });
+  assert.ok(!bare!.blocks.some((b) => b.type === "table" && (b as TableBlock).key === "balancehistory"));
+  assert.ok(!(bare!.rail![0] as KeyValueBlock).rows.some((r) => r.label === "Cash balance"));
+});
+
+test("customer tax-id + address actions (PA-10): curated-type spoof refused, live re-list on remove, address parse matrix", async () => {
+  const section = makeCustomersSection();
+  const added: Array<[string, string]> = [];
+  const removed: string[] = [];
+  const updates: Array<Record<string, unknown>> = [];
+  const ctx = {
+    actor: { id: "42", name: "Ada", role: "admin", isAdmin: true },
+    stripe: {
+      addTaxId: async (_c: string, type: string, value: string) => {
+        added.push([type, value]);
+        return { id: "txi_new" };
+      },
+      listTaxIds: async () => [{ id: "txi_mine", type: "eu_vat", value: "DE1" }],
+      removeTaxId: async (_c: string, id: string) => {
+        removed.push(id);
+      },
+      updateCustomer: async (_c: string, p: Record<string, unknown>) => updates.push(p),
+    },
+    audit: async () => {},
+  } as unknown as DashboardCtx;
+
+  // Tax add: CONFIRM, curated type only, Stripe error → fieldErrors.value.
+  const noConfirm = await section.action!(ctx, {
+    key: "section:customers.tax_id_add",
+    params: { customerId: "cus_1", type: "eu_vat", value: "DE123" },
+  });
+  assert.match(noConfirm.error ?? "", /CONFIRM/);
+  const spoof = await section.action!(ctx, {
+    key: "section:customers.tax_id_add",
+    params: { customerId: "cus_1", type: "xx_evil", value: "DE123" },
+    confirmWord: "CONFIRM",
+  });
+  assert.equal(spoof.ok, false);
+  assert.equal(added.length, 0);
+  const okAdd = await section.action!(ctx, {
+    key: "section:customers.tax_id_add",
+    params: { customerId: "cus_1", type: "eu_vat", value: "DE123456789" },
+    confirmWord: "CONFIRM",
+  });
+  assert.equal(okAdd.ok, true);
+  assert.deepEqual(added, [["eu_vat", "DE123456789"]]);
+  (ctx.stripe as unknown as Record<string, unknown>).addTaxId = async () => {
+    throw new Error("Invalid value for eu_vat.");
+  };
+  const stripeErr = await section.action!(ctx, {
+    key: "section:customers.tax_id_add",
+    params: { customerId: "cus_1", type: "eu_vat", value: "BADVALUE" },
+    confirmWord: "CONFIRM",
+  });
+  assert.match(stripeErr.fieldErrors?.value ?? "", /Invalid value/);
+
+  // Tax remove: foreign id refused via the live re-list.
+  const foreign = await section.action!(ctx, {
+    key: "section:customers.tax_id_remove",
+    params: { customerId: "cus_1", taxIdId: "txi_other" },
+    confirmWord: "CONFIRM",
+  });
+  assert.equal(foreign.ok, false);
+  const okRemove = await section.action!(ctx, {
+    key: "section:customers.tax_id_remove",
+    params: { customerId: "cus_1", taxIdId: "txi_mine" },
+    confirmWord: "CONFIRM",
+  });
+  assert.equal(okRemove.ok, true);
+  assert.deepEqual(removed, ["txi_mine"]);
+
+  // Addresses: parse matrix.
+  const billing = await section.action!(ctx, {
+    key: "section:customers.address_billing",
+    params: { customerId: "cus_1", address: "1 Main St | | Berlin | | 10115 | de" },
+  });
+  assert.equal(billing.ok, true);
+  assert.deepEqual(updates[0], { address: { line1: "1 Main St", city: "Berlin", postal_code: "10115", country: "DE" } });
+  const cleared = await section.action!(ctx, {
+    key: "section:customers.address_billing",
+    params: { customerId: "cus_1", address: "-" },
+  });
+  assert.equal(cleared.ok, true);
+  assert.deepEqual(updates[1], { address: "" });
+  const noCountry = await section.action!(ctx, {
+    key: "section:customers.address_billing",
+    params: { customerId: "cus_1", address: "1 Main St | | Berlin" },
+  });
+  assert.equal(noCountry.ok, false);
+  const noName = await section.action!(ctx, {
+    key: "section:customers.address_shipping",
+    params: { customerId: "cus_1", address: "| 1 Main St | | Berlin | | 10115 | de" },
+  });
+  assert.equal(noName.ok, false);
+  const shipping = await section.action!(ctx, {
+    key: "section:customers.address_shipping",
+    params: { customerId: "cus_1", address: "Ada Lovelace | 1 Main St | | Berlin | | 10115 | de" },
+  });
+  assert.equal(shipping.ok, true);
+  assert.deepEqual(updates[2], {
+    shipping: { name: "Ada Lovelace", address: { line1: "1 Main St", city: "Berlin", postal_code: "10115", country: "DE" } },
+  });
+});
+
+// ---- PA-11: subscription schedules ----
+
+test("rebuildCurrentPhase (PA-11): preserves trial_end + coupon discounts, flags unsupported settings", async () => {
+  const { rebuildCurrentPhase } = await import("../../bot/StripeClient");
+  const base = {
+    phases: [
+      {
+        items: [{ price: "price_a", quantity: 2, discounts: [] }],
+        start_date: 100,
+        end_date: 200,
+        trial_end: 150,
+        discounts: [{ coupon: "co_1" }, { coupon: { id: "co_2" } }],
+        default_payment_method: null,
+      },
+    ],
+  } as unknown as Stripe.SubscriptionSchedule;
+  const ok = rebuildCurrentPhase(base);
+  assert.deepEqual(ok.unsupported, []);
+  assert.deepEqual(ok.phase, {
+    items: [{ price: "price_a", quantity: 2 }],
+    start_date: 100,
+    end_date: 200,
+    trial_end: 150,
+    discounts: [{ coupon: "co_1" }, { coupon: "co_2" }],
+  });
+  const bad = rebuildCurrentPhase({
+    phases: [
+      {
+        items: [{ price: "price_a", quantity: 1, discounts: [{ coupon: "co_x" }] }],
+        start_date: 100,
+        end_date: 200,
+        trial_end: null,
+        discounts: [{ coupon: null }],
+        default_payment_method: "pm_1",
+      },
+    ],
+  } as unknown as Stripe.SubscriptionSchedule);
+  assert.equal(bad.unsupported.length, 3);
+});
+
+test("registry subscription.schedule (PA-11): parse/revalidate matrix; set_phases rebuilds phase 0 and maps durations; cancel is T2", async () => {
+  const def = actionByKey("subscription.schedule")!;
+  assert.equal(def.dangerous, true);
+  assert.equal(def.parseParams({ subscriptionId: "sub_1", op: "set_phases", phases: [] }).ok, false);
+  assert.equal(
+    def.parseParams({ subscriptionId: "sub_1", op: "set_phases", phases: [{ priceId: "price_a", quantity: 1, durationCount: 99, durationUnit: "month" }] }).ok,
+    false
+  );
+  const parsed = def.parseParams({
+    subscriptionId: "sub_1",
+    op: "set_phases",
+    endBehavior: "cancel",
+    phases: [
+      { priceId: "price_a", quantity: 1, durationCount: 3, durationUnit: "month", trial: true },
+      { priceId: "price_b", quantity: 2, durationCount: 1, durationUnit: "year", proration: "none" },
+    ],
+  });
+  assert.ok(parsed.ok);
+  const p = (parsed as { params: unknown }).params as Record<string, unknown>;
+
+  const scheduleUpdates: Array<Record<string, unknown>> = [];
+  const created: string[] = [];
+  const mkCtx = (over: { subStatus?: string; schedule?: string | null; schedStatus?: string; priceRecurring?: boolean; allow?: string[] } = {}) =>
+    ({
+      stripe: {
+        getSubscription: async () => ({ id: "sub_1", customer: "cus_1", status: over.subStatus ?? "active", schedule: over.schedule ?? null }),
+        getSubscriptionSchedule: async () => ({
+          id: "sched_1",
+          status: over.schedStatus ?? "active",
+          phases: [
+            { items: [{ price: "price_old", quantity: 1, discounts: [] }], start_date: 100, end_date: 200, trial_end: null, discounts: [], default_payment_method: null },
+          ],
+        }),
+        getPrice: async (id: string) => ({ id, active: true, recurring: over.priceRecurring === false ? null : { interval: "month" } }),
+        createScheduleFromSubscription: async (subId: string) => {
+          created.push(subId);
+          return { id: "sched_new" };
+        },
+        updateSchedulePhases: async (schedId: string, params: Record<string, unknown>) => {
+          scheduleUpdates.push({ schedId, ...params });
+          return { id: schedId };
+        },
+        releaseSchedule: async (schedId: string, idem: string) => {
+          scheduleUpdates.push({ released: schedId, idem });
+          return { id: schedId };
+        },
+        cancelSchedule: async (schedId: string, idem: string) => {
+          scheduleUpdates.push({ canceled: schedId, idem });
+          return { id: schedId };
+        },
+      },
+      settingsStore: { allowedPriceIds: () => over.allow ?? [] },
+      stripeCustomerId: "cus_1",
+      idemScope: "s1",
+    }) as unknown as ActionExecCtx;
+
+  assert.match((await def.revalidate(mkCtx({ subStatus: "canceled" }), p)) ?? "", /Subscription is canceled/);
+  assert.match((await def.revalidate(mkCtx({ priceRecurring: false }), p)) ?? "", /not recurring/);
+  assert.match((await def.revalidate(mkCtx({ allow: ["price_other"] }), p)) ?? "", /allowlist/);
+  assert.match((await def.revalidate(mkCtx({ schedule: "sched_1", schedStatus: "released" }), p)) ?? "", /release/);
+  assert.equal(await def.revalidate(mkCtx(), p), null);
+
+  // Execute without a schedule: create → rebuild phase 0 → append mapped futures.
+  const done = await def.execute(mkCtx(), p);
+  assert.equal(done.ok, true);
+  assert.deepEqual(created, ["sub_1"]);
+  const update = scheduleUpdates[0] as { phases: Array<Record<string, unknown>>; endBehavior: string };
+  assert.equal(update.endBehavior, "cancel");
+  assert.equal(update.phases.length, 3);
+  assert.deepEqual(update.phases[0], { items: [{ price: "price_old", quantity: 1 }], start_date: 100, end_date: 200 });
+  assert.deepEqual(update.phases[1], {
+    items: [{ price: "price_a", quantity: 1 }],
+    duration: { interval: "month", interval_count: 3 },
+    trial: true,
+    proration_behavior: "create_prorations",
+  });
+  assert.deepEqual(update.phases[2], {
+    items: [{ price: "price_b", quantity: 2 }],
+    duration: { interval: "year", interval_count: 1 },
+    proration_behavior: "none",
+  });
+
+  // Release / cancel need an attached schedule; cancel revalidation matrix.
+  const relParsed = (def.parseParams({ subscriptionId: "sub_1", op: "release" }) as { params: unknown }).params;
+  assert.match((await def.revalidate(mkCtx(), relParsed)) ?? "", /No schedule/);
+  assert.equal(await def.revalidate(mkCtx({ schedule: "sched_1" }), relParsed), null);
+  await def.execute(mkCtx({ schedule: "sched_1" }), relParsed);
+  assert.ok((scheduleUpdates.at(-1) as { released?: string }).released === "sched_1");
+
+  // Dashboard belts: op cancel = T2, set_phases = T1 only.
+  const fake = fakeSettings();
+  const provider: DashboardAuthProvider = {
+    enter: async () => ({ kind: "page" }),
+    authenticate: async () => fakeAuthResult("active"),
+    publicEndpoint: async () => null,
+    sessionEndpoint: async () => null,
+  };
+  const gatewayCalls: string[] = [];
+  const dashboard = new Dashboard(fake.store, provider, [fakeSection()], {
+    stripe: { isTestMode: () => true } as unknown as StripeClient,
+    settings: fake.store,
+    stores: {} as never,
+    billing: {
+      actions: {} as never,
+      gateway: { request: async (_a: unknown, key: string) => { gatewayCalls.push(key); return { kind: "executed", text: "ok" }; } } as never,
+    },
+  });
+  const cancel = await dashboard.api("action", "c", {
+    key: "subscription.schedule",
+    params: { subscriptionId: "sub_1", op: "cancel" },
+    confirmWord: "CONFIRM",
+  });
+  assert.equal((cancel.json as { needsStepUp?: boolean }).needsStepUp, true);
+  const setPhases = await dashboard.api("action", "c", {
+    key: "subscription.schedule",
+    params: { subscriptionId: "sub_1", op: "set_phases", phases: [{ priceId: "price_a", quantity: 1, durationCount: 1, durationUnit: "month" }] },
+    confirmWord: "CONFIRM",
+  });
+  assert.deepEqual(setPhases.json, { ok: true, text: "ok" });
+  assert.deepEqual(gatewayCalls, ["subscription.schedule"]);
+});
+
+test("schedule editor page (PA-11): token grammar, add/remove refs, baked server-parsed confirm, live-schedule panel + detail wiring", async () => {
+  const section = makeSubscriptionsSection();
+
+  // No schedule: locked current-phase card, picker adds tokens.
+  const empty = await section.buildPage(subsCtx(), { page: "subscriptions.schedule", params: { id: "sub_1" }, filters: {} });
+  assert.ok(empty!.blocks.some((b) => b.type === "kv" && (b as KeyValueBlock).title === "Current phase (locked)"));
+  const picker = empty!.blocks.find((b) => b.type === "table" && (b as TableBlock).key === "schedpicker") as TableBlock;
+  const addRef = picker.rows[0].actions![0].ref!;
+  assert.equal(addRef.filters!.phases, "price_old*1*1m");
+
+  // Composed tokens render, reorder/remove refs rewrite the token list, and
+  // the confirm bakes the SERVER-parsed phases.
+  const composed = await section.buildPage(subsCtx(), {
+    page: "subscriptions.schedule",
+    params: { id: "sub_1" },
+    filters: { phases: "price_old*1*3m*t,price_new*2*1y*pn,garbage", end: "cancel" },
+  });
+  const table = composed!.blocks.find((b) => b.type === "table" && (b as TableBlock).key === "composed") as TableBlock;
+  assert.equal(table.rows.length, 2);
+  assert.ok(table.notice!.includes("1 invalid"));
+  const downRef = table.rows[0].actions!.find((a) => a.label === "Down")!.ref!;
+  assert.equal(downRef.filters!.phases, "price_new*2*1y*pn,price_old*1*3m*t");
+  const removeRef = table.rows[1].actions!.find((a) => a.label === "Remove")!.ref!;
+  assert.equal(removeRef.filters!.phases, "price_old*1*3m*t");
+  const confirm = composed!.blocks.find((b) => b.type === "kv" && (b as KeyValueBlock).title === "Confirm") as KeyValueBlock;
+  assert.deepEqual(confirm.actions![0].params, {
+    subscriptionId: "sub_1",
+    op: "set_phases",
+    endBehavior: "cancel",
+    phases: [
+      { priceId: "price_old", quantity: 1, durationCount: 3, durationUnit: "month", trial: true, proration: "create_prorations" },
+      { priceId: "price_new", quantity: 2, durationCount: 1, durationUnit: "year", proration: "none" },
+    ],
+  });
+  assert.ok(composed!.blocks.some((b) => b.type === "timeline"));
+
+  // With a live schedule: read-only phases panel + Release/Cancel header
+  // actions (cancel = stepUp); the sub DETAIL gains the panel + edit link.
+  const schedCtx = subsCtx();
+  const liveSchedule = {
+    id: "sched_1",
+    status: "active",
+    end_behavior: "release",
+    current_phase: { start_date: 100, end_date: 200 },
+    phases: [
+      { items: [{ price: "price_old", quantity: 1 }], start_date: 100, end_date: 200, trial_end: null, discounts: [] },
+      { items: [{ price: "price_new", quantity: 1 }], start_date: 200, end_date: 300, trial_end: null, discounts: [] },
+    ],
+  };
+  (schedCtx.stripe as unknown as Record<string, unknown>).getSubscription = async () => ({
+    ...(await (subsCtx().stripe as unknown as { getSubscription: () => Promise<Record<string, unknown>> }).getSubscription()),
+    schedule: "sched_1",
+  });
+  (schedCtx.stripe as unknown as Record<string, unknown>).getSubscriptionSchedule = async () => liveSchedule;
+  const withSched = await section.buildPage(schedCtx, { page: "subscriptions.schedule", params: { id: "sub_1" }, filters: {} });
+  const header = withSched!.blocks[0] as HeaderBlock;
+  assert.deepEqual(header.actions!.map((a) => a.label), ["Release schedule", "Cancel schedule"]);
+  assert.equal(header.actions![1].stepUp, true);
+  const panel = withSched!.blocks.find((b) => b.type === "table" && (b as TableBlock).key === "schedulephases") as TableBlock;
+  assert.equal(panel.rows.length, 2);
+  assert.deepEqual((panel.rows[0].cells[4] as { badges: Array<{ text: string }> }).badges.map((b) => b.text), ["Current"]);
+
+  const detail = await section.buildPage(schedCtx, { page: "subscriptions.detail", params: { id: "sub_1" } });
+  const detailPanel = detail!.blocks.find((b) => b.type === "table" && (b as TableBlock).key === "schedulephases") as TableBlock;
+  assert.ok(detailPanel);
+  assert.deepEqual(detailPanel.footerRef, { page: "subscriptions.schedule", params: { id: "sub_1" } });
+  const detailHeader = detail!.blocks.find((b) => b.type === "header") as HeaderBlock;
+  assert.ok(detailHeader.actions!.some((a) => a.label === "Edit schedule"));
+});
+
 // ---- PA-8: router fix, +Create, invoice composer, Customer-360 writes ----
 
-test("client router (PA-8): id-less subpages round-trip (#/subscriptions/new is NOT a detail page) and the shell ships the +Create menu", () => {
-  // Exercise the REAL shipped client code: extract parseHash/hashFor from the
-  // clientApp module string and run them with a stubbed location.
-  const start = clientApp.indexOf("D.parseHash");
-  const end = clientApp.indexOf("D.navigateRef");
+test("client router (PA-8/13): real /billing paths round-trip (id-less subpages, filters as query params, legacy #/ links) and the shell ships the +Create menu", () => {
+  // Exercise the REAL shipped client code: extract BASE/parseRoute/hrefFor
+  // from the clientApp module string and run them with a stubbed location.
+  const start = clientApp.indexOf("D.BASE");
+  const end = clientApp.indexOf("D.go =");
   assert.ok(start >= 0 && end > start);
   const makeD = new Function(
     "location",
     `var D = { defaultPage: "home" };\n${clientApp.slice(start, end)}\nreturn D;`
-  ) as (location: { hash: string }) => {
-    parseHash(): { page: string; params: Record<string, string> };
-    hashFor(page: string, params: Record<string, string>, filters: Record<string, string>): string;
+  ) as (location: { pathname: string; search: string; hash: string }) => {
+    parseRoute(): { page: string; params: Record<string, string>; filters: Record<string, string> };
+    hrefFor(page: string, params: Record<string, string>, filters: Record<string, string>): string;
   };
-  const roundTrip = (page: string, params: Record<string, string> = {}) => {
-    const D = makeD({ hash: "" });
-    const hash = D.hashFor(page, params, {});
-    return makeD({ hash }).parseHash();
+  const locFor = (href: string) => {
+    const qi = href.indexOf("?");
+    return { pathname: qi < 0 ? href : href.slice(0, qi), search: qi < 0 ? "" : href.slice(qi), hash: "" };
+  };
+  const roundTrip = (page: string, params: Record<string, string> = {}, filters: Record<string, string> = {}) => {
+    const D = makeD({ pathname: "/billing", search: "", hash: "" });
+    const href = D.hrefFor(page, params, filters);
+    assert.ok(href.startsWith("/billing/"), `href ${href} must be a real path`);
+    return makeD(locFor(href)).parseRoute();
   };
   assert.deepEqual(roundTrip("subscriptions.new"), { page: "subscriptions.new", params: {}, filters: {} });
   assert.deepEqual(roundTrip("invoices.new"), { page: "invoices.new", params: {}, filters: {} });
@@ -4154,11 +4991,27 @@ test("client router (PA-8): id-less subpages round-trip (#/subscriptions/new is 
     params: { id: "sub_1" },
     filters: {},
   });
+  // Filters ride real query params — copyable URLs (PA-13 user decision).
+  const withFilters = makeD({ pathname: "/billing", search: "", hash: "" }).hrefFor("payments", {}, { status: "failed", date: "7d" });
+  assert.equal(withFilters, "/billing/payments?f_status=failed&f_date=7d");
+  assert.deepEqual(makeD(locFor(withFilters)).parseRoute().filters, { status: "failed", date: "7d" });
+  // Panel root → default page; legacy #/… links still parse.
+  assert.equal(makeD({ pathname: "/billing", search: "", hash: "" }).parseRoute().page, "home");
+  assert.deepEqual(makeD({ pathname: "/billing", search: "", hash: "#/customers/cus_9?f_x=1" }).parseRoute(), {
+    page: "customers.detail",
+    params: { id: "cus_9" },
+    filters: { x: "1" },
+  });
+  // SPA glue exists: pushState navigation, popstate handling, link interception.
+  assert.ok(clientApp.includes("history.pushState"));
+  assert.ok(clientApp.includes('window.addEventListener("popstate", D.onRouteChange)'));
+  assert.ok(clientApp.includes("D.bindLinks"));
   // Every sidebar entry ships a nav icon — icon-less items render misaligned.
   const iconsBlock = clientApp.slice(clientApp.indexOf("D.NAV_ICONS"), clientApp.indexOf("D.navIcon ="));
   const NAV_ROOTS = [
     "home", "balances", "payments", "customers", "subscriptions", "invoices", "disputes", "catalog",
-    "links", "quotes", "approvals", "blocklist", "fraud", "portal", "meters", "bookmarks", "security",
+    "links", "quotes", "approvals", "blocklist", "fraud", "portal", "meters", "events", "webhooks",
+    "reports", "bookmarks", "security",
   ];
   for (const root of NAV_ROOTS) {
     assert.ok(new RegExp(`\\b${root}: "`).test(iconsBlock), `nav page "${root}" has no icon in D.NAV_ICONS`);
@@ -4523,4 +5376,742 @@ test("count-cards: invoices chips use invoices.search per status; subscriptions 
   subQueries.length = 0;
   await subSection.buildPage(subCtx2, { page: "subscriptions", filters: { customer: "cus_1" } });
   assert.equal(subQueries.length, 0); // scoped view never searches
+});
+
+// ---- PA-12: ops & observability ----
+
+test("groundwork (PA-12): CSV export rides saveBlob (no data: URI); the modal handles ActionResult.file/link; flash links are noopener and survive the reload", () => {
+  // 12.0 + 13.7 in one implementation: Blob download sink, CSV swapped onto it.
+  assert.ok(clientBlocks.includes("D.saveBlob = function"));
+  assert.ok(clientBlocks.includes("URL.createObjectURL"));
+  assert.ok(!clientBlocks.includes("data:text/csv"));
+  // Modal ok-branch: file → bytes → saveBlob; link → flashOk's second arg.
+  assert.ok(clientModal.includes("j.file"));
+  assert.ok(clientModal.includes("D.saveBlob(j.file.name"));
+  assert.ok(clientModal.includes("j.link || null"));
+  // loadPage clears the flash on entry — the flash call must come AFTER it or
+  // the message (and the short-lived link anchor) is wiped instantly.
+  assert.ok(clientModal.indexOf("D.loadPage();") < clientModal.indexOf("D.flashOk(j.queued"));
+  // Link anchors: child nodes with textContent + rel=noopener, never innerHTML.
+  assert.ok(clientCore.includes('a.rel = "noopener"'));
+  assert.ok(clientCore.includes("a.textContent = link.label"));
+});
+
+test("quote PDF (PA-12): open/accepted only, cap/magic failure degrades friendly, success returns ActionResult.file", async () => {
+  const { makeQuotesSection: makeQuotes12 } = await import("../sections/quotesSection");
+  const section = makeQuotes12();
+  const { ctx } = quotesCtx();
+  const stripe = ctx.stripe as unknown as Record<string, unknown>;
+  stripe.getQuotePdf = async () => Buffer.from("%PDF-1.4 fake quote");
+  // Draft → refused on the live status re-read, before any PDF fetch.
+  const draft = await section.action!(ctx, { key: "section:quotes.pdf", params: { id: "qt_draft" } });
+  assert.equal(draft.ok, false);
+  assert.match(draft.error!, /open or accepted/);
+  // Open → file payload named after the quote number.
+  const ok = await section.action!(ctx, { key: "section:quotes.pdf", params: { id: "qt_open" } });
+  assert.equal(ok.ok, true);
+  assert.equal(ok.file!.name, "QT-0002.pdf");
+  assert.equal(ok.file!.mime, "application/pdf");
+  assert.equal(Buffer.from(ok.file!.b64, "base64").toString(), "%PDF-1.4 fake quote");
+  // Over-cap / non-PDF (StripeClient returns null) → friendly pointer.
+  stripe.getQuotePdf = async () => null;
+  const overCap = await section.action!(ctx, { key: "section:quotes.pdf", params: { id: "qt_open" } });
+  assert.equal(overCap.ok, false);
+  assert.match(overCap.error!, /Stripe Dashboard/);
+});
+
+test("events page (PA-12): curated select + validated typeq pill (custom wins, garbage dropped), object refs via shared refForId, evt_ cursor", async () => {
+  const { makeEventsSection } = await import("../sections/eventsSection");
+  const section = makeEventsSection();
+  const calls: Array<Record<string, unknown>> = [];
+  const ctx = {
+    stripe: {
+      listEventsPage: async (opts: Record<string, unknown>) => {
+        calls.push(opts);
+        return {
+          events: [
+            { id: "evt_1", type: "invoice.paid", created: 1_700_000_000, data: { object: { id: "in_9", object: "invoice" } } },
+            { id: "evt_2", type: "customer.created", created: 1_700_000_100, data: { object: { id: "cus_9", object: "customer" } } },
+          ],
+          hasMore: true,
+        };
+      },
+    },
+  } as unknown as DashboardCtx;
+  const page = await section.buildPage(ctx, { page: "events", filters: {} });
+  const table = page!.blocks.find((b) => b.type === "table") as TableBlock;
+  assert.equal(table.rows.length, 2);
+  const objCell = table.rows[0].cells[1] as { t: string; ref?: { page: string } };
+  assert.equal(objCell.ref!.page, "invoices.detail");
+  assert.equal(table.nextCursor, "evt_2");
+  assert.equal(calls[0].type, undefined);
+  // typeq wins over the curated select.
+  await section.buildPage(ctx, { page: "events", filters: { type: "invoice.paid", typeq: "charge.*" } });
+  assert.equal(calls[1].type, "charge.*");
+  // Garbage typeq is dropped server-side (it would flow into the Stripe param).
+  await section.buildPage(ctx, { page: "events", filters: { typeq: "DROP TABLE; --" } });
+  assert.equal(calls[2].type, undefined);
+  // The select value must come from the curated set.
+  await section.buildPage(ctx, { page: "events", filters: { type: "evil.type" } });
+  assert.equal(calls[3].type, undefined);
+  // refForId moved to cells.ts and grew the PA-7 object families.
+  assert.equal(refForId("plink_1")!.page, "links.detail");
+  assert.equal(refForId("qt_1")!.page, "quotes.detail");
+  assert.equal(refForId("prod_1")!.page, "catalog.detail");
+  assert.equal(refForId("evt_1"), null);
+});
+
+function webhooksCtx(opts: { botManagedId?: string | null } = {}) {
+  const audits: string[] = [];
+  const updates: Array<[string, Record<string, unknown>]> = [];
+  const deletes: string[] = [];
+  const endpoints = [
+    {
+      id: "we_bot",
+      url: "https://bot.example.com/stripe",
+      status: "enabled",
+      enabled_events: ["charge.refunded", "charge.dispute.created", "invoice.paid", "invoice.payment_failed"],
+      api_version: "2026-06-01",
+      created: 1_700_000_000,
+    },
+    { id: "we_other", url: "https://ext.example.com/hook", status: "enabled", enabled_events: ["*"], api_version: null, created: 1_700_000_100 },
+  ];
+  const ctx = {
+    actor: { id: "42", name: "Ada", role: "admin", isAdmin: true },
+    stripe: {
+      listWebhookEndpoints: async () => endpoints,
+      createWebhookEndpoint: async () => ({ id: "we_new", secret: "whsec_SUPERSECRET123" }),
+      updateWebhookEndpoint: async (id: string, params: Record<string, unknown>) => {
+        updates.push([id, params]);
+        return {};
+      },
+      deleteWebhookEndpoint: async (id: string) => {
+        deletes.push(id);
+      },
+    },
+    settings: { stripeWebhookEndpointId: () => (opts.botManagedId === undefined ? "we_bot" : opts.botManagedId) },
+    audit: async (c: string) => {
+      audits.push(c);
+    },
+    security: { sessionIdHash: "h", authMethod: "passkey", stepUpFresh: () => true },
+  } as unknown as DashboardCtx;
+  return { ctx, audits, updates, deletes };
+}
+
+test("webhooks (PA-12): bot-managed row is badged + actionless and the SERVER refuses disable/delete on it; whsec_ shows once in text and never in the audit", async () => {
+  const { makeWebhooksSection } = await import("../sections/webhooksSection");
+  const section = makeWebhooksSection();
+  const f = webhooksCtx();
+  const page = await section.buildPage(f.ctx, { page: "webhooks", filters: {} });
+  const table = page!.blocks.find((b) => b.type === "table") as TableBlock;
+  const botRow = table.rows.find((r) => r.id === "we_bot")!;
+  assert.equal(botRow.actions, undefined);
+  const flags = botRow.cells[1] as { t: string; badges: Array<{ text: string }> };
+  assert.equal(flags.t, "flags");
+  assert.ok(flags.badges.some((b) => b.text === "Bot-managed"));
+  const otherRow = table.rows.find((r) => r.id === "we_other")!;
+  assert.equal(otherRow.actions!.length, 2);
+  const evCell = otherRow.cells[2] as { v: string };
+  assert.equal(evCell.v, "All events");
+
+  // Server-side bot-managed refusal regardless of what the client baked.
+  const disable = await section.action!(f.ctx, {
+    key: "section:webhooks.toggle",
+    params: { id: "we_bot", enabled: false },
+    confirmWord: "CONFIRM",
+  });
+  assert.equal(disable.ok, false);
+  assert.match(disable.error!, /bot-managed/i);
+  const del = await section.action!(f.ctx, { key: "section:webhooks.delete", params: { id: "we_bot" }, confirmWord: "CONFIRM" });
+  assert.equal(del.ok, false);
+  assert.equal(f.deletes.length, 0);
+  assert.equal(f.updates.length, 0);
+
+  // T1: writes refuse without CONFIRM.
+  const noConfirm = await section.action!(f.ctx, { key: "section:webhooks.create", params: { url: "https://x.example/hook", all: true } });
+  assert.equal(noConfirm.ok, false);
+
+  // Create: http URL and bad event tokens refused; success discloses the
+  // secret ONCE in text while the audit records only that a disclosure happened.
+  const httpUrl = await section.action!(f.ctx, {
+    key: "section:webhooks.create",
+    params: { url: "http://x.example/hook", all: true },
+    confirmWord: "CONFIRM",
+  });
+  assert.equal(httpUrl.ok, false);
+  const badEvents = await section.action!(f.ctx, {
+    key: "section:webhooks.create",
+    params: { url: "https://x.example/hook", events: "invoice.paid NOT-VALID!" },
+    confirmWord: "CONFIRM",
+  });
+  assert.equal(badEvents.ok, false);
+  const created = await section.action!(f.ctx, {
+    key: "section:webhooks.create",
+    params: { url: "https://x.example/hook", events: "invoice.paid charge.*" },
+    confirmWord: "CONFIRM",
+  });
+  assert.equal(created.ok, true);
+  assert.ok(created.text!.includes("whsec_SUPERSECRET123"));
+  assert.ok(f.audits.length > 0);
+  assert.ok(f.audits.every((a) => !a.includes("whsec_")));
+  assert.match(f.audits[f.audits.length - 1], /disclosed once to Ada/);
+
+  // Toggle (non-managed): live re-read refuses a no-op enable, disable works.
+  const already = await section.action!(f.ctx, {
+    key: "section:webhooks.toggle",
+    params: { id: "we_other", enabled: true },
+    confirmWord: "CONFIRM",
+  });
+  assert.equal(already.ok, false);
+  const disabled = await section.action!(f.ctx, {
+    key: "section:webhooks.toggle",
+    params: { id: "we_other", enabled: false },
+    confirmWord: "CONFIRM",
+  });
+  assert.equal(disabled.ok, true);
+  assert.deepEqual(f.updates, [["we_other", { disabled: true }]]);
+});
+
+test("reports (PA-12): run validates curated type + dates; download link only for succeeded runs (10-min expiry) via ActionResult.link; Refresh is a no-op ok", async () => {
+  const { makeReportsSection } = await import("../sections/reportsSection");
+  const section = makeReportsSection();
+  const links: Array<[string, number]> = [];
+  const created: Array<[string, Record<string, unknown>]> = [];
+  const runs: Record<string, Record<string, unknown>> = {
+    frr_ok: {
+      id: "frr_ok",
+      report_type: "balance.summary.1",
+      status: "succeeded",
+      created: 1_700_000_000,
+      result: { id: "file_1" },
+      parameters: { interval_start: 1_680_000_000, interval_end: 1_690_000_000 },
+    },
+    frr_wip: { id: "frr_wip", report_type: "balance.summary.1", status: "pending", created: 1_700_000_050, result: null, parameters: {} },
+  };
+  const ctx = {
+    stripe: {
+      listReportRuns: async () => Object.values(runs),
+      getReportRun: async (id: string) => {
+        if (!runs[id]) throw new Error("nope");
+        return runs[id];
+      },
+      createReportRun: async (type: string, params: Record<string, unknown>) => {
+        created.push([type, params]);
+        return { id: "frr_new" };
+      },
+      createFileLink: async (fileId: string, expiresAt: number) => {
+        links.push([fileId, expiresAt]);
+        return { url: "https://files.stripe.com/links/x" };
+      },
+    },
+    audit: async () => {},
+  } as unknown as DashboardCtx;
+
+  // Page: Refresh in the header; the download row action only on the succeeded run.
+  const page = await section.buildPage(ctx, { page: "reports", filters: {} });
+  const header = page!.blocks[0] as HeaderBlock;
+  assert.ok(header.actions!.some((a) => a.key === "section:reports.refresh"));
+  const table = page!.blocks.find((b) => b.type === "table") as TableBlock;
+  assert.equal(table.rows.find((r) => r.id === "frr_ok")!.actions!.length, 1);
+  assert.equal(table.rows.find((r) => r.id === "frr_wip")!.actions, undefined);
+
+  // Run: curated types only; YYYY-MM-DD; start<end≤now.
+  const badType = await section.action!(ctx, { key: "section:reports.run", params: { reportType: "evil.1", start: "2026-06-01", end: "2026-07-01" } });
+  assert.equal(badType.ok, false);
+  const badDate = await section.action!(ctx, { key: "section:reports.run", params: { reportType: "balance.summary.1", start: "junk", end: "2026-07-01" } });
+  assert.equal(badDate.ok, false);
+  const reversed = await section.action!(ctx, { key: "section:reports.run", params: { reportType: "balance.summary.1", start: "2026-07-01", end: "2026-06-01" } });
+  assert.equal(reversed.ok, false);
+  const future = await section.action!(ctx, { key: "section:reports.run", params: { reportType: "balance.summary.1", start: "2026-06-01", end: "2099-01-01" } });
+  assert.equal(future.ok, false);
+  assert.equal(created.length, 0);
+  const okRun = await section.action!(ctx, { key: "section:reports.run", params: { reportType: "balance.summary.1", start: "2026-06-01", end: "2026-07-01" } });
+  assert.equal(okRun.ok, true);
+  assert.equal(created.length, 1);
+
+  // Link: live re-read refuses pending; succeeded mints a ~600s FileLink.
+  const pending = await section.action!(ctx, { key: "section:reports.link", params: { id: "frr_wip" } });
+  assert.equal(pending.ok, false);
+  assert.equal(links.length, 0);
+  const linked = await section.action!(ctx, { key: "section:reports.link", params: { id: "frr_ok" } });
+  assert.equal(linked.ok, true);
+  assert.equal(linked.link!.label, "Download report");
+  assert.equal(links[0][0], "file_1");
+  const ttl = links[0][1] - Math.floor(Date.now() / 1000);
+  assert.ok(ttl > 590 && ttl <= 600, `link TTL ${ttl}s should be ~600s`);
+
+  // Refresh: bare ok — dispatchAction reloads the page on ok, zero client code.
+  const refreshed = await section.action!(ctx, { key: "section:reports.refresh", params: {} });
+  assert.equal(refreshed.ok, true);
+});
+
+test("checkout sessions (PA-12): Links page grows tabs; session URL renders only while open; setup-mode amount is a bare status pill; status filter validated", async () => {
+  const { makeLinksSection: makeLinks12 } = await import("../sections/linksSection");
+  const section = makeLinks12();
+  const calls: Array<Record<string, unknown>> = [];
+  const ctx = {
+    stripe: {
+      formatAmount: (a: number, c: string) => `${(a / 100).toFixed(2)} ${c.toUpperCase()}`,
+      listPaymentLinks: async () => ({ links: [], hasMore: false }),
+      listAllActivePrices: async () => [],
+      listCheckoutSessions: async (opts: Record<string, unknown>) => {
+        calls.push(opts);
+        return {
+          sessions: [
+            {
+              id: "cs_open",
+              status: "open",
+              mode: "payment",
+              amount_total: 2900,
+              currency: "eur",
+              customer: "cus_1",
+              customer_details: null,
+              created: 1_700_000_000,
+              url: "https://checkout.stripe.com/c/pay/x",
+            },
+            {
+              id: "cs_done",
+              status: "complete",
+              mode: "subscription",
+              amount_total: 4900,
+              currency: "eur",
+              customer: null,
+              customer_details: { email: "a@b.c" },
+              created: 1_700_000_100,
+              url: null,
+            },
+            {
+              id: "cs_setup",
+              status: "expired",
+              mode: "setup",
+              amount_total: null,
+              currency: null,
+              customer: null,
+              customer_details: null,
+              created: 1_700_000_200,
+              url: null,
+            },
+          ],
+          hasMore: false,
+        };
+      },
+    },
+  } as unknown as DashboardCtx;
+
+  // Both views ship the tab row.
+  const linksPage = await section.buildPage(ctx, { page: "links", filters: {} });
+  const linkTabs = linksPage!.blocks.find((b) => b.type === "tabs") as TabsBlock;
+  assert.deepEqual(linkTabs.items.map((i) => i.value), ["", "sessions"]);
+
+  const page = await section.buildPage(ctx, { page: "links", filters: { view: "sessions" } });
+  const tabs = page!.blocks.find((b) => b.type === "tabs") as TabsBlock;
+  assert.equal(tabs.value, "sessions");
+  const table = page!.blocks.find((b) => b.type === "table") as TableBlock;
+  assert.equal(table.rows.length, 3);
+  const urlOpen = table.rows[0].cells[4] as { t: string };
+  assert.equal(urlOpen.t, "external");
+  const urlDone = table.rows[1].cells[4] as { t: string; v: string };
+  assert.equal(urlDone.v, "—");
+  const amountSetup = table.rows[2].cells[0] as { t: string };
+  assert.equal(amountSetup.t, "badge");
+  const custLink = table.rows[0].cells[2] as { t: string; ref: { page: string } };
+  assert.equal(custLink.t, "link");
+  assert.equal(custLink.ref.page, "customers.detail");
+
+  // Status filter flows into the Stripe param; garbage is dropped.
+  await section.buildPage(ctx, { page: "links", filters: { view: "sessions", status: "open" } });
+  assert.equal(calls[1].status, "open");
+  await section.buildPage(ctx, { page: "links", filters: { view: "sessions", status: "evil" } });
+  assert.equal(calls[2].status, undefined);
+});
+
+test("shipping rates (PA-12): 5th Catalog tab; create parses the amount idiom (zero-decimal guard); toggle validates shr_ and archives", async () => {
+  const { makeCatalogSection: makeCatalog12 } = await import("../sections/catalogSection");
+  const section = makeCatalog12();
+  const created: Array<Record<string, unknown>> = [];
+  const toggled: Array<[string, boolean]> = [];
+  const ctx = {
+    stripe: {
+      formatAmount: (a: number, c: string) => `${(a / 100).toFixed(2)} ${c.toUpperCase()}`,
+      listShippingRates: async () => [
+        {
+          id: "shr_1",
+          display_name: "Standard",
+          active: true,
+          created: 1_700_000_000,
+          fixed_amount: { amount: 500, currency: "eur" },
+          tax_behavior: "exclusive",
+        },
+      ],
+      createShippingRate: async (params: Record<string, unknown>) => {
+        created.push(params);
+        return { id: "shr_new" };
+      },
+      setShippingRateActive: async (id: string, active: boolean) => {
+        toggled.push([id, active]);
+        return { id, active, display_name: "Standard" };
+      },
+    },
+    audit: async () => {},
+  } as unknown as DashboardCtx;
+
+  const page = await section.buildPage(ctx, { page: "catalog", filters: { view: "shipping" } });
+  const tabs = page!.blocks.find((b) => b.type === "tabs") as TabsBlock;
+  assert.ok(tabs.items.some((i) => i.value === "shipping"));
+  const table = page!.blocks.find((b) => b.type === "table") as TableBlock;
+  assert.equal(table.rows.length, 1);
+  assert.equal(table.rows[0].actions![0].label, "Archive");
+
+  const badAmount = await section.action!(ctx, { key: "section:catalog.shipping_create", params: { displayName: "X", amount: "five euro" } });
+  assert.equal(badAmount.ok, false);
+  const zeroDec = await section.action!(ctx, { key: "section:catalog.shipping_create", params: { displayName: "X", amount: "5.50 jpy" } });
+  assert.equal(zeroDec.ok, false);
+  assert.equal(created.length, 0);
+  const ok = await section.action!(ctx, {
+    key: "section:catalog.shipping_create",
+    params: { displayName: "Standard", amount: "5.00 eur", taxBehavior: "exclusive" },
+  });
+  assert.equal(ok.ok, true);
+  assert.deepEqual(created[0], { displayName: "Standard", amountMinor: 500, currency: "eur", taxBehavior: "exclusive" });
+
+  const badId = await section.action!(ctx, { key: "section:catalog.shipping_toggle", params: { id: "prod_1", active: false } });
+  assert.equal(badId.ok, false);
+  const arch = await section.action!(ctx, { key: "section:catalog.shipping_toggle", params: { id: "shr_1", active: false } });
+  assert.equal(arch.ok, true);
+  assert.deepEqual(toggled, [["shr_1", false]]);
+});
+
+test("payout schedule (PA-12): T1+T2 belts run before any write; anchor/manual validation; Stripe refusal maps friendly; read-only card renders", async () => {
+  const { makeBalancesSection: makeBalances12 } = await import("../sections/balancesSection");
+  const section = makeBalances12();
+  const updates: Array<Record<string, unknown>> = [];
+  let failUpdate = false;
+  const mk = (stepUpFresh: boolean) =>
+    ({
+      stripe: {
+        formatAmount: (a: number, c: string) => `${(a / 100).toFixed(2)} ${c.toUpperCase()}`,
+        getBalance: async () => ({ available: [], pending: [] }),
+        listPayouts: async () => ({ payouts: [], hasMore: false }),
+        listAccountBalanceTransactions: async () => ({ transactions: [], hasMore: false }),
+        getAccount: async () => ({ id: "acct_1", settings: { payouts: { schedule: { interval: "daily", delay_days: 2 } } } }),
+        updatePayoutSchedule: async (s: Record<string, unknown>) => {
+          if (failUpdate) throw new Error("not allowed for this account");
+          updates.push(s);
+          return {};
+        },
+      },
+      audit: async () => {},
+      security: { sessionIdHash: "h", authMethod: "passkey", stepUpFresh: () => stepUpFresh },
+    }) as unknown as DashboardCtx;
+  const ctx = mk(true);
+
+  // List: explicit header with the T1+T2 editor + the read-only schedule card.
+  const page = await section.buildPage(ctx, { page: "balances", filters: {} });
+  const header = page!.blocks[0] as HeaderBlock;
+  assert.equal(header.actions![0].key, "section:balances.payout_schedule");
+  assert.equal(header.actions![0].dangerous, true);
+  assert.equal(header.actions![0].stepUp, true);
+  const kv = page!.blocks.find((b) => b.type === "kv") as KeyValueBlock;
+  assert.equal(kv.title, "Payout schedule");
+  assert.ok(kv.rows.some((r) => r.label === "Delay"));
+
+  // Belts before writes.
+  const noConfirm = await section.action!(ctx, { key: "section:balances.payout_schedule", params: { interval: "daily" } });
+  assert.equal(noConfirm.ok, false);
+  const needsStep = await section.action!(mk(false), {
+    key: "section:balances.payout_schedule",
+    params: { interval: "daily" },
+    confirmWord: "CONFIRM",
+  });
+  assert.equal(needsStep.needsStepUp, true);
+  assert.equal(updates.length, 0);
+
+  // Validation matrix: weekly/monthly need anchors, manual takes no delay.
+  const weeklyNoAnchor = await section.action!(ctx, { key: "section:balances.payout_schedule", params: { interval: "weekly" }, confirmWord: "CONFIRM" });
+  assert.equal(weeklyNoAnchor.ok, false);
+  const monthlyNoAnchor = await section.action!(ctx, { key: "section:balances.payout_schedule", params: { interval: "monthly" }, confirmWord: "CONFIRM" });
+  assert.equal(monthlyNoAnchor.ok, false);
+  const manualDelay = await section.action!(ctx, {
+    key: "section:balances.payout_schedule",
+    params: { interval: "manual", delayDays: 5 },
+    confirmWord: "CONFIRM",
+  });
+  assert.equal(manualDelay.ok, false);
+  assert.equal(updates.length, 0);
+  const ok = await section.action!(ctx, {
+    key: "section:balances.payout_schedule",
+    params: { interval: "weekly", weeklyAnchor: "monday", delayDays: 7 },
+    confirmWord: "CONFIRM",
+  });
+  assert.equal(ok.ok, true);
+  assert.deepEqual(updates, [{ interval: "weekly", weeklyAnchor: "monday", delayDays: 7 }]);
+
+  // ⚠ own-account accounts.update can be Connect-only — refusal degrades.
+  failUpdate = true;
+  const refused = await section.action!(ctx, { key: "section:balances.payout_schedule", params: { interval: "daily" }, confirmWord: "CONFIRM" });
+  assert.equal(refused.ok, false);
+  assert.match(refused.error!, /Connect-only/);
+});
+
+// ---- PA-13: design polish ----
+
+test("bell (PA-13): nav-badges collects attention items (iso-sorted newest first, capped at 15); home attention() mirrors the inbox", async () => {
+  const fake = fakeSettings();
+  const provider: DashboardAuthProvider = {
+    enter: async () => ({ kind: "page" }),
+    authenticate: async () => fakeAuthResult("active"),
+    publicEndpoint: async () => null,
+    sessionEndpoint: async () => null,
+  };
+  // A section whose attention() over-produces on purpose (cap check).
+  const noisy: DashboardSectionModule = {
+    nav: [{ key: "customers", label: "Customers", page: "customers" }],
+    ownsPage: (p) => p === "customers",
+    buildPage: async () => ({ title: "Customers", crumbs: [{ label: "Customers" }], blocks: [] }),
+    navBadge: async () => "3",
+    attention: async () =>
+      Array.from({ length: 20 }, (_, i) => ({
+        label: `item ${i}`,
+        badge: { kind: "warn" as const, text: "W" },
+        iso: new Date(1_700_000_000_000 + i * 1000).toISOString(),
+        ref: { page: "customers" },
+      })),
+  };
+  const stripe = { isTestMode: () => true } as unknown as StripeClient;
+  const dashboard = new Dashboard(fake.store, provider, [noisy], {
+    stripe,
+    settings: fake.store,
+    stores: {} as never,
+    billing: {} as never,
+  });
+  const res = await dashboard.api("nav-badges", "cookie", {});
+  const json = res.json as { badges: Record<string, string>; attention?: Array<{ label: string; iso: string }> };
+  assert.equal(json.badges.customers, "3");
+  assert.equal(json.attention!.length, 15);
+  // Newest first: item 19 leads.
+  assert.equal(json.attention![0].label, "item 19");
+  assert.ok(json.attention![0].iso > json.attention![14].iso);
+
+  // Home's attention() is the SAME computation as the inbox rows.
+  const homeModule = makeHomeSection({ metrics: fakeMetrics });
+  const ctx = homeCtx();
+  const items = await homeModule.attention!(ctx);
+  const page = await homeModule.buildPage(ctx, { page: "home" });
+  const inbox = page!.blocks.find((b) => b.type === "table") as TableBlock;
+  assert.equal(items.length, inbox.rows.length);
+  const rowIds = inbox.rows.map((r) => r.id);
+  assert.ok(rowIds.includes("dispute-dp_1") && rowIds.includes("approval-apr_1") && rowIds.includes("efw-issfr_1"));
+  // Every bell item navigates somewhere.
+  assert.ok(items.every((it) => typeof it.ref?.page === "string" && it.ref.page.length > 0));
+  // Client side: bell bind + popover renderer + poll wiring exist.
+  assert.ok(clientApp.includes("D.bindBell"));
+  assert.ok(clientApp.includes("Nothing needs attention."));
+  assert.ok(clientApp.includes("res.j.attention || []"));
+});
+
+test("peek (PA-13): endpoint allowlists pages, validates ids per kind, caches 30s; section peeks are last4-only plain text", async () => {
+  const fake = fakeSettings();
+  const provider: DashboardAuthProvider = {
+    enter: async () => ({ kind: "page" }),
+    authenticate: async () => fakeAuthResult("active"),
+    publicEndpoint: async () => null,
+    sessionEndpoint: async () => null,
+  };
+  let customerReads = 0;
+  const peekSection: DashboardSectionModule = {
+    nav: [{ key: "customers", label: "Customers", page: "customers" }],
+    ownsPage: (p) => p === "customers" || p === "customers.detail",
+    buildPage: async () => ({ title: "Customers", crumbs: [{ label: "Customers" }], blocks: [] }),
+    peek: async (_ctx, _page, id) => {
+      customerReads++;
+      return { title: `Peek ${id}`, lines: ["ada@example.com"] };
+    },
+  };
+  const stripe = { isTestMode: () => true } as unknown as StripeClient;
+  const dashboard = new Dashboard(fake.store, provider, [peekSection], {
+    stripe,
+    settings: fake.store,
+    stores: {} as never,
+    billing: {} as never,
+  });
+  // Unknown page + malformed ids never reach the module.
+  const badPage = await dashboard.api("peek", "cookie", { page: "security", id: "cus_1" });
+  assert.equal(badPage.status, 404);
+  const badId = await dashboard.api("peek", "cookie", { page: "customers.detail", id: "ch_1" });
+  assert.equal(badId.status, 404);
+  assert.equal(customerReads, 0);
+  // Valid → module runs once; the second hit is served from the 30s cache.
+  const first = await dashboard.api("peek", "cookie", { page: "customers.detail", id: "cus_1" });
+  assert.equal(first.status, 200);
+  assert.equal((first.json as { title: string }).title, "Peek cus_1");
+  const second = await dashboard.api("peek", "cookie", { page: "customers.detail", id: "cus_1" });
+  assert.equal(second.status, 200);
+  assert.equal(customerReads, 1);
+
+  // Real section peeks: one retrieve each, last4 at most, plain-text lines.
+  const custSection = makeCustomersSection();
+  const custPeek = await custSection.peek!(
+    {
+      stripe: {
+        formatAmount: (a: number, c: string) => `${(a / 100).toFixed(2)} ${c.toUpperCase()}`,
+        getCustomer: async () => ({
+          id: "cus_1",
+          name: "Ada Lovelace",
+          email: "ada@example.com",
+          created: 1_700_000_000,
+          balance: -500,
+          currency: "eur",
+          delinquent: false,
+        }),
+      },
+    } as unknown as DashboardCtx,
+    "customers.detail",
+    "cus_1"
+  );
+  assert.equal(custPeek!.title, "Ada Lovelace");
+  assert.ok(custPeek!.lines.includes("ada@example.com"));
+  assert.ok(custPeek!.lines.some((l) => l.includes("credit")));
+
+  const paySection = makePaymentsSection();
+  const payPeek = await paySection.peek!(
+    {
+      stripe: {
+        formatAmount: (a: number, c: string) => `${(a / 100).toFixed(2)} ${c.toUpperCase()}`,
+        getChargeDetailed: async () => ({
+          id: "ch_1",
+          amount: 2900,
+          currency: "eur",
+          status: "failed",
+          refunded: false,
+          disputed: false,
+          created: 1_700_000_000,
+          billing_details: { email: "ada@example.com" },
+          payment_method_details: { card: { brand: "visa", last4: "4242", number: "4242424242424242" } },
+          outcome: { seller_message: "The bank declined the payment." },
+        }),
+      },
+    } as unknown as DashboardCtx,
+    "payments.detail",
+    "ch_1"
+  );
+  assert.equal(payPeek!.title, "29.00 EUR");
+  assert.equal(payPeek!.badge!.text, "Failed");
+  assert.ok(payPeek!.lines.some((l) => l.includes("···· 4242")));
+  assert.ok(payPeek!.lines.every((l) => !l.includes("4242424242424242")));
+  assert.ok(payPeek!.lines.length <= 5);
+
+  // Client module: allowlist + hover-intent + textContent-only rendering.
+  assert.ok(clientPeek.includes('"customers.detail": 1'));
+  assert.ok(clientPeek.includes("setTimeout"));
+  assert.ok(clientPeek.includes("peekline"));
+  assert.ok(!clientPeek.includes("innerHTML"));
+});
+
+test("daterange (PA-13): parse matrix (presets, custom inclusive end, garbage), search upper bound, list threading, client pill", async () => {
+  const { parseDateFilter: parse13 } = await import("../sections/paymentsSection");
+  const now = Math.floor(Date.now() / 1000);
+  // Presets → gte only.
+  const preset = parse13("7d");
+  assert.ok(preset.createdGte! > now - 8 * 86400 && preset.createdGte! < now - 6 * 86400);
+  assert.equal(preset.createdLt, undefined);
+  // Custom range: inclusive end (+86400).
+  const range = parse13("2026-06-01..2026-06-30");
+  assert.equal(range.createdGte, Math.floor(Date.parse("2026-06-01T00:00:00Z") / 1000));
+  assert.equal(range.createdLt, Math.floor(Date.parse("2026-06-30T00:00:00Z") / 1000) + 86400);
+  // Garbage / inverted ranges parse to NO bounds.
+  assert.deepEqual(parse13("evil"), {});
+  assert.deepEqual(parse13("2026-06-30..2026-06-01"), {});
+  assert.deepEqual(parse13("2026-06-01..evil"), {});
+
+  // End-to-end: the range reaches the charge/PI listings AND the chip search
+  // queries (upper bound included).
+  const section = makePaymentsSection();
+  const listCalls: Array<Record<string, unknown>> = [];
+  const searchQueries: string[] = [];
+  const ctx = paymentsCtx();
+  const stripeFake = ctx.stripe as unknown as Record<string, unknown>;
+  stripeFake.listAllCharges = async (opts: Record<string, unknown>) => {
+    listCalls.push(opts);
+    return { charges: [], hasMore: false };
+  };
+  stripeFake.listAllPaymentIntents = async (opts: Record<string, unknown>) => {
+    listCalls.push(opts);
+    return { paymentIntents: [], hasMore: false };
+  };
+  stripeFake.countBySearch = async (_kind: string, q: string) => {
+    searchQueries.push(q);
+    return 1;
+  };
+  const page = await section.buildPage(ctx, { page: "payments", filters: { date: "2026-06-01..2026-06-30" } });
+  const expectedGte = Math.floor(Date.parse("2026-06-01T00:00:00Z") / 1000);
+  const expectedLt = Math.floor(Date.parse("2026-06-30T00:00:00Z") / 1000) + 86400;
+  assert.ok(listCalls.every((c) => c.createdGte === expectedGte && c.createdLt === expectedLt));
+  assert.ok(searchQueries.length > 0);
+  assert.ok(searchQueries.every((q) => q.includes(`created>=${expectedGte}`) && q.includes(`created<${expectedLt}`)));
+  // The filter def is a daterange pill echoing the range value.
+  const table = page!.blocks.find((b) => b.type === "table") as TableBlock;
+  const dateFilter = table.filters!.find((f) => f.key === "date")!;
+  assert.equal(dateFilter.kind, "daterange");
+  assert.equal(dateFilter.value, "2026-06-01..2026-06-30");
+
+  // Client pill: preset select + Custom two-date row; label joins the range.
+  assert.ok(clientBlocks.includes('f.kind === "daterange"'));
+  assert.ok(clientBlocks.includes('d1.type = "date"'));
+  assert.ok(clientBlocks.includes('d1.value + ".." + d2.value'));
+});
+
+test("polish (PA-13): sticky thead CSS (desktop overflow trade), g-then-key shortcuts + help dialog, mobile drawer bindings", () => {
+  const { dashboardCss } = require("../html/styles") as { dashboardCss(): string };
+  const css = dashboardCss();
+  // Sticky headers: desktop swaps overflow-x for sticky; th background is opaque.
+  assert.ok(css.includes("overflow-x:visible"));
+  assert.ok(css.includes("thead th { position:sticky; top:56px"));
+  // Mobile drawer + scrim.
+  assert.ok(css.includes(".side.open { transform:translateX(0)"));
+  assert.ok(css.includes("#scrim.show"));
+  // Shortcuts: guards for modifiers/inputs/dialogs, 1.5s arm, palette untouched.
+  assert.ok(clientApp.includes("D.SHORTCUT_PAGES"));
+  assert.ok(clientApp.includes("e.ctrlKey || e.metaKey || e.altKey"));
+  assert.ok(clientApp.includes('t.tagName === "INPUT"'));
+  assert.ok(clientApp.includes("dialog[open]"));
+  assert.ok(clientApp.includes("1500"));
+  // Hamburger bindings: aria-expanded + close on nav/hashchange/scrim.
+  assert.ok(clientApp.includes("D.bindMenu"));
+  assert.ok(clientApp.includes("aria-expanded"));
+});
+
+test("bookmark everything (PA-13 user ask): every object family toggles via the shared helper; the board routes rows through refForId", async () => {
+  const { BOOKMARK_ID_RES, toggleBookmarkAction, isBookmarkedSafe } = await import("../sections/bookmarks");
+  // Every family has an id shape and a board route.
+  const samples: Record<string, string> = {
+    dispute: "dp_1", customer: "cus_1", charge: "ch_1", subscription: "sub_1", invoice: "in_1",
+    payout: "po_1", link: "plink_1", quote: "qt_1", product: "prod_1",
+  };
+  for (const [type, id] of Object.entries(samples)) {
+    assert.ok(BOOKMARK_ID_RES[type as keyof typeof BOOKMARK_ID_RES].test(id), `${type} id shape`);
+    assert.ok(refForId(id), `${type} id must route to a page on the board`);
+  }
+  // Toggle validates the id per type; a mismatched id never reaches the store.
+  const toggles: Array<[string, string, string | null]> = [];
+  const ctx = {
+    actor: { id: "42", name: "Ada" },
+    stores: {
+      qol: {
+        toggleBookmark: async (type: string, id: string, label: string | null) => {
+          toggles.push([type, id, label]);
+          return { bookmarked: true };
+        },
+        isBookmarked: async () => true,
+      },
+    },
+  } as unknown as DashboardCtx;
+  const bad = await toggleBookmarkAction(ctx, "subscription", { id: "cus_1" });
+  assert.equal(bad.ok, false);
+  assert.equal(toggles.length, 0);
+  const ok = await toggleBookmarkAction(ctx, "subscription", { id: "sub_1", label: "Ada on Pro" });
+  assert.equal(ok.ok, true);
+  assert.deepEqual(toggles, [["subscription", "sub_1", "Ada on Pro"]]);
+  // The safe read never throws, even without a qol store in the fixture.
+  assert.equal(await isBookmarkedSafe({ stores: {} } as unknown as DashboardCtx, "quote", "qt_1"), false);
+  assert.equal(await isBookmarkedSafe(ctx, "quote", "qt_1"), true);
 });

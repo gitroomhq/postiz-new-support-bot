@@ -3,6 +3,7 @@ import { StripeClient } from "../../bot/StripeClient";
 import type { ActionActor } from "../../bot/billing/actions/BillingActionService";
 import { ActionButton, Badge, Block, Cell, TableBlock } from "../renderer/contract";
 import { DashboardCtx, DashboardSectionModule, SectionPage, str, validCursor, validId } from "./types";
+import { bookmarkButton, isBookmarkedSafe, toggleBookmarkAction } from "./bookmarks";
 import {
   amount,
   avatarCell,
@@ -10,11 +11,14 @@ import {
   chargeBadge,
   dateCell,
   estimateMrr,
+  fmtAddress,
   formatPerCurrency,
   idCell,
   invoiceBadge,
   isoDateCell,
+  money,
   paymentMethodCell,
+  sentence,
   strong,
   subBadge,
   text,
@@ -28,6 +32,56 @@ import {
 // Insights/Details/Linked accounts stacked label-over-value in the right rail.
 
 const PAGE_SIZE = 25;
+
+// Curated tax-ID types (PA-10) — the Stripe union is 100+ entries; support
+// workflows need these. Server-side membership check beats trusting the select.
+const TAX_ID_TYPES = [
+  { value: "eu_vat", label: "EU VAT" },
+  { value: "gb_vat", label: "GB VAT" },
+  { value: "us_ein", label: "US EIN" },
+  { value: "ch_vat", label: "CH VAT" },
+  { value: "no_vat", label: "NO VAT" },
+  { value: "au_abn", label: "AU ABN" },
+  { value: "ca_bn", label: "CA BN" },
+  { value: "ca_gst_hst", label: "CA GST/HST" },
+  { value: "in_gst", label: "IN GST" },
+  { value: "jp_cn", label: "JP CN" },
+  { value: "nz_gst", label: "NZ GST" },
+  { value: "sg_gst", label: "SG GST" },
+  { value: "br_cnpj", label: "BR CNPJ" },
+  { value: "mx_rfc", label: "MX RFC" },
+  { value: "tr_tin", label: "TR TIN" },
+];
+
+// Parse the one-line address input: "line1 | line2 | city | state | postal |
+// country(2)" — shipping prepends "name |". Blank segments are omitted; a
+// lone "-" clears (Stripe Emptyable "").
+function parseAddressInput(
+  raw: string,
+  shipping: boolean
+): { ok: true; value: "" | Record<string, unknown> } | { ok: false; error: string } {
+  const input = raw.trim();
+  if (!input) return { ok: false, error: "Enter the address, or '-' to clear." };
+  if (input === "-") return { ok: true, value: "" };
+  const parts = input.split("|").map((s) => s.trim());
+  const expected = shipping ? 7 : 6;
+  if (parts.length > expected) return { ok: false, error: `Too many segments — expected at most ${expected} '|'-separated parts.` };
+  while (parts.length < expected) parts.push("");
+  const name = shipping ? parts.shift()! : null;
+  if (shipping && !name) return { ok: false, error: "Shipping needs a recipient name as the first segment." };
+  const [line1, line2, city, state, postal, country] = parts;
+  if (!line1) return { ok: false, error: "line1 is required." };
+  if (!/^[A-Za-z]{2}$/.test(country)) return { ok: false, error: "Country must be a 2-letter code (last segment)." };
+  const address = {
+    line1,
+    ...(line2 ? { line2 } : {}),
+    ...(city ? { city } : {}),
+    ...(state ? { state } : {}),
+    ...(postal ? { postal_code: postal } : {}),
+    country: country.toUpperCase(),
+  };
+  return { ok: true, value: shipping ? { name, address } : address };
+}
 
 function actionActor(ctx: DashboardCtx): ActionActor {
   return { kind: "dashboard", id: ctx.actor.id, name: ctx.actor.name, isAdmin: ctx.actor.isAdmin };
@@ -47,6 +101,24 @@ export function makeCustomersSection(): DashboardSectionModule {
 
     ownsPage(page: string): boolean {
       return page === "customers" || page === "customers.detail" || page === "customers.portal";
+    },
+
+    // Hover peek card (PA-13): ONE retrieve, plain-text lines only.
+    async peek(ctx: DashboardCtx, page: string, id: string) {
+      if (page !== "customers.detail") return null;
+      const c = await ctx.stripe.getCustomer(id).catch(() => null);
+      if (!c) return null;
+      const lines: string[] = [];
+      if (c.email) lines.push(c.email);
+      lines.push(`Customer since ${new Date(c.created * 1000).toISOString().slice(0, 10)}`);
+      if (typeof c.balance === "number" && c.balance !== 0) {
+        lines.push(`Balance ${ctx.stripe.formatAmount(c.balance, c.currency ?? "usd")}${c.balance < 0 ? " (credit)" : ""}`);
+      }
+      return {
+        title: c.name ?? c.email ?? c.id,
+        ...(c.delinquent ? { badge: { kind: "warn" as const, text: "Delinquent" } } : {}),
+        lines: lines.slice(0, 5),
+      };
     },
 
     async buildPage(ctx: DashboardCtx, req): Promise<SectionPage | null> {
@@ -79,6 +151,9 @@ async function customerAction(
   needsStepUp?: boolean;
 }> {
   const confirmed = confirmWord === "CONFIRM";
+
+  // T0 — shared team bookmark toggle (bookmark helper validates its own id).
+  if (key === "section:customers.bookmark") return toggleBookmarkAction(ctx, "customer", p);
 
   // Create has no target id; everything else validates one.
   if (key === "section:customers.create") {
@@ -172,6 +247,55 @@ async function customerAction(
       await ctx.stripe.updateCustomer(customerId, { metadata });
       await ctx.audit(`Customer ${customerId} metadata updated — ${Object.keys(metadata).length} key(s)`);
       return { ok: true, text: `Metadata updated (${Object.keys(metadata).length} key(s)).` };
+    }
+
+    // T1 — add a tax ID (prints on every future invoice; can flip
+    // reverse-charge). Type is validated against the curated set — the
+    // select options are advisory only (hostile client).
+    case "section:customers.tax_id_add": {
+      if (!confirmed) return { ok: false, error: "Type CONFIRM to run this action." };
+      const type = str(p.type, 20);
+      if (!TAX_ID_TYPES.some((t) => t.value === type)) return { ok: false, fieldErrors: { type: "Pick a tax ID type." } };
+      const value = str(p.value, 30).trim();
+      if (!/^[A-Za-z0-9 .-]{2,30}$/.test(value)) return { ok: false, fieldErrors: { value: "2-30 chars: letters, digits, space, dot, dash." } };
+      try {
+        const taxId = await ctx.stripe.addTaxId(customerId, type, value);
+        await ctx.audit(`Customer ${customerId}: tax ID ${taxId.id} added (${type})`);
+        return { ok: true, text: `Tax ID added (${type.replace(/_/g, " ")} ${value}).` };
+      } catch (e) {
+        // Stripe validates per-type formats with useful messages.
+        return { ok: false, fieldErrors: { value: (e as Error).message?.slice(0, 200) ?? "Stripe rejected the value." } };
+      }
+    }
+
+    // T1 — remove a tax ID; live re-list proves it belongs to THIS customer.
+    case "section:customers.tax_id_remove": {
+      if (!confirmed) return { ok: false, error: "Type CONFIRM to run this action." };
+      const taxIdId = typeof p.taxIdId === "string" && /^(txi|atxi)_[A-Za-z0-9]{1,64}$/.test(p.taxIdId) ? p.taxIdId : null;
+      if (!taxIdId) return { ok: false, error: "Bad tax ID id." };
+      const existing = await ctx.stripe.listTaxIds(customerId).catch(() => [] as Stripe.TaxId[]);
+      if (!existing.some((t) => t.id === taxIdId)) return { ok: false, error: "That tax ID is not on this customer." };
+      await ctx.stripe.removeTaxId(customerId, taxIdId);
+      await ctx.audit(`Customer ${customerId}: tax ID ${taxIdId} removed`);
+      return { ok: true, text: "Tax ID removed." };
+    }
+
+    // T0 — billing address as ONE structured line ('-' clears).
+    case "section:customers.address_billing": {
+      const parsed = parseAddressInput(str(p.address, 400), false);
+      if (!parsed.ok) return { ok: false, fieldErrors: { address: parsed.error } };
+      await ctx.stripe.updateCustomer(customerId, { address: parsed.value as Stripe.CustomerUpdateParams["address"] });
+      await ctx.audit(`Customer ${customerId}: billing address ${parsed.value === "" ? "cleared" : "updated"}`);
+      return { ok: true, text: parsed.value === "" ? "Billing address cleared." : "Billing address updated." };
+    }
+
+    // T0 — shipping (leading recipient-name segment, required by Stripe).
+    case "section:customers.address_shipping": {
+      const parsed = parseAddressInput(str(p.address, 400), true);
+      if (!parsed.ok) return { ok: false, fieldErrors: { address: parsed.error } };
+      await ctx.stripe.updateCustomer(customerId, { shipping: parsed.value as Stripe.CustomerUpdateParams["shipping"] });
+      await ctx.audit(`Customer ${customerId}: shipping address ${parsed.value === "" ? "cleared" : "updated"}`);
+      return { ok: true, text: parsed.value === "" ? "Shipping address cleared." : "Shipping address updated." };
     }
 
     // T1 + T2 — grant monetary credits against METERED usage. Money-adjacent
@@ -336,17 +460,28 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
     return notFound("This customer does not exist (or was deleted).");
   }
 
-  const [subs, invoices, methods, chargesPage, disputes, blocks, discordIds, notes, creditGrants] = await Promise.all([
-    ctx.stripe.listSubscriptions(id).catch(() => [] as Stripe.Subscription[]),
-    ctx.stripe.listInvoices(id, 10).catch(() => ({ invoices: [] as Stripe.Invoice[], hasMore: false })),
-    ctx.stripe.listAllPaymentMethods(id).catch(() => [] as Stripe.PaymentMethod[]),
-    ctx.stripe.listCharges(id, 100).catch(() => ({ charges: [] as Stripe.Charge[], hasMore: false })),
-    ctx.stores.dispute.listByCustomer(id, 10).catch(() => []),
-    ctx.stores.block.listForCustomer(id, customer.email).catch(() => []),
-    ctx.stores.session.findDiscordIdsByStripeId(id).catch(() => [] as string[]),
-    ctx.stores.qol.listNotes("customer", id, 0, 5).catch(() => ({ rows: [], total: 0 })),
-    ctx.stripe.listCreditGrants(id).catch(() => [] as Stripe.Billing.CreditGrant[]),
-  ]);
+  // PA-10 note: 12 parallel STRIPE reads is the ceiling here — consolidate
+  // before adding more (every new one is .catch-guarded and independent; the
+  // bookmark flag is a local DB read, not a Stripe call).
+  const [subs, invoices, methods, chargesPage, disputes, blocks, discordIds, notes, creditGrants, taxIds, balanceTxns, cashBalance, bookmarked] =
+    await Promise.all([
+      ctx.stripe.listSubscriptions(id).catch(() => [] as Stripe.Subscription[]),
+      ctx.stripe.listInvoices(id, 10).catch(() => ({ invoices: [] as Stripe.Invoice[], hasMore: false })),
+      ctx.stripe.listAllPaymentMethods(id).catch(() => [] as Stripe.PaymentMethod[]),
+      ctx.stripe.listCharges(id, 100).catch(() => ({ charges: [] as Stripe.Charge[], hasMore: false })),
+      ctx.stores.dispute.listByCustomer(id, 10).catch(() => []),
+      ctx.stores.block.listForCustomer(id, customer.email).catch(() => []),
+      ctx.stores.session.findDiscordIdsByStripeId(id).catch(() => [] as string[]),
+      ctx.stores.qol.listNotes("customer", id, 0, 5).catch(() => ({ rows: [], total: 0 })),
+      ctx.stripe.listCreditGrants(id).catch(() => [] as Stripe.Billing.CreditGrant[]),
+      ctx.stripe.listTaxIds(id).catch(() => [] as Stripe.TaxId[]),
+      ctx.stripe
+        .listBalanceTransactions(id, 10)
+        .then((r) => r.data)
+        .catch(() => [] as Stripe.CustomerBalanceTransaction[]),
+      ctx.stripe.getCashBalance(id).catch(() => null),
+      isBookmarkedSafe(ctx, "customer", id),
+    ]);
 
   const main: Block[] = [];
   const rail: Block[] = [];
@@ -380,6 +515,7 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
         summary:
           "Mints an off-session SetupIntent for saving a card via Stripe.js/Elements or the API. Only the seti_ id is shown — never the client secret.",
       },
+      bookmarkButton("section:customers.bookmark", bookmarked, id, title),
     ],
   });
 
@@ -432,6 +568,18 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
       ...(balance
         ? [{ label: "Balance", cell: text(balance, customer.balance < 0 ? "negative = customer credit" : undefined) }]
         : []),
+      ...(() => {
+        // PA-10: bank-transfer funds awaiting reconciliation (usually absent).
+        const buckets = Object.entries(cashBalance?.available ?? {}).filter(([, v]) => v !== 0);
+        if (buckets.length === 0) return [];
+        const map = new Map(buckets);
+        return [
+          {
+            label: "Cash balance",
+            cell: text(formatPerCurrency(ctx.stripe, map), "bank-transfer funds awaiting reconciliation"),
+          },
+        ];
+      })(),
     ],
   });
 
@@ -460,6 +608,19 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
         label: "Default payment method",
         cell: defaultPmObj ? paymentMethodCell(defaultPmObj) : defaultPm ? idCell(defaultPm, { copy: true }) : text("—"),
       },
+      ...(customer.discount
+        ? [
+            {
+              label: "Discount",
+              cell: text(
+                typeof customer.discount.source?.coupon === "string"
+                  ? customer.discount.source.coupon
+                  : customer.discount.source?.coupon?.name ?? customer.discount.source?.coupon?.id ?? "coupon",
+                "applies to every invoice"
+              ),
+            },
+          ]
+        : []),
       ...(customer.description ? [{ label: "Description", cell: text(customer.description) }] : []),
     ],
     // Inline edit (PA-8, replaces the customers.edit page): the same modals,
@@ -504,6 +665,17 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
         ],
         summary: "Replaces the listed keys (other keys survive); '-' wipes everything.",
       },
+      ...(customer.discount
+        ? [
+            registryButton(ctx, {
+              key: "customer.coupon",
+              label: "Remove discount",
+              dangerous: true, // T1 param-aware (needsConfirmExtra) server-side
+              params: { customerId: id, op: "remove" },
+              summary: "Removes the CUSTOMER-level discount — every future invoice bills full price.",
+            }),
+          ]
+        : []),
     ],
   });
 
@@ -516,6 +688,94 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
       rows: metaEntries.slice(0, 20).map(([k, v]) => ({ label: k, cell: text(String(v).slice(0, 120)) })),
     });
   }
+
+  // ---- rail: Tax IDs (PA-10; print on every invoice → both actions T1) ----
+  rail.push({
+    type: "kv",
+    title: taxIds.length ? `Tax IDs (${taxIds.length})` : "Tax IDs",
+    rows: taxIds.length
+      ? taxIds.slice(0, 10).map((t) => ({
+          label: sentence(t.type.replace(/_/g, " ")),
+          cell: text(t.value, t.verification?.status ? sentence(t.verification.status) : undefined),
+        }))
+      : [{ label: "Tax ID", cell: text("none") }],
+    actions: [
+      {
+        key: "section:customers.tax_id_add",
+        label: "Add tax ID",
+        dangerous: true,
+        params: { customerId: id },
+        inputs: [
+          { type: "select", key: "type", label: "Type", options: TAX_ID_TYPES },
+          { type: "text", key: "value", label: "Value (e.g. DE123456789)", maxLength: 30 },
+        ],
+        summary: "Prints on every future invoice and can flip reverse-charge treatment.",
+      },
+      ...(taxIds.length
+        ? [
+            {
+              key: "section:customers.tax_id_remove",
+              label: "Remove tax ID",
+              dangerous: true,
+              params: { customerId: id },
+              inputs: [
+                {
+                  type: "select" as const,
+                  key: "taxIdId",
+                  label: "Tax ID",
+                  options: taxIds.slice(0, 25).map((t) => ({ value: t.id, label: `${t.type.replace(/_/g, " ")} — ${t.value}` })),
+                },
+              ],
+              summary: "Removes the tax ID from future invoices (already-issued invoices keep it).",
+            },
+          ]
+        : []),
+    ],
+  });
+
+  // ---- rail: Addresses (PA-10) ----
+  const billAddr = fmtAddress(customer.address);
+  const shipAddr = fmtAddress(customer.shipping?.address ?? null);
+  rail.push({
+    type: "kv",
+    title: "Addresses",
+    rows: [
+      { label: "Billing", cell: text(billAddr ?? "—") },
+      { label: "Shipping", cell: text(shipAddr ?? "—", customer.shipping?.name ?? undefined) },
+    ],
+    actions: [
+      {
+        key: "section:customers.address_billing",
+        label: "Edit billing address",
+        params: { customerId: id },
+        inputs: [
+          {
+            type: "text",
+            key: "address",
+            label: "line1 | line2 | city | state | postal | country(2) — '-' clears",
+            multiline: true,
+            maxLength: 400,
+          },
+        ],
+        summary: "Blank segments are omitted; line1 + 2-letter country are required.",
+      },
+      {
+        key: "section:customers.address_shipping",
+        label: "Edit shipping address",
+        params: { customerId: id },
+        inputs: [
+          {
+            type: "text",
+            key: "address",
+            label: "name | line1 | line2 | city | state | postal | country(2) — '-' clears",
+            multiline: true,
+            maxLength: 400,
+          },
+        ],
+        summary: "The leading segment is the recipient name (required by Stripe).",
+      },
+    ],
+  });
 
   // ---- rail: Linked accounts (Discord / Postiz) ----
   const linkRows: Array<{ label: string; cell: Cell }> = [];
@@ -753,6 +1013,32 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
       })),
       footer: `${Math.min(creditGrants.length, 25)} result${creditGrants.length === 1 ? "" : "s"}`,
       notice: "Credits apply automatically against metered-usage charges on future invoices.",
+    });
+  }
+
+  // ---- main: balance-transaction history (PA-10; glance, not a ledger) ----
+  if (balanceTxns.length > 0) {
+    main.push({
+      type: "table",
+      key: "balancehistory",
+      title: "Balance history",
+      columns: [
+        { key: "amount", label: "Amount" },
+        { key: "desc", label: "Description" },
+        { key: "created", label: "Date" },
+        { key: "ending", label: "Ending balance", align: "right" },
+      ],
+      rows: balanceTxns.map((t) => ({
+        id: t.id,
+        cells: [
+          money(ctx.stripe, t.amount, t.currency, t.amount < 0 ? "pos" : "neg"),
+          text(t.description ?? sentence(t.type.replace(/_/g, " "))),
+          dateCell(t.created),
+          money(ctx.stripe, t.ending_balance, t.currency),
+        ] as Cell[],
+      })),
+      footer: `${balanceTxns.length} most recent`,
+      notice: "Customer credit ledger — negative = credit toward future invoices.",
     });
   }
 

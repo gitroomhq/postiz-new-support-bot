@@ -20,6 +20,12 @@ const TYPE_TITLES: Record<BillingObjectType, string> = {
   dispute: "Dispute",
   customer: "Customer",
   charge: "Charge",
+  subscription: "Subscription",
+  invoice: "Invoice",
+  payout: "Payout",
+  link: "Payment link",
+  quote: "Quote",
+  product: "Product",
 };
 
 const NOTES_PAGE_SIZE = 10;

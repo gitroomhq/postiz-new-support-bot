@@ -1,15 +1,20 @@
 import type Stripe from "stripe";
 import { ActionResult, Badge, Block, Cell } from "../renderer/contract";
 import { DashboardCtx, DashboardSectionModule, SectionPage, str, validCursor } from "./types";
-import { badgeCell, idCell, money, strong, text, windowCount } from "./cells";
+import { bookmarkButton, isBookmarkedSafe, toggleBookmarkAction } from "./bookmarks";
+import { amount, badgeCell, dateCell, idCell, money, sentence, strong, text, windowCount } from "./cells";
 
 // Payment links (#/links, PA-7a): Stripe-hosted checkout URLs. List + detail
 // + create (price + quantity modal) + activate/deactivate. The URL is the
 // product here, so it renders as a copyable external cell everywhere. Reads
 // expand line_items so the pages show what each link sells without N+1s.
+// PA-12 added a second tab: Checkout sessions (read-only) — the sessions the
+// links (and the API) actually minted.
 
 const LINK_ID_RE = /^plink_[A-Za-z0-9]{1,64}$/;
 const PRICE_RE = /^price_[A-Za-z0-9]{1,64}$/;
+const SESSION_ID_RE = /^cs_[A-Za-z0-9_]{1,110}$/;
+const SESSION_STATUSES = ["open", "complete", "expired"] as const;
 
 export function makeLinksSection(): DashboardSectionModule {
   return {
@@ -20,7 +25,11 @@ export function makeLinksSection(): DashboardSectionModule {
     },
 
     async buildPage(ctx: DashboardCtx, req): Promise<SectionPage | null> {
-      if (req.page === "links") return list(ctx, req.filters ?? {}, req.cursor ?? null);
+      if (req.page === "links") {
+        const filters = req.filters ?? {};
+        if (filters.view === "sessions") return sessionsList(ctx, filters, req.cursor ?? null);
+        return list(ctx, filters, req.cursor ?? null);
+      }
       const id = typeof req.params?.id === "string" && LINK_ID_RE.test(req.params.id) ? req.params.id : null;
       if (!id) return notFound("That payment link id is not valid (plink_…).");
       return detail(ctx, id);
@@ -29,6 +38,9 @@ export function makeLinksSection(): DashboardSectionModule {
     async action(ctx: DashboardCtx, req): Promise<ActionResult> {
       const p = req.params ?? {};
       switch (req.key) {
+        // T0 — shared team bookmark toggle.
+        case "section:links.bookmark":
+          return toggleBookmarkAction(ctx, "link", p);
         // T0 (catalog-create tier) — mint a checkout URL for one price.
         case "section:links.create": {
           const priceId = typeof p.price === "string" && PRICE_RE.test(p.price) ? p.price : null;
@@ -105,6 +117,7 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
         },
       ],
     },
+    linksTabs(""),
     {
       type: "table",
       key: "links",
@@ -159,9 +172,102 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
   return { title: "Payment links", crumbs: [{ label: "Payment links" }], blocks };
 }
 
+// Tab row under the H1 — value "" is Payment links, "sessions" the checkout
+// sessions the links (and the API) minted.
+function linksTabs(view: string): Block {
+  return {
+    type: "tabs",
+    key: "view",
+    value: view || undefined,
+    items: [
+      { value: "", label: "Payment links" },
+      { value: "sessions", label: "Checkout sessions" },
+    ],
+  };
+}
+
+// ---- Checkout sessions (PA-12, read-only) ----
+
+function sessionBadge(status: string | null): Badge {
+  return status === "complete"
+    ? { kind: "ok", text: "Complete" }
+    : status === "expired"
+      ? { kind: "neutral", text: "Expired" }
+      : { kind: "info", text: "Open" };
+}
+
+async function sessionsList(ctx: DashboardCtx, filters: Record<string, string>, cursor: string | null): Promise<SectionPage> {
+  const statusFilter = SESSION_STATUSES.includes(str(filters.status, 12) as (typeof SESSION_STATUSES)[number])
+    ? (str(filters.status, 12) as (typeof SESSION_STATUSES)[number])
+    : undefined;
+  const rawCursor = validCursor(cursor) ?? "";
+  const startingAfter = SESSION_ID_RE.test(rawCursor) ? rawCursor : undefined;
+  const { sessions, hasMore } = await ctx.stripe.listCheckoutSessions({
+    limit: 25,
+    ...(statusFilter ? { status: statusFilter } : {}),
+    ...(startingAfter ? { startingAfter } : {}),
+  });
+
+  const blocks: Block[] = [
+    { type: "header", title: "Payment links" },
+    linksTabs("sessions"),
+    {
+      type: "table",
+      key: "sessions",
+      columns: [
+        { key: "amount", label: "Amount" },
+        { key: "mode", label: "Mode" },
+        { key: "customer", label: "Customer" },
+        { key: "created", label: "Created" },
+        { key: "url", label: "URL" },
+        { key: "id", label: "ID" },
+      ],
+      filters: [
+        {
+          key: "status",
+          label: "Status",
+          kind: "select",
+          value: statusFilter,
+          options: SESSION_STATUSES.map((s) => ({ value: s, label: sentence(s) })),
+        },
+      ],
+      exportable: true,
+      rows: sessions.map((s) => {
+        const custId = typeof s.customer === "string" ? s.customer : s.customer?.id ?? null;
+        const custLabel = custId ?? s.customer_details?.email ?? null;
+        return {
+          id: s.id,
+          cells: [
+            // Setup-mode sessions have no amount — the status pill stands alone.
+            s.amount_total != null && s.currency
+              ? amount(ctx.stripe, s.amount_total, s.currency, sessionBadge(s.status))
+              : badgeCell(sessionBadge(s.status).kind, sessionBadge(s.status).text),
+            text(sentence(s.mode ?? "payment")),
+            custId
+              ? ({ t: "link", v: custLabel ?? custId, ref: { page: "customers.detail", params: { id: custId } } } as Cell)
+              : text(custLabel ?? "—"),
+            dateCell(s.created),
+            // The checkout URL only works (and only exists) while open.
+            s.status === "open" && s.url
+              ? ({ t: "external", v: "Open checkout ↗", href: s.url, copy: true } as Cell)
+              : text("—"),
+            idCell(s.id, { copy: true }),
+          ] as Cell[],
+        };
+      }),
+      nextCursor: hasMore && sessions.length > 0 ? sessions[sessions.length - 1].id : null,
+      empty: statusFilter ? "No checkout sessions with this status (within this window)." : "No checkout sessions yet.",
+      ...(sessions.length ? { footer: `${sessions.length}${hasMore ? "+" : ""} item${sessions.length === 1 ? "" : "s"}` } : {}),
+      notice: "Read-only — sessions are minted by payment links and the API; open URLs die when the session expires.",
+    },
+  ];
+  return { title: "Payment links", crumbs: [{ label: "Payment links" }], blocks };
+}
+
 async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
   const link = await ctx.stripe.getPaymentLink(id).catch(() => null);
   if (!link) return notFound("This payment link does not exist.");
+  const bookmarked = await isBookmarkedSafe(ctx, "link", id);
   const items = link.line_items?.data ?? [];
   const after =
     link.after_completion?.type === "redirect"
@@ -184,6 +290,7 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
               summary: "Kills the URL — customers holding it see an error page until reactivation.",
             }
           : { key: "section:links.toggle", label: "Reactivate", style: "primary", params: { id: link.id, active: true } },
+        bookmarkButton("section:links.bookmark", bookmarked, link.id, sellsLabel(link)),
       ],
     },
     {

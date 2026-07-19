@@ -2,20 +2,13 @@
 // block; this code just draws it. Dynamic text via textContent only.
 
 export const clientBlocks = `
+// Real copyable path hrefs (PA-13): delegates to the router's D.hrefFor
+// (defined in clientApp — modules all share one IIFE, calls happen at render
+// time). Anchors carry /billing/… URLs; D.bindLinks SPA-intercepts left
+// clicks while ctrl/middle-click open real tabs.
 D.refHref = function (ref) {
   if (!ref) return null;
-  var parts = ref.page.split(".");
-  var seg = [parts[0]];
-  var id = ref.params && ref.params.id;
-  if (id) seg.push(id);
-  if (parts.length > 1 && parts[1] !== "detail") seg.push(parts[1]);
-  var href = "#/" + seg.map(encodeURIComponent).join("/");
-  var fs = [];
-  Object.keys(ref.filters || {}).forEach(function (k) {
-    if (ref.filters[k]) fs.push("f_" + encodeURIComponent(k) + "=" + encodeURIComponent(ref.filters[k]));
-  });
-  if (fs.length) href += "?" + fs.join("&");
-  return href;
+  return D.hrefFor(ref.page, ref.params || {}, ref.filters || {});
 };
 
 // Card-brand chip label (text stand-in for the brand logo — CSP forbids images).
@@ -279,6 +272,17 @@ D.csvField = function (s) {
   s = s == null ? "" : String(s);
   return /[",\\r\\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
 };
+// Blob download sink (CSV exports, quote PDFs). Object URLs work under CSPs
+// that block data: URIs; data may be a string or a Uint8Array.
+D.saveBlob = function (name, mime, data) {
+  var blob = new Blob([data], { type: mime });
+  var url = URL.createObjectURL(blob);
+  var a = document.createElement("a");
+  a.href = url;
+  a.download = name;
+  document.body.appendChild(a); a.click();
+  setTimeout(function () { document.body.removeChild(a); URL.revokeObjectURL(url); }, 60);
+};
 D.exportCsv = function (b, visIdx, ids) {
   var cols = b.columns || [];
   var rows = b.rows || [];
@@ -287,11 +291,7 @@ D.exportCsv = function (b, visIdx, ids) {
   rows.forEach(function (r) {
     lines.push(visIdx.map(function (i) { return D.csvField(D.cellText((r.cells || [])[i])); }).join(","));
   });
-  var a = document.createElement("a");
-  a.href = "data:text/csv;charset=utf-8," + encodeURIComponent(lines.join("\\r\\n"));
-  a.download = (b.key || "export") + ".csv";
-  document.body.appendChild(a); a.click();
-  setTimeout(function () { document.body.removeChild(a); }, 60);
+  D.saveBlob((b.key || "export") + ".csv", "text/csv;charset=utf-8", lines.join("\\r\\n"));
 };
 
 // "Edit columns" popover — show/hide, persisted per table key; re-renders in place.
@@ -591,8 +591,11 @@ D.filterPill = function (f) {
     pill.appendChild(D.el("span", null, f.label));
   } else {
     var valLabel = f.value;
-    if (f.kind === "select") {
+    if (f.kind === "select" || f.kind === "daterange") {
       (f.options || []).forEach(function (o) { if (o.value === f.value) valLabel = o.label; });
+    }
+    if (f.kind === "daterange" && f.value.indexOf("..") > 0) {
+      valLabel = f.value.split("..").join(" \\u2013 ");
     }
     pill.appendChild(D.el("span", "plab", f.label));
     pill.appendChild(D.el("span", "psep", "|"));
@@ -604,7 +607,33 @@ D.filterPill = function (f) {
   }
   var pop = D.el("div", "fpop");
   pop.appendChild(D.el("label", null, f.label));
-  if (f.kind === "select") {
+  if (f.kind === "daterange") {
+    // Preset select + a "Custom…" two-date row (PA-13). One filter value:
+    // preset token or "YYYY-MM-DD..YYYY-MM-DD".
+    var isRange = !!f.value && f.value.indexOf("..") > 0;
+    var dsel = document.createElement("select");
+    dsel.appendChild(new Option("All", ""));
+    (f.options || []).forEach(function (o) { dsel.appendChild(new Option(o.label, o.value)); });
+    dsel.appendChild(new Option("Custom\\u2026", "custom"));
+    dsel.value = isRange ? "custom" : (f.value || "");
+    pop.appendChild(dsel);
+    var rangeRow = D.el("div", "rangerow");
+    var d1 = document.createElement("input"); d1.type = "date";
+    var d2 = document.createElement("input"); d2.type = "date";
+    if (isRange) { var rp = f.value.split(".."); d1.value = rp[0]; d2.value = rp[1]; }
+    var rgo = D.el("button", "btn sm primary", "Apply");
+    rgo.type = "button";
+    rgo.addEventListener("click", function () {
+      if (d1.value && d2.value) D.applyFilter(f.key, d1.value + ".." + d2.value);
+    });
+    rangeRow.appendChild(d1); rangeRow.appendChild(d2); rangeRow.appendChild(rgo);
+    rangeRow.hidden = !isRange;
+    dsel.addEventListener("change", function () {
+      if (dsel.value === "custom") { rangeRow.hidden = false; return; }
+      D.applyFilter(f.key, dsel.value);
+    });
+    pop.appendChild(rangeRow);
+  } else if (f.kind === "select") {
     var sel = document.createElement("select");
     sel.appendChild(new Option("All", ""));
     (f.options || []).forEach(function (o) { sel.appendChild(new Option(o.label, o.value)); });

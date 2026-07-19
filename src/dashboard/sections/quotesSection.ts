@@ -1,6 +1,7 @@
 import type Stripe from "stripe";
 import { ActionButton, ActionResult, Badge, Block, Cell } from "../renderer/contract";
 import { DashboardCtx, DashboardSectionModule, SectionPage, str, validCursor } from "./types";
+import { bookmarkButton, isBookmarkedSafe, toggleBookmarkAction } from "./bookmarks";
 import { badgeCell, dateCell, idCell, money, sentence, strong, text, windowCount } from "./cells";
 
 // Quotes (#/quotes, PA-7b): price proposals with a lifecycle — draft → open
@@ -15,6 +16,9 @@ const PRICE_RE = /^price_[A-Za-z0-9]{1,64}$/;
 const CUSTOMER_RE = /^cus_[A-Za-z0-9]{1,64}$/;
 
 const STATUSES: Stripe.Quote.Status[] = ["draft", "open", "accepted", "canceled"];
+
+// PDFs are tens of KB; 2MB bounds the b64 JSON response the channel carries.
+const QUOTE_PDF_MAX_BYTES = 2 * 1024 * 1024;
 
 export function makeQuotesSection(): DashboardSectionModule {
   return {
@@ -55,6 +59,29 @@ export function makeQuotesSection(): DashboardSectionModule {
       if (!id) return { ok: false, error: "Bad quote id." };
       const confirmed = req.confirmWord === "CONFIRM";
       switch (req.key) {
+        // T0 — shared team bookmark toggle.
+        case "section:quotes.bookmark":
+          return toggleBookmarkAction(ctx, "quote", p);
+        // T0 — download the finalized PDF (Stripe renders PDFs for open and
+        // accepted quotes only; drafts have none). The bytes ride the JSON
+        // channel as b64 (ActionResult.file), size-capped in StripeClient.
+        case "section:quotes.pdf": {
+          const quote = await ctx.stripe.getQuote(id).catch(() => null);
+          if (!quote) return { ok: false, error: "This quote does not exist." };
+          if (quote.status !== "open" && quote.status !== "accepted") {
+            return { ok: false, error: `Quote is ${quote.status} — PDFs exist for open or accepted quotes only.` };
+          }
+          const pdf = await ctx.stripe.getQuotePdf(id, QUOTE_PDF_MAX_BYTES);
+          if (!pdf) {
+            return { ok: false, error: "Could not fetch the PDF (too large or not a PDF) — use the Stripe Dashboard." };
+          }
+          await ctx.audit(`Quote ${id} PDF downloaded (${pdf.length} bytes)`);
+          return {
+            ok: true,
+            text: `Quote PDF ready (${Math.max(1, Math.round(pdf.length / 1024))} KB).`,
+            file: { name: `${quote.number ?? quote.id}.pdf`, mime: "application/pdf", b64: pdf.toString("base64") },
+          };
+        }
         // T1 — draft → open: assigns the number, customer can accept.
         case "section:quotes.finalize": {
           if (!confirmed) return { ok: false, error: "Type CONFIRM to run this action." };
@@ -213,6 +240,7 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
 async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
   const quote = await ctx.stripe.getQuote(id).catch(() => null);
   if (!quote) return notFound("This quote does not exist.");
+  const bookmarked = await isBookmarkedSafe(ctx, "quote", id);
   const items = quote.line_items?.data ?? [];
   const cust = customerBits(quote);
   const subId = typeof quote.subscription === "string" ? quote.subscription : quote.subscription?.id ?? null;
@@ -220,6 +248,11 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
 
   // Status-aware writes: finalize/cancel while draft, accept/cancel while open.
   const actions: ActionButton[] = [];
+  if (quote.status === "open" || quote.status === "accepted") {
+    // No inputs, not dangerous → modal-less simple dispatch; the response
+    // carries the PDF as ActionResult.file.
+    actions.push({ key: "section:quotes.pdf", label: "Download PDF", params: { id: quote.id } });
+  }
   if (quote.status === "draft") {
     actions.push({
       key: "section:quotes.finalize",
@@ -252,6 +285,7 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
       summary: "Cancels the quote — it can no longer be finalized or accepted.",
     });
   }
+  actions.push(bookmarkButton("section:quotes.bookmark", bookmarked, quote.id, quote.number ?? quote.id));
 
   const main: Block[] = [
     {

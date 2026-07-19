@@ -1,6 +1,18 @@
 import { BillingBookmark, BillingNote, PrismaClient } from "../../generated/prisma/client";
 
-export type BillingObjectType = "dispute" | "customer" | "charge";
+// dispute/customer/charge are the original trio (Discord notes panels use
+// them too); the rest arrived with the dashboard's bookmark-everything pass
+// (PA-13) — the DB column is a plain string, so this is code-level only.
+export type BillingObjectType =
+  | "dispute"
+  | "customer"
+  | "charge"
+  | "subscription"
+  | "invoice"
+  | "payout"
+  | "link"
+  | "quote"
+  | "product";
 
 // Team-visible notes + the shared bookmark board for billing objects
 // (disputes/customers/charges). Notes mirror the ticket_notes shape; the

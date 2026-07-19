@@ -97,6 +97,30 @@ export function chipCount(searchN: number | null, windowN: number, windowOverflo
   return searchN != null ? searchCountLabel(searchN) : windowCount(windowN, windowOverflowed);
 }
 
+// One-line postal address ("1 Main St, 10115 Berlin, DE") or null when unset.
+export function fmtAddress(a?: Stripe.Address | null): string | null {
+  if (!a) return null;
+  const parts = [a.line1, a.line2, [a.postal_code, a.city].filter(Boolean).join(" ").trim(), a.state, a.country]
+    .map((p) => (p ? String(p).trim() : ""))
+    .filter(Boolean);
+  return parts.length ? parts.join(", ") : null;
+}
+
+// Route a Stripe object id to its dashboard page (shared by the Home feed and
+// the Events page; null when we have no page for that object family).
+export function refForId(id: string): ObjectRef | null {
+  if (/^cus_/.test(id)) return { page: "customers.detail", params: { id } };
+  if (/^(ch|py|pi)_/.test(id)) return { page: "payments.detail", params: { id } };
+  if (/^po_/.test(id)) return { page: "balances.detail", params: { id } };
+  if (/^sub_/.test(id)) return { page: "subscriptions.detail", params: { id } };
+  if (/^in_/.test(id)) return { page: "invoices.detail", params: { id } };
+  if (/^(dp|du)_/.test(id)) return { page: "disputes.detail", params: { id } };
+  if (/^plink_/.test(id)) return { page: "links.detail", params: { id } };
+  if (/^qt_/.test(id)) return { page: "quotes.detail", params: { id } };
+  if (/^prod_/.test(id)) return { page: "catalog.detail", params: { id } };
+  return null;
+}
+
 // Stripe pills are sentence case ("Past due"), never raw enum values.
 export function sentence(status: string): string {
   const s = status.replace(/_/g, " ");

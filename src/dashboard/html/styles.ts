@@ -36,6 +36,36 @@ export function dashboardCss(): string {
   /* Global "+ Create" menu (PA-8): reuses the ··· popover chrome. */
   .topbar .createwrap .morepop { right:0; left:auto; min-width:220px; }
 
+  /* Needs-attention bell (PA-13): same popover chrome, wider for the labels. */
+  .topbar .bellwrap .morepop { right:0; left:auto; min-width:320px; max-width:420px; max-height:60vh; overflow-y:auto; }
+  #bellbtn { position:relative; display:inline-flex; align-items:center; gap:4px; padding:6px 8px; }
+  #bellbtn svg { width:15px; height:15px; }
+  #bellbtn .navcount { position:absolute; top:-5px; right:-6px; }
+  .bellitem { display:flex; align-items:flex-start; gap:8px; text-align:left; white-space:normal; }
+  .bellitem .belllabel { flex:1; min-width:0; font-size:13px; line-height:1.35; }
+  .bellitem .badge { flex:0 0 auto; margin-top:1px; }
+
+  /* Hover peek card (PA-13): singleton fixed card, viewport-clamped. */
+  .peekcard { position:fixed; z-index:60; background:var(--surface); border:1px solid var(--border);
+    border-radius:10px; box-shadow:var(--shadow-pop); padding:12px 14px; max-width:320px; min-width:200px;
+    pointer-events:auto; }
+  .peekcard .peekhead { display:flex; align-items:center; gap:8px; margin:0 0 6px; flex-wrap:wrap; }
+  .peekcard .peektitle { font-weight:600; color:var(--heading); font-size:14px; }
+  .peekcard .peekline { color:var(--muted); font-size:12.5px; line-height:1.5; overflow-wrap:anywhere; }
+
+  /* daterange filter (PA-13): the custom two-date row inside the pill popover. */
+  .fpop .rangerow { display:flex; gap:6px; align-items:center; flex-wrap:wrap; }
+  .fpop .rangerow input[type=date] { font-size:12.5px; padding:5px 7px; }
+
+  /* ?-help dialog (PA-13). */
+  .helptable { border-collapse:collapse; margin:8px 0 4px; }
+  .helptable td { padding:5px 14px 5px 0; font-size:13.5px; color:var(--muted); }
+  .helptable kbd { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:11.5px; color:var(--heading);
+    background:var(--fill); border:1px solid var(--border-strong); border-radius:4px; padding:1px 5px; }
+
+  #menubtn { display:none; }
+  #scrim { display:none; }
+
   /* Command palette (⌘K) under the topbar search box. */
   .palpop { position:absolute; top:calc(100% + 8px); left:0; width:560px; max-width:min(80vw,560px); z-index:30;
     background:var(--surface); border:1px solid var(--border); border-radius:12px; box-shadow:var(--shadow-pop);
@@ -130,6 +160,15 @@ export function dashboardCss(): string {
   .stat.link:hover { border-color:var(--accent); }
 
   .tablewrap { overflow-x:auto; margin:0 -20px; padding:0 20px; }
+  /* Sticky table headers (PA-13, desktop only): overflow-x:auto makes
+     .tablewrap the scroll container and kills sticky — desktop gives up
+     h-scroll for pinned headers; mobile keeps the trade the other way.
+     Sections are transparent, so the th background is the PAGE token. */
+  @media (min-width:761px) {
+    .tablewrap { overflow-x:visible; }
+    .tablewrap thead th { position:sticky; top:56px; background:var(--bg); z-index:2;
+      box-shadow:0 1px 0 var(--border); }
+  }
   td .sub { display:block; color:var(--faint); font-size:12px; }
   td.money { font-variant-numeric:tabular-nums; font-weight:500; white-space:nowrap; }
   td.money.pos { color:var(--ok); }
@@ -346,15 +385,24 @@ export function dashboardCss(): string {
   @keyframes shimmer { to { background-position:-200% 0; } }
   @media (prefers-reduced-motion: reduce) { .skel { animation:none; } .spinner { animation:none; } }
 
+  /* Mobile pass (PA-13): hamburger + sliding drawer replaces the old
+     horizontal nav strip; tables keep overflow-x h-scroll. */
   @media (max-width:760px) {
     #app { grid-template-columns:1fr; }
-    .side { position:static; height:auto; flex-direction:row; align-items:center; overflow-x:auto; padding:10px 12px; }
-    .brand { padding:4px 8px; }
-    #nav { flex-direction:row; }
-    #nav .navsep { padding:0 6px; }
+    .side { position:fixed; left:0; top:0; bottom:0; width:242px; z-index:40; background:var(--bg);
+      border-right:1px solid var(--border); transform:translateX(-100%); transition:transform .18s ease;
+      height:100vh; height:100dvh; }
+    .side.open { transform:translateX(0); box-shadow:var(--shadow-pop); }
+    #scrim.show { display:block; position:fixed; inset:0; background:rgba(0,0,0,.35); z-index:35; }
+    #menubtn { display:inline-flex; padding:6px 10px; }
     main { padding:18px 16px 70px; }
     .kv .kvrow { grid-template-columns:1fr; gap:2px; }
-    .topbar { padding:0 16px; }
+    .topbar { padding:0 12px; gap:8px; }
+    .tablewrap { -webkit-overflow-scrolling:touch; }
+    .countcard { min-width:88px; padding:8px 10px; }
+    .countcard .cnum { font-size:16px; }
+    .palpop { width:calc(100vw - 24px); max-width:calc(100vw - 24px); }
   }
+  @media (max-width:560px) { .topbar .who { display:none; } }
   `;
 }

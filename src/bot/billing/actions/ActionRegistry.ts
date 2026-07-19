@@ -1,5 +1,5 @@
 import type Stripe from "stripe";
-import { StripeClient } from "../../StripeClient";
+import { StripeClient, rebuildCurrentPhase } from "../../StripeClient";
 import { SessionStore } from "../../../auth/SessionStore";
 import { SettingsStore, BillingActionLevel } from "../../../config/SettingsStore";
 import { BlockService, BlockEntry } from "../BlockService";
@@ -317,6 +317,57 @@ const paymentIntentCancel = defineAction<PaymentIntentCancelParams>({
   },
 });
 
+interface PaymentIntentCaptureParams {
+  paymentIntentId: string;
+  amountMinor?: number;
+}
+
+// Capture is the moment the customer's card is actually charged — T1 via
+// dangerous here, plus an unconditional T2 step-up in Dashboard.ts (DASH_T2),
+// the same class as charge.create.
+const paymentIntentCapture = defineAction<PaymentIntentCaptureParams>({
+  key: "payment_intent.capture",
+  label: "Capture payment",
+  group: "Charges",
+  defaultLevel: "none",
+  dangerous: true,
+  parseParams: (raw) => {
+    const o = obj(raw);
+    const paymentIntentId = o ? idWithPrefix(o.paymentIntentId, "pi_") : null;
+    if (!paymentIntentId) return { ok: false, error: "paymentIntentId (pi_…) required" };
+    const amountMinor = o && o.amountMinor != null ? posInt(o.amountMinor) : null;
+    if (o && o.amountMinor != null && !amountMinor) return { ok: false, error: "amountMinor must be a positive integer" };
+    return { ok: true, params: { paymentIntentId, ...(amountMinor ? { amountMinor } : {}) } };
+  },
+  summarize: (p) =>
+    p.amountMinor
+      ? `Capture ${p.amountMinor} minor units of ${p.paymentIntentId} (the remainder is released)`
+      : `Capture the full authorized amount of ${p.paymentIntentId}`,
+  revalidate: async (ctx, p) => {
+    const cus = requireCustomer(ctx);
+    if (!cus) return "No linked Stripe customer.";
+    const pi = await ctx.stripe.getPaymentIntent(p.paymentIntentId);
+    if (customerIdOf(pi) !== cus) return "Payment intent does not belong to this customer.";
+    if (pi.status !== "requires_capture") return `Payment intent is ${pi.status} — only requires_capture payments can be captured.`;
+    if (p.amountMinor != null && p.amountMinor > (pi.amount_capturable ?? 0)) {
+      return `Amount exceeds the capturable remainder (${pi.amount_capturable ?? 0} minor units).`;
+    }
+    return null;
+  },
+  execute: async (ctx, p) => {
+    const pi = await ctx.stripe.capturePaymentIntent(
+      p.paymentIntentId,
+      p.amountMinor,
+      `panel-picapture-${p.paymentIntentId}-${ctx.idemScope}`
+    );
+    const captured = pi.amount_received ?? p.amountMinor ?? pi.amount;
+    return {
+      ok: true,
+      text: `Captured ${fmt(ctx.stripe, captured, pi.currency)} of ${pi.id}.${p.amountMinor ? " The uncaptured remainder was released." : ""}`,
+    };
+  },
+});
+
 interface SubscriptionCancelParams {
   subscriptionId: string;
   when: "now" | "period_end";
@@ -499,6 +550,8 @@ interface SubscriptionTermsParams {
   subscriptionId: string;
   trialEndUnix?: number;
   quantity?: number;
+  // Ends a running trial immediately — billing starts NOW (T2 in Dashboard.ts).
+  endTrialNow?: boolean;
 }
 
 const subscriptionTerms = defineAction<SubscriptionTermsParams>({
@@ -512,13 +565,18 @@ const subscriptionTerms = defineAction<SubscriptionTermsParams>({
     const subscriptionId = o ? idWithPrefix(o.subscriptionId, "sub_") : null;
     const trialEndUnix = o ? (posInt(o.trialEndUnix) ?? undefined) : undefined;
     const quantity = o ? (posInt(o.quantity) ?? undefined) : undefined;
-    if (!subscriptionId || (trialEndUnix == null && quantity == null)) {
-      return { ok: false, error: "subscriptionId (sub_…) and at least one of trialEndUnix/quantity required" };
+    const endTrialNow = o?.endTrialNow === true ? true : undefined;
+    if (!subscriptionId || (trialEndUnix == null && quantity == null && !endTrialNow)) {
+      return { ok: false, error: "subscriptionId (sub_…) and at least one of trialEndUnix/quantity/endTrialNow required" };
     }
-    return { ok: true, params: { subscriptionId, trialEndUnix, quantity } };
+    if (endTrialNow && trialEndUnix != null) {
+      return { ok: false, error: "endTrialNow and trialEndUnix are mutually exclusive" };
+    }
+    return { ok: true, params: { subscriptionId, trialEndUnix, quantity, endTrialNow } };
   },
   summarize: (p) =>
     `Update ${p.subscriptionId}: ${[
+      p.endTrialNow ? "END TRIAL NOW (billing starts immediately)" : null,
       p.trialEndUnix != null ? `trial end → ${new Date(p.trialEndUnix * 1000).toISOString().slice(0, 10)}` : null,
       p.quantity != null ? `quantity → ${p.quantity}` : null,
     ]
@@ -530,11 +588,16 @@ const subscriptionTerms = defineAction<SubscriptionTermsParams>({
     const sub = await ctx.stripe.getSubscription(p.subscriptionId);
     if (customerIdOf(sub) !== cus) return "Subscription does not belong to this customer.";
     if (sub.status === "canceled") return "Subscription is canceled.";
+    if (p.endTrialNow && sub.status !== "trialing") return `Subscription is ${sub.status} — no trial to end.`;
     if (p.trialEndUnix != null && p.trialEndUnix * 1000 <= Date.now()) return "Trial end must be in the future.";
     return null;
   },
   execute: async (ctx, p) => {
     const done: string[] = [];
+    if (p.endTrialNow) {
+      await ctx.stripe.setTrialEnd(p.subscriptionId, "now", `panel-trialnow-${p.subscriptionId}-${ctx.idemScope}`);
+      done.push("trial ended — billing starts now");
+    }
     if (p.trialEndUnix != null) {
       await ctx.stripe.setTrialEnd(p.subscriptionId, p.trialEndUnix, `panel-trial-${p.subscriptionId}-${p.trialEndUnix}-${ctx.idemScope}`);
       done.push(`trial end set to ${new Date(p.trialEndUnix * 1000).toISOString().slice(0, 10)}`);
@@ -705,6 +768,150 @@ const subscriptionItems = defineAction<SubscriptionItemsParams>({
       `panel-itemrm-${p.subscriptionId}-${p.itemId}-${ctx.idemScope}`
     );
     return { ok: true, text: `Removed item ${p.itemId} from ${p.subscriptionId} with prorations.` };
+  },
+});
+
+// ---- subscription schedules (PA-11) ----
+
+interface SchedulePhaseParam {
+  priceId: string;
+  quantity: number;
+  durationCount: number;
+  durationUnit: "day" | "week" | "month" | "year";
+  trial?: boolean;
+  proration?: "none" | "create_prorations";
+}
+
+interface SubscriptionScheduleOpParams {
+  subscriptionId: string;
+  op: "set_phases" | "release" | "cancel";
+  phases?: SchedulePhaseParam[];
+  endBehavior?: "release" | "cancel";
+}
+
+const SCHEDULE_MAX_PHASES = 5;
+const DURATION_UNITS = new Set(["day", "week", "month", "year"]);
+
+// One action, one /config level, for the whole schedule lifecycle: replace
+// future phases / release (sub continues on current terms) / cancel (CANCELS
+// THE SUBSCRIPTION — T2 param-aware in Dashboard.ts). Phase 0 is ALWAYS
+// rebuilt server-side from the live schedule (rebuildCurrentPhase) — a
+// hostile client cannot touch the current phase by construction.
+const subscriptionSchedule = defineAction<SubscriptionScheduleOpParams>({
+  key: "subscription.schedule",
+  label: "Subscription schedule",
+  group: "Subscriptions",
+  defaultLevel: "none",
+  dangerous: true,
+  parseParams: (raw) => {
+    const o = obj(raw);
+    const subscriptionId = o ? idWithPrefix(o.subscriptionId, "sub_") : null;
+    const op = o && (o.op === "set_phases" || o.op === "release" || o.op === "cancel") ? o.op : null;
+    if (!subscriptionId || !op) return { ok: false, error: "subscriptionId (sub_…) and op (set_phases|release|cancel) required" };
+    if (op !== "set_phases") return { ok: true, params: { subscriptionId, op } };
+    const rawPhases = o && Array.isArray(o.phases) ? o.phases : null;
+    if (!rawPhases || rawPhases.length < 1 || rawPhases.length > SCHEDULE_MAX_PHASES) {
+      return { ok: false, error: `phases must have 1-${SCHEDULE_MAX_PHASES} entries` };
+    }
+    const phases: SchedulePhaseParam[] = [];
+    for (const entry of rawPhases) {
+      const po = obj(entry);
+      const priceId = po ? idWithPrefix(po.priceId, "price_") : null;
+      const quantity = po ? posInt(po.quantity) : null;
+      const durationCount = po ? posInt(po.durationCount) : null;
+      const durationUnit = po && typeof po.durationUnit === "string" && DURATION_UNITS.has(po.durationUnit) ? (po.durationUnit as SchedulePhaseParam["durationUnit"]) : null;
+      if (!priceId || !quantity || quantity > 999 || !durationCount || durationCount > 36 || !durationUnit) {
+        return { ok: false, error: "each phase needs priceId (price_…), quantity 1-999, durationCount 1-36 and durationUnit day|week|month|year" };
+      }
+      phases.push({
+        priceId,
+        quantity,
+        durationCount,
+        durationUnit,
+        ...(po!.trial === true ? { trial: true } : {}),
+        proration: po!.proration === "none" ? "none" : "create_prorations",
+      });
+    }
+    const endBehavior = o?.endBehavior === "cancel" ? ("cancel" as const) : ("release" as const);
+    return { ok: true, params: { subscriptionId, op, phases, endBehavior } };
+  },
+  summarize: (p) =>
+    p.op === "cancel"
+      ? `CANCEL the schedule AND subscription ${p.subscriptionId} immediately`
+      : p.op === "release"
+        ? `Release the schedule on ${p.subscriptionId} (subscription continues on current terms)`
+        : `Schedule ${p.phases!.length} future phase(s) on ${p.subscriptionId}, then ${p.endBehavior === "cancel" ? "CANCEL the subscription" : "continue on the last phase's terms"}`,
+  revalidate: async (ctx, p) => {
+    const cus = requireCustomer(ctx);
+    if (!cus) return "No linked Stripe customer.";
+    const sub = await ctx.stripe.getSubscription(p.subscriptionId);
+    if (customerIdOf(sub) !== cus) return "Subscription does not belong to this customer.";
+    const scheduleId = typeof sub.schedule === "string" ? sub.schedule : sub.schedule?.id ?? null;
+    if (p.op === "release" || p.op === "cancel") {
+      if (!scheduleId) return "No schedule is attached to this subscription.";
+      const schedule = await ctx.stripe.getSubscriptionSchedule(scheduleId);
+      if (schedule.status !== "active" && schedule.status !== "not_started") {
+        return `Schedule is ${schedule.status} — nothing to ${p.op}.`;
+      }
+      if (p.op === "cancel" && sub.status === "canceled") return "Subscription is already canceled.";
+      return null;
+    }
+    if (sub.status !== "active" && sub.status !== "trialing") return `Subscription is ${sub.status}.`;
+    if (scheduleId) {
+      const schedule = await ctx.stripe.getSubscriptionSchedule(scheduleId);
+      if (schedule.status !== "active" && schedule.status !== "not_started") {
+        return `Schedule is ${schedule.status} — release it first.`;
+      }
+    }
+    const allowlist = ctx.settingsStore.allowedPriceIds();
+    for (const phase of p.phases!) {
+      const price = await ctx.stripe.getPrice(phase.priceId).catch(() => null);
+      if (!price) return `Price ${phase.priceId} does not exist.`;
+      if (!price.active) return `Price ${phase.priceId} is archived.`;
+      if (!price.recurring) return `Price ${phase.priceId} is not recurring.`;
+      if (allowlist.length > 0 && !allowlist.includes(phase.priceId)) {
+        return `Price ${phase.priceId} is not on the plan allowlist (/config → Billing).`;
+      }
+    }
+    return null;
+  },
+  execute: async (ctx, p) => {
+    const sub = await ctx.stripe.getSubscription(p.subscriptionId);
+    let scheduleId = typeof sub.schedule === "string" ? sub.schedule : sub.schedule?.id ?? null;
+    if (p.op === "release") {
+      await ctx.stripe.releaseSchedule(scheduleId!, `panel-schedrel-${p.subscriptionId}-${ctx.idemScope}`);
+      return { ok: true, text: `Schedule released — ${p.subscriptionId} continues on its current terms; future phases are discarded.` };
+    }
+    if (p.op === "cancel") {
+      await ctx.stripe.cancelSchedule(scheduleId!, `panel-schedcancel-${p.subscriptionId}-${ctx.idemScope}`);
+      return { ok: true, text: `Schedule canceled — subscription ${p.subscriptionId} is now CANCELED.` };
+    }
+    if (!scheduleId) {
+      const created = await ctx.stripe.createScheduleFromSubscription(p.subscriptionId, `panel-schedmk-${p.subscriptionId}-${ctx.idemScope}`);
+      scheduleId = created.id;
+    }
+    const schedule = await ctx.stripe.getSubscriptionSchedule(scheduleId);
+    const { phase: currentPhase, unsupported } = rebuildCurrentPhase(schedule);
+    if (unsupported.length > 0) {
+      return { ok: false, error: `The current phase has settings this editor can't preserve (${unsupported.join("; ")}) — edit in the Stripe dashboard.` };
+    }
+    const futurePhases: Stripe.SubscriptionScheduleUpdateParams.Phase[] = p.phases!.map((phase) => ({
+      items: [{ price: phase.priceId, quantity: phase.quantity }],
+      duration: { interval: phase.durationUnit, interval_count: phase.durationCount },
+      ...(phase.trial ? { trial: true } : {}),
+      proration_behavior: phase.proration ?? "create_prorations",
+    }));
+    await ctx.stripe.updateSchedulePhases(
+      scheduleId,
+      { phases: [currentPhase, ...futurePhases], endBehavior: p.endBehavior ?? "release" },
+      `panel-sched-${p.subscriptionId}-${ctx.idemScope}`
+    );
+    return {
+      ok: true,
+      text: `Scheduled ${p.phases!.length} future phase(s) on ${p.subscriptionId} — after the last phase the subscription ${
+        p.endBehavior === "cancel" ? "CANCELS" : "continues on that phase's terms"
+      }.`,
+    };
   },
 });
 
@@ -933,30 +1140,59 @@ const invoiceCreditNote = defineAction<InvoiceCreditNoteParams>({
 });
 
 interface CustomerCouponParams {
-  subscriptionId: string;
+  // apply targets a subscription; remove targets a subscription OR the
+  // customer-level discount (exactly one id present).
+  subscriptionId?: string;
+  customerId?: string;
+  op: "apply" | "remove";
   promoCode?: string;
   couponId?: string;
 }
 
 const customerCoupon = defineAction<CustomerCouponParams>({
   key: "customer.coupon",
-  label: "Apply coupon / promo",
+  label: "Apply / remove coupon",
   group: "Customer",
   defaultLevel: "none",
-  dangerous: false,
+  dangerous: false, // remove is T1 param-aware in Dashboard.ts (needsConfirm)
   parseParams: (raw) => {
     const o = obj(raw);
-    const subscriptionId = o ? idWithPrefix(o.subscriptionId, "sub_") : null;
-    const promoCode = o ? (str(o.promoCode, 100) ?? undefined) : undefined;
-    const couponId = o ? (str(o.couponId, 100) ?? undefined) : undefined;
-    if (!subscriptionId || (!promoCode && !couponId)) return { ok: false, error: "subscriptionId (sub_…) and promoCode or couponId required" };
-    return { ok: true, params: { subscriptionId, promoCode, couponId } };
+    // op defaults to "apply" so pre-PA-9 payloads (Intercom canvas) keep working.
+    const op = o?.op === "remove" ? ("remove" as const) : ("apply" as const);
+    const subscriptionId = o ? (idWithPrefix(o.subscriptionId, "sub_") ?? undefined) : undefined;
+    if (op === "apply") {
+      const promoCode = o ? (str(o.promoCode, 100) ?? undefined) : undefined;
+      const couponId = o ? (str(o.couponId, 100) ?? undefined) : undefined;
+      if (!subscriptionId || (!promoCode && !couponId)) return { ok: false, error: "subscriptionId (sub_…) and promoCode or couponId required" };
+      return { ok: true, params: { subscriptionId, op, promoCode, couponId } };
+    }
+    const customerId = o ? (idWithPrefix(o.customerId, "cus_") ?? undefined) : undefined;
+    if (!subscriptionId === !customerId) {
+      return { ok: false, error: "remove needs exactly one of subscriptionId (sub_…) or customerId (cus_…)" };
+    }
+    return { ok: true, params: { op, subscriptionId, customerId } };
   },
-  summarize: (p) => `Apply ${p.promoCode ? `promo code ${p.promoCode}` : `coupon ${p.couponId}`} to ${p.subscriptionId}`,
+  summarize: (p) =>
+    p.op === "remove"
+      ? `Remove the discount from ${p.subscriptionId ?? "the customer"}`
+      : `Apply ${p.promoCode ? `promo code ${p.promoCode}` : `coupon ${p.couponId}`} to ${p.subscriptionId}`,
   revalidate: async (ctx, p) => {
     const cus = requireCustomer(ctx);
     if (!cus) return "No linked Stripe customer.";
-    const sub = await ctx.stripe.getSubscription(p.subscriptionId);
+    if (p.op === "remove") {
+      if (p.subscriptionId) {
+        const sub = await ctx.stripe.getSubscription(p.subscriptionId);
+        if (customerIdOf(sub) !== cus) return "Subscription does not belong to this customer.";
+        if ((sub.discounts?.length ?? 0) === 0) return "No discount on this subscription.";
+        return null;
+      }
+      if (p.customerId !== cus) return "Customer id does not match the bound customer.";
+      const customer = await ctx.stripe.getCustomer(cus);
+      if (!customer || customer.deleted) return "Customer no longer exists in Stripe.";
+      if (!customer.discount) return "No customer-level discount.";
+      return null;
+    }
+    const sub = await ctx.stripe.getSubscription(p.subscriptionId!);
     if (customerIdOf(sub) !== cus) return "Subscription does not belong to this customer.";
     if (sub.status !== "active" && sub.status !== "trialing") return `Subscription is ${sub.status}.`;
     if (p.promoCode) {
@@ -966,6 +1202,14 @@ const customerCoupon = defineAction<CustomerCouponParams>({
     return null;
   },
   execute: async (ctx, p) => {
+    if (p.op === "remove") {
+      if (p.subscriptionId) {
+        await ctx.stripe.removeSubscriptionDiscount(p.subscriptionId);
+        return { ok: true, text: `Discount removed from ${p.subscriptionId}. (A customer-level discount, if any, still applies.)` };
+      }
+      await ctx.stripe.removeCustomerDiscount(ctx.stripeCustomerId!);
+      return { ok: true, text: "Customer-level discount removed." };
+    }
     let couponId = p.couponId;
     let label = p.couponId ?? "";
     if (p.promoCode) {
@@ -977,7 +1221,7 @@ const customerCoupon = defineAction<CustomerCouponParams>({
       couponId = typeof coupon === "string" ? coupon : coupon.id;
       label = `promo ${p.promoCode}`;
     }
-    await ctx.stripe.applyDiscountCoupon(p.subscriptionId, couponId!, `panel-coupon-${p.subscriptionId}-${couponId}-${ctx.idemScope}`);
+    await ctx.stripe.applyDiscountCoupon(p.subscriptionId!, couponId!, `panel-coupon-${p.subscriptionId}-${couponId}-${ctx.idemScope}`);
     return { ok: true, text: `Applied ${label || `coupon ${couponId}`} to ${p.subscriptionId}.` };
   },
 });
@@ -1217,6 +1461,7 @@ export const BILLING_ACTIONS: BillingActionDef[] = [
   refundPartial,
   refundFraud,
   paymentIntentCancel,
+  paymentIntentCapture,
   chargeCreate,
   subscriptionCancel,
   subscriptionPauseResume,
@@ -1224,6 +1469,7 @@ export const BILLING_ACTIONS: BillingActionDef[] = [
   subscriptionTerms,
   subscriptionCreate,
   subscriptionItems,
+  subscriptionSchedule,
   invoiceCollect,
   invoiceFinalize,
   invoiceVoid,

@@ -9,8 +9,9 @@ import { amount, cardCell, dateCell, idCell, sentence, text } from "./cells";
 // approve closes the review; "decline" = the existing fraud-refund / PI-cancel
 // registry ladder), the recent early-fraud-warning feed, plus the three
 // account-wide hunts extracted into FraudHuntService — by card fingerprint
-// (multi-account picture), by last4+brand (grouped by fingerprint) and by
-// amount (PaymentIntents — catches DECLINED attempts that never became a
+// (multi-account picture), by last4+brand+status (grouped by fingerprint;
+// "failed" narrows to declined attempts and their PaymentIntents) and by
+// amount (PaymentIntents — catches attempts that never produced any
 // charge). Hunt inputs ride the hash filters, validated hard server-side;
 // hunts NEVER run inside revalidators (the Search API lags ~1 min and must
 // not gate money movement).
@@ -199,6 +200,7 @@ async function cardHunts(ctx: DashboardCtx, deps: { hunts: FraudHuntService }, f
   const fingerprint = str(filters.fp, 64);
   const last4 = str(filters.last4, 4);
   const brand = str(filters.brand, 20);
+  const status = str(filters.status, 9);
   const blocks: Block[] = [];
 
   // Fingerprint hunt: exact card identity across every customer.
@@ -240,6 +242,8 @@ async function cardHunts(ctx: DashboardCtx, deps: { hunts: FraudHuntService }, f
   blocks.push(fpTable);
 
   // last4 hunt: grouped by fingerprint (the exact id for the hunt above).
+  // "Failed only" is the failed-PaymentIntent hunt: declines/blocks DO exist
+  // as failed charges, each pointing at its PI.
   const l4Table: TableBlock = {
     type: "table",
     key: "l4hunt",
@@ -247,29 +251,51 @@ async function cardHunts(ctx: DashboardCtx, deps: { hunts: FraudHuntService }, f
     filters: [
       { key: "last4", label: "Last 4", kind: "text", value: last4 || undefined, placeholder: "4242" },
       { key: "brand", label: "Brand", kind: "text", value: brand || undefined, placeholder: "visa / mastercard / amex" },
+      {
+        key: "status",
+        label: "Status",
+        kind: "select",
+        value: status || undefined,
+        options: [
+          { label: "All attempts", value: "" },
+          { label: "Failed only", value: "failed" },
+          { label: "Succeeded only", value: "succeeded" },
+        ],
+      },
     ],
     columns: [
       { key: "card", label: "Card" },
       { key: "exp", label: "Expires" },
       { key: "charges", label: "Charges", align: "right" },
+      { key: "failed", label: "Failed", align: "right" },
+      { key: "lastfail", label: "Last failure" },
       { key: "customers", label: "Customers" },
       { key: "fp", label: "Fingerprint" },
     ],
     rows: [],
-    empty: last4 ? "No settled charges for that card. Declined attempts never become charges — hunt by amount instead." : "Enter the last 4 digits (brand narrows it).",
+    empty: last4
+      ? "No matching charges. Declined attempts DO show up (as failed charges) — only never-confirmed attempts (abandoned checkout, unfinished 3DS) don't; hunt by amount for those."
+      : "Enter the last 4 digits (brand narrows it; Failed only = declined attempts and their payment intents).",
     notice: `last4 is not unique — rows are grouped by fingerprint; feed one into the exact hunt above. ${SEARCH_LAG_NOTICE}`,
   };
   if (last4) {
-    const result = await deps.hunts.cardsByLast4(last4, brand || undefined);
+    const result = await deps.hunts.cardsByLast4(last4, brand || undefined, status || undefined);
     if (!result.ok) {
       blocks.push({ type: "notice", badge: { kind: "error", text: "Invalid" }, text: result.error });
     } else {
       l4Table.rows = result.rows.map((g, i) => ({
         id: g.fingerprint ?? `nofp-${i}`,
+        ...(g.lastFailure?.piId ? { ref: { page: "payments.detail", params: { id: g.lastFailure.piId } } } : {}),
         cells: [
           cardCell(g.brand, g.last4),
           text(g.exp),
           text(String(g.count)),
+          g.failed
+            ? ({ t: "badge", b: { kind: "error", text: String(g.failed) } as Badge } as Cell)
+            : text("0"),
+          g.lastFailure
+            ? text(`${g.lastFailure.reason ?? "no reason given"} · ${g.lastFailure.piId ?? g.lastFailure.chargeId}`)
+            : text("—"),
           text(
             g.customers
               .slice(0, 3)
@@ -312,7 +338,7 @@ async function amountHunt(ctx: DashboardCtx, deps: { hunts: FraudHuntService }, 
     empty: amountRaw
       ? "No payment attempts for that amount (declined ones included). Different currency, or a different Stripe account?"
       : "Enter the exact amount the customer sees on their statement — declined and issuer-blocked attempts show up here.",
-    notice: `Searches PaymentIntents, so DECLINED / incomplete attempts are included — the ones charge searches are blind to. ${SEARCH_LAG_NOTICE}`,
+    notice: `Searches PaymentIntents, so attempts that never produced a charge (abandoned checkout, unfinished 3DS) are included — the ones the card hunts can't see. ${SEARCH_LAG_NOTICE}`,
   };
   if (amountRaw) {
     const result = await deps.hunts.paymentsByAmount(amountRaw, currency || undefined);

@@ -4,15 +4,17 @@ import { MountedPanelRoute, PanelRequestMeta } from "../server/panelMount";
 import { actionByKey } from "../bot/billing/actions/ActionRegistry";
 import type { ActionActor } from "../bot/billing/actions/BillingActionService";
 import { DashboardAuthProvider, DashboardAuthResult } from "./DashboardAuth";
-import { DashboardCtx, DashboardSectionModule } from "./sections/types";
+import { DashboardCtx, DashboardSectionModule, validId } from "./sections/types";
 import type { GlobalSearch } from "./search/GlobalSearch";
 import type { HomeMetrics } from "./metrics/HomeMetrics";
 import {
   ActionResult,
   ActivationStatusResponse,
+  AttentionItem,
   NavBadgesResponse,
   NavItem,
   PageView,
+  PeekResponse,
   ViewRequest,
 } from "./renderer/contract";
 import { renderDashboardShell } from "./html/shellHtml";
@@ -36,15 +38,30 @@ const DASH_T1_EXTRA = new Set([
 ]);
 // T2 (fresh factor re-assert): fraud refunds, blocklisting, cancel-NOW,
 // off-session invoice pay, off-session card charges, creating a subscription
-// that charges immediately, and balance adjustments (credits shrink future
-// invoices — money-adjacent).
-const DASH_T2 = new Set(["charge.refund_fraud", "customer.block", "charge.create", "customer.balance"]);
+// that charges immediately, balance adjustments (credits shrink future
+// invoices — money-adjacent), and capturing an authorization (the moment the
+// card is actually charged).
+const DASH_T2 = new Set([
+  "charge.refund_fraud",
+  "customer.block",
+  "charge.create",
+  "customer.balance",
+  "payment_intent.capture",
+]);
 
 function needsStepUp(key: string, params: Record<string, unknown> | undefined): boolean {
   if (DASH_T2.has(key)) return true;
   if (key === "subscription.cancel" && params?.when === "now") return true;
   if (key === "subscription.create" && params?.collection === "charge") return true;
+  if (key === "subscription.terms" && params?.endTrialNow === true) return true; // billing starts immediately
+  if (key === "subscription.schedule" && params?.op === "cancel") return true; // cancels the subscription outright
   return key === "invoice.collect" && params?.op === "pay";
+}
+
+// Param-aware T1: keys whose DANGEROUS variant depends on the op (mirrors
+// needsStepUp). Removing a discount changes what the customer pays next cycle.
+function needsConfirmExtra(key: string, params: Record<string, unknown> | undefined): boolean {
+  return key === "customer.coupon" && params?.op === "remove";
 }
 
 export type DashboardAuditFn = (actor: { id: string; name: string }, change: string) => Promise<void>;
@@ -53,8 +70,13 @@ export type DashboardAuditFn = (actor: { id: string; name: string }, change: str
 // then generic page dispatch across the registered section modules. Everything
 // the page renders is decided HERE (server-driven UI); the client is a dumb
 // block renderer with a hash router.
+const PEEK_TTL_MS = 30_000;
+
 export class Dashboard implements MountedPanelRoute {
   private rate = new Map<string, number[]>();
+  // Hover peek cache (searchCountCache idiom): per-Dashboard, 30s TTL. Null
+  // values cache too so a missing object can't be hammered by re-hovers.
+  private peekCache = new Map<string, { at: number; value: PeekResponse | null }>();
   private buildCtxDeps: Omit<DashboardCtx, "actor" | "audit" | "reverse" | "security">;
   private search?: GlobalSearch;
   private metrics?: HomeMetrics;
@@ -176,15 +198,52 @@ export class Dashboard implements MountedPanelRoute {
         case "nav-badges": {
           const ctx = this.ctxFor(auth);
           const badges: Record<string, string> = {};
+          const attention: AttentionItem[] = [];
           await Promise.all(
             this.modules.map(async (m) => {
-              if (!m.navBadge) return;
-              const value = await m.navBadge(ctx).catch(() => null);
-              if (value) for (const item of m.nav) badges[item.key] = value;
+              if (m.navBadge) {
+                const value = await m.navBadge(ctx).catch(() => null);
+                if (value) for (const item of m.nav) badges[item.key] = value;
+              }
+              // Bell feed (PA-13): same 60s poll — one request feeds the nav
+              // pills AND the needs-attention popover.
+              if (m.attention) {
+                const items = await m.attention(ctx).catch(() => [] as AttentionItem[]);
+                attention.push(...items);
+              }
             })
           );
-          const json: NavBadgesResponse = { badges };
+          attention.sort((a, b) => (a.iso < b.iso ? 1 : a.iso > b.iso ? -1 : 0)); // newest first
+          const json: NavBadgesResponse = {
+            badges,
+            ...(attention.length ? { attention: attention.slice(0, 15) } : {}),
+          };
           return { status: 200, json };
+        }
+        case "peek": {
+          // Hover peek cards (PA-13): page allowlist + kind-specific id
+          // validation FIRST — the module hook only ever sees clean input.
+          const page = typeof request.page === "string" ? request.page : "";
+          const rawId = typeof request.id === "string" ? request.id.slice(0, 80) : "";
+          const okId =
+            page === "customers.detail"
+              ? validId("customer", rawId)
+              : page === "payments.detail"
+                ? (validId("charge", rawId) ?? validId("payment_intent", rawId))
+                : null;
+          if (!okId) return { status: 404, json: { error: "unknown peek" } };
+          const cacheKey = `${page}:${okId}`;
+          const hit = this.peekCache.get(cacheKey);
+          if (hit && Date.now() - hit.at < PEEK_TTL_MS) {
+            return hit.value ? { status: 200, json: hit.value } : { status: 404, json: { error: "no peek" } };
+          }
+          const module = this.modules.find((m) => m.peek && m.ownsPage(page));
+          if (!module?.peek) return { status: 404, json: { error: "unknown peek" } };
+          const value = await module.peek(this.ctxFor(auth), page, okId).catch(() => null);
+          this.peekCache.set(cacheKey, { at: Date.now(), value });
+          if (this.peekCache.size > 500) this.peekCache.clear(); // crude bound; 30s TTL refills fast
+          if (!value) return { status: 404, json: { error: "no peek" } };
+          return { status: 200, json: value };
         }
         case "action": {
           const key = typeof request.key === "string" ? request.key.slice(0, 64) : "";
@@ -235,7 +294,7 @@ export class Dashboard implements MountedPanelRoute {
     if (needsStepUp(key, params) && !auth.stepUpFresh()) {
       return { ok: false, needsStepUp: true };
     }
-    if (def.dangerous || DASH_T1_EXTRA.has(key)) {
+    if (def.dangerous || DASH_T1_EXTRA.has(key) || needsConfirmExtra(key, params)) {
       const word = typeof request.confirmWord === "string" ? request.confirmWord : "";
       if (word !== "CONFIRM") return { ok: false, error: "Type CONFIRM to run this action.", fieldErrors: {} };
     }

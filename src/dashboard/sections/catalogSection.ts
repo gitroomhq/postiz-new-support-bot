@@ -3,6 +3,7 @@ import { StripeClient } from "../../bot/StripeClient";
 import { promoCoupon, promoCouponId } from "../../bot/billing/ui";
 import { ActionButton, ActionResult, Badge, Block, Cell, TableBlock } from "../renderer/contract";
 import { DashboardCtx, DashboardSectionModule, SectionPage, str, validCursor } from "./types";
+import { bookmarkButton, isBookmarkedSafe, toggleBookmarkAction } from "./bookmarks";
 import { avatarCell, badgeCell, dateCell, formatPerCurrency, idCell, text } from "./cells";
 
 // Product catalog (#/catalog): Products & prices read-only (PromosHub-parity
@@ -28,7 +29,9 @@ export function makeCatalogSection(): DashboardSectionModule {
       }
       const filters = req.filters ?? {};
       const view =
-        filters.view === "coupons" || filters.view === "promos" || filters.view === "tax" ? filters.view : "";
+        filters.view === "coupons" || filters.view === "promos" || filters.view === "tax" || filters.view === "shipping"
+          ? filters.view
+          : "";
       const blocks: Block[] = [];
       blocks.push({
         type: "tabs",
@@ -39,11 +42,13 @@ export function makeCatalogSection(): DashboardSectionModule {
           { value: "coupons", label: "Coupons" },
           { value: "promos", label: "Promo codes" },
           { value: "tax", label: "Tax rates" },
+          { value: "shipping", label: "Shipping rates" },
         ],
       });
       if (view === "coupons") blocks.push(...(await couponsBlocks(ctx)));
       else if (view === "promos") blocks.push(...(await promosBlocks(ctx, filters)));
       else if (view === "tax") blocks.push(...(await taxBlocks(ctx)));
+      else if (view === "shipping") blocks.push(...(await shippingBlocks(ctx)));
       else blocks.push(await productsTable(ctx, req.cursor ?? null));
       return { title: "Product catalog", crumbs: [{ label: "Product catalog" }], blocks };
     },
@@ -52,6 +57,10 @@ export function makeCatalogSection(): DashboardSectionModule {
       const p = req.params ?? {};
       const confirmed = req.confirmWord === "CONFIRM";
       switch (req.key) {
+        // T0 — shared team bookmark toggle (product detail).
+        case "section:catalog.bookmark":
+          return toggleBookmarkAction(ctx, "product", p);
+
         // T0 (promos tier) — create a coupon. Same validation as the hub modal.
         case "section:catalog.coupon_create": {
           const id = str(p.id, 60).trim();
@@ -217,6 +226,41 @@ export function makeCatalogSection(): DashboardSectionModule {
           return { ok: true, text: `${rate.display_name} is now ${rate.active ? "active" : "archived"}.` };
         }
 
+        // T0 — create a fixed-amount shipping rate (PA-12; mirror of tax
+        // rates: no delete, no amount edits — archive and recreate).
+        case "section:catalog.shipping_create": {
+          const displayName = str(p.displayName, 100).trim();
+          if (!displayName) return { ok: false, fieldErrors: { displayName: "A display name is required (shown at checkout)." } };
+          const amountRaw = str(p.amount, 30).trim();
+          const amountMatch = amountRaw.match(/^(\d+(?:\.\d{1,2})?)\s+([a-zA-Z]{3})$/);
+          if (!amountMatch) {
+            return { ok: false, fieldErrors: { amount: "Amount must look like `5.00 eur` (amount + currency)." } };
+          }
+          const currency = amountMatch[2].toLowerCase();
+          const value = Number.parseFloat(amountMatch[1]);
+          if (StripeClient.isZeroDecimal(currency) && amountMatch[1].includes(".")) {
+            return { ok: false, fieldErrors: { amount: `${currency} is a zero-decimal currency — whole amounts only.` } };
+          }
+          const amountMinor = StripeClient.isZeroDecimal(currency) ? Math.round(value) : Math.round(value * 100);
+          const taxBehavior =
+            p.taxBehavior === "inclusive" || p.taxBehavior === "exclusive" ? p.taxBehavior : undefined;
+          const rate = await ctx.stripe.createShippingRate(
+            { displayName, amountMinor, currency, ...(taxBehavior ? { taxBehavior } : {}) },
+            `dash-shipping-${Date.now().toString(36)}`
+          );
+          await ctx.audit(`Shipping rate ${rate.id} created — ${displayName} ${ctx.stripe.formatAmount(amountMinor, currency)}`);
+          return { ok: true, text: `Shipping rate ${rate.id} created.` };
+        }
+
+        // T0 — archive/restore a shipping rate (delete does not exist).
+        case "section:catalog.shipping_toggle": {
+          const id = str(p.id, 64).trim();
+          if (!/^shr_[A-Za-z0-9]{1,64}$/.test(id)) return { ok: false, error: "Bad shipping rate id." };
+          const rate = await ctx.stripe.setShippingRateActive(id, p.active === true);
+          await ctx.audit(`Shipping rate ${id} ${rate.active ? "restored" : "archived"}`);
+          return { ok: true, text: `${rate.display_name ?? id} is now ${rate.active ? "active" : "archived"}.` };
+        }
+
         // T0 — toggle a promotion code (Stripe can't edit/delete promos).
         case "section:catalog.promo_toggle": {
           const id = str(p.id, 64).trim();
@@ -314,9 +358,10 @@ async function productDetail(ctx: DashboardCtx, id: string): Promise<SectionPage
     }
     throw e;
   }
-  const [prices, subCounts] = await Promise.all([
+  const [prices, subCounts, bookmarked] = await Promise.all([
     ctx.stripe.listPricesForProduct(id, 50),
     ctx.stripe.countActiveSubscriptionsByPrice(10).catch(() => ({ counts: new Map<string, number>(), scanned: 0, truncated: false })),
+    isBookmarkedSafe(ctx, "product", id),
   ]);
   const name = product.name ?? id;
 
@@ -350,6 +395,7 @@ async function productDetail(ctx: DashboardCtx, id: string): Promise<SectionPage
     ...(product.description ? { sub: product.description.slice(0, 200) } : {}),
     id,
     badges: [{ kind: product.active ? "ok" : "neutral", text: product.active ? "Active" : "Archived" } as Badge],
+    actions: [bookmarkButton("section:catalog.bookmark", bookmarked, id, name)],
   });
   main.push({
     type: "table",
@@ -626,6 +672,77 @@ async function taxBlocks(ctx: DashboardCtx): Promise<Block[]> {
           { type: "text", key: "description", label: "Internal description (optional)" },
         ],
         summary: "Creates the tax rate — the percentage is immutable afterwards.",
+      },
+    ],
+  };
+  return [table, create];
+}
+
+// ---- Shipping rates (PA-12: list + create + archive/restore) ----
+
+async function shippingBlocks(ctx: DashboardCtx): Promise<Block[]> {
+  const rates = await ctx.stripe.listShippingRates(25).catch(() => [] as Stripe.ShippingRate[]);
+  const table: TableBlock = {
+    type: "table",
+    key: "shippingrates",
+    title: "Shipping rates",
+    columns: [
+      { key: "name", label: "Name" },
+      { key: "amount", label: "Amount", align: "right" },
+      { key: "tax", label: "Tax behavior" },
+      { key: "status", label: "" },
+      { key: "created", label: "Created" },
+      { key: "id", label: "ID" },
+    ],
+    rows: rates.map((r) => ({
+      id: r.id,
+      cells: [
+        { t: "text", v: r.display_name ?? r.id, strong: true } as Cell,
+        r.fixed_amount ? text(ctx.stripe.formatAmount(r.fixed_amount.amount, r.fixed_amount.currency)) : text("—"),
+        text(r.tax_behavior && r.tax_behavior !== "unspecified" ? r.tax_behavior : "—"),
+        badgeCell(r.active ? "ok" : "neutral", r.active ? "Active" : "Archived"),
+        dateCell(r.created),
+        idCell(r.id, { copy: true }),
+      ] as Cell[],
+      actions: [
+        r.active
+          ? {
+              key: "section:catalog.shipping_toggle",
+              label: "Archive",
+              params: { id: r.id, active: false },
+              summary: "Hides the rate from new checkouts — existing sessions keep it.",
+            }
+          : { key: "section:catalog.shipping_toggle", label: "Restore", params: { id: r.id, active: true } },
+      ],
+    })),
+    empty: "No shipping rates yet.",
+    ...(rates.length ? { footer: `${rates.length} most recent shipping rates` } : {}),
+    notice: "Shipping rates can't be deleted or have their amount edited — archive and create a replacement.",
+  };
+  const create: Block = {
+    type: "notice",
+    badge: { kind: "info", text: "Create" },
+    text: "Shipping rates attach to checkout sessions and payment links as fixed shipping charges.",
+    actions: [
+      {
+        key: "section:catalog.shipping_create",
+        label: "New shipping rate",
+        style: "primary",
+        inputs: [
+          { type: "text", key: "displayName", label: "Display name (e.g. Standard shipping)" },
+          { type: "text", key: "amount", label: "Amount + currency (e.g. 5.00 eur)" },
+          {
+            type: "select",
+            key: "taxBehavior",
+            label: "Tax behavior",
+            options: [
+              { value: "", label: "Unspecified" },
+              { value: "exclusive", label: "Exclusive (tax added on top)" },
+              { value: "inclusive", label: "Inclusive (amount contains tax)" },
+            ],
+          },
+        ],
+        summary: "Creates a fixed-amount shipping rate — the amount is immutable afterwards.",
       },
     ],
   };

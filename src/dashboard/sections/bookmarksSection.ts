@@ -1,19 +1,15 @@
 import { Block, Cell, ObjectRef, TableBlock } from "../renderer/contract";
 import { DashboardCtx, DashboardSectionModule, SectionPage, str } from "./types";
-import { badgeCell, idCell, isoDateCell, sentence, text } from "./cells";
+import { isBookmarkType, toggleBookmarkAction } from "./bookmarks";
+import { badgeCell, idCell, isoDateCell, refForId, sentence, text } from "./cells";
 
-// Team bookmarks (#/bookmarks, Operate group): the shared board over
+// Team bookmarks (/billing/bookmarks, Operate group): the shared board over
 // BillingQolStore — one list for the whole team, rows deep-link into the
-// typed detail pages. Saved filters were considered and SKIPPED (palette
-// recents already cover the cheap version; server persistence isn't worth it).
+// typed detail pages (every object family since the PA-13 bookmark-everything
+// pass; rows route via the shared refForId). Saved filters were considered
+// and SKIPPED (palette recents already cover the cheap version).
 
 const PAGE_SIZE = 25;
-
-const REF_PAGES: Record<string, string> = {
-  dispute: "disputes.detail",
-  customer: "customers.detail",
-  charge: "payments.detail",
-};
 
 export function makeBookmarksSection(): DashboardSectionModule {
   return {
@@ -37,8 +33,7 @@ export function makeBookmarksSection(): DashboardSectionModule {
           { key: "when", label: "When" },
         ],
         rows: rows.map((b) => {
-          const page = REF_PAGES[b.objectType];
-          const ref: ObjectRef | undefined = page ? { page, params: { id: b.objectId } } : undefined;
+          const ref: ObjectRef | undefined = refForId(b.objectId) ?? undefined;
           return {
             id: b.id,
             ...(ref ? { ref } : {}),
@@ -59,7 +54,7 @@ export function makeBookmarksSection(): DashboardSectionModule {
           };
         }),
         nextCursor: offset + PAGE_SIZE < total ? String(offset + PAGE_SIZE) : null,
-        empty: "Nothing bookmarked yet — use the Bookmark action on a dispute, customer or payment.",
+        empty: "Nothing bookmarked yet — every detail page has a Bookmark action.",
         ...(rows.length ? { footer: `${rows.length} of ${total} bookmark${total === 1 ? "" : "s"}` } : {}),
         notice: "One shared list for the whole team.",
       };
@@ -71,11 +66,9 @@ export function makeBookmarksSection(): DashboardSectionModule {
       if (req.key !== "section:bookmarks.remove") return { ok: false, error: "Unknown action." };
       const p = req.params ?? {};
       const type = str(p.type, 20);
-      const id = str(p.id, 80);
-      if (!REF_PAGES[type] || !id) return { ok: false, error: "Bad bookmark." };
+      if (!isBookmarkType(type)) return { ok: false, error: "Bad bookmark." };
       // toggleBookmark on an existing entry removes it (shared-list semantics).
-      const r = await ctx.stores.qol.toggleBookmark(type as "dispute" | "customer" | "charge", id, null, ctx.actor.id, ctx.actor.name);
-      return { ok: true, text: r.bookmarked ? "Bookmarked." : "Bookmark removed." };
+      return toggleBookmarkAction(ctx, type, p);
     },
   };
 }

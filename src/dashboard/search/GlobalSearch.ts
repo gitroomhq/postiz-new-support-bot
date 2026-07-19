@@ -151,11 +151,30 @@ export class GlobalSearch {
     const tasks: Array<Promise<SearchGroup | null>> = [];
 
     if (/^\d{4}$/.test(term)) {
-      // Four digits → card last4 hunt.
+      // Four digits → card last4 hunt: one group for all attempts, one for
+      // failed-only (declined attempts DO exist as failed charges — surfaced
+      // separately with their PI + decline reason so card-testing pops out).
       tasks.push(
         this.timeboxed(async () => {
           const res = await this.stripe.searchChargesByCardLast4(term, undefined, GROUP_LIMIT);
           return { label: `Payments · card ····${term}`, hits: res.charges.map((c) => chargeHit(this.stripe, c)) };
+        })
+      );
+      tasks.push(
+        this.timeboxed(async () => {
+          const res = await this.stripe.searchChargesByCardLast4(term, undefined, GROUP_LIMIT, undefined, "failed");
+          return {
+            label: `Failed payments · card ····${term}`,
+            hits: res.charges.map((c) => {
+              const piId = typeof c.payment_intent === "string" ? c.payment_intent : c.payment_intent?.id;
+              return {
+                title: this.stripe.formatAmount(c.amount, c.currency),
+                sub: c.outcome?.seller_message ?? c.failure_message ?? c.failure_code ?? "failed",
+                id: piId ?? c.id,
+                ref: { page: "payments.detail", params: { id: piId ?? c.id } },
+              };
+            }),
+          };
         })
       );
     } else if (/^\d+([.,]\d{1,2})?$/.test(term)) {

@@ -50,8 +50,20 @@ D.dispatchAction = function (body, onErr) {
     var modal = D.q("modal");
     if (j.ok) {
       if (modal.open) modal.close();
-      D.flashOk(j.queued ? (j.text || "Queued for admin approval.") : (j.text || "Done."));
+      // ActionResult.file: small binary riding the JSON channel (quote PDFs) —
+      // b64 → bytes → Blob download.
+      if (j.file && j.file.b64) {
+        try {
+          var bin = atob(j.file.b64);
+          var bytes = new Uint8Array(bin.length);
+          for (var bi = 0; bi < bin.length; bi++) bytes[bi] = bin.charCodeAt(bi);
+          D.saveBlob(j.file.name || "download", j.file.mime || "application/octet-stream", bytes);
+        } catch (e) {}
+      }
+      // loadPage clears the flash on entry — flash AFTER so the message (and
+      // any short-lived j.link anchor) survives the reload.
       D.loadPage();
+      D.flashOk(j.queued ? (j.text || "Queued for admin approval.") : (j.text || "Done."), j.link || null);
     } else if (j.needsStepUp) {
       // Fresh factor required (T2): run the step-up ceremony, then retry the
       // exact same request once.

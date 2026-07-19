@@ -113,8 +113,21 @@ D.copyBtn = function (value) {
 };
 
 D.clearFlash = function () { var f = D.q("flash"); f.textContent = ""; f.className = "flash"; };
-D.flashOk = function (msg) {
+// Optional link: an anchor appended as a CHILD NODE (textContent label,
+// rel=noopener — never innerHTML). Link flashes don't auto-clear: the URL may
+// be short-lived (report downloads) and must stay clickable until navigation.
+D.flashOk = function (msg, link) {
   var f = D.q("flash"); f.textContent = msg; f.className = "flash ok";
+  if (link && link.href) {
+    f.appendChild(document.createTextNode(" "));
+    var a = document.createElement("a");
+    a.href = link.href;
+    a.target = "_blank";
+    a.rel = "noopener";
+    a.textContent = link.label || "Open";
+    f.appendChild(a);
+    return;
+  }
   setTimeout(function () { if (f.classList.contains("ok")) D.clearFlash(); }, 2600);
 };
 D.flashErr = function (msg) { var f = D.q("flash"); f.textContent = msg; f.className = "flash error"; };

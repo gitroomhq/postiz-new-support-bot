@@ -171,6 +171,13 @@ export class CardsHub {
             required: false,
             placeholder: "visa / mastercard / amex — narrows results",
           })
+        ),
+        new ActionRowBuilder<TextInputBuilder>().addComponents(
+          textInput("status", "Status filter (optional)", {
+            required: false,
+            placeholder: "failed / succeeded / pending — blank = all",
+            maxLength: 9,
+          })
         )
       );
   }
@@ -209,9 +216,10 @@ export class CardsHub {
 
   // ---- account-wide "find when card lookups come up empty" flows ----
 
-  // Amount search hits PaymentIntents, so it surfaces DECLINED / blocked attempts
-  // (issuer-refused renewals) that never became a charge — exactly what the
-  // last4/charge searches cannot see.
+  // Amount search hits PaymentIntents, so it surfaces attempts that never
+  // produced ANY charge (abandoned checkout, unfinished 3DS) — the slice the
+  // last4/charge searches cannot see. Ordinary declines DO become failed
+  // charges; the last4 hunt reaches those with its status filter.
   private async handleFindAmountModal(interaction: ModalSubmitInteraction): Promise<void> {
     const amountRaw = interaction.fields.getTextInputValue("amount").trim();
     const currencyRaw = interaction.fields.getTextInputValue("currency").trim().toLowerCase();
@@ -373,8 +381,16 @@ export class CardsHub {
   private async handleLast4Modal(interaction: ModalSubmitInteraction): Promise<void> {
     const last4 = interaction.fields.getTextInputValue("last4").trim();
     const brand = interaction.fields.getTextInputValue("brand").trim().toLowerCase();
+    const status = interaction.fields.getTextInputValue("status").trim().toLowerCase();
     if (!/^\d{4}$/.test(last4)) {
       await interaction.reply({ embeds: [makeEmbed("Enter exactly the 4 digits.", COLORS.danger)], flags: 64 });
+      return;
+    }
+    if (status && !/^(succeeded|pending|failed)$/.test(status)) {
+      await interaction.reply({
+        embeds: [makeEmbed("Status must be `failed`, `succeeded` or `pending` (or blank for all).", COLORS.danger)],
+        flags: 64,
+      });
       return;
     }
     if (brand && !/^[a-z_]+$/.test(brand)) {
@@ -387,15 +403,21 @@ export class CardsHub {
 
     await this.ctx.sessions.ackModal(interaction);
     await this.ctx.sessions.tryRender(interaction, async () => {
-      const { charges, nextPage } = await this.ctx.stripe.searchChargesByCardLast4(last4, brand || undefined, 100);
+      const { charges, nextPage } = await this.ctx.stripe.searchChargesByCardLast4(
+        last4,
+        brand || undefined,
+        100,
+        undefined,
+        (status || undefined) as "succeeded" | "pending" | "failed" | undefined
+      );
       if (charges.length === 0) {
         await interaction.editReply({
           embeds: [
             makeEmbed(
-              `No **settled charges** found for cards ending \`${last4}\`${brand ? ` (${brand})` : ""}.\n\n` +
-                "⚠️ This searches charges only. A **declined or bank-blocked** payment never becomes a charge, so it " +
-                "won't show here even though the customer sees it on their statement. Use **Find by Amount** to catch " +
-                "those declined attempts.",
+              `No ${status ? `**${status}** ` : ""}charges found for cards ending \`${last4}\`${brand ? ` (${brand})` : ""}.\n\n` +
+                "⚠️ Declined and Radar-blocked payments **do** show up here as failed charges. What this search can't " +
+                "see is an attempt that never reached confirmation (abandoned checkout, unfinished 3DS) — use " +
+                "**Find by Amount** for those.",
               COLORS.neutral
             ),
           ],
@@ -411,7 +433,15 @@ export class CardsHub {
 
       // last4 is not unique, so group by fingerprint — that's the id the other
       // card tools take for exact matching.
-      type Group = { label: string; exp: string; fp: string | null; count: number; customers: Map<string, string | null> };
+      type Group = {
+        label: string;
+        exp: string;
+        fp: string | null;
+        count: number;
+        failed: number;
+        lastFail: { piId: string | null; chargeId: string; reason: string | null; created: number } | null;
+        customers: Map<string, string | null>;
+      };
       const groups = new Map<string, Group>();
       for (const charge of charges) {
         const card = charge.payment_method_details?.card;
@@ -422,9 +452,22 @@ export class CardsHub {
           exp: `${card.exp_month ?? "?"}/${card.exp_year ?? "?"}`,
           fp: card.fingerprint ?? null,
           count: 0,
+          failed: 0,
+          lastFail: null,
           customers: new Map(),
         };
         group.count++;
+        if (charge.status === "failed") {
+          group.failed++;
+          if (!group.lastFail || charge.created > group.lastFail.created) {
+            group.lastFail = {
+              piId: typeof charge.payment_intent === "string" ? charge.payment_intent : (charge.payment_intent?.id ?? null),
+              chargeId: charge.id,
+              reason: charge.outcome?.seller_message ?? charge.failure_message ?? charge.failure_code ?? null,
+              created: charge.created,
+            };
+          }
+        }
         const cusId = typeof charge.customer === "string" ? charge.customer : charge.customer?.id;
         if (cusId && !group.customers.has(cusId)) {
           group.customers.set(cusId, charge.billing_details?.email ?? charge.receipt_email ?? null);
@@ -438,14 +481,17 @@ export class CardsHub {
           .map(([id, email]) => `\`${id}\`${email ? ` (${email})` : ""}`)
           .join(", ");
         const more = g.customers.size > 5 ? ` +${g.customers.size - 5} more` : "";
+        const lastFail = g.lastFail
+          ? `\n↳ last failed <t:${g.lastFail.created}:R>: ${g.lastFail.reason ?? "no reason given"} · \`${g.lastFail.piId ?? g.lastFail.chargeId}\``
+          : "";
         return (
-          `**${g.label}** · exp ${g.exp} · ${g.count} charge(s)\n` +
-          `fingerprint: ${g.fp ? `\`${g.fp}\`` : "—"}\ncustomers: ${customers || "—"}${more}`
+          `**${g.label}** · exp ${g.exp} · ${g.count} charge(s)${g.failed ? ` · ⛔ ${g.failed} failed` : ""}\n` +
+          `fingerprint: ${g.fp ? `\`${g.fp}\`` : "—"}\ncustomers: ${customers || "—"}${more}${lastFail}`
         );
       });
 
       const embed = new EmbedBuilder()
-        .setTitle(`Cards ending •••• ${last4}${brand ? ` (${brand})` : ""}`)
+        .setTitle(`Cards ending •••• ${last4}${brand ? ` (${brand})` : ""}${status ? ` — ${status} only` : ""}`)
         .setColor(COLORS.brand)
         .setDescription(lines.join("\n\n").slice(0, 4096))
         .setFooter({

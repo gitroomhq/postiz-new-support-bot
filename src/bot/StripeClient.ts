@@ -133,10 +133,11 @@ export class StripeClient {
   async createWebhookEndpoint(
     url: string,
     events: Stripe.WebhookEndpointCreateParams.EnabledEvent[],
-    idempotencyKey: string
+    idempotencyKey: string,
+    opts: { description?: string } = {}
   ): Promise<{ id: string; secret: string | null }> {
     const ep = await this.stripe.webhookEndpoints.create(
-      { url, enabled_events: events, description: "Postiz support bot" },
+      { url, enabled_events: events, description: opts.description ?? "Postiz support bot" },
       { idempotencyKey }
     );
     return { id: ep.id, secret: ep.secret ?? null };
@@ -235,6 +236,16 @@ export class StripeClient {
     return { subscriptionId: active[0].id };
   }
 
+  // Discount removal (PA-9). Sub-level removal leaves a customer-level
+  // discount (if any) untouched — they are separate objects at Stripe.
+  async removeSubscriptionDiscount(subscriptionId: string): Promise<void> {
+    await this.stripe.subscriptions.deleteDiscount(subscriptionId);
+  }
+
+  async removeCustomerDiscount(customerId: string): Promise<void> {
+    await this.stripe.customers.deleteDiscount(customerId);
+  }
+
   async refundCharge(chargeId: string, idempotencyKey?: string): Promise<{ refundId: string; amount: number; currency: string }> {
     const refund = await this.stripe.refunds.create(
       { charge: chargeId },
@@ -284,24 +295,30 @@ export class StripeClient {
   }
 
   // last4 is far from unique — callers should aggregate by fingerprint for exact
-  // identification. Both inputs are validated by the caller (digits / [a-z_]) since
-  // they are interpolated into the query string.
+  // identification. Both string inputs are validated by the caller (digits /
+  // [a-z_]) since they are interpolated into the query string; status is a
+  // closed union for the same reason. Declined/blocked attempts on a confirmed
+  // PI DO exist here as status:"failed" charges — only attempts that never
+  // reached confirmation (abandoned checkout, unfinished 3DS) have no charge
+  // at all and need the amount-based PI search instead.
   async searchChargesByCardLast4(
     last4: string,
     brand: string | undefined,
     limit = 10,
-    page?: string
+    page?: string,
+    status?: "succeeded" | "pending" | "failed"
   ): Promise<{ charges: Stripe.Charge[]; nextPage: string | null }> {
     const query =
       `payment_method_details.card.last4:"${last4}"` +
-      (brand ? ` AND payment_method_details.card.brand:"${brand}"` : "");
+      (brand ? ` AND payment_method_details.card.brand:"${brand}"` : "") +
+      (status ? ` AND status:"${status}"` : "");
     const res = await this.stripe.charges.search({ query, limit, ...(page ? { page } : {}) });
     return { charges: res.data, nextPage: res.next_page ?? null };
   }
 
   // Account-wide search over PaymentIntents by exact amount (minor units) and
-  // optional currency. Unlike charges.search, this reaches DECLINED / incomplete
-  // attempts that never produced a Charge — issuer-blocked or failed renewals the
+  // optional currency. Unlike charges.search, this reaches attempts that never
+  // produced ANY charge (abandoned checkout, unfinished 3DS) — the slice the
   // last4/charge searches are structurally blind to. latest_charge is expanded so
   // callers can read the card + decline reason off the failed charge when present.
   // amountMinor is interpolated into the query, so callers must pass a number.
@@ -365,19 +382,25 @@ export class StripeClient {
   // ---- Dashboard account-wide reads (/billing web) ----
 
   // Account-wide charge browse (dashboard Payments list), newest first.
-  // createdGte narrows the window server-side (the date filter pill).
+  // createdGte/createdLt narrow the window server-side (the date filter pill;
+  // Lt is exclusive — callers add a day to make custom ranges inclusive).
   async listAllCharges(opts: {
     limit?: number;
     startingAfter?: string;
     createdGte?: number;
+    createdLt?: number;
   }): Promise<{ charges: Stripe.Charge[]; hasMore: boolean }> {
+    const created = {
+      ...(opts.createdGte ? { gte: opts.createdGte } : {}),
+      ...(opts.createdLt ? { lt: opts.createdLt } : {}),
+    };
     const res = await this.stripe.charges.list({
       limit: opts.limit ?? 25,
       // Expand the customer (name/email in the list) and refunds (refunded-date
       // column) so the list matches Stripe's look with no per-row lookups.
       expand: ["data.customer", "data.refunds"],
       ...(opts.startingAfter ? { starting_after: opts.startingAfter } : {}),
-      ...(opts.createdGte ? { created: { gte: opts.createdGte } } : {}),
+      ...(Object.keys(created).length ? { created } : {}),
     });
     return { charges: res.data, hasMore: res.has_more };
   }
@@ -388,11 +411,16 @@ export class StripeClient {
     limit?: number;
     startingAfter?: string;
     createdGte?: number;
+    createdLt?: number;
   }): Promise<{ paymentIntents: Stripe.PaymentIntent[]; hasMore: boolean }> {
+    const created = {
+      ...(opts.createdGte ? { gte: opts.createdGte } : {}),
+      ...(opts.createdLt ? { lt: opts.createdLt } : {}),
+    };
     const res = await this.stripe.paymentIntents.list({
       limit: opts.limit ?? 25,
       ...(opts.startingAfter ? { starting_after: opts.startingAfter } : {}),
-      ...(opts.createdGte ? { created: { gte: opts.createdGte } } : {}),
+      ...(Object.keys(created).length ? { created } : {}),
     });
     return { paymentIntents: res.data, hasMore: res.has_more };
   }
@@ -449,10 +477,36 @@ export class StripeClient {
 
   // Manual payout from the AVAILABLE balance to the default external account.
   async createPayout(
-    params: { amountMinor: number; currency: string; description?: string; statementDescriptor?: string },
+    params: {
+      amountMinor: number;
+      currency: string;
+      description?: string;
+      statementDescriptor?: string;
+      // "instant" needs an eligible debit destination and draws from the
+      // instant_available balance (fee applies); default is standard.
+      method?: "standard" | "instant";
+    },
     idempotencyKey: string
   ): Promise<Stripe.Payout> {
     return this.stripe.payouts.create(
+      {
+        amount: params.amountMinor,
+        currency: params.currency,
+        ...(params.description ? { description: params.description } : {}),
+        ...(params.statementDescriptor ? { statement_descriptor: params.statementDescriptor } : {}),
+        ...(params.method === "instant" ? { method: "instant" as const } : {}),
+      },
+      { idempotencyKey }
+    );
+  }
+
+  // Pull money from the account's default verified bank into the Stripe
+  // balance. Statement descriptor caps at 15 chars for top-ups (not 22).
+  async createTopUp(
+    params: { amountMinor: number; currency: string; description?: string; statementDescriptor?: string },
+    idempotencyKey: string
+  ): Promise<Stripe.Topup> {
+    return this.stripe.topups.create(
       {
         amount: params.amountMinor,
         currency: params.currency,
@@ -558,6 +612,21 @@ export class StripeClient {
   async listEvents(limit = 15): Promise<Stripe.Event[]> {
     const res = await this.stripe.events.list({ limit });
     return res.data;
+  }
+
+  // Paginated/filtered event browse for the dashboard Events page (Stripe
+  // retains 30 days). type accepts Stripe's wildcard forms ("invoice.*").
+  async listEventsPage(opts: {
+    limit?: number;
+    type?: string;
+    startingAfter?: string;
+  }): Promise<{ events: Stripe.Event[]; hasMore: boolean }> {
+    const res = await this.stripe.events.list({
+      limit: opts.limit ?? 25,
+      ...(opts.type ? { type: opts.type } : {}),
+      ...(opts.startingAfter ? { starting_after: opts.startingAfter } : {}),
+    });
+    return { events: res.data, hasMore: res.has_more };
   }
 
   // Active-subscription count for the Home stat tile. Stripe returns no
@@ -1160,6 +1229,38 @@ export class StripeClient {
     return this.stripe.accounts.retrieve();
   }
 
+  // Payout schedule on our OWN account (PA-12). ⚠ accounts.update may be
+  // Connect-only for some account types — best-effort by design: callers map
+  // Stripe's refusal to a friendly error; the read path stays correct.
+  async updatePayoutSchedule(schedule: {
+    interval: "manual" | "daily" | "weekly" | "monthly";
+    weeklyAnchor?: string;
+    monthlyAnchor?: number;
+    delayDays?: number;
+  }): Promise<Stripe.Account> {
+    const account = await this.getAccount();
+    return this.stripe.accounts.update(account.id, {
+      settings: {
+        payouts: {
+          schedule: {
+            interval: schedule.interval,
+            ...(schedule.weeklyAnchor
+              ? { weekly_anchor: schedule.weeklyAnchor as Stripe.AccountUpdateParams.Settings.Payouts.Schedule.WeeklyAnchor }
+              : {}),
+            ...(schedule.monthlyAnchor != null ? { monthly_anchor: schedule.monthlyAnchor } : {}),
+            ...(schedule.delayDays != null ? { delay_days: schedule.delayDays } : {}),
+          },
+        },
+      },
+    });
+  }
+
+  // Bank-transfer funds a customer has sent that await reconciliation onto
+  // invoices. null on error — most customers have no cash balance object.
+  async getCashBalance(customerId: string): Promise<Stripe.CashBalance | null> {
+    return this.stripe.customers.retrieveCashBalance(customerId).catch(() => null);
+  }
+
   // Account-level tax IDs (the VAT etc. displayed on our invoices) — distinct
   // from customer tax IDs and from the write-only onboarding company tax_id.
   async listAccountTaxIds(): Promise<Stripe.TaxId[]> {
@@ -1191,6 +1292,20 @@ export class StripeClient {
 
   // Only valid while the PaymentIntent is in a cancelable status
   // (requires_payment_method / requires_confirmation / requires_action / processing).
+  // Capture an authorized (requires_capture) payment. Partial captures
+  // release the uncaptured remainder back to the customer (Stripe default).
+  async capturePaymentIntent(
+    paymentIntentId: string,
+    amountMinor?: number,
+    idempotencyKey?: string
+  ): Promise<Stripe.PaymentIntent> {
+    return this.stripe.paymentIntents.capture(
+      paymentIntentId,
+      amountMinor != null ? { amount_to_capture: amountMinor } : {},
+      idempotencyKey ? { idempotencyKey } : undefined
+    );
+  }
+
   async cancelPaymentIntent(paymentIntentId: string, idempotencyKey?: string): Promise<Stripe.PaymentIntent> {
     return this.stripe.paymentIntents.cancel(
       paymentIntentId,
@@ -1353,6 +1468,21 @@ export class StripeClient {
     return this.stripe.paymentLinks.update(paymentLinkId, { active });
   }
 
+  // ---- checkout sessions (PA-12): read-only browse on the Links page ----
+
+  async listCheckoutSessions(opts: {
+    limit?: number;
+    status?: "open" | "complete" | "expired";
+    startingAfter?: string;
+  }): Promise<{ sessions: Stripe.Checkout.Session[]; hasMore: boolean }> {
+    const res = await this.stripe.checkout.sessions.list({
+      limit: opts.limit ?? 25,
+      ...(opts.status ? { status: opts.status } : {}),
+      ...(opts.startingAfter ? { starting_after: opts.startingAfter } : {}),
+    });
+    return { sessions: res.data, hasMore: res.has_more };
+  }
+
   // ---- tax rates (PA-7a) ----
 
   async listTaxRates(limit = 25): Promise<Stripe.TaxRate[]> {
@@ -1380,6 +1510,39 @@ export class StripeClient {
   // use; already-attached invoices/subscriptions keep them.
   async setTaxRateActive(taxRateId: string, active: boolean): Promise<Stripe.TaxRate> {
     return this.stripe.taxRates.update(taxRateId, { active });
+  }
+
+  // ---- shipping rates (PA-12): fixed-amount rates, 5th Catalog tab ----
+
+  async listShippingRates(limit = 25): Promise<Stripe.ShippingRate[]> {
+    const res = await this.stripe.shippingRates.list({ limit });
+    return res.data;
+  }
+
+  async createShippingRate(
+    params: {
+      displayName: string;
+      amountMinor: number;
+      currency: string;
+      taxBehavior?: "inclusive" | "exclusive" | "unspecified";
+    },
+    idempotencyKey: string
+  ): Promise<Stripe.ShippingRate> {
+    return this.stripe.shippingRates.create(
+      {
+        display_name: params.displayName,
+        type: "fixed_amount",
+        fixed_amount: { amount: params.amountMinor, currency: params.currency },
+        ...(params.taxBehavior ? { tax_behavior: params.taxBehavior } : {}),
+      },
+      { idempotencyKey }
+    );
+  }
+
+  // Shipping rates can't be deleted — archiving (active:false) hides them
+  // from new checkouts; existing sessions keep them.
+  async setShippingRateActive(shippingRateId: string, active: boolean): Promise<Stripe.ShippingRate> {
+    return this.stripe.shippingRates.update(shippingRateId, { active });
   }
 
   // ---- quotes (PA-7b) ----
@@ -1428,6 +1591,33 @@ export class StripeClient {
   // Accepting mints the subscription/invoice the quote describes.
   async acceptQuote(quoteId: string, idempotencyKey?: string): Promise<Stripe.Quote> {
     return this.stripe.quotes.accept(quoteId, {}, idempotencyKey ? { idempotencyKey } : undefined);
+  }
+
+  // Quote PDF (PA-12): the API returns a STREAM, not a File object — fileLinks
+  // can't mint URLs for it, so the bytes ride the dashboard's JSON channel as
+  // b64. Size-capped accumulation + the %PDF magic-byte check (receipt-PDF
+  // idiom) so an error page never gets served as a download. Null = no PDF
+  // obtainable within the cap.
+  async getQuotePdf(quoteId: string, maxBytes: number): Promise<Buffer | null> {
+    const stream = (await this.stripe.quotes.pdf(quoteId)) as unknown as NodeJS.ReadableStream & { destroy?: () => void };
+    const data = await new Promise<Buffer | null>((resolve, reject) => {
+      const chunks: Buffer[] = [];
+      let total = 0;
+      stream.on("data", (chunk: Buffer) => {
+        total += chunk.length;
+        if (total > maxBytes) {
+          if (stream.destroy) stream.destroy();
+          resolve(null);
+          return;
+        }
+        chunks.push(chunk);
+      });
+      stream.on("end", () => resolve(Buffer.concat(chunks)));
+      stream.on("error", reject);
+    });
+    if (!data || data.length === 0) return null;
+    if (!data.subarray(0, 5).toString("latin1").startsWith("%PDF")) return null;
+    return data;
   }
 
   // ---- usage meters (PA-7b) ----
@@ -1838,6 +2028,29 @@ export class StripeClient {
     );
   }
 
+  // ---- full-phase schedule editor (PA-11) ----
+
+  // Replace the schedule's phases wholesale. Callers pass the REBUILT current
+  // phase first (rebuildCurrentPhase) — the update API only accepts
+  // param-shaped phases and refuses overlapping/omitted current phases.
+  async updateSchedulePhases(
+    scheduleId: string,
+    params: { phases: Stripe.SubscriptionScheduleUpdateParams.Phase[]; endBehavior: "release" | "cancel" },
+    idempotencyKey?: string
+  ): Promise<Stripe.SubscriptionSchedule> {
+    return this.stripe.subscriptionSchedules.update(
+      scheduleId,
+      { phases: params.phases, end_behavior: params.endBehavior },
+      idempotencyKey ? { idempotencyKey } : undefined
+    );
+  }
+
+  // CANCELS THE SUBSCRIPTION TOO — Stripe semantics; callers must ceremony
+  // this like a subscription cancellation (T2 in the dashboard).
+  async cancelSchedule(scheduleId: string, idempotencyKey?: string): Promise<Stripe.SubscriptionSchedule> {
+    return this.stripe.subscriptionSchedules.cancel(scheduleId, {}, idempotencyKey ? { idempotencyKey } : undefined);
+  }
+
   // ---- Billing admin panel (/billing) invoice, credit & payment writes ----
 
   // pending_invoice_items_behavior MUST stay "exclude": ad-hoc invoices must never
@@ -1905,6 +2118,60 @@ export class StripeClient {
 
   // auto_advance stays off: finalizing must not let Stripe auto-collect later —
   // collection happens explicitly via sendInvoice/payInvoice.
+  // ---- draft-invoice editor (PA-9) ----
+  // invoiceItems.list is the source of truth for EDITABLE rows on a one-off
+  // draft — never map Basil invoice.lines back to ii_ ids (fragile parent
+  // indirection). Subscription-cycle drafts have no invoiceitems and are not
+  // editable here.
+
+  async listInvoiceItems(invoiceId: string): Promise<Stripe.InvoiceItem[]> {
+    const res = await this.stripe.invoiceItems.list({ invoice: invoiceId, limit: 50 });
+    return res.data;
+  }
+
+  async updateInvoiceItem(
+    itemId: string,
+    params: { amountMinor?: number; quantity?: number; description?: string },
+    idempotencyKey?: string
+  ): Promise<Stripe.InvoiceItem> {
+    return this.stripe.invoiceItems.update(
+      itemId,
+      {
+        ...(params.amountMinor != null ? { amount: params.amountMinor } : {}),
+        ...(params.quantity != null ? { quantity: params.quantity } : {}),
+        ...(params.description != null ? { description: params.description } : {}),
+      },
+      idempotencyKey ? { idempotencyKey } : undefined
+    );
+  }
+
+  async getInvoiceItem(itemId: string): Promise<Stripe.InvoiceItem> {
+    return this.stripe.invoiceItems.retrieve(itemId);
+  }
+
+  async deleteInvoiceItem(itemId: string): Promise<void> {
+    await this.stripe.invoiceItems.del(itemId);
+  }
+
+  // Draft-only metadata/memo/footer/due-date edits ("description" is the memo
+  // shown above the line items on the hosted invoice).
+  async updateInvoiceDetails(
+    invoiceId: string,
+    params: { dueDateUnix?: number; memo?: string | null; footer?: string | null; metadata?: Stripe.Emptyable<Stripe.MetadataParam> },
+    idempotencyKey?: string
+  ): Promise<Stripe.Invoice> {
+    return this.stripe.invoices.update(
+      invoiceId,
+      {
+        ...(params.dueDateUnix != null ? { due_date: params.dueDateUnix } : {}),
+        ...(params.memo !== undefined ? { description: params.memo ?? "" } : {}),
+        ...(params.footer !== undefined ? { footer: params.footer ?? "" } : {}),
+        ...(params.metadata !== undefined ? { metadata: params.metadata } : {}),
+      },
+      idempotencyKey ? { idempotencyKey } : undefined
+    );
+  }
+
   async finalizeInvoice(invoiceId: string, idempotencyKey?: string): Promise<Stripe.Invoice> {
     return this.stripe.invoices.finalizeInvoice(
       invoiceId,
@@ -2005,6 +2272,44 @@ export class StripeClient {
     );
   }
 
+  // ---- reporting (PA-12): report runs + short-lived file links ----
+
+  async listReportRuns(limit = 25): Promise<Stripe.Reporting.ReportRun[]> {
+    const res = await this.stripe.reporting.reportRuns.list({ limit });
+    return res.data;
+  }
+
+  async getReportRun(runId: string): Promise<Stripe.Reporting.ReportRun> {
+    return this.stripe.reporting.reportRuns.retrieve(runId);
+  }
+
+  // Report types are free strings in the SDK; per-account availability is
+  // validated by Stripe at create time — callers map those errors to friendly
+  // text. Runs execute asynchronously.
+  async createReportRun(
+    reportType: string,
+    params: { intervalStart?: number; intervalEnd?: number },
+    idempotencyKey: string
+  ): Promise<Stripe.Reporting.ReportRun> {
+    const interval = {
+      ...(params.intervalStart ? { interval_start: params.intervalStart } : {}),
+      ...(params.intervalEnd ? { interval_end: params.intervalEnd } : {}),
+    };
+    return this.stripe.reporting.reportRuns.create(
+      {
+        report_type: reportType,
+        ...(Object.keys(interval).length ? { parameters: interval } : {}),
+      },
+      { idempotencyKey }
+    );
+  }
+
+  // Mints a tokenized, expiring public URL onto a Stripe File (report
+  // results are real Files — unlike quote PDFs, which are streams).
+  async createFileLink(fileId: string, expiresAt: number): Promise<Stripe.FileLink> {
+    return this.stripe.fileLinks.create({ file: fileId, expires_at: expiresAt });
+  }
+
   // ---- test clocks (test mode only — the "Run simulation" affordance) ----
 
   async getTestClock(clockId: string): Promise<Stripe.TestHelpers.TestClock> {
@@ -2038,4 +2343,40 @@ export class StripeClient {
       return `${value} ${currency.toUpperCase()}`;
     }
   }
+}
+
+// Rebuild a schedule's CURRENT phase (phase 0) into the param shape the
+// update API accepts, preserving trial_end and coupon-backed discounts (the
+// response-only fields the older scheduleNextPhasePlan rebuild dropped).
+// Anything that cannot be re-sent faithfully lands in `unsupported` — callers
+// must refuse rather than silently drop it.
+export function rebuildCurrentPhase(schedule: Stripe.SubscriptionSchedule): {
+  phase: Stripe.SubscriptionScheduleUpdateParams.Phase;
+  unsupported: string[];
+} {
+  const current = schedule.phases[0];
+  const unsupported: string[] = [];
+  const discounts: Array<{ coupon: string }> = [];
+  for (const d of current.discounts ?? []) {
+    const coupon = typeof d.coupon === "string" ? d.coupon : d.coupon?.id ?? null;
+    if (coupon) discounts.push({ coupon });
+    else unsupported.push("a phase discount without a resolvable coupon");
+  }
+  const items: Stripe.SubscriptionScheduleUpdateParams.Phase.Item[] = [];
+  for (const item of current.items) {
+    if (item.discounts?.length) unsupported.push("per-item discounts on the current phase");
+    items.push({
+      price: typeof item.price === "string" ? item.price : item.price.id,
+      ...(item.quantity != null ? { quantity: item.quantity } : {}),
+    });
+  }
+  if (current.default_payment_method) unsupported.push("a phase-level default payment method");
+  const phase: Stripe.SubscriptionScheduleUpdateParams.Phase = {
+    items,
+    start_date: current.start_date,
+    end_date: current.end_date,
+    ...(current.trial_end ? { trial_end: current.trial_end } : {}),
+    ...(discounts.length ? { discounts } : {}),
+  };
+  return { phase, unsupported };
 }

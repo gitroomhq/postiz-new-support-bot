@@ -63,12 +63,20 @@ export class DashboardActionGateway {
         }
         return { ok: true, key, params, binding };
       }
-      case "payment_intent.cancel": {
+      case "payment_intent.cancel":
+      case "payment_intent.capture": {
         const paymentIntentId = validId("payment_intent", params.paymentIntentId);
         if (!paymentIntentId) return { ok: false, error: "paymentIntentId (pi_…) required." };
         const pi = await this.stripe.getPaymentIntent(paymentIntentId);
         const customerId = idOf(pi.customer);
         if (!customerId) return { ok: false, error: "This payment intent has no customer attached." };
+        // Partial-capture modal input is in major units; convert with the
+        // PI's currency (same idiom as the charge-refund conversion).
+        if (key === "payment_intent.capture" && params.amountMinor == null && typeof params.amountMajor === "number" && isFinite(params.amountMajor)) {
+          const factor = StripeClient.isZeroDecimal(pi.currency) ? 1 : 100;
+          params.amountMinor = Math.round(params.amountMajor * factor);
+          delete params.amountMajor;
+        }
         return { ok: true, key, params, binding: await this.bindingFor(customerId) };
       }
       case "subscription.cancel":
@@ -76,7 +84,15 @@ export class DashboardActionGateway {
       case "subscription.change_plan":
       case "subscription.terms":
       case "subscription.items":
+      case "subscription.schedule":
       case "customer.coupon": {
+        // coupon op:"remove" may target the CUSTOMER-level discount instead of
+        // a subscription — bind via the explicit customer id then.
+        if (key === "customer.coupon" && params.op === "remove" && params.subscriptionId == null) {
+          const customerId = validId("customer", params.customerId);
+          if (!customerId) return { ok: false, error: "customerId (cus_…) required to remove a customer-level discount." };
+          return { ok: true, key, params, binding: await this.bindingFor(customerId) };
+        }
         const subscriptionId = validId("subscription", params.subscriptionId);
         if (!subscriptionId) return { ok: false, error: "subscriptionId (sub_…) required." };
         const sub = await this.stripe.getSubscription(subscriptionId);

@@ -1,21 +1,33 @@
-// Client module: hash router, nav/crumb rendering, jump-to-ID, activation
-// poll, nav-badge poll and boot. Hash convention (mirrors ObjectRef):
-//   #/customers                → page "customers"
-//   #/customers/cus_123        → page "customers.detail", params { id }
-//   #/customers/cus_123/portal → page "customers.portal", params { id }
-//   #/invoices/new             → page "invoices.new" (id-less subpage)
+// Client module: path router (History API), nav/crumb rendering, jump-to-ID,
+// activation poll, nav-badge poll and boot. URL convention (mirrors ObjectRef;
+// REAL copyable paths, not hash routes — PA-13 user decision):
+//   /billing/customers            → page "customers"
+//   /billing/customers/cus_123    → page "customers.detail", params { id }
+//   /billing/customers/cus_1/portal → page "customers.portal", params { id }
+//   /billing/invoices/new         → page "invoices.new" (id-less subpage)
 // The second segment is an object id ONLY when it looks like one (Stripe ids
 // always carry an underscore); otherwise it names an id-less subpage like
-// "new" — that keeps #/subscriptions/new ≠ subscriptions.detail{id:"new"}.
-// Filters serialize as query params (f_<key>=<value>). Cursors stay in memory.
+// "new" — that keeps /billing/subscriptions/new ≠ detail{id:"new"}.
+// Filters serialize as real query params (f_<key>=<value>). Cursors stay in
+// memory. Legacy #/… links still parse and are canonicalized on route change.
 
 export const clientApp = `
-D.parseHash = function () {
-  var h = location.hash.replace(/^#\\/?/, "");
-  var qIdx = h.indexOf("?");
-  var query = "";
-  if (qIdx >= 0) { query = h.slice(qIdx + 1); h = h.slice(0, qIdx); }
-  var seg = h.split("/").filter(function (s) { return s.length > 0; }).map(decodeURIComponent);
+D.BASE = "/billing";
+
+D.parseRoute = function () {
+  var path = location.pathname || "";
+  var query = (location.search || "").replace(/^\\?/, "");
+  // Legacy hash route (#/customers/cus_1?f_x=y) wins when present — old
+  // bookmarks keep working; onRouteChange canonicalizes it to a path.
+  if (location.hash && location.hash.indexOf("#/") === 0) {
+    var h = location.hash.slice(2);
+    var qIdx = h.indexOf("?");
+    query = "";
+    if (qIdx >= 0) { query = h.slice(qIdx + 1); h = h.slice(0, qIdx); }
+    path = D.BASE + "/" + h;
+  }
+  if (path.indexOf(D.BASE) === 0) path = path.slice(D.BASE.length);
+  var seg = path.split("/").filter(function (s) { return s.length > 0; }).map(decodeURIComponent);
   var page, params = {};
   if (seg.length === 0) page = D.defaultPage;
   else if (seg.length === 1) page = seg[0];
@@ -35,45 +47,71 @@ D.parseHash = function () {
   return { page: page, params: params, filters: filters };
 };
 
-D.hashFor = function (page, params, filters) {
+D.hrefFor = function (page, params, filters) {
   var parts = page.split(".");
   var seg = [parts[0]];
   if (params && params.id) seg.push(params.id);
   if (parts.length > 1 && parts[1] !== "detail") seg.push(parts[1]);
-  var h = "#/" + seg.map(encodeURIComponent).join("/");
+  var href = D.BASE + "/" + seg.map(encodeURIComponent).join("/");
   var fs = [];
   Object.keys(filters || {}).forEach(function (k) {
     if (filters[k]) fs.push("f_" + encodeURIComponent(k) + "=" + encodeURIComponent(filters[k]));
   });
-  if (fs.length) h += "?" + fs.join("&");
-  return h;
+  if (fs.length) href += "?" + fs.join("&");
+  return href;
+};
+
+D.go = function (href) {
+  try { history.pushState({}, "", href); } catch (e) { location.href = href; return; }
+  D.onRouteChange();
 };
 
 D.navigateRef = function (ref) {
   if (!ref) return;
-  location.hash = D.hashFor(ref.page, ref.params || {}, ref.filters || {});
+  D.go(D.hrefFor(ref.page, ref.params || {}, ref.filters || {}));
 };
 
 D.applyFilter = function (key, value) {
   var f = {};
   Object.keys(D.state.filters).forEach(function (k) { f[k] = D.state.filters[k]; });
   if (value) f[key] = value; else delete f[key];
-  location.hash = D.hashFor(D.state.page, D.state.params, f);
+  D.go(D.hrefFor(D.state.page, D.state.params, f));
 };
 
 D.clearFilters = function () {
-  location.hash = D.hashFor(D.state.page, D.state.params, {});
+  D.go(D.hrefFor(D.state.page, D.state.params, {}));
 };
 
-D.onHashChange = function () {
-  var parsed = D.parseHash();
+D.onRouteChange = function () {
+  var parsed = D.parseRoute();
+  // Canonicalize a legacy #/… URL into its path form (copyable, shareable).
+  if (location.hash && location.hash.indexOf("#/") === 0) {
+    try { history.replaceState({}, "", D.hrefFor(parsed.page, parsed.params, parsed.filters)); } catch (e) {}
+  }
   var samePage = D.state.page === parsed.page && JSON.stringify(D.state.params) === JSON.stringify(parsed.params);
   var sameFilters = JSON.stringify(D.state.filters) === JSON.stringify(parsed.filters);
   D.state.page = parsed.page;
   D.state.params = parsed.params;
   D.state.filters = parsed.filters;
   if (!samePage || !sameFilters) { D.state.cursor = null; D.state.stack = []; }
+  try { window.dispatchEvent(new CustomEvent("dashroute")); } catch (e) {}
   D.loadPage();
+};
+
+// Internal anchors (refHref emits real /billing/… hrefs) SPA-navigate on a
+// plain left click; modified clicks and middle clicks keep native new-tab
+// behavior — the server serves the shell for any /billing path.
+D.bindLinks = function () {
+  document.addEventListener("click", function (e) {
+    if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+    var t = e.target;
+    while (t && t !== document.body && t.tagName !== "A") t = t.parentNode;
+    if (!t || t.tagName !== "A" || t.target === "_blank") return;
+    var href = t.getAttribute("href") || "";
+    if (href !== D.BASE && href.indexOf(D.BASE + "/") !== 0) return;
+    e.preventDefault();
+    D.go(href);
+  });
 };
 
 D.loadPage = function () {
@@ -138,6 +176,9 @@ D.NAV_ICONS = {
   fraud: "M8 2.5 13 4.3v3.5c0 3-2.2 4.8-5 5.7-2.8-.9-5-2.7-5-5.7V4.3Z",
   portal: "M7 3.2H3.2v9.6h9.6V9M9.8 3.2h3v3M12.8 3.2 7.6 8.4",
   meters: "M3.1 11.6a5.6 5.6 0 1 1 9.8 0M8 10.2l2.6-3.8",
+  events: "M8.6 2.2 3.4 9h3.4l-1 4.8L11 7.2H7.6l1-5Z",
+  webhooks: "M5.2 10.8a2.1 2.1 0 1 0 2.1 2.1V8.4l2.8-4.6a2.1 2.1 0 1 1 2.6 1.2M4.4 8.5a2.1 2.1 0 1 0 3.5 2.3h5a2.1 2.1 0 1 0 0 .1",
+  reports: "M3 13.4h10.8M4.6 13V8.6h2V13M7.9 13V4.6h2V13M11.2 13V6.6h2V13",
   bookmarks: "M4.2 2.9h7.6v10.2L8 10.6l-3.8 2.5Z",
   security: "M4.6 7.4V6a3.4 3.4 0 0 1 6.8 0v1.4M3.9 7.4h8.2v6H3.9Z"
 };
@@ -178,7 +219,7 @@ D.renderNav = function (v) {
     var count = D.navBadges && D.navBadges[item.key];
     if (count) b.appendChild(D.el("span", "navcount", count));
     if (item.key === v.activeNav) b.classList.add("active");
-    b.addEventListener("click", function () { location.hash = D.hashFor(item.page, {}, {}); });
+    b.addEventListener("click", function () { D.go(D.hrefFor(item.page, {}, {})); });
     nav.appendChild(b);
   });
 };
@@ -202,16 +243,124 @@ D.renderCrumbs = function (v) {
   });
 };
 
-// ---- nav badges (60s poll while active) ----
+// ---- nav badges + bell attention (one 60s poll while active) ----
 D.navBadges = {};
+D.attention = [];
 D.badgeTimer = null;
 D.pollBadges = function () {
   D.api("nav-badges", {}).then(function (res) {
     if (res.status !== 200 || !res.j || !res.j.badges) return;
     D.navBadges = res.j.badges;
+    D.attention = res.j.attention || [];
+    D.syncBell();
     if (D.state.view) D.renderNav(D.state.view);
   }).catch(function () {});
   D.badgeTimer = setTimeout(D.pollBadges, 60000);
+};
+
+// ---- needs-attention bell (PA-13) ----
+D.syncBell = function () {
+  var count = D.q("bellcount");
+  if (!count) return;
+  var n = D.attention.length;
+  count.hidden = n === 0;
+  count.textContent = n ? String(n) : "";
+};
+D.renderBellPop = function (pop) {
+  pop.textContent = "";
+  if (!D.attention.length) {
+    pop.appendChild(D.el("div", "palnote", "Nothing needs attention."));
+    return;
+  }
+  D.attention.forEach(function (it) {
+    var row = D.el("button", "btn menuitem bellitem");
+    row.type = "button";
+    row.appendChild(D.badge(it.badge));
+    var lab = D.el("span", "belllabel", it.label);
+    lab.title = D.fmtAbs(it.iso);
+    row.appendChild(lab);
+    row.addEventListener("click", function () {
+      D.closeAllPops();
+      D.navigateRef(it.ref);
+    });
+    pop.appendChild(row);
+  });
+};
+D.bindBell = function () {
+  var btn = D.q("bellbtn");
+  var pop = D.q("bellpop");
+  if (!btn || !pop) return;
+  var NS = "http://www.w3.org/2000/svg";
+  var svg = document.createElementNS(NS, "svg");
+  svg.setAttribute("viewBox", "0 0 16 16");
+  svg.setAttribute("aria-hidden", "true");
+  var p = document.createElementNS(NS, "path");
+  p.setAttribute("d", "M8 2.2a3.8 3.8 0 0 0-3.8 3.8v2.4L3 10.6h10l-1.2-2.2V6A3.8 3.8 0 0 0 8 2.2ZM6.6 12.4a1.5 1.5 0 0 0 2.8 0");
+  p.setAttribute("fill", "none");
+  p.setAttribute("stroke", "currentColor");
+  p.setAttribute("stroke-width", "1.4");
+  p.setAttribute("stroke-linecap", "round");
+  p.setAttribute("stroke-linejoin", "round");
+  svg.appendChild(p);
+  btn.appendChild(svg);
+  var count = D.el("span", "navcount", "");
+  count.id = "bellcount";
+  count.hidden = true;
+  btn.appendChild(count);
+  btn.addEventListener("click", function (e) {
+    e.stopPropagation();
+    var wasOpen = pop.classList.contains("open");
+    D.closeAllPops();
+    if (!wasOpen) { D.renderBellPop(pop); pop.classList.add("open"); }
+  });
+};
+
+// ---- keyboard shortcuts (PA-13): g-then-key navigation + ? help ----
+D.SHORTCUT_PAGES = { p: "payments", c: "customers", h: "home", b: "balances", i: "invoices", d: "disputes" };
+D.gArmedAt = 0;
+D.bindShortcuts = function () {
+  document.addEventListener("keydown", function (e) {
+    if (e.ctrlKey || e.metaKey || e.altKey) return; // Ctrl+K stays with the palette
+    var t = e.target;
+    if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT" || t.isContentEditable)) return;
+    if (document.querySelector("dialog[open]") && e.key !== "?") return;
+    if (e.key === "?") {
+      var hm = D.q("helpmodal");
+      if (hm && !hm.open) { hm.showModal(); e.preventDefault(); }
+      return;
+    }
+    if (e.key === "g") { D.gArmedAt = Date.now(); return; }
+    if (D.gArmedAt && Date.now() - D.gArmedAt < 1500) {
+      var page = D.SHORTCUT_PAGES[e.key];
+      D.gArmedAt = 0;
+      if (page) { e.preventDefault(); D.go(D.hrefFor(page, {}, {})); }
+    }
+  });
+  var help = D.q("helpmodal");
+  var close = D.q("helpClose");
+  if (close && help) close.addEventListener("click", function () { help.close(); });
+};
+
+// ---- mobile hamburger (PA-13): slides the fixed sidebar in/out ----
+D.bindMenu = function () {
+  var btn = D.q("menubtn");
+  var side = document.querySelector(".side");
+  var scrim = D.q("scrim");
+  if (!btn || !side) return;
+  var close = function () {
+    side.classList.remove("open");
+    if (scrim) scrim.classList.remove("show");
+    btn.setAttribute("aria-expanded", "false");
+  };
+  btn.addEventListener("click", function () {
+    var open = side.classList.toggle("open");
+    if (scrim) scrim.classList.toggle("show", open);
+    btn.setAttribute("aria-expanded", String(open));
+  });
+  if (scrim) scrim.addEventListener("click", close);
+  window.addEventListener("dashroute", close);
+  var nav = D.q("nav");
+  if (nav) nav.addEventListener("click", close);
 };
 
 // ---- id routes (shared by the palette's fast-path) ----
@@ -317,7 +466,7 @@ D.bindCreate = function () {
     mi.type = "button";
     mi.addEventListener("click", function () {
       D.closeAllPops();
-      location.hash = D.hashFor(item.page, {}, {});
+      D.go(D.hrefFor(item.page, {}, {}));
     });
     pop.appendChild(mi);
   });
@@ -336,12 +485,18 @@ D.startApp = function () {
   D.bindModal();
   D.bindJump();
   D.bindCreate();
+  D.bindBell();
+  D.bindShortcuts();
+  D.bindMenu();
   D.q("logout").addEventListener("click", function () {
-    // Back to the sign-in screen (standing URL) rather than a dead end.
-    D.api("logout", {}).then(function () { location.hash = ""; location.reload(); });
+    // Back to the sign-in screen at the panel root (standing URL).
+    D.api("logout", {}).then(function () { location.href = D.BASE; });
   });
-  window.addEventListener("hashchange", D.onHashChange);
-  D.onHashChange();
+  D.bindLinks();
+  window.addEventListener("popstate", D.onRouteChange);
+  // Legacy #/… deep links still fire hashchange — route them too.
+  window.addEventListener("hashchange", D.onRouteChange);
+  D.onRouteChange();
   D.pollBadges();
 };
 
