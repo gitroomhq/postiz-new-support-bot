@@ -6192,15 +6192,16 @@ test("PM fingerprint (PA-13): the 360 payment-methods table exposes the fingerpr
   ];
   const page = await makeCustomersSection().buildPage(ctx, { page: "customers.detail", params: { id: "cus_test1" } });
   const pms = page!.blocks.find((b) => b.type === "table" && (b as TableBlock).key === "pms") as TableBlock;
-  assert.equal(pms.columns.some((c) => c.label === "Fingerprint"), true);
+  assert.equal(pms.columns.some((c) => c.label === "Identity"), true);
   const fpCell = pms.rows[0].cells[3] as { t: string; v: string; ref?: { page: string; filters?: Record<string, string> } };
   assert.equal(fpCell.v, "Xt5EWLLDS7FJjR1c");
   assert.deepEqual(fpCell.ref, { page: "fraud", filters: { view: "card", fp: "Xt5EWLLDS7FJjR1c" } });
-  // Wallet PMs (Link/PayPal…) have no fingerprint in Stripe's API — the
-  // instrument is vaulted on the wallet's side; the cell says so.
-  const walletCell = pms.rows[1].cells[3] as { t: string; v: string; sub?: string };
-  assert.equal(walletCell.v, "—");
-  assert.equal(walletCell.sub, "wallet-vaulted");
+  // Wallet PMs (Link/PayPal…) have no fingerprint — the wallet ACCOUNT EMAIL
+  // is the cross-customer identity, linking into the Payments email sweep.
+  const walletCell = pms.rows[1].cells[3] as { t: string; v: string; ref?: { page: string; filters?: Record<string, string> } };
+  assert.equal(walletCell.t, "link");
+  assert.equal(walletCell.v, "ada@example.com");
+  assert.deepEqual(walletCell.ref, { page: "payments", filters: { email: "ada@example.com" } });
   // Bank-debit rails DO expose fingerprints — copyable, but no card hunt link
   // (charges.search only indexes card fingerprints).
   const sepaCell = pms.rows[2].cells[3] as { t: string; v: string; ref?: unknown; copy?: boolean };

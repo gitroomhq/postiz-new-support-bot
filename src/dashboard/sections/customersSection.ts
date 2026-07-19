@@ -85,22 +85,29 @@ function parseAddressInput(
   return { ok: true, value: shipping ? { name, address } : address };
 }
 
-// PM fingerprint cell (PA-13.F). Stripe exposes `fingerprint` on the types
-// that carry one directly (cards + bank-debit rails); only CARD fingerprints
-// link into the reverse-card hunt (charges.search indexes only those).
-// Wallets like Link/PayPal vault the instrument on their side — the
-// PaymentMethod object has no fingerprint, and the dash says why. The card
-// identity still surfaces on each CHARGE's detail rail after they pay.
+// PM identity cell (PA-13.F). Stripe exposes `fingerprint` on the types that
+// carry the instrument directly (cards + bank-debit rails); only CARD
+// fingerprints link into the reverse-card hunt (charges.search indexes only
+// those). Wallets (Link/PayPal…) vault the card on their side and expose NO
+// fingerprint — but the wallet ACCOUNT EMAIL is their stable cross-customer
+// identity (it lands in billing_details.email on every charge), so it links
+// into the Payments whole-account email sweep instead.
 const WALLET_PM_TYPES = new Set(["link", "paypal", "klarna", "cashapp", "amazon_pay", "revolut_pay"]);
 
 function pmFingerprintCell(pm: Stripe.PaymentMethod): Cell {
   const details = (pm as unknown as Record<string, { fingerprint?: string | null } | undefined>)[pm.type];
   const fingerprint = details?.fingerprint ?? null;
-  if (!fingerprint) return WALLET_PM_TYPES.has(pm.type) ? text("—", "wallet-vaulted") : text("—");
-  if (pm.type === "card") {
-    return idCell(fingerprint, { copy: true, ref: { page: "fraud", filters: { view: "card", fp: fingerprint } } });
+  if (fingerprint) {
+    if (pm.type === "card") {
+      return idCell(fingerprint, { copy: true, ref: { page: "fraud", filters: { view: "card", fp: fingerprint } } });
+    }
+    return idCell(fingerprint, { copy: true });
   }
-  return idCell(fingerprint, { copy: true });
+  const walletEmail = pm.link?.email ?? pm.paypal?.payer_email ?? null;
+  if (walletEmail) {
+    return { t: "link", v: walletEmail, ref: { page: "payments", filters: { email: walletEmail } } };
+  }
+  return WALLET_PM_TYPES.has(pm.type) ? text("—", "wallet-vaulted") : text("—");
 }
 
 function actionActor(ctx: DashboardCtx): ActionActor {
@@ -967,7 +974,7 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
       { key: "method", label: "Method" },
       { key: "default", label: "Default" },
       { key: "expires", label: "Expires" },
-      { key: "fingerprint", label: "Fingerprint" },
+      { key: "fingerprint", label: "Identity" },
       { key: "id", label: "ID" },
     ],
     rows: methods.slice(0, 25).map((pm) => ({
