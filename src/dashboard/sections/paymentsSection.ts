@@ -312,6 +312,7 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
           ? ({ t: "link", v: email ?? cus, ref: { page: "customers.detail", params: { id: cus } } } as Cell)
           : text(email ?? "—"),
         dateCell(c.created),
+        c.refunds?.data?.[0]?.created ? dateCell(c.refunds.data[0].created) : text("—"),
         text(c.failure_message ?? "—"),
         { t: "flags", badges: flags } as Cell,
       ] as Cell[],
@@ -333,6 +334,7 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
           { key: "desc", label: "Description" },
           { key: "customer", label: "Customer" },
           { key: "created", label: "Date" },
+          { key: "refunded", label: "Refunded date" },
           { key: "decline", label: "Decline reason" },
           { key: "flags", label: "Flags" },
         ],

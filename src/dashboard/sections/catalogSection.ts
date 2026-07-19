@@ -3,7 +3,7 @@ import { StripeClient } from "../../bot/StripeClient";
 import { promoCoupon, promoCouponId } from "../../bot/billing/ui";
 import { ActionButton, ActionResult, Badge, Block, Cell, TableBlock } from "../renderer/contract";
 import { DashboardCtx, DashboardSectionModule, SectionPage, str, validCursor } from "./types";
-import { avatarCell, badgeCell, dateCell, idCell, text } from "./cells";
+import { avatarCell, badgeCell, dateCell, formatPerCurrency, idCell, text } from "./cells";
 
 // Product catalog (#/catalog): Products & prices read-only (PromosHub-parity
 // actions live on the Coupons / Promo codes tabs — list/check/create/toggle
@@ -167,15 +167,32 @@ function priceLabel(stripe: { formatAmount(a: number, c: string): string }, pric
 
 async function productsTable(ctx: DashboardCtx, cursor: string | null): Promise<Block> {
   const startingAfter = validCursor(cursor) ?? undefined;
-  const { products, hasMore } = await ctx.stripe.listProducts({ limit: 25, startingAfter });
+  const [{ products, hasMore }, allPrices] = await Promise.all([
+    ctx.stripe.listProducts({ limit: 25, startingAfter }),
+    ctx.stripe.listAllActivePrices(100).catch(() => [] as Stripe.Price[]),
+  ]);
+  // Group prices by product so the list shows a real price even when a product
+  // has no default_price set (+ "N prices" when there's more than one).
+  const pricesByProduct = new Map<string, Stripe.Price[]>();
+  for (const p of allPrices) {
+    const pid = typeof p.product === "string" ? p.product : p.product?.id;
+    if (!pid) continue;
+    const bucket = pricesByProduct.get(pid);
+    if (bucket) bucket.push(p);
+    else pricesByProduct.set(pid, [p]);
+  }
   const rows = products.map((prod) => {
-    const price = prod.default_price && typeof prod.default_price !== "string" ? (prod.default_price as Stripe.Price) : null;
+    const dflt = prod.default_price && typeof prod.default_price !== "string" ? (prod.default_price as Stripe.Price) : null;
+    const grouped = pricesByProduct.get(prod.id) ?? [];
+    const shown = dflt ?? grouped[0] ?? null;
+    const count = grouped.length || (dflt ? 1 : 0);
+    const label = shown ? `${priceLabel(ctx.stripe, shown)}${count > 1 ? ` · ${count} prices` : ""}` : "No price";
     return {
       id: prod.id,
       ref: { page: "catalog.detail", params: { id: prod.id } },
       cells: [
         avatarCell("product", prod.name, { sub: prod.description?.slice(0, 80) }),
-        text(priceLabel(ctx.stripe, price)),
+        text(label),
         badgeCell(prod.active ? "ok" : "neutral", prod.active ? "Active" : "Archived"),
         dateCell(prod.created),
         idCell(prod.id, { copy: true }),
@@ -187,7 +204,7 @@ async function productsTable(ctx: DashboardCtx, cursor: string | null): Promise<
     key: "products",
     columns: [
       { key: "name", label: "Name" },
-      { key: "price", label: "Default price" },
+      { key: "price", label: "Pricing" },
       { key: "status", label: "" },
       { key: "created", label: "Created" },
       { key: "id", label: "ID" },
@@ -210,10 +227,36 @@ async function productDetail(ctx: DashboardCtx, id: string): Promise<SectionPage
     }
     throw e;
   }
-  const prices = await ctx.stripe.listPricesForProduct(id, 50);
+  const [prices, subCounts] = await Promise.all([
+    ctx.stripe.listPricesForProduct(id, 50),
+    ctx.stripe.countActiveSubscriptionsByPrice(10).catch(() => ({ counts: new Map<string, number>(), scanned: 0, truncated: false })),
+  ]);
   const name = product.name ?? id;
 
+  // MRR + active-subscription totals for this product, from the (single) active-sub sweep.
+  const mrrByCur = new Map<string, number>();
+  let activeSubs = 0;
+  for (const price of prices) {
+    const cnt = subCounts.counts.get(price.id) ?? 0;
+    activeSubs += cnt;
+    if (!cnt || !price.recurring || price.unit_amount == null) continue;
+    const n = price.recurring.interval_count || 1;
+    const per = price.unit_amount * cnt;
+    const monthly =
+      price.recurring.interval === "month"
+        ? per / n
+        : price.recurring.interval === "year"
+          ? per / (12 * n)
+          : price.recurring.interval === "week"
+            ? (per * 52) / (12 * n)
+            : price.recurring.interval === "day"
+              ? (per * 365) / (12 * n)
+              : 0;
+    if (monthly > 0) mrrByCur.set(price.currency, (mrrByCur.get(price.currency) ?? 0) + Math.round(monthly));
+  }
+
   const main: Block[] = [];
+  const rail: Block[] = [];
   main.push({
     type: "header",
     title: name,
@@ -228,25 +271,69 @@ async function productDetail(ctx: DashboardCtx, id: string): Promise<SectionPage
     columns: [
       { key: "price", label: "Price" },
       { key: "type", label: "Type" },
+      { key: "subs", label: "Subscriptions" },
       { key: "status", label: "" },
       { key: "id", label: "ID" },
     ],
-    rows: prices.map((price) => ({
-      id: price.id,
-      cells: [
-        text(priceLabel(ctx.stripe, price), price.nickname ?? undefined),
-        text(price.recurring ? `Recurring (${price.recurring.interval})` : "One-time"),
-        badgeCell(price.active ? "ok" : "neutral", price.active ? "Active" : "Archived"),
-        idCell(price.id, { copy: true }),
-      ] as Cell[],
-    })),
+    rows: prices.map((price) => {
+      const cnt = subCounts.counts.get(price.id) ?? 0;
+      return {
+        id: price.id,
+        cells: [
+          text(priceLabel(ctx.stripe, price), price.nickname ?? undefined),
+          text(price.recurring ? `Recurring (${price.recurring.interval})` : "One-time"),
+          text(cnt ? `${cnt} active` : "—"),
+          badgeCell(price.active ? "ok" : "neutral", price.active ? "Active" : "Archived"),
+          idCell(price.id, { copy: true }),
+        ] as Cell[],
+      };
+    }),
     empty: "No prices on this product.",
-    notice: "Read-only — subscriptions pick these prices in the change-plan flow.",
+    notice: `Read-only — subscriptions pick these prices in the change-plan flow.${subCounts.truncated ? " Subscription counts are approximate (sweep truncated)." : ""}`,
   });
+
+  // Rail: Insights (MRR) / Details / Metadata.
+  rail.push({
+    type: "kv",
+    title: "Insights",
+    big: true,
+    rows: [
+      { label: "MRR", cell: text(formatPerCurrency(ctx.stripe, mrrByCur)) },
+      { label: "Active subscriptions", cell: text(String(activeSubs)) },
+      { label: "Prices", cell: text(String(prices.length)) },
+    ],
+  });
+  rail.push({
+    type: "kv",
+    title: "Details",
+    rows: [
+      { label: "Product ID", cell: idCell(id, { copy: true }) },
+      { label: "Status", cell: badgeCell(product.active ? "ok" : "neutral", product.active ? "Active" : "Archived") },
+      { label: "Created", cell: dateCell(product.created) },
+      ...(product.unit_label ? [{ label: "Unit label", cell: text(product.unit_label) }] : []),
+      ...(typeof product.statement_descriptor === "string" && product.statement_descriptor
+        ? [{ label: "Statement descriptor", cell: text(product.statement_descriptor) }]
+        : []),
+      ...(typeof product.tax_code === "string" && product.tax_code
+        ? [{ label: "Tax code", cell: text(product.tax_code) }]
+        : []),
+      ...(product.description ? [{ label: "Description", cell: text(product.description) }] : []),
+    ],
+  });
+  const productMeta = Object.entries(product.metadata ?? {});
+  rail.push({
+    type: "kv",
+    title: "Metadata",
+    rows: productMeta.length
+      ? productMeta.slice(0, 15).map(([k, v]) => ({ label: k, cell: text(String(v).slice(0, 200)) }))
+      : [{ label: "Metadata", cell: text("No metadata") }],
+  });
+
   return {
     title: name,
     crumbs: [{ label: "Product catalog", ref: { page: "catalog" } }, { label: id, copyId: id }],
     blocks: main,
+    rail,
   };
 }
 

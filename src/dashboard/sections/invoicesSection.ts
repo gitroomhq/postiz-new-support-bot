@@ -1,6 +1,6 @@
 import type Stripe from "stripe";
 import type { ActionActor } from "../../bot/billing/actions/BillingActionService";
-import { ActionButton, Block, Cell } from "../renderer/contract";
+import { ActionButton, Badge, Block, Cell } from "../renderer/contract";
 import { DashboardCtx, DashboardSectionModule, SectionPage, str, validCursor, validId } from "./types";
 import { amount, badgeCell, cardCell, dateCell, idCell, invoiceBadge, money, sentence, text } from "./cells";
 
@@ -131,6 +131,14 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
 
 // ---- DETAIL ----
 
+function fmtAddress(a?: Stripe.Address | null): string | null {
+  if (!a) return null;
+  const parts = [a.line1, a.line2, [a.postal_code, a.city].filter(Boolean).join(" ").trim(), a.state, a.country]
+    .map((p) => (p ? String(p).trim() : ""))
+    .filter(Boolean);
+  return parts.length ? parts.join(", ") : null;
+}
+
 async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
   const invoice = await ctx.stripe.getInvoice(id).catch(() => null);
   if (!invoice) return notFound("This invoice does not exist.");
@@ -254,6 +262,42 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
       ],
     });
   }
+
+  // Billing details (Stripe's "Summary" left column: who/where/how it's billed).
+  const billTo = invoice.customer_name || invoice.customer_email || customerId;
+  const billAddr = fmtAddress(invoice.customer_address);
+  const shipAddr = fmtAddress(invoice.customer_shipping?.address ?? null);
+  main.push({
+    type: "kv",
+    title: "Billing details",
+    rows: [
+      ...(billTo ? [{ label: "Billed to", cell: text(billTo) }] : []),
+      ...(invoice.customer_email ? [{ label: "Email", cell: text(invoice.customer_email) }] : []),
+      ...(billAddr ? [{ label: "Billing address", cell: text(billAddr) }] : []),
+      ...(shipAddr ? [{ label: "Shipping address", cell: text(shipAddr) }] : []),
+      { label: "Currency", cell: text(invoice.currency.toUpperCase()) },
+      {
+        label: "Billing method",
+        cell: text(invoice.collection_method === "send_invoice" ? "Send invoice" : "Charge automatically"),
+      },
+      ...(invoice.description ? [{ label: "Memo", cell: text(invoice.description) }] : []),
+      ...(invoice.footer ? [{ label: "Footer", cell: text(invoice.footer) }] : []),
+    ],
+  });
+
+  // Recent activity — the invoice lifecycle from its status transitions.
+  const st = invoice.status_transitions;
+  const isoOf = (sec: number) => new Date(sec * 1000).toISOString();
+  const activity: Array<{ label: string; iso: string; kind: Badge["kind"] }> = [
+    { label: "Invoice created", iso: isoOf(invoice.created), kind: "info" },
+  ];
+  if (st?.finalized_at) activity.push({ label: "Finalized", iso: isoOf(st.finalized_at), kind: "info" });
+  if (st?.paid_at) activity.push({ label: "Paid", iso: isoOf(st.paid_at), kind: "ok" });
+  if (st?.voided_at) activity.push({ label: "Voided", iso: isoOf(st.voided_at), kind: "neutral" });
+  if (st?.marked_uncollectible_at)
+    activity.push({ label: "Marked uncollectible", iso: isoOf(st.marked_uncollectible_at), kind: "error" });
+  activity.sort((a, b) => (a.iso < b.iso ? 1 : a.iso > b.iso ? -1 : 0));
+  main.push({ type: "timeline", title: "Recent activity", items: activity });
 
   // Summary (label left, amount right — the breakdown variant). Basil quirk:
   // tax lives in total_taxes, not the old tax_amounts.

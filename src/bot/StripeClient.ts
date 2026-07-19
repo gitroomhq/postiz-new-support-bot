@@ -373,9 +373,9 @@ export class StripeClient {
   }): Promise<{ charges: Stripe.Charge[]; hasMore: boolean }> {
     const res = await this.stripe.charges.list({
       limit: opts.limit ?? 25,
-      // Expand the customer so the list can show a name/email (Stripe's look)
-      // instead of a raw cus_ id — one request, no per-row lookups.
-      expand: ["data.customer"],
+      // Expand the customer (name/email in the list) and refunds (refunded-date
+      // column) so the list matches Stripe's look with no per-row lookups.
+      expand: ["data.customer", "data.refunds"],
       ...(opts.startingAfter ? { starting_after: opts.startingAfter } : {}),
       ...(opts.createdGte ? { created: { gte: opts.createdGte } } : {}),
     });
@@ -566,6 +566,13 @@ export class StripeClient {
       limit,
       expand: ["data.product"],
     });
+    return res.data;
+  }
+
+  // All active prices (recurring + one-time) in one call — lets the catalog list
+  // show a real price + "N prices" even when a product has no default_price set.
+  async listAllActivePrices(limit = 100): Promise<Stripe.Price[]> {
+    const res = await this.stripe.prices.list({ active: true, limit });
     return res.data;
   }
 

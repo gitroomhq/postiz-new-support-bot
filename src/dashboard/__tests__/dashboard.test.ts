@@ -34,7 +34,7 @@ import type { BlockStore } from "../../bot/billing/BlockStore";
 import type { CredentialStore } from "../auth/CredentialStore";
 import type { DashboardDbSessions } from "../auth/DashboardDbSessions";
 import type { DashboardAudit } from "../auth/DashboardAudit";
-import { Block, EvidenceBlock, HeaderBlock, KeyValueBlock, TableBlock } from "../renderer/contract";
+import { Block, EvidenceBlock, HeaderBlock, KeyValueBlock, TableBlock, TimelineBlock } from "../renderer/contract";
 import { renderDashboardShell } from "../html/shellHtml";
 import { clientCore } from "../html/clientCore";
 import { clientBlocks } from "../html/clientBlocks";
@@ -921,9 +921,9 @@ test("payments list: count-cards over the window, flags, incomplete switches to 
   assert.equal(counts.Failed, 1);
   assert.equal(counts.Incomplete, 1);
   // ch_1/ch_2 belong to the blocked customer; ch_2 also has an EFW.
-  // Columns: [0]amount [1]pm [2]desc [3]customer [4]date [5]decline [6]flags.
+  // Columns: [0]amount [1]pm [2]desc [3]customer [4]date [5]refunded [6]decline [7]flags.
   const row2 = table.rows.find((r) => r.id === "ch_2")!;
-  const flags = row2.cells[6] as { t: "flags"; badges: Array<{ text: string }> };
+  const flags = row2.cells[7] as { t: "flags"; badges: Array<{ text: string }> };
   assert.deepEqual(flags.badges.map((b) => b.text).sort(), ["BLOCKED", "EFW"]);
   // Amount cell carries the status pill.
   assert.equal((row2.cells[0] as { badge?: { text: string } }).badge?.text, "Partial refund");
@@ -965,12 +965,12 @@ test("payments list: Stripe toolbar (select/export/edit-columns) + decline-reaso
   assert.ok(table.selectable && table.exportable && table.editableColumns);
   assert.deepEqual(
     table.columns.map((c) => c.key),
-    ["amount", "pm", "desc", "customer", "created", "decline", "flags"]
+    ["amount", "pm", "desc", "customer", "created", "refunded", "decline", "flags"]
   );
-  // Every row carries a cell for the new decline column (index 5).
+  // Every row carries cells for the new refunded-date (5) + decline (6) columns.
   const row1 = table.rows.find((r) => r.id === "ch_1")!;
-  assert.equal(row1.cells.length, 7);
-  assert.equal((row1.cells[5] as { v: string }).v, "—");
+  assert.equal(row1.cells.length, 8);
+  assert.equal((row1.cells[6] as { v: string }).v, "—");
 });
 
 test("charge detail: an open dispute surfaces a banner + Dispute rail card + single Disputed pill", async () => {
@@ -1402,6 +1402,13 @@ function invoiceCtx(status: string): DashboardCtx {
     created: 1_700_000_000,
     due_date: 1_700_900_000,
     collection_method: "send_invoice",
+    customer_address: { line1: "Unter den Linden 1", city: "Berlin", postal_code: "10117", country: "DE" },
+    status_transitions: {
+      finalized_at: 1_700_050_000,
+      paid_at: status === "paid" ? 1_700_060_000 : null,
+      voided_at: null,
+      marked_uncollectible_at: null,
+    },
     hosted_invoice_url: "https://invoice.stripe.com/i/xyz",
     invoice_pdf: "https://pay.stripe.com/invoice/xyz/pdf",
     total_taxes: [],
@@ -1460,6 +1467,25 @@ test("invoices list: count-cards + draft builder header action; detail: status-g
   // DRAFT invoice: finalize + delete only.
   const draft = await section.buildPage(invoiceCtx("draft"), { page: "invoices.detail", params: { id: "in_1" } });
   assert.deepEqual((draft!.blocks[0] as HeaderBlock).actions!.map((a) => a.key), ["invoice.finalize", "invoice.void"]);
+});
+
+test("invoice detail (PA-3): Billing details block + Recent activity timeline", async () => {
+  const section = makeInvoicesSection();
+  const page = await section.buildPage(invoiceCtx("paid"), { page: "invoices.detail", params: { id: "in_1" } });
+  const billing = page!.blocks.find((b) => b.type === "kv" && b.title === "Billing details") as KeyValueBlock;
+  assert.ok(billing, "expected a Billing details block");
+  assert.equal((billing.rows.find((r) => r.label === "Billed to")!.cell as { v: string }).v, "Ada");
+  assert.equal((billing.rows.find((r) => r.label === "Billing method")!.cell as { v: string }).v, "Send invoice");
+  assert.equal(
+    (billing.rows.find((r) => r.label === "Billing address")!.cell as { v: string }).v,
+    "Unter den Linden 1, 10117 Berlin, DE"
+  );
+  const activity = page!.blocks.find((b) => b.type === "timeline" && b.title === "Recent activity") as TimelineBlock;
+  assert.ok(activity, "expected a Recent activity timeline");
+  const labels = activity.items.map((i) => i.label);
+  assert.ok(labels.includes("Invoice created") && labels.includes("Finalized") && labels.includes("Paid"));
+  // Newest-first: Paid is above Invoice created.
+  assert.ok(labels.indexOf("Paid") < labels.indexOf("Invoice created"));
 });
 
 test("gateway M3: finalize binds via invoice, credit-note amountMajor converts via invoice currency, draft builder folds items", async () => {
@@ -2559,6 +2585,7 @@ test("catalog: products render avatar+default price with cursoring; coupon delet
         hasMore: true,
         _startedAfter: opts.startingAfter,
       }),
+      listAllActivePrices: async () => [],
       listCoupons: async () => [
         { id: "SUMMER", name: "Summer", percent_off: 25, duration: "once", times_redeemed: 3, valid: true },
       ],
@@ -2602,6 +2629,41 @@ test("catalog: products render avatar+default price with cursoring; coupon delet
   assert.equal(good.ok, true);
   assert.equal(created[0].percentOff, 25);
   assert.equal(created[0].durationInMonths, 3);
+});
+
+test("catalog (PA-3): products without default_price show a grouped price + 'N prices'; product detail gets an Insights/MRR rail + per-price sub counts", async () => {
+  const { makeCatalogSection } = await import("../sections/catalogSection");
+  const priceA = { id: "price_a", product: "prod_2", unit_amount: 1500, currency: "eur", active: true, recurring: { interval: "month", interval_count: 1 } };
+  const priceB = { id: "price_b", product: "prod_2", unit_amount: 15000, currency: "eur", active: true, recurring: { interval: "year", interval_count: 1 } };
+  const ctx = {
+    stripe: {
+      formatAmount: (a: number, c: string) => `${(a / 100).toFixed(2)} ${c.toUpperCase()}`,
+      listProducts: async () => ({
+        products: [{ id: "prod_2", name: "Team", active: true, created: 1, default_price: null }],
+        hasMore: false,
+      }),
+      listAllActivePrices: async () => [priceA, priceB],
+      getProduct: async () => ({ id: "prod_2", name: "Team", active: true, created: 1, description: "Team plan", metadata: {} }),
+      listPricesForProduct: async () => [priceA],
+      countActiveSubscriptionsByPrice: async () => ({ counts: new Map([["price_a", 4]]), scanned: 4, truncated: false }),
+    },
+    audit: async () => {},
+  } as unknown as DashboardCtx;
+  const section = makeCatalogSection();
+
+  // List: no default_price → grouped first price + "· N prices".
+  const list = await section.buildPage(ctx, { page: "catalog", filters: {} });
+  const table = list!.blocks.find((b) => b.type === "table") as TableBlock;
+  assert.equal((table.rows[0].cells[1] as { v: string }).v, "15.00 EUR / month · 2 prices");
+
+  // Detail: Insights rail (MRR = 15.00 × 4 = 60.00) + per-price sub count column.
+  const detail = await section.buildPage(ctx, { page: "catalog.detail", params: { id: "prod_2" } });
+  const insights = detail!.rail!.find((b) => b.type === "kv" && (b as KeyValueBlock).title === "Insights") as KeyValueBlock;
+  assert.ok(insights, "expected an Insights rail card");
+  assert.equal((insights.rows.find((r) => r.label === "MRR")!.cell as { v: string }).v, "60.00 EUR");
+  assert.equal((insights.rows.find((r) => r.label === "Active subscriptions")!.cell as { v: string }).v, "4");
+  const priceTable = detail!.blocks.find((b) => b.type === "table" && b.key === "prices") as TableBlock;
+  assert.equal((priceTable.rows[0].cells[2] as { v: string }).v, "4 active");
 });
 
 // ---- M7: customer editing ----
