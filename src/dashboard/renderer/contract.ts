@@ -109,6 +109,14 @@ export interface TableBlock {
   notice?: string; // footnote under the table
   footer?: string; // Stripe "N items" gray count under the table
   footerRef?: ObjectRef; // renders the footer as a link ("3 results" → filtered list page)
+  // Stripe list-toolbar affordances (client-side; the server just opts in):
+  selectable?: boolean; // leading checkbox column + a "N selected" bulk bar
+  exportable?: boolean; // header "Export" → client CSV of the currently-rendered rows
+  editableColumns?: boolean; // header "Edit columns" → client show/hide, persisted per `key`
+  // Optional server actions over the selected row ids. The client injects the
+  // selected ids as params.ids (money-moving bulk ops still ride the tier ladder
+  // server-side); the built-in "Export selected" is always available when selectable.
+  bulkActions?: ActionButton[];
 }
 export interface KeyValueBlock {
   type: "kv";

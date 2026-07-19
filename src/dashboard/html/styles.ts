@@ -213,6 +213,21 @@ export function dashboardCss(): string {
   .fpop label { font-size:12px; font-weight:600; color:var(--heading); }
   .fpop .btn { align-self:flex-end; }
 
+  /* List toolbar (filter pills left, Export / Edit-columns right) + bulk bar. */
+  .listtoolbar { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; margin:0 0 14px; flex-wrap:wrap; }
+  .listtoolbar .pillbar { margin:0; }
+  .listtoolbar .toolright { display:flex; gap:8px; align-items:center; margin-left:auto; }
+  .bulkbar { display:flex; align-items:center; gap:8px; margin:12px 0 0; padding:8px 12px; border-radius:var(--radius-sm);
+    background:var(--accent-weak); border:1px solid var(--accent); flex-wrap:wrap; }
+  .bulkbar .bulkcount { font-weight:600; color:var(--accent); font-size:13px; margin-right:4px; }
+  th.selcol, td.selcol { width:34px; text-align:center; padding-right:0; }
+  th.selcol input, td.selcol input { cursor:pointer; margin:0; vertical-align:middle; }
+  .colmenu { min-width:180px; }
+  .colmenu .colopt { display:flex; align-items:center; gap:8px; padding:5px 8px; border-radius:6px; font-weight:500;
+    font-size:13px; color:var(--heading); cursor:pointer; white-space:nowrap; }
+  .colmenu .colopt:hover { background:var(--hover); }
+  .colmenu .colopt input { margin:0; cursor:pointer; }
+
   .tsearch { margin:0 0 14px; position:relative; max-width:560px; }
   .tsearch input { padding:8px 12px 8px 34px; font-size:13.5px; }
   .tsearch svg { position:absolute; left:12px; top:50%; transform:translateY(-50%); width:14px; height:14px;

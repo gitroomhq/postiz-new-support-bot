@@ -921,8 +921,9 @@ test("payments list: count-cards over the window, flags, incomplete switches to 
   assert.equal(counts.Failed, 1);
   assert.equal(counts.Incomplete, 1);
   // ch_1/ch_2 belong to the blocked customer; ch_2 also has an EFW.
+  // Columns: [0]amount [1]pm [2]desc [3]customer [4]date [5]decline [6]flags.
   const row2 = table.rows.find((r) => r.id === "ch_2")!;
-  const flags = row2.cells[5] as { t: "flags"; badges: Array<{ text: string }> };
+  const flags = row2.cells[6] as { t: "flags"; badges: Array<{ text: string }> };
   assert.deepEqual(flags.badges.map((b) => b.text).sort(), ["BLOCKED", "EFW"]);
   // Amount cell carries the status pill.
   assert.equal((row2.cells[0] as { badge?: { text: string } }).badge?.text, "Partial refund");
@@ -953,6 +954,71 @@ test("payment detail: unlinked customer gets the partial-remaining refund button
   const breakdown = page!.blocks.find((b) => b.type === "kv" && b.title === "Payment breakdown") as KeyValueBlock;
   const net = breakdown.rows.find((r) => r.label === "Net amount")!;
   assert.equal((net.cell as { v: string }).v, "23.81 EUR");
+});
+
+// ---- PA-2: list toolbar + dispute-on-charge ----
+
+test("payments list: Stripe toolbar (select/export/edit-columns) + decline-reason column", async () => {
+  const section = makePaymentsSection();
+  const page = await section.buildPage(paymentsCtx(), { page: "payments", filters: {} });
+  const table = page!.blocks.find((b) => b.type === "table") as TableBlock;
+  assert.ok(table.selectable && table.exportable && table.editableColumns);
+  assert.deepEqual(
+    table.columns.map((c) => c.key),
+    ["amount", "pm", "desc", "customer", "created", "decline", "flags"]
+  );
+  // Every row carries a cell for the new decline column (index 5).
+  const row1 = table.rows.find((r) => r.id === "ch_1")!;
+  assert.equal(row1.cells.length, 7);
+  assert.equal((row1.cells[5] as { v: string }).v, "—");
+});
+
+test("charge detail: an open dispute surfaces a banner + Dispute rail card + single Disputed pill", async () => {
+  const section = makePaymentsSection();
+  const ctx = paymentsCtx();
+  (ctx.stripe as unknown as { getChargeDetailed: unknown }).getChargeDetailed = async () => ({
+    id: "ch_2",
+    status: "succeeded",
+    captured: true,
+    refunded: false,
+    disputed: true,
+    amount: 7900,
+    amount_refunded: 0,
+    currency: "eur",
+    created: 1_700_000_000,
+    customer: "cus_a",
+    payment_method_details: { type: "card", card: { brand: "visa", last4: "0259" } },
+  });
+  (ctx.stores.dispute as unknown as { listByCustomer: unknown }).listByCustomer = async () => [
+    {
+      id: "dp_9",
+      chargeId: "ch_2",
+      customerId: "cus_a",
+      amount: 7900,
+      currency: "eur",
+      reason: "fraudulent",
+      status: "needs_response",
+      evidenceDueBy: new Date(1_700_300_000 * 1000),
+      disputeCreatedAt: new Date(1_700_000_000 * 1000),
+    },
+  ];
+  const page = await section.buildPage(ctx, { page: "payments.detail", params: { id: "ch_2" } });
+  // Header shows exactly one "Disputed" pill (no duplicate status+flag).
+  const header = page!.blocks[0] as HeaderBlock;
+  assert.equal(header.badges!.filter((b) => b.text === "Disputed").length, 1);
+  // A dispute banner is present in the main column.
+  assert.ok(
+    page!.blocks.some((b) => b.type === "notice" && /disputed this payment/i.test((b as { text: string }).text))
+  );
+  // The right rail carries a Dispute card whose "Respond" row deep-links to the workbench.
+  const disputeCard = page!.rail!.find(
+    (b) => b.type === "kv" && (b as KeyValueBlock).title === "Dispute"
+  ) as KeyValueBlock;
+  assert.ok(disputeCard, "expected a Dispute rail card");
+  const respond = disputeCard.rows.find((r) => r.label === "Respond")!;
+  const respondRef = (respond.cell as unknown as { ref: { page: string; params: { id: string } } }).ref;
+  assert.equal(respondRef.page, "disputes.detail");
+  assert.equal(respondRef.params.id, "dp_9");
 });
 
 // ---- M4: global search ----

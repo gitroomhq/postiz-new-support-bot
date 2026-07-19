@@ -111,6 +111,8 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
   const amountFilter = str(filters.amount, 20);
   const last4 = /^\d{4}$/.test(filters.last4 ?? "") ? filters.last4 : "";
   const flagged = str(filters.flagged, 12);
+  const currencyFilter = str(filters.currency, 8).toLowerCase();
+  const pmFilter = str(filters.pm, 24).toLowerCase();
 
   const createdGte = DATE_RANGES[dateKey]
     ? Math.floor(Date.now() / 1000) - DATE_RANGES[dateKey] * 86400
@@ -196,6 +198,17 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
     },
   ];
 
+  // Currency + payment-method pills, built from what's actually in the window.
+  const cap = (s: string) => (s ? s.charAt(0).toUpperCase() + s.slice(1) : s);
+  const currencies = [...new Set(charges.map((c) => c.currency))].sort();
+  const brands = [...new Set(charges.map((c) => c.payment_method_details?.card?.brand).filter(Boolean))] as string[];
+  const extraFilters: NonNullable<TableBlock["filters"]> = [];
+  if (currencies.length > 1)
+    extraFilters.push({ key: "currency", label: "Currency", kind: "select", value: currencyFilter || undefined, options: currencies.map((c) => ({ value: c, label: c.toUpperCase() })) });
+  if (brands.length)
+    extraFilters.push({ key: "pm", label: "Payment method", kind: "select", value: pmFilter || undefined, options: brands.map((b) => ({ value: b, label: cap(b) })) });
+  const mainFilters: TableBlock["filters"] = [...(sharedFilters ?? []), ...extraFilters];
+
   const header: Block = {
     type: "header",
     title: "Payments",
@@ -269,6 +282,8 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
     if (flagged === "blocked" && !isBlocked(c)) return false;
     if (flagged === "disputed" && !c.disputed) return false;
     if (flagged === "efw" && !efwChargeIds.has(c.id)) return false;
+    if (currencyFilter && c.currency !== currencyFilter) return false;
+    if (pmFilter && (c.payment_method_details?.card?.brand ?? "") !== pmFilter) return false;
     return true;
   });
 
@@ -297,12 +312,13 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
           ? ({ t: "link", v: email ?? cus, ref: { page: "customers.detail", params: { id: cus } } } as Cell)
           : text(email ?? "—"),
         dateCell(c.created),
+        text(c.failure_message ?? "—"),
         { t: "flags", badges: flags } as Cell,
       ] as Cell[],
     };
   });
 
-  const hasInMemoryFilter = !!(status || last4 || amountFilter || flagged);
+  const hasInMemoryFilter = !!(status || last4 || amountFilter || flagged || currencyFilter || pmFilter);
   return {
     title: "Payments",
     crumbs: [{ label: "Payments" }],
@@ -317,10 +333,14 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
           { key: "desc", label: "Description" },
           { key: "customer", label: "Customer" },
           { key: "created", label: "Date" },
+          { key: "decline", label: "Decline reason" },
           { key: "flags", label: "Flags" },
         ],
         counts,
-        filters: sharedFilters,
+        filters: mainFilters,
+        selectable: true,
+        exportable: true,
+        editableColumns: true,
         rows,
         nextCursor: chargeWindow.hasMore && charges.length > 0 ? charges[charges.length - 1].id : null,
         empty: hasInMemoryFilter ? "No payments match these filters (within this window)." : "No payments yet.",
@@ -436,13 +456,34 @@ async function chargeDetail(ctx: DashboardCtx, id: string): Promise<SectionPage>
     actions,
   });
 
+  // Dispute banner: surface an open chargeback on the charge page itself, with
+  // the urgency + a pointer to the evidence workbench (which stays the one editor).
+  const disputeOpen = chargeDispute && !["won", "lost", "prevented"].includes(chargeDispute.status);
+  const disputeDaysLeft = chargeDispute?.evidenceDueBy
+    ? Math.ceil((chargeDispute.evidenceDueBy.getTime() - Date.now()) / 86400000)
+    : null;
+  if (disputeOpen && chargeDispute) {
+    const urgency =
+      disputeDaysLeft == null
+        ? "Disputed"
+        : disputeDaysLeft <= 0
+          ? "Past due"
+          : `${disputeDaysLeft} day${disputeDaysLeft === 1 ? "" : "s"} to respond`;
+    main.push({
+      type: "notice",
+      badge: { kind: disputeDaysLeft != null && disputeDaysLeft <= 2 ? "error" : "warn", text: urgency },
+      text: `The customer disputed this payment (${sentence(chargeDispute.reason)}). Respond with evidence in the Disputes workbench — see the Dispute panel on the right.`,
+    });
+  }
+
   // Recent activity: refunds (newest first from Stripe) + dispute + lifecycle.
   const timeline: Array<{ label: string; iso: string; text?: string; kind?: Badge["kind"]; ref?: { page: string; params?: Record<string, string> } }> = [];
   for (const refund of refundsRes.refunds) {
+    const arn = refund.destination_details?.card?.reference;
     timeline.push({
       label: `Refunded ${ctx.stripe.formatAmount(refund.amount, refund.currency)}${refund.reason ? ` (${sentence(refund.reason)})` : ""}`,
       iso: new Date(refund.created * 1000).toISOString(),
-      text: `${refund.id} · ${refund.status ?? "?"}`,
+      text: `${refund.id} · ${refund.status ?? "?"}${arn ? ` · ARN ${arn}` : ""}`,
       kind: "info",
     });
   }
@@ -607,6 +648,41 @@ async function chargeDetail(ctx: DashboardCtx, id: string): Promise<SectionPage>
       },
     ],
   });
+
+  // Dispute panel (rail): id / amount / reason / status / response-due + a link
+  // straight into the evidence workbench.
+  if (chargeDispute) {
+    rail.push({
+      type: "kv",
+      title: "Dispute",
+      rows: [
+        {
+          label: "Respond",
+          cell: {
+            t: "link",
+            v: "Open evidence workbench",
+            ref: { page: "disputes.detail", params: { id: chargeDispute.id } },
+          } as Cell,
+        },
+        {
+          label: "Dispute ID",
+          cell: idCell(chargeDispute.id, { copy: true, ref: { page: "disputes.detail", params: { id: chargeDispute.id } } }),
+        },
+        { label: "Amount", cell: money(ctx.stripe, chargeDispute.amount, chargeDispute.currency) },
+        { label: "Reason", cell: text(sentence(chargeDispute.reason)) },
+        {
+          label: "Status",
+          cell: badgeCell(
+            chargeDispute.status === "won" ? "ok" : chargeDispute.status === "lost" ? "error" : "warn",
+            sentence(chargeDispute.status)
+          ),
+        },
+        ...(chargeDispute.evidenceDueBy
+          ? [{ label: "Response due", cell: dateCell(Math.floor(chargeDispute.evidenceDueBy.getTime() / 1000)) }]
+          : []),
+      ],
+    });
+  }
 
   rail.push({
     type: "kv",
