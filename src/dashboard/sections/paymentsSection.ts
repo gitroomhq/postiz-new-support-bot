@@ -685,9 +685,14 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
         nextCursor: !searchMode && chargeWindow.hasMore && charges.length > 0 ? charges[charges.length - 1].id : null,
         empty: hasInMemoryFilter ? "No payments match these filters (within this window)." : "No payments yet.",
         ...(rows.length ? { footer: `${rows.length} item${rows.length === 1 ? "" : "s"}` } : {}),
-        notice: searchMode
-          ? `Card/email filters sweep the WHOLE account via Stripe Search (~1 min lag; first ${WINDOW} matches shown). Incomplete attempts aren't searchable by card or email.`
-          : `Counts and filters cover the ${WINDOW} most recent payments${dateKey ? ` of the ${dateKey} window` : ""} per page — use Next for older ones. EFW matching covers the 100 most recent warnings.`,
+        notice:
+          (searchMode
+            ? `Card/email filters sweep the WHOLE account via Stripe Search (~1 min lag; first ${WINDOW} matches shown). Incomplete attempts aren't searchable by card or email.`
+            : `Counts and filters cover the ${WINDOW} most recent payments${dateKey ? ` of the ${dateKey} window` : ""} per page — use Next for older ones. EFW matching covers the 100 most recent warnings.`) +
+          // The wallet blind spot: Link/PayPal charges expose no card digits.
+          (last4 || fingerprint || pmFilter
+            ? " Wallet payments (Link/PayPal) expose no card digits — they never match card filters."
+            : ""),
       },
     ],
   };

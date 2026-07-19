@@ -274,9 +274,9 @@ async function cardHunts(ctx: DashboardCtx, deps: { hunts: FraudHuntService }, f
     ],
     rows: [],
     empty: last4
-      ? "No matching charges. Declined attempts DO show up (as failed charges) — only never-confirmed attempts (abandoned checkout, unfinished 3DS) don't; hunt by amount for those."
-      : "Enter the last 4 digits (brand narrows it; Failed only = declined attempts and their payment intents).",
-    notice: `last4 is not unique — rows are grouped by fingerprint; feed one into the exact hunt above. ${SEARCH_LAG_NOTICE}`,
+      ? "No matching charges. Two blind spots: wallet payments (Link/PayPal/Klarna) expose NO card digits on their charges — hunt those by customer email or amount; and never-confirmed attempts (abandoned checkout, unfinished 3DS) have no charge — hunt by amount. Declined attempts DO show up as failed charges."
+      : "Enter the last 4 digits (brand narrows it; Failed only = declined attempts and their payment intents). Wallet-rail payments (Link/PayPal) carry no card digits and can't be found here.",
+    notice: `last4 is not unique — rows are grouped by fingerprint; feed one into the exact hunt above. Wallet payments (Link/PayPal) expose no card digits to any lookup. ${SEARCH_LAG_NOTICE}`,
   };
   if (last4) {
     const result = await deps.hunts.cardsByLast4(last4, brand || undefined, status || undefined);

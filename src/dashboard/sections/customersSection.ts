@@ -85,6 +85,24 @@ function parseAddressInput(
   return { ok: true, value: shipping ? { name, address } : address };
 }
 
+// PM fingerprint cell (PA-13.F). Stripe exposes `fingerprint` on the types
+// that carry one directly (cards + bank-debit rails); only CARD fingerprints
+// link into the reverse-card hunt (charges.search indexes only those).
+// Wallets like Link/PayPal vault the instrument on their side — the
+// PaymentMethod object has no fingerprint, and the dash says why. The card
+// identity still surfaces on each CHARGE's detail rail after they pay.
+const WALLET_PM_TYPES = new Set(["link", "paypal", "klarna", "cashapp", "amazon_pay", "revolut_pay"]);
+
+function pmFingerprintCell(pm: Stripe.PaymentMethod): Cell {
+  const details = (pm as unknown as Record<string, { fingerprint?: string | null } | undefined>)[pm.type];
+  const fingerprint = details?.fingerprint ?? null;
+  if (!fingerprint) return WALLET_PM_TYPES.has(pm.type) ? text("—", "wallet-vaulted") : text("—");
+  if (pm.type === "card") {
+    return idCell(fingerprint, { copy: true, ref: { page: "fraud", filters: { view: "card", fp: fingerprint } } });
+  }
+  return idCell(fingerprint, { copy: true });
+}
+
 function actionActor(ctx: DashboardCtx): ActionActor {
   return { kind: "dashboard", id: ctx.actor.id, name: ctx.actor.name, isAdmin: ctx.actor.isAdmin };
 }
@@ -958,14 +976,7 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
         paymentMethodCell(pm),
         pm.id === defaultPm ? badgeCell("info", "Default") : text("—"),
         pm.type === "card" && pm.card ? text(`${pm.card.exp_month}/${pm.card.exp_year}`) : text("—"),
-        // Exact card identity — links into the reverse-card hunt (every
-        // customer that ever charged this exact card).
-        pm.type === "card" && pm.card?.fingerprint
-          ? idCell(pm.card.fingerprint, {
-              copy: true,
-              ref: { page: "fraud", filters: { view: "card", fp: pm.card.fingerprint } },
-            })
-          : text("—"),
+        pmFingerprintCell(pm),
         idCell(pm.id, { copy: true }),
       ] as Cell[],
       actions: [

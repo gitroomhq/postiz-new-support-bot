@@ -6187,7 +6187,8 @@ test("PM fingerprint (PA-13): the 360 payment-methods table exposes the fingerpr
   const ctx = fakeCustomerCtx();
   (ctx.stripe as unknown as Record<string, unknown>).listAllPaymentMethods = async () => [
     { id: "pm_1", type: "card", card: { brand: "visa", last4: "4242", exp_month: 7, exp_year: 2027, fingerprint: "Xt5EWLLDS7FJjR1c" } },
-    { id: "pm_2", type: "link" },
+    { id: "pm_2", type: "link", link: { email: "ada@example.com" } },
+    { id: "pm_3", type: "sepa_debit", sepa_debit: { last4: "3000", fingerprint: "SepaFp123" } },
   ];
   const page = await makeCustomersSection().buildPage(ctx, { page: "customers.detail", params: { id: "cus_test1" } });
   const pms = page!.blocks.find((b) => b.type === "table" && (b as TableBlock).key === "pms") as TableBlock;
@@ -6195,9 +6196,16 @@ test("PM fingerprint (PA-13): the 360 payment-methods table exposes the fingerpr
   const fpCell = pms.rows[0].cells[3] as { t: string; v: string; ref?: { page: string; filters?: Record<string, string> } };
   assert.equal(fpCell.v, "Xt5EWLLDS7FJjR1c");
   assert.deepEqual(fpCell.ref, { page: "fraud", filters: { view: "card", fp: "Xt5EWLLDS7FJjR1c" } });
-  // Wallet PMs have no fingerprint — em dash, no dead link.
-  const walletCell = pms.rows[1].cells[3] as { t: string; v: string };
+  // Wallet PMs (Link/PayPal…) have no fingerprint in Stripe's API — the
+  // instrument is vaulted on the wallet's side; the cell says so.
+  const walletCell = pms.rows[1].cells[3] as { t: string; v: string; sub?: string };
   assert.equal(walletCell.v, "—");
+  assert.equal(walletCell.sub, "wallet-vaulted");
+  // Bank-debit rails DO expose fingerprints — copyable, but no card hunt link
+  // (charges.search only indexes card fingerprints).
+  const sepaCell = pms.rows[2].cells[3] as { t: string; v: string; ref?: unknown; copy?: boolean };
+  assert.equal(sepaCell.v, "SepaFp123");
+  assert.equal(sepaCell.ref, undefined);
 });
 
 test("customers list filters (PA-13): created is a server param; delinquent/country/has-subscription slice the page", async () => {
