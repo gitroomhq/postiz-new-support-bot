@@ -78,6 +78,25 @@ export function isoDateCell(d: Date): Cell {
   return { t: "date", v: iso.slice(0, 10), iso };
 }
 
+// ---- count-card labels ----
+
+// Real chip totals come from the Search API, whose total_count caps at 10,000
+// — render the cap as an explicit floor. When search is unavailable (no API,
+// call failed) callers fall back to the fetched-window count via windowCount,
+// suffixed "+" whenever the window overflowed — never a bare wrong number.
+export function searchCountLabel(n: number): number | string {
+  return n >= 10_000 ? "10,000+" : n;
+}
+
+export function windowCount(n: number, windowOverflowed: boolean): number | string {
+  return windowOverflowed ? `${n}+` : n;
+}
+
+// searchN when the search succeeded, honest windowed fallback otherwise.
+export function chipCount(searchN: number | null, windowN: number, windowOverflowed: boolean): number | string {
+  return searchN != null ? searchCountLabel(searchN) : windowCount(windowN, windowOverflowed);
+}
+
 // Stripe pills are sentence case ("Past due"), never raw enum values.
 export function sentence(status: string): string {
   const s = status.replace(/_/g, " ");

@@ -1,7 +1,7 @@
 import type Stripe from "stripe";
 import { ActionButton, ActionResult, Badge, Block, Cell } from "../renderer/contract";
 import { DashboardCtx, DashboardSectionModule, SectionPage, str, validCursor } from "./types";
-import { badgeCell, dateCell, idCell, money, sentence, strong, text } from "./cells";
+import { badgeCell, dateCell, idCell, money, sentence, strong, text, windowCount } from "./cells";
 
 // Quotes (#/quotes, PA-7b): price proposals with a lifecycle — draft → open
 // (finalized) → accepted (mints the subscription/invoice) or canceled. Writes
@@ -165,14 +165,16 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
         { key: "expires", label: "Expires" },
         { key: "id", label: "ID" },
       ],
+      // Quotes have no Search API — counts are windowed, suffixed "+" when
+      // the window overflowed so they never read as exact totals.
       counts: {
         key: "status",
         items: [
-          { value: "", label: "All", count: quotesRes.quotes.length },
+          { value: "", label: "All", count: windowCount(quotesRes.quotes.length, quotesRes.hasMore) },
           ...STATUSES.map((s) => ({
             value: s,
             label: sentence(s),
-            count: quotesRes.quotes.filter((q) => q.status === s).length,
+            count: windowCount(quotesRes.quotes.filter((q) => q.status === s).length, quotesRes.hasMore),
           })),
         ],
       },

@@ -1,7 +1,7 @@
 import type Stripe from "stripe";
 import { ActionResult, Badge, Block, Cell } from "../renderer/contract";
 import { DashboardCtx, DashboardSectionModule, SectionPage, str, validCursor } from "./types";
-import { badgeCell, idCell, money, strong, text } from "./cells";
+import { badgeCell, idCell, money, strong, text, windowCount } from "./cells";
 
 // Payment links (#/links, PA-7a): Stripe-hosted checkout URLs. List + detail
 // + create (price + quantity modal) + activate/deactivate. The URL is the
@@ -114,12 +114,18 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
         { key: "url", label: "URL" },
         { key: "id", label: "ID" },
       ],
+      // Payment links have no Search API — counts are windowed, suffixed "+"
+      // when the window overflowed so they never read as exact totals.
       counts: {
         key: "status",
         items: [
-          { value: "", label: "All", count: linksRes.links.length },
-          { value: "active", label: "Active", count: linksRes.links.filter((l) => l.active).length },
-          { value: "inactive", label: "Deactivated", count: linksRes.links.filter((l) => !l.active).length },
+          { value: "", label: "All", count: windowCount(linksRes.links.length, linksRes.hasMore) },
+          { value: "active", label: "Active", count: windowCount(linksRes.links.filter((l) => l.active).length, linksRes.hasMore) },
+          {
+            value: "inactive",
+            label: "Deactivated",
+            count: windowCount(linksRes.links.filter((l) => !l.active).length, linksRes.hasMore),
+          },
         ],
       },
       exportable: true,

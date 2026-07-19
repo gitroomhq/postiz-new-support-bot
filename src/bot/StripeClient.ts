@@ -1007,6 +1007,37 @@ export class StripeClient {
     return this.stripe.disputes.close(disputeId, {}, { idempotencyKey });
   }
 
+  // ---- search counts (list count-cards) ----
+  // Lists never expose totals, so window-derived chip counts silently cap at
+  // the fetch window. Search total_count is exact up to Stripe's 10k cap —
+  // plenty for a UI chip (render "10,000+" at the cap; the ratio engine's
+  // countWithSearchCap handles beyond-cap exactness where it matters). The
+  // 30s cache absorbs filter clicks and pagination re-renders. Queries are
+  // BUILT BY CALLERS from validated values only — never raw user input.
+  private searchCountCache = new Map<string, { at: number; value: number }>();
+
+  async countBySearch(
+    kind: "charges" | "paymentIntents" | "invoices" | "subscriptions",
+    query: string
+  ): Promise<number> {
+    const cacheKey = `${kind}:${query}`;
+    const hit = this.searchCountCache.get(cacheKey);
+    if (hit && Date.now() - hit.at < 30_000) return hit.value;
+    const params = { query, limit: 1 as const, expand: ["total_count"] };
+    const res =
+      kind === "charges"
+        ? await this.stripe.charges.search(params)
+        : kind === "paymentIntents"
+          ? await this.stripe.paymentIntents.search(params)
+          : kind === "invoices"
+            ? await this.stripe.invoices.search(params)
+            : await this.stripe.subscriptions.search(params);
+    const value = (res as { total_count?: number }).total_count ?? 0;
+    if (this.searchCountCache.size > 500) this.searchCountCache.clear();
+    this.searchCountCache.set(cacheKey, { at: Date.now(), value });
+    return value;
+  }
+
   // Count of succeeded charges in [createdGte, createdLt) — the dispute-ratio
   // denominator. Search exposes total_count (lists don't) but CAPS it at
   // 10,000, so busy windows are counted in recursively-split time slices

@@ -2,7 +2,19 @@ import type Stripe from "stripe";
 import type { ActionActor } from "../../bot/billing/actions/BillingActionService";
 import { ActionButton, ActionResult, Badge, Block, Cell, FilterDef, TableBlock } from "../renderer/contract";
 import { DashboardCtx, DashboardSectionModule, SectionPage, str, validCursor, validId } from "./types";
-import { avatarCell, badgeCell, dateCell, idCell, money, paymentMethodCell, sentence, strong, subBadge, text } from "./cells";
+import {
+  avatarCell,
+  badgeCell,
+  chipCount,
+  dateCell,
+  idCell,
+  money,
+  paymentMethodCell,
+  sentence,
+  strong,
+  subBadge,
+  text,
+} from "./cells";
 
 // Subscriptions: account-wide LIST archetype (status count-cards + price
 // filter), the DETAIL archetype (sub-stat strip + Pricing + Upcoming invoice
@@ -99,7 +111,20 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
   const customerScope = validId("customer", filters.customer) ?? "";
 
   const cursorId = validId("subscription", validCursor(cursor) ?? "") ?? undefined;
-  const [subsRes, prices] = await Promise.all([
+
+  // Real chip totals via subscriptions.search (window counts cap at WINDOW).
+  // Subscription search indexes created/metadata/status only — customer- or
+  // price-scoped views and the Paused chip (pause_collection) can't be
+  // expressed, so those stay honest windowed counts ("N+" on overflow).
+  const scoped = Boolean(customerScope || priceId);
+  const countSearch = (q: string) =>
+    scoped
+      ? Promise.resolve(null)
+      : Promise.resolve()
+          .then(() => ctx.stripe.countBySearch("subscriptions", q))
+          .catch(() => null);
+  const SUB_STATUSES = ["active", "trialing", "past_due", "canceled"] as const;
+  const [subsRes, prices, chipTotals] = await Promise.all([
     ctx.stripe.listAllSubscriptions({
       status: "all",
       priceId: priceId || undefined,
@@ -108,18 +133,33 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
       startingAfter: cursorId,
     }),
     ctx.stripe.listRecurringPrices(50).catch(() => [] as Stripe.Price[]),
+    Promise.all([countSearch("created>0"), ...SUB_STATUSES.map((s) => countSearch(`status:"${s}"`))]),
   ]);
   const subs = subsRes.subscriptions;
+  const [nAll, nActive, nTrialing, nPastDue, nCanceled] = chipTotals;
 
+  const over = subsRes.hasMore;
   const counts = {
     key: "status",
     items: [
-      { value: "", label: "All", count: subs.length },
-      { value: "active", label: "Active", count: subs.filter((s) => s.status === "active").length },
-      { value: "trialing", label: "Trialing", count: subs.filter((s) => s.status === "trialing").length },
-      { value: "past_due", label: "Past due", count: subs.filter((s) => s.status === "past_due").length },
-      { value: "paused", label: "Paused", count: subs.filter((s) => !!s.pause_collection).length },
-      { value: "canceled", label: "Canceled", count: subs.filter((s) => s.status === "canceled").length },
+      { value: "", label: "All", count: chipCount(nAll, subs.length, over) },
+      { value: "active", label: "Active", count: chipCount(nActive, subs.filter((s) => s.status === "active").length, over) },
+      {
+        value: "trialing",
+        label: "Trialing",
+        count: chipCount(nTrialing, subs.filter((s) => s.status === "trialing").length, over),
+      },
+      {
+        value: "past_due",
+        label: "Past due",
+        count: chipCount(nPastDue, subs.filter((s) => s.status === "past_due").length, over),
+      },
+      { value: "paused", label: "Paused", count: chipCount(null, subs.filter((s) => !!s.pause_collection).length, over) },
+      {
+        value: "canceled",
+        label: "Canceled",
+        count: chipCount(nCanceled, subs.filter((s) => s.status === "canceled").length, over),
+      },
     ],
   };
 
@@ -197,7 +237,7 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
         nextCursor: subsRes.hasMore && subs.length > 0 ? subs[subs.length - 1].id : null,
         empty: status ? "No subscriptions match this filter (within this window)." : "No subscriptions yet.",
         ...(rows.length ? { footer: `${rows.length} item${rows.length === 1 ? "" : "s"}` } : {}),
-        notice: `Counts cover the ${WINDOW} most recent subscriptions per page — use Next for older ones.`,
+        notice: `Chip counts are account totals (Paused counts this page's window); the table shows ${WINDOW} per page — use Next for older ones.`,
       },
     ],
   };

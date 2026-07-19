@@ -882,6 +882,8 @@ function paymentsCtx(): DashboardCtx {
     listAllCharges: async () => ({
       charges: [
         charge({ id: "ch_1" }),
+        // Partial refund: keeps its badge but does NOT count as "Refunded"
+        // (the chip matches Stripe's searchable refunded:"true" = full).
         charge({ id: "ch_2", amount_refunded: 500 }),
         charge({ id: "ch_3", status: "failed", customer: "cus_b", billing_details: { email: "b@x.com" } }),
       ],
@@ -950,7 +952,7 @@ test("payments list: count-cards over the window, flags, incomplete switches to 
   const counts = Object.fromEntries(table.counts!.items.map((i) => [i.label, i.count]));
   assert.equal(counts.All, 3);
   assert.equal(counts.Succeeded, 2);
-  assert.equal(counts.Refunded, 1);
+  assert.equal(counts.Refunded, 0); // ch_2 is a PARTIAL refund — full refunds only
   assert.equal(counts.Failed, 1);
   assert.equal(counts.Incomplete, 1);
   // ch_1/ch_2 belong to the blocked customer; ch_2 also has an EFW.
@@ -960,9 +962,9 @@ test("payments list: count-cards over the window, flags, incomplete switches to 
   assert.deepEqual(flags.badges.map((b) => b.text).sort(), ["BLOCKED", "EFW"]);
   // Amount cell carries the status pill.
   assert.equal((row2.cells[0] as { badge?: { text: string } }).badge?.text, "Partial refund");
-  // Refunded filter narrows within the window.
+  // Refunded filter = FULLY refunded (chip parity) — the partial ch_2 is out.
   const refunded = await section.buildPage(paymentsCtx(), { page: "payments", filters: { status: "refunded" } });
-  assert.equal((refunded!.blocks.find((b) => b.type === "table") as TableBlock).rows.length, 1);
+  assert.equal((refunded!.blocks.find((b) => b.type === "table") as TableBlock).rows.length, 0);
   // Incomplete flips to PaymentIntent rows.
   const incomplete = await section.buildPage(paymentsCtx(), { page: "payments", filters: { status: "incomplete" } });
   const piTable = incomplete!.blocks.find((b) => b.type === "table") as TableBlock;
@@ -4408,4 +4410,107 @@ test("customer 360 (PA-8): inline edit on the Details card, row actions on subs/
   });
   assert.equal(okVoid.ok, true);
   assert.deepEqual(voided, ["credgr_live"]);
+});
+
+// ---- real count-cards (search totals instead of window-capped numbers) ----
+
+test("count-cards: payments chips use search totals (scoped by customer+date), cap renders '10,000+', search failure falls back to windowed 'N+'", async () => {
+  const section = makePaymentsSection();
+  const queries: Array<[string, string]> = [];
+  const ctx = paymentsCtx();
+  (ctx.stripe as unknown as Record<string, unknown>).countBySearch = async (kind: string, q: string) => {
+    queries.push([kind, q]);
+    if (q === "created>0") return 12_345; // the All chip — over the search cap
+    if (q.includes('status:"succeeded"') && kind === "charges") return 431;
+    return 7;
+  };
+  const page = await section.buildPage(ctx, { page: "payments", filters: {} });
+  const table = page!.blocks.find((b) => b.type === "table") as TableBlock;
+  const counts = Object.fromEntries(table.counts!.items.map((i) => [i.label, i.count]));
+  assert.equal(counts.All, "10,000+"); // capped totals are floors, never fake exact numbers
+  assert.equal(counts.Succeeded, 431);
+  assert.equal(counts.Incomplete, 5 * 7); // one search per incomplete PI status, summed
+  // Customer + date filters scope the queries (client-side filters don't).
+  (ctx.stripe as unknown as Record<string, unknown>).listCharges = async () => ({ charges: [], hasMore: false });
+  (ctx.stripe as unknown as Record<string, unknown>).listPaymentIntents = async () => [];
+  queries.length = 0;
+  await section.buildPage(ctx, { page: "payments", filters: { customer: "cus_a", date: "7d" } });
+  assert.ok(queries.length > 0);
+  assert.ok(queries.every(([, q]) => q.includes('customer:"cus_a"') && q.includes("created>=")));
+
+  // No countBySearch on the client (or it throws) → windowed counts, "+" when
+  // the window overflowed instead of a bare wrong number.
+  const stale = paymentsCtx();
+  (stale.stripe as unknown as Record<string, unknown>).listAllCharges = async () => ({
+    charges: [
+      {
+        id: "ch_1",
+        status: "succeeded",
+        captured: true,
+        refunded: false,
+        disputed: false,
+        amount: 100,
+        amount_refunded: 0,
+        currency: "eur",
+        created: 1,
+        billing_details: {},
+      },
+    ],
+    hasMore: true,
+  });
+  const fallback = await section.buildPage(stale, { page: "payments", filters: {} });
+  const fbTable = fallback!.blocks.find((b) => b.type === "table") as TableBlock;
+  const fbCounts = Object.fromEntries(fbTable.counts!.items.map((i) => [i.label, i.count]));
+  assert.equal(fbCounts.All, "1+");
+  assert.equal(fbCounts.Succeeded, "1+");
+});
+
+test("count-cards: invoices chips use invoices.search per status; subscriptions search only unscoped (Paused/scoped stay windowed)", async () => {
+  // Invoices: per-status totals + customer scoping.
+  const invSection = makeInvoicesSection();
+  const invQueries: string[] = [];
+  const invCtx2 = {
+    actor: { id: "42", name: "Ada", role: "admin", isAdmin: true },
+    stripe: {
+      formatAmount: (a: number, c: string) => `${(a / 100).toFixed(2)} ${c.toUpperCase()}`,
+      listInvoicesByStatus: async () => ({
+        data: [{ id: "in_1", status: "open", total: 100, currency: "eur", created: 1, customer: "cus_1", number: "I-1" }],
+        has_more: true,
+      }),
+      countBySearch: async (kind: string, q: string) => {
+        assert.equal(kind, "invoices");
+        invQueries.push(q);
+        return q.includes('status:"open"') ? 42 : 500;
+      },
+    },
+    billing: { actions: { effectiveMode: () => "direct" } },
+    audit: async () => {},
+  } as unknown as DashboardCtx;
+  const invPage = await invSection.buildPage(invCtx2, { page: "invoices", filters: { customer: "cus_1" } });
+  const invTable = invPage!.blocks.find((b) => b.type === "table") as TableBlock;
+  const invCounts = Object.fromEntries(invTable.counts!.items.map((i) => [i.label, i.count]));
+  assert.equal(invCounts.All, 500);
+  assert.equal(invCounts.Open, 42);
+  assert.ok(invQueries.every((q) => q.includes('customer:"cus_1"')));
+
+  // Subscriptions: search totals account-wide; Paused chip is windowed; a
+  // customer/price scope disables search entirely (fields aren't indexed).
+  const subSection = makeSubscriptionsSection();
+  const subQueries: string[] = [];
+  const subCtx2 = subsCtx();
+  (subCtx2.stripe as unknown as Record<string, unknown>).countBySearch = async (kind: string, q: string) => {
+    assert.equal(kind, "subscriptions");
+    subQueries.push(q);
+    return 99;
+  };
+  const subPage = await subSection.buildPage(subCtx2, { page: "subscriptions", filters: {} });
+  const subTable = subPage!.blocks.find((b) => b.type === "table") as TableBlock;
+  const subCounts = Object.fromEntries(subTable.counts!.items.map((i) => [i.label, i.count]));
+  assert.equal(subCounts.All, 99);
+  assert.equal(subCounts.Active, 99);
+  assert.ok(typeof subCounts.Paused === "number"); // pause_collection is not searchable
+  assert.ok(subQueries.length > 0);
+  subQueries.length = 0;
+  await subSection.buildPage(subCtx2, { page: "subscriptions", filters: { customer: "cus_1" } });
+  assert.equal(subQueries.length, 0); // scoped view never searches
 });

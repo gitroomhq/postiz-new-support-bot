@@ -12,6 +12,7 @@ import {
   badgeCell,
   cardCell,
   chargeBadge,
+  chipCount,
   dateCell,
   idCell,
   isoDateCell,
@@ -203,7 +204,22 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
   const customerScope = validId("customer", filters.customer) ?? "";
 
   const cursorId = validId("charge", cursor) ?? undefined;
-  const [chargeWindow, piWindow, efws, blockPage] = await Promise.all([
+
+  // Real chip totals via the Search API — the fetched window caps at WINDOW,
+  // so counting rows inside it shows "100" forever on a busy account. Scope
+  // mirrors the server-side filters (customer + date); currency/pm/amount/
+  // last4/flagged slice the window rows client-side, as before. Every count
+  // falls back to the honest windowed number ("N+") if search fails.
+  const scopeParts: string[] = [];
+  if (customerScope) scopeParts.push(`customer:"${customerScope}"`);
+  if (createdGte) scopeParts.push(`created>=${createdGte}`);
+  const searchQ = (extra?: string) => [...scopeParts, ...(extra ? [extra] : [])].join(" AND ") || "created>0";
+  const countSearch = (kind: "charges" | "paymentIntents", q: string) =>
+    Promise.resolve()
+      .then(() => ctx.stripe.countBySearch(kind, q))
+      .catch(() => null);
+
+  const [chargeWindow, piWindow, efws, blockPage, searchCounts] = await Promise.all([
     customerScope
       ? ctx.stripe.listCharges(customerScope, WINDOW, cursorId)
       : ctx.stripe.listAllCharges({ limit: WINDOW, createdGte, startingAfter: cursorId }),
@@ -213,6 +229,24 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
     ).catch(() => ({ paymentIntents: [] as Stripe.PaymentIntent[], hasMore: false })),
     ctx.stripe.listRecentEarlyFraudWarnings(100).catch(() => [] as Stripe.Radar.EarlyFraudWarning[]),
     ctx.stores.block.listPage(0, 200).catch(() => ({ rows: [], total: 0 })),
+    Promise.all([
+      countSearch("charges", searchQ()),
+      countSearch("charges", searchQ('status:"succeeded"')),
+      countSearch("charges", searchQ('refunded:"true"')),
+      countSearch("charges", searchQ('disputed:"true"')),
+      countSearch("charges", searchQ('status:"failed"')),
+      // One count per incomplete PI status — Stripe search has no grouping
+      // parentheses, so OR can't be mixed with the scope's ANDs safely.
+      Promise.all([...INCOMPLETE_PI].map((s) => countSearch("paymentIntents", searchQ(`status:"${s}"`)))),
+    ]).then(([all, succeeded, refunded, disputed, failed, piByStatus]) => ({
+      all,
+      succeeded,
+      refunded,
+      disputed,
+      failed,
+      uncaptured: piByStatus[[...INCOMPLETE_PI].indexOf("requires_capture")],
+      incomplete: piByStatus.every((c) => c != null) ? piByStatus.reduce((s, c) => s! + c!, 0) : null,
+    })),
   ]);
 
   const efwChargeIds = new Set(efws.map((w) => (typeof w.charge === "string" ? w.charge : w.charge.id)));
@@ -232,21 +266,47 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
   const charges = chargeWindow.charges;
   const incompletePis = piWindow.paymentIntents.filter((pi) => INCOMPLETE_PI.has(pi.status));
 
-  // Count-cards are FILTERS over the fetched window (may overlap, like Stripe's).
+  // Count-cards are FILTERS whose totals come from search (exact); the rows
+  // they reveal still come from the fetched window. Fallback = windowed "N+".
+  const over = chargeWindow.hasMore;
   const counts = {
     key: "status",
     items: [
-      { value: "", label: "All", count: charges.length },
-      { value: "succeeded", label: "Succeeded", count: charges.filter((c) => c.status === "succeeded").length },
-      { value: "refunded", label: "Refunded", count: charges.filter((c) => (c.amount_refunded ?? 0) > 0).length },
-      { value: "disputed", label: "Disputed", count: charges.filter((c) => c.disputed).length },
-      { value: "failed", label: "Failed", count: charges.filter((c) => c.status === "failed").length },
+      { value: "", label: "All", count: chipCount(searchCounts.all, charges.length, over) },
+      {
+        value: "succeeded",
+        label: "Succeeded",
+        count: chipCount(searchCounts.succeeded, charges.filter((c) => c.status === "succeeded").length, over),
+      },
+      {
+        value: "refunded",
+        label: "Refunded",
+        count: chipCount(searchCounts.refunded, charges.filter((c) => c.refunded).length, over),
+      },
+      {
+        value: "disputed",
+        label: "Disputed",
+        count: chipCount(searchCounts.disputed, charges.filter((c) => c.disputed).length, over),
+      },
+      {
+        value: "failed",
+        label: "Failed",
+        count: chipCount(searchCounts.failed, charges.filter((c) => c.status === "failed").length, over),
+      },
       {
         value: "uncaptured",
         label: "Uncaptured",
-        count: charges.filter((c) => c.status === "succeeded" && !c.captured).length,
+        count: chipCount(
+          searchCounts.uncaptured,
+          charges.filter((c) => c.status === "succeeded" && !c.captured).length,
+          over
+        ),
       },
-      { value: "incomplete", label: "Incomplete", count: incompletePis.length },
+      {
+        value: "incomplete",
+        label: "Incomplete",
+        count: chipCount(searchCounts.incomplete, incompletePis.length, piWindow.hasMore),
+      },
     ],
   };
 
@@ -370,7 +430,9 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
     // Per-customer listings can't take a server-side date param — cut here.
     if (customerScope && createdGte && c.created < createdGte) return false;
     if (status === "succeeded" && c.status !== "succeeded") return false;
-    if (status === "refunded" && (c.amount_refunded ?? 0) === 0) return false;
+    // Fully refunded — Stripe's own chip definition (searchable as
+    // refunded:"true"); partial refunds keep their "Partial refund" badge.
+    if (status === "refunded" && !c.refunded) return false;
     if (status === "disputed" && !c.disputed) return false;
     if (status === "failed" && c.status !== "failed") return false;
     if (status === "uncaptured" && (c.status !== "succeeded" || c.captured)) return false;

@@ -2,7 +2,7 @@ import type Stripe from "stripe";
 import type { ActionActor } from "../../bot/billing/actions/BillingActionService";
 import { ActionButton, Badge, Block, Cell } from "../renderer/contract";
 import { DashboardCtx, DashboardSectionModule, SectionPage, str, validCursor, validId } from "./types";
-import { amount, badgeCell, cardCell, dateCell, idCell, invoiceBadge, money, sentence, strong, text } from "./cells";
+import { amount, badgeCell, cardCell, chipCount, dateCell, idCell, invoiceBadge, money, sentence, strong, text } from "./cells";
 import { StripeClient } from "../../bot/StripeClient";
 
 // Invoices: account-wide LIST archetype (status count-cards) and the DETAIL
@@ -49,18 +49,33 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
   const status = str(filters.status, 16);
   const customerScope = validId("customer", filters.customer) ?? "";
   const cursorId = validId("invoice", validCursor(cursor) ?? "") ?? undefined;
-  const res = await ctx.stripe.listInvoicesByStatus(customerScope || null, undefined, WINDOW, cursorId);
+
+  // Real chip totals via invoices.search total_count (window counts cap at
+  // WINDOW); fallback = honest windowed "N+" when search fails.
+  const scope = customerScope ? `customer:"${customerScope}"` : "";
+  const searchQ = (extra?: string) => [scope, extra].filter(Boolean).join(" AND ") || "created>0";
+  const countSearch = (q: string) =>
+    Promise.resolve()
+      .then(() => ctx.stripe.countBySearch("invoices", q))
+      .catch(() => null);
+  const STATUSES = ["draft", "open", "paid", "void", "uncollectible"] as const;
+  const [res, chipTotals] = await Promise.all([
+    ctx.stripe.listInvoicesByStatus(customerScope || null, undefined, WINDOW, cursorId),
+    Promise.all([countSearch(searchQ()), ...STATUSES.map((s) => countSearch(searchQ(`status:"${s}"`)))]),
+  ]);
+  const [nAll, ...nByStatus] = chipTotals;
   const invoices = res.data;
 
+  const over = res.has_more;
   const counts = {
     key: "status",
     items: [
-      { value: "", label: "All", count: invoices.length },
-      { value: "draft", label: "Draft", count: invoices.filter((i) => i.status === "draft").length },
-      { value: "open", label: "Open", count: invoices.filter((i) => i.status === "open").length },
-      { value: "paid", label: "Paid", count: invoices.filter((i) => i.status === "paid").length },
-      { value: "void", label: "Void", count: invoices.filter((i) => i.status === "void").length },
-      { value: "uncollectible", label: "Uncollectible", count: invoices.filter((i) => i.status === "uncollectible").length },
+      { value: "", label: "All", count: chipCount(nAll, invoices.length, over) },
+      ...STATUSES.map((s, i) => ({
+        value: s,
+        label: sentence(s),
+        count: chipCount(nByStatus[i], invoices.filter((inv) => inv.status === s).length, over),
+      })),
     ],
   };
 
@@ -119,7 +134,7 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
           res.has_more && invoices.length > 0 ? invoices[invoices.length - 1].id ?? null : null,
         empty: status || customerScope ? "No invoices match this filter (within this window)." : "No invoices yet.",
         ...(rows.length ? { footer: `${rows.length} item${rows.length === 1 ? "" : "s"}` } : {}),
-        notice: `Counts cover the ${WINDOW} most recent invoices per page — use Next for older ones.`,
+        notice: `Chip counts are account totals; the table shows ${WINDOW} per page — use Next for older ones.`,
       },
     ],
   };
