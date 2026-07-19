@@ -6163,9 +6163,29 @@ test("payments filters (PA-13): fingerprint/email flip the rows into a whole-acc
   await section.buildPage(ctx, { page: "payments", filters: { fingerprint: "!!nope!!" } });
   assert.equal(searches.length, 0);
 
-  // Email mode: exact-match search on billing_details.email.
-  await section.buildPage(ctx, { page: "payments", filters: { email: 'Other@X.com"\\' } });
-  assert.ok(searches[0].includes('billing_details.email~"other@x.com"'));
+  // Email mode: billing_details.email is NOT a supported charges.search
+  // field (prod-confirmed) — the sweep goes customers-first and merges their
+  // charge histories; chip search is skipped entirely (windowed chips).
+  const emailLookups: string[] = [];
+  const chargeLists: string[] = [];
+  stripe.searchCustomersByEmail = async (email: string) => {
+    emailLookups.push(email);
+    return [{ id: "cus_l1" }, { id: "cus_l2" }];
+  };
+  stripe.listCharges = async (cus: string) => {
+    chargeLists.push(cus);
+    return { charges: [{ ...hit, id: `ch_${cus}`, customer: cus, created: cus === "cus_l2" ? 1_700_000_500 : 1_600_000_000 }], hasMore: false };
+  };
+  countQs.length = 0;
+  const emailPage = await section.buildPage(ctx, { page: "payments", filters: { email: 'Other@X.com"\\' } });
+  assert.deepEqual(emailLookups, ["other@x.com"]);
+  assert.deepEqual(chargeLists.sort(), ["cus_l1", "cus_l2"]);
+  assert.equal(countQs.length, 0); // email can't scope chip searches — honest windowed chips
+  const emailTable = emailPage!.blocks.find((b) => b.type === "table") as TableBlock;
+  // Merged newest-first across both matched customers.
+  assert.deepEqual(emailTable.rows.map((r) => r.id), ["ch_cus_l2", "ch_cus_l1"]);
+  assert.equal(emailTable.nextCursor, null);
+  assert.match(emailTable.notice!, /matched 2 customers/);
 
   // Window slicers: decline reason (outcome/failure_code contains) + invoice.
   stripe.listAllCharges = async () => ({
@@ -6318,7 +6338,7 @@ test("search sweep resilience (PA-13.F): a refused charges.search renders an emp
     throw new Error("expand[0] cannot be data.refunds on search");
   };
   stripe.countBySearch = async () => 0;
-  const page = await section.buildPage(ctx, { page: "payments", filters: { email: "ada@example.com" } });
+  const page = await section.buildPage(ctx, { page: "payments", filters: { fingerprint: "Xt5EWLLDS7FJjR1c" } });
   const table = page!.blocks.find((b) => b.type === "table" && (b as TableBlock).key === "payments") as TableBlock;
   assert.equal(table.rows.length, 0);
   assert.match(table.notice!, /Search failed/);

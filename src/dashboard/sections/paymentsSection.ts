@@ -338,38 +338,60 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
   // Chip totals must honor the custom range's upper bound too.
   if (createdLt) scopeParts.push(`created<${createdLt}`);
   if (fingerprint) scopeParts.push(`payment_method_details.card.fingerprint:"${fingerprint}"`);
-  // Substring operator, same shape as the palette's proven charge search —
-  // also catches +tag address variants.
-  if (emailFilter) scopeParts.push(`billing_details.email~"${emailFilter}"`);
   const searchQ = (extra?: string) => [...scopeParts, ...(extra ? [extra] : [])].join(" AND ") || "created>0";
+  // Email can't scope search chip queries at all (billing_details.email is
+  // an UNSUPPORTED charges.search field on this API version — prod-confirmed
+  // Stripe refusal) — with an email filter active, chips fall back to honest
+  // windowed counts over the swept rows.
+  const chipsSearchable = !emailFilter;
   const countSearch = (kind: "charges" | "paymentIntents", q: string) =>
-    Promise.resolve()
-      .then(() => ctx.stripe.countBySearch(kind, q))
-      .catch(() => null);
+    chipsSearchable
+      ? Promise.resolve()
+          .then(() => ctx.stripe.countBySearch(kind, q))
+          .catch(() => null)
+      : Promise.resolve(null);
 
-  // Search mode: fingerprint/email aren't list params, so the ROWS come from
-  // charges.search (whole account, not just the recency window) — this is the
-  // reverse-card lookup. No cursor (one 100-row page + exact total). A
-  // refused/failed search degrades to an empty table with an explanatory
-  // notice — it must never 500 the whole page.
-  const searchMode = Boolean(fingerprint || emailFilter);
+  // Sweep modes (rows beyond the recency window — the reverse lookups):
+  // fingerprint → charges.search (a documented search field, whole account);
+  // email → customers-FIRST (customers.search email~) then merge those
+  // customers' charge histories, since charges.search refuses email fields.
+  // Guest charges with no customer record are invisible to the email sweep.
+  // Failures degrade to an empty table + Stripe's message — never a 500.
+  const fingerprintMode = Boolean(fingerprint);
+  const emailSweep = Boolean(emailFilter) && !fingerprintMode && !customerScope;
+  const searchMode = fingerprintMode || emailSweep;
   let searchFailMsg: string | null = null;
+  let emailSweepCustomers = 0;
+  const reportSweepFailure = (e: unknown, what: string) => {
+    // Ship the real refusal to Sentry (log.error captures exceptions) AND
+    // surface it in the page notice — deploys have no log access.
+    searchFailMsg = e instanceof Error ? e.message.slice(0, 200) : "unknown error";
+    log.child("dashboard").error(`payments ${what} sweep failed`, e, { "stripe.search_query": searchQ() });
+    return { charges: [] as Stripe.Charge[], hasMore: false };
+  };
+  const emailSweepCharges = async (): Promise<{ charges: Stripe.Charge[]; hasMore: boolean }> => {
+    const matched = await ctx.stripe.searchCustomersByEmail(emailFilter, 10);
+    emailSweepCustomers = matched.length;
+    const lists = await Promise.all(
+      matched.map((c) => ctx.stripe.listCharges(c.id, WINDOW).catch(() => ({ charges: [] as Stripe.Charge[], hasMore: false })))
+    );
+    const merged = lists
+      .flatMap((l) => l.charges)
+      .sort((a, b) => b.created - a.created);
+    return { charges: merged.slice(0, WINDOW), hasMore: merged.length > WINDOW || lists.some((l) => l.hasMore) };
+  };
 
   const [chargeWindow, piWindow, efws, blockPage, searchCounts] = await Promise.all([
-    searchMode
+    fingerprintMode
       ? ctx.stripe
           .searchChargesForList(searchQ(), WINDOW)
           .then((r) => ({ charges: r.charges, hasMore: (r.totalCount ?? r.charges.length) > r.charges.length }))
-          .catch((e: unknown) => {
-            // Ship the real refusal to Sentry (log.error captures exceptions)
-            // AND surface it in the page notice — deploys have no log access.
-            searchFailMsg = e instanceof Error ? e.message.slice(0, 200) : "unknown error";
-            log.child("dashboard").error("payments card/email sweep failed", e, { "stripe.search_query": searchQ() });
-            return { charges: [] as Stripe.Charge[], hasMore: false };
-          })
-      : customerScope
-        ? ctx.stripe.listCharges(customerScope, WINDOW, cursorId)
-        : ctx.stripe.listAllCharges({ limit: WINDOW, createdGte, createdLt, startingAfter: cursorId }),
+          .catch((e: unknown) => reportSweepFailure(e, "card"))
+      : emailSweep
+        ? emailSweepCharges().catch((e: unknown) => reportSweepFailure(e, "email"))
+        : customerScope
+          ? ctx.stripe.listCharges(customerScope, WINDOW, cursorId)
+          : ctx.stripe.listAllCharges({ limit: WINDOW, createdGte, createdLt, startingAfter: cursorId }),
     (searchMode
       ? // PI search can't express card/email fields — the Incomplete view is
         // meaningless under these filters; it renders empty with a notice.
@@ -596,9 +618,10 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
   }
 
   const filtered = charges.filter((c) => {
-    // Per-customer listings can't take a server-side date param — cut here.
-    if (customerScope && createdGte && c.created < createdGte) return false;
-    if (customerScope && createdLt && c.created >= createdLt) return false;
+    // Per-customer listings (and the email-sweep merge, which is built from
+    // them) can't take a server-side date param — cut here.
+    if ((customerScope || emailSweep) && createdGte && c.created < createdGte) return false;
+    if ((customerScope || emailSweep) && createdLt && c.created >= createdLt) return false;
     if (status === "succeeded" && c.status !== "succeeded") return false;
     // Fully refunded — Stripe's own chip definition (searchable as
     // refunded:"true"); partial refunds keep their "Partial refund" badge.
@@ -618,10 +641,11 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
     if (flagged === "efw" && !efwChargeIds.has(c.id)) return false;
     if (currencyFilter && c.currency !== currencyFilter) return false;
     if (pmFilter && (c.payment_method_details?.card?.brand ?? "") !== pmFilter) return false;
-    // PA-13 expansion: email/fingerprint re-check what search matched (and cut
-    // the plain window when search was unavailable); decline reason + invoice
-    // slice the fetched rows — the list API can't express them.
-    if (emailFilter && !(c.billing_details?.email ?? c.receipt_email ?? "").toLowerCase().includes(emailFilter)) return false;
+    // PA-13 expansion: the billing-email cut applies when rows came from a
+    // window/fingerprint fetch — NOT to the email sweep, whose rows matched
+    // via the CUSTOMER email (the charge's billing email may legitimately
+    // differ). Decline reason + invoice slice the fetched rows.
+    if (emailFilter && !emailSweep && !(c.billing_details?.email ?? c.receipt_email ?? "").toLowerCase().includes(emailFilter)) return false;
     if (fingerprint && c.payment_method_details?.card?.fingerprint !== fingerprint) return false;
     if (declineFilter && !`${c.outcome?.reason ?? ""} ${c.failure_code ?? ""}`.toLowerCase().includes(declineFilter)) return false;
     if (invoiceFilter) {
@@ -705,9 +729,11 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
         notice:
           (searchFailMsg
             ? `Stripe Search failed for this card/email sweep — the table is empty, NOT a real zero-matches result. Stripe said: "${searchFailMsg}"`
-            : searchMode
-              ? `Card/email filters sweep the WHOLE account via Stripe Search (~1 min lag; first ${WINDOW} matches shown). Incomplete attempts aren't searchable by card or email.`
-              : `Counts and filters cover the ${WINDOW} most recent payments${dateKey ? ` of the ${dateKey} window` : ""} per page — use Next for older ones. EFW matching covers the 100 most recent warnings.`) +
+            : fingerprintMode
+              ? `Card fingerprint sweeps the WHOLE account via Stripe Search (~1 min lag; first ${WINDOW} matches shown). Incomplete attempts aren't searchable by card.`
+              : emailSweep
+                ? `Email sweep: matched ${emailSweepCustomers} customer${emailSweepCustomers === 1 ? "" : "s"} by email (up to 10) and merged their charge histories. Guest checkouts without a customer record aren't found; chips count these results.`
+                : `Counts and filters cover the ${WINDOW} most recent payments${dateKey ? ` of the ${dateKey} window` : ""} per page — use Next for older ones. EFW matching covers the 100 most recent warnings.`) +
           // The wallet blind spot: Link/PayPal charges expose no card digits.
           (last4 || fingerprint || pmFilter
             ? " Wallet payments (Link/PayPal) expose no card digits — they never match card filters."

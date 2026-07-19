@@ -361,6 +361,17 @@ export class StripeClient {
     }
   }
 
+  // Customers by (billing/wallet) email, substring match. `email` IS a
+  // supported customers.search field — unlike charges.search, where Stripe
+  // REFUSES billing_details.email (prod-confirmed on this API version), so
+  // email sweeps go customers-first and then merge their charges.
+  async searchCustomersByEmail(email: string, limit = 10): Promise<Stripe.Customer[]> {
+    const safe = email.replace(/["\\]/g, "").trim();
+    if (safe.length < 3) return [];
+    const res = await this.stripe.customers.search({ query: `email~"${safe}"`, limit });
+    return res.data;
+  }
+
   async getCustomer(customerId: string): Promise<Stripe.Customer | null> {
     const customer = await this.stripe.customers.retrieve(customerId);
     return customer.deleted ? null : (customer as Stripe.Customer);
@@ -752,8 +763,12 @@ export class StripeClient {
   async searchChargesByTerm(term: string, limit = 5): Promise<Stripe.Charge[]> {
     const safe = term.replace(/["\\]/g, "").trim();
     if (safe.length < 2) return [];
+    // billing_details.email is NOT a supported charges.search field on this
+    // API version (Stripe refusal observed in prod) — the old email clause
+    // made this whole query fail silently. Email terms find their hits via
+    // the customers group instead; charges match on description only.
     const res = await this.stripe.charges.search({
-      query: `billing_details.email~"${safe}" OR description~"${safe}"`,
+      query: `description~"${safe}"`,
       limit,
     });
     return res.data;
