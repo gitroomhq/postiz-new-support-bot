@@ -90,6 +90,7 @@ ${dashboardCss()}
     <header class="topbar">
       <span class="jumpwrap"><input type="text" id="jump" placeholder="Search — name, email, amount, last4 or Stripe id (Ctrl+K)" autocomplete="off"><div id="palpop" class="palpop"></div></span>
       <span class="who" id="who"></span>
+      <span class="morewrap createwrap"><button class="btn sm primary" id="createbtn" type="button">+ Create</button><div id="createmenu" class="morepop"></div></span>
       <button class="btn sm" id="themebtn" type="button" title="Color theme — click to switch">Auto</button>
       <button class="btn sm" id="logout" type="button">End session</button>
     </header>

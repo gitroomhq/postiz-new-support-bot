@@ -122,6 +122,22 @@ export class DashboardActionGateway {
           params.currency = currency;
           delete params.amountMajor;
         }
+        // Balance-adjust modal collects a direction + major-unit amount; fold
+        // into the registry's signed deltaMinor (credit = negative = the
+        // customer owes less on future invoices).
+        if (key === "customer.balance" && params.deltaMinor == null) {
+          const mode = params.mode === "credit" || params.mode === "debit" ? params.mode : null;
+          const amountMajor = typeof params.amountMajor === "number" && isFinite(params.amountMajor) ? params.amountMajor : null;
+          const currency = typeof params.currency === "string" ? params.currency.trim().toLowerCase() : "";
+          if (!mode || amountMajor == null || amountMajor <= 0 || !/^[a-z]{3}$/.test(currency)) {
+            return { ok: false, error: "Pick credit/debit, a positive amount and a 3-letter currency." };
+          }
+          const factor = StripeClient.isZeroDecimal(currency) ? 1 : 100;
+          params.deltaMinor = Math.round(amountMajor * factor) * (mode === "credit" ? -1 : 1);
+          params.currency = currency;
+          delete params.mode;
+          delete params.amountMajor;
+        }
         // The web draft builder collects ONE line item as flat modal fields;
         // fold them into the registry's items[] shape (multi-line drafts stay
         // in /billing).

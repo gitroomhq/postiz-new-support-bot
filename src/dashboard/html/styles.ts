@@ -33,6 +33,8 @@ export function dashboardCss(): string {
   .topbar .jumpwrap { flex:1; max-width:430px; position:relative; }
   /* Search stays left; identity + session controls pin to the right edge. */
   .topbar .who { margin-left:auto; }
+  /* Global "+ Create" menu (PA-8): reuses the ··· popover chrome. */
+  .topbar .createwrap .morepop { right:0; left:auto; min-width:220px; }
 
   /* Command palette (⌘K) under the topbar search box. */
   .palpop { position:absolute; top:calc(100% + 8px); left:0; width:560px; max-width:min(80vw,560px); z-index:30;

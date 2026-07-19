@@ -35,9 +35,10 @@ const DASH_T1_EXTRA = new Set([
   "customer.payment_method",
 ]);
 // T2 (fresh factor re-assert): fraud refunds, blocklisting, cancel-NOW,
-// off-session invoice pay, off-session card charges, and creating a
-// subscription that charges immediately.
-const DASH_T2 = new Set(["charge.refund_fraud", "customer.block", "charge.create"]);
+// off-session invoice pay, off-session card charges, creating a subscription
+// that charges immediately, and balance adjustments (credits shrink future
+// invoices — money-adjacent).
+const DASH_T2 = new Set(["charge.refund_fraud", "customer.block", "charge.create", "customer.balance"]);
 
 function needsStepUp(key: string, params: Record<string, unknown> | undefined): boolean {
   if (DASH_T2.has(key)) return true;

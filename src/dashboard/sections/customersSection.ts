@@ -1,4 +1,5 @@
 import type Stripe from "stripe";
+import { StripeClient } from "../../bot/StripeClient";
 import type { ActionActor } from "../../bot/billing/actions/BillingActionService";
 import { ActionButton, Badge, Block, Cell, TableBlock } from "../renderer/contract";
 import { DashboardCtx, DashboardSectionModule, SectionPage, str, validCursor, validId } from "./types";
@@ -45,14 +46,13 @@ export function makeCustomersSection(): DashboardSectionModule {
     nav: [{ key: "customers", label: "Customers", page: "customers" }],
 
     ownsPage(page: string): boolean {
-      return page === "customers" || page === "customers.detail" || page === "customers.edit" || page === "customers.portal";
+      return page === "customers" || page === "customers.detail" || page === "customers.portal";
     },
 
     async buildPage(ctx: DashboardCtx, req): Promise<SectionPage | null> {
       if (req.page === "customers") return list(ctx, req.filters ?? {}, req.cursor ?? null);
       const id = validId("customer", req.params?.id);
       if (!id) return notFound("That customer id is not valid.");
-      if (req.page === "customers.edit") return editPage(ctx, id);
       if (req.page === "customers.portal") return portalLinkPage(ctx, id);
       return detail(ctx, id);
     },
@@ -70,7 +70,14 @@ async function customerAction(
   key: string,
   p: Record<string, unknown>,
   confirmWord: string | undefined
-): Promise<{ ok: boolean; text?: string; error?: string; fieldErrors?: Record<string, string>; needsReverse?: boolean }> {
+): Promise<{
+  ok: boolean;
+  text?: string;
+  error?: string;
+  fieldErrors?: Record<string, string>;
+  needsReverse?: boolean;
+  needsStepUp?: boolean;
+}> {
   const confirmed = confirmWord === "CONFIRM";
 
   // Create has no target id; everything else validates one.
@@ -165,6 +172,59 @@ async function customerAction(
       await ctx.stripe.updateCustomer(customerId, { metadata });
       await ctx.audit(`Customer ${customerId} metadata updated — ${Object.keys(metadata).length} key(s)`);
       return { ok: true, text: `Metadata updated (${Object.keys(metadata).length} key(s)).` };
+    }
+
+    // T1 + T2 — grant monetary credits against METERED usage. Money-adjacent
+    // (credits shrink future usage bills), so typed CONFIRM plus fresh factor.
+    case "section:customers.credit_grant": {
+      if (!confirmed) return { ok: false, error: "Type CONFIRM to run this action." };
+      if (!ctx.security.stepUpFresh()) return { ok: false, needsStepUp: true };
+      const amountMajor = typeof p.amountMajor === "number" && isFinite(p.amountMajor) && p.amountMajor > 0 ? p.amountMajor : null;
+      if (!amountMajor) return { ok: false, fieldErrors: { amountMajor: "Enter a positive amount." } };
+      const currency = str(p.currency, 3).trim().toLowerCase();
+      if (!/^[a-z]{3}$/.test(currency)) return { ok: false, fieldErrors: { currency: "3-letter currency code." } };
+      const category = p.category === "paid" ? ("paid" as const) : ("promotional" as const);
+      const name = str(p.name, 100).trim();
+      const expiresDays =
+        typeof p.expiresDays === "number" && Number.isSafeInteger(p.expiresDays) && p.expiresDays >= 1 && p.expiresDays <= 3650
+          ? p.expiresDays
+          : null;
+      const customer = await ctx.stripe.getCustomer(customerId).catch(() => null);
+      if (!customer || customer.deleted) return { ok: false, error: "Customer no longer exists in Stripe." };
+      const amountMinor = Math.round(amountMajor * (StripeClient.isZeroDecimal(currency) ? 1 : 100));
+      const grant = await ctx.stripe.createCreditGrant(
+        {
+          customerId,
+          amountMinor,
+          currency,
+          category,
+          ...(name ? { name } : {}),
+          ...(expiresDays ? { expiresAt: Math.floor(Date.now() / 1000) + expiresDays * 86400 } : {}),
+        },
+        `dash-credgrant-${customerId}-${Date.now().toString(36)}`
+      );
+      await ctx.audit(
+        `Credit grant ${grant.id} for ${customerId}: ${ctx.stripe.formatAmount(amountMinor, currency)} (${category}${expiresDays ? `, expires in ${expiresDays}d` : ""})`
+      );
+      return { ok: true, text: `Granted ${ctx.stripe.formatAmount(amountMinor, currency)} in billing credits (${grant.id}).` };
+    }
+
+    // T1 — void a grant: zeroes the REMAINING credit (applied credit stays).
+    case "section:customers.credit_grant_void": {
+      if (!confirmed) return { ok: false, error: "Type CONFIRM to run this action." };
+      const grantId = typeof p.grantId === "string" && /^credgr_[A-Za-z0-9_]{1,80}$/.test(p.grantId) ? p.grantId : null;
+      if (!grantId) return { ok: false, error: "Bad credit grant id." };
+      const grant = await ctx.stripe.getCreditGrant(grantId).catch(() => null);
+      if (!grant) return { ok: false, error: "This credit grant does not exist." };
+      const grantCustomer = typeof grant.customer === "string" ? grant.customer : grant.customer?.id ?? null;
+      if (grantCustomer !== customerId) return { ok: false, error: "That grant belongs to a different customer." };
+      if (grant.voided_at) return { ok: false, error: "This grant is already voided." };
+      if (grant.expires_at && grant.expires_at < Math.floor(Date.now() / 1000)) {
+        return { ok: false, error: "This grant has already expired." };
+      }
+      await ctx.stripe.voidCreditGrant(grantId, `dash-credvoid-${grantId}`);
+      await ctx.audit(`Credit grant ${grantId} VOIDED for ${customerId}`);
+      return { ok: true, text: `Credit grant ${grantId} voided — remaining credit is gone; already-applied credit stays.` };
     }
 
     // T1 — link a Discord user to this Stripe customer.
@@ -276,7 +336,7 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
     return notFound("This customer does not exist (or was deleted).");
   }
 
-  const [subs, invoices, methods, chargesPage, disputes, blocks, discordIds, notes] = await Promise.all([
+  const [subs, invoices, methods, chargesPage, disputes, blocks, discordIds, notes, creditGrants] = await Promise.all([
     ctx.stripe.listSubscriptions(id).catch(() => [] as Stripe.Subscription[]),
     ctx.stripe.listInvoices(id, 10).catch(() => ({ invoices: [] as Stripe.Invoice[], hasMore: false })),
     ctx.stripe.listAllPaymentMethods(id).catch(() => [] as Stripe.PaymentMethod[]),
@@ -285,6 +345,7 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
     ctx.stores.block.listForCustomer(id, customer.email).catch(() => []),
     ctx.stores.session.findDiscordIdsByStripeId(id).catch(() => [] as string[]),
     ctx.stores.qol.listNotes("customer", id, 0, 5).catch(() => ({ rows: [], total: 0 })),
+    ctx.stripe.listCreditGrants(id).catch(() => [] as Stripe.Billing.CreditGrant[]),
   ]);
 
   const main: Block[] = [];
@@ -401,7 +462,60 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
       },
       ...(customer.description ? [{ label: "Description", cell: text(customer.description) }] : []),
     ],
+    // Inline edit (PA-8, replaces the customers.edit page): the same modals,
+    // with current values embedded in the labels (web modals can't prefill).
+    actions: [
+      {
+        key: "section:customers.update",
+        label: "Edit details",
+        params: { customerId: id },
+        inputs: [
+          { type: "text", key: "name", label: `Name (now: ${customer.name ?? "—"}) — blank keeps, '-' clears` },
+          { type: "text", key: "email", label: `Email (now: ${customer.email ?? "—"})` },
+          { type: "text", key: "description", label: `Description (now: ${customer.description?.slice(0, 60) ?? "—"})` },
+        ],
+        summary: "Blank fields stay unchanged; a single '-' clears the field.",
+      },
+      {
+        key: "section:customers.tax_locale",
+        label: "Tax & locale",
+        params: { customerId: id },
+        inputs: [
+          {
+            type: "select",
+            key: "taxExempt",
+            label: "Tax exemption",
+            value: customer.tax_exempt ?? "none",
+            options: [
+              { value: "none", label: "None (taxable)" },
+              { value: "exempt", label: "Exempt" },
+              { value: "reverse", label: "Reverse charge" },
+            ],
+          },
+          { type: "text", key: "locale", label: `Preferred locale (now: ${customer.preferred_locales?.[0] ?? "—"}) — '-' clears` },
+        ],
+      },
+      {
+        key: "section:customers.metadata",
+        label: "Metadata",
+        params: { customerId: id },
+        inputs: [
+          { type: "text", key: "metadata", label: "key=value per line — '-' alone clears ALL metadata", multiline: true, maxLength: 2000 },
+        ],
+        summary: "Replaces the listed keys (other keys survive); '-' wipes everything.",
+      },
+    ],
   });
+
+  // ---- rail: Metadata (moved from the removed edit page) ----
+  const metaEntries = Object.entries(customer.metadata ?? {});
+  if (metaEntries.length > 0) {
+    rail.push({
+      type: "kv",
+      title: `Metadata (${metaEntries.length})`,
+      rows: metaEntries.slice(0, 20).map(([k, v]) => ({ label: k, cell: text(String(v).slice(0, 120)) })),
+    });
+  }
 
   // ---- rail: Linked accounts (Discord / Postiz) ----
   const linkRows: Array<{ label: string; cell: Cell }> = [];
@@ -449,6 +563,19 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
           item?.current_period_end ? dateCell(item.current_period_end) : text("—"),
           idCell(sub.id, { copy: true }),
         ] as Cell[],
+        // Update jumps into the change-plan flow; cancel keeps its full
+        // ceremony on the subscription detail page.
+        ...(sub.status !== "canceled"
+          ? {
+              actions: [
+                {
+                  key: "nav:subscriptions.update",
+                  label: "Update",
+                  ref: { page: "subscriptions.changeplan", params: { id: sub.id } },
+                } as ActionButton,
+              ],
+            }
+          : {}),
       };
     }),
     empty: "No subscriptions.",
@@ -567,6 +694,9 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
         idCell(invoice.number ?? invoice.id ?? "draft", { copy: !!invoice.id }),
         dateCell(invoice.created),
       ] as Cell[],
+      // State actions inline (PA-8): same registry belts as the invoice
+      // detail; the hybrid renderer puts the first inline, the rest in ···.
+      ...(invoice.id ? { actions: invoiceRowActions(ctx, invoice) } : {}),
     })),
     empty: "No invoices.",
     ...(invoices.invoices.length > 0
@@ -576,6 +706,55 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
         }
       : {}),
   });
+
+  // ---- main: credit grants (PA-8; only when any exist — Grant lives in Manage) ----
+  if (creditGrants.length > 0) {
+    const now = Math.floor(Date.now() / 1000);
+    const grantBadge = (g: Stripe.Billing.CreditGrant): Badge =>
+      g.voided_at
+        ? { kind: "error", text: "Voided" }
+        : g.expires_at && g.expires_at < now
+          ? { kind: "neutral", text: "Expired" }
+          : { kind: "ok", text: "Active" };
+    main.push({
+      type: "table",
+      key: "creditgrants",
+      title: "Credit grants",
+      columns: [
+        { key: "amount", label: "Amount" },
+        { key: "name", label: "Name" },
+        { key: "category", label: "Category" },
+        { key: "expires", label: "Expires" },
+        { key: "id", label: "ID" },
+      ],
+      rows: creditGrants.slice(0, 25).map((g) => ({
+        id: g.id,
+        cells: [
+          g.amount.monetary
+            ? amount(ctx.stripe, g.amount.monetary.value, g.amount.monetary.currency, grantBadge(g))
+            : text("—"),
+          text(g.name ?? "—"),
+          text(g.category === "paid" ? "Paid" : "Promotional"),
+          g.expires_at ? dateCell(g.expires_at) : text("Never"),
+          idCell(g.id, { copy: true }),
+        ] as Cell[],
+        actions:
+          !g.voided_at && !(g.expires_at && g.expires_at < now)
+            ? [
+                {
+                  key: "section:customers.credit_grant_void",
+                  label: "Void",
+                  dangerous: true,
+                  params: { customerId: id, grantId: g.id },
+                  summary: "Zeroes the REMAINING credit on this grant — already-applied credit stays applied.",
+                },
+              ]
+            : [],
+      })),
+      footer: `${Math.min(creditGrants.length, 25)} result${creditGrants.length === 1 ? "" : "s"}`,
+      notice: "Credits apply automatically against metered-usage charges on future invoices.",
+    });
+  }
 
   // ---- main: dispute mirror rows ----
   if (disputes.length > 0) {
@@ -620,15 +799,95 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
     });
   }
 
-  // ---- rail: manage (M7 edit surface + PA-6 portal link) ----
+  // ---- rail: manage (PA-8 act-from-customer + money surfaces + links/delete) ----
   rail.push({
     type: "kv",
     title: "Manage",
     rows: [
-      { label: "Edit", cell: { t: "link", v: "Edit customer →", ref: { page: "customers.edit", params: { id } } } as Cell },
+      {
+        label: "Subscription",
+        cell: { t: "link", v: "New subscription →", ref: { page: "subscriptions.new", filters: { customer: id } } } as Cell,
+      },
+      {
+        label: "Invoice",
+        cell: { t: "link", v: "New invoice →", ref: { page: "invoices.new", filters: { customer: id } } } as Cell,
+      },
       {
         label: "Customer portal",
         cell: { t: "link", v: "Mint portal login link →", ref: { page: "customers.portal", params: { id } } } as Cell,
+      },
+    ],
+    actions: [
+      registryButton(ctx, {
+        key: "customer.balance",
+        label: "Adjust balance",
+        dangerous: true,
+        stepUp: true,
+        params: { customerId: id },
+        inputs: [
+          {
+            type: "select",
+            key: "mode",
+            label: "Direction",
+            options: [
+              { value: "credit", label: "Credit — customer owes less" },
+              { value: "debit", label: "Debit — customer owes more" },
+            ],
+          },
+          { type: "number", key: "amountMajor", label: "Amount (major units, e.g. 10.00)", min: 0 },
+          { type: "text", key: "currency", label: "Currency (3 letters)", placeholder: customer.currency ?? "eur" },
+          { type: "text", key: "note", label: "Note (optional)" },
+        ],
+        summary: "Adjusts the running balance applied to FUTURE invoices (credit = negative). Requires a fresh factor.",
+      }),
+      {
+        key: "section:customers.credit_grant",
+        label: "Grant credits",
+        dangerous: true,
+        stepUp: true,
+        params: { customerId: id },
+        inputs: [
+          { type: "number", key: "amountMajor", label: "Amount (major units, e.g. 25.00)", min: 0 },
+          { type: "text", key: "currency", label: "Currency (3 letters)", placeholder: customer.currency ?? "eur" },
+          {
+            type: "select",
+            key: "category",
+            label: "Category",
+            options: [
+              { value: "promotional", label: "Promotional (goodwill)" },
+              { value: "paid", label: "Paid (purchased credits)" },
+            ],
+          },
+          { type: "text", key: "name", label: "Name (optional, shown in Stripe)" },
+          { type: "number", key: "expiresDays", label: "Expires in days (optional)", min: 1, max: 3650 },
+        ],
+        summary:
+          "Grants monetary billing credits applied against METERED usage charges. Requires a fresh factor.",
+      },
+      {
+        key: "section:customers.link",
+        label: "Link Discord user",
+        dangerous: true,
+        params: { customerId: id },
+        inputs: [{ type: "text", key: "discordUserId", label: "Discord user id (digits)" }],
+        summary: "Points that Discord user's session at this Stripe customer — self-service billing then acts on it.",
+      },
+      {
+        key: "section:customers.unlink",
+        label: "Unlink Discord",
+        dangerous: true,
+        params: { customerId: id },
+        summary: `Clears the Stripe link on every Discord user currently pointing at ${id}.`,
+        ...(discordIds.length === 0 ? { disabledReason: "No Discord users are linked to this customer." } : {}),
+      },
+      {
+        key: "section:customers.delete",
+        label: "Delete customer",
+        style: "danger",
+        dangerous: true,
+        reverseConfirm: true,
+        params: { customerId: id },
+        summary: `Permanently deletes ${id} in Stripe — active subscriptions are canceled and this cannot be undone. Discord links are cleared afterwards. Needs the Discord reverse code (/billing → Show destructive-action code).`,
       },
     ],
   });
@@ -644,129 +903,60 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
   };
 }
 
-// ---- EDIT page (M7): current values + the edit/link/delete action set ----
-
-async function editPage(ctx: DashboardCtx, id: string): Promise<SectionPage> {
-  const customer = await ctx.stripe.getCustomer(id).catch(() => null);
-  if (!customer || customer.deleted) return notFound("This customer does not exist (or was deleted).");
-  const discordIds = await ctx.stores.session.findDiscordIdsByStripeId(id).catch(() => [] as string[]);
-
-  const actions = [
-    {
-      key: "section:customers.update",
-      label: "Edit details",
-      style: "primary" as const,
-      params: { customerId: id },
-      inputs: [
-        { type: "text" as const, key: "name", label: `Name (now: ${customer.name ?? "—"}) — blank keeps, '-' clears` },
-        { type: "text" as const, key: "email", label: `Email (now: ${customer.email ?? "—"})` },
-        { type: "text" as const, key: "description", label: `Description (now: ${customer.description?.slice(0, 60) ?? "—"})` },
-      ],
-      summary: "Blank fields stay unchanged; a single '-' clears the field.",
-    },
-    {
-      key: "section:customers.tax_locale",
-      label: "Tax & locale",
-      params: { customerId: id },
-      inputs: [
-        {
-          type: "select" as const,
-          key: "taxExempt",
-          label: "Tax exemption",
-          value: customer.tax_exempt ?? "none",
-          options: [
-            { value: "none", label: "None (taxable)" },
-            { value: "exempt", label: "Exempt" },
-            { value: "reverse", label: "Reverse charge" },
-          ],
-        },
-        { type: "text" as const, key: "locale", label: `Preferred locale (now: ${customer.preferred_locales?.[0] ?? "—"}) — '-' clears` },
-      ],
-    },
-    {
-      key: "section:customers.metadata",
-      label: "Metadata",
-      params: { customerId: id },
-      inputs: [
-        { type: "text" as const, key: "metadata", label: "key=value per line — '-' alone clears ALL metadata", multiline: true, maxLength: 2000 },
-      ],
-      summary: "Replaces the listed keys (other keys survive); '-' wipes everything.",
-    },
-    {
-      key: "section:customers.link",
-      label: "Link Discord user",
-      dangerous: true,
-      params: { customerId: id },
-      inputs: [{ type: "text" as const, key: "discordUserId", label: "Discord user id (digits)" }],
-      summary: "Points that Discord user's session at this Stripe customer — self-service billing then acts on it.",
-    },
-    {
-      key: "section:customers.unlink",
-      label: "Unlink Discord",
-      dangerous: true,
-      params: { customerId: id },
-      summary: `Clears the Stripe link on every Discord user currently pointing at ${id}.`,
-      ...(discordIds.length === 0 ? { disabledReason: "No Discord users are linked to this customer." } : {}),
-    },
-    {
-      key: "section:customers.delete",
-      label: "Delete customer",
-      style: "danger" as const,
-      dangerous: true,
-      reverseConfirm: true,
-      params: { customerId: id },
-      summary: `Permanently deletes ${id} in Stripe — active subscriptions are canceled and this cannot be undone. Discord links are cleared afterwards. Needs the Discord reverse code (/billing → Show destructive-action code).`,
-    },
-  ];
-
-  const metaEntries = Object.entries(customer.metadata ?? {});
-  const blocks: Block[] = [
-    {
-      type: "header",
-      title: customer.name || customer.email || id,
-      sub: "Edit customer",
-      id,
-      actions,
-    },
-    {
-      type: "kv",
-      title: "Current values",
-      rows: [
-        { label: "Name", cell: text(customer.name ?? "—") },
-        { label: "Email", cell: text(customer.email ?? "—") },
-        { label: "Description", cell: text(customer.description ?? "—") },
-        { label: "Tax exemption", cell: text(customer.tax_exempt ?? "none") },
-        { label: "Locale", cell: text(customer.preferred_locales?.[0] ?? "—") },
-        {
-          label: "Discord links",
-          cell: discordIds.length ? text(discordIds.map((d) => `@${d}`).join(", ")) : text("none"),
-        },
-      ],
-    },
-    ...(metaEntries.length
-      ? [
-          {
-            type: "kv",
-            title: `Metadata (${metaEntries.length})`,
-            rows: metaEntries.slice(0, 20).map(([k, v]) => ({ label: k, cell: text(String(v).slice(0, 120)) })),
-          } as Block,
-        ]
-      : []),
-  ];
-
-  return {
-    title: "Edit customer",
-    crumbs: [
-      { label: "Customers", ref: { page: "customers" } },
-      { label: customer.email ?? id, ref: { page: "customers.detail", params: { id } } },
-      { label: "Edit", copyId: id },
-    ],
-    blocks,
-  };
-}
 
 function pmIntentId(charge: Stripe.Charge): string | null {
   return typeof charge.payment_intent === "string" ? charge.payment_intent : charge.payment_intent?.id ?? null;
+}
+
+// Status-appropriate invoice lifecycle buttons for 360 rows — the same
+// registry keys/params the invoice detail uses (belts enforced there).
+function invoiceRowActions(ctx: DashboardCtx, invoice: Stripe.Invoice): ActionButton[] {
+  const invoiceId = invoice.id!;
+  if (invoice.status === "draft") {
+    return [
+      registryButton(ctx, {
+        key: "invoice.finalize",
+        label: "Finalize",
+        dangerous: true,
+        params: { invoiceId },
+        summary: "Locks the draft and makes it open/collectible.",
+      }),
+      registryButton(ctx, {
+        key: "invoice.void",
+        label: "Delete draft",
+        dangerous: true,
+        params: { invoiceId, op: "delete_draft" },
+        summary: "Deletes the draft permanently.",
+      }),
+    ];
+  }
+  if (invoice.status === "open") {
+    return [
+      registryButton(ctx, {
+        key: "invoice.collect",
+        label: "Send",
+        dangerous: true,
+        params: { invoiceId, op: "send" },
+        summary: "Emails the hosted invoice to the customer.",
+      }),
+      registryButton(ctx, {
+        key: "invoice.collect",
+        label: "Collect now",
+        dangerous: true,
+        stepUp: true,
+        params: { invoiceId, op: "pay" },
+        summary: "Attempts an OFF-SESSION charge on the default payment method. Requires a fresh factor.",
+      }),
+      registryButton(ctx, {
+        key: "invoice.void",
+        label: "Void",
+        dangerous: true,
+        params: { invoiceId, op: "void" },
+        summary: "Voids the invoice — it can no longer be paid.",
+      }),
+    ];
+  }
+  return [];
 }
 
 // ---- customer portal login link (PA-6) ----

@@ -1450,6 +1450,41 @@ export class StripeClient {
     return res.data;
   }
 
+  // ---- credit grants (PA-8) ----
+
+  async listCreditGrants(customerId: string, limit = 25): Promise<Stripe.Billing.CreditGrant[]> {
+    const res = await this.stripe.billing.creditGrants.list({ customer: customerId, limit });
+    return res.data;
+  }
+
+  async getCreditGrant(creditGrantId: string): Promise<Stripe.Billing.CreditGrant> {
+    return this.stripe.billing.creditGrants.retrieve(creditGrantId);
+  }
+
+  // Monetary credits against METERED usage (Stripe currently supports only
+  // metered prices as the applicability scope). No expiry unless given.
+  async createCreditGrant(
+    params: { customerId: string; amountMinor: number; currency: string; name?: string; category: "paid" | "promotional"; expiresAt?: number },
+    idempotencyKey: string
+  ): Promise<Stripe.Billing.CreditGrant> {
+    return this.stripe.billing.creditGrants.create(
+      {
+        customer: params.customerId,
+        amount: { type: "monetary", monetary: { value: params.amountMinor, currency: params.currency } },
+        applicability_config: { scope: { price_type: "metered" } },
+        category: params.category,
+        ...(params.name ? { name: params.name } : {}),
+        ...(params.expiresAt ? { expires_at: params.expiresAt } : {}),
+      },
+      { idempotencyKey }
+    );
+  }
+
+  // Voiding zeroes the remaining credit; already-applied credit stays applied.
+  async voidCreditGrant(creditGrantId: string, idempotencyKey?: string): Promise<Stripe.Billing.CreditGrant> {
+    return this.stripe.billing.creditGrants.voidGrant(creditGrantId, {}, idempotencyKey ? { idempotencyKey } : undefined);
+  }
+
   // Product catalog (read-only surface for the dashboard). default_price is
   // expanded so list rows can show the headline price without N+1 reads.
   async listProducts(opts: { limit?: number; startingAfter?: string } = {}): Promise<{ products: Stripe.Product[]; hasMore: boolean }> {

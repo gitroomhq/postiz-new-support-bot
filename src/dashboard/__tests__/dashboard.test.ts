@@ -391,6 +391,7 @@ function fakeCustomerCtx(): DashboardCtx {
     listAllPaymentMethods: async () => [
       { id: "pm_1", type: "card", card: { brand: "visa", last4: "4242", exp_month: 7, exp_year: 2027 } },
     ],
+    listCreditGrants: async () => [],
     listCharges: async () => ({
       charges: [
         {
@@ -430,11 +431,23 @@ test("customer 360: Insights/Details/Linked accounts in the rail, atoms in the m
   const section = makeCustomersSection();
   const page = await section.buildPage(fakeCustomerCtx(), { page: "customers.detail", params: { id: "cus_test1" } });
   assert.ok(page);
-  // M7 appended the Manage card (edit link) — Insights/Details/Linked + Manage.
+  // PA-8: Insights/Details/Linked + Manage (edit is inline now, no edit page).
   assert.ok(page!.rail && page!.rail.length === 4, "expected a 4-card rail");
   const manage = page!.rail![3] as KeyValueBlock;
   assert.equal(manage.title, "Manage");
-  assert.deepEqual((manage.rows[0].cell as { ref?: unknown }).ref, { page: "customers.edit", params: { id: "cus_test1" } });
+  // Act-from-customer entries carry the customer into the composers.
+  assert.deepEqual((manage.rows[0].cell as { ref?: unknown }).ref, { page: "subscriptions.new", filters: { customer: "cus_test1" } });
+  assert.deepEqual((manage.rows[1].cell as { ref?: unknown }).ref, { page: "invoices.new", filters: { customer: "cus_test1" } });
+  // Money surfaces + link/delete moved onto the Manage card.
+  const manageKeys = (manage.actions ?? []).map((a) => a.key);
+  assert.deepEqual(manageKeys, [
+    "customer.balance",
+    "section:customers.credit_grant",
+    "section:customers.link",
+    "section:customers.unlink",
+    "section:customers.delete",
+  ]);
+  assert.equal(manage.actions![0].stepUp, true);
   const [insights, details, linked] = page!.rail as KeyValueBlock[];
   assert.equal(insights.title, "Insights");
   assert.equal(insights.big, true);
@@ -1482,7 +1495,8 @@ test("invoices list: count-cards + draft builder header action; detail: status-g
   const section = makeInvoicesSection();
   const page = await section.buildPage(invoiceCtx("open"), { page: "invoices", filters: {} });
   const header = page!.blocks[0] as HeaderBlock;
-  assert.ok(header.actions!.some((a) => a.key === "invoice.create_draft"));
+  // PA-8: the one-line modal became a link-button into the multi-line composer.
+  assert.deepEqual(header.actions![0].ref, { page: "invoices.new" });
   const table = page!.blocks.find((b) => b.type === "table") as TableBlock;
   const counts = Object.fromEntries(table.counts!.items.map((i) => [i.label, i.count]));
   assert.equal(counts.All, 2);
@@ -4107,4 +4121,291 @@ test("meters (PA-7b): list w/ toggle; detail summaries REQUIRE a customer scope 
   });
   assert.equal(okCreate.ok, true);
   assert.deepEqual(created[0], { displayName: "API requests", eventName: "api_requests", formula: "sum" });
+});
+
+// ---- PA-8: router fix, +Create, invoice composer, Customer-360 writes ----
+
+test("client router (PA-8): id-less subpages round-trip (#/subscriptions/new is NOT a detail page) and the shell ships the +Create menu", () => {
+  // Exercise the REAL shipped client code: extract parseHash/hashFor from the
+  // clientApp module string and run them with a stubbed location.
+  const start = clientApp.indexOf("D.parseHash");
+  const end = clientApp.indexOf("D.navigateRef");
+  assert.ok(start >= 0 && end > start);
+  const makeD = new Function(
+    "location",
+    `var D = { defaultPage: "home" };\n${clientApp.slice(start, end)}\nreturn D;`
+  ) as (location: { hash: string }) => {
+    parseHash(): { page: string; params: Record<string, string> };
+    hashFor(page: string, params: Record<string, string>, filters: Record<string, string>): string;
+  };
+  const roundTrip = (page: string, params: Record<string, string> = {}) => {
+    const D = makeD({ hash: "" });
+    const hash = D.hashFor(page, params, {});
+    return makeD({ hash }).parseHash();
+  };
+  assert.deepEqual(roundTrip("subscriptions.new"), { page: "subscriptions.new", params: {}, filters: {} });
+  assert.deepEqual(roundTrip("invoices.new"), { page: "invoices.new", params: {}, filters: {} });
+  assert.deepEqual(roundTrip("customers.detail", { id: "cus_1" }), { page: "customers.detail", params: { id: "cus_1" }, filters: {} });
+  assert.deepEqual(roundTrip("customers.portal", { id: "cus_1" }), { page: "customers.portal", params: { id: "cus_1" }, filters: {} });
+  assert.deepEqual(roundTrip("subscriptions.changeplan", { id: "sub_1" }), {
+    page: "subscriptions.changeplan",
+    params: { id: "sub_1" },
+    filters: {},
+  });
+  // Topbar + Create: markup in the shell, bind + items in the client.
+  const html = renderDashboardShell({ nonce: "n" });
+  assert.ok(html.includes('id="createbtn"'));
+  assert.ok(html.includes('id="createmenu"'));
+  assert.ok(clientApp.includes("D.bindCreate"));
+  for (const label of ["New customer", "New invoice", "New subscription", "New payment link", "New quote"]) {
+    assert.ok(clientApp.includes(label), `missing +Create item ${label}`);
+  }
+});
+
+test("gateway (PA-8): customer.balance folds direction+major into signed deltaMinor; baked invoice items[] pass through untouched", async () => {
+  const { gateway } = gatewayFixture();
+  const credit = await gateway.resolve("customer.balance", {
+    customerId: "cus_1",
+    mode: "credit",
+    amountMajor: 12.5,
+    currency: "EUR",
+  });
+  assert.ok(credit.ok);
+  const creditParams = (credit as { params: Record<string, unknown> }).params;
+  assert.equal(creditParams.deltaMinor, -1250);
+  assert.equal(creditParams.currency, "eur");
+  assert.ok(!("mode" in creditParams) && !("amountMajor" in creditParams));
+  const debit = await gateway.resolve("customer.balance", { customerId: "cus_1", mode: "debit", amountMajor: 5, currency: "jpy" });
+  assert.ok(debit.ok);
+  assert.equal((debit as { params: Record<string, unknown> }).params.deltaMinor, 5); // zero-decimal
+  const bad = await gateway.resolve("customer.balance", { customerId: "cus_1", mode: "credit", amountMajor: -3, currency: "eur" });
+  assert.equal(bad.ok, false);
+  // Composer-baked multi-line items skip the one-line folding entirely.
+  const items = [
+    { description: "Pro ×2", amountMinor: 5800, currency: "eur" },
+    { description: "Setup fee", amountMinor: 4900, currency: "eur" },
+  ];
+  const draft = await gateway.resolve("invoice.create_draft", { customerId: "cus_1", daysUntilDue: 30, items });
+  assert.ok(draft.ok);
+  assert.deepEqual((draft as { params: Record<string, unknown> }).params.items, items);
+});
+
+function invoiceComposerCtx() {
+  const ctx = {
+    actor: { id: "42", name: "Ada", role: "admin", isAdmin: true },
+    stripe: {
+      formatAmount: (a: number, c: string) => `${(a / 100).toFixed(2)} ${c.toUpperCase()}`,
+      listAllActivePrices: async () => [
+        { id: "price_a", nickname: "Pro", unit_amount: 2900, currency: "eur", product: "prod_1", recurring: { interval: "month" } },
+        { id: "price_b", nickname: "US One-off", unit_amount: 900, currency: "usd", product: "prod_2", recurring: null },
+      ],
+      getCustomer: async (id: string) => ({ id, name: "Ada Lovelace", email: "ada@example.com", deleted: false }),
+    },
+    settings: {} as never,
+    stores: {} as never,
+    billing: { actions: { effectiveMode: () => "direct" }, gateway: {} as never },
+    audit: async () => {},
+    security: { sessionIdHash: "h", authMethod: "passkey", stepUpFresh: () => true },
+  } as unknown as DashboardCtx;
+  return ctx;
+}
+
+test("invoice composer (PA-8): lines accumulate via URL tokens, currency-locks the picker, and bakes registry items[] server-side", async () => {
+  const section = makeInvoicesSection();
+  const ctx = invoiceComposerCtx();
+
+  // No customer yet: guidance notice, no Create block, full picker.
+  const empty = await section.buildPage(ctx, { page: "invoices.new", filters: {} });
+  assert.ok(empty!.blocks.some((b) => b.type === "notice" && (b as NoticeBlock).text.includes("cus_")));
+  assert.ok(!empty!.blocks.some((b) => b.type === "kv" && (b as KeyValueBlock).title === "Create"));
+  const picker = empty!.blocks.find((b) => b.type === "table" && (b as TableBlock).key === "picker") as TableBlock;
+  assert.equal(picker.rows.length, 2);
+  // Add-ref carries the price token plus the whole filter state.
+  const addRef = picker.rows[0].actions![0].ref!;
+  assert.equal(addRef.page, "invoices.new");
+  assert.equal(addRef.filters!.lines, "price_a*1");
+
+  // Customer + 2× price_a: line table, totals, Create bakes items[] + due days.
+  const built = await section.buildPage(ctx, {
+    page: "invoices.new",
+    filters: { customer: "cus_1", lines: "price_a*2", due: "14" },
+  });
+  const lines = built!.blocks.find((b) => b.type === "table" && (b as TableBlock).key === "lines") as TableBlock;
+  assert.equal(lines.rows.length, 1);
+  assert.deepEqual(lines.rows[0].cells[3], { t: "money", v: "58.00 EUR" });
+  // Remove-ref drops the token (empty lines filter is omitted entirely).
+  assert.equal(lines.rows[0].actions![0].ref!.filters!.lines, undefined);
+  const totals = built!.blocks.find((b) => b.type === "kv" && (b as KeyValueBlock).title === "Totals") as KeyValueBlock;
+  assert.deepEqual(totals.rows[1].cell, { t: "money", v: "58.00 EUR" });
+  const create = built!.blocks.find((b) => b.type === "kv" && (b as KeyValueBlock).title === "Create") as KeyValueBlock;
+  const confirm = create.actions![0];
+  assert.equal(confirm.key, "invoice.create_draft");
+  assert.deepEqual(confirm.params, {
+    customerId: "cus_1",
+    daysUntilDue: 14,
+    items: [{ description: "Pro ×2", amountMinor: 5800, currency: "eur" }],
+  });
+  // Picker is currency-locked to EUR (the USD price disappears).
+  const lockedPicker = built!.blocks.find((b) => b.type === "table" && (b as TableBlock).key === "picker") as TableBlock;
+  assert.deepEqual(lockedPicker.rows.map((r) => r.id), ["price_a"]);
+
+  // Pending custom line parses "desc | amount | cur" into an encoded token.
+  const custom = await section.buildPage(ctx, {
+    page: "invoices.new",
+    filters: { customer: "cus_1", lines: "price_a*1", custom: "Setup fee | 49.00 | eur" },
+  });
+  const customNotice = custom!.blocks.find((b) => b.type === "notice" && (b as NoticeBlock).actions?.length) as NoticeBlock;
+  assert.ok(customNotice);
+  assert.equal(customNotice.actions![0].ref!.filters!.lines, "price_a*1,c:Setup%20fee:4900:eur");
+  assert.equal(customNotice.actions![0].ref!.filters!.custom, undefined); // consumed on add
+
+  // Mixed currencies refuse to compose.
+  const mixed = await section.buildPage(ctx, {
+    page: "invoices.new",
+    filters: { customer: "cus_1", lines: "price_a*1,c:Extra:500:usd" },
+  });
+  assert.ok(mixed!.blocks.some((b) => b.type === "notice" && (b as NoticeBlock).badge.text === "Mixed currencies"));
+  assert.ok(!mixed!.blocks.some((b) => b.type === "kv" && (b as KeyValueBlock).title === "Create"));
+
+  // The invoices-list entry is now a link-button into the composer.
+  const invCtx = {
+    ...ctx,
+    stripe: {
+      ...(ctx.stripe as object),
+      listInvoicesByStatus: async () => ({ data: [], has_more: false }),
+    },
+  } as unknown as DashboardCtx;
+  const list = await section.buildPage(invCtx, { page: "invoices", filters: {} });
+  const listHeader = list!.blocks[0] as HeaderBlock;
+  assert.deepEqual(listHeader.actions![0].ref, { page: "invoices.new" });
+});
+
+test("customer 360 (PA-8): inline edit on the Details card, row actions on subs/invoices, credit grants table + T1/T2 belts", async () => {
+  const section = makeCustomersSection();
+  const ctx = fakeCustomerCtx();
+  (ctx.stripe as unknown as Record<string, unknown>).listInvoices = async () => ({
+    invoices: [
+      { id: "in_open", number: "INV-2", status: "open", total: 900, currency: "eur", created: 1_700_000_300 },
+      { id: "in_paid", number: "INV-1", status: "paid", total: 2900, currency: "eur", created: 1_700_000_100 },
+    ],
+    hasMore: false,
+  });
+  (ctx.stripe as unknown as Record<string, unknown>).listCreditGrants = async () => [
+    {
+      id: "credgr_live",
+      amount: { type: "monetary", monetary: { value: 2500, currency: "eur" } },
+      category: "promotional",
+      name: "Goodwill",
+      customer: "cus_test1",
+      effective_at: 1_700_000_000,
+      expires_at: null,
+      voided_at: null,
+    },
+    {
+      id: "credgr_dead",
+      amount: { type: "monetary", monetary: { value: 1000, currency: "eur" } },
+      category: "paid",
+      name: null,
+      customer: "cus_test1",
+      effective_at: 1_700_000_000,
+      expires_at: null,
+      voided_at: 1_700_100_000,
+    },
+  ];
+  const page = await section.buildPage(ctx, { page: "customers.detail", params: { id: "cus_test1" } });
+
+  // Inline edit: the Details rail card carries the three edit modals.
+  const details = page!.rail!.find((b) => b.type === "kv" && (b as KeyValueBlock).title === "Details") as KeyValueBlock;
+  assert.deepEqual(
+    (details.actions ?? []).map((a) => a.key),
+    ["section:customers.update", "section:customers.tax_locale", "section:customers.metadata"]
+  );
+  // The edit page is gone.
+  assert.equal(section.ownsPage("customers.edit"), false);
+
+  // Subscription rows: Update link into the change-plan flow.
+  const subsTable = page!.blocks.find((b) => b.type === "table" && (b as TableBlock).key === "subs") as TableBlock;
+  assert.deepEqual(subsTable.rows[0].actions![0].ref, { page: "subscriptions.changeplan", params: { id: "sub_1" } });
+
+  // Invoice rows: state actions on OPEN (Collect now = T2), none on PAID.
+  const invTable = page!.blocks.find((b) => b.type === "table" && (b as TableBlock).key === "invoices") as TableBlock;
+  const openActions = invTable.rows[0].actions!;
+  assert.deepEqual(openActions.map((a) => a.label), ["Send", "Collect now", "Void"]);
+  assert.equal(openActions[1].stepUp, true);
+  assert.equal(invTable.rows[1].actions!.length, 0);
+
+  // Credit grants table: active row voidable, voided row shows no action.
+  const grants = page!.blocks.find((b) => b.type === "table" && (b as TableBlock).key === "creditgrants") as TableBlock;
+  assert.equal(grants.rows.length, 2);
+  assert.equal(grants.rows[0].actions![0].key, "section:customers.credit_grant_void");
+  assert.equal(grants.rows[1].actions!.length, 0);
+  const grantAmount = grants.rows[0].cells[0] as { badge?: { text: string } };
+  assert.equal(grantAmount.badge!.text, "Active");
+  assert.equal((grants.rows[1].cells[0] as { badge?: { text: string } }).badge!.text, "Voided");
+
+  // Grant belts: CONFIRM first, then a fresh factor (fixture is stale) —
+  // no Stripe write happens before the gates pass.
+  const grantsCreated: Array<Record<string, unknown>> = [];
+  (ctx.stripe as unknown as Record<string, unknown>).createCreditGrant = async (p: Record<string, unknown>) => {
+    grantsCreated.push(p);
+    return { id: "credgr_new" };
+  };
+  const noConfirm = await section.action!(ctx, {
+    key: "section:customers.credit_grant",
+    params: { customerId: "cus_test1", amountMajor: 25, currency: "eur" },
+  });
+  assert.equal(noConfirm.ok, false);
+  const stale = await section.action!(ctx, {
+    key: "section:customers.credit_grant",
+    params: { customerId: "cus_test1", amountMajor: 25, currency: "eur" },
+    confirmWord: "CONFIRM",
+  });
+  assert.deepEqual(stale, { ok: false, needsStepUp: true });
+  assert.equal(grantsCreated.length, 0);
+  (ctx as unknown as { security: Record<string, unknown> }).security = {
+    sessionIdHash: "h",
+    authMethod: "passkey",
+    stepUpFresh: () => true,
+  };
+  const granted = await section.action!(ctx, {
+    key: "section:customers.credit_grant",
+    params: { customerId: "cus_test1", amountMajor: 25, currency: "eur", category: "promotional", expiresDays: 30 },
+    confirmWord: "CONFIRM",
+  });
+  assert.equal(granted.ok, true);
+  assert.equal(grantsCreated[0].amountMinor, 2500);
+  assert.equal(grantsCreated[0].category, "promotional");
+  assert.ok(typeof grantsCreated[0].expiresAt === "number");
+
+  // Void belts: live revalidation refuses voided grants and foreign customers.
+  const voided: string[] = [];
+  (ctx.stripe as unknown as Record<string, unknown>).getCreditGrant = async (id: string) =>
+    id === "credgr_dead"
+      ? { id, customer: "cus_test1", voided_at: 1_700_100_000, expires_at: null }
+      : id === "credgr_foreign"
+        ? { id, customer: "cus_other", voided_at: null, expires_at: null }
+        : { id, customer: "cus_test1", voided_at: null, expires_at: null };
+  (ctx.stripe as unknown as Record<string, unknown>).voidCreditGrant = async (id: string) => {
+    voided.push(id);
+    return { id };
+  };
+  const deadVoid = await section.action!(ctx, {
+    key: "section:customers.credit_grant_void",
+    params: { customerId: "cus_test1", grantId: "credgr_dead" },
+    confirmWord: "CONFIRM",
+  });
+  assert.equal(deadVoid.ok, false);
+  const foreignVoid = await section.action!(ctx, {
+    key: "section:customers.credit_grant_void",
+    params: { customerId: "cus_test1", grantId: "credgr_foreign" },
+    confirmWord: "CONFIRM",
+  });
+  assert.equal(foreignVoid.ok, false);
+  const okVoid = await section.action!(ctx, {
+    key: "section:customers.credit_grant_void",
+    params: { customerId: "cus_test1", grantId: "credgr_live" },
+    confirmWord: "CONFIRM",
+  });
+  assert.equal(okVoid.ok, true);
+  assert.deepEqual(voided, ["credgr_live"]);
 });

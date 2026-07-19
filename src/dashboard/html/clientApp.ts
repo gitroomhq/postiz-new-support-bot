@@ -2,7 +2,11 @@
 // poll, nav-badge poll and boot. Hash convention (mirrors ObjectRef):
 //   #/customers                → page "customers"
 //   #/customers/cus_123        → page "customers.detail", params { id }
-//   #/customers/cus_123/edit   → page "customers.edit", params { id }
+//   #/customers/cus_123/portal → page "customers.portal", params { id }
+//   #/invoices/new             → page "invoices.new" (id-less subpage)
+// The second segment is an object id ONLY when it looks like one (Stripe ids
+// always carry an underscore); otherwise it names an id-less subpage like
+// "new" — that keeps #/subscriptions/new ≠ subscriptions.detail{id:"new"}.
 // Filters serialize as query params (f_<key>=<value>). Cursors stay in memory.
 
 export const clientApp = `
@@ -15,6 +19,7 @@ D.parseHash = function () {
   var page, params = {};
   if (seg.length === 0) page = D.defaultPage;
   else if (seg.length === 1) page = seg[0];
+  else if (seg.length === 2 && seg[1].indexOf("_") < 0) page = seg[0] + "." + seg[1];
   else if (seg.length === 2) { page = seg[0] + ".detail"; params.id = seg[1]; }
   else { page = seg[0] + "." + seg[2]; params.id = seg[1]; }
   var filters = {};
@@ -290,12 +295,43 @@ D.bindLockCode = function () {
   });
 };
 
+// Global "+ Create" menu (PA-8): every composer entry point in one place.
+// Items navigate to hash routes — modals stay where their pages define them.
+D.CREATE_ITEMS = [
+  { label: "New customer", page: "customers" },
+  { label: "New invoice", page: "invoices.new" },
+  { label: "New subscription", page: "subscriptions.new" },
+  { label: "New payment link", page: "links" },
+  { label: "New quote", page: "quotes" }
+];
+D.bindCreate = function () {
+  var btn = D.q("createbtn");
+  var pop = D.q("createmenu");
+  if (!btn || !pop) return;
+  D.CREATE_ITEMS.forEach(function (item) {
+    var mi = D.el("button", "btn menuitem", item.label);
+    mi.type = "button";
+    mi.addEventListener("click", function () {
+      D.closeAllPops();
+      location.hash = D.hashFor(item.page, {}, {});
+    });
+    pop.appendChild(mi);
+  });
+  btn.addEventListener("click", function (e) {
+    e.stopPropagation();
+    var wasOpen = pop.classList.contains("open");
+    D.closeAllPops();
+    if (!wasOpen) pop.classList.add("open");
+  });
+};
+
 D.started = false;
 D.startApp = function () {
   if (D.started) return;
   D.started = true;
   D.bindModal();
   D.bindJump();
+  D.bindCreate();
   D.q("logout").addEventListener("click", function () {
     // Back to the sign-in screen (standing URL) rather than a dead end.
     D.api("logout", {}).then(function () { location.hash = ""; location.reload(); });

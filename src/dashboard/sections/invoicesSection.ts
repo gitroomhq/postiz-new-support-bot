@@ -2,13 +2,16 @@ import type Stripe from "stripe";
 import type { ActionActor } from "../../bot/billing/actions/BillingActionService";
 import { ActionButton, Badge, Block, Cell } from "../renderer/contract";
 import { DashboardCtx, DashboardSectionModule, SectionPage, str, validCursor, validId } from "./types";
-import { amount, badgeCell, cardCell, dateCell, idCell, invoiceBadge, money, sentence, text } from "./cells";
+import { amount, badgeCell, cardCell, dateCell, idCell, invoiceBadge, money, sentence, strong, text } from "./cells";
+import { StripeClient } from "../../bot/StripeClient";
 
 // Invoices: account-wide LIST archetype (status count-cards) and the DETAIL
 // archetype (copy-field hosted URL + Summary + line items + credit notes +
 // enabled-payment-method chips + Metadata + rail). Lifecycle ops render as
-// registry buttons per status; the one-off draft builder collects a single
-// line item (multi-line drafts stay in /billing).
+// registry buttons per status. PA-8 added the multi-line COMPOSER page
+// (`invoices.new`): filter-driven like subscriptions.new, lines accumulate in
+// a compact `lines` token filter (price*qty + encoded custom lines) and the
+// confirm bakes the registry `invoice.create_draft` items[] server-side.
 
 const WINDOW = 100;
 
@@ -17,11 +20,12 @@ export function makeInvoicesSection(): DashboardSectionModule {
     nav: [{ key: "invoices", label: "Invoices", page: "invoices" }],
 
     ownsPage(page: string): boolean {
-      return page === "invoices" || page === "invoices.detail";
+      return page === "invoices" || page === "invoices.detail" || page === "invoices.new";
     },
 
     async buildPage(ctx: DashboardCtx, req): Promise<SectionPage | null> {
       if (req.page === "invoices") return list(ctx, req.filters ?? {}, req.cursor ?? null);
+      if (req.page === "invoices.new") return composer(ctx, req.filters ?? {});
       const id = validId("invoice", req.params?.id);
       if (!id) return notFound("That invoice id is not valid (in_…).");
       return detail(ctx, id);
@@ -88,20 +92,12 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
         type: "header",
         title: "Invoices",
         actions: [
-          registryButton(ctx, {
-            key: "invoice.create_draft",
-            label: "New draft invoice",
+          {
+            key: "nav:invoices.new",
+            label: "Create invoice",
             style: "primary",
-            inputs: [
-              { type: "text", key: "customerId", label: "Customer id (cus_…)", placeholder: "cus_…" },
-              { type: "text", key: "description", label: "Line description", maxLength: 300 },
-              { type: "number", key: "amountMajor", label: "Amount (e.g. 29.00)", min: 0 },
-              { type: "text", key: "currency", label: "Currency (3 letters)", placeholder: "usd" },
-              { type: "number", key: "daysUntilDue", label: "Days until due (optional)", min: 1 },
-              { type: "toggle", key: "finalize", label: "Finalize immediately (email invoice)" },
-            ],
-            summary: "One-line draft invoice (collection: email). Multi-line drafts live in /billing → Invoices.",
-          }),
+            ref: { page: "invoices.new" },
+          },
         ],
       },
       {
@@ -440,6 +436,298 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
     ],
     blocks: main,
     rail,
+  };
+}
+
+// ---- COMPOSER (`invoices.new`, PA-8) ----
+// Filter-driven multi-line draft builder. State lives entirely in the URL
+// filters (the subscriptions.new idiom): `customer` scopes it, `lines` holds
+// the accumulated items as tokens, `due`/`qty`/`custom` are knobs. Tokens:
+//   price_x*3                          → 3 × that price
+//   c:<encodeURIComponent(desc)>:<minor>:<cur> → ad-hoc custom line
+// The confirm bakes the registry invoice.create_draft items[] SERVER-side —
+// the client only ever toggles "finalize".
+
+const MAX_LINES = 10; // registry invoice.create_draft cap
+
+interface ComposedLine {
+  token: string;
+  desc: string;
+  qty: number;
+  unitMinor: number;
+  currency: string;
+}
+
+function parseLineTokens(raw: string, prices: Stripe.Price[]): { lines: ComposedLine[]; dropped: number } {
+  const lines: ComposedLine[] = [];
+  let dropped = 0;
+  for (const token of raw.split(",").filter(Boolean).slice(0, MAX_LINES)) {
+    if (token.startsWith("c:")) {
+      const parts = token.split(":");
+      const desc = decodeURIComponent(parts[1] ?? "").slice(0, 300);
+      const minor = Number.parseInt(parts[2] ?? "", 10);
+      const cur = (parts[3] ?? "").toLowerCase();
+      if (!desc || !Number.isSafeInteger(minor) || minor <= 0 || !/^[a-z]{3}$/.test(cur)) {
+        dropped++;
+        continue;
+      }
+      lines.push({ token, desc, qty: 1, unitMinor: minor, currency: cur });
+      continue;
+    }
+    const m = /^(price_[A-Za-z0-9]{1,64})\*(\d{1,3})$/.exec(token);
+    const price = m ? prices.find((p) => p.id === m[1]) : undefined;
+    const qty = m ? Number.parseInt(m[2], 10) : 0;
+    if (!price || price.unit_amount == null || qty < 1 || qty > 999) {
+      dropped++;
+      continue;
+    }
+    lines.push({
+      token,
+      desc: price.nickname ?? (typeof price.product === "string" ? price.product : price.id),
+      qty,
+      unitMinor: price.unit_amount,
+      currency: price.currency,
+    });
+  }
+  return { lines, dropped };
+}
+
+async function composer(ctx: DashboardCtx, filters: Record<string, string>): Promise<SectionPage> {
+  const customerId = validId("customer", filters.customer) ?? "";
+  const due = ["7", "14", "30"].includes(filters.due ?? "") ? filters.due : "30";
+  const qtyRaw = str(filters.qty, 3).trim();
+  const addQty = /^\d{1,3}$/.test(qtyRaw) && Number.parseInt(qtyRaw, 10) >= 1 ? Math.min(Number.parseInt(qtyRaw, 10), 999) : 1;
+  const linesRaw = str(filters.lines, 2000);
+  const customRaw = str(filters.custom, 400).trim();
+
+  const [prices, customer] = await Promise.all([
+    ctx.stripe.listAllActivePrices(100).catch(() => [] as Stripe.Price[]),
+    customerId
+      ? Promise.resolve()
+          .then(() => ctx.stripe.getCustomer(customerId))
+          .catch(() => null)
+      : Promise.resolve(null),
+  ]);
+
+  const { lines, dropped } = parseLineTokens(linesRaw, prices);
+  const lineCurrency = lines[0]?.currency ?? null;
+  const mixed = lines.some((l) => l.currency !== lineCurrency);
+  const totalMinor = lines.reduce((sum, l) => sum + l.unitMinor * l.qty, 0);
+
+  // Every ref must carry the FULL filter state (refs replace, not merge).
+  const baseFilters = (over: Record<string, string | null>): Record<string, string> => {
+    const f: Record<string, string> = {};
+    const merged: Record<string, string | null> = {
+      customer: customerId || null,
+      lines: linesRaw || null,
+      due: due === "30" ? null : due,
+      qty: qtyRaw || null,
+      custom: customRaw || null,
+      ...over,
+    };
+    for (const [k, v] of Object.entries(merged)) if (v) f[k] = v;
+    return f;
+  };
+
+  const blocks: Block[] = [
+    {
+      type: "header",
+      title: "New invoice",
+      sub: customer && !customer.deleted ? customer.name ?? customer.email ?? customerId : "Draft composer",
+    },
+  ];
+
+  if (!customerId) {
+    blocks.push({
+      type: "notice",
+      badge: { kind: "info", text: "Customer" },
+      text: "Set the Customer filter (cus_…) below to scope the invoice — everything else stays as you build.",
+    });
+  } else if (!customer || customer.deleted) {
+    blocks.push({ type: "notice", badge: { kind: "error", text: "Not found" }, text: `Customer ${customerId} does not exist (or was deleted).` });
+  }
+
+  // Pending custom line: parses "desc | 12.50 | eur" from the custom filter
+  // into an add-ref that moves it into the token list.
+  if (customRaw) {
+    const parts = customRaw.split("|").map((s) => s.trim());
+    const desc = (parts[0] ?? "").slice(0, 300);
+    const amt = Number.parseFloat(parts[1] ?? "");
+    const cur = (parts[2] ?? "").toLowerCase();
+    const valid = desc.length > 0 && Number.isFinite(amt) && amt > 0 && /^[a-z]{3}$/.test(cur);
+    if (valid) {
+      const minor = Math.round(amt * (StripeClient.isZeroDecimal(cur) ? 1 : 100));
+      const token = `c:${encodeURIComponent(desc)}:${minor}:${cur}`;
+      blocks.push({
+        type: "notice",
+        badge: { kind: "info", text: "Custom line" },
+        text: `"${desc}" — ${ctx.stripe.formatAmount(minor, cur)}`,
+        actions: [
+          {
+            key: "nav:invoices.addcustom",
+            label: "Add line",
+            style: "primary",
+            ref: { page: "invoices.new", filters: baseFilters({ lines: [linesRaw, token].filter(Boolean).join(","), custom: null }) },
+          },
+        ],
+      });
+    } else {
+      blocks.push({
+        type: "notice",
+        badge: { kind: "warn", text: "Custom line" },
+        text: 'Format: description | amount | currency — e.g. "Setup fee | 49.00 | eur".',
+      });
+    }
+  }
+
+  // Current lines + totals.
+  blocks.push({
+    type: "table",
+    key: "lines",
+    title: "Invoice lines",
+    columns: [
+      { key: "desc", label: "Description" },
+      { key: "qty", label: "Qty", align: "right" },
+      { key: "unit", label: "Unit", align: "right" },
+      { key: "amount", label: "Amount", align: "right" },
+    ],
+    rows: lines.map((l) => ({
+      id: l.token,
+      cells: [
+        text(l.desc),
+        text(String(l.qty)),
+        money(ctx.stripe, l.unitMinor, l.currency),
+        money(ctx.stripe, l.unitMinor * l.qty, l.currency),
+      ] as Cell[],
+      actions: [
+        {
+          key: "nav:invoices.removeline",
+          label: "Remove",
+          ref: {
+            page: "invoices.new",
+            filters: baseFilters({ lines: lines.filter((o) => o.token !== l.token).map((o) => o.token).join(",") || null }),
+          },
+        },
+      ],
+    })),
+    empty: "No lines yet — add prices from the picker below, or a custom line via the Custom filter.",
+    ...(dropped ? { notice: `${dropped} invalid/unknown line token(s) were dropped.` } : {}),
+  });
+
+  if (mixed) {
+    blocks.push({
+      type: "notice",
+      badge: { kind: "error", text: "Mixed currencies" },
+      text: "An invoice bills ONE currency — remove lines until a single currency remains.",
+    });
+  } else if (lines.length > 0 && lineCurrency) {
+    blocks.push({
+      type: "kv",
+      title: "Totals",
+      amounts: true,
+      rows: [
+        { label: "Subtotal", cell: money(ctx.stripe, totalMinor, lineCurrency) },
+        { label: "Total", cell: money(ctx.stripe, totalMinor, lineCurrency) },
+      ],
+    });
+  }
+
+  // Confirm: bakes the registry items[] — description ×qty flattened to
+  // amountMinor per line (the registry shape). Renders only when creatable.
+  const ready = customerId && customer && !customer.deleted && lines.length > 0 && !mixed;
+  if (ready) {
+    blocks.push({
+      type: "kv",
+      title: "Create",
+      rows: [
+        { label: "Customer", cell: idCell(customerId, { copy: true, ref: { page: "customers.detail", params: { id: customerId } } }) },
+        { label: "Collection", cell: text(`Email invoice, due in ${due} days`) },
+        { label: "Lines", cell: text(`${lines.length} — ${ctx.stripe.formatAmount(totalMinor, lineCurrency!)}`) },
+      ],
+      actions: [
+        registryButton(ctx, {
+          key: "invoice.create_draft",
+          label: "Create draft invoice",
+          style: "primary",
+          params: {
+            customerId,
+            daysUntilDue: Number.parseInt(due, 10),
+            items: lines.map((l) => ({
+              description: l.qty > 1 ? `${l.desc} ×${l.qty}` : l.desc,
+              amountMinor: l.unitMinor * l.qty,
+              currency: l.currency,
+            })),
+          },
+          inputs: [{ type: "toggle", key: "finalize", label: "Finalize immediately (emails the invoice)" }],
+          summary: `Creates a draft invoice for ${customerId} with ${lines.length} line(s), ${ctx.stripe.formatAmount(totalMinor, lineCurrency!)} total. Finalizing emails it and makes it collectible.`,
+        }),
+      ],
+    });
+  }
+
+  // Price picker: currency-locked once lines exist.
+  const pickable = prices.filter(
+    (p) => p.unit_amount != null && (!lineCurrency || mixed || p.currency === lineCurrency)
+  );
+  blocks.push({
+    type: "table",
+    key: "picker",
+    title: "Add from catalog",
+    columns: [
+      { key: "name", label: "Price" },
+      { key: "amount", label: "Amount", align: "right" },
+      { key: "kind", label: "Type" },
+    ],
+    filters: [
+      { key: "customer", label: "Customer", kind: "text", value: customerId || undefined, placeholder: "cus_…" },
+      {
+        key: "due",
+        label: "Due",
+        kind: "select",
+        value: due === "30" ? undefined : due,
+        options: [
+          { value: "7", label: "Due in 7 days" },
+          { value: "14", label: "Due in 14 days" },
+          { value: "30", label: "Due in 30 days" },
+        ],
+      },
+      { key: "qty", label: "Qty", kind: "text", value: qtyRaw || undefined, placeholder: "1" },
+      { key: "custom", label: "Custom line", kind: "text", value: customRaw || undefined, placeholder: "desc | 12.50 | eur" },
+    ],
+    rows: pickable.slice(0, 25).map((p) => ({
+      id: p.id,
+      cells: [
+        strong(p.nickname ?? (typeof p.product === "string" ? p.product : p.id), p.id),
+        money(ctx.stripe, p.unit_amount ?? 0, p.currency),
+        text(p.recurring ? `Recurring /${p.recurring.interval}` : "One-time"),
+      ] as Cell[],
+      actions:
+        lines.length >= MAX_LINES
+          ? []
+          : [
+              {
+                key: "nav:invoices.addline",
+                label: addQty > 1 ? `Add ×${addQty}` : "Add",
+                ref: {
+                  page: "invoices.new",
+                  filters: baseFilters({ lines: [linesRaw, `${p.id}*${addQty}`].filter(Boolean).join(",") }),
+                },
+              },
+            ],
+    })),
+    empty: lineCurrency && !mixed ? `No active ${lineCurrency.toUpperCase()} prices to add.` : "No active prices in the catalog.",
+    notice:
+      lines.length >= MAX_LINES
+        ? `Line cap reached (${MAX_LINES}).`
+        : lineCurrency && !mixed
+          ? `Picker is locked to ${lineCurrency.toUpperCase()} — the invoice's currency.`
+          : "Qty applies to the next Add. Custom lines: description | amount | currency.",
+  });
+
+  return {
+    title: "New invoice",
+    crumbs: [{ label: "Invoices", ref: { page: "invoices" } }, { label: "New" }],
+    blocks,
   };
 }
 
