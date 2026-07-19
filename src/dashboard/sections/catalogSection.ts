@@ -81,6 +81,25 @@ export function makeCatalogSection(): DashboardSectionModule {
             }
             amountOffMinor = StripeClient.isZeroDecimal(currency) ? Math.round(value) : Math.round(value * 100);
           }
+          // Restrictions (all optional): redemption cap, last-redeemable date,
+          // and a product scope.
+          const maxRedemptions =
+            typeof p.maxRedemptions === "number" && Number.isSafeInteger(p.maxRedemptions) && p.maxRedemptions > 0
+              ? p.maxRedemptions
+              : undefined;
+          const redeemByDays =
+            typeof p.redeemByDays === "number" && Number.isSafeInteger(p.redeemByDays) && p.redeemByDays > 0
+              ? p.redeemByDays
+              : undefined;
+          const appliesRaw = str(p.appliesTo, 400).trim();
+          let appliesToProducts: string[] | undefined;
+          if (appliesRaw) {
+            const parts = appliesRaw.split(/[,\s]+/).filter(Boolean);
+            if (parts.length > 20 || parts.some((prod) => !PRODUCT_ID_RE.test(prod))) {
+              return { ok: false, fieldErrors: { appliesTo: "Product ids (prod_…), comma-separated, max 20." } };
+            }
+            appliesToProducts = parts;
+          }
           const coupon = await ctx.stripe.createCoupon(
             {
               id: id || undefined,
@@ -90,6 +109,9 @@ export function makeCatalogSection(): DashboardSectionModule {
               currency,
               duration: durationMatch[1] as "once" | "forever" | "repeating",
               durationInMonths: durationMatch[2] ? Number.parseInt(durationMatch[2], 10) : undefined,
+              maxRedemptions,
+              redeemByUnix: redeemByDays ? Math.floor(Date.now() / 1000) + redeemByDays * 86400 : undefined,
+              appliesToProducts,
             },
             `dash-coupon-${Date.now().toString(36)}`
           );
@@ -107,7 +129,8 @@ export function makeCatalogSection(): DashboardSectionModule {
           return { ok: true, text: `Coupon ${id} deleted.` };
         }
 
-        // T0 — create a promotion code on a coupon.
+        // T0 — create a promotion code on a coupon (+ optional restrictions:
+        // minimum order amount, first-purchase-only, single-customer scope).
         case "section:catalog.promo_create": {
           const coupon = str(p.coupon, 60).trim();
           const code = str(p.code, 60).trim();
@@ -117,12 +140,35 @@ export function makeCatalogSection(): DashboardSectionModule {
           if ((maxRedemptionsRaw && !/^\d+$/.test(maxRedemptionsRaw)) || (expiresDaysRaw && !/^\d+$/.test(expiresDaysRaw))) {
             return { ok: false, error: "Max redemptions and expiry days must be whole numbers." };
           }
+          const minAmountRaw = str(p.minimumAmount, 30).trim();
+          let minimumAmountMinor: number | undefined;
+          let minimumAmountCurrency: string | undefined;
+          if (minAmountRaw) {
+            const m = minAmountRaw.match(/^(\d+(?:\.\d{1,2})?)\s+([a-zA-Z]{3})$/);
+            if (!m) {
+              return { ok: false, fieldErrors: { minimumAmount: "Minimum amount must look like `25.00 eur` (amount + currency)." } };
+            }
+            minimumAmountCurrency = m[2].toLowerCase();
+            const value = Number.parseFloat(m[1]);
+            if (StripeClient.isZeroDecimal(minimumAmountCurrency) && m[1].includes(".")) {
+              return { ok: false, fieldErrors: { minimumAmount: `${minimumAmountCurrency} is a zero-decimal currency — whole amounts only.` } };
+            }
+            minimumAmountMinor = StripeClient.isZeroDecimal(minimumAmountCurrency) ? Math.round(value) : Math.round(value * 100);
+          }
+          const customerRaw = str(p.customer, 80).trim();
+          if (customerRaw && !/^cus_[A-Za-z0-9]{1,64}$/.test(customerRaw)) {
+            return { ok: false, fieldErrors: { customer: "Customer must be a cus_… id (or empty for everyone)." } };
+          }
           const promo = await ctx.stripe.createPromotionCode(
             {
               coupon,
               code: code || undefined,
               maxRedemptions: maxRedemptionsRaw ? Number.parseInt(maxRedemptionsRaw, 10) : undefined,
               expiresAt: expiresDaysRaw ? Math.floor(Date.now() / 1000) + Number.parseInt(expiresDaysRaw, 10) * 86400 : undefined,
+              minimumAmountMinor,
+              minimumAmountCurrency,
+              firstTimeTransaction: p.firstTime === true,
+              customerId: customerRaw || undefined,
             },
             `dash-promo-${Date.now().toString(36)}`
           );
@@ -390,6 +436,9 @@ async function couponsBlocks(ctx: DashboardCtx): Promise<Block[]> {
           { type: "text", key: "percentOff", label: "Percent off (fill this OR amount)" },
           { type: "text", key: "amountOff", label: "Amount off + currency (e.g. 12.50 eur)" },
           { type: "text", key: "duration", label: "Duration: once / forever / repeating:N", placeholder: "default: once" },
+          { type: "number", key: "maxRedemptions", label: "Max redemptions (empty = unlimited)", min: 1 },
+          { type: "number", key: "redeemByDays", label: "Redeemable for N days (empty = forever)", min: 1 },
+          { type: "text", key: "appliesTo", label: "Only for products (prod_…, comma-separated; empty = all)" },
         ],
         summary: "Creates the coupon promo codes can apply.",
       },
@@ -427,6 +476,9 @@ async function promosBlocks(ctx: DashboardCtx, filters: Record<string, string>):
       { type: "text", key: "code", label: "Code (empty = auto-generate)" },
       { type: "number", key: "maxRedemptions", label: "Max redemptions (empty = unlimited)", min: 1 },
       { type: "number", key: "expiresDays", label: "Expires in days (empty = never)", min: 1 },
+      { type: "text", key: "minimumAmount", label: "Minimum order amount (e.g. 25.00 eur; empty = none)" },
+      { type: "toggle", key: "firstTime", label: "First purchase only" },
+      { type: "text", key: "customer", label: "Restrict to customer (cus_…; empty = everyone)" },
     ],
     summary: "Creates a customer-facing code on an existing coupon.",
   };

@@ -25,6 +25,14 @@ D.actionBtn = function (a) {
     });
     return b;
   }
+  if (a.ref) {
+    // Link-button: pure navigation (composer entry points) — nothing is posted.
+    b.addEventListener("click", function (e) {
+      e.stopPropagation();
+      D.navigateRef(a.ref);
+    });
+    return b;
+  }
   var simple = !(a.inputs && a.inputs.length) && !a.dangerous && !a.reverseConfirm && a.mode !== "queue";
   b.addEventListener("click", function (e) {
     e.stopPropagation();

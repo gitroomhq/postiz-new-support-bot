@@ -104,11 +104,23 @@ export class DashboardActionGateway {
       case "invoice.create_draft":
       case "customer.balance":
       case "customer.payment_method":
-      case "customer.block": {
+      case "customer.block":
+      case "subscription.create":
+      case "charge.create": {
         // Explicit-customer actions: the page bakes params.customerId; only
         // its SHAPE is trusted — the registry revalidates existence/ownership.
         const customerId = validId("customer", params.customerId);
         if (!customerId) return { ok: false, error: "customerId (cus_…) required." };
+        // Charge-saved-card modal input is in major units; convert with the
+        // TYPED currency — there is no target object to derive it from.
+        if (key === "charge.create" && params.amountMinor == null && typeof params.amountMajor === "number" && isFinite(params.amountMajor)) {
+          const currency = typeof params.currency === "string" ? params.currency.trim().toLowerCase() : "";
+          if (!/^[a-z]{3}$/.test(currency)) return { ok: false, error: "A 3-letter currency is required." };
+          const factor = StripeClient.isZeroDecimal(currency) ? 1 : 100;
+          params.amountMinor = Math.round(params.amountMajor * factor);
+          params.currency = currency;
+          delete params.amountMajor;
+        }
         // The web draft builder collects ONE line item as flat modal fields;
         // fold them into the registry's items[] shape (multi-line drafts stay
         // in /billing).

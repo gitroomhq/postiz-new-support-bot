@@ -34,7 +34,7 @@ import type { BlockStore } from "../../bot/billing/BlockStore";
 import type { CredentialStore } from "../auth/CredentialStore";
 import type { DashboardDbSessions } from "../auth/DashboardDbSessions";
 import type { DashboardAudit } from "../auth/DashboardAudit";
-import { Block, EvidenceBlock, HeaderBlock, KeyValueBlock, TableBlock, TimelineBlock } from "../renderer/contract";
+import { Block, EvidenceBlock, HeaderBlock, KeyValueBlock, NoticeBlock, TableBlock, TabsBlock, TimelineBlock } from "../renderer/contract";
 import { renderDashboardShell } from "../html/shellHtml";
 import { clientCore } from "../html/clientCore";
 import { clientBlocks } from "../html/clientBlocks";
@@ -420,7 +420,7 @@ function fakeCustomerCtx(): DashboardCtx {
     stripe,
     settings: {} as never,
     stores,
-    billing: {} as never,
+    billing: { actions: { effectiveMode: () => "direct" }, gateway: {} as never } as unknown as DashboardCtx["billing"],
     audit: async () => {},
     security: { sessionIdHash: "h", authMethod: "passkey", stepUpFresh: () => false },
   } as unknown as DashboardCtx;
@@ -454,12 +454,14 @@ test("customer 360: Insights/Details/Linked accounts in the rail, atoms in the m
   assert.equal(header.type, "header");
   assert.equal((header as { sub?: string }).sub, "ada@example.com");
   assert.ok(!page!.blocks.some((b) => b.type === "stats"));
-  // Main tables use the atoms: payments amount cell carries the status pill.
+  // Main tables use the atoms: payments amount cell carries the status pill
+  // (+ the PA-4 numeric major value for client-side bulk totals).
   const payments = page!.blocks.find((b) => b.type === "table" && b.key === "charges") as TableBlock;
   assert.deepEqual(payments.rows[0].cells[0], {
     t: "amount",
     v: "29.00 EUR",
     cur: "EUR",
+    major: 29,
     badge: { kind: "warn", text: "Partial refund" },
   });
   assert.equal(payments.footer, "1 result — view all");
@@ -1240,7 +1242,7 @@ test("failed payment: timeline tells the real story (seller message + codes), no
 
 // ---- M3: subscriptions + invoices ----
 
-function subsCtx(overrides: { previewThrows?: boolean } = {}): DashboardCtx {
+function subsCtx(overrides: { previewThrows?: boolean; testMode?: boolean; testClock?: string } = {}): DashboardCtx {
   const sub = {
     id: "sub_1",
     status: "active",
@@ -1252,6 +1254,7 @@ function subsCtx(overrides: { previewThrows?: boolean } = {}): DashboardCtx {
     trial_end: null,
     collection_method: "charge_automatically",
     default_payment_method: null,
+    test_clock: overrides.testClock ?? null,
     discounts: [],
     latest_invoice: "in_9",
     items: {
@@ -1291,11 +1294,35 @@ function subsCtx(overrides: { previewThrows?: boolean } = {}): DashboardCtx {
         { id: "price_new", nickname: "Postiz Ultra", currency: "eur", unit_amount: 4900, recurring: { interval: "month", interval_count: 1 } },
       ],
       getSubscription: async () => sub,
+      isTestMode: () => overrides.testMode === true,
+      getCustomer: async () => ({
+        id: "cus_a",
+        name: "Ada Lovelace",
+        email: "ada@example.com",
+        invoice_settings: { default_payment_method: "pm_9" },
+      }),
+      getPaymentMethod: async () => ({
+        id: "pm_9",
+        type: "card",
+        card: { brand: "visa", last4: "4242", exp_month: 4, exp_year: 2030 },
+      }),
+      previewNewSubscription: async () => {
+        if (overrides.previewThrows) throw new Error("currency mismatch");
+        return {
+          amount_due: 2900,
+          currency: "eur",
+          lines: { data: [{ id: "il_n", description: "Postiz Pro", amount: 2900, currency: "eur" }] },
+        };
+      },
+      getTestClock: async () => ({ id: overrides.testClock ?? "clock_1", frozen_time: 1_700_000_000 }),
+      advanceTestClock: async () => ({ id: overrides.testClock ?? "clock_1", frozen_time: 1_700_000_000 }),
       previewUpcomingInvoice: async () => ({
         amount_due: 2900,
         currency: "eur",
+        subtotal: 2900,
+        total: 2900,
         next_payment_attempt: 1_700_900_000,
-        lines: { data: [{ id: "il_1", description: "Postiz Pro", amount: 2900, currency: "eur" }] },
+        lines: { data: [{ id: "il_1", description: "Postiz Pro", amount: 2900, currency: "eur", quantity: 1 }] },
       }),
       previewPlanChange: async () => {
         if (overrides.previewThrows) throw new Error("incompatible");
@@ -1669,12 +1696,16 @@ test("integration refs: change-plan rows self-select via filters; Customer-360 f
     filters: {},
   });
   const prices = picker!.blocks.find((b) => b.type === "table" && b.key === "prices") as TableBlock;
-  assert.deepEqual(prices.rows[0].ref, {
+  // PA-4: the picker includes the CURRENT price (row 0, marked) so qty/promo/
+  // cycle-only updates are possible; every row still self-selects via filters.
+  assert.deepEqual(prices.rows.map((r) => r.id), ["price_old", "price_new"]);
+  assert.deepEqual(prices.rows[1].ref, {
     page: "subscriptions.changeplan",
     params: { id: "sub_1" },
     filters: { price: "price_new" },
   });
-  assert.ok(!prices.filters?.length); // the "weird pill" is gone
+  assert.deepEqual(prices.rows[0].cells[1], { t: "badge", b: { kind: "neutral", text: "Current" } });
+  assert.ok(prices.filters?.some((f) => f.key === "qty")); // the update knobs ride the filter bar
   // Selected badge appears once a price is picked.
   const picked = await makeSubscriptionsSection().buildPage(subsCtx(), {
     page: "subscriptions.changeplan",
@@ -1682,7 +1713,8 @@ test("integration refs: change-plan rows self-select via filters; Customer-360 f
     filters: { price: "price_new" },
   });
   const pickedTable = picked!.blocks.find((b) => b.type === "table" && b.key === "prices") as TableBlock;
-  assert.deepEqual(pickedTable.rows[0].cells[1], { t: "badge", b: { kind: "info", text: "Selected" } });
+  const selectedRow = pickedTable.rows.find((r) => r.id === "price_new")!;
+  assert.deepEqual(selectedRow.cells[1], { t: "badge", b: { kind: "info", text: "Selected" } });
 
   // Customer 360 footers land on customer-filtered lists.
   const customer = await makeCustomersSection().buildPage(fakeCustomerCtx(), {
@@ -2782,4 +2814,389 @@ test("client JS modules parse and the shell embeds them nonced", () => {
   assert.ok(html.includes('id="modal"'));
   // No unresolved template interpolations leaked into the page.
   assert.ok(!html.includes("${"));
+});
+
+// ---- PA-4: subscription writes + enablers ----
+
+test("subscription detail (PA-4): 'Customer on Product' title, pm brand+last4, si_ id column, upcoming totals ladder, Simulation only in test mode", async () => {
+  const section = makeSubscriptionsSection();
+  const page = await section.buildPage(subsCtx(), { page: "subscriptions.detail", params: { id: "sub_1" } });
+  const header = page!.blocks[0] as HeaderBlock;
+  assert.equal(header.title, "Ada Lovelace on Postiz Pro");
+  assert.equal(page!.title, "Ada Lovelace on Postiz Pro");
+  // Pricing table surfaces the subscription-item id.
+  const pricing = page!.blocks.find((b) => b.type === "table" && b.key === "pricing") as TableBlock;
+  assert.equal(pricing.columns[pricing.columns.length - 1].key, "id");
+  const idCellV = pricing.rows[0].cells[pricing.rows[0].cells.length - 1] as { t: string; v: string };
+  assert.equal(idCellV.t, "id");
+  assert.equal(idCellV.v, "si_1");
+  assert.equal(pricing.footer, "Update subscription (proration preview)");
+  // Payment method resolves to brand+last4 via the customer default (never a raw pm_ id).
+  const details = page!.rail![0] as KeyValueBlock;
+  const pmRow = details.rows.find((r) => r.label === "Payment method")!;
+  assert.equal((pmRow.cell as { t: string }).t, "card");
+  assert.equal((pmRow.cell as { brand: string; last4: string }).brand, "visa");
+  // Upcoming invoice: line rows then the Subtotal/Total/Amount-due ladder.
+  const upcoming = page!.blocks.find((b) => b.type === "table" && b.key === "upcoming") as TableBlock;
+  assert.deepEqual(upcoming.columns.map((c) => c.key), ["desc", "qty", "amount"]);
+  const rowIds = upcoming.rows.map((r) => r.id);
+  assert.ok(rowIds.includes("t_subtotal") && rowIds.includes("t_total") && rowIds.includes("t_due"));
+  // Live mode: no Simulation card.
+  assert.ok(!page!.rail!.some((b) => b.type === "kv" && (b as KeyValueBlock).title === "Simulation"));
+  // Test mode + clock: Simulation card with the advance action.
+  const testPage = await section.buildPage(subsCtx({ testMode: true, testClock: "clock_1" }), {
+    page: "subscriptions.detail",
+    params: { id: "sub_1" },
+  });
+  const sim = testPage!.rail!.find((b) => b.type === "kv" && (b as KeyValueBlock).title === "Simulation") as KeyValueBlock;
+  assert.ok(sim);
+  assert.equal(sim.actions![0].key, "section:subscriptions.clock_advance");
+});
+
+test("subscriptions list (PA-4): header carries a Create-subscription link-button", async () => {
+  const section = makeSubscriptionsSection();
+  const page = await section.buildPage(subsCtx(), { page: "subscriptions", filters: {} });
+  const header = page!.blocks[0] as HeaderBlock;
+  const create = header.actions!.find((a) => a.label === "Create subscription")!;
+  assert.deepEqual(create.ref, { page: "subscriptions.new" });
+});
+
+test("update subscription (PA-4): qty/promo/cycle ride the preview and the confirm params; current price alone is refused", async () => {
+  const ctx = subsCtx();
+  const seen: { args?: Record<string, unknown> } = {};
+  (ctx.stripe as unknown as Record<string, unknown>).previewPlanChange = async (args: Record<string, unknown>) => {
+    seen.args = args;
+    return { amount_due: 8850, currency: "eur", lines: { data: [{ id: "il_a", description: "delta", amount: 5950, currency: "eur" }] } };
+  };
+  const section = makeSubscriptionsSection();
+  const page = await section.buildPage(ctx, {
+    page: "subscriptions.changeplan",
+    params: { id: "sub_1" },
+    filters: { price: "price_new", qty: "3", promo: "SAVE20", cycle: "now" },
+  });
+  assert.ok(seen.args);
+  assert.equal(seen.args.quantity, 3);
+  assert.equal(seen.args.billingCycleAnchor, "now");
+  const confirm = page!.blocks.find(
+    (b) => "actions" in b && (b as { actions?: Array<{ key: string }> }).actions?.some((a) => a.key === "subscription.change_plan")
+  ) as { actions: Array<{ key: string; params?: Record<string, unknown> }> };
+  assert.ok(confirm);
+  assert.deepEqual(confirm.actions[0].params, {
+    subscriptionId: "sub_1",
+    priceId: "price_new",
+    quantity: 3,
+    promoCode: "SAVE20",
+    cycleAnchor: "now",
+  });
+  // Current price with no other delta → NO CHANGE notice, no confirm button.
+  const noop = await section.buildPage(subsCtx(), {
+    page: "subscriptions.changeplan",
+    params: { id: "sub_1" },
+    filters: { price: "price_old" },
+  });
+  assert.ok(!noop!.blocks.some((b) => "actions" in b && (b as { actions?: Array<{ key: string }> }).actions?.some((a) => a.key === "subscription.change_plan")));
+  assert.ok(noop!.blocks.some((b) => b.type === "notice" && (b as NoticeBlock).badge.text === "NO CHANGE"));
+  // Qty-only update against the current price IS a valid change set.
+  const qtyOnly = await section.buildPage(subsCtx(), {
+    page: "subscriptions.changeplan",
+    params: { id: "sub_1" },
+    filters: { qty: "5" },
+  });
+  const qtyConfirm = qtyOnly!.blocks.find(
+    (b) => "actions" in b && (b as { actions?: Array<{ key: string }> }).actions?.some((a) => a.key === "subscription.change_plan")
+  ) as { actions: Array<{ key: string; params?: Record<string, unknown> }> };
+  assert.ok(qtyConfirm, "qty-only change must be confirmable");
+  assert.deepEqual(qtyConfirm.actions[0].params, { subscriptionId: "sub_1", priceId: "price_old", quantity: 5 });
+});
+
+test("create-subscription composer (PA-4): confirm exists ONLY after a successful first-invoice preview; charge collection is step-up", async () => {
+  const section = makeSubscriptionsSection();
+  const hasCreate = (page: { blocks: Block[] }): boolean =>
+    page.blocks.some((b) => "actions" in b && (b as { actions?: Array<{ key: string }> }).actions?.some((a) => a.key === "subscription.create"));
+  // No customer picked → price table renders, no preview/confirm.
+  const empty = await section.buildPage(subsCtx(), { page: "subscriptions.new", filters: {} });
+  assert.ok(empty!.blocks.some((b) => b.type === "table" && (b as TableBlock).key === "prices"));
+  assert.ok(!hasCreate(empty as never));
+  // Customer + price → customer card, preview table, confirm with baked params + stepUp (charge collection).
+  const ready = await section.buildPage(subsCtx(), {
+    page: "subscriptions.new",
+    filters: { customer: "cus_a", price: "price_new", qty: "2", trial: "14" },
+  });
+  assert.ok(ready!.blocks.some((b) => b.type === "kv" && (b as KeyValueBlock).title === "Customer"));
+  assert.ok(ready!.blocks.some((b) => b.type === "table" && (b as TableBlock).key === "preview"));
+  const confirm = ready!.blocks.find(
+    (b) => "actions" in b && (b as { actions?: Array<{ key: string }> }).actions?.some((a) => a.key === "subscription.create")
+  ) as { actions: Array<{ key: string; params?: Record<string, unknown>; stepUp?: boolean; dangerous?: boolean }> };
+  const btn = confirm.actions[0];
+  assert.equal(btn.dangerous, true);
+  assert.equal(btn.stepUp, true);
+  assert.deepEqual(btn.params, { customerId: "cus_a", priceId: "price_new", quantity: 2, trialDays: 14, collection: "charge" });
+  // Invoice collection → no step-up flag.
+  const invoiceMode = await section.buildPage(subsCtx(), {
+    page: "subscriptions.new",
+    filters: { customer: "cus_a", price: "price_new", collection: "invoice" },
+  });
+  const invBtn = (invoiceMode!.blocks.find(
+    (b) => "actions" in b && (b as { actions?: Array<{ key: string }> }).actions?.some((a) => a.key === "subscription.create")
+  ) as { actions: Array<{ key: string; params?: Record<string, unknown>; stepUp?: boolean }> }).actions[0];
+  assert.ok(!invBtn.stepUp);
+  assert.equal((invBtn.params as { collection: string }).collection, "invoice");
+  // Preview failure → no confirm.
+  const failed = await section.buildPage(subsCtx({ previewThrows: true }), {
+    page: "subscriptions.new",
+    filters: { customer: "cus_a", price: "price_new" },
+  });
+  assert.ok(!hasCreate(failed as never));
+});
+
+test("test-clock advance (PA-4): refused on live keys; advances frozen_time by days on test keys", async () => {
+  const section = makeSubscriptionsSection();
+  const live = await section.action!(subsCtx({ testClock: "clock_1" }), {
+    key: "section:subscriptions.clock_advance",
+    params: { id: "sub_1", days: 30 },
+  });
+  assert.equal(live.ok, false);
+  const ctx = subsCtx({ testMode: true, testClock: "clock_1" });
+  const advanced: Array<[string, number]> = [];
+  (ctx.stripe as unknown as Record<string, unknown>).advanceTestClock = async (clockId: string, frozen: number) => {
+    advanced.push([clockId, frozen]);
+    return { id: clockId, frozen_time: frozen };
+  };
+  const ok = await section.action!(ctx, { key: "section:subscriptions.clock_advance", params: { id: "sub_1", days: 30 } });
+  assert.equal(ok.ok, true);
+  assert.deepEqual(advanced, [["clock_1", 1_700_000_000 + 30 * 86400]]);
+});
+
+test("payments list (PA-4): transactions tab row points forward tabs at Balances; bulk refund rides bulkActions (hidden when denied)", async () => {
+  const section = makePaymentsSection();
+  const page = await section.buildPage(paymentsCtx(), { page: "payments", filters: {} });
+  const tabs = page!.blocks.find((b) => b.type === "tabs") as TabsBlock;
+  assert.ok(tabs, "expected a tabs block");
+  assert.deepEqual(tabs.items.map((i) => i.label), ["Payments", "Payouts", "Top-ups", "All activity"]);
+  assert.equal(tabs.items[0].ref, undefined);
+  for (const it of tabs.items.slice(1)) assert.deepEqual(it.ref, { page: "balances" });
+  const table = page!.blocks.find((b) => b.type === "table") as TableBlock;
+  assert.equal(table.bulkActions!.length, 1);
+  assert.equal(table.bulkActions![0].key, "section:payments.bulk_refund");
+  assert.equal(table.bulkActions![0].dangerous, true);
+  // Refunds disabled by /config → the bulk button disappears entirely.
+  const deniedCtx = paymentsCtx();
+  (deniedCtx.billing.actions as unknown as Record<string, unknown>).effectiveMode = () => "denied";
+  const deniedPage = await section.buildPage(deniedCtx, { page: "payments", filters: {} });
+  const deniedTable = deniedPage!.blocks.find((b) => b.type === "table") as TableBlock;
+  assert.equal(deniedTable.bulkActions, undefined);
+});
+
+test("bulk refund (PA-4): typed CONFIRM enforced, ids validated+capped, every charge rides the gateway ladder individually", async () => {
+  const section = makePaymentsSection();
+  const ctx = paymentsCtx();
+  const calls: Array<[string, Record<string, unknown>]> = [];
+  (ctx.billing as unknown as Record<string, unknown>).gateway = {
+    request: async (_actor: unknown, key: string, params: Record<string, unknown>) => {
+      calls.push([key, params]);
+      if (params.chargeId === "ch_2") return { kind: "failed", error: "already refunded" };
+      if (params.chargeId === "ch_3") return { kind: "queued" };
+      return { kind: "executed", text: "ok" };
+    },
+  };
+  // No CONFIRM → refused before any gateway call.
+  const noConfirm = await section.action!(ctx, { key: "section:payments.bulk_refund", params: { ids: ["ch_1"] } });
+  assert.equal(noConfirm.ok, false);
+  assert.equal(calls.length, 0);
+  // Mixed outcomes: invalid ids are dropped, valid ones each hit the ladder.
+  const run = await section.action!(ctx, {
+    key: "section:payments.bulk_refund",
+    params: { ids: ["ch_1", "ch_2", "ch_3", "nope", "ch_1"] },
+    confirmWord: "CONFIRM",
+  });
+  assert.equal(run.ok, true);
+  assert.deepEqual(calls.map(([, p]) => p.chargeId), ["ch_1", "ch_2", "ch_3"]);
+  assert.ok(calls.every(([k]) => k === "charge.refund_full"));
+  assert.ok(run.text!.includes("1 refunded") && run.text!.includes("1 queued") && run.text!.includes("1 skipped"));
+  assert.ok(run.text!.includes("ch_2: already refunded"));
+  // Cap: more than 25 ids is refused outright.
+  const tooMany = await section.action!(ctx, {
+    key: "section:payments.bulk_refund",
+    params: { ids: Array.from({ length: 26 }, (_, i) => `ch_bulk${i}`) },
+    confirmWord: "CONFIRM",
+  });
+  assert.equal(tooMany.ok, false);
+  assert.ok(tooMany.error!.includes("25"));
+});
+
+test("registry (PA-4): subscription.create / charge.create / pm-attach parse hostile input and gate tiers server-side", async () => {
+  // subscription.create parse + revalidate surface.
+  const subCreate = actionByKey("subscription.create")!;
+  assert.equal(subCreate.dangerous, true);
+  const parsed = subCreate.parseParams({ customerId: "cus_1", priceId: "price_1", collection: "charge", quantity: 3, promoCode: "X" });
+  assert.ok(parsed.ok);
+  assert.equal((parsed as { params: { quantity: number } }).params.quantity, 3);
+  assert.equal(subCreate.parseParams({ customerId: "cus_1", priceId: "price_1", collection: "nope" }).ok, false);
+  assert.equal(subCreate.parseParams({ customerId: "cus_1", priceId: "price_1", collection: "charge", trialDays: 9999 }).ok, false);
+  // charge.create refuses garbage currencies/amounts.
+  const chargeCreate = actionByKey("charge.create")!;
+  assert.equal(chargeCreate.dangerous, true);
+  assert.equal(chargeCreate.parseParams({ amountMinor: 500, currency: "eur" }).ok, true);
+  assert.equal(chargeCreate.parseParams({ amountMinor: -5, currency: "eur" }).ok, false);
+  assert.equal(chargeCreate.parseParams({ amountMinor: 500, currency: "euros" }).ok, false);
+  // customer.payment_method attach accepts pm_/tok_, other ops stay pm_-only.
+  const pmAction = actionByKey("customer.payment_method")!;
+  assert.equal(pmAction.parseParams({ paymentMethodId: "tok_visa", op: "attach" }).ok, true);
+  assert.equal(pmAction.parseParams({ paymentMethodId: "tok_visa", op: "detach" }).ok, false);
+  assert.equal(pmAction.parseParams({ paymentMethodId: "pm_1", op: "set_default" }).ok, true);
+  // change_plan still accepts the legacy 2-field shape AND the unified extras.
+  const changePlan = actionByKey("subscription.change_plan")!;
+  const legacy = changePlan.parseParams({ subscriptionId: "sub_1", priceId: "price_1" });
+  assert.ok(legacy.ok);
+  const unified = changePlan.parseParams({ subscriptionId: "sub_1", priceId: "price_1", quantity: 2, promoCode: "S", cycleAnchor: "now", itemId: "si_2" });
+  assert.ok(unified.ok);
+  assert.equal((unified as { params: { cycleAnchor: string } }).params.cycleAnchor, "now");
+});
+
+test("gateway (PA-4): subscription.create + charge.create bind from the explicit customer; charge.create converts major→minor via the typed currency", async () => {
+  const { gateway, captured } = gatewayFixture();
+  const sub = await gateway.resolve("subscription.create", { customerId: "cus_new", priceId: "price_1", collection: "charge" });
+  assert.ok(sub.ok);
+  assert.equal((sub as { binding: { stripeCustomerId: string } }).binding.stripeCustomerId, "cus_new");
+  const charge = await gateway.resolve("charge.create", { customerId: "cus_new", amountMajor: 12.5, currency: "EUR" });
+  assert.ok(charge.ok);
+  const chargeParams = (charge as { params: { amountMinor?: number; currency?: string; amountMajor?: number } }).params;
+  assert.equal(chargeParams.amountMinor, 1250);
+  assert.equal(chargeParams.currency, "eur");
+  assert.equal(chargeParams.amountMajor, undefined);
+  // Garbage currency with a major amount is refused at the gateway.
+  const bad = await gateway.resolve("charge.create", { customerId: "cus_new", amountMajor: 5, currency: "euros" });
+  assert.equal(bad.ok, false);
+  assert.equal(captured.length, 0); // resolve() never executes anything
+});
+
+test("catalog (PA-4): coupon restrictions (max redemptions / redeem-by / applies-to) and promo restrictions (min amount / first-time / customer) reach Stripe", async () => {
+  const { makeCatalogSection } = await import("../sections/catalogSection");
+  const coupons: Array<Record<string, unknown>> = [];
+  const promos: Array<Record<string, unknown>> = [];
+  const ctx = {
+    stripe: {
+      createCoupon: async (params: Record<string, unknown>) => {
+        coupons.push(params);
+        return { id: "NEW", duration: "once", percent_off: 10, times_redeemed: 0, valid: true };
+      },
+      createPromotionCode: async (params: Record<string, unknown>) => {
+        promos.push(params);
+        return { id: "promo_1", code: "SAVE", active: true };
+      },
+      formatAmount: (a: number, c: string) => `${(a / 100).toFixed(2)} ${c.toUpperCase()}`,
+    },
+    audit: async () => {},
+  } as unknown as DashboardCtx;
+  const section = makeCatalogSection();
+  const coupon = await section.action!(ctx, {
+    key: "section:catalog.coupon_create",
+    params: { percentOff: "25", maxRedemptions: 50, redeemByDays: 30, appliesTo: "prod_1, prod_2" },
+  });
+  assert.equal(coupon.ok, true);
+  assert.equal(coupons[0].maxRedemptions, 50);
+  assert.ok(typeof coupons[0].redeemByUnix === "number" && (coupons[0].redeemByUnix as number) > Math.floor(Date.now() / 1000));
+  assert.deepEqual(coupons[0].appliesToProducts, ["prod_1", "prod_2"]);
+  const badApplies = await section.action!(ctx, {
+    key: "section:catalog.coupon_create",
+    params: { percentOff: "25", appliesTo: "price_1" },
+  });
+  assert.equal(badApplies.ok, false);
+  const promo = await section.action!(ctx, {
+    key: "section:catalog.promo_create",
+    params: { coupon: "NEW", minimumAmount: "25.00 eur", firstTime: true, customer: "cus_9" },
+  });
+  assert.equal(promo.ok, true);
+  assert.equal(promos[0].minimumAmountMinor, 2500);
+  assert.equal(promos[0].minimumAmountCurrency, "eur");
+  assert.equal(promos[0].firstTimeTransaction, true);
+  assert.equal(promos[0].customerId, "cus_9");
+  const badMin = await section.action!(ctx, {
+    key: "section:catalog.promo_create",
+    params: { coupon: "NEW", minimumAmount: "25 euros" },
+  });
+  assert.equal(badMin.ok, false);
+});
+
+test("customer 360 (PA-4): attach-PM + SetupIntent header actions; per-card Charge/Set-default/Detach ride the registry", async () => {
+  const section = makeCustomersSection();
+  const page = await section.buildPage(fakeCustomerCtx(), { page: "customers.detail", params: { id: "cus_test1" } });
+  const header = page!.blocks[0] as HeaderBlock;
+  const attach = header.actions!.find((a) => a.key === "customer.payment_method")!;
+  assert.equal(attach.dangerous, true);
+  assert.deepEqual(attach.params, { customerId: "cus_test1", op: "attach" });
+  assert.ok(header.actions!.some((a) => a.key === "section:customers.setup_intent"));
+  const pms = page!.blocks.find((b) => b.type === "table" && (b as TableBlock).key === "pms") as TableBlock;
+  const rowActions = pms.rows[0].actions!;
+  const chargeBtn = rowActions.find((a) => a.key === "charge.create")!;
+  assert.equal(chargeBtn.stepUp, true);
+  assert.deepEqual(chargeBtn.params, { customerId: "cus_test1", paymentMethodId: "pm_1" });
+  // pm_1 IS the default → no Set-default button, but Detach present.
+  assert.ok(!rowActions.some((a) => a.label === "Set default"));
+  assert.ok(rowActions.some((a) => a.label === "Detach"));
+  // SetupIntent action returns only the seti_ id, never a client secret.
+  const ctx = fakeCustomerCtx();
+  (ctx.stripe as unknown as Record<string, unknown>).createSetupIntent = async () => ({
+    id: "seti_1",
+    status: "requires_payment_method",
+    client_secret: "seti_1_secret_SHOULD_NEVER_APPEAR",
+  });
+  const si = await section.action!(ctx, { key: "section:customers.setup_intent", params: { customerId: "cus_test1" } });
+  assert.equal(si.ok, true);
+  assert.ok(si.text!.includes("seti_1"));
+  assert.ok(!si.text!.includes("secret_SHOULD_NEVER_APPEAR"));
+});
+
+test("dashboard belts (PA-4): charge.create always steps up; subscription.create steps up only for charge collection", async () => {
+  const fake = fakeSettings();
+  const gatewayCalls: string[] = [];
+  const provider: DashboardAuthProvider = {
+    enter: async () => ({ kind: "page" }),
+    authenticate: async () => fakeAuthResult("active"),
+    publicEndpoint: async () => null,
+    sessionEndpoint: async () => null,
+  };
+  const stripe = { isTestMode: () => true } as unknown as StripeClient;
+  const dashboard = new Dashboard(fake.store, provider, [fakeSection()], {
+    stripe,
+    settings: fake.store,
+    stores: {} as never,
+    billing: {
+      actions: {} as never,
+      gateway: {
+        request: async (_a: unknown, key: string) => {
+          gatewayCalls.push(key);
+          return { kind: "executed", text: "ok" };
+        },
+      } as never,
+    },
+  });
+  // charge.create without a fresh factor → needsStepUp, nothing executed.
+  const charge = await dashboard.api("action", "sess", {
+    key: "charge.create",
+    params: { customerId: "cus_1", amountMinor: 500, currency: "eur" },
+    confirmWord: "CONFIRM",
+  });
+  assert.deepEqual(charge.json, { ok: false, needsStepUp: true });
+  // subscription.create with invoice collection skips step-up but still needs CONFIRM (T1: dangerous).
+  const invoiceNoConfirm = await dashboard.api("action", "sess", {
+    key: "subscription.create",
+    params: { customerId: "cus_1", priceId: "price_1", collection: "invoice" },
+  });
+  assert.equal((invoiceNoConfirm.json as { ok: boolean }).ok, false);
+  assert.ok((invoiceNoConfirm.json as { error?: string }).error?.includes("CONFIRM"));
+  const invoiceConfirmed = await dashboard.api("action", "sess", {
+    key: "subscription.create",
+    params: { customerId: "cus_1", priceId: "price_1", collection: "invoice" },
+    confirmWord: "CONFIRM",
+  });
+  assert.deepEqual(invoiceConfirmed.json, { ok: true, text: "ok" });
+  // subscription.create with charge collection → the step-up gate fires first.
+  const chargeMode = await dashboard.api("action", "sess", {
+    key: "subscription.create",
+    params: { customerId: "cus_1", priceId: "price_1", collection: "charge" },
+    confirmWord: "CONFIRM",
+  });
+  assert.deepEqual(chargeMode.json, { ok: false, needsStepUp: true });
+  assert.deepEqual(gatewayCalls, ["subscription.create"]);
 });

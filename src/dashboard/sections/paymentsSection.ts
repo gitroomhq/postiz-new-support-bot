@@ -28,6 +28,7 @@ import {
 // detail view stays within the ≤4-Stripe-calls budget.
 
 const WINDOW = 100; // in-memory filter/count window per page (documented in the notice)
+const BULK_REFUND_MAX = 25; // blast-radius cap per bulk-refund run
 
 const DATE_RANGES: Record<string, number> = { "24h": 1, "7d": 7, "30d": 30, "90d": 90 };
 
@@ -81,6 +82,41 @@ export function makePaymentsSection(): DashboardSectionModule {
           if (!chargeId) return { ok: false, error: "Bad charge id." };
           const r = await ctx.stores.qol.toggleBookmark("charge", chargeId, str(p.label, 80) || null, ctx.actor.id, ctx.actor.name);
           return { ok: true, text: r.bookmarked ? "Bookmarked." : "Bookmark removed." };
+        }
+        case "section:payments.bulk_refund": {
+          // Bulk money movement gets the STRONG ceremony: typed CONFIRM is
+          // enforced HERE (the modal listed count + total), and every charge
+          // then rides the registry ladder INDIVIDUALLY via the gateway —
+          // per-charge ownership binding, live revalidation, level/queue
+          // routing and refund idempotency. One bad row never blocks the rest.
+          if (req.confirmWord !== "CONFIRM") return { ok: false, error: "Type CONFIRM to run this action." };
+          const rawIds = Array.isArray(p.ids) ? (p.ids as unknown[]) : [];
+          const ids = [...new Set(rawIds.map((v) => validId("charge", v)).filter((v): v is string => v != null))];
+          if (ids.length === 0) return { ok: false, error: "Select at least one charge row first." };
+          if (ids.length > BULK_REFUND_MAX) {
+            return { ok: false, error: `Bulk refund is capped at ${BULK_REFUND_MAX} charges per run — select fewer rows.` };
+          }
+          const actor = actionActor(ctx);
+          let executed = 0;
+          let queued = 0;
+          const failures: string[] = [];
+          for (const chargeId of ids) {
+            const outcome = await ctx.billing.gateway.request(actor, "charge.refund_full", { chargeId });
+            if (outcome.kind === "executed") executed++;
+            else if (outcome.kind === "queued") queued++;
+            else failures.push(`${chargeId}: ${outcome.error}`);
+          }
+          await ctx.audit(
+            `Bulk refund over ${ids.length} charge(s) — ${executed} refunded, ${queued} queued, ${failures.length} skipped`
+          );
+          const parts = [
+            executed ? `${executed} refunded` : null,
+            queued ? `${queued} queued for approval` : null,
+            failures.length ? `${failures.length} skipped` : null,
+          ].filter(Boolean);
+          const detail = failures.length ? ` — ${failures.slice(0, 3).join("; ")}${failures.length > 3 ? "; …" : ""}` : "";
+          if (executed + queued === 0) return { ok: false, error: `Bulk refund: every charge was skipped${detail}` };
+          return { ok: true, text: `Bulk refund: ${parts.join(", ")}${detail}` };
         }
         default:
           return { ok: false, error: "Unknown action." };
@@ -223,6 +259,39 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
     ],
   };
 
+  // Stripe transactions tab row. Payouts/Top-ups/All-activity become their own
+  // views in PA-5 — until then those tabs land on Balances (payouts + balance
+  // transactions live there today).
+  const tabs: Block = {
+    type: "tabs",
+    key: "txview",
+    value: "",
+    items: [
+      { value: "", label: "Payments" },
+      { value: "payouts", label: "Payouts", ref: { page: "balances" } },
+      { value: "topups", label: "Top-ups", ref: { page: "balances" } },
+      { value: "activity", label: "All activity", ref: { page: "balances" } },
+    ],
+  };
+
+  // Bulk refund over the selected rows (money-moving bulk → strong ceremony;
+  // hidden entirely when the refund action is disabled by /config).
+  const refundMode = ctx.billing.actions.effectiveMode("charge.refund_full", actionActor(ctx));
+  const bulkActions: ActionButton[] =
+    refundMode === "denied"
+      ? []
+      : [
+          {
+            key: "section:payments.bulk_refund",
+            label: "Refund selected…",
+            style: "danger",
+            dangerous: true,
+            mode: refundMode === "queue" ? "queue" : "direct",
+            summary:
+              `Fully refunds every selected charge (max ${BULK_REFUND_MAX} per run). Each charge is revalidated individually through the action ladder; unlinked customers get the remaining amount as a partial refund. Skipped charges are reported per id.`,
+          },
+        ];
+
   // Incomplete view: PaymentIntent rows instead of charges.
   if (status === "incomplete") {
     const rows = incompletePis.map((pi) => ({
@@ -243,6 +312,7 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
       crumbs: [{ label: "Payments" }],
       blocks: [
         header,
+        tabs,
         {
           type: "table",
           key: "payments",
@@ -325,6 +395,7 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
     crumbs: [{ label: "Payments" }],
     blocks: [
       header,
+      tabs,
       {
         type: "table",
         key: "payments",
@@ -343,6 +414,7 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
         selectable: true,
         exportable: true,
         editableColumns: true,
+        ...(bulkActions.length ? { bulkActions } : {}),
         rows,
         nextCursor: chargeWindow.hasMore && charges.length > 0 ? charges[charges.length - 1].id : null,
         empty: hasInMemoryFilter ? "No payments match these filters (within this window)." : "No payments yet.",

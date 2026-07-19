@@ -33,7 +33,9 @@ export type Cell =
   | { t: "money"; v: string; tone?: "pos" | "neg" | "muted" }
   // Stripe amount atom: bold amount + faint ISO code, optionally the status
   // pill in the SAME cell ("€29.00 EUR  [Succeeded ✓]" — the Payments look).
-  | { t: "amount"; v: string; cur: string; badge?: Badge }
+  // major carries the numeric major-unit value so the client can sum selected
+  // rows for bulk-action ceremonies without parsing formatted strings.
+  | { t: "amount"; v: string; cur: string; badge?: Badge; major?: number }
   | { t: "badge"; b: Badge }
   | { t: "flags"; badges: Badge[] }
   | { t: "date"; v: string; iso: string } // v = preformatted absolute; client renders relative w/ hover
@@ -68,6 +70,9 @@ export interface ActionButton {
   // Client-special flows that need browser APIs (WebAuthn) instead of the
   // generic modal: "passkey-register" runs the create() ceremony.
   special?: "passkey-register";
+  // Link-button: navigates to a page instead of POSTing an action (composer
+  // entry points). Mutually exclusive with inputs/params — nothing is posted.
+  ref?: ObjectRef;
 }
 
 export interface HeaderBlock {
@@ -164,12 +169,14 @@ export interface ChartBlock {
   window: string; // "7d" | "30d" | "90d" — baked from the page's window filter
 }
 // Stripe tab row under the H1 (active = blurple underline). Tabs write a page
-// filter, exactly like count-cards — value "" is the first/default tab.
+// filter, exactly like count-cards — value "" is the first/default tab. A tab
+// with a ref navigates to another page instead (cross-section tab rows, e.g.
+// Payments → Payouts).
 export interface TabsBlock {
   type: "tabs";
   key: string; // filter key the tabs steer ("view")
   value?: string; // active tab value (echoed back; "" = default)
-  items: Array<{ value: string; label: string; badge?: string }>;
+  items: Array<{ value: string; label: string; badge?: string; ref?: ObjectRef }>;
 }
 
 // ---- dispute evidence workbench (M6.2) ----

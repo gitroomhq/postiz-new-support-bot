@@ -1,5 +1,6 @@
 import type Stripe from "stripe";
-import { Badge, Block, Cell, TableBlock } from "../renderer/contract";
+import type { ActionActor } from "../../bot/billing/actions/BillingActionService";
+import { ActionButton, Badge, Block, Cell, TableBlock } from "../renderer/contract";
 import { DashboardCtx, DashboardSectionModule, SectionPage, str, validCursor, validId } from "./types";
 import {
   amount,
@@ -26,6 +27,18 @@ import {
 // Insights/Details/Linked accounts stacked label-over-value in the right rail.
 
 const PAGE_SIZE = 25;
+
+function actionActor(ctx: DashboardCtx): ActionActor {
+  return { kind: "dashboard", id: ctx.actor.id, name: ctx.actor.name, isAdmin: ctx.actor.isAdmin };
+}
+
+// Advisory render mode for a registry button: queue notice or disabled state.
+// Execution re-checks server-side regardless.
+function registryButton(ctx: DashboardCtx, button: ActionButton): ActionButton {
+  const mode = ctx.billing.actions.effectiveMode(button.key, actionActor(ctx));
+  if (mode === "denied") return { ...button, disabledReason: "Disabled by /config → Billing → Intercom Actions." };
+  return { ...button, mode: mode === "queue" ? "queue" : "direct" };
+}
 
 export function makeCustomersSection(): DashboardSectionModule {
   return {
@@ -81,6 +94,18 @@ async function customerAction(
   if (!customerId) return { ok: false, error: "Bad customer id." };
 
   switch (key) {
+    // T0 — mint an off-session SetupIntent for saving a card later. Only the
+    // seti_ id is surfaced; the client_secret never leaves the server (it is
+    // only useful to a Stripe.js confirm flow on the customer's device).
+    case "section:customers.setup_intent": {
+      const si = await ctx.stripe.createSetupIntent({ customerId }, `dash-seti-${customerId}-${Date.now().toString(36)}`);
+      await ctx.audit(`SetupIntent ${si.id} created for ${customerId}`);
+      return {
+        ok: true,
+        text: `SetupIntent ${si.id} created (${si.status}). Confirm it via Stripe.js/Elements or the API — the client secret is not shown here.`,
+      };
+    }
+
     // T0 — core details. Blank = keep as-is; a single "-" clears the field
     // (web modals can't prefill text inputs, so absent ≠ clear).
     case "section:customers.update": {
@@ -274,6 +299,26 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
     title,
     ...(customer.email && customer.email !== title ? { sub: customer.email, subCopy: true } : {}),
     badges: headBadges,
+    actions: [
+      registryButton(ctx, {
+        key: "customer.payment_method",
+        label: "Attach payment method",
+        dangerous: true,
+        params: { customerId: id, op: "attach" },
+        inputs: [
+          { type: "text", key: "paymentMethodId", label: "Payment method (pm_…) or card token (tok_…)", placeholder: "pm_… / tok_…" },
+          { type: "toggle", key: "makeDefault", label: "Set as default for invoices" },
+        ],
+        summary: "Attaches an existing unattached payment method (or mints one from a card token) to this customer.",
+      }),
+      {
+        key: "section:customers.setup_intent",
+        label: "Create SetupIntent",
+        params: { customerId: id },
+        summary:
+          "Mints an off-session SetupIntent for saving a card via Stripe.js/Elements or the API. Only the seti_ id is shown — never the client secret.",
+      },
+    ],
   });
 
   // Blocklist banner (error notice with the first block's context).
@@ -465,6 +510,39 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
         pm.type === "card" && pm.card ? text(`${pm.card.exp_month}/${pm.card.exp_year}`) : text("—"),
         idCell(pm.id, { copy: true }),
       ] as Cell[],
+      actions: [
+        registryButton(ctx, {
+          key: "charge.create",
+          label: "Charge",
+          dangerous: true,
+          stepUp: true,
+          params: { customerId: id, paymentMethodId: pm.id },
+          inputs: [
+            { type: "number", key: "amountMajor", label: "Amount (major units, e.g. 12.50)", min: 0 },
+            { type: "text", key: "currency", label: "Currency (3 letters)", placeholder: customer.currency ?? "eur" },
+            { type: "text", key: "description", label: "Description (optional)" },
+          ],
+          summary: "Charges this saved payment method OFF-SESSION immediately (no customer present). Requires a fresh factor.",
+        }),
+        ...(pm.id !== defaultPm
+          ? [
+              registryButton(ctx, {
+                key: "customer.payment_method",
+                label: "Set default",
+                dangerous: true,
+                params: { customerId: id, paymentMethodId: pm.id, op: "set_default" },
+                summary: "Future invoices/renewals bill this payment method.",
+              }),
+            ]
+          : []),
+        registryButton(ctx, {
+          key: "customer.payment_method",
+          label: "Detach",
+          dangerous: true,
+          params: { customerId: id, paymentMethodId: pm.id, op: "detach" },
+          summary: "Removes the payment method from this customer (it cannot be re-attached — a new one must be saved).",
+        }),
+      ],
     })),
     empty: "No saved payment methods.",
     ...(methods.length > 0 ? { footer: `${Math.min(methods.length, 25)} result${methods.length === 1 ? "" : "s"}` } : {}),

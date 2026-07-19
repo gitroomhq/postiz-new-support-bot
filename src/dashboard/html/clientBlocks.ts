@@ -169,16 +169,20 @@ D.renderQr = function (b) {
   return box;
 };
 
-// Stripe tab row: quiet labels, 2px accent underline on the active one.
+// Stripe tab row: quiet labels, 2px accent underline on the active one. A tab
+// with a ref navigates to another page instead of writing the filter.
 D.renderTabs = function (b) {
   var row = D.el("div", "tabrow");
   var current = D.state.filters[b.key] || "";
   (b.items || []).forEach(function (it) {
-    var tab = D.el("button", "tab" + ((it.value || "") === current ? " active" : ""));
+    var tab = D.el("button", "tab" + (!it.ref && (it.value || "") === current ? " active" : ""));
     tab.type = "button";
     tab.appendChild(D.el("span", null, it.label));
     if (it.badge) tab.appendChild(D.el("span", "tabcount", it.badge));
-    tab.addEventListener("click", function () { D.applyFilter(b.key, it.value); });
+    tab.addEventListener("click", function () {
+      if (it.ref) D.navigateRef(it.ref);
+      else D.applyFilter(b.key, it.value);
+    });
     row.appendChild(tab);
   });
   return row;
@@ -395,10 +399,29 @@ D.renderTable = function (b) {
     exps.type = "button";
     exps.addEventListener("click", function () { D.exportCsv(b, visIdx, ids); });
     bulkbar.appendChild(exps);
+    // Per-currency totals of the selected rows' first amount column — the
+    // ceremony summary must list count + total (server re-derives from LIVE
+    // objects; this is the advisory display).
+    var totals = {};
+    b.rows.forEach(function (r) {
+      if (!sel[r.id]) return;
+      for (var ci = 0; ci < (r.cells || []).length; ci++) {
+        var c = r.cells[ci];
+        if (c && c.t === "amount" && typeof c.major === "number") {
+          totals[c.cur] = (totals[c.cur] || 0) + c.major;
+          break;
+        }
+      }
+    });
+    var totalStr = Object.keys(totals).sort().map(function (cur) {
+      return cur + " " + totals[cur].toFixed(2);
+    }).join(" + ");
     (b.bulkActions || []).forEach(function (a) {
       var merged = {}; for (var k in a) merged[k] = a[k];
       merged.params = {}; for (var p in (a.params || {})) merged.params[p] = a.params[p];
       merged.params.ids = ids;
+      merged.summary = ids.length + " row" + (ids.length === 1 ? "" : "s") + " selected" +
+        (totalStr ? " — total " + totalStr : "") + ". " + (a.summary || "");
       var btn = D.actionBtn(merged); btn.classList.add("sm");
       bulkbar.appendChild(btn);
     });

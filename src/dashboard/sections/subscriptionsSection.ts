@@ -1,32 +1,71 @@
 import type Stripe from "stripe";
 import type { ActionActor } from "../../bot/billing/actions/BillingActionService";
-import { ActionButton, Badge, Block, Cell, TableBlock } from "../renderer/contract";
+import { ActionButton, ActionResult, Badge, Block, Cell, FilterDef, TableBlock } from "../renderer/contract";
 import { DashboardCtx, DashboardSectionModule, SectionPage, str, validCursor, validId } from "./types";
-import { avatarCell, badgeCell, dateCell, idCell, money, paymentMethodCell, sentence, subBadge, text } from "./cells";
+import { avatarCell, badgeCell, dateCell, idCell, money, paymentMethodCell, sentence, strong, subBadge, text } from "./cells";
 
 // Subscriptions: account-wide LIST archetype (status count-cards + price
-// filter) and the DETAIL archetype (sub-stat strip + Pricing + Upcoming
-// invoice + rail). Plan changes go through a MANDATORY proration-preview
-// subpage — the confirm button only exists after a preview was rendered for
-// the exact target price; there is no direct change-plan modal.
+// filter), the DETAIL archetype (sub-stat strip + Pricing + Upcoming invoice
+// + rail), the unified UPDATE subpage (price/qty/promo/cycle behind a
+// MANDATORY proration preview — the confirm button only exists after a
+// preview rendered for the exact change set; there is no direct modal), and
+// the CREATE composer (same mandatory first-invoice preview).
 
 const WINDOW = 100;
+const PRICE_RE = /^price_[A-Za-z0-9]{1,64}$/;
+const ITEM_RE = /^si_[A-Za-z0-9]{1,64}$/;
 
 export function makeSubscriptionsSection(): DashboardSectionModule {
   return {
     nav: [{ key: "subscriptions", label: "Subscriptions", page: "subscriptions" }],
 
     ownsPage(page: string): boolean {
-      return page === "subscriptions" || page === "subscriptions.detail" || page === "subscriptions.changeplan";
+      return (
+        page === "subscriptions" ||
+        page === "subscriptions.detail" ||
+        page === "subscriptions.changeplan" ||
+        page === "subscriptions.new"
+      );
     },
 
     async buildPage(ctx: DashboardCtx, req): Promise<SectionPage | null> {
       if (req.page === "subscriptions") return list(ctx, req.filters ?? {}, req.cursor ?? null);
+      if (req.page === "subscriptions.new") return composer(ctx, req.filters ?? {});
       const id = validId("subscription", req.params?.id);
       if (!id) return notFound("That subscription id is not valid (sub_…).");
       if (req.page === "subscriptions.detail") return detail(ctx, id);
-      if (req.page === "subscriptions.changeplan") return changePlan(ctx, id, req.filters ?? {});
+      if (req.page === "subscriptions.changeplan") return updatePage(ctx, id, req.filters ?? {});
       return null;
+    },
+
+    async action(ctx: DashboardCtx, req): Promise<ActionResult> {
+      // Test-mode "Run simulation": advance the customer's test clock. The
+      // clock id is derived from the LIVE subscription server-side — the
+      // client only names the sub.
+      if (req.key === "section:subscriptions.clock_advance") {
+        if (!ctx.stripe.isTestMode()) return { ok: false, error: "Simulation runs only against a TEST key." };
+        const id = validId("subscription", req.params?.id);
+        const daysRaw = req.params?.days;
+        const days =
+          typeof daysRaw === "number" && Number.isSafeInteger(daysRaw) && daysRaw >= 1 && daysRaw <= 365 ? daysRaw : null;
+        if (!id || !days) return { ok: false, fieldErrors: { days: "Days must be between 1 and 365." } };
+        const sub = await ctx.stripe.getSubscription(id).catch(() => null);
+        const clockId = sub
+          ? typeof sub.test_clock === "string"
+            ? sub.test_clock
+            : sub.test_clock?.id ?? null
+          : null;
+        if (!clockId) return { ok: false, error: "This subscription's customer has no test clock." };
+        const clock = await ctx.stripe.getTestClock(clockId);
+        const target = clock.frozen_time + days * 86400;
+        await ctx.stripe.advanceTestClock(clockId, target);
+        await ctx.audit(`Test clock ${clockId} advanced ${days}d (sub ${id})`);
+        return {
+          ok: true,
+          text: `Test clock advanced ${days} day${days === 1 ? "" : "s"} → ${new Date(target * 1000).toISOString().slice(0, 10)}. Stripe replays renewals/invoices shortly.`,
+        };
+      }
+      return { ok: false, error: "Unknown action." };
     },
   };
 }
@@ -118,6 +157,18 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
     crumbs: [{ label: "Subscriptions" }],
     blocks: [
       {
+        type: "header",
+        title: "Subscriptions",
+        actions: [
+          {
+            key: "nav:subscriptions.new",
+            label: "Create subscription",
+            style: "primary",
+            ref: { page: "subscriptions.new" },
+          },
+        ],
+      },
+      {
         type: "table",
         key: "subs",
         columns: [
@@ -158,16 +209,43 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
   const sub = await ctx.stripe.getSubscription(id).catch(() => null);
   if (!sub) return notFound("This subscription does not exist.");
   const customerId = typeof sub.customer === "string" ? sub.customer : sub.customer?.id ?? null;
-  const [upcoming, discordIds] = await Promise.all([
+  const [upcoming, discordIds, customer] = await Promise.all([
     customerId && sub.status !== "canceled"
       ? ctx.stripe.previewUpcomingInvoice(customerId, id)
       : Promise.resolve(null),
     customerId ? ctx.stores.session.findDiscordIdsByStripeId(customerId).catch(() => []) : Promise.resolve([]),
+    customerId
+      ? Promise.resolve()
+          .then(() => ctx.stripe.getCustomer(customerId))
+          .catch(() => null)
+      : Promise.resolve(null),
   ]);
 
   const plan = planLabel(sub);
   const item = sub.items.data[0];
   const cancelable = sub.status !== "canceled";
+  // Stripe titles subscription pages "Customer on Product".
+  const customerName = customer && !customer.deleted ? customer.name ?? customer.email ?? customerId : customerId;
+  const title = customerName ? `${customerName} on ${plan.name}` : plan.name;
+
+  // Payment method as brand+last4, never a raw pm_ id: the sub-level default
+  // is expanded on getSubscription; when absent Stripe falls back to the
+  // customer's default — resolve that one with a single extra read.
+  const subPm = sub.default_payment_method;
+  let pmCell: Cell | null = null;
+  if (subPm && typeof subPm === "object") {
+    pmCell = paymentMethodCell(subPm as Stripe.PaymentMethod);
+  } else {
+    const customerPmRaw = customer && !customer.deleted ? customer.invoice_settings?.default_payment_method : null;
+    const customerPmId = typeof customerPmRaw === "string" ? customerPmRaw : customerPmRaw?.id ?? null;
+    const fallbackId = typeof subPm === "string" ? subPm : customerPmId;
+    if (fallbackId) {
+      const pm = await ctx.stripe.getPaymentMethod(fallbackId).catch(() => null);
+      pmCell = pm
+        ? paymentMethodCell(pm, typeof subPm === "string" ? undefined : "customer default")
+        : idCell(fallbackId, { copy: true });
+    }
+  }
 
   // Change-plan is deliberately NOT a header action: it lives behind the
   // proration-preview subpage (Pricing footer + rail link) — the mandatory
@@ -235,7 +313,7 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
 
   main.push({
     type: "header",
-    title: plan.name,
+    title,
     ...(plan.per ? { sub: plan.per } : {}),
     badges: [
       subBadge(sub.status),
@@ -277,7 +355,7 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
     ],
   });
 
-  // Pricing table (all items).
+  // Pricing table (all items, si_ ids surfaced).
   main.push({
     type: "table",
     key: "pricing",
@@ -288,6 +366,7 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
       { key: "unit", label: "Unit", align: "right" },
       { key: "total", label: "Total", align: "right" },
       { key: "interval", label: "Billing" },
+      { key: "id", label: "ID" },
     ],
     rows: sub.items.data.map((it) => {
       const p = it.price;
@@ -301,38 +380,72 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
           p?.unit_amount != null ? money(ctx.stripe, p.unit_amount, p.currency) : text("—"),
           p?.unit_amount != null ? money(ctx.stripe, p.unit_amount * qty, p.currency) : text("—"),
           text(p?.recurring ? `every ${p.recurring.interval_count ?? 1} ${p.recurring.interval}` : "—"),
+          idCell(it.id, { copy: true }),
         ] as Cell[],
       };
     }),
     ...(sub.status === "active" || sub.status === "trialing"
-      ? { footer: "Change plan (proration preview)", footerRef: { page: "subscriptions.changeplan", params: { id } } }
+      ? { footer: "Update subscription (proration preview)", footerRef: { page: "subscriptions.changeplan", params: { id } } }
       : {}),
   });
 
-  // Upcoming-invoice preview.
+  // Upcoming-invoice preview: full breakdown — every line w/ qty, then the
+  // subtotal→total→amount-due ladder Stripe shows.
   if (upcoming) {
+    const lineRows = upcoming.lines.data.slice(0, 20).map((line, i) => ({
+      id: line.id ?? String(i),
+      cells: [
+        text(line.description ?? "line"),
+        text(String(line.quantity ?? 1)),
+        money(ctx.stripe, line.amount, line.currency),
+      ] as Cell[],
+    }));
+    const totalRows: Array<{ id: string; cells: Cell[] }> = [];
+    if (typeof upcoming.subtotal === "number") {
+      totalRows.push({
+        id: "t_subtotal",
+        cells: [text("Subtotal"), text(""), money(ctx.stripe, upcoming.subtotal, upcoming.currency)] as Cell[],
+      });
+      if (typeof upcoming.total === "number" && upcoming.total !== upcoming.subtotal) {
+        totalRows.push({
+          id: "t_adjust",
+          cells: [
+            text("Discounts & tax"),
+            text(""),
+            money(ctx.stripe, upcoming.total - upcoming.subtotal, upcoming.currency),
+          ] as Cell[],
+        });
+      }
+    }
+    if (typeof upcoming.total === "number") {
+      totalRows.push({
+        id: "t_total",
+        cells: [text("Total"), text(""), money(ctx.stripe, upcoming.total, upcoming.currency)] as Cell[],
+      });
+    }
+    totalRows.push({
+      id: "t_due",
+      cells: [strong("Amount due"), text(""), money(ctx.stripe, upcoming.amount_due, upcoming.currency)] as Cell[],
+    });
     main.push({
       type: "table",
       key: "upcoming",
       title: "Upcoming invoice",
       columns: [
         { key: "desc", label: "Description" },
+        { key: "qty", label: "Qty", align: "right" },
         { key: "amount", label: "Amount", align: "right" },
       ],
-      rows: upcoming.lines.data.slice(0, 10).map((line, i) => ({
-        id: line.id ?? String(i),
-        cells: [text(line.description ?? "line"), money(ctx.stripe, line.amount, line.currency)] as Cell[],
-      })),
-      notice: `Total ${ctx.stripe.formatAmount(upcoming.amount_due, upcoming.currency)}${
+      rows: [...lineRows, ...totalRows],
+      notice: `${upcoming.lines.data.length > 20 ? `Showing 20 of ${upcoming.lines.data.length} lines. ` : ""}${
         upcoming.next_payment_attempt
-          ? ` — collects ${new Date(upcoming.next_payment_attempt * 1000).toISOString().slice(0, 10)}`
+          ? `Collects ${new Date(upcoming.next_payment_attempt * 1000).toISOString().slice(0, 10)}. `
           : ""
-      }. Preview — amounts can still change.`,
+      }Preview — amounts can still change.`,
     });
   }
 
-  // Rail: Details + Customer.
-  const defaultPm = sub.default_payment_method;
+  // Rail: Details + Customer (+ Simulation in test mode).
   rail.push({
     type: "kv",
     title: "Details",
@@ -344,11 +457,7 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
         label: "Collection",
         cell: text(sub.collection_method === "send_invoice" ? "Email invoice" : "Charge automatically"),
       },
-      ...(defaultPm && typeof defaultPm === "object"
-        ? [{ label: "Default payment method", cell: paymentMethodCell(defaultPm as Stripe.PaymentMethod) }]
-        : defaultPm && typeof defaultPm === "string"
-          ? [{ label: "Default payment method", cell: idCell(defaultPm, { copy: true }) }]
-          : []),
+      { label: "Payment method", cell: pmCell ?? text("—") },
       ...(sub.discounts?.length ? [{ label: "Discounts", cell: text(String(sub.discounts.length)) }] : []),
       ...(typeof sub.latest_invoice === "string"
         ? [
@@ -361,8 +470,8 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
       ...(sub.status === "active" || sub.status === "trialing"
         ? [
             {
-              label: "Change plan",
-              cell: { t: "link", v: "Open proration preview", ref: { page: "subscriptions.changeplan", params: { id } } } as Cell,
+              label: "Update",
+              cell: { t: "link", v: "Update subscription (preview)", ref: { page: "subscriptions.changeplan", params: { id } } } as Cell,
             },
           ]
         : []),
@@ -373,56 +482,148 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
     title: "Customer",
     rows: customerId
       ? [
+          ...(customerName && customerName !== customerId ? [{ label: "Name", cell: text(customerName) }] : []),
           { label: "ID", cell: idCell(customerId, { copy: true, ref: { page: "customers.detail", params: { id: customerId } } }) },
           { label: "Discord", cell: discordIds.length ? idCell(discordIds[0], { copy: true }) : text("not linked") },
         ]
       : [{ label: "Customer", cell: text("No customer attached.") }],
   });
 
+  // Test-mode-only "Run simulation" affordance (Stripe test clocks). Prod runs
+  // sk_live, so this card never renders there.
+  if (ctx.stripe.isTestMode()) {
+    const clockId = typeof sub.test_clock === "string" ? sub.test_clock : sub.test_clock?.id ?? null;
+    rail.push({
+      type: "kv",
+      title: "Simulation",
+      rows: [
+        {
+          label: "Test clock",
+          cell: clockId ? idCell(clockId, { copy: true }) : text("none — clocks attach at customer creation"),
+        },
+      ],
+      ...(clockId
+        ? {
+            actions: [
+              {
+                key: "section:subscriptions.clock_advance",
+                label: "Run simulation",
+                inputs: [{ type: "number", key: "days", label: "Advance by days (1–365)", min: 1, max: 365 }],
+                params: { id: sub.id },
+                summary:
+                  "Advances the customer's test clock — Stripe replays renewals, invoices and dunning up to the new time. Test mode only.",
+              },
+            ],
+          }
+        : {}),
+    });
+  }
+
   return {
-    title: plan.name,
+    title,
     crumbs: [{ label: "Subscriptions", ref: { page: "subscriptions" } }, { label: sub.id, copyId: sub.id }],
     blocks: main,
     rail,
   };
 }
 
-// ---- CHANGE PLAN (mandatory proration preview) ----
+// ---- UPDATE SUBSCRIPTION (unified drawer: item/price/qty/promo/cycle behind
+// the mandatory proration preview) ----
 
-async function changePlan(ctx: DashboardCtx, id: string, filters: Record<string, string>): Promise<SectionPage> {
+const intervalRank: Record<string, number> = { day: 0, week: 1, month: 2, year: 3 };
+
+function sortPrices(prices: Stripe.Price[]): Stripe.Price[] {
+  return [...prices].sort(
+    (a, b) =>
+      (intervalRank[a.recurring?.interval ?? ""] ?? 9) - (intervalRank[b.recurring?.interval ?? ""] ?? 9) ||
+      (a.unit_amount ?? 0) - (b.unit_amount ?? 0)
+  );
+}
+
+async function updatePage(ctx: DashboardCtx, id: string, filters: Record<string, string>): Promise<SectionPage> {
   const sub = await ctx.stripe.getSubscription(id).catch(() => null);
   if (!sub) return notFound("This subscription does not exist.");
   if (sub.status !== "active" && sub.status !== "trialing") {
-    return notFound(`Subscription is ${sub.status} — plans can only change on active/trialing subscriptions.`);
+    return notFound(`Subscription is ${sub.status} — only active/trialing subscriptions can be updated.`);
   }
   const customerId = typeof sub.customer === "string" ? sub.customer : sub.customer?.id ?? null;
-  const item = sub.items.data[0];
-  if (!customerId || !item) return notFound("Subscription has no customer/item to change.");
+  const itemFilter = ITEM_RE.test(filters.item ?? "") ? filters.item : "";
+  const item = itemFilter ? sub.items.data.find((it) => it.id === itemFilter) ?? null : sub.items.data[0] ?? null;
+  if (!customerId || !item) return notFound("Subscription has no customer/item to update.");
 
   const prices = await ctx.stripe.listRecurringPrices(50).catch(() => [] as Stripe.Price[]);
   const allowlist = ctx.settings.allowedPriceIds();
-  const intervalRank: Record<string, number> = { day: 0, week: 1, month: 2, year: 3 };
-  const candidates = prices
-    .filter((p) => p.id !== item.price?.id && (allowlist.length === 0 || allowlist.includes(p.id)))
-    .sort(
-      (a, b) =>
-        (intervalRank[a.recurring?.interval ?? ""] ?? 9) - (intervalRank[b.recurring?.interval ?? ""] ?? 9) ||
-        (a.unit_amount ?? 0) - (b.unit_amount ?? 0)
-    );
+  const currentPriceId = item.price?.id ?? "";
+  // The picker includes the CURRENT price (marked) so qty/promo/cycle-only
+  // updates are possible; other prices respect the allowlist.
+  let candidates = sortPrices(
+    prices.filter((p) => p.id === currentPriceId || allowlist.length === 0 || allowlist.includes(p.id))
+  );
+  if (currentPriceId && item.price && !candidates.some((p) => p.id === currentPriceId)) {
+    candidates = [item.price as Stripe.Price, ...candidates];
+  }
 
-  const targetPrice = /^price_[A-Za-z0-9]{1,64}$/.test(filters.price ?? "") ? filters.price : "";
+  // The whole change set rides page filters so row-picks and field edits
+  // compose (a row click preserves qty/promo/cycle).
+  const targetPrice = PRICE_RE.test(filters.price ?? "") ? filters.price : "";
+  const effectiveTarget = targetPrice || currentPriceId;
+  const qtyRaw = str(filters.qty, 6).trim();
+  const quantity = /^\d{1,5}$/.test(qtyRaw) ? Math.max(1, Number.parseInt(qtyRaw, 10)) : null;
+  const promo = str(filters.promo, 60).replace(/["\\]/g, "").trim();
+  const cycle = filters.cycle === "now" ? "now" : "";
+  const currentQty = item.quantity ?? 1;
+  const priceChanged = !!effectiveTarget && effectiveTarget !== currentPriceId;
+  const qtyChanged = quantity != null && quantity !== currentQty;
+  const dirty = priceChanged || qtyChanged || !!promo || cycle === "now";
+
+  const carried: Record<string, string> = {
+    ...(itemFilter ? { item: itemFilter } : {}),
+    ...(qtyRaw ? { qty: qtyRaw } : {}),
+    ...(promo ? { promo } : {}),
+    ...(cycle ? { cycle } : {}),
+  };
+
+  const pageFilters: FilterDef[] = [
+    ...(sub.items.data.length > 1
+      ? [
+          {
+            key: "item",
+            label: "Item",
+            kind: "select" as const,
+            value: item.id,
+            options: sub.items.data.map((it) => ({
+              value: it.id,
+              label: it.price?.nickname ?? it.price?.id ?? it.id,
+            })),
+          },
+        ]
+      : []),
+    { key: "qty", label: "Quantity", kind: "text" as const, value: qtyRaw || undefined, placeholder: `current: ${currentQty}` },
+    { key: "promo", label: "Promo code", kind: "text" as const, value: promo || undefined, placeholder: "SAVE20" },
+    {
+      key: "cycle",
+      label: "Billing cycle",
+      kind: "select" as const,
+      value: cycle || undefined,
+      options: [
+        { value: "", label: "Keep cycle" },
+        { value: "now", label: "Reset cycle to now" },
+      ],
+    },
+  ];
+
   const plan = planLabel(sub);
   // Row click = pick: each row navigates to this page with its price applied.
   const blocks: Block[] = [
     {
       type: "header",
-      title: "Change plan",
+      title: "Update subscription",
       sub: `${plan.name} · ${sub.id}`,
     },
     {
       type: "table",
       key: "prices",
-      title: "Pick the target price",
+      title: "Price",
       columns: [
         { key: "name", label: "Price" },
         { key: "picked", label: "" },
@@ -430,43 +631,56 @@ async function changePlan(ctx: DashboardCtx, id: string, filters: Record<string,
         { key: "interval", label: "Billing" },
         { key: "id", label: "ID" },
       ],
+      filters: pageFilters,
       rows: candidates.slice(0, 25).map((p) => ({
         id: p.id,
-        ref: { page: "subscriptions.changeplan", params: { id }, filters: { price: p.id } },
+        ref: { page: "subscriptions.changeplan", params: { id }, filters: { ...carried, price: p.id } },
         cells: [
           avatarCell("subscription", p.nickname ?? p.id),
-          p.id === targetPrice ? badgeCell("info", "Selected") : text(""),
+          p.id === currentPriceId
+            ? badgeCell("neutral", "Current")
+            : p.id === effectiveTarget
+              ? badgeCell("info", "Selected")
+              : text(""),
           p.unit_amount != null ? money(ctx.stripe, p.unit_amount, p.currency) : text("—"),
           text(p.recurring ? `every ${p.recurring.interval_count ?? 1} ${p.recurring.interval}` : "—"),
           idCell(p.id, { copy: true }),
         ] as Cell[],
       })),
       empty: allowlist.length
-        ? "No other prices on the plan allowlist (/config → Billing)."
-        : "No other recurring prices found.",
-      notice: "Click a price to preview the proration, then confirm below the preview.",
+        ? "No prices on the plan allowlist (/config → Billing)."
+        : "No recurring prices found.",
+      notice: "Pick a price and/or set quantity, promo or cycle — then confirm below the proration preview.",
     },
   ];
 
-  // MANDATORY preview: the confirm button exists ONLY once a target price was
-  // chosen and its proration preview rendered.
-  if (targetPrice) {
+  // MANDATORY preview: the confirm button exists ONLY once the change set is
+  // non-empty and its proration preview rendered.
+  if (dirty && effectiveTarget) {
     const preview = await ctx.stripe
       .previewPlanChange({
         customerId,
         subscriptionId: id,
         itemId: item.id,
-        priceId: targetPrice,
+        priceId: effectiveTarget,
         prorationDate: Math.floor(Date.now() / 1000),
+        ...(qtyChanged ? { quantity: quantity! } : {}),
+        ...(cycle === "now" ? { billingCycleAnchor: "now" as const } : {}),
       })
       .catch(() => null);
     if (!preview) {
       blocks.push({
         type: "notice",
         badge: { kind: "error", text: "PREVIEW FAILED" },
-        text: "Stripe could not preview this change (incompatible currency/interval?). Pick a different price.",
+        text: "Stripe could not preview this change (incompatible currency/interval?). Pick a different change set.",
       });
     } else {
+      const changeBits = [
+        priceChanged ? `price → ${effectiveTarget}` : null,
+        qtyChanged ? `quantity → ${quantity}` : null,
+        promo ? `promo ${promo} (applied at execution — not in the preview)` : null,
+        cycle === "now" ? "billing cycle resets to now" : null,
+      ].filter(Boolean);
       blocks.push({
         type: "table",
         key: "preview",
@@ -481,18 +695,219 @@ async function changePlan(ctx: DashboardCtx, id: string, filters: Record<string,
         })),
         notice: `Next invoice would be ${ctx.stripe.formatAmount(preview.amount_due, preview.currency)}. Estimate — the committed prorations are computed at execution time.`,
       });
+      const confirmParams: Record<string, unknown> = { subscriptionId: id, priceId: effectiveTarget };
+      if (itemFilter && itemFilter !== sub.items.data[0]?.id) confirmParams.itemId = itemFilter;
+      if (qtyChanged) confirmParams.quantity = quantity;
+      if (promo) confirmParams.promoCode = promo;
+      if (cycle === "now") confirmParams.cycleAnchor = "now";
       blocks.push({
         type: "notice",
         badge: { kind: "info", text: "REVIEWED" },
-        text: `Move ${sub.id} to ${targetPrice} with prorations.`,
+        text: `Update ${sub.id}: ${changeBits.join(", ")}.`,
         actions: [
           registryButton(ctx, {
             key: "subscription.change_plan",
-            label: "Change plan",
+            label: "Update subscription",
             style: "primary",
             dangerous: true,
-            params: { subscriptionId: id, priceId: targetPrice },
-            summary: `Swap the subscription item to ${targetPrice} with create_prorations — you reviewed the preview above.`,
+            params: confirmParams,
+            summary: `Apply ${changeBits.join(", ")} with create_prorations — you reviewed the preview above.`,
+          }),
+        ],
+      });
+    }
+  } else if (targetPrice && !dirty) {
+    blocks.push({
+      type: "notice",
+      badge: { kind: "info", text: "NO CHANGE" },
+      text: "That is already the current price — set a different price, quantity, promo or cycle reset.",
+    });
+  }
+
+  return {
+    title: "Update subscription",
+    crumbs: [
+      { label: "Subscriptions", ref: { page: "subscriptions" } },
+      { label: sub.id, ref: { page: "subscriptions.detail", params: { id } } },
+      { label: "Update" },
+    ],
+    blocks,
+  };
+}
+
+// ---- CREATE SUBSCRIPTION (composer, mandatory first-invoice preview) ----
+
+async function composer(ctx: DashboardCtx, filters: Record<string, string>): Promise<SectionPage> {
+  const customerId = validId("customer", filters.customer) ?? "";
+  const targetPrice = PRICE_RE.test(filters.price ?? "") ? filters.price : "";
+  const qtyRaw = str(filters.qty, 6).trim();
+  const quantity = /^\d{1,5}$/.test(qtyRaw) && Number.parseInt(qtyRaw, 10) > 1 ? Number.parseInt(qtyRaw, 10) : null;
+  const promo = str(filters.promo, 60).replace(/["\\]/g, "").trim();
+  const trialRaw = str(filters.trial, 4).trim();
+  const trialDays = /^\d{1,3}$/.test(trialRaw) && Number.parseInt(trialRaw, 10) > 0 ? Number.parseInt(trialRaw, 10) : null;
+  const collection: "charge" | "invoice" = filters.collection === "invoice" ? "invoice" : "charge";
+
+  const [prices, customer] = await Promise.all([
+    ctx.stripe.listRecurringPrices(50).catch(() => [] as Stripe.Price[]),
+    customerId
+      ? Promise.resolve()
+          .then(() => ctx.stripe.getCustomer(customerId))
+          .catch(() => null)
+      : Promise.resolve(null),
+  ]);
+  const allowlist = ctx.settings.allowedPriceIds();
+  const candidates = sortPrices(prices.filter((p) => allowlist.length === 0 || allowlist.includes(p.id)));
+
+  const carried: Record<string, string> = {
+    ...(customerId ? { customer: customerId } : {}),
+    ...(qtyRaw ? { qty: qtyRaw } : {}),
+    ...(promo ? { promo } : {}),
+    ...(trialRaw ? { trial: trialRaw } : {}),
+    ...(filters.collection === "invoice" ? { collection: "invoice" } : {}),
+  };
+
+  const blocks: Block[] = [
+    {
+      type: "header",
+      title: "Create subscription",
+      sub: "Pick a customer and a price — the first-invoice preview is the mandatory review step.",
+    },
+  ];
+
+  // Customer resolution card: name/email + whether off-session billing can work.
+  if (customerId) {
+    if (!customer || customer.deleted) {
+      blocks.push({
+        type: "notice",
+        badge: { kind: "error", text: "NO CUSTOMER" },
+        text: `Customer ${customerId} does not exist (or was deleted).`,
+      });
+    } else {
+      const pmRaw = customer.invoice_settings?.default_payment_method;
+      const pmId = typeof pmRaw === "string" ? pmRaw : pmRaw?.id ?? null;
+      const pm = pmId ? await ctx.stripe.getPaymentMethod(pmId).catch(() => null) : null;
+      blocks.push({
+        type: "kv",
+        title: "Customer",
+        rows: [
+          { label: "Customer", cell: strong(customer.name ?? customer.email ?? customerId) },
+          { label: "ID", cell: idCell(customerId, { copy: true, ref: { page: "customers.detail", params: { id: customerId } } }) },
+          ...(customer.email ? [{ label: "Email", cell: text(customer.email) }] : []),
+          {
+            label: "Default payment method",
+            cell: pm
+              ? paymentMethodCell(pm)
+              : text(pmId ?? "none", pmId ? undefined : "charge-now needs a card — use invoice or a trial"),
+          },
+        ],
+      });
+    }
+  }
+
+  blocks.push({
+    type: "table",
+    key: "prices",
+    title: "Price",
+    columns: [
+      { key: "name", label: "Price" },
+      { key: "picked", label: "" },
+      { key: "amount", label: "Amount", align: "right" },
+      { key: "interval", label: "Billing" },
+      { key: "id", label: "ID" },
+    ],
+    filters: [
+      { key: "customer", label: "Customer", kind: "text", value: customerId || undefined, placeholder: "cus_…" },
+      { key: "qty", label: "Quantity", kind: "text", value: qtyRaw || undefined, placeholder: "1" },
+      { key: "promo", label: "Promo code", kind: "text", value: promo || undefined, placeholder: "SAVE20" },
+      { key: "trial", label: "Trial days", kind: "text", value: trialRaw || undefined, placeholder: "0" },
+      {
+        key: "collection",
+        label: "Collection",
+        kind: "select",
+        value: filters.collection === "invoice" ? "invoice" : undefined,
+        options: [
+          { value: "", label: "Charge automatically" },
+          { value: "invoice", label: "Email invoice (due in 7 days)" },
+        ],
+      },
+    ],
+    rows: candidates.slice(0, 25).map((p) => ({
+      id: p.id,
+      ref: { page: "subscriptions.new", filters: { ...carried, price: p.id } },
+      cells: [
+        avatarCell("subscription", p.nickname ?? p.id),
+        p.id === targetPrice ? badgeCell("info", "Selected") : text(""),
+        p.unit_amount != null ? money(ctx.stripe, p.unit_amount, p.currency) : text("—"),
+        text(p.recurring ? `every ${p.recurring.interval_count ?? 1} ${p.recurring.interval}` : "—"),
+        idCell(p.id, { copy: true }),
+      ] as Cell[],
+    })),
+    empty: allowlist.length
+      ? "No prices on the plan allowlist (/config → Billing)."
+      : "No active recurring prices found.",
+    notice: customerId
+      ? "Click a price to preview the first invoice, then confirm below the preview."
+      : "Set the Customer filter (cus_…) first, then pick a price.",
+  });
+
+  // MANDATORY preview: confirm exists ONLY after a successful first-invoice
+  // preview for the exact customer+price(+qty/trial) combination.
+  if (customerId && customer && !customer.deleted && targetPrice) {
+    const preview = await ctx.stripe
+      .previewNewSubscription({
+        customerId,
+        priceId: targetPrice,
+        ...(quantity ? { quantity } : {}),
+        ...(trialDays ? { trialEndUnix: Math.floor(Date.now() / 1000) + trialDays * 86400 } : {}),
+      })
+      .catch(() => null);
+    if (!preview) {
+      blocks.push({
+        type: "notice",
+        badge: { kind: "error", text: "PREVIEW FAILED" },
+        text: "Stripe could not preview this subscription (currency mismatch with the customer?). Pick a different price.",
+      });
+    } else {
+      const bits = [
+        `${targetPrice}${quantity ? ` ×${quantity}` : ""}`,
+        trialDays ? `${trialDays}-day trial` : null,
+        promo ? `promo ${promo} (applied at creation — not in the preview)` : null,
+        collection === "invoice" ? "collected by emailed invoice" : "charges the default payment method",
+      ].filter(Boolean);
+      blocks.push({
+        type: "table",
+        key: "preview",
+        title: trialDays ? "First invoice after trial (preview)" : "First invoice (preview)",
+        columns: [
+          { key: "desc", label: "Description" },
+          { key: "amount", label: "Amount", align: "right" },
+        ],
+        rows: preview.lines.data.slice(0, 15).map((line, i) => ({
+          id: line.id ?? String(i),
+          cells: [text(line.description ?? "line"), money(ctx.stripe, line.amount, line.currency)] as Cell[],
+        })),
+        notice: `First invoice would be ${ctx.stripe.formatAmount(preview.amount_due, preview.currency)}. Estimate — computed again at creation time.`,
+      });
+      blocks.push({
+        type: "notice",
+        badge: { kind: "info", text: "REVIEWED" },
+        text: `Create a subscription for ${customerId}: ${bits.join(", ")}.`,
+        actions: [
+          registryButton(ctx, {
+            key: "subscription.create",
+            label: "Create subscription",
+            style: "primary",
+            dangerous: true,
+            ...(collection === "charge" ? { stepUp: true } : {}),
+            params: {
+              customerId,
+              priceId: targetPrice,
+              ...(quantity ? { quantity } : {}),
+              ...(promo ? { promoCode: promo } : {}),
+              ...(trialDays ? { trialDays } : {}),
+              collection,
+            },
+            summary: `Creates the subscription now — ${collection === "charge" ? "the default payment method is charged immediately (unless trialing)" : "an invoice is emailed, due in 7 days"}. You reviewed the preview above.`,
           }),
         ],
       });
@@ -500,12 +915,8 @@ async function changePlan(ctx: DashboardCtx, id: string, filters: Record<string,
   }
 
   return {
-    title: "Change plan",
-    crumbs: [
-      { label: "Subscriptions", ref: { page: "subscriptions" } },
-      { label: sub.id, ref: { page: "subscriptions.detail", params: { id } } },
-      { label: "Change plan" },
-    ],
+    title: "Create subscription",
+    crumbs: [{ label: "Subscriptions", ref: { page: "subscriptions" } }, { label: "New" }],
     blocks,
   };
 }

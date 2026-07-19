@@ -394,14 +394,22 @@ const subscriptionPauseResume = defineAction<SubscriptionPauseResumeParams>({
   },
 });
 
+// The unified "Update subscription" action: price swap and/or quantity, promo,
+// billing-cycle reset — all optional beyond the target price (pass the current
+// price to change only the other knobs). Backward compatible with the original
+// {subscriptionId, priceId} shape the Intercom canvas sends.
 interface SubscriptionChangePlanParams {
   subscriptionId: string;
   priceId: string;
+  itemId?: string;
+  quantity?: number;
+  promoCode?: string;
+  cycleAnchor?: "now";
 }
 
 const subscriptionChangePlan = defineAction<SubscriptionChangePlanParams>({
   key: "subscription.change_plan",
-  label: "Change plan",
+  label: "Update subscription (price/qty/promo/cycle)",
   group: "Subscriptions",
   defaultLevel: "none",
   dangerous: true,
@@ -410,30 +418,80 @@ const subscriptionChangePlan = defineAction<SubscriptionChangePlanParams>({
     const subscriptionId = o ? idWithPrefix(o.subscriptionId, "sub_") : null;
     const priceId = o ? idWithPrefix(o.priceId, "price_") : null;
     if (!subscriptionId || !priceId) return { ok: false, error: "subscriptionId (sub_…) and priceId (price_…) required" };
-    return { ok: true, params: { subscriptionId, priceId } };
+    return {
+      ok: true,
+      params: {
+        subscriptionId,
+        priceId,
+        itemId: o ? (idWithPrefix(o.itemId, "si_") ?? undefined) : undefined,
+        quantity: o ? (posInt(o.quantity) ?? undefined) : undefined,
+        promoCode: o ? (str(o.promoCode, 100) ?? undefined) : undefined,
+        cycleAnchor: o?.cycleAnchor === "now" ? "now" : undefined,
+      },
+    };
   },
-  summarize: (p) => `Change ${p.subscriptionId} to price ${p.priceId} (with prorations)`,
+  summarize: (p) =>
+    `Update ${p.subscriptionId} → price ${p.priceId}` +
+    (p.quantity != null ? ` ×${p.quantity}` : "") +
+    (p.promoCode ? `, promo ${p.promoCode}` : "") +
+    (p.cycleAnchor === "now" ? ", billing cycle reset to now" : "") +
+    " (with prorations)",
   revalidate: async (ctx, p) => {
     const cus = requireCustomer(ctx);
     if (!cus) return "No linked Stripe customer.";
     const sub = await ctx.stripe.getSubscription(p.subscriptionId);
     if (customerIdOf(sub) !== cus) return "Subscription does not belong to this customer.";
     if (sub.status !== "active" && sub.status !== "trialing") return `Subscription is ${sub.status} — not changeable.`;
+    const item = p.itemId ? sub.items.data.find((it) => it.id === p.itemId) : sub.items.data[0];
+    if (p.itemId && !item) return "That item does not exist on this subscription.";
+    const samePrice = item?.price?.id === p.priceId;
+    if (samePrice && p.quantity == null && !p.promoCode && !p.cycleAnchor) {
+      return "Nothing to change — pick a different price, quantity, promo or cycle reset.";
+    }
     const price = await ctx.stripe.getPrice(p.priceId).catch(() => null);
     if (!price || !price.recurring) return "Target price does not exist or is not recurring.";
     const allowlist = ctx.settingsStore.allowedPriceIds();
-    if (allowlist.length > 0 && !allowlist.includes(p.priceId)) return "Target price is not on the plan allowlist (/config → Billing).";
+    // Keeping the CURRENT price (qty/promo/cycle-only update) is always fine —
+    // the allowlist gates plan MOVES, not already-held plans.
+    if (!samePrice && allowlist.length > 0 && !allowlist.includes(p.priceId)) {
+      return "Target price is not on the plan allowlist (/config → Billing).";
+    }
+    if (p.promoCode) {
+      const codes = await ctx.stripe.findPromotionCodes(p.promoCode);
+      if (!codes.some((c) => c.active)) return "Promo code not found or inactive.";
+    }
     return null;
   },
   execute: async (ctx, p) => {
     const sub = await ctx.stripe.getSubscription(p.subscriptionId);
-    const itemId = sub.items.data[0]?.id;
-    if (!itemId) return { ok: false, error: "Subscription has no item to swap." };
+    const item = p.itemId ? sub.items.data.find((it) => it.id === p.itemId) : sub.items.data[0];
+    if (!item) return { ok: false, error: "Subscription has no matching item to update." };
+    let promotionCodeId: string | undefined;
+    if (p.promoCode) {
+      const codes = await ctx.stripe.findPromotionCodes(p.promoCode);
+      const active = codes.find((c) => c.active);
+      if (!active) return { ok: false, error: "Promo code not found or inactive." };
+      promotionCodeId = active.id;
+    }
     await ctx.stripe.changeSubscriptionPlan(
-      { subscriptionId: p.subscriptionId, itemId, priceId: p.priceId, prorationBehavior: "create_prorations" },
+      {
+        subscriptionId: p.subscriptionId,
+        itemId: item.id,
+        priceId: p.priceId,
+        prorationBehavior: "create_prorations",
+        quantity: p.quantity,
+        promotionCodeId,
+        billingCycleAnchor: p.cycleAnchor,
+      },
       `panel-planchange-${p.subscriptionId}-${p.priceId}-${ctx.idemScope}`
     );
-    return { ok: true, text: `Subscription ${p.subscriptionId} moved to ${p.priceId} with prorations.` };
+    const bits = [
+      `price ${p.priceId}`,
+      p.quantity != null ? `quantity ${p.quantity}` : null,
+      promotionCodeId ? `promo ${p.promoCode}` : null,
+      p.cycleAnchor === "now" ? "billing cycle reset" : null,
+    ].filter(Boolean);
+    return { ok: true, text: `Subscription ${p.subscriptionId} updated — ${bits.join(", ")} (with prorations).` };
   },
 });
 
@@ -489,6 +547,98 @@ const subscriptionTerms = defineAction<SubscriptionTermsParams>({
       done.push(`quantity set to ${p.quantity}`);
     }
     return { ok: true, text: `Subscription ${p.subscriptionId}: ${done.join(", ")}.` };
+  },
+});
+
+interface SubscriptionCreateParams {
+  customerId: string;
+  priceId: string;
+  quantity?: number;
+  promoCode?: string;
+  trialDays?: number;
+  collection: "charge" | "invoice";
+}
+
+const subscriptionCreate = defineAction<SubscriptionCreateParams>({
+  key: "subscription.create",
+  label: "Create subscription",
+  group: "Subscriptions",
+  defaultLevel: "none",
+  dangerous: true,
+  parseParams: (raw) => {
+    const o = obj(raw);
+    const customerId = o ? idWithPrefix(o.customerId, "cus_") : null;
+    const priceId = o ? idWithPrefix(o.priceId, "price_") : null;
+    const collection = o && (o.collection === "charge" || o.collection === "invoice") ? o.collection : null;
+    if (!customerId || !priceId || !collection) {
+      return { ok: false, error: "customerId (cus_…), priceId (price_…) and collection (charge|invoice) required" };
+    }
+    const trialDays = posInt(o!.trialDays) ?? undefined;
+    if (trialDays != null && trialDays > 730) return { ok: false, error: "trialDays must be ≤ 730" };
+    return {
+      ok: true,
+      params: {
+        customerId,
+        priceId,
+        quantity: posInt(o!.quantity) ?? undefined,
+        promoCode: str(o!.promoCode, 100) ?? undefined,
+        trialDays,
+        collection,
+      },
+    };
+  },
+  summarize: (p) =>
+    `Create a subscription for ${p.customerId} on ${p.priceId}` +
+    (p.quantity != null ? ` ×${p.quantity}` : "") +
+    (p.trialDays ? `, ${p.trialDays}-day trial` : "") +
+    (p.promoCode ? `, promo ${p.promoCode}` : "") +
+    (p.collection === "invoice" ? " (email invoice)" : " (charge the default payment method now)"),
+  revalidate: async (ctx, p) => {
+    const cus = requireCustomer(ctx);
+    if (!cus) return "No linked Stripe customer.";
+    if (p.customerId !== cus) return "Customer binding mismatch.";
+    const customer = await ctx.stripe.getCustomer(cus);
+    if (!customer || customer.deleted) return "Customer no longer exists in Stripe.";
+    const price = await ctx.stripe.getPrice(p.priceId).catch(() => null);
+    if (!price || !price.recurring) return "Price does not exist or is not recurring.";
+    if (!price.active) return "Price is archived.";
+    const allowlist = ctx.settingsStore.allowedPriceIds();
+    if (allowlist.length > 0 && !allowlist.includes(p.priceId)) return "Price is not on the plan allowlist (/config → Billing).";
+    if (p.promoCode) {
+      const codes = await ctx.stripe.findPromotionCodes(p.promoCode);
+      if (!codes.some((c) => c.active)) return "Promo code not found or inactive.";
+    }
+    // Charge-now needs something to charge: no trial softens the first invoice.
+    if (
+      p.collection === "charge" &&
+      !p.trialDays &&
+      !customer.invoice_settings?.default_payment_method &&
+      !customer.default_source
+    ) {
+      return "Customer has no default payment method — collect by invoice, add a trial, or attach a card first.";
+    }
+    return null;
+  },
+  execute: async (ctx, p) => {
+    let promotionCodeId: string | undefined;
+    if (p.promoCode) {
+      const codes = await ctx.stripe.findPromotionCodes(p.promoCode);
+      const active = codes.find((c) => c.active);
+      if (!active) return { ok: false, error: "Promo code not found or inactive." };
+      promotionCodeId = active.id;
+    }
+    const sub = await ctx.stripe.createSubscription(
+      {
+        customerId: p.customerId,
+        priceId: p.priceId,
+        quantity: p.quantity,
+        promotionCodeId,
+        trialDays: p.trialDays,
+        collection: p.collection,
+      },
+      `panel-subcreate-${p.customerId}-${p.priceId}-${ctx.idemScope}`
+    );
+    return { ok: true, text: `Subscription ${sub.id} created (${sub.status}).` };
   },
 });
 
@@ -810,8 +960,11 @@ const customerBalance = defineAction<CustomerBalanceParams>({
 });
 
 interface CustomerPaymentMethodParams {
+  // pm_… everywhere; op "attach" also accepts a card token (tok_…) which is
+  // first minted into a PaymentMethod server-side.
   paymentMethodId: string;
-  op: "detach" | "set_default";
+  op: "detach" | "set_default" | "attach";
+  makeDefault?: boolean;
 }
 
 const customerPaymentMethod = defineAction<CustomerPaymentMethodParams>({
@@ -822,26 +975,120 @@ const customerPaymentMethod = defineAction<CustomerPaymentMethodParams>({
   dangerous: false,
   parseParams: (raw) => {
     const o = obj(raw);
-    const paymentMethodId = o ? idWithPrefix(o.paymentMethodId, "pm_") : null;
-    const op = o && (o.op === "detach" || o.op === "set_default") ? o.op : null;
-    if (!paymentMethodId || !op) return { ok: false, error: "paymentMethodId (pm_…) and op (detach|set_default) required" };
-    return { ok: true, params: { paymentMethodId, op } };
+    const op = o && (o.op === "detach" || o.op === "set_default" || o.op === "attach") ? o.op : null;
+    const paymentMethodId = o
+      ? op === "attach"
+        ? (idWithPrefix(o.paymentMethodId, "pm_") ?? idWithPrefix(o.paymentMethodId, "tok_"))
+        : idWithPrefix(o.paymentMethodId, "pm_")
+      : null;
+    if (!paymentMethodId || !op) {
+      return { ok: false, error: "paymentMethodId (pm_…, attach also tok_…) and op (detach|set_default|attach) required" };
+    }
+    return { ok: true, params: { paymentMethodId, op, makeDefault: o?.makeDefault === true } };
   },
-  summarize: (p) => `${p.op === "detach" ? "Detach" : "Set as default"} payment method ${p.paymentMethodId}`,
+  summarize: (p) =>
+    p.op === "attach"
+      ? `Attach payment method ${p.paymentMethodId}${p.makeDefault ? " and set as default" : ""}`
+      : `${p.op === "detach" ? "Detach" : "Set as default"} payment method ${p.paymentMethodId}`,
   revalidate: async (ctx, p) => {
     const cus = requireCustomer(ctx);
     if (!cus) return "No linked Stripe customer.";
+    if (p.op === "attach") {
+      const customer = await ctx.stripe.getCustomer(cus);
+      if (!customer || customer.deleted) return "Customer no longer exists in Stripe.";
+      if (p.paymentMethodId.startsWith("pm_")) {
+        const pm = await ctx.stripe.getPaymentMethod(p.paymentMethodId).catch(() => null);
+        if (!pm) return "Payment method does not exist.";
+        const owner = typeof pm.customer === "string" ? pm.customer : pm.customer?.id ?? null;
+        if (owner && owner !== cus) return "Payment method belongs to a different customer.";
+      }
+      return null;
+    }
     const methods = await ctx.stripe.listAllPaymentMethods(cus);
     if (!methods.some((m) => m.id === p.paymentMethodId)) return "Payment method is not attached to this customer.";
     return null;
   },
   execute: async (ctx, p) => {
+    if (p.op === "attach") {
+      let pmId = p.paymentMethodId;
+      if (pmId.startsWith("tok_")) {
+        const created = await ctx.stripe.createPaymentMethodFromToken(pmId, `panel-pmtok-${ctx.idemScope}`);
+        pmId = created.id;
+      }
+      const pm = await ctx.stripe.attachPaymentMethod(pmId, ctx.stripeCustomerId!);
+      if (p.makeDefault) await ctx.stripe.setDefaultPaymentMethod(ctx.stripeCustomerId!, pm.id);
+      const label = pm.type === "card" && pm.card ? `${pm.card.brand} ···· ${pm.card.last4}` : pm.id;
+      return { ok: true, text: `Payment method ${label} (${pm.id}) attached${p.makeDefault ? " and set as default" : ""}.` };
+    }
     if (p.op === "detach") {
       await ctx.stripe.detachPaymentMethod(p.paymentMethodId);
       return { ok: true, text: `Payment method ${p.paymentMethodId} detached.` };
     }
     await ctx.stripe.setDefaultPaymentMethod(ctx.stripeCustomerId!, p.paymentMethodId);
     return { ok: true, text: `Payment method ${p.paymentMethodId} set as default.` };
+  },
+});
+
+interface ChargeCreateParams {
+  amountMinor: number;
+  currency: string;
+  paymentMethodId?: string;
+  description?: string;
+}
+
+// Off-session charge of a SAVED payment method (no customer present). The
+// hardest new money primitive: T1 typed-CONFIRM via `dangerous` plus an
+// unconditional T2 step-up in Dashboard.ts.
+const chargeCreate = defineAction<ChargeCreateParams>({
+  key: "charge.create",
+  label: "Charge saved payment method",
+  group: "Charges",
+  defaultLevel: "none",
+  dangerous: true,
+  parseParams: (raw) => {
+    const o = obj(raw);
+    const amountMinor = o ? posInt(o.amountMinor) : null;
+    const currency = o ? str(o.currency, 3)?.toLowerCase() : null;
+    if (!amountMinor || !currency || !/^[a-z]{3}$/.test(currency)) {
+      return { ok: false, error: "positive amountMinor and 3-letter currency required" };
+    }
+    return {
+      ok: true,
+      params: {
+        amountMinor,
+        currency,
+        paymentMethodId: idWithPrefix(o!.paymentMethodId, "pm_") ?? undefined,
+        description: str(o!.description, 300) ?? undefined,
+      },
+    };
+  },
+  summarize: (p, stripe) =>
+    `Charge ${fmt(stripe, p.amountMinor, p.currency)} off-session to ${p.paymentMethodId ?? "the default payment method"}`,
+  revalidate: async (ctx, p) => {
+    const cus = requireCustomer(ctx);
+    if (!cus) return "No linked Stripe customer.";
+    const customer = await ctx.stripe.getCustomer(cus);
+    if (!customer || customer.deleted) return "Customer no longer exists in Stripe.";
+    if (p.paymentMethodId) {
+      const methods = await ctx.stripe.listAllPaymentMethods(cus);
+      if (!methods.some((m) => m.id === p.paymentMethodId)) return "Payment method is not attached to this customer.";
+    } else if (!customer.invoice_settings?.default_payment_method && !customer.default_source) {
+      return "Customer has no default payment method — pick a saved card explicitly.";
+    }
+    return null;
+  },
+  execute: async (ctx, p) => {
+    const pi = await ctx.stripe.createManualPaymentIntent(
+      {
+        customerId: ctx.stripeCustomerId!,
+        amountMinor: p.amountMinor,
+        currency: p.currency,
+        paymentMethodId: p.paymentMethodId,
+        description: p.description ?? `Off-session charge via ${ctx.actor.kind} panel (${ctx.actor.name})`,
+      },
+      `panel-charge-${p.amountMinor}-${p.currency}-${ctx.idemScope}`
+    );
+    return { ok: true, text: `Charged ${fmt(ctx.stripe, p.amountMinor, p.currency)} — payment intent ${pi.id} (${pi.status}).` };
   },
 });
 
@@ -904,10 +1151,12 @@ export const BILLING_ACTIONS: BillingActionDef[] = [
   refundPartial,
   refundFraud,
   paymentIntentCancel,
+  chargeCreate,
   subscriptionCancel,
   subscriptionPauseResume,
   subscriptionChangePlan,
   subscriptionTerms,
+  subscriptionCreate,
   invoiceCollect,
   invoiceFinalize,
   invoiceVoid,

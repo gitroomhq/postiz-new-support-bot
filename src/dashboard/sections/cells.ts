@@ -27,9 +27,23 @@ export function idCell(v: string, opts: { ref?: ObjectRef; copy?: boolean } = {}
   return { t: "id", v, ...(opts.ref ? { ref: opts.ref } : {}), ...(opts.copy ? { copy: true } : {}) };
 }
 
+// Currencies Stripe treats as zero-decimal (mirror of StripeClient's set —
+// kept local so cells.ts stays dependency-light for test fakes).
+const ZERO_DECIMAL = new Set([
+  "bif", "clp", "djf", "gnf", "jpy", "kmf", "krw", "mga", "pyg", "rwf", "ugx", "vnd", "vuv", "xaf", "xof", "xpf",
+]);
+
 // Stripe amount atom: "€29.00 EUR" (+ optional status pill in the same cell).
+// major rides along so the client can sum selections for bulk ceremonies.
 export function amount(fmt: AmountFormatter, amountMinor: number, currency: string, badge?: Badge): Cell {
-  return { t: "amount", v: fmt.formatAmount(amountMinor, currency), cur: currency.toUpperCase(), ...(badge ? { badge } : {}) };
+  const major = ZERO_DECIMAL.has(currency.toLowerCase()) ? amountMinor : amountMinor / 100;
+  return {
+    t: "amount",
+    v: fmt.formatAmount(amountMinor, currency),
+    cur: currency.toUpperCase(),
+    major,
+    ...(badge ? { badge } : {}),
+  };
 }
 
 export function money(fmt: AmountFormatter, amountMinor: number, currency: string, tone?: "pos" | "neg" | "muted"): Cell {

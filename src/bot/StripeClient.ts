@@ -524,6 +524,23 @@ export class StripeClient {
     }
   }
 
+  // First-invoice preview for a subscription that does NOT exist yet (the
+  // create-subscription composer). trial_end shifts the first collection.
+  async previewNewSubscription(params: {
+    customerId: string;
+    priceId: string;
+    quantity?: number;
+    trialEndUnix?: number;
+  }): Promise<Stripe.Invoice> {
+    return this.stripe.invoices.createPreview({
+      customer: params.customerId,
+      subscription_details: {
+        items: [{ price: params.priceId, ...(params.quantity ? { quantity: params.quantity } : {}) }],
+        ...(params.trialEndUnix ? { trial_end: params.trialEndUnix } : {}),
+      },
+    });
+  }
+
   // Free-text charge search for the palette (email/description substring).
   // Search API: eventually consistent (~1min), never used in revalidators.
   async searchChargesByTerm(term: string, limit = 5): Promise<Stripe.Charge[]> {
@@ -556,7 +573,11 @@ export class StripeClient {
   }
 
   async getSubscription(subscriptionId: string): Promise<Stripe.Subscription> {
-    return this.stripe.subscriptions.retrieve(subscriptionId, { expand: ["discounts.source.coupon"] });
+    // default_payment_method is expanded so panels can show brand+last4
+    // instead of a raw pm_ id without a second round-trip.
+    return this.stripe.subscriptions.retrieve(subscriptionId, {
+      expand: ["discounts.source.coupon", "default_payment_method"],
+    });
   }
 
   async listRecurringPrices(limit = 100): Promise<Stripe.Price[]> {
@@ -612,6 +633,7 @@ export class StripeClient {
     params: {
       customerId: string;
       priceId: string;
+      quantity?: number;
       couponId?: string;
       promotionCodeId?: string;
       trialDays?: number;
@@ -622,7 +644,7 @@ export class StripeClient {
     return this.stripe.subscriptions.create(
       {
         customer: params.customerId,
-        items: [{ price: params.priceId }],
+        items: [{ price: params.priceId, ...(params.quantity ? { quantity: params.quantity } : {}) }],
         ...(params.couponId
           ? { discounts: [{ coupon: params.couponId }] }
           : params.promotionCodeId
@@ -648,6 +670,9 @@ export class StripeClient {
       priceId: string;
       prorationBehavior: "create_prorations" | "none";
       discounts?: "clear" | string;
+      promotionCodeId?: string;
+      quantity?: number;
+      billingCycleAnchor?: "now";
       prorationDate?: number;
     },
     idempotencyKey: string
@@ -655,16 +680,19 @@ export class StripeClient {
     return this.stripe.subscriptions.update(
       params.subscriptionId,
       {
-        items: [{ id: params.itemId, price: params.priceId }],
+        items: [{ id: params.itemId, price: params.priceId, ...(params.quantity ? { quantity: params.quantity } : {}) }],
         proration_behavior: params.prorationBehavior,
+        ...(params.billingCycleAnchor === "now" ? { billing_cycle_anchor: "now" as const } : {}),
         ...(params.prorationDate && params.prorationBehavior === "create_prorations"
           ? { proration_date: params.prorationDate }
           : {}),
-        ...(params.discounts === "clear"
-          ? { discounts: "" }
-          : params.discounts
-            ? { discounts: [{ coupon: params.discounts }] }
-            : {}),
+        ...(params.promotionCodeId
+          ? { discounts: [{ promotion_code: params.promotionCodeId }] }
+          : params.discounts === "clear"
+            ? { discounts: "" }
+            : params.discounts
+              ? { discounts: [{ coupon: params.discounts }] }
+              : {}),
       },
       { idempotencyKey }
     );
@@ -1067,7 +1095,16 @@ export class StripeClient {
   }
 
   async createPromotionCode(
-    params: { coupon: string; code?: string; maxRedemptions?: number; expiresAt?: number },
+    params: {
+      coupon: string;
+      code?: string;
+      maxRedemptions?: number;
+      expiresAt?: number;
+      minimumAmountMinor?: number;
+      minimumAmountCurrency?: string;
+      firstTimeTransaction?: boolean;
+      customerId?: string;
+    },
     idempotencyKey: string
   ): Promise<Stripe.PromotionCode> {
     return this.stripe.promotionCodes.create(
@@ -1076,6 +1113,17 @@ export class StripeClient {
         ...(params.code ? { code: params.code } : {}),
         ...(params.maxRedemptions ? { max_redemptions: params.maxRedemptions } : {}),
         ...(params.expiresAt ? { expires_at: params.expiresAt } : {}),
+        ...(params.customerId ? { customer: params.customerId } : {}),
+        ...(params.minimumAmountMinor != null || params.firstTimeTransaction
+          ? {
+              restrictions: {
+                ...(params.minimumAmountMinor != null
+                  ? { minimum_amount: params.minimumAmountMinor, minimum_amount_currency: params.minimumAmountCurrency }
+                  : {}),
+                ...(params.firstTimeTransaction ? { first_time_transaction: true } : {}),
+              },
+            }
+          : {}),
         expand: ["promotion.coupon"],
       },
       { idempotencyKey }
@@ -1114,6 +1162,9 @@ export class StripeClient {
       currency?: string;
       duration: "once" | "forever" | "repeating";
       durationInMonths?: number;
+      maxRedemptions?: number;
+      redeemByUnix?: number;
+      appliesToProducts?: string[];
     },
     idempotencyKey: string
   ): Promise<Stripe.Coupon> {
@@ -1125,6 +1176,9 @@ export class StripeClient {
         ...(params.amountOffMinor != null ? { amount_off: params.amountOffMinor, currency: params.currency } : {}),
         duration: params.duration,
         ...(params.durationInMonths ? { duration_in_months: params.durationInMonths } : {}),
+        ...(params.maxRedemptions ? { max_redemptions: params.maxRedemptions } : {}),
+        ...(params.redeemByUnix ? { redeem_by: params.redeemByUnix } : {}),
+        ...(params.appliesToProducts?.length ? { applies_to: { products: params.appliesToProducts } } : {}),
       },
       { idempotencyKey }
     );
@@ -1157,6 +1211,39 @@ export class StripeClient {
 
   async detachPaymentMethod(paymentMethodId: string): Promise<void> {
     await this.stripe.paymentMethods.detach(paymentMethodId);
+  }
+
+  // Attach an existing (floating) PaymentMethod to a customer. PMs created via
+  // Elements/API/token float free until attached; Stripe rejects the attach if
+  // the PM already belongs to a different customer.
+  async attachPaymentMethod(paymentMethodId: string, customerId: string): Promise<Stripe.PaymentMethod> {
+    return this.stripe.paymentMethods.attach(paymentMethodId, { customer: customerId });
+  }
+
+  // Server-side PM creation from a card TOKEN (tok_…) — raw card numbers never
+  // touch this server; tokens come from Stripe.js or test fixtures.
+  async createPaymentMethodFromToken(token: string, idempotencyKey?: string): Promise<Stripe.PaymentMethod> {
+    return this.stripe.paymentMethods.create(
+      { type: "card", card: { token } },
+      idempotencyKey ? { idempotencyKey } : undefined
+    );
+  }
+
+  // Off-session SetupIntent for saving a card without charging it. The
+  // client_secret is deliberately never surfaced in panels — it is only useful
+  // to a Stripe.js confirm flow on the customer's device.
+  async createSetupIntent(
+    params: { customerId: string; paymentMethodId?: string },
+    idempotencyKey?: string
+  ): Promise<Stripe.SetupIntent> {
+    return this.stripe.setupIntents.create(
+      {
+        customer: params.customerId,
+        usage: "off_session",
+        ...(params.paymentMethodId ? { payment_method: params.paymentMethodId } : {}),
+      },
+      idempotencyKey ? { idempotencyKey } : undefined
+    );
   }
 
   async setDefaultPaymentMethod(customerId: string, paymentMethodId: string): Promise<void> {
@@ -1241,14 +1328,17 @@ export class StripeClient {
     itemId: string;
     priceId: string;
     prorationDate: number;
+    quantity?: number;
+    billingCycleAnchor?: "now" | "unchanged";
   }): Promise<Stripe.Invoice> {
     return this.stripe.invoices.createPreview({
       customer: params.customerId,
       subscription: params.subscriptionId,
       subscription_details: {
-        items: [{ id: params.itemId, price: params.priceId }],
+        items: [{ id: params.itemId, price: params.priceId, ...(params.quantity ? { quantity: params.quantity } : {}) }],
         proration_behavior: "create_prorations",
         proration_date: params.prorationDate,
+        ...(params.billingCycleAnchor === "now" ? { billing_cycle_anchor: "now" as const } : {}),
       },
     });
   }
@@ -1540,6 +1630,18 @@ export class StripeClient {
       },
       idempotencyKey ? { idempotencyKey } : undefined
     );
+  }
+
+  // ---- test clocks (test mode only — the "Run simulation" affordance) ----
+
+  async getTestClock(clockId: string): Promise<Stripe.TestHelpers.TestClock> {
+    return this.stripe.testHelpers.testClocks.retrieve(clockId);
+  }
+
+  // frozenTime must be >= the clock's current frozen_time; Stripe replays all
+  // billing activity (renewals, invoices, dunning) up to the new time.
+  async advanceTestClock(clockId: string, frozenTime: number): Promise<Stripe.TestHelpers.TestClock> {
+    return this.stripe.testHelpers.testClocks.advance(clockId, { frozen_time: frozenTime });
   }
 
   // Currencies Stripe treats as zero-decimal: the minor unit IS the major unit.
