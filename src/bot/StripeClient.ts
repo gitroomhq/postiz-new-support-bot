@@ -347,14 +347,18 @@ export class StripeClient {
     // reachable from the read-only MCP server, where the term is model-supplied.
     const safe = term.replace(/["\\]/g, "").trim();
     if (safe.length < 2) return [];
-    const res = await this.stripe.customers.search({
-      query: `name~"${safe}" OR email~"${safe}"`,
-      limit,
+    const query = `name~"${safe}" OR email~"${safe}"`;
+    try {
       // Same expansion as listCustomersPage so the list's has-subscription
-      // filter works on search results too.
-      expand: ["data.subscriptions"],
-    });
-    return res.data;
+      // filter works on search results too — but search endpoints can refuse
+      // sub-list expansions that list endpoints allow, so degrade rather
+      // than kill the search box.
+      const res = await this.stripe.customers.search({ query, limit, expand: ["data.subscriptions"] });
+      return res.data;
+    } catch {
+      const res = await this.stripe.customers.search({ query, limit });
+      return res.data;
+    }
   }
 
   async getCustomer(customerId: string): Promise<Stripe.Customer | null> {
@@ -436,21 +440,29 @@ export class StripeClient {
     return { paymentIntents: res.data, hasMore: res.has_more };
   }
 
-  // Charge search shaped for the Payments LIST (customer + refunds expanded
-  // like listAllCharges, total_count for the footer). Powers the filters the
-  // list API can't express server-side — card fingerprint (the reverse-card
-  // sweep) and exact email. Queries are BUILT BY CALLERS from validated
-  // values only. Search lags live data by ~1 minute.
+  // Charge search shaped for the Payments LIST (customer expanded like
+  // listAllCharges, total_count for the footer). Powers the filters the list
+  // API can't express server-side — card fingerprint (the reverse-card sweep)
+  // and exact email. NO data.refunds expand: search endpoints refuse sub-LIST
+  // expansions that plain list endpoints allow (the refunded-date column
+  // degrades to "—" in sweep mode). If even data.customer is refused, retry
+  // bare — a degraded row beats a dead page. Queries are BUILT BY CALLERS
+  // from validated values only. Search lags live data by ~1 minute.
   async searchChargesForList(
     query: string,
     limit = 100
   ): Promise<{ charges: Stripe.Charge[]; totalCount: number | null }> {
-    const res = await this.stripe.charges.search({
-      query,
-      limit,
-      expand: ["data.customer", "data.refunds", "total_count"],
-    });
-    return { charges: res.data, totalCount: res.total_count ?? null };
+    try {
+      const res = await this.stripe.charges.search({
+        query,
+        limit,
+        expand: ["data.customer", "total_count"],
+      });
+      return { charges: res.data, totalCount: res.total_count ?? null };
+    } catch {
+      const res = await this.stripe.charges.search({ query, limit, expand: ["total_count"] });
+      return { charges: res.data, totalCount: res.total_count ?? null };
+    }
   }
 
   // Refunds of one charge (payment-detail timeline) or account-wide.

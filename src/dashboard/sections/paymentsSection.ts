@@ -346,14 +346,21 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
 
   // Search mode: fingerprint/email aren't list params, so the ROWS come from
   // charges.search (whole account, not just the recency window) — this is the
-  // reverse-card lookup. No cursor (one 100-row page + exact total).
+  // reverse-card lookup. No cursor (one 100-row page + exact total). A
+  // refused/failed search degrades to an empty table with an explanatory
+  // notice — it must never 500 the whole page.
   const searchMode = Boolean(fingerprint || emailFilter);
+  let searchFailed = false;
 
   const [chargeWindow, piWindow, efws, blockPage, searchCounts] = await Promise.all([
     searchMode
       ? ctx.stripe
           .searchChargesForList(searchQ(), WINDOW)
           .then((r) => ({ charges: r.charges, hasMore: (r.totalCount ?? r.charges.length) > r.charges.length }))
+          .catch(() => {
+            searchFailed = true;
+            return { charges: [] as Stripe.Charge[], hasMore: false };
+          })
       : customerScope
         ? ctx.stripe.listCharges(customerScope, WINDOW, cursorId)
         : ctx.stripe.listAllCharges({ limit: WINDOW, createdGte, createdLt, startingAfter: cursorId }),
@@ -683,12 +690,18 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
         rows,
         // Search mode has no starting_after cursor — one 100-row page.
         nextCursor: !searchMode && chargeWindow.hasMore && charges.length > 0 ? charges[charges.length - 1].id : null,
-        empty: hasInMemoryFilter ? "No payments match these filters (within this window)." : "No payments yet.",
+        empty: searchFailed
+          ? "Stripe Search refused this query — check the bot logs, or try the email/fingerprint without special characters."
+          : hasInMemoryFilter
+            ? "No payments match these filters (within this window)."
+            : "No payments yet.",
         ...(rows.length ? { footer: `${rows.length} item${rows.length === 1 ? "" : "s"}` } : {}),
         notice:
-          (searchMode
-            ? `Card/email filters sweep the WHOLE account via Stripe Search (~1 min lag; first ${WINDOW} matches shown). Incomplete attempts aren't searchable by card or email.`
-            : `Counts and filters cover the ${WINDOW} most recent payments${dateKey ? ` of the ${dateKey} window` : ""} per page — use Next for older ones. EFW matching covers the 100 most recent warnings.`) +
+          (searchFailed
+            ? "Stripe Search failed for this card/email sweep — the table is empty, NOT a real zero-matches result."
+            : searchMode
+              ? `Card/email filters sweep the WHOLE account via Stripe Search (~1 min lag; first ${WINDOW} matches shown). Incomplete attempts aren't searchable by card or email.`
+              : `Counts and filters cover the ${WINDOW} most recent payments${dateKey ? ` of the ${dateKey} window` : ""} per page — use Next for older ones. EFW matching covers the 100 most recent warnings.`) +
           // The wallet blind spot: Link/PayPal charges expose no card digits.
           (last4 || fingerprint || pmFilter
             ? " Wallet payments (Link/PayPal) expose no card digits — they never match card filters."

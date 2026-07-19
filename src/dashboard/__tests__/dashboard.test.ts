@@ -6309,3 +6309,18 @@ test("invoices + subscriptions filters (PA-13): server params thread through; no
   const subTable = manualOnly!.blocks.find((b) => b.type === "table") as TableBlock;
   assert.deepEqual(subTable.rows.map((r) => r.id), ["sub_manual"]);
 });
+
+test("search sweep resilience (PA-13.F): a refused charges.search renders an empty table + honest notice, never a 500", async () => {
+  const section = makePaymentsSection();
+  const ctx = paymentsCtx();
+  const stripe = ctx.stripe as unknown as Record<string, unknown>;
+  stripe.searchChargesForList = async () => {
+    throw new Error("expand[0] cannot be data.refunds on search");
+  };
+  stripe.countBySearch = async () => 0;
+  const page = await section.buildPage(ctx, { page: "payments", filters: { email: "ada@example.com" } });
+  const table = page!.blocks.find((b) => b.type === "table" && (b as TableBlock).key === "payments") as TableBlock;
+  assert.equal(table.rows.length, 0);
+  assert.match(table.notice!, /Search failed/);
+  assert.match(table.empty!, /refused this query/);
+});
