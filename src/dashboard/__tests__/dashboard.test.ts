@@ -4154,6 +4154,16 @@ test("client router (PA-8): id-less subpages round-trip (#/subscriptions/new is 
     params: { id: "sub_1" },
     filters: {},
   });
+  // Every sidebar entry ships a nav icon — icon-less items render misaligned.
+  const iconsBlock = clientApp.slice(clientApp.indexOf("D.NAV_ICONS"), clientApp.indexOf("D.navIcon ="));
+  const NAV_ROOTS = [
+    "home", "balances", "payments", "customers", "subscriptions", "invoices", "disputes", "catalog",
+    "links", "quotes", "approvals", "blocklist", "fraud", "portal", "meters", "bookmarks", "security",
+  ];
+  for (const root of NAV_ROOTS) {
+    assert.ok(new RegExp(`\\b${root}: "`).test(iconsBlock), `nav page "${root}" has no icon in D.NAV_ICONS`);
+  }
+
   // Topbar + Create: markup in the shell, bind + items in the client.
   const html = renderDashboardShell({ nonce: "n" });
   assert.ok(html.includes('id="createbtn"'));
