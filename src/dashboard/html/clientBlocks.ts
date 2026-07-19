@@ -100,9 +100,8 @@ D.renderCell = function (td, cell) {
     (cell.badges || []).forEach(function (b) { set.appendChild(D.badge(b)); });
     td.appendChild(set);
   } else if (cell.t === "date") {
-    var f = D.fmtRel(cell.iso);
-    var sp = D.el("span", null, f.rel);
-    sp.title = f.abs;
+    var sp = D.el("span", "nowrap", D.fmtAbs(cell.iso));
+    sp.title = D.fmtRel(cell.iso).rel;
     td.appendChild(sp);
   } else if (cell.t === "id") {
     if (cell.ref) {
@@ -515,9 +514,8 @@ D.renderTimeline = function (b) {
     } else {
       title.appendChild(document.createTextNode(it.label));
     }
-    var f = D.fmtRel(it.iso);
-    var when = D.el("span", "twhen", f.rel);
-    when.title = f.abs;
+    var when = D.el("span", "twhen", D.fmtAbs(it.iso));
+    when.title = D.fmtRel(it.iso).rel;
     title.appendChild(when);
     li.appendChild(title);
     if (it.text) li.appendChild(D.el("div", "ttext", it.text));
@@ -535,8 +533,23 @@ D.renderNotice = function (b) {
   return bar;
 };
 
+D.emptyIcon = function () {
+  var NS = "http://www.w3.org/2000/svg";
+  var tile = D.el("span", "eicon");
+  var svg = document.createElementNS(NS, "svg");
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("aria-hidden", "true");
+  var p = document.createElementNS(NS, "path");
+  p.setAttribute("d", "M4 7.5h16v9H4Zm0 0 8 5 8-5");
+  p.setAttribute("fill", "none"); p.setAttribute("stroke", "currentColor");
+  p.setAttribute("stroke-width", "1.6"); p.setAttribute("stroke-linejoin", "round");
+  svg.appendChild(p); tile.appendChild(svg);
+  return tile;
+};
+
 D.renderEmpty = function (b) {
   var box = D.el("div", "section emptybox");
+  box.appendChild(D.emptyIcon());
   box.appendChild(D.el("div", "etitle", b.title));
   if (b.hint) box.appendChild(D.el("div", "ehint", b.hint));
   return box;

@@ -276,8 +276,12 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
     const flags: Badge[] = [];
     if (isBlocked(c)) flags.push({ kind: "error", text: "BLOCKED" });
     if (efwChargeIds.has(c.id)) flags.push({ kind: "warn", text: "EFW" });
+    const custObj = c.customer && typeof c.customer !== "string" ? c.customer : null;
     const cus = typeof c.customer === "string" ? c.customer : c.customer?.id ?? null;
-    const email = c.billing_details?.email ?? c.receipt_email ?? null;
+    // Prefer the customer's name/email (Stripe's list look); fall back to the
+    // charge's billing/receipt email, then the raw id as a last resort.
+    const custName = custObj && !("deleted" in custObj) ? custObj.name ?? custObj.email ?? null : null;
+    const email = custName ?? c.billing_details?.email ?? c.receipt_email ?? null;
     return {
       id: c.id,
       ref: { page: "payments.detail", params: { id: c.id } },
@@ -412,7 +416,10 @@ async function chargeDetail(ctx: DashboardCtx, id: string): Promise<SectionPage>
   });
 
   const headBadges: Badge[] = [chargeBadge(charge)];
-  if (chargeDispute || charge.disputed) headBadges.push({ kind: "error", text: "Disputed" });
+  // Only add a "Disputed" flag when the status pill isn't already showing it
+  // (a refunded+disputed charge shows "Refunded" as status, so the flag adds info).
+  if ((chargeDispute || charge.disputed) && chargeBadge(charge).text !== "Disputed")
+    headBadges.push({ kind: "error", text: "Disputed" });
   if (hasEfw) headBadges.push({ kind: "warn", text: "EFW" });
   if (blocks.length > 0) headBadges.push({ kind: "error", text: "Blocked customer" });
 

@@ -39,7 +39,27 @@ D.el = function (tag, cls, text) {
   return e;
 };
 
-D.badge = function (b) { return D.el("span", "badge " + (b.kind || "info"), b.text); };
+// Stripe status pills carry a small leading glyph. Refunds get the return
+// arrow; otherwise the glyph follows the kind (✓ ok, ✗ error, ⓘ warn/info).
+D.BADGE_GLYPH = { ok: "\\u2713", error: "\\u2717", warn: "\\u24d8", info: "\\u24d8", neutral: "" };
+D.badge = function (b) {
+  var el = D.el("span", "badge " + (b.kind || "info"));
+  var txt = b.text || "";
+  var g = /refund/i.test(txt) && !/partial/i.test(txt) ? "\\u21a9" : D.BADGE_GLYPH[b.kind || "info"];
+  if (g) el.appendChild(D.el("span", "bg", g));
+  el.appendChild(document.createTextNode(txt));
+  return el;
+};
+
+// Absolute local timestamp ("Jul 18, 2026, 11:49 PM") for cells/timelines.
+D.fmtAbs = function (iso) {
+  var t = Date.parse(iso);
+  if (isNaN(t)) return iso;
+  try {
+    return new Date(t).toLocaleString(undefined,
+      { month: "short", day: "numeric", year: "numeric", hour: "numeric", minute: "2-digit" });
+  } catch (e) { return new Date(t).toLocaleString(); }
+};
 
 // Relative time from an ISO string; absolute local string on hover (title).
 D.fmtRel = function (iso) {

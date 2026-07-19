@@ -373,6 +373,9 @@ export class StripeClient {
   }): Promise<{ charges: Stripe.Charge[]; hasMore: boolean }> {
     const res = await this.stripe.charges.list({
       limit: opts.limit ?? 25,
+      // Expand the customer so the list can show a name/email (Stripe's look)
+      // instead of a raw cus_ id — one request, no per-row lookups.
+      expand: ["data.customer"],
       ...(opts.startingAfter ? { starting_after: opts.startingAfter } : {}),
       ...(opts.createdGte ? { created: { gte: opts.createdGte } } : {}),
     });

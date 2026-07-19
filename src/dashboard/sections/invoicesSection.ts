@@ -68,7 +68,9 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
       ...(invoice.id ? { ref: { page: "invoices.detail", params: { id: invoice.id } } } : {}),
       cells: [
         amount(ctx.stripe, invoice.total, invoice.currency, invoiceBadge(invoice.status)),
-        idCell(invoice.number ?? invoice.id ?? "draft", { copy: !!invoice.id }),
+        invoice.number
+          ? idCell(invoice.number, { copy: true })
+          : text("Draft"),
         customer
           ? ({ t: "link", v: invoice.customer_email ?? customer, ref: { page: "customers.detail", params: { id: customer } } } as Cell)
           : text(invoice.customer_email ?? "—"),

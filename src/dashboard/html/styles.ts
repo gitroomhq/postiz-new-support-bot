@@ -18,6 +18,12 @@ export function dashboardCss(): string {
     font-size:14px; transition:background .1s,color .1s; }
   #nav button:hover { background:var(--hover); }
   #nav button.active { background:var(--accent-weak); color:var(--accent); font-weight:600; }
+  #nav .navleft { display:flex; align-items:center; gap:9px; min-width:0; }
+  #nav .navico { width:16px; height:16px; color:var(--faint); flex:0 0 auto; display:inline-flex; }
+  #nav .navico svg { width:16px; height:16px; }
+  #nav button:hover .navico { color:var(--muted); }
+  #nav button.active .navico { color:var(--accent); }
+  #nav .navlabel { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   #nav .navcount { font-size:12px; font-weight:500; color:var(--danger); background:var(--danger-weak);
     border-radius:4px; padding:0 6px; }
   .mainwrap { display:flex; flex-direction:column; min-width:0; }
@@ -25,8 +31,8 @@ export function dashboardCss(): string {
     border-bottom:1px solid var(--border); color:var(--muted); font-size:13.5px; position:sticky; top:0;
     background:var(--bg); z-index:5; }
   .topbar .jumpwrap { flex:1; max-width:430px; position:relative; }
-  /* Search stays left; badge + identity + session controls pin to the right edge. */
-  .topbar #modebadge { margin-left:auto; }
+  /* Search stays left; identity + session controls pin to the right edge. */
+  .topbar .who { margin-left:auto; }
 
   /* Command palette (⌘K) under the topbar search box. */
   .palpop { position:absolute; top:calc(100% + 8px); left:0; width:560px; max-width:min(80vw,560px); z-index:30;
@@ -63,7 +69,6 @@ export function dashboardCss(): string {
     box-shadow:none; border-radius:var(--radius); }
   .topbar input#jump:focus { background:var(--surface); border-color:var(--accent); box-shadow:0 0 0 3px var(--ring); }
   .topbar .who { white-space:nowrap; }
-  body.testmode .topbar { box-shadow:inset 0 3px 0 #ed6704; }
   /* Stripe fills the viewport — no centered column cap. */
   main { padding:24px 40px 90px; width:100%; }
   #crumbs { display:flex; align-items:center; gap:6px; flex-wrap:wrap; color:var(--muted); font-size:13px; margin:0 0 10px; }
@@ -146,6 +151,9 @@ export function dashboardCss(): string {
   .tab:focus-visible { box-shadow:0 0 0 3px var(--ring); border-radius:4px; }
 
   /* Stripe atoms ------------------------------------------------------- */
+  .badge { display:inline-flex; align-items:center; gap:3px; }
+  .badge .bg { font-size:10px; line-height:1; opacity:.85; }
+  .nowrap { white-space:nowrap; }
   .strongname { font-weight:600; color:var(--heading); }
   a.reflink.strongname { color:var(--heading); }
   a.reflink.strongname:hover { color:var(--accent); text-decoration:none; }
@@ -156,16 +164,11 @@ export function dashboardCss(): string {
   .amountcell .badge { margin-left:9px; }
 
   .cardcell { display:inline-flex; align-items:center; gap:7px; }
-  .cardchip { display:inline-flex; align-items:center; justify-content:center; min-width:30px; height:19px;
-    padding:0 4px; border-radius:3px; font-size:9px; font-weight:700; letter-spacing:.04em; color:#fff;
-    background:#5b6470; }
-  .cardchip.visa { background:#1737c8; }
-  .cardchip.mastercard { background:#22232a; }
-  .cardchip.amex { background:#016fd0; }
-  .cardchip.discover { background:#e55c20; }
-  .cardchip.jcb { background:#0e4c96; }
-  .cardchip.diners { background:#0079be; }
-  .cardchip.unionpay { background:#045aa7; }
+  /* Stripe-style monochrome card-brand mark: a quiet bordered chip, not a
+     bold filled colour badge (true SVG brand logos can come later). */
+  .cardchip { display:inline-flex; align-items:center; justify-content:center; min-width:32px; height:20px;
+    padding:0 5px; border-radius:4px; font-size:9px; font-weight:700; letter-spacing:.04em; color:var(--muted);
+    background:var(--fill); border:1px solid var(--border-strong); }
   .cardnum { font-variant-numeric:tabular-nums; color:var(--heading); }
 
   .avcell { display:inline-flex; align-items:center; gap:8px; }
@@ -265,6 +268,9 @@ export function dashboardCss(): string {
   .noticebar .ntext { flex:1; min-width:200px; }
 
   .emptybox { text-align:center; color:var(--muted); padding:44px 16px; }
+  .emptybox .eicon { width:44px; height:44px; margin:0 auto 12px; border-radius:11px; background:var(--accent-weak);
+    color:var(--accent); display:flex; align-items:center; justify-content:center; }
+  .emptybox .eicon svg { width:22px; height:22px; }
   .emptybox .etitle { font-size:15px; font-weight:600; color:var(--heading); }
   .emptybox .ehint { font-size:13.5px; margin-top:4px; }
 

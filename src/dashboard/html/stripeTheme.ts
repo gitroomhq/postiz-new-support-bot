@@ -38,13 +38,13 @@ export function stripeBaseCss(): string {
     --bg:#ffffff; --surface:#ffffff; --fill:#f4f7fa; --hover:#f4f7fa;
     --border:#ecf1f6; --border-strong:#d8dee4;
     --text:#545969; --heading:#30313d; --muted:#687385; --faint:#99a5b2;
-    --accent:#533afd; --accent-hover:#4430d4; --accent-fg:#ffffff; --accent-weak:#efecff;
+    --accent:#635bff; --accent-hover:#5546e8; --accent-fg:#ffffff; --accent-weak:#f5f3ff;
     --ok:#006908; --ok-weak:#d7f7c2;
     --warn:#a82c00; --warn-weak:#fcedb9;
     --danger:#b3093c; --danger-strong:#df1b41; --danger-weak:#ffe9ee;
-    --info:#4430d4; --info-weak:#efecff;
+    --info:#5546e8; --info-weak:#f5f3ff;
     --neutral:#545969; --neutral-weak:#ebeef1;
-    --track:#d8dee4; --ring:rgba(83,58,253,.24);
+    --track:#d8dee4; --ring:rgba(99,91,255,.24);
     --shadow-sm:0 1px 1px rgba(33,37,44,.06);
     --shadow-card:0 1px 2px rgba(33,37,44,.05),0 2px 6px rgba(33,37,44,.04);
     --shadow-pop:0 15px 35px rgba(49,49,93,.18),0 5px 15px rgba(0,0,0,.12);

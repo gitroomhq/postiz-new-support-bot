@@ -86,9 +86,6 @@ D.loadPage = function () {
       }
       D.state.view = v;
       document.title = v.title + " · Billing";
-      document.body.classList.toggle("testmode", !!v.testMode);
-      D.q("modebadge").textContent = v.testMode ? "TEST MODE" : "LIVE";
-      D.q("modebadge").className = "badge " + (v.testMode ? "warn" : "ok");
       D.q("who").textContent = "Acting as " + v.actorLabel;
       D.renderNav(v);
       D.renderCrumbs(v);
@@ -118,6 +115,42 @@ D.loadPage = function () {
     });
 };
 
+// Line-style nav icons (16x16, stroke geometry only — CSP-safe, no images),
+// keyed by the nav root page.
+D.NAV_ICONS = {
+  home: "M2.5 8 8 3l5.5 5M4 7.2v6h3v-3.2h2v3.2h3v-6",
+  balances: "M2.6 4h10.8M2.6 8h10.8M2.6 12h6.8",
+  payments: "M2 4.6h12v6.8H2ZM2 7h12",
+  customers: "M8 8.2a2.4 2.4 0 1 0 0-4.8 2.4 2.4 0 0 0 0 4.8ZM3.6 13.4a4.4 4.4 0 0 1 8.8 0",
+  subscriptions: "M13 6a5 5 0 1 0 .3 4M13 2.8v3.3h-3.3",
+  invoices: "M4 2.6h5l3 3v7.8H4ZM9 2.6V5.7h3M6 8.4h4M6 10.4h4",
+  disputes: "M8 2.5 13 4.3v3.5c0 3-2.2 4.8-5 5.7-2.8-.9-5-2.7-5-5.7V4.3ZM8 6v2.6M8 10.6v.3",
+  catalog: "M8 2.3 13.4 5 8 7.7 2.6 5ZM2.6 5v6L8 13.7 13.4 11V5",
+  approvals: "M8 14.3A6.3 6.3 0 1 0 8 1.7a6.3 6.3 0 0 0 0 12.6ZM5.4 8l1.9 1.9L11 6.2",
+  blocklist: "M8 14.3A6.3 6.3 0 1 0 8 1.7a6.3 6.3 0 0 0 0 12.6ZM3.7 3.7l8.6 8.6",
+  fraud: "M8 2.5 13 4.3v3.5c0 3-2.2 4.8-5 5.7-2.8-.9-5-2.7-5-5.7V4.3Z",
+  bookmarks: "M4.2 2.9h7.6v10.2L8 10.6l-3.8 2.5Z",
+  security: "M4.6 7.4V6a3.4 3.4 0 0 1 6.8 0v1.4M3.9 7.4h8.2v6H3.9Z"
+};
+D.navIcon = function (page) {
+  var d = D.NAV_ICONS[(page || "").split(".")[0]];
+  if (!d) return null;
+  var NS = "http://www.w3.org/2000/svg";
+  var box = D.el("span", "navico");
+  var svg = document.createElementNS(NS, "svg");
+  svg.setAttribute("viewBox", "0 0 16 16");
+  svg.setAttribute("aria-hidden", "true");
+  var p = document.createElementNS(NS, "path");
+  p.setAttribute("d", d);
+  p.setAttribute("fill", "none");
+  p.setAttribute("stroke", "currentColor");
+  p.setAttribute("stroke-width", "1.5");
+  p.setAttribute("stroke-linecap", "round");
+  p.setAttribute("stroke-linejoin", "round");
+  svg.appendChild(p); box.appendChild(svg);
+  return box;
+};
+
 D.renderNav = function (v) {
   var nav = D.q("nav");
   nav.textContent = "";
@@ -128,7 +161,11 @@ D.renderNav = function (v) {
     lastGroup = group;
     var b = document.createElement("button");
     b.type = "button";
-    b.appendChild(D.el("span", null, item.label));
+    var left = D.el("span", "navleft");
+    var ico = D.navIcon(item.page);
+    if (ico) left.appendChild(ico);
+    left.appendChild(D.el("span", "navlabel", item.label));
+    b.appendChild(left);
     var count = D.navBadges && D.navBadges[item.key];
     if (count) b.appendChild(D.el("span", "navcount", count));
     if (item.key === v.activeNav) b.classList.add("active");
