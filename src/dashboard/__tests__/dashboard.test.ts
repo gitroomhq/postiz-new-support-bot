@@ -1147,7 +1147,6 @@ function homeCtx(): DashboardCtx {
     stripe: {
       formatAmount: (a: number, c: string) => `${(a / 100).toFixed(2)} ${c.toUpperCase()}`,
       getBalance: async () => ({ available: [{ amount: 12000, currency: "eur" }], pending: [{ amount: 500, currency: "eur" }] }),
-      countActiveSubscriptions: async () => ({ count: 100, truncated: true }),
       listEvents: async () => [
         { type: "charge.succeeded", created: now - 60, data: { object: { id: "ch_1", amount: 2900, currency: "eur" } } },
       ],
@@ -1661,7 +1660,10 @@ test("HomeMetrics: daily bucketing, truncation notes, TTL cache + singleflight, 
   const { HomeMetrics } = await import("../metrics/HomeMetrics");
   const now = Math.floor(Date.now() / 1000);
   let txCalls = 0;
+  let subsCalls = 0;
   const stripe = {
+    // Fakes ignore the created-range args — each slice of the sliced sweeps
+    // returns the same rows, and the id-dedupe merge collapses the repeats.
     listAccountBalanceTransactions: async () => {
       txCalls++;
       return {
@@ -1681,20 +1683,22 @@ test("HomeMetrics: daily bucketing, truncation notes, TTL cache + singleflight, 
       hasMore: false,
     }),
     listCustomersPage: async () => ({ customers: [{ id: "cus_1", created: now - 3600 }], hasMore: false }),
-    listAllSubscriptions: async () => ({
-      subscriptions: [
-        {
-          id: "sub_1",
-          items: {
-            data: [
-              { quantity: 2, price: { id: "p1", nickname: "Pro", currency: "eur", unit_amount: 2900, recurring: { interval: "month", interval_count: 1 } } },
-            ],
+    listAllSubscriptions: async () => {
+      subsCalls++;
+      return {
+        subscriptions: [
+          {
+            id: "sub_1",
+            items: {
+              data: [
+                { quantity: 2, price: { id: "p1", nickname: "Pro", currency: "eur", unit_amount: 2900, recurring: { interval: "month", interval_count: 1 } } },
+              ],
+            },
           },
-        },
-      ],
-      hasMore: false,
-    }),
-    countActiveSubscriptions: async () => ({ count: 137, truncated: false }),
+        ],
+        hasMore: false,
+      };
+    },
     countSucceededCharges: async () => 200,
   } as unknown as StripeClient;
   const settings = { disputeRatioWarnPct: () => 0.75, disputeRatioCriticalPct: () => 1.5 } as unknown as SettingsStoreType;
@@ -1706,16 +1710,27 @@ test("HomeMetrics: daily bucketing, truncation notes, TTL cache + singleflight, 
   assert.equal(gross!.currency, "EUR"); // top-volume currency wins; USD noted
   assert.match(gross!.note ?? "", /USD/);
   assert.equal(gross!.points.length, 7);
-  assert.equal(gross!.points[6].v, 29); // today's bucket in major units
-  // Cache: a second read within the TTL does not re-hit Stripe.
+  assert.equal(gross!.points[6].v, 29); // today's bucket in major units, deduped across slices
+  // Cache: a second read within the TTL does not re-hit Stripe (the first
+  // compute made one call per created-slice).
+  const txCallsAfterFirst = txCalls;
+  assert.ok(txCallsAfterFirst >= 1);
   await metrics.series("gross_volume", "7d");
-  assert.equal(txCalls, 1);
+  assert.equal(txCalls, txCallsAfterFirst);
 
   const failed = await metrics.series("failed_payments", "7d");
   assert.equal(failed!.points.reduce((s, p) => s + p.v, 0), 1);
 
+  // Shared active-subs sweep: the tile kicks it and never blocks (null on the
+  // very first read); the MRR chart awaits the SAME singleflight, and the
+  // tile count then derives from it with no second enumeration.
+  assert.equal(await metrics.activeSubsCount(), null);
   const mrr = await metrics.series("mrr_by_plan", "30d");
   assert.deepEqual(mrr!.points[0], { label: "Pro", v: 58 }); // 2 × €29
+  const subsCallsAfterSweep = subsCalls;
+  assert.ok(subsCallsAfterSweep >= 1);
+  assert.deepEqual(await metrics.activeSubsCount(), { count: 1, truncated: false });
+  assert.equal(subsCalls, subsCallsAfterSweep);
 
   const ratio = await metrics.series("dispute_ratio", "30d");
   assert.equal(ratio!.points.length, 6);

@@ -618,13 +618,18 @@ export class StripeClient {
     type?: string;
     payoutId?: string;
     createdGte?: number;
+    createdLt?: number;
   }): Promise<{ transactions: Stripe.BalanceTransaction[]; hasMore: boolean }> {
+    const created = {
+      ...(opts.createdGte ? { gte: opts.createdGte } : {}),
+      ...(opts.createdLt ? { lt: opts.createdLt } : {}),
+    };
     const res = await this.stripe.balanceTransactions.list({
       limit: opts.limit ?? 25,
       ...(opts.startingAfter ? { starting_after: opts.startingAfter } : {}),
       ...(opts.type ? { type: opts.type } : {}),
       ...(opts.payoutId ? { payout: opts.payoutId } : {}),
-      ...(opts.createdGte ? { created: { gte: opts.createdGte } } : {}),
+      ...(Object.keys(created).length ? { created } : {}),
     });
     return { transactions: res.data, hasMore: res.has_more };
   }
@@ -700,25 +705,6 @@ export class StripeClient {
       ...(opts.startingAfter ? { starting_after: opts.startingAfter } : {}),
     });
     return { events: res.data, hasMore: res.has_more };
-  }
-
-  // Active-subscription count for the Home stat tile. Stripe returns no
-  // totals, so this pages with a hard cap — capped counts report truncated
-  // and render as "N+".
-  async countActiveSubscriptions(maxPages = 2): Promise<{ count: number; truncated: boolean }> {
-    let count = 0;
-    let startingAfter: string | undefined;
-    for (let page = 0; page < maxPages; page++) {
-      const res = await this.stripe.subscriptions.list({
-        status: "active",
-        limit: 100,
-        ...(startingAfter ? { starting_after: startingAfter } : {}),
-      });
-      count += res.data.length;
-      if (!res.has_more || res.data.length === 0) return { count, truncated: false };
-      startingAfter = res.data[res.data.length - 1].id;
-    }
-    return { count, truncated: true };
   }
 
   // Account-wide subscription browse (dashboard Subscriptions list). Status
