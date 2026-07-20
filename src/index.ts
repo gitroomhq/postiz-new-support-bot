@@ -50,6 +50,9 @@ import { IntercomPanel } from "./intercom/panel/IntercomPanel";
 import { SlaRuleStore } from "./sla/SlaRuleStore";
 import { SlaFactsLoader } from "./sla/facts";
 import { SlaService } from "./sla/SlaService";
+import { SentryFeedbackClient } from "./sentry/SentryFeedbackClient";
+import { SentryFeedbackStore } from "./sentry/SentryFeedbackStore";
+import { SentryFeedbackImporter } from "./sentry/SentryFeedbackImporter";
 import { SlaSweeper } from "./intercom/SlaSweeper";
 import { SlaEnforcer } from "./intercom/SlaEnforcer";
 import { AssignmentService } from "./intercom/AssignmentService";
@@ -336,6 +339,9 @@ async function main() {
     stripeClient,
     settingsStore
   );
+  // Sentry feedback import ledger — also the exemption source for the
+  // inactivity sweeper (notes-only) and the SLA engines (fully exempt).
+  const sentryFeedbackStore = new SentryFeedbackStore(prisma);
   const slaService = new SlaService(
     prisma,
     settingsStore,
@@ -346,7 +352,8 @@ async function main() {
     ticketStore,
     sessionStore,
     auditLogger,
-    temporalProducers
+    temporalProducers,
+    sentryFeedbackStore
   );
   slaRuleStore.setOnChange(() => slaService.onRulesChanged());
   intercomExecutor.setSlaService(slaService);
@@ -368,7 +375,8 @@ async function main() {
     intercomStore,
     settingsStore,
     (fn) => intercomExecutor.withAuthor(fn),
-    assignmentService
+    assignmentService,
+    sentryFeedbackStore
   );
   intercomWebhookHandler.setSlaEnforcer(slaEnforcer);
 
@@ -437,6 +445,7 @@ async function main() {
   );
   // The client exists as soon as the constructor ran; nothing fires before login.
   bot.setSlaService(slaService);
+  bot.setSentryFeedbackStore(sentryFeedbackStore);
   auditLogger.bindClient(bot.client);
   billingActionService.bindClient(bot.client);
   intercomWebhookHandler.bindClient(bot.client);
@@ -599,9 +608,17 @@ async function main() {
   // Influx gauge snapshot body for the metricsSnapshotWorkflow's snapshotTick.
   const snapshotScheduler = new SnapshotScheduler(prisma, settingsStore);
   // Workspace inactivity sweeper body (native/unbridged Intercom objects).
-  const inactivitySweeper = new InactivitySweeper(intercomClient, intercomStore, settingsStore);
+  const inactivitySweeper = new InactivitySweeper(intercomClient, intercomStore, settingsStore, sentryFeedbackStore);
   // SLA safety-sweep body (slaSweepWorkflow's slaSweepTick).
   const slaSweeper = new SlaSweeper(intercomClient, intercomStore, settingsStore, slaService);
+  // Sentry feedback → Intercom import body (sentryFeedbackWorkflow's tick).
+  const sentryFeedbackClient = new SentryFeedbackClient(settingsStore);
+  const sentryFeedbackImporter = new SentryFeedbackImporter(
+    sentryFeedbackClient,
+    intercomClient,
+    sentryFeedbackStore,
+    settingsStore
+  );
 
   // ---- Temporal worker (all background work lives in workflows) ----
 
@@ -620,6 +637,7 @@ async function main() {
     inactivitySweeper,
     slaSweeper,
     slaEnforcer,
+    sentryFeedbackImporter,
     kbScheduler,
     snapshotScheduler,
     stripeWebhookHandler,

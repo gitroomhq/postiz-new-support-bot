@@ -77,7 +77,7 @@ const DEFAULT_TAGS: TagInput[] = [
   { emoji: "📁", label: "Closed", closesThread: true, reminderEnabled: false },
 ];
 
-// The six global secrets and their Vault KV home (one KV entry per
+// The seven global secrets and their Vault KV home (one KV entry per
 // integration; field names live inside the entry). Shared by the read
 // resolver, the write router, the panel state helper and the migrator.
 export type GlobalSecretColumn =
@@ -86,6 +86,7 @@ export type GlobalSecretColumn =
   | "stripeWebhookSecret"
   | "stripeSecretKey"
   | "sentryReadToken"
+  | "sentryWebhookSecret"
   | "influxToken";
 
 export const GLOBAL_SECRETS: Record<GlobalSecretColumn, { integration: VaultIntegration; field: string }> = {
@@ -94,6 +95,7 @@ export const GLOBAL_SECRETS: Record<GlobalSecretColumn, { integration: VaultInte
   stripeWebhookSecret: { integration: "stripe", field: "webhookSecret" },
   stripeSecretKey: { integration: "stripe", field: "secretKey" },
   sentryReadToken: { integration: "sentry", field: "readToken" },
+  sentryWebhookSecret: { integration: "sentry", field: "webhookSecret" },
   influxToken: { integration: "influx", field: "token" },
 };
 
@@ -123,7 +125,7 @@ export class SettingsStore {
     this.vault = vault;
   }
 
-  // ---- Vault secret plumbing (the six GLOBAL_SECRETS columns) ----
+  // ---- Vault secret plumbing (the seven GLOBAL_SECRETS columns) ----
 
   // Read path. A column holds one of: null/"" (not set), the vault:kv sentinel
   // (value lives in Vault KV → serve from the in-memory cache, null while the
@@ -1348,6 +1350,96 @@ export class SettingsStore {
     this.settings = await this.prisma.botSettings.update({
       where: { id: "global" },
       data,
+    });
+  }
+
+  // ---- Sentry feedback import (User Feedback widget → Intercom) ----
+
+  sentryReadEnabled(): boolean {
+    return this.settings.sentryReadEnabled;
+  }
+
+  // Org auth token (org:read, project:read, event:read). Vault-held or locally
+  // encrypted; deliberately NO env fallback (deploy has no .env access).
+  sentryReadToken(): string | null {
+    return this.resolveSecret(this.settings.sentryReadToken, "sentryReadToken");
+  }
+
+  // Sentry internal-integration client secret — verifies sentry-hook-signature
+  // on POST /sentry/webhook. Unset = the endpoint rejects everything and the
+  // polling looper carries delivery alone.
+  sentryWebhookSecret(): string | null {
+    return this.resolveSecret(this.settings.sentryWebhookSecret, "sentryWebhookSecret");
+  }
+
+  sentryOrgSlug(): string | null {
+    return this.settings.sentryOrgSlug?.trim() || null;
+  }
+
+  // Comma-separated project-slug allowlist; empty = import from all projects.
+  sentryFeedbackProjectSlugs(): string[] {
+    const raw = this.settings.sentryProjectSlug ?? "";
+    return [...new Set(raw.split(",").map((s) => s.trim().toLowerCase()).filter(Boolean))];
+  }
+
+  sentryReadRegion(): "us" | "eu" {
+    return this.settings.sentryReadRegion === "eu" ? "eu" : "us";
+  }
+
+  sentryFeedbackTeamId(): string | null {
+    return this.settings.sentryFeedbackTeamId;
+  }
+
+  // No-backfill floor, stamped at FIRST enable. Null = never enabled — a hard
+  // gate independent of the toggle (Sync Now force bypasses the toggle, never
+  // this). Deliberately not reset on disable: a re-enable imports the gap.
+  sentryFeedbackWatermarkAt(): Date | null {
+    return this.settings.sentryFeedbackWatermarkAt;
+  }
+
+  sentryFeedbackLastSyncAt(): Date | null {
+    return this.settings.sentryFeedbackLastSyncAt;
+  }
+
+  sentryFeedbackConfigured(): boolean {
+    return Boolean(this.sentryReadToken() && this.sentryOrgSlug() && this.sentryFeedbackWatermarkAt());
+  }
+
+  async updateSentryFeedback(data: {
+    sentryReadEnabled?: boolean;
+    sentryReadToken?: string | null;
+    sentryWebhookSecret?: string | null;
+    sentryOrgSlug?: string | null;
+    sentryProjectSlug?: string | null;
+    sentryReadRegion?: string;
+    sentryFeedbackTeamId?: string | null;
+    sentryFeedbackWatermarkAt?: Date;
+  }): Promise<void> {
+    const { sentryReadToken, sentryWebhookSecret, ...rest } = data;
+    this.settings = await this.prisma.botSettings.update({
+      where: { id: "global" },
+      data: {
+        ...rest,
+        // Secrets route vault-first with local-encryption fallback; an empty
+        // string / null clears them.
+        ...(sentryReadToken !== undefined
+          ? { sentryReadToken: await this.routeSecretWrite("sentryReadToken", sentryReadToken) }
+          : {}),
+        ...(sentryWebhookSecret !== undefined
+          ? { sentryWebhookSecret: await this.routeSecretWrite("sentryWebhookSecret", sentryWebhookSecret) }
+          : {}),
+      },
+    });
+  }
+
+  // Tick stamp: lastSyncAt always; the watermark only when the walk advanced it.
+  async recordSentryFeedbackSync(data: { lastSyncAt: Date; watermarkAt?: Date }): Promise<void> {
+    this.settings = await this.prisma.botSettings.update({
+      where: { id: "global" },
+      data: {
+        sentryFeedbackLastSyncAt: data.lastSyncAt,
+        ...(data.watermarkAt ? { sentryFeedbackWatermarkAt: data.watermarkAt } : {}),
+      },
     });
   }
 

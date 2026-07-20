@@ -1016,7 +1016,7 @@ function isContactNotRestorable(e: unknown): boolean {
   return e instanceof IntercomHttpError && /(not restorable|permanent deletion)/i.test(e.message);
 }
 
-function escapeHtmlText(text: string): string {
+export function escapeHtmlText(text: string): string {
   return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
 

@@ -4,6 +4,7 @@ import { IntercomClient, IntercomHttpError } from "./IntercomClient";
 import type { IntercomStore } from "./IntercomStore";
 import type { IntercomSweepConversation } from "./types";
 import type { AssignmentService, WithAuthor } from "./AssignmentService";
+import type { SentryFeedbackStore } from "../sentry/SentryFeedbackStore";
 import type { SlaEnforceResult } from "../temporal/types";
 import { evaluateClocks, CLOCK_LABELS, type ClockEvaluation, type ClockInput, type ClockMarkers } from "../sla/clocks";
 import { hasClockDurations, type SlaTargetEntry } from "../sla/types";
@@ -69,7 +70,8 @@ export class SlaEnforcer {
     private store: IntercomStore,
     private settingsStore: SettingsStore,
     private withAuthor: WithAuthor,
-    private assignment: AssignmentService
+    private assignment: AssignmentService,
+    private feedbackStore: SentryFeedbackStore | null = null
   ) {}
 
   // Unsnooze re-anchor: the next-reply clock restarts from the unsnooze
@@ -141,10 +143,12 @@ export class SlaEnforcer {
       await sleep(WRITE_SPACING_MS);
     };
 
-    // Batch state: sla_states + bridged links for the whole snapshot.
+    // Batch state: sla_states + bridged links + feedback imports for the
+    // whole snapshot.
     const ids = items.map((c) => c.id);
     const stateByConv = new Map<string, StateRow>();
     const linkByConv = new Map<string, { ticketThreadId: string; ticketId: string | null; lastTagsJson: unknown }>();
+    const feedbackConvIds = new Set<string>();
     for (const ch of chunk(ids, DB_CHUNK)) {
       const rows = await this.prisma.slaState.findMany({ where: { conversationId: { in: ch } } });
       for (const r of rows) if (r.conversationId) stateByConv.set(r.conversationId, r as unknown as StateRow);
@@ -160,6 +164,9 @@ export class SlaEnforcer {
             lastTagsJson: l.lastTagsJson,
           });
         }
+      }
+      if (this.feedbackStore) {
+        for (const id of await this.feedbackStore.filterImportedConversationIds(ch)) feedbackConvIds.add(id);
       }
     }
 
@@ -217,6 +224,11 @@ export class SlaEnforcer {
       for (const conv of items) {
         if (!budget()) break;
         if (!notSnoozed(conv)) continue;
+        // Imported Sentry feedback runs no clocks (applyForNative never writes
+        // a target, but this pass also honors hand-set live attributes — so
+        // the skip must live here too). Stray-assignment above still balances
+        // team-assigned imports, by design.
+        if (feedbackConvIds.has(conv.id)) continue;
         const state = stateByConv.get(conv.id) ?? null;
         // Effective target: our ledger first (covers pins — pinned writes land
         // in lastWrittenTarget), live attribute as fallback for subjects the

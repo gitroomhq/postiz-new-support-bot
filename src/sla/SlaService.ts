@@ -10,6 +10,7 @@ import { TicketStore } from "../bot/TicketStore";
 import { SessionStore } from "../auth/SessionStore";
 import { AuditLogger } from "../bot/AuditLogger";
 import { TemporalProducers } from "../temporal/producers";
+import type { SentryFeedbackStore } from "../sentry/SentryFeedbackStore";
 import { log } from "../util/logger";
 import { metricCount } from "../util/instrument";
 
@@ -54,7 +55,8 @@ export class SlaService {
     private ticketStore: TicketStore,
     private sessionStore: SessionStore,
     private auditLogger: AuditLogger,
-    private producers: TemporalProducers | null
+    private producers: TemporalProducers | null,
+    private feedbackStore: SentryFeedbackStore | null = null
   ) {}
 
   // ---- trigger entry points (fire-and-forget safe, never throw) ----
@@ -142,6 +144,12 @@ export class SlaService {
   async applyForNative(conversationId: string, reason: string): Promise<SlaApplyResult> {
     if (!this.settingsStore.slaEnabled()) return this.skipped("disabled");
     if (!this.settingsStore.intercomConfigured()) return this.skipped("intercom-unconfigured");
+    // Imported Sentry feedback is not a support request: no SLA target, no
+    // clocks (the enforcer skips them too). Single choke point — sweep,
+    // webhook hooks and manual apply all route through here.
+    if (this.feedbackStore && (await this.feedbackStore.getByConversationId(conversationId))) {
+      return this.skipped("sentry-feedback-import");
+    }
 
     const stateId = `c:${conversationId}`;
     const state = await this.getState(stateId);

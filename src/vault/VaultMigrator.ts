@@ -14,6 +14,7 @@ export const COLUMN_LABELS: Record<GlobalSecretColumn, string> = {
   stripeWebhookSecret: "Stripe webhook signing secret",
   stripeSecretKey: "Stripe API key",
   sentryReadToken: "Sentry read token",
+  sentryWebhookSecret: "Sentry webhook secret",
   influxToken: "InfluxDB token",
 };
 

@@ -12,6 +12,7 @@ import {
   disputesRunNowSignal,
   inactivityRunNowSignal,
   kbRefreshNowSignal,
+  sentryFeedbackRunNowSignal,
   slaEnforceRunNowSignal,
   slaRunNowSignal,
 } from "./definitions";
@@ -134,6 +135,26 @@ export async function slaEnforceWorkflow(): Promise<void> {
     await inactivityActs.slaEnforceTick(force).catch(() => {});
     await canIfDue(() => continueWithMemo<typeof slaEnforceWorkflow>());
     await condition(() => runNow, 5 * 60_000);
+  }
+}
+
+// Sentry feedback → Intercom import: poll for new User Feedback widget
+// submissions and create Intercom conversations (agents reply there; Intercom
+// emails the submitter). 15-minute safety-net cadence — the POST
+// /sentry/webhook endpoint fires the runNow signal for near-real-time
+// imports. Gates (enabled/configured/watermark) re-read inside the activity,
+// so /config changes apply on the next tick.
+export async function sentryFeedbackWorkflow(): Promise<void> {
+  let runNow = false;
+  setHandler(sentryFeedbackRunNowSignal, () => {
+    runNow = true;
+  });
+  for (;;) {
+    const force = runNow;
+    runNow = false;
+    await inactivityActs.sentryFeedbackTick(force).catch(() => {});
+    await canIfDue(() => continueWithMemo<typeof sentryFeedbackWorkflow>());
+    await condition(() => runNow, 15 * 60_000);
   }
 }
 

@@ -38,6 +38,16 @@ export interface StripeWebhookRoute {
   handle: (event: Stripe.Event) => Promise<void>;
 }
 
+// Inbound Sentry webhook (internal integration) — a pure accelerator for the
+// feedback-sync looper: after signature verification the payload is DISCARDED
+// and onEvent() just fires the looper's run-now signal (the 15-min poll is
+// the delivery guarantee). Secret lives in BotSettings/Vault; unset = the
+// endpoint rejects everything.
+export interface SentryWebhookRoute {
+  getSecret: () => string | null;
+  onEvent: () => Promise<void>;
+}
+
 // Stripe panel (tokenized standalone page opened from the Intercom canvas).
 // GET exchanges the SINGLE-USE HMAC link token for an HttpOnly session cookie
 // (verified/consumed inside the route object); the API authenticates by that
@@ -83,7 +93,8 @@ export class CallbackServer {
     private stripeWebhook?: StripeWebhookRoute,
     private intercomPanel?: IntercomPanelRoute,
     private adminPanel?: AdminPanelRoute,
-    private dashboard?: DashboardRoute
+    private dashboard?: DashboardRoute,
+    private sentryWebhook?: SentryWebhookRoute
   ) {
     this.app = express();
     // req.ip drives the panel per-IP throttle. Without this, req.ip is the
@@ -313,6 +324,38 @@ export class CallbackServer {
       }
     );
 
+    // Sentry webhook (feedback-sync accelerator). Sentry signs internal-
+    // integration deliveries with sentry-hook-signature = hex(HMAC-SHA256 of
+    // the RAW body, integration client secret). Anything unverifiable → 403
+    // (Sentry does not retry 4xx — the poll covers the gap). After a valid
+    // signature the response is ALWAYS 200: onEvent is best-effort signaling,
+    // and sustained 5xx would make Sentry auto-disable the webhook.
+    this.app.head("/sentry/webhook", (_req, res) => {
+      res.sendStatus(200);
+    });
+    this.app.post(
+      "/sentry/webhook",
+      express.json({
+        limit: "1mb",
+        verify: (req, _res, buf) => {
+          (req as RawBodyRequest).rawBody = buf;
+        },
+      }),
+      async (req, res) => {
+        const secret = this.sentryWebhook?.getSecret();
+        const signature = req.header("sentry-hook-signature");
+        const raw = (req as RawBodyRequest).rawBody;
+        if (!this.sentryWebhook || !secret || !signature || !raw || !sentrySignatureMatches(raw, secret, signature)) {
+          metricCount("sentry.webhooks", 1, { accepted: false });
+          res.status(403).send("Forbidden");
+          return;
+        }
+        metricCount("sentry.webhooks", 1, { accepted: true });
+        await this.sentryWebhook.onEvent().catch(() => {});
+        res.status(200).send("ok");
+      }
+    );
+
     // Last middleware: reports unhandled route errors to Sentry (Express 5
     // forwards rejected async handlers here automatically). The route-level
     // try/catches above still own the HTTP response shape.
@@ -350,6 +393,15 @@ function signatureMatches(raw: Buffer, secret: string, header: string): boolean 
 
 // Canvas Kit signs with plain hex HMAC-SHA256 (no prefix) in X-Body-Signature.
 function canvasSignatureMatches(raw: Buffer, secret: string, header: string): boolean {
+  const expected = createHmac("sha256", secret).update(raw).digest("hex");
+  const a = createHash("sha256").update(header.trim().toLowerCase()).digest();
+  const b = createHash("sha256").update(expected).digest();
+  return timingSafeEqual(a, b);
+}
+
+// Sentry internal integrations sign with plain hex HMAC-SHA256 (no prefix) in
+// sentry-hook-signature. Exported for direct unit testing.
+export function sentrySignatureMatches(raw: Buffer, secret: string, header: string): boolean {
   const expected = createHmac("sha256", secret).update(raw).digest("hex");
   const a = createHash("sha256").update(header.trim().toLowerCase()).digest();
   const b = createHash("sha256").update(expected).digest();

@@ -18,6 +18,7 @@ import {
   SIG_INACTIVITY_RUN_NOW,
   SIG_SLA_RUN_NOW,
   SIG_SLA_ENFORCE_RUN_NOW,
+  SIG_SENTRY_FEEDBACK_RUN_NOW,
   SIG_INBOUND_EVENT,
   SIG_INTERCOM_CLEAR_OUTBOX,
   SIG_INTERCOM_ENQUEUE,
@@ -280,6 +281,16 @@ export class TemporalProducers {
     });
   }
 
+  // /config "Sync Now" button + the POST /sentry/webhook accelerator.
+  async sentryFeedbackRunNow(): Promise<GatewayResult> {
+    return this.temporal.signalWithStart({
+      workflowType: "sentryFeedbackWorkflow",
+      workflowId: SINGLETONS.sentryFeedback,
+      signalName: SIG_SENTRY_FEEDBACK_RUN_NOW,
+      options: looperStartOptions(SINGLETONS.sentryFeedback),
+    });
+  }
+
   // ---- baseline: retire dead singletons/schedules, then ensure the live ones ----
 
   // Idempotent; runs before the worker starts (boot / toggle ON) and on
@@ -300,6 +311,7 @@ export class TemporalProducers {
       ["inactivityLoopWorkflow", SINGLETONS.inactivityLoop],
       ["slaSweepWorkflow", SINGLETONS.slaSweep],
       ["slaEnforceWorkflow", SINGLETONS.slaEnforce],
+      ["sentryFeedbackWorkflow", SINGLETONS.sentryFeedback],
     ];
     for (const [type, id] of singles) {
       if (client) {

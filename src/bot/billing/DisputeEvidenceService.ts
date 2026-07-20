@@ -563,7 +563,7 @@ export class DisputeEvidenceService {
       }
     }
     if (email) {
-      for (const id of await ai.intercom.searchContactIdsByEmail(email).catch(() => [])) contactIds.add(id);
+      for (const c of await ai.intercom.searchContactsByEmail(email).catch(() => [])) contactIds.add(c.id);
     }
     if (contactIds.size === 0) return null;
 

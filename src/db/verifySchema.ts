@@ -45,6 +45,7 @@ const EXPECTED_COLUMNS: Record<string, string[]> = {
     "intercomSnoozeStatusTagId", "intercomLastInboundAt", "intercomModeChangedAt", "sentryDsn", "sentryEnvironment", "sentryTracesSampleRate", "sentryProfilesSampleRate",
     "sentryLogsEnabled", "sentryDebug", "sentrySendDefaultPii", "sentryAiRecordContent",
     "sentryReadEnabled", "sentryReadToken", "sentryOrgSlug", "sentryProjectSlug", "sentryReadRegion",
+    "sentryFeedbackTeamId", "sentryFeedbackWatermarkAt", "sentryFeedbackLastSyncAt", "sentryWebhookSecret",
     "aiModel", "aiModelLight",
     "aiEffortAsk", "aiEffortCause", "aiMaxBudgetUsdAsk", "aiMaxBudgetUsdCause", "aiPostizPrefetchEnabled",
     "aiPreviousRunsEnabled",
@@ -114,6 +115,10 @@ const EXPECTED_COLUMNS: Record<string, string[]> = {
   billing_notes: ["id", "objectType", "objectId", "authorId", "authorName", "text", "createdAt"],
   billing_bookmarks: ["id", "objectType", "objectId", "label", "addedById", "addedByName", "createdAt"],
   dispute_watches: ["id", "disputeId", "userId", "createdAt"],
+  sentry_feedback_imports: [
+    "id", "sentryIssueId", "sentryShortId", "projectSlug", "status", "contactEmail", "contactName",
+    "intercomContactId", "intercomConversationId", "pageUrl", "feedbackAt", "importedAt",
+  ],
   ai_runs: [
     "id", "agentName", "kind", "source", "model", "outcome", "sessionId", "batchId", "numTurns", "durationMs",
     "inputTokens", "outputTokens", "cacheReadTokens", "cacheCreationTokens", "costUsd", "toolCalls", "toolErrors",

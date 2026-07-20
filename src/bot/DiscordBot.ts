@@ -36,6 +36,7 @@ import {
 import { BotConfig } from "../config";
 import { embed as makeEmbed, COLORS } from "../util/embeds";
 import { SettingsStore, isUnicodeEmoji, ReminderTarget, type GlobalSecretColumn, type SecretState } from "../config/SettingsStore";
+import type { SentryFeedbackStore } from "../sentry/SentryFeedbackStore";
 import { EscalationTier, StatusTag } from "../generated/prisma/client";
 import { EscalationTierStore } from "../config/EscalationTierStore";
 import { SessionStore } from "../auth/SessionStore";
@@ -154,6 +155,9 @@ export class DiscordBot {
   private slaService: {
     onTicketTrigger(threadId: string, reason: "created" | "customer_reply"): Promise<void>;
   } | null = null;
+  // Sentry feedback import ledger — bound late from index.ts; the /config
+  // panel reads its counters.
+  private sentryFeedback: SentryFeedbackStore | null = null;
 
   private discordLog = log.child("discord");
 
@@ -227,6 +231,10 @@ export class DiscordBot {
     onTicketTrigger(threadId: string, reason: "created" | "customer_reply"): Promise<void>;
   }): void {
     this.slaService = service;
+  }
+
+  setSentryFeedbackStore(store: SentryFeedbackStore): void {
+    this.sentryFeedback = store;
   }
 
   // Late-bound from index.ts: the admin web-panel graph needs bot.client (created
@@ -1216,6 +1224,19 @@ export class DiscordBot {
       return;
     }
 
+    if (interaction.customId === "config_sentryfeedback_team_pick") {
+      if (!this.isAdmin(interaction)) {
+        await interaction.reply({ embeds: [makeEmbed("Administrator permission required.", COLORS.danger)], flags: 64 });
+        return;
+      }
+      const value = interaction.values[0];
+      const teamId = value === "__none__" ? null : value;
+      await this.settingsStore.updateSentryFeedback({ sentryFeedbackTeamId: teamId });
+      this.auditConfig(interaction, `Sentry feedback team routing → ${teamId ?? "unassigned"}`);
+      await interaction.update(await this.buildSentryFeedbackPanel());
+      return;
+    }
+
     if (interaction.customId.startsWith("config_intercom_")) {
       await this.handleIntercomSelect(interaction);
       return;
@@ -1831,6 +1852,13 @@ export class DiscordBot {
               ? `${sentryActive() ? "on" : "configured ⚠️ restart pending"} · traces ${s.sentryTracesSampleRate()} · logs ${s.sentryLogsEnabled() ? "on" : "off"}`
               : "off"
           }`,
+          `**Sentry Feedback:** ${
+            !s.sentryReadToken() || !s.sentryOrgSlug()
+              ? "off — not configured"
+              : s.sentryReadEnabled()
+                ? `on${s.sentryFeedbackLastSyncAt() ? ` · last sync <t:${Math.floor(s.sentryFeedbackLastSyncAt()!.getTime() / 1000)}:R>` : ""}`
+                : "configured · off"
+          }`,
           "",
           "The Intercom button below holds connection settings only. Bridge behavior, SLA rules, automation and maintenance are managed via **/intercom**.",
         ].join("\n")
@@ -1838,6 +1866,7 @@ export class DiscordBot {
     const buttons = new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder().setCustomId("config_intercom").setLabel("Intercom").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("config_sentry").setLabel("Sentry").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("config_sentryfeedback").setLabel("Sentry Feedback").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("config_back_main").setLabel("Back").setStyle(ButtonStyle.Secondary)
     );
     return { embeds: [embed], components: [buttons] };
@@ -2245,6 +2274,71 @@ export class DiscordBot {
     );
 
     return { embeds: [embed], components: [setupButtons, toggleButtons, actionButtons] };
+  }
+
+  // /config → Integrations → Sentry Feedback: User Feedback widget → Intercom
+  // import (agents reply in Intercom; Intercom emails the submitter). Async —
+  // shows live ledger counters and the resolved team name.
+  private async buildSentryFeedbackPanel() {
+    const s = this.settingsStore;
+    const stateLabel: Record<SecretState, string> = {
+      none: "_not set_",
+      local: "stored (local encryption)",
+      "local-unreadable": "⚠️ stored but unreadable — re-enter",
+      vault: "stored (Vault)",
+      "vault-unreachable": "stored (Vault) ⚠️ unreachable right now",
+    };
+    const base = s.resolvedPublicBaseUrl();
+    const watermark = s.sentryFeedbackWatermarkAt();
+    const lastSync = s.sentryFeedbackLastSyncAt();
+    const counts = (await this.sentryFeedback?.statusCounts().catch(() => null)) ?? null;
+    const teamId = s.sentryFeedbackTeamId();
+    const teamName = teamId ? await this.intercomClient.getTeamNameCached(teamId).catch(() => null) : null;
+    const projects = s.sentryFeedbackProjectSlugs();
+
+    const statusLine =
+      !s.sentryReadToken() || !s.sentryOrgSlug()
+        ? "**not configured** — set the read token and org slug below"
+        : !watermark
+          ? "**never enabled** — toggling on stamps the import floor (older feedback never imports)"
+          : s.sentryReadEnabled()
+            ? "**on** — webhook accelerator + 15-min poll"
+            : "**off** (Sync Now still runs a one-shot test)";
+
+    const embed = new EmbedBuilder()
+      .setTitle("Sentry Feedback → Intercom")
+      .setColor(0x5865f2)
+      .setDescription(
+        [
+          `**Status:** ${statusLine}`,
+          "",
+          `**Org:** ${s.sentryOrgSlug() ? `\`${s.sentryOrgSlug()}\`` : "_not set_"} · **Region:** ${s.sentryReadRegion().toUpperCase()}`,
+          `**Projects:** ${projects.length ? projects.map((p) => `\`${p}\``).join(", ") : "_all_"}`,
+          `**Read token:** ${stateLabel[s.secretState("sentryReadToken")]} · **Webhook secret:** ${stateLabel[s.secretState("sentryWebhookSecret")]}`,
+          `**Team routing:** ${teamId ? (teamName ?? `id ${teamId}`) : "_unassigned_"}`,
+          `**Import floor:** ${watermark ? `<t:${Math.floor(watermark.getTime() / 1000)}:f>` : "_not stamped_"} · **Last sync:** ${lastSync ? `<t:${Math.floor(lastSync.getTime() / 1000)}:R>` : "_never_"}`,
+          `**Imported:** ${counts?.imported ?? 0} · **Skipped (no email):** ${counts?.skippedNoEmail ?? 0}`,
+          `**Webhook URL:** ${base ? `\`${base}/sentry/webhook\`` : "⚠️ _no public URL — set one via Billing → Stripe Webhooks_"}`,
+          "",
+          "Each User Feedback widget item becomes an Intercom conversation authored by the submitter (email contact): replies are emailed to them and their answers thread back. Anonymous feedback is skipped. Create a Sentry **internal integration** (token scopes `org:read project:read event:read`), point its webhook at the URL above and paste its client secret here — unsigned posts are rejected and the 15-min poll covers delivery.",
+          "Feedback conversations get agent-idle notes but are never nagged, auto-closed or SLA-clocked. Disabling keeps the import floor: a re-enable imports the gap.",
+        ].join("\n")
+      );
+
+    const row1 = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId("config_sentryfeedback_toggle")
+        .setLabel(`Enabled: ${s.sentryReadEnabled() ? "on" : "off"}`)
+        .setStyle(s.sentryReadEnabled() ? ButtonStyle.Success : ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("config_sentryfeedback_creds").setLabel("Credentials").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("config_sentryfeedback_scope").setLabel("Org & Projects").setStyle(ButtonStyle.Primary)
+    );
+    const row2 = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId("config_sentryfeedback_team").setLabel("Team Routing").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("config_sentryfeedback_sync_now").setLabel("Sync Now").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("config_integrations").setLabel("Back").setStyle(ButtonStyle.Secondary)
+    );
+    return { embeds: [embed], components: [row1, row2] };
   }
 
   // /config → Analytics: InfluxDB export + AI ticket scoring. Async because it
@@ -3609,6 +3703,141 @@ export class DiscordBot {
       return;
     }
 
+    if (id === "config_sentryfeedback") {
+      await interaction.update(await this.buildSentryFeedbackPanel());
+      return;
+    }
+
+    if (id === "config_sentryfeedback_toggle") {
+      const enabling = !this.settingsStore.sentryReadEnabled();
+      // First enable stamps the no-backfill floor; disable/re-enable keeps it
+      // (a re-enable imports the gap, never pre-floor history).
+      const firstEnable = enabling && !this.settingsStore.sentryFeedbackWatermarkAt();
+      await this.settingsStore.updateSentryFeedback({
+        sentryReadEnabled: enabling,
+        ...(firstEnable ? { sentryFeedbackWatermarkAt: new Date() } : {}),
+      });
+      this.auditConfig(
+        interaction,
+        `Sentry feedback import → ${enabling ? "on" : "off"}${firstEnable ? " (import floor stamped — older feedback never imports)" : ""}`
+      );
+      await interaction.update(await this.buildSentryFeedbackPanel());
+      return;
+    }
+
+    if (id === "config_sentryfeedback_creds") {
+      const modal = new ModalBuilder()
+        .setCustomId("config_sentryfeedback_creds_modal")
+        .setTitle("Sentry Feedback Credentials");
+      modal.addComponents(
+        new ActionRowBuilder<TextInputBuilder>().addComponents(
+          new TextInputBuilder()
+            .setCustomId("read_token")
+            .setLabel("Org auth token (blank = keep, off = clear)")
+            .setStyle(TextInputStyle.Short)
+            .setRequired(false)
+        ),
+        new ActionRowBuilder<TextInputBuilder>().addComponents(
+          new TextInputBuilder()
+            .setCustomId("webhook_secret")
+            .setLabel("Webhook secret (blank = keep, off = clear)")
+            .setStyle(TextInputStyle.Short)
+            .setRequired(false)
+        )
+      );
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (id === "config_sentryfeedback_scope") {
+      const s = this.settingsStore;
+      const modal = new ModalBuilder().setCustomId("config_sentryfeedback_scope_modal").setTitle("Sentry Feedback Scope");
+      modal.addComponents(
+        new ActionRowBuilder<TextInputBuilder>().addComponents(
+          new TextInputBuilder()
+            .setCustomId("org_slug")
+            .setLabel("Org slug")
+            .setStyle(TextInputStyle.Short)
+            .setValue(s.sentryOrgSlug() ?? "")
+            .setRequired(false)
+        ),
+        new ActionRowBuilder<TextInputBuilder>().addComponents(
+          new TextInputBuilder()
+            .setCustomId("projects")
+            .setLabel("Project slugs (comma-separated, blank=all)")
+            .setStyle(TextInputStyle.Short)
+            .setValue(s.sentryFeedbackProjectSlugs().join(", "))
+            .setRequired(false)
+        ),
+        new ActionRowBuilder<TextInputBuilder>().addComponents(
+          new TextInputBuilder()
+            .setCustomId("region")
+            .setLabel("Region: us or eu")
+            .setStyle(TextInputStyle.Short)
+            .setValue(s.sentryReadRegion())
+            .setRequired(false)
+        )
+      );
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (id === "config_sentryfeedback_team") {
+      await interaction.deferUpdate();
+      try {
+        const teams = await this.intercomClient.listTeams();
+        const current = this.settingsStore.sentryFeedbackTeamId();
+        const select = new StringSelectMenuBuilder()
+          .setCustomId("config_sentryfeedback_team_pick")
+          .setPlaceholder("Team for imported feedback conversations")
+          .addOptions([
+            {
+              label: "— unassigned —",
+              value: "__none__",
+              description: "Imports land in the shared inbox",
+              default: !current,
+            },
+            ...teams.slice(0, 24).map((t) => ({
+              label: t.name.slice(0, 100),
+              value: t.id,
+              description: `id ${t.id}`,
+              default: t.id === current,
+            })),
+          ]);
+        await interaction.editReply({
+          embeds: [
+            makeEmbed(
+              "Imported feedback conversations get assigned to this team on creation (a team also opts them into balanced auto-assignment when that is enabled for it). Agents can reassign afterwards.",
+              COLORS.neutral
+            ),
+          ],
+          components: [
+            new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(select),
+            new ActionRowBuilder<ButtonBuilder>().addComponents(
+              new ButtonBuilder().setCustomId("config_sentryfeedback").setLabel("Back").setStyle(ButtonStyle.Secondary)
+            ),
+          ],
+        });
+      } catch (e) {
+        await interaction.followUp({
+          embeds: [makeEmbed(`Could not list Intercom teams: ${e instanceof Error ? e.message : e}`, COLORS.danger)],
+          flags: 64,
+        });
+      }
+      return;
+    }
+
+    if (id === "config_sentryfeedback_sync_now") {
+      await interaction.deferUpdate();
+      const result = await this.temporalOps?.producers.sentryFeedbackRunNow();
+      this.auditConfig(
+        interaction,
+        `Sentry feedback sync triggered → ${result?.ok ? "signalled" : "not routable (Temporal off?)"}`
+      );
+      await interaction.editReply(await this.buildSentryFeedbackPanel());
+      return;
+    }
+
     if (id === "config_sentry_dsn") {
       const modal = new ModalBuilder().setCustomId("config_sentry_dsn_modal").setTitle("Sentry DSN");
       modal.addComponents(
@@ -4190,6 +4419,71 @@ export class DiscordBot {
         embeds: [makeEmbed(repo ? `GitHub repo set to \`${repo}\`.` : "GitHub repo cleared.", COLORS.success)],
         flags: 64,
       });
+      return;
+    }
+
+    if (interaction.customId === "config_sentryfeedback_creds_modal") {
+      const tokenInput = interaction.fields.getTextInputValue("read_token").trim();
+      const secretInput = interaction.fields.getTextInputValue("webhook_secret").trim();
+      // Secrets are never pre-filled (no-echo), so a blank field means "keep
+      // current"; clearing is explicit via off/none/disable/-.
+      const clears = (v: string) => /^(off|none|disable|-)$/i.test(v);
+      const update: { sentryReadToken?: string | null; sentryWebhookSecret?: string | null } = {};
+      if (tokenInput) update.sentryReadToken = clears(tokenInput) ? null : tokenInput;
+      if (secretInput) update.sentryWebhookSecret = clears(secretInput) ? null : secretInput;
+      await this.settingsStore.updateSentryFeedback(update);
+      // Deliberately no secret values in the audit line.
+      this.auditConfig(
+        interaction,
+        `Sentry feedback credentials updated (read token ${
+          tokenInput ? (clears(tokenInput) ? "cleared" : "set") : "unchanged"
+        }, webhook secret ${secretInput ? (clears(secretInput) ? "cleared" : "set") : "unchanged"})`
+      );
+      await interaction.reply({
+        embeds: [
+          makeEmbed(
+            this.settingsStore.sentryWebhookSecret()
+              ? "Sentry feedback credentials saved. Point the internal integration's webhook at `POST <public-url>/sentry/webhook`."
+              : "Sentry feedback credentials saved. No webhook secret set — the webhook endpoint rejects everything and the 15-min poll carries imports alone.",
+            COLORS.success
+          ),
+        ],
+        flags: 64,
+      });
+      return;
+    }
+
+    if (interaction.customId === "config_sentryfeedback_scope_modal") {
+      const org = interaction.fields.getTextInputValue("org_slug").trim().toLowerCase();
+      const projectsInput = interaction.fields.getTextInputValue("projects").trim().toLowerCase();
+      const region = interaction.fields.getTextInputValue("region").trim().toLowerCase();
+      const slugOk = (v: string) => /^[a-z0-9._-]+$/.test(v);
+      const projectList = projectsInput
+        ? projectsInput.split(",").map((p) => p.trim()).filter(Boolean)
+        : [];
+      if ((org && !slugOk(org)) || projectList.some((p) => !slugOk(p))) {
+        await interaction.reply({
+          embeds: [makeEmbed("Slugs may only contain `a-z 0-9 . _ -` (comma-separate multiple projects).", COLORS.warn)],
+          flags: 64,
+        });
+        return;
+      }
+      if (region && region !== "us" && region !== "eu") {
+        await interaction.reply({ embeds: [makeEmbed("Region must be `us` or `eu`.", COLORS.warn)], flags: 64 });
+        return;
+      }
+      await this.settingsStore.updateSentryFeedback({
+        sentryOrgSlug: org || null,
+        sentryProjectSlug: projectList.length ? projectList.join(",") : null,
+        ...(region ? { sentryReadRegion: region } : {}),
+      });
+      this.auditConfig(
+        interaction,
+        `Sentry feedback scope → org ${org || "—"}, projects ${projectList.length ? projectList.join(", ") : "all"}, region ${(
+          region || this.settingsStore.sentryReadRegion()
+        ).toUpperCase()}`
+      );
+      await interaction.reply({ embeds: [makeEmbed("Sentry feedback scope saved.", COLORS.success)], flags: 64 });
       return;
     }
 
@@ -5229,7 +5523,24 @@ export class DiscordBot {
             page: (token, cookie) => this.dashboard!.page(token, cookie),
             api: (endpoint, sessionId, body) => this.dashboard!.api(endpoint, sessionId, body),
           }
-        : undefined
+        : undefined,
+      {
+        // Secret is read per request (BotSettings/Vault, changes live).
+        getSecret: () => this.settingsStore.sentryWebhookSecret(),
+        // Verified webhook → nudge the feedback-sync looper. The 20s debounce
+        // only bounds Temporal signal chatter under a delivery burst — the
+        // looper's runNow flag coalesces anyway, and the 15-min poll is the
+        // delivery guarantee when Temporal is paused/unreachable.
+        onEvent: (() => {
+          let lastSignalAt = 0;
+          return async () => {
+            const now = Date.now();
+            if (now - lastSignalAt < 20_000) return;
+            lastSignalAt = now;
+            await this.temporalOps?.producers.sentryFeedbackRunNow();
+          };
+        })(),
+      }
     );
     callbackServer.start();
   }

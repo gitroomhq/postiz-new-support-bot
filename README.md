@@ -44,7 +44,7 @@ Almost everything is configured live through the admin-only **`/config`** panel 
 
 Every deploy replays running workflows against the new bundle — a changed command sequence wedges them with nondeterminism task failures. Rules:
 
-- **Loopers** (`kb-refresh`, `metrics-snapshot`, `cleanup-loop`, `disputes-loop`, `intercom-inactivity-loop`, `sla-sweep`, `sla-enforce`): change their bodies freely, but bump the workflow's entry in `LOOPER_GENERATIONS` (`src/temporal/types.ts`) **in the same commit**. `ensureBaseline()` terminates a running singleton whose memo generation differs and starts a fresh run — safe because loopers are stateless between ticks.
+- **Loopers** (`kb-refresh`, `metrics-snapshot`, `cleanup-loop`, `disputes-loop`, `intercom-inactivity-loop`, `sla-sweep`, `sla-enforce`, `sentry-feedback-sync`): change their bodies freely, but bump the workflow's entry in `LOOPER_GENERATIONS` (`src/temporal/types.ts`) **in the same commit**. `ensureBaseline()` terminates a running singleton whose memo generation differs and starts a fresh run — safe because loopers are stateless between ticks.
 - **Retiring a singleton/Schedule**: add it to `RETIRED_SINGLETONS` / `RETIRED_WORKFLOW_QUERIES` / `RETIRED_SCHEDULES` (`src/temporal/types.ts`) and remove it from `SINGLETONS` in the same commit — `ensureBaseline()` terminates/deletes retired ids on every boot before the worker polls (the agent-rip release retired `scoring-loop`, its `scoring-batch-*` children and the `status-report` Schedule this way). A retired id must never be re-added.
 - **Stateful long-lived workflows** (`ticketWorkflow` — its outbox carries non-refetchable Discord payloads — and `intercomInboxWorkflow`): any change to the order/type of emitted commands (activities, timers, children) must use `patched('<id>')` dual-path code, removed only after all pre-change runs have completed or continued-as-new (ticket retention is 14 days past close ⇒ two releases minimum). Terminate is NOT acceptable for these.
 - **Short workflows** (stripe/refund/AI/score/status children): same `patched()` rule when in-flight runs matter; the exposure window is only the seconds around a deploy.
@@ -55,7 +55,7 @@ Every deploy replays running workflows against the new bundle — a changed comm
 
 **Priority-removal release notes**: the `applyPriorityUpdate` handler left `ticketWorkflow` — replay-safe for clean histories (`setHandler` emits no commands). The only at-risk runs are ticketWorkflows started 2026-07-09→13 that actually received an `applyPriority` update: those wedge with a nondeterminism task failure on the first post-deploy replay — terminate the run in the Temporal UI, then use the ticket's Heal Message Gaps button to re-sync the mirror. Rollback past this release is safe: the old build re-registers the handler/stub and its `ensureSchema` recreates `priority_tags`/`priorityTagId` where missing. Post-deploy: click `/config → Intercom → Ensure Attributes` once (archives the stale "Priority" ticket attribute in Intercom), and confirm `conversation.priority.updated` is unsubscribed in the Developer Hub.
 
-**Agent-rip follow-up release (N+1) checklist**: after this release proves out (DB backup first) — drop tables `canned_responses`, `ticket_scores`, `scoring_batches`, `ticket_ai_runs`, `ticket_notes`, `priority_tags` (priority CODE already fully removed in the priority-removal release; only the orphaned table/column DDL remains); drop `tickets.escalationTierId`/`priorityTagId` (+FKs), `remindersPaused`, `firstResponseAt`, `aiAnswer` (KEEP `reminderCount`/`lastReminderAt`/`recloseAt` — the timer engine lives); drop the `bot_settings` AI/scoring/report/sentry-read orphans (KEEP `aiModel`, `aiModelLight`, `aiEffortAsk`, `aiMaxBudgetUsdAsk` — dispute evidence; KEEP `reminderTarget` on status_tags — it doubles as the waiting-on-customer marker; KEEP `backfillDone`); mirror every drop in `ensureSchema.ts` (destructive-convergence block) + `verifySchema.ts`; remove the `aiRunWorkflow`/`scoreOneWorkflow`/`publishStatusReportWorkflow` tombstones + their activity stubs; remove the legacy `"priority"` skip case in `IntercomEventExecutor` + the skip-only `"priority"` members of `OutboxEventType`/`IcEventType` (safe once pre-removal outboxes have drained); remove `AgentRipMigration` + its `index.ts` wiring (the flag column stays); drop the `sentryReadToken` entry from the Vault secret registry together with its column.
+**Agent-rip follow-up release (N+1) checklist**: after this release proves out (DB backup first) — drop tables `canned_responses`, `ticket_scores`, `scoring_batches`, `ticket_ai_runs`, `ticket_notes`, `priority_tags` (priority CODE already fully removed in the priority-removal release; only the orphaned table/column DDL remains); drop `tickets.escalationTierId`/`priorityTagId` (+FKs), `remindersPaused`, `firstResponseAt`, `aiAnswer` (KEEP `reminderCount`/`lastReminderAt`/`recloseAt` — the timer engine lives); drop the `bot_settings` AI/scoring/report orphans (KEEP `aiModel`, `aiModelLight`, `aiEffortAsk`, `aiMaxBudgetUsdAsk` — dispute evidence; KEEP `reminderTarget` on status_tags — it doubles as the waiting-on-customer marker; KEEP `backfillDone`; the former sentry-read orphans `sentryReadEnabled`/`sentryReadToken`/`sentryOrgSlug`/`sentryProjectSlug`/`sentryReadRegion` are NO LONGER orphans — the Sentry feedback import revived them); mirror every drop in `ensureSchema.ts` (destructive-convergence block) + `verifySchema.ts`; remove the `aiRunWorkflow`/`scoreOneWorkflow`/`publishStatusReportWorkflow` tombstones + their activity stubs; remove the legacy `"priority"` skip case in `IntercomEventExecutor` + the skip-only `"priority"` members of `OutboxEventType`/`IcEventType` (safe once pre-removal outboxes have drained); remove `AgentRipMigration` + its `index.ts` wiring (the flag column stays).
 
 **Active `patched()` ids**: `intercom-ensure-park` (ticketWorkflow pump: a dead ensure parks the queue instead of hot-looping) — introduced in the bi-mode hardening release; removable two releases later per the rule above.
 
@@ -78,6 +78,20 @@ The Intercom workspace runs on the **Advanced** plan, which has no native SLAs, 
 
 Alerts stay **inside Intercom** (agent Discord pings were retired): at-risk flips the `SLA Status` attribute; a breach also adds the `sla-breached` tag and one internal note per breached clock. Rules are priority-ordered (first enabled match wins, conditions AND-ed) over ticket basics, Stripe customer state, Intercom data and keywords; no match writes the default target. Target evaluation fires on ticket creation, status changes, customer replies, assignee changes, Stripe events and the native webhooks (30-min `sla-sweep` safety net); the clocks + assignment stray-sweep run every 5 min (`sla-enforce`).
 
+### Sentry feedback → Intercom import
+
+Sentry's User Feedback widget is write-only for users — nobody can answer them there. The `sentry-feedback-sync` looper (15 min, plus a webhook accelerator) turns each **widget** feedback item into an Intercom conversation authored by an email contact matching the submitter: agents reply in Intercom, Intercom's email fallback delivers the reply (imported contacts never have Messenger sessions), and the submitter's email answer threads back into the same conversation. Sentry itself is strictly read-only; anonymous submissions are skipped (counted on the panel); there is **no backfill** — the first enable stamps an import floor.
+
+Setup (`/config → Integrations → Sentry Feedback`):
+
+1. In Sentry, create an **org auth token** with `org:read`, `project:read`, `event:read` and paste it via **Credentials** (Vault-routed like every global secret).
+2. Set **Org & Projects** (org slug required; project slugs optional allowlist; region `us`/`eu`).
+3. Optional real-time trigger: Sentry → Settings → Developer Settings → **internal integration** → webhook URL `POST <public-url>/sentry/webhook` (Issue events on), paste its **client secret** via Credentials. Unsigned/unverified posts get 403; the poll alone also works.
+4. Optional **Team Routing** — imported conversations get team-assigned on creation (and thereby balanced by the assignment engine if that team has it enabled).
+5. Toggle **Enabled: on** (stamps the import floor on first enable) — **Sync Now** forces a one-shot test run.
+
+Imported conversations are tagged `sentry-feedback`, carry an internal metadata note (submitter, page URL, Sentry link), get agent-idle reminder notes, and are **never** customer-nagged, auto-closed or SLA-clocked.
+
 ## Setup
 
 ```bash
@@ -89,7 +103,7 @@ pnpm test:temporal    # opt-in Temporal time-skipping integration tests (downloa
 # dev: pnpm dev       # ts-node
 ```
 
-`DATABASE_URL` must point at a PostgreSQL database; the app ensures its own schema on boot. An externally reachable URL (`POSTIZ_CALLBACK_URL` origin, or `/config → Billing → Webhooks → Set Public URL`) is needed for the Postiz OAuth callback, Intercom webhooks, and Stripe webhooks.
+`DATABASE_URL` must point at a PostgreSQL database; the app ensures its own schema on boot. An externally reachable URL (`POSTIZ_CALLBACK_URL` origin, or `/config → Billing → Webhooks → Set Public URL`) is needed for the Postiz OAuth callback, Intercom webhooks, Stripe webhooks, and the optional Sentry feedback webhook.
 
 ## Layout
 

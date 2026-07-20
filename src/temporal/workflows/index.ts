@@ -16,6 +16,7 @@ export {
   inactivityLoopWorkflow,
   slaSweepWorkflow,
   slaEnforceWorkflow,
+  sentryFeedbackWorkflow,
   metricsSnapshotWorkflow,
   cleanupLoopWorkflow,
   disputesLoopWorkflow,

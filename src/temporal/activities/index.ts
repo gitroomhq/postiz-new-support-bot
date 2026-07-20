@@ -22,6 +22,7 @@ import type { SlaEnforcer } from "../../intercom/SlaEnforcer";
 import { IntercomHttpError } from "../../intercom/IntercomClient";
 import { DeferEchoError, type IntercomWebhookHandler } from "../../intercom/IntercomWebhookHandler";
 import type { EnsurePayload } from "../../intercom/types";
+import type { SentryFeedbackImporter } from "../../sentry/SentryFeedbackImporter";
 import type { SnapshotScheduler } from "../../metrics/SnapshotScheduler";
 import {
   exportIntercomQueueDepth,
@@ -65,6 +66,7 @@ export interface ActivityDeps {
   inactivitySweeper: InactivitySweeper;
   slaSweeper: SlaSweeper;
   slaEnforcer: SlaEnforcer;
+  sentryFeedbackImporter: SentryFeedbackImporter;
   kbScheduler: KnowledgeBaseScheduler;
   snapshotScheduler: SnapshotScheduler;
   stripeWebhookHandler: StripeWebhookHandler;
@@ -94,6 +96,7 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
     inactivitySweeper,
     slaSweeper,
     slaEnforcer,
+    sentryFeedbackImporter,
     kbScheduler,
     snapshotScheduler,
     stripeWebhookHandler,
@@ -652,6 +655,24 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
       }, 30_000);
       try {
         return await slaSweeper.sweep(force);
+      } finally {
+        clearInterval(keepalive);
+      }
+    },
+
+    // Sentry feedback → Intercom import. The importer applies the
+    // enabled/configured/watermark gates itself.
+    async sentryFeedbackTick(force) {
+      heartbeat();
+      const keepalive = setInterval(() => {
+        try {
+          heartbeat();
+        } catch {
+          /* worker shutting down — the sweep finishes on its own */
+        }
+      }, 30_000);
+      try {
+        return await sentryFeedbackImporter.tick(force);
       } finally {
         clearInterval(keepalive);
       }

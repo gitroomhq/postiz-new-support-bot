@@ -1,6 +1,7 @@
 import type { SettingsStore } from "../config/SettingsStore";
 import type { IntercomClient } from "./IntercomClient";
 import type { IntercomStore } from "./IntercomStore";
+import type { SentryFeedbackStore } from "../sentry/SentryFeedbackStore";
 import type { InactivitySweepResult } from "../temporal/types";
 import { exportIntercomSweep } from "../metrics/MetricsExporter";
 import { applyTeam } from "./reminderText";
@@ -41,7 +42,8 @@ export class InactivitySweeper {
   constructor(
     private client: IntercomClient,
     private store: IntercomStore,
-    private settingsStore: SettingsStore
+    private settingsStore: SettingsStore,
+    private feedbackStore: SentryFeedbackStore | null = null
   ) {}
 
   // force = the /config "Run Now" button: bypasses the enabled toggle (a
@@ -57,6 +59,13 @@ export class InactivitySweeper {
     result.skipped = false;
 
     const now = Date.now();
+    // Imported Sentry feedback gets agent-idle notes only — never nags, never
+    // auto-close (feedback ≠ support request; a nag would land as an email to
+    // the submitter). One indexed query per sweep beats per-item lookups: the
+    // loop below pages EVERY open conversation.
+    const feedbackConvIds = new Set(
+      this.feedbackStore ? await this.feedbackStore.listImportedConversationIds().catch(() => []) : []
+    );
     const agentWaitMs = Math.max(1, this.settingsStore.inactivityAgentWaitDays()) * DAY_MS;
     const customerWaitMs = Math.max(1, this.settingsStore.inactivityCustomerWaitDays()) * DAY_MS;
     const nagsBeforeClose = Math.max(1, this.settingsStore.inactivityNagsBeforeClose());
@@ -132,10 +141,10 @@ export class InactivitySweeper {
               writes++;
               result.agentReminders++;
             }
-          } else if (lastAdminMs > 0) {
+          } else if (lastAdminMs > 0 && !feedbackConvIds.has(conv.id)) {
             // Customer-idle: the agent replied last. Nag with a real outbound
             // reply; after N unanswered nags, close conversation + native
-            // ticket parity.
+            // ticket parity. Imported feedback is excluded (notes-only above).
             const customerRepliedSinceNag =
               state?.lastCustomerNagAt != null &&
               conv.lastContactReplyAt != null &&

@@ -241,6 +241,23 @@ export class IntercomClient {
     return { id: String(data.id) };
   }
 
+  // Email-identified contact for the Sentry feedback import — the ONE create
+  // path that deliberately gives Intercom an email channel: agent replies to
+  // these conversations fall back to email, and the submitter's email reply
+  // threads back in. Role "user" (not "lead") so a returning submitter matches
+  // the same record instead of accreting lead/user duplicate pairs. No
+  // external_id — these are not Discord customers.
+  async createEmailContact(input: { email: string; name?: string | null }): Promise<{ id: string }> {
+    const data = await this.json<{ id?: string | number }>(
+      "/contacts",
+      "POST",
+      { role: "user", email: input.email, ...(input.name ? { name: input.name } : {}) },
+      "contact create"
+    );
+    if (data.id == null) throw new IntercomHttpError(500, "Intercom contact create: missing id in response");
+    return { id: String(data.id) };
+  }
+
   // Intercom's "delete contact" only ARCHIVES; find/search are blind to
   // archived records, so a re-created contact 409s ("...archived contact...
   // id=X"). Reactivating by id lets the contact author conversations again.
@@ -282,16 +299,19 @@ export class IntercomClient {
     await this.json("/data_attributes", "POST", { name, description, model: "contact", data_type: "string" }, "data attribute create");
   }
 
-  // Email lookup for the dispute-evidence context: a Stripe customer's email →
-  // Intercom contact ids (an email can map to lead + user duplicates).
-  async searchContactIdsByEmail(email: string): Promise<string[]> {
-    const data = await this.json<{ data?: Array<{ id?: string | number }> }>(
+  // Email lookup (an email can map to lead + user duplicates). Role lets the
+  // feedback import prefer the user record; the dispute-evidence context just
+  // collects the ids.
+  async searchContactsByEmail(email: string): Promise<Array<{ id: string; role: "user" | "lead" | null }>> {
+    const data = await this.json<{ data?: Array<{ id?: string | number; role?: string }> }>(
       "/contacts/search",
       "POST",
       { query: { field: "email", operator: "=", value: email }, pagination: { per_page: 10 } },
       "contact search by email"
     );
-    return (data.data ?? []).map((c) => (c.id != null ? String(c.id) : null)).filter((id): id is string => !!id);
+    return (data.data ?? [])
+      .filter((c) => c.id != null)
+      .map((c) => ({ id: String(c.id), role: c.role === "user" || c.role === "lead" ? c.role : null }));
   }
 
   // ---- Conversations ----
@@ -391,13 +411,15 @@ export class IntercomClient {
   }
 
   // Contact-initiated conversation. The response is a Message object; the
-  // conversation id lives in its conversation_id field.
-  async createConversation(contactId: string, body: string, createdAtIso?: string): Promise<string> {
+  // conversation id lives in its conversation_id field. fromType must match
+  // the contact's role — Intercom rejects type "user" with a lead id (the
+  // feedback import passes "lead" when reusing a lead-role email match).
+  async createConversation(contactId: string, body: string, createdAtIso?: string, fromType: "user" | "lead" = "user"): Promise<string> {
     const data = await this.json<{ conversation_id?: string | number }>(
       "/conversations",
       "POST",
       {
-        from: { type: "user", id: contactId },
+        from: { type: fromType, id: contactId },
         body,
         ...(createdAtIso ? { created_at: toUnix(createdAtIso) } : {}),
       },

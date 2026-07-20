@@ -151,14 +151,20 @@ model BotSettings {
   sentryDebug              Boolean @default(false) // SDK debug to stdout; restart to apply
   sentrySendDefaultPii     Boolean @default(false)
   sentryAiRecordContent    Boolean @default(false) // AI prompts/responses/tool I/O on gen_ai spans — off by default (customer PII); opt in via /config
-  // Sentry READ access — separate from the write-only DSN above. Lets /ai correlate
-  // a ticket with real Postiz product errors. Token is encrypted at rest (crypto.ts);
-  // needs an auth token (event:read, project:read) + org/project slugs. Off by default.
+  // Sentry READ access — separate from the write-only DSN above. Feeds the
+  // feedback import (Sentry User Feedback widget → Intercom conversations).
+  // Token is encrypted at rest (crypto.ts/Vault); needs an org auth token
+  // (org:read, project:read, event:read). Off by default.
   sentryReadEnabled        Boolean @default(false)
   sentryReadToken          String?
   sentryOrgSlug            String?
-  sentryProjectSlug        String?
+  sentryProjectSlug        String? // comma-separated project slugs to import from; null/empty = all projects
   sentryReadRegion         String  @default("us") // "us" | "eu" — org tokens don't auto-route to EU (de.sentry.io)
+  // Sentry feedback → Intercom import (edited via /config → Integrations → Sentry Feedback).
+  sentryFeedbackTeamId      String?   // Intercom team imported conversations are assigned to; null = unassigned
+  sentryFeedbackWatermarkAt DateTime? // stamped at FIRST enable; only feedback newer than this ever imports (no backfill)
+  sentryFeedbackLastSyncAt  DateTime? // last completed sync tick — /config status line
+  sentryWebhookSecret       String?   // Sentry internal-integration client secret — encrypted (crypto.ts/Vault)
   // AI models (edited via /config → AI & Knowledge). Free-text so new model ids
   // work without a code change. Light model runs the tool-less /ai summarize|draft.
   aiModel               String  @default("sonnet")
@@ -943,4 +949,27 @@ model DashboardAuditLog {
   @@index([at])
   @@index([actorId, at])
   @@map("dashboard_audit_log")
+}
+
+// Sentry User Feedback → Intercom import ledger: one row per TERMINAL outcome
+// ("imported" | "skipped_no_email"). Dedup key = Sentry issue id (widget
+// feedback is 1:1 issue↔submission); the conversation id powers the
+// inactivity-sweeper/SLA exemption lookups. Failed items get NO row — the
+// sync watermark freezes at them and the next tick retries.
+model SentryFeedbackImport {
+  id                     String   @id @default(cuid())
+  sentryIssueId          String   @unique
+  sentryShortId          String?
+  projectSlug            String?
+  status                 String // "imported" | "skipped_no_email"
+  contactEmail           String?
+  contactName            String?
+  intercomContactId      String?
+  intercomConversationId String?  @unique // Postgres unique ignores NULLs, so skipped rows coexist
+  pageUrl                String?
+  feedbackAt             DateTime // Sentry issue firstSeen — watermark math + audit
+  importedAt             DateTime @default(now())
+
+  @@index([importedAt])
+  @@map("sentry_feedback_imports")
 }

@@ -28,6 +28,7 @@ export const SINGLETONS = {
   inactivityLoop: "intercom-inactivity-loop",
   slaSweep: "sla-sweep",
   slaEnforce: "sla-enforce",
+  sentryFeedback: "sentry-feedback-sync",
 } as const;
 
 export const VAULT_UPGRADE_WORKFLOW_ID = "vault-upgrade";
@@ -68,6 +69,7 @@ export const LOOPER_GENERATIONS: Record<string, number> = {
   [SINGLETONS.inactivityLoop]: 1,
   [SINGLETONS.slaSweep]: 1,
   [SINGLETONS.slaEnforce]: 1,
+  [SINGLETONS.sentryFeedback]: 1,
 };
 
 // ---- Custom search attributes ----
@@ -110,6 +112,7 @@ export const SIG_DISPUTES_RUN_NOW = "disputesRunNow";
 export const SIG_INACTIVITY_RUN_NOW = "inactivityRunNow";
 export const SIG_SLA_RUN_NOW = "slaRunNow";
 export const SIG_SLA_ENFORCE_RUN_NOW = "slaEnforceRunNow";
+export const SIG_SENTRY_FEEDBACK_RUN_NOW = "sentryFeedbackRunNow";
 export const UPD_APPLY_STATUS = "applyStatus";
 export const QRY_TICKET_STATE = "getState";
 
@@ -355,6 +358,16 @@ export interface InactivitySweepResult {
   skipped: boolean; // disabled or Intercom unconfigured
 }
 
+export interface SentryFeedbackTickResult {
+  listed: number;
+  imported: number;
+  skippedNoEmail: number;
+  deduped: number;
+  errors: number;
+  capped: boolean; // per-tick import cap hit — remainder picked up next tick
+  skipped: boolean; // disabled / not configured / no watermark / Intercom unconfigured
+}
+
 export interface SlaSweepResult {
   scanned: number;
   written: number;
@@ -410,6 +423,7 @@ export interface CoreActivities {
   inactivitySweepTick(force: boolean): Promise<InactivitySweepResult>;
   slaSweepTick(force: boolean): Promise<SlaSweepResult>;
   slaEnforceTick(force: boolean): Promise<SlaEnforceResult>;
+  sentryFeedbackTick(force: boolean): Promise<SentryFeedbackTickResult>;
   snapshotTick(): Promise<void>;
   cleanupTick(): Promise<void>;
   // Tombstone stubs (agent-rip): in-flight runs at deploy time still proxy

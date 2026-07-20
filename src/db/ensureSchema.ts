@@ -816,6 +816,30 @@ const STATEMENTS: string[] = [
   `ALTER TABLE "sla_states" ADD COLUMN IF NOT EXISTS "lastStatusWritten" TEXT`,
   `ALTER TABLE "sla_states" ADD COLUMN IF NOT EXISTS "breachTagged" BOOLEAN NOT NULL DEFAULT false`,
   `ALTER TABLE "sla_states" ADD COLUMN IF NOT EXISTS "lastEnforcedAt" TIMESTAMP(3)`,
+  // Sentry feedback → Intercom import: dedup/exemption ledger + the /config
+  // knobs (team routing, no-backfill watermark, webhook secret — 7th global).
+  `CREATE TABLE IF NOT EXISTS "sentry_feedback_imports" (
+    "id" TEXT NOT NULL,
+    "sentryIssueId" TEXT NOT NULL,
+    "sentryShortId" TEXT,
+    "projectSlug" TEXT,
+    "status" TEXT NOT NULL,
+    "contactEmail" TEXT,
+    "contactName" TEXT,
+    "intercomContactId" TEXT,
+    "intercomConversationId" TEXT,
+    "pageUrl" TEXT,
+    "feedbackAt" TIMESTAMP(3) NOT NULL,
+    "importedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT "sentry_feedback_imports_pkey" PRIMARY KEY ("id")
+  )`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS "sentry_feedback_imports_sentryIssueId_key" ON "sentry_feedback_imports"("sentryIssueId")`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS "sentry_feedback_imports_intercomConversationId_key" ON "sentry_feedback_imports"("intercomConversationId")`,
+  `CREATE INDEX IF NOT EXISTS "sentry_feedback_imports_importedAt_idx" ON "sentry_feedback_imports"("importedAt")`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "sentryFeedbackTeamId" TEXT`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "sentryFeedbackWatermarkAt" TIMESTAMP(3)`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "sentryFeedbackLastSyncAt" TIMESTAMP(3)`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "sentryWebhookSecret" TEXT`,
 ];
 
 export async function ensureSchema(prisma: PrismaClient): Promise<void> {
