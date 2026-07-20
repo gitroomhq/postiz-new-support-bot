@@ -840,6 +840,10 @@ const STATEMENTS: string[] = [
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "sentryFeedbackWatermarkAt" TIMESTAMP(3)`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "sentryFeedbackLastSyncAt" TIMESTAMP(3)`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "sentryWebhookSecret" TEXT`,
+  // Feedback imports as customer tickets (type picked via /config) + the
+  // ledger's ticket-id column for the sweeper/enforcer exemption lookups.
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "sentryFeedbackTicketTypeId" TEXT`,
+  `ALTER TABLE "sentry_feedback_imports" ADD COLUMN IF NOT EXISTS "intercomTicketId" TEXT`,
 ];
 
 export async function ensureSchema(prisma: PrismaClient): Promise<void> {

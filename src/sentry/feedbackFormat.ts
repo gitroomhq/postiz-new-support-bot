@@ -34,27 +34,41 @@ export interface FeedbackNoteInput {
   shortId: string | null;
   permalink: string | null;
   projectSlug: string | null;
-  feedbackAtIso: string;
 }
 
 // Agent-facing internal note: Sentry provenance + page context. Customers
 // never see notes, so the debug metadata lives here instead of the opening
-// message. Every field is end-user- or Sentry-supplied → escaped.
+// message. No timestamp line — the conversation itself is backdated to the
+// submission time. Every field is end-user- or Sentry-supplied → escaped.
 export function buildMetadataNote(input: FeedbackNoteInput): string {
   const lines: string[] = [];
   const source = [input.projectSlug, input.shortId].filter(Boolean).map((s) => escapeHtmlText(String(s))).join(" · ");
-  lines.push(`<p><b>Sentry feedback import</b>${source ? ` — ${source}` : ""}</p>`);
-  lines.push(
-    `<p>Submitted ${escapeHtmlText(input.feedbackAtIso)} by ${escapeHtmlText(input.name || "(no name)")} &lt;${escapeHtmlText(input.email)}&gt;</p>`
-  );
+  lines.push(`<p><b>Sentry feedback</b>${source ? ` — ${source}` : ""}</p>`);
+  const name = input.name?.trim();
+  lines.push(`<p>From: ${name ? `${escapeHtmlText(name)} (${escapeHtmlText(input.email)})` : escapeHtmlText(input.email)}</p>`);
   if (input.pageUrl) {
     lines.push(`<p>Page: <a href="${escapeHtmlText(input.pageUrl)}">${escapeHtmlText(input.pageUrl)}</a></p>`);
   }
   if (input.permalink) {
     lines.push(`<p><a href="${escapeHtmlText(input.permalink)}">Open in Sentry</a></p>`);
   }
-  lines.push("<p>Replies to this conversation are emailed to the submitter.</p>");
   return lines.join("");
+}
+
+// Ticket attributes for the customer-ticket conversion — same default-field
+// keys the bridge's attachTicket uses.
+export function buildTicketAttributes(input: {
+  name: string | null;
+  email: string;
+  message: string | null;
+  projectSlug: string | null;
+}): Record<string, string> {
+  const who = input.name?.trim() || input.email;
+  const title = `${who} — Feedback${input.projectSlug ? ` (${input.projectSlug})` : ""}`;
+  return {
+    _default_title_: title.slice(0, 250),
+    _default_description_: (input.message?.trim() || "(empty feedback message)").slice(0, 4000),
+  };
 }
 
 // One page-walk plan: everything newer than the floor, oldest first (so the

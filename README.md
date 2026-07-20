@@ -87,10 +87,10 @@ Setup (`/config → Integrations → Sentry Feedback`):
 1. In Sentry, create an **org auth token** with `org:read`, `project:read`, `event:read` and paste it via **Credentials** (Vault-routed like every global secret).
 2. Set **Org & Projects** (org slug required; project slugs optional allowlist; region `us`/`eu`).
 3. Optional real-time trigger: Sentry → Settings → Developer Settings → **internal integration** → webhook URL `POST <public-url>/sentry/webhook` (Issue events on), paste its **client secret** via Credentials. Unsigned/unverified posts get 403; the poll alone also works.
-4. Optional **Team Routing** — imported conversations get team-assigned on creation (and thereby balanced by the assignment engine if that team has it enabled).
+4. Optional **Ticket Type** — when set, every new import is immediately converted into a ticket of that type (Customer category recommended — one unified inbox object, same convert path as the bridge; conversion is best-effort, a failure leaves the plain conversation standing). Optional **Team Routing** — imported conversations (and their converted tickets) get team-assigned on creation, and thereby balanced by the assignment engine if that team has it enabled.
 5. Toggle **Enabled: on** (stamps the import floor on first enable) — **Sync Now** forces a one-shot test run.
 
-Imported conversations are tagged `sentry-feedback`, carry an internal metadata note (submitter, page URL, Sentry link), get agent-idle reminder notes, and are **never** customer-nagged, auto-closed or SLA-clocked.
+Imported conversations are tagged `sentry-feedback`, carry an internal metadata note (submitter, page URL, Sentry link — the conversation itself is backdated to the submission time), get agent-idle reminder notes (once — the ticket sweep skips converted imports), and are **never** customer-nagged, auto-closed or SLA-clocked.
 
 ## Setup
 

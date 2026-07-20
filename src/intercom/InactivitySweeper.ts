@@ -62,10 +62,12 @@ export class InactivitySweeper {
     // Imported Sentry feedback gets agent-idle notes only — never nags, never
     // auto-close (feedback ≠ support request; a nag would land as an email to
     // the submitter). One indexed query per sweep beats per-item lookups: the
-    // loop below pages EVERY open conversation.
-    const feedbackConvIds = new Set(
-      this.feedbackStore ? await this.feedbackStore.listImportedConversationIds().catch(() => []) : []
-    );
+    // loops below page EVERY open conversation/ticket. Converted feedback
+    // shows up in BOTH sweeps (unified customer-ticket object) — the ticket
+    // loop skips it entirely so it isn't double-noted.
+    const feedbackRefs = this.feedbackStore ? await this.feedbackStore.listImportedRefs().catch(() => []) : [];
+    const feedbackConvIds = new Set(feedbackRefs.map((r) => r.conversationId));
+    const feedbackTicketIds = new Set(feedbackRefs.flatMap((r) => (r.ticketId ? [r.ticketId] : [])));
     const agentWaitMs = Math.max(1, this.settingsStore.inactivityAgentWaitDays()) * DAY_MS;
     const customerWaitMs = Math.max(1, this.settingsStore.inactivityCustomerWaitDays()) * DAY_MS;
     const nagsBeforeClose = Math.max(1, this.settingsStore.inactivityNagsBeforeClose());
@@ -226,6 +228,8 @@ export class InactivitySweeper {
         result.scanned++;
         try {
           if (await this.store.getLinkByTicketId(ticket.id)) continue; // bridged
+          // Converted feedback import — the conversation loop owns its notes.
+          if (feedbackTicketIds.has(ticket.id)) continue;
           const stateId = `ticket:${ticket.id}`;
           const lastActivityMs = ticket.updatedAt?.getTime() ?? ticket.createdAt?.getTime() ?? now;
           if (now - lastActivityMs < agentWaitMs) continue;

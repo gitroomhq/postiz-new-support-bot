@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { buildConversationBody, buildMetadataNote, parseSentryLinkHeader } from "../feedbackFormat";
+import { buildConversationBody, buildMetadataNote, buildTicketAttributes, parseSentryLinkHeader } from "../feedbackFormat";
 
 test("buildConversationBody escapes HTML and keeps structure", () => {
   const body = buildConversationBody('Hello <script>alert("x")</script> & friends\n\nSecond para\nwith break');
@@ -29,15 +29,16 @@ test("buildMetadataNote escapes every field and renders links only when present"
     shortId: "POSTIZ-1X",
     permalink: "https://sentry.io/organizations/acme/issues/42/",
     projectSlug: "postiz-web",
-    feedbackAtIso: "2026-07-20T10:00:00Z",
   });
-  assert.ok(note.includes("Eve &lt;script&gt;&quot;"));
-  assert.ok(note.includes("&lt;eve@example.com&gt;"));
+  assert.ok(note.includes("From: Eve &lt;script&gt;&quot; (eve@example.com)"));
   assert.ok(note.includes('href="https://app.example.com/x?a=1&amp;b=2"'));
   assert.ok(note.includes("Open in Sentry"));
   assert.ok(note.includes("postiz-web"));
   assert.ok(note.includes("POSTIZ-1X"));
-  assert.ok(note.includes("emailed to the submitter"));
+  // The conversation itself is backdated — no timestamp line; and no
+  // replies-are-emailed footer (removed by user request).
+  assert.ok(!note.includes("Submitted"));
+  assert.ok(!note.includes("emailed to the submitter"));
 
   const bare = buildMetadataNote({
     name: null,
@@ -46,11 +47,35 @@ test("buildMetadataNote escapes every field and renders links only when present"
     shortId: null,
     permalink: null,
     projectSlug: null,
-    feedbackAtIso: "2026-07-20T10:00:00Z",
   });
-  assert.ok(bare.includes("(no name)"));
+  assert.ok(bare.includes("From: a@b.c"));
+  assert.ok(!bare.includes("("));
   assert.ok(!bare.includes("<a "));
   assert.ok(!bare.includes("Page:"));
+});
+
+test("buildTicketAttributes composes title/description with caps and fallbacks", () => {
+  const attrs = buildTicketAttributes({
+    name: "Someone",
+    email: "a@b.c",
+    message: "  It broke  ",
+    projectSlug: "postiz-web",
+  });
+  assert.equal(attrs._default_title_, "Someone — Feedback (postiz-web)");
+  assert.equal(attrs._default_description_, "It broke");
+
+  const bare = buildTicketAttributes({ name: null, email: "a@b.c", message: null, projectSlug: null });
+  assert.equal(bare._default_title_, "a@b.c — Feedback");
+  assert.equal(bare._default_description_, "(empty feedback message)");
+
+  const long = buildTicketAttributes({
+    name: "n".repeat(400),
+    email: "a@b.c",
+    message: "m".repeat(5000),
+    projectSlug: null,
+  });
+  assert.equal(long._default_title_.length, 250);
+  assert.equal(long._default_description_.length, 4000);
 });
 
 test("parseSentryLinkHeader extracts the next cursor only when results are pending", () => {

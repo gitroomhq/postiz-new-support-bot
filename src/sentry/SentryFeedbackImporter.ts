@@ -2,7 +2,13 @@ import type { SettingsStore } from "../config/SettingsStore";
 import { IntercomHttpError, type IntercomClient } from "../intercom/IntercomClient";
 import type { SentryFeedbackTickResult } from "../temporal/types";
 import { log } from "../util/logger";
-import { advanceWatermark, buildConversationBody, buildMetadataNote, planFeedbackWalk } from "./feedbackFormat";
+import {
+  advanceWatermark,
+  buildConversationBody,
+  buildMetadataNote,
+  buildTicketAttributes,
+  planFeedbackWalk,
+} from "./feedbackFormat";
 import type { SentryFeedbackClient, SentryFeedbackIssue } from "./SentryFeedbackClient";
 import type { SentryFeedbackStore } from "./SentryFeedbackStore";
 
@@ -170,6 +176,33 @@ export class SentryFeedbackImporter {
 
         // Decorations are best-effort: the ledger row exists, so dedup and
         // the sweeper/SLA exemptions hold even when any of these fail.
+        // Ticket conversion first ("normal ticket" parity): convert failure
+        // leaves a plain conversation import standing — retrying the whole
+        // item would duplicate the conversation instead.
+        let ticketId: string | null = null;
+        const ticketTypeId = this.settingsStore.sentryFeedbackTicketTypeId();
+        if (ticketTypeId) {
+          try {
+            await paceWrite();
+            ticketId = await this.convertFeedbackConversation(
+              conversationId,
+              ticketTypeId,
+              buildTicketAttributes({
+                name: context.name,
+                email,
+                message: context.message,
+                projectSlug: issue.projectSlug,
+              })
+            );
+            await this.store.setTicketId(issue.id, ticketId);
+          } catch (e) {
+            ticketId = null;
+            syncLog.warn("sentry feedback import: ticket conversion failed — staying a conversation", {
+              "intercom.conversation_id": conversationId,
+              "error.message": e instanceof Error ? e.message : String(e),
+            });
+          }
+        }
         try {
           await paceWrite();
           await this.intercom.replyAsAdmin(conversationId, {
@@ -182,7 +215,6 @@ export class SentryFeedbackImporter {
               shortId: issue.shortId,
               permalink: issue.permalink,
               projectSlug: issue.projectSlug,
-              feedbackAtIso: issue.firstSeen,
             }),
           });
         } catch (e) {
@@ -212,6 +244,18 @@ export class SentryFeedbackImporter {
               "error.message": e instanceof Error ? e.message : String(e),
             });
           }
+          if (ticketId) {
+            // Bridge parity: the converted ticket gets the team too.
+            try {
+              await paceWrite();
+              await this.intercom.updateTicket(ticketId, { assigneeId: teamId, adminId });
+            } catch (e) {
+              syncLog.warn("sentry feedback import: ticket team assignment failed", {
+                "intercom.ticket_id": ticketId,
+                "error.message": e instanceof Error ? e.message : String(e),
+              });
+            }
+          }
         }
       } catch (e) {
         result.errors++;
@@ -239,4 +283,26 @@ export class SentryFeedbackImporter {
     });
     return result;
   }
+
+  // The bridge's attachTicket ladder minus the standalone rung: convert with
+  // attributes → adopt an existing conversion (heal retry) → convert bare. No
+  // unlinked-ticket fallback — a feedback ticket detached from its
+  // conversation would orphan the email thread this feature exists for.
+  private async convertFeedbackConversation(
+    conversationId: string,
+    ticketTypeId: string,
+    attributes: Record<string, string>
+  ): Promise<string> {
+    try {
+      return (await this.intercom.convertToTicket(conversationId, ticketTypeId, attributes)).ticketId;
+    } catch (e) {
+      if (e instanceof IntercomHttpError && e.status >= 400 && e.status < 500) {
+        const existing = await this.intercom.getConversationTicketId(conversationId).catch(() => null);
+        if (existing) return existing;
+        return (await this.intercom.convertToTicket(conversationId, ticketTypeId)).ticketId;
+      }
+      throw e;
+    }
+  }
+
 }

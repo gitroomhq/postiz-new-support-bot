@@ -1390,6 +1390,12 @@ export class SettingsStore {
     return this.settings.sentryFeedbackTeamId;
   }
 
+  // Customer ticket type imports are converted into; null = imports stay
+  // plain conversations.
+  sentryFeedbackTicketTypeId(): string | null {
+    return this.settings.sentryFeedbackTicketTypeId;
+  }
+
   // No-backfill floor, stamped at FIRST enable. Null = never enabled — a hard
   // gate independent of the toggle (Sync Now force bypasses the toggle, never
   // this). Deliberately not reset on disable: a re-enable imports the gap.
@@ -1413,6 +1419,7 @@ export class SettingsStore {
     sentryProjectSlug?: string | null;
     sentryReadRegion?: string;
     sentryFeedbackTeamId?: string | null;
+    sentryFeedbackTicketTypeId?: string | null;
     sentryFeedbackWatermarkAt?: Date;
   }): Promise<void> {
     const { sentryReadToken, sentryWebhookSecret, ...rest } = data;

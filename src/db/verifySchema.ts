@@ -46,6 +46,7 @@ const EXPECTED_COLUMNS: Record<string, string[]> = {
     "sentryLogsEnabled", "sentryDebug", "sentrySendDefaultPii", "sentryAiRecordContent",
     "sentryReadEnabled", "sentryReadToken", "sentryOrgSlug", "sentryProjectSlug", "sentryReadRegion",
     "sentryFeedbackTeamId", "sentryFeedbackWatermarkAt", "sentryFeedbackLastSyncAt", "sentryWebhookSecret",
+    "sentryFeedbackTicketTypeId",
     "aiModel", "aiModelLight",
     "aiEffortAsk", "aiEffortCause", "aiMaxBudgetUsdAsk", "aiMaxBudgetUsdCause", "aiPostizPrefetchEnabled",
     "aiPreviousRunsEnabled",
@@ -117,7 +118,7 @@ const EXPECTED_COLUMNS: Record<string, string[]> = {
   dispute_watches: ["id", "disputeId", "userId", "createdAt"],
   sentry_feedback_imports: [
     "id", "sentryIssueId", "sentryShortId", "projectSlug", "status", "contactEmail", "contactName",
-    "intercomContactId", "intercomConversationId", "pageUrl", "feedbackAt", "importedAt",
+    "intercomContactId", "intercomConversationId", "intercomTicketId", "pageUrl", "feedbackAt", "importedAt",
   ],
   ai_runs: [
     "id", "agentName", "kind", "source", "model", "outcome", "sessionId", "batchId", "numTurns", "durationMs",

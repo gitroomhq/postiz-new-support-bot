@@ -161,10 +161,11 @@ model BotSettings {
   sentryProjectSlug        String? // comma-separated project slugs to import from; null/empty = all projects
   sentryReadRegion         String  @default("us") // "us" | "eu" — org tokens don't auto-route to EU (de.sentry.io)
   // Sentry feedback → Intercom import (edited via /config → Integrations → Sentry Feedback).
-  sentryFeedbackTeamId      String?   // Intercom team imported conversations are assigned to; null = unassigned
-  sentryFeedbackWatermarkAt DateTime? // stamped at FIRST enable; only feedback newer than this ever imports (no backfill)
-  sentryFeedbackLastSyncAt  DateTime? // last completed sync tick — /config status line
-  sentryWebhookSecret       String?   // Sentry internal-integration client secret — encrypted (crypto.ts/Vault)
+  sentryFeedbackTeamId       String?   // Intercom team imported conversations are assigned to; null = unassigned
+  sentryFeedbackWatermarkAt  DateTime? // stamped at FIRST enable; only feedback newer than this ever imports (no backfill)
+  sentryFeedbackLastSyncAt   DateTime? // last completed sync tick — /config status line
+  sentryWebhookSecret        String?   // Sentry internal-integration client secret — encrypted (crypto.ts/Vault)
+  sentryFeedbackTicketTypeId String?   // convert imports into customer tickets of this type; null = plain conversations
   // AI models (edited via /config → AI & Knowledge). Free-text so new model ids
   // work without a code change. Light model runs the tool-less /ai summarize|draft.
   aiModel               String  @default("sonnet")
@@ -966,6 +967,7 @@ model SentryFeedbackImport {
   contactName            String?
   intercomContactId      String?
   intercomConversationId String?  @unique // Postgres unique ignores NULLs, so skipped rows coexist
+  intercomTicketId       String? // set when the conversation was converted to a customer ticket
   pageUrl                String?
   feedbackAt             DateTime // Sentry issue firstSeen — watermark math + audit
   importedAt             DateTime @default(now())

@@ -38,25 +38,35 @@ export class SentryFeedbackStore {
     await this.prisma.sentryFeedbackImport.create({ data: { ...data, status: "skipped_no_email" } });
   }
 
-  // Preload for the inactivity sweeper: every imported conversation id in one
-  // indexed query (the sweep pages ALL open conversations, so a Set beats
+  // Stamps the customer-ticket conversion onto the ledger row (powers the
+  // sweeper's ticket-loop exemption and assignment parity).
+  async setTicketId(sentryIssueId: string, intercomTicketId: string): Promise<void> {
+    await this.prisma.sentryFeedbackImport.update({ where: { sentryIssueId }, data: { intercomTicketId } });
+  }
+
+  // Preload for the inactivity sweeper: every imported conversation/ticket id
+  // pair in one indexed query (the sweep pages ALL open objects, so Sets beat
   // per-item lookups; ids-only memory is trivial at feedback volume).
-  async listImportedConversationIds(): Promise<string[]> {
+  async listImportedRefs(): Promise<Array<{ conversationId: string; ticketId: string | null }>> {
     const rows = await this.prisma.sentryFeedbackImport.findMany({
       where: { intercomConversationId: { not: null } },
-      select: { intercomConversationId: true },
+      select: { intercomConversationId: true, intercomTicketId: true },
     });
-    return rows.map((r) => r.intercomConversationId).filter((id): id is string => !!id);
+    return rows
+      .filter((r): r is typeof r & { intercomConversationId: string } => !!r.intercomConversationId)
+      .map((r) => ({ conversationId: r.intercomConversationId, ticketId: r.intercomTicketId }));
   }
 
   // Chunk variant for the SLA enforcer's batched preload loop.
-  async filterImportedConversationIds(conversationIds: string[]): Promise<string[]> {
+  async mapImportedRefs(conversationIds: string[]): Promise<Array<{ conversationId: string; ticketId: string | null }>> {
     if (conversationIds.length === 0) return [];
     const rows = await this.prisma.sentryFeedbackImport.findMany({
       where: { intercomConversationId: { in: conversationIds } },
-      select: { intercomConversationId: true },
+      select: { intercomConversationId: true, intercomTicketId: true },
     });
-    return rows.map((r) => r.intercomConversationId).filter((id): id is string => !!id);
+    return rows
+      .filter((r): r is typeof r & { intercomConversationId: string } => !!r.intercomConversationId)
+      .map((r) => ({ conversationId: r.intercomConversationId, ticketId: r.intercomTicketId }));
   }
 
   async statusCounts(): Promise<{ imported: number; skippedNoEmail: number }> {

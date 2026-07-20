@@ -148,7 +148,10 @@ export class SlaEnforcer {
     const ids = items.map((c) => c.id);
     const stateByConv = new Map<string, StateRow>();
     const linkByConv = new Map<string, { ticketThreadId: string; ticketId: string | null; lastTagsJson: unknown }>();
-    const feedbackConvIds = new Set<string>();
+    // conversationId → converted ticket id (null while unconverted). Presence
+    // = feedback import (clock-pass skip); the ticket id feeds stray
+    // assignment so balanced picks land on the ticket too (bridge parity).
+    const feedbackByConv = new Map<string, string | null>();
     for (const ch of chunk(ids, DB_CHUNK)) {
       const rows = await this.prisma.slaState.findMany({ where: { conversationId: { in: ch } } });
       for (const r of rows) if (r.conversationId) stateByConv.set(r.conversationId, r as unknown as StateRow);
@@ -166,7 +169,7 @@ export class SlaEnforcer {
         }
       }
       if (this.feedbackStore) {
-        for (const id of await this.feedbackStore.filterImportedConversationIds(ch)) feedbackConvIds.add(id);
+        for (const ref of await this.feedbackStore.mapImportedRefs(ch)) feedbackByConv.set(ref.conversationId, ref.ticketId);
       }
     }
 
@@ -187,7 +190,7 @@ export class SlaEnforcer {
           const link = linkByConv.get(stray.id) ?? null;
           const assignee = await this.assignment.assignConversation(stray.id, stray.teamAssigneeId, {
             threadId: link?.ticketThreadId ?? null,
-            ticketId: link?.ticketId ?? null,
+            ticketId: link?.ticketId ?? feedbackByConv.get(stray.id) ?? null,
           });
           if (assignee) {
             result.assigned++;
@@ -228,7 +231,7 @@ export class SlaEnforcer {
         // a target, but this pass also honors hand-set live attributes — so
         // the skip must live here too). Stray-assignment above still balances
         // team-assigned imports, by design.
-        if (feedbackConvIds.has(conv.id)) continue;
+        if (feedbackByConv.has(conv.id)) continue;
         const state = stateByConv.get(conv.id) ?? null;
         // Effective target: our ledger first (covers pins — pinned writes land
         // in lastWrittenTarget), live attribute as fallback for subjects the

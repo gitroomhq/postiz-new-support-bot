@@ -25,10 +25,12 @@ interface HarnessOpts {
   enabled?: boolean;
   configured?: boolean;
   teamId?: string | null;
+  ticketTypeId?: string | null;
   projectSlugs?: string[];
   createContact409?: boolean;
   searchAfter409?: Array<{ id: string; role: "user" | "lead" | null }>;
   failNthConversation?: number; // the Nth createConversation call throws
+  convertFails?: "permanent" | "permanent-with-existing" | "transient";
   noteFails?: boolean;
 }
 
@@ -105,6 +107,21 @@ function makeHarness(opts: HarnessOpts = {}): Harness {
     async assignConversationToTeam(conversationId: string, teamId: string) {
       ops.push(`ic.assign:${conversationId}:${teamId}`);
     },
+    async convertToTicket(conversationId: string, ticketTypeId: string, attributes?: Record<string, unknown>) {
+      ops.push(`ic.convert:${conversationId}:${ticketTypeId}:${attributes ? "attrs" : "bare"}`);
+      if (opts.convertFails === "transient") throw new IntercomHttpError(500, "convert boom");
+      if (opts.convertFails === "permanent" || opts.convertFails === "permanent-with-existing") {
+        throw new IntercomHttpError(422, "cannot convert");
+      }
+      return { ticketId: `ticket-${conversationId}` };
+    },
+    async getConversationTicketId(conversationId: string) {
+      ops.push(`ic.ticketOf:${conversationId}`);
+      return opts.convertFails === "permanent-with-existing" ? `ticket-existing-${conversationId}` : null;
+    },
+    async updateTicket(ticketId: string, input: { assigneeId?: string }) {
+      ops.push(`ic.ticketAssign:${ticketId}:${input.assigneeId ?? "?"}`);
+    },
   } as unknown as IntercomClient;
 
   const store = {
@@ -119,6 +136,9 @@ function makeHarness(opts: HarnessOpts = {}): Harness {
       ops.push(`store.skipped:${data.sentryIssueId}`);
       ledger.set(data.sentryIssueId, { status: "skipped_no_email" });
     },
+    async setTicketId(sentryIssueId: string, ticketId: string) {
+      ops.push(`store.ticket:${sentryIssueId}:${ticketId}`);
+    },
   } as unknown as SentryFeedbackStore;
 
   const settings = {
@@ -130,6 +150,7 @@ function makeHarness(opts: HarnessOpts = {}): Harness {
     sentryFeedbackWatermarkAt: () => opts.watermark ?? new Date("2026-07-20T10:00:00Z"),
     sentryFeedbackProjectSlugs: () => opts.projectSlugs ?? [],
     sentryFeedbackTeamId: () => opts.teamId ?? null,
+    sentryFeedbackTicketTypeId: () => opts.ticketTypeId ?? null,
     recordSentryFeedbackSync: async (data: { lastSyncAt: Date; watermarkAt?: Date }) => {
       recorded.push(data);
     },
@@ -267,6 +288,63 @@ test("ledger hits dedup without Intercom calls and still advance the watermark (
   assert.ok(!h.ops.some((op) => op.startsWith("ic.")));
   // Watermark advanced through the 25 processed items only.
   assert.equal(h.recorded[0].watermarkAt?.toISOString(), "2026-07-20T11:24:00.000Z");
+});
+
+test("ticket type set: convert lands right after the ledger commit, ticket gets the team too", async () => {
+  const h = makeHarness({
+    issues: [issue("1", "2026-07-20T11:00:00Z")],
+    contexts: { "1": context("a@b.c") },
+    emailMatches: [{ id: "user-7", role: "user" }],
+    ticketTypeId: "tt-9",
+    teamId: "team-3",
+  });
+  const result = await h.importer.tick(false);
+  assert.equal(result.imported, 1);
+  assert.deepEqual(h.ops, [
+    "sentry.list",
+    "sentry.context:1",
+    "ic.search:a@b.c",
+    "ic.createConversation:user-7:user",
+    "store.imported:1",
+    "ic.convert:conv-user-7:tt-9:attrs",
+    "store.ticket:1:ticket-conv-user-7",
+    "ic.note:conv-user-7:note",
+    "ic.tag.ensure:sentry-feedback",
+    "ic.tag.apply:conv-user-7",
+    "ic.assign:conv-user-7:team-3",
+    "ic.ticketAssign:ticket-conv-user-7:team-3",
+  ]);
+});
+
+test("permanent convert failure adopts an existing conversion instead of degrading", async () => {
+  const h = makeHarness({
+    issues: [issue("1", "2026-07-20T11:00:00Z")],
+    contexts: { "1": context("a@b.c") },
+    emailMatches: [{ id: "user-7", role: "user" }],
+    ticketTypeId: "tt-9",
+    convertFails: "permanent-with-existing",
+  });
+  const result = await h.importer.tick(false);
+  assert.equal(result.imported, 1);
+  assert.equal(result.errors, 0);
+  assert.ok(h.ops.includes("ic.ticketOf:conv-user-7"));
+  assert.ok(h.ops.includes("store.ticket:1:ticket-existing-conv-user-7"));
+});
+
+test("convert failure is best-effort: the conversation import stands", async () => {
+  const h = makeHarness({
+    issues: [issue("1", "2026-07-20T11:00:00Z")],
+    contexts: { "1": context("a@b.c") },
+    emailMatches: [{ id: "user-7", role: "user" }],
+    ticketTypeId: "tt-9",
+    convertFails: "transient",
+  });
+  const result = await h.importer.tick(false);
+  assert.equal(result.imported, 1);
+  assert.equal(result.errors, 0);
+  assert.ok(!h.ops.some((op) => op.startsWith("store.ticket:")));
+  assert.ok(h.ops.includes("ic.note:conv-user-7:note")); // later decorations still ran
+  assert.equal(h.recorded[0].watermarkAt?.toISOString(), "2026-07-20T11:00:00.000Z");
 });
 
 test("project allowlist filters client-side", async () => {

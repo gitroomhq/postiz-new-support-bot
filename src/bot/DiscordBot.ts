@@ -1237,6 +1237,19 @@ export class DiscordBot {
       return;
     }
 
+    if (interaction.customId === "config_sentryfeedback_tickettype_pick") {
+      if (!this.isAdmin(interaction)) {
+        await interaction.reply({ embeds: [makeEmbed("Administrator permission required.", COLORS.danger)], flags: 64 });
+        return;
+      }
+      const value = interaction.values[0];
+      const ticketTypeId = value === "__none__" ? null : value;
+      await this.settingsStore.updateSentryFeedback({ sentryFeedbackTicketTypeId: ticketTypeId });
+      this.auditConfig(interaction, `Sentry feedback ticket type → ${ticketTypeId ?? "conversation only"}`);
+      await interaction.update(await this.buildSentryFeedbackPanel());
+      return;
+    }
+
     if (interaction.customId.startsWith("config_intercom_")) {
       await this.handleIntercomSelect(interaction);
       return;
@@ -2295,6 +2308,12 @@ export class DiscordBot {
     const teamId = s.sentryFeedbackTeamId();
     const teamName = teamId ? await this.intercomClient.getTeamNameCached(teamId).catch(() => null) : null;
     const projects = s.sentryFeedbackProjectSlugs();
+    const ticketTypeId = s.sentryFeedbackTicketTypeId();
+    let ticketTypeLabel = "_conversation only_";
+    if (ticketTypeId) {
+      const type = (await this.intercomClient.listTicketTypes().catch(() => null))?.find((t) => t.id === ticketTypeId);
+      ticketTypeLabel = type ? `${type.name} (${type.category ?? "?"})` : `id ${ticketTypeId}`;
+    }
 
     const statusLine =
       !s.sentryReadToken() || !s.sentryOrgSlug()
@@ -2315,7 +2334,7 @@ export class DiscordBot {
           `**Org:** ${s.sentryOrgSlug() ? `\`${s.sentryOrgSlug()}\`` : "_not set_"} · **Region:** ${s.sentryReadRegion().toUpperCase()}`,
           `**Projects:** ${projects.length ? projects.map((p) => `\`${p}\``).join(", ") : "_all_"}`,
           `**Read token:** ${stateLabel[s.secretState("sentryReadToken")]} · **Webhook secret:** ${stateLabel[s.secretState("sentryWebhookSecret")]}`,
-          `**Team routing:** ${teamId ? (teamName ?? `id ${teamId}`) : "_unassigned_"}`,
+          `**Ticket type:** ${ticketTypeLabel} · **Team routing:** ${teamId ? (teamName ?? `id ${teamId}`) : "_unassigned_"}`,
           `**Import floor:** ${watermark ? `<t:${Math.floor(watermark.getTime() / 1000)}:f>` : "_not stamped_"} · **Last sync:** ${lastSync ? `<t:${Math.floor(lastSync.getTime() / 1000)}:R>` : "_never_"}`,
           `**Imported:** ${counts?.imported ?? 0} · **Skipped (no email):** ${counts?.skippedNoEmail ?? 0}`,
           `**Webhook URL:** ${base ? `\`${base}/sentry/webhook\`` : "⚠️ _no public URL — set one via Billing → Stripe Webhooks_"}`,
@@ -2334,6 +2353,7 @@ export class DiscordBot {
       new ButtonBuilder().setCustomId("config_sentryfeedback_scope").setLabel("Org & Projects").setStyle(ButtonStyle.Primary)
     );
     const row2 = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId("config_sentryfeedback_tickettype").setLabel("Ticket Type").setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId("config_sentryfeedback_team").setLabel("Team Routing").setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId("config_sentryfeedback_sync_now").setLabel("Sync Now").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("config_integrations").setLabel("Back").setStyle(ButtonStyle.Secondary)
@@ -3779,6 +3799,58 @@ export class DiscordBot {
         )
       );
       await interaction.showModal(modal);
+      return;
+    }
+
+    if (id === "config_sentryfeedback_tickettype") {
+      await interaction.deferUpdate();
+      try {
+        const types = await this.intercomClient.listTicketTypes();
+        // Both categories technically work, but Customer first: convert merges
+        // conversation + ticket into ONE inbox object (BridgeHub rationale).
+        const rank = (t: { category?: string | null }) => {
+          const c = (t.category ?? "").toLowerCase();
+          return c === "customer" ? 0 : c === "back-office" ? 1 : 2;
+        };
+        const pool = [...types].sort((a, b) => rank(a) - rank(b));
+        const current = this.settingsStore.sentryFeedbackTicketTypeId();
+        const select = new StringSelectMenuBuilder()
+          .setCustomId("config_sentryfeedback_tickettype_pick")
+          .setPlaceholder("Ticket type for imported feedback")
+          .addOptions([
+            {
+              label: "— conversation only —",
+              value: "__none__",
+              description: "Import as plain conversations (no ticket)",
+              default: !current,
+            },
+            ...pool.slice(0, 24).map((t) => ({
+              label: t.name.slice(0, 100),
+              value: t.id,
+              description: `${t.category ?? "?"} · id ${t.id}`.slice(0, 100),
+              default: t.id === current,
+            })),
+          ]);
+        await interaction.editReply({
+          embeds: [
+            makeEmbed(
+              "New imports are converted into a ticket of this type right after creation (Customer category recommended — one unified inbox object). Existing imports stay as they are.",
+              COLORS.neutral
+            ),
+          ],
+          components: [
+            new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(select),
+            new ActionRowBuilder<ButtonBuilder>().addComponents(
+              new ButtonBuilder().setCustomId("config_sentryfeedback").setLabel("Back").setStyle(ButtonStyle.Secondary)
+            ),
+          ],
+        });
+      } catch (e) {
+        await interaction.followUp({
+          embeds: [makeEmbed(`Could not list ticket types: ${e instanceof Error ? e.message : e}`, COLORS.danger)],
+          flags: 64,
+        });
+      }
       return;
     }
 
