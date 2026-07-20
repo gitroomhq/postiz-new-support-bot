@@ -360,6 +360,7 @@ async function main() {
   statusService.setSlaService(slaService);
   stripeWebhookHandler.setSlaService(slaService);
   intercomWebhookHandler.setSlaService(slaService);
+  intercomWebhookHandler.setSentryFeedbackStore(sentryFeedbackStore);
   sessionStore.setSlaHook((threadId) => slaService.onTicketTrigger(threadId, "refund_review"));
 
   // ---- Balanced assignment + bot-native SLA enforcement (Advanced tier:

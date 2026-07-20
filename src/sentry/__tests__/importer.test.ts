@@ -206,10 +206,10 @@ test("existing user-role contact is reused; conversation → ledger → decorati
     "ic.search:a@b.c",
     "ic.createConversation:user-7:user",
     "store.imported:1",
+    "ic.assign:conv-user-7:team-3",
     "ic.note:conv-user-7:note",
     "ic.tag.ensure:sentry-feedback",
     "ic.tag.apply:conv-user-7",
-    "ic.assign:conv-user-7:team-3",
   ]);
 });
 
@@ -308,11 +308,11 @@ test("ticket type set: convert lands right after the ledger commit, ticket gets 
     "store.imported:1",
     "ic.convert:conv-user-7:tt-9:attrs",
     "store.ticket:1:ticket-conv-user-7",
+    "ic.assign:conv-user-7:team-3",
+    "ic.ticketAssign:ticket-conv-user-7:team-3",
     "ic.note:conv-user-7:note",
     "ic.tag.ensure:sentry-feedback",
     "ic.tag.apply:conv-user-7",
-    "ic.assign:conv-user-7:team-3",
-    "ic.ticketAssign:ticket-conv-user-7:team-3",
   ]);
 });
 

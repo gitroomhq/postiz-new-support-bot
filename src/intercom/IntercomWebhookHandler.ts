@@ -186,6 +186,14 @@ export class IntercomWebhookHandler {
     this.assignmentService = service;
   }
 
+  // Sentry feedback import ledger — bound late. Creation-time balanced
+  // assignment must not race the importer's own paced decoration writes.
+  private sentryFeedbackStore: { getByConversationId(conversationId: string): Promise<unknown> } | null = null;
+
+  setSentryFeedbackStore(store: NonNullable<IntercomWebhookHandler["sentryFeedbackStore"]>): void {
+    this.sentryFeedbackStore = store;
+  }
+
   // SLA enforcement engine — bound late; owns the unsnooze re-anchor for the
   // next-reply clock.
   private slaEnforcer: { reanchorAfterUnsnooze(conversationId: string): Promise<void> } | null = null;
@@ -315,7 +323,18 @@ export class IntercomWebhookHandler {
       item?.team_assignee_id != null && String(item.team_assignee_id) !== "0" ? String(item.team_assignee_id) : null;
     if (this.assignmentService) {
       if (topic === "conversation.user.created" && !link) {
-        await this.assignmentService.maybeAssignOnCreate(conversationId, teamId, null, null).catch(() => undefined);
+        // Sentry feedback imports skip the creation balancer: Intercom builds
+        // this payload at DELIVERY time, so it can already carry the team the
+        // importer routed mid-decoration — balancing here races the importer's
+        // remaining team-routing writes (observed assign→unassign churn). The
+        // enforcer's stray sweep balances imports once the dust settles and
+        // mirrors the pick onto the converted ticket.
+        const feedback = this.sentryFeedbackStore
+          ? await this.sentryFeedbackStore.getByConversationId(conversationId).catch(() => null)
+          : null;
+        if (!feedback) {
+          await this.assignmentService.maybeAssignOnCreate(conversationId, teamId, null, null).catch(() => undefined);
+        }
       } else if (topic === "conversation.user.replied") {
         const assigneeId = item?.admin_assignee_id != null && String(item.admin_assignee_id) !== "0"
           ? String(item.admin_assignee_id)

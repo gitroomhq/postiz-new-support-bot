@@ -203,36 +203,10 @@ export class SentryFeedbackImporter {
             });
           }
         }
-        try {
-          await paceWrite();
-          await this.intercom.replyAsAdmin(conversationId, {
-            adminId,
-            note: true,
-            body: buildMetadataNote({
-              name: context.name,
-              email,
-              pageUrl: context.url,
-              shortId: issue.shortId,
-              permalink: issue.permalink,
-              projectSlug: issue.projectSlug,
-            }),
-          });
-        } catch (e) {
-          syncLog.warn("sentry feedback import: metadata note failed", {
-            "intercom.conversation_id": conversationId,
-            "error.message": e instanceof Error ? e.message : String(e),
-          });
-        }
-        try {
-          if (tagId === null) tagId = (await this.intercom.findOrCreateTag(FEEDBACK_TAG)).id;
-          await paceWrite();
-          await this.intercom.tagConversation(conversationId, tagId, adminId);
-        } catch (e) {
-          syncLog.warn("sentry feedback import: tag failed", {
-            "intercom.conversation_id": conversationId,
-            "error.message": e instanceof Error ? e.message : String(e),
-          });
-        }
+        // Team routing directly after conversion (before note/tag): all
+        // assignment-relevant writes land as early as possible — the balanced
+        // admin pick itself is deliberately left to the enforcer's stray
+        // sweep (the creation webhook skips imports to avoid churn).
         const teamId = this.settingsStore.sentryFeedbackTeamId();
         if (teamId) {
           try {
@@ -256,6 +230,33 @@ export class SentryFeedbackImporter {
               });
             }
           }
+        }
+        try {
+          await paceWrite();
+          await this.intercom.replyAsAdmin(conversationId, {
+            adminId,
+            note: true,
+            body: buildMetadataNote({
+              pageUrl: context.url,
+              shortId: issue.shortId,
+              permalink: issue.permalink,
+            }),
+          });
+        } catch (e) {
+          syncLog.warn("sentry feedback import: metadata note failed", {
+            "intercom.conversation_id": conversationId,
+            "error.message": e instanceof Error ? e.message : String(e),
+          });
+        }
+        try {
+          if (tagId === null) tagId = (await this.intercom.findOrCreateTag(FEEDBACK_TAG)).id;
+          await paceWrite();
+          await this.intercom.tagConversation(conversationId, tagId, adminId);
+        } catch (e) {
+          syncLog.warn("sentry feedback import: tag failed", {
+            "intercom.conversation_id": conversationId,
+            "error.message": e instanceof Error ? e.message : String(e),
+          });
         }
       } catch (e) {
         result.errors++;

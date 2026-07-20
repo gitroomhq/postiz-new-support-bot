@@ -28,24 +28,19 @@ export function buildConversationBody(message: string): string {
 }
 
 export interface FeedbackNoteInput {
-  name: string | null;
-  email: string;
   pageUrl: string | null;
   shortId: string | null;
   permalink: string | null;
-  projectSlug: string | null;
 }
 
 // Agent-facing internal note: Sentry provenance + page context. Customers
 // never see notes, so the debug metadata lives here instead of the opening
-// message. No timestamp line — the conversation itself is backdated to the
-// submission time. Every field is end-user- or Sentry-supplied → escaped.
+// message. Deliberately minimal (operator-tuned): the conversation already
+// carries the submitter identity and the backdated submission time, and the
+// project is visible behind the Sentry link.
 export function buildMetadataNote(input: FeedbackNoteInput): string {
   const lines: string[] = [];
-  const source = [input.projectSlug, input.shortId].filter(Boolean).map((s) => escapeHtmlText(String(s))).join(" · ");
-  lines.push(`<p><b>Sentry feedback</b>${source ? ` — ${source}` : ""}</p>`);
-  const name = input.name?.trim();
-  lines.push(`<p>From: ${name ? `${escapeHtmlText(name)} (${escapeHtmlText(input.email)})` : escapeHtmlText(input.email)}</p>`);
+  lines.push(`<p><b>Sentry feedback</b>${input.shortId ? ` — ${escapeHtmlText(input.shortId)}` : ""}</p>`);
   if (input.pageUrl) {
     lines.push(`<p>Page: <a href="${escapeHtmlText(input.pageUrl)}">${escapeHtmlText(input.pageUrl)}</a></p>`);
   }

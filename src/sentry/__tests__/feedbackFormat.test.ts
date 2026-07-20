@@ -21,37 +21,23 @@ test("buildConversationBody truncates pathological messages with a marker", () =
   assert.ok(body.length < 65_000);
 });
 
-test("buildMetadataNote escapes every field and renders links only when present", () => {
+test("buildMetadataNote is minimal: short id header + escaped links only", () => {
   const note = buildMetadataNote({
-    name: 'Eve <script>"',
-    email: "eve@example.com",
     pageUrl: "https://app.example.com/x?a=1&b=2",
     shortId: "POSTIZ-1X",
     permalink: "https://sentry.io/organizations/acme/issues/42/",
-    projectSlug: "postiz-web",
   });
-  assert.ok(note.includes("From: Eve &lt;script&gt;&quot; (eve@example.com)"));
+  assert.ok(note.includes("<b>Sentry feedback</b> — POSTIZ-1X"));
   assert.ok(note.includes('href="https://app.example.com/x?a=1&amp;b=2"'));
   assert.ok(note.includes("Open in Sentry"));
-  assert.ok(note.includes("postiz-web"));
-  assert.ok(note.includes("POSTIZ-1X"));
-  // The conversation itself is backdated — no timestamp line; and no
-  // replies-are-emailed footer (removed by user request).
+  // Operator-trimmed: no timestamp, no From line, no project slug, no footer
+  // (submitter + time live on the conversation itself).
   assert.ok(!note.includes("Submitted"));
+  assert.ok(!note.includes("From:"));
   assert.ok(!note.includes("emailed to the submitter"));
 
-  const bare = buildMetadataNote({
-    name: null,
-    email: "a@b.c",
-    pageUrl: null,
-    shortId: null,
-    permalink: null,
-    projectSlug: null,
-  });
-  assert.ok(bare.includes("From: a@b.c"));
-  assert.ok(!bare.includes("("));
-  assert.ok(!bare.includes("<a "));
-  assert.ok(!bare.includes("Page:"));
+  const bare = buildMetadataNote({ pageUrl: null, shortId: null, permalink: null });
+  assert.equal(bare, "<p><b>Sentry feedback</b></p>");
 });
 
 test("buildTicketAttributes composes title/description with caps and fallbacks", () => {
