@@ -141,7 +141,6 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
   const { createdGte, createdLt } = parseDateFilter(createdRaw);
   const collection =
     filters.collection === "charge_automatically" || filters.collection === "send_invoice" ? filters.collection : "";
-  const syncFilter = filters.sync === "unsynced" ? "unsynced" : "";
 
   const cursorId = validId("subscription", validCursor(cursor) ?? "") ?? undefined;
 
@@ -204,9 +203,6 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
 
   const filtered = subs.filter((s) => {
     if (collection && s.collection_method !== collection) return false;
-    // "Unsynced only" is the repair worklist: canceled subs can't be
-    // repaired anymore, so they don't belong on it.
-    if (syncFilter === "unsynced" && (s.status === "canceled" || postizSyncStatus(s) === "synced")) return false;
     if (!status) return true;
     if (status === "paused") return !!s.pause_collection;
     return s.status === status;
@@ -216,9 +212,6 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
     const plan = planLabel(sub);
     const item = sub.items.data[0];
     const flags: Badge[] = subStatusFlags(sub);
-    // Postiz sync is background QoS — it only surfaces when something is
-    // actually broken on a sub that can still be fixed.
-    if (sub.status !== "canceled" && postizSyncStatus(sub) !== "synced") flags.push(syncBadge(postizSyncStatus(sub)));
     const customer = typeof sub.customer === "string" ? sub.customer : sub.customer?.id ?? null;
     return {
       id: sub.id,
@@ -295,20 +288,10 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
               { value: "send_invoice", label: "Send invoice" },
             ],
           },
-          {
-            key: "sync",
-            label: "Postiz sync",
-            kind: "select",
-            value: syncFilter || undefined,
-            options: [{ value: "unsynced", label: "Unsynced only" }],
-          },
         ],
         rows,
         nextCursor: subsRes.hasMore && subs.length > 0 ? subs[subs.length - 1].id : null,
-        empty:
-          status || collection || syncFilter
-            ? "No subscriptions match this filter (within this window)."
-            : "No subscriptions yet.",
+        empty: status || collection ? "No subscriptions match this filter (within this window)." : "No subscriptions yet.",
         ...(rows.length ? { footer: `${rows.length} item${rows.length === 1 ? "" : "s"}` } : {}),
         notice: scoped
           ? `Customer/price/collection filters aren't searchable — chip counts cover this window only ("N+" on overflow).`

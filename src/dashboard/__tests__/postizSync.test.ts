@@ -511,26 +511,16 @@ test("detail: synced sub gets no repair button and clean cancel summaries; non-c
   );
 });
 
-test("list: sync surfaces only as a flag on broken fixable subs; unsynced filter is the repair worklist", async () => {
+test("list: Postiz sync has NO surface — no column, no flag, no filter (detail-only concern)", async () => {
   const section = makeSubscriptionsSection();
-  const ctx = sectionCtx();
-  (ctx.stripe as unknown as Record<string, unknown>).listAllSubscriptions = async () => ({
-    subscriptions: [fakeSub(), fakeSub({ id: "sub_synced", metadata: gitroomMeta() }), fakeSub({ id: "sub_gone", status: "canceled" })],
-    hasMore: false,
-  });
-  const page = await section.buildPage(ctx, { page: "subscriptions", filters: {} });
+  const page = await section.buildPage(sectionCtx(), { page: "subscriptions", filters: {} });
   const table = page!.blocks.find((b) => b.type === "table") as TableBlock;
-  // No dedicated column — background QoS.
   assert.ok(!table.columns.some((c) => c.key === "sync"));
-  const flagsOf = (id: string) =>
-    ((table.rows.find((r) => r.id === id)!.cells.find((c) => (c as { t: string }).t === "flags") as { badges: Array<{ text: string }> })
-      .badges).map((b) => b.text);
-  assert.ok(flagsOf("sub_1").includes("No Postiz sync")); // broken + fixable → flagged
-  assert.ok(!flagsOf("sub_synced").includes("No Postiz sync")); // healthy → silent
-  assert.ok(!flagsOf("sub_gone").includes("No Postiz sync")); // canceled → past fixing, silent
-  const filteredPage = await section.buildPage(ctx, { page: "subscriptions", filters: { sync: "unsynced" } });
-  const filtered = filteredPage!.blocks.find((b) => b.type === "table") as TableBlock;
-  assert.deepEqual(filtered.rows.map((r) => r.id), ["sub_1"]); // synced AND canceled hidden
+  assert.ok(!table.filters!.some((f) => f.key === "sync"));
+  for (const row of table.rows) {
+    const flags = (row.cells.find((c) => (c as { t: string }).t === "flags") as { badges: Array<{ text: string }> }).badges;
+    assert.ok(!flags.some((b) => b.text.includes("Postiz")), `row ${row.id} must not carry a Postiz flag`);
+  }
 });
 
 test("subStatusFlags: an already-canceled period-end sub collapses to one past-tense badge", () => {
