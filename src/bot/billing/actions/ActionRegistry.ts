@@ -5,6 +5,13 @@ import { SettingsStore, BillingActionLevel } from "../../../config/SettingsStore
 import { BlockService, BlockEntry } from "../BlockService";
 import { BLOCK_KINDS, type BlockKind } from "../BlockStore";
 import { RefundCoreService } from "../RefundCoreService";
+import {
+  buildPostizMetadata,
+  derivePostizPlan,
+  isGitroomSub,
+  postizSyncStatus,
+  postizUniqueId,
+} from "../postizPlan";
 
 // Single source of truth for every canvas/panel billing action: the panel UI,
 // the canvas card, the /config levels panel and the approval executor all
@@ -501,6 +508,12 @@ const subscriptionChangePlan = defineAction<SubscriptionChangePlanParams>({
     }
     const price = await ctx.stripe.getPrice(p.priceId).catch(() => null);
     if (!price || !price.recurring) return "Target price does not exist or is not recurring.";
+    // A gitroom sub may only MOVE to canonical Postiz prices — the platform
+    // applies whatever the metadata says, so a non-canonical price would
+    // desync what the customer pays from what they get.
+    if (!samePrice && isGitroomSub(sub) && !derivePostizPlan(price)) {
+      return "This subscription syncs to Postiz — the target price must be a canonical Postiz price ($29/$278, $39/$374, $49/$470, $99/$950 USD). Use a promo for discounts.";
+    }
     const allowlist = ctx.settingsStore.allowedPriceIds();
     // Keeping the CURRENT price (qty/promo/cycle-only update) is always fine —
     // the allowlist gates plan MOVES, not already-held plans.
@@ -524,6 +537,23 @@ const subscriptionChangePlan = defineAction<SubscriptionChangePlanParams>({
       if (!active) return { ok: false, error: "Promo code not found or inactive." };
       promotionCodeId = active.id;
     }
+    // Keep the Postiz metadata in the SAME update call: the platform re-reads
+    // billing/period from metadata on customer.subscription.updated, so a
+    // price change without the matching metadata strands the org on the old
+    // tier. uniqueId is the platform's Subscription.identifier — preserved,
+    // never rotated.
+    let metadata: Record<string, string> | undefined;
+    let syncBit: string | null = null;
+    if (isGitroomSub(sub)) {
+      const price = await ctx.stripe.getPrice(p.priceId).catch(() => null);
+      const plan = price ? derivePostizPlan(price) : null;
+      if (plan) {
+        metadata = buildPostizMetadata(plan, sub.metadata?.uniqueId || postizUniqueId(ctx.idemScope));
+        syncBit = `Postiz sync ${plan.tier}/${plan.period}`;
+      } else if (item.price?.id !== p.priceId) {
+        return { ok: false, error: "Target price is not a canonical Postiz price — cannot keep this subscription synced." };
+      }
+    }
     await ctx.stripe.changeSubscriptionPlan(
       {
         subscriptionId: p.subscriptionId,
@@ -533,6 +563,7 @@ const subscriptionChangePlan = defineAction<SubscriptionChangePlanParams>({
         quantity: p.quantity,
         promotionCodeId,
         billingCycleAnchor: p.cycleAnchor,
+        metadata,
       },
       `panel-planchange-${p.subscriptionId}-${p.priceId}-${ctx.idemScope}`
     );
@@ -541,6 +572,7 @@ const subscriptionChangePlan = defineAction<SubscriptionChangePlanParams>({
       p.quantity != null ? `quantity ${p.quantity}` : null,
       promotionCodeId ? `promo ${p.promoCode}` : null,
       p.cycleAnchor === "now" ? "billing cycle reset" : null,
+      syncBit,
     ].filter(Boolean);
     return { ok: true, text: `Subscription ${p.subscriptionId} updated — ${bits.join(", ")} (with prorations).` };
   },
@@ -620,6 +652,9 @@ interface SubscriptionCreateParams {
   promoCode?: string;
   trialDays?: number;
   collection: "charge" | "invoice";
+  // Postiz sync is the default: the platform only recognizes subscriptions
+  // carrying the gitroom metadata contract. false = deliberately non-Postiz.
+  postizSync?: boolean;
 }
 
 const subscriptionCreate = defineAction<SubscriptionCreateParams>({
@@ -647,6 +682,7 @@ const subscriptionCreate = defineAction<SubscriptionCreateParams>({
         promoCode: str(o!.promoCode, 100) ?? undefined,
         trialDays,
         collection,
+        postizSync: o!.postizSync === false ? false : true,
       },
     };
   },
@@ -655,7 +691,8 @@ const subscriptionCreate = defineAction<SubscriptionCreateParams>({
     (p.quantity != null ? ` ×${p.quantity}` : "") +
     (p.trialDays ? `, ${p.trialDays}-day trial` : "") +
     (p.promoCode ? `, promo ${p.promoCode}` : "") +
-    (p.collection === "invoice" ? " (email invoice)" : " (charge the default payment method now)"),
+    (p.collection === "invoice" ? " (email invoice)" : " (charge the default payment method now)") +
+    (p.postizSync === false ? " — NO Postiz sync" : " — Postiz sync (tier from the price)"),
   revalidate: async (ctx, p) => {
     const cus = requireCustomer(ctx);
     if (!cus) return "No linked Stripe customer.";
@@ -665,6 +702,9 @@ const subscriptionCreate = defineAction<SubscriptionCreateParams>({
     const price = await ctx.stripe.getPrice(p.priceId).catch(() => null);
     if (!price || !price.recurring) return "Price does not exist or is not recurring.";
     if (!price.active) return "Price is archived.";
+    if (p.postizSync !== false && !derivePostizPlan(price)) {
+      return "Price is not a canonical Postiz price ($29/$278, $39/$374, $49/$470, $99/$950 USD) — pick a canonical price, use a promo for discounts, or set No sync.";
+    }
     const allowlist = ctx.settingsStore.allowedPriceIds();
     if (allowlist.length > 0 && !allowlist.includes(p.priceId)) return "Price is not on the plan allowlist (/config → Billing).";
     if (p.promoCode) {
@@ -690,6 +730,15 @@ const subscriptionCreate = defineAction<SubscriptionCreateParams>({
       if (!active) return { ok: false, error: "Promo code not found or inactive." };
       promotionCodeId = active.id;
     }
+    let metadata: Record<string, string> | undefined;
+    let syncText = "no Postiz sync";
+    if (p.postizSync !== false) {
+      const price = await ctx.stripe.getPrice(p.priceId);
+      const plan = derivePostizPlan(price);
+      if (!plan) return { ok: false, error: "Price is not a canonical Postiz price — cannot attach sync metadata." };
+      metadata = buildPostizMetadata(plan, postizUniqueId(ctx.idemScope));
+      syncText = `Postiz sync ${plan.tier}/${plan.period}`;
+    }
     const sub = await ctx.stripe.createSubscription(
       {
         customerId: p.customerId,
@@ -698,10 +747,65 @@ const subscriptionCreate = defineAction<SubscriptionCreateParams>({
         promotionCodeId,
         trialDays: p.trialDays,
         collection: p.collection,
+        metadata,
       },
       `panel-subcreate-${p.customerId}-${p.priceId}-${ctx.idemScope}`
     );
-    return { ok: true, text: `Subscription ${sub.id} created (${sub.status}).` };
+    return { ok: true, text: `Subscription ${sub.id} created (${sub.status}, ${syncText}).` };
+  },
+});
+
+interface SubscriptionRepairSyncParams {
+  subscriptionId: string;
+}
+
+// Stamps the Postiz sync contract (service/billing/period/uniqueId) onto a
+// subscription whose metadata is missing or wrong. The metadata-only update
+// fires customer.subscription.updated, so the platform re-syncs the org's
+// tier immediately — and a later cancel actually downgrades it instead of
+// being dropped by the webhook's service gate. Tier is DERIVED from the
+// item's price; non-canonical prices are unrepairable by design.
+const subscriptionRepairSync = defineAction<SubscriptionRepairSyncParams>({
+  key: "subscription.repair_sync",
+  label: "Repair Postiz sync metadata",
+  group: "Subscriptions",
+  defaultLevel: "none",
+  dangerous: true,
+  parseParams: (raw) => {
+    const o = obj(raw);
+    const subscriptionId = o ? idWithPrefix(o.subscriptionId, "sub_") : null;
+    if (!subscriptionId) return { ok: false, error: "subscriptionId (sub_…) required" };
+    return { ok: true, params: { subscriptionId } };
+  },
+  summarize: (p) => `Repair Postiz sync metadata on ${p.subscriptionId} (tier derived from its price)`,
+  revalidate: async (ctx, p) => {
+    const cus = requireCustomer(ctx);
+    if (!cus) return "No linked Stripe customer.";
+    const sub = await ctx.stripe.getSubscription(p.subscriptionId);
+    if (customerIdOf(sub) !== cus) return "Subscription does not belong to this customer.";
+    if (sub.status === "canceled") return "Subscription is already canceled — nothing left to sync.";
+    if (postizSyncStatus(sub) === "synced") return "Subscription already carries correct Postiz sync metadata.";
+    const price = sub.items.data[0]?.price;
+    if (!price || !derivePostizPlan(price)) {
+      return "This subscription's price is not a canonical Postiz price — the tier cannot be derived, so it cannot be synced. Move it to a canonical price first.";
+    }
+    return null;
+  },
+  execute: async (ctx, p) => {
+    const sub = await ctx.stripe.getSubscription(p.subscriptionId);
+    const price = sub.items.data[0]?.price;
+    const plan = price ? derivePostizPlan(price) : null;
+    if (!plan) return { ok: false, error: "Price is not a canonical Postiz price — tier cannot be derived." };
+    const uniqueId = sub.metadata?.uniqueId || postizUniqueId(ctx.idemScope);
+    await ctx.stripe.updateSubscriptionMetadata(
+      p.subscriptionId,
+      buildPostizMetadata(plan, uniqueId),
+      `panel-subrepair-${p.subscriptionId}-${ctx.idemScope}`
+    );
+    return {
+      ok: true,
+      text: `Postiz sync metadata repaired on ${p.subscriptionId} — service gitroom, billing ${plan.tier}, period ${plan.period}, uniqueId ${uniqueId}. The platform re-syncs on the update event.`,
+    };
   },
 });
 
@@ -869,6 +973,11 @@ const subscriptionSchedule = defineAction<SubscriptionScheduleOpParams>({
       if (!price) return `Price ${phase.priceId} does not exist.`;
       if (!price.active) return `Price ${phase.priceId} is archived.`;
       if (!price.recurring) return `Price ${phase.priceId} is not recurring.`;
+      // Each phase becomes the live price at its boundary — on a gitroom sub
+      // every phase must stay derivable or the platform strands on a stale tier.
+      if (isGitroomSub(sub) && !derivePostizPlan(price)) {
+        return `Price ${phase.priceId} is not a canonical Postiz price — this subscription syncs to Postiz, so every phase must use one.`;
+      }
       if (allowlist.length > 0 && !allowlist.includes(phase.priceId)) {
         return `Price ${phase.priceId} is not on the plan allowlist (/config → Billing).`;
       }
@@ -895,12 +1004,28 @@ const subscriptionSchedule = defineAction<SubscriptionScheduleOpParams>({
     if (unsupported.length > 0) {
       return { ok: false, error: `The current phase has settings this editor can't preserve (${unsupported.join("; ")}) — edit in the Stripe dashboard.` };
     }
-    const futurePhases: Stripe.SubscriptionScheduleUpdateParams.Phase[] = p.phases!.map((phase) => ({
-      items: [{ price: phase.priceId, quantity: phase.quantity }],
-      duration: { interval: phase.durationUnit, interval_count: phase.durationCount },
-      ...(phase.trial ? { trial: true } : {}),
-      proration_behavior: phase.proration ?? "create_prorations",
-    }));
+    // On gitroom subs, each future phase carries the sync contract with the
+    // billing/period THAT phase's price charges — the phase boundary fires
+    // customer.subscription.updated, so scheduled downgrades sync on time.
+    const gitroom = isGitroomSub(sub);
+    const uniqueId = sub.metadata?.uniqueId || postizUniqueId(ctx.idemScope);
+    const futurePhases: Stripe.SubscriptionScheduleUpdateParams.Phase[] = [];
+    for (const phase of p.phases!) {
+      let metadata: Record<string, string> | undefined;
+      if (gitroom) {
+        const price = await ctx.stripe.getPrice(phase.priceId).catch(() => null);
+        const plan = price ? derivePostizPlan(price) : null;
+        if (!plan) return { ok: false, error: `Price ${phase.priceId} is not a canonical Postiz price — cannot keep this subscription synced.` };
+        metadata = buildPostizMetadata(plan, uniqueId);
+      }
+      futurePhases.push({
+        items: [{ price: phase.priceId, quantity: phase.quantity }],
+        duration: { interval: phase.durationUnit, interval_count: phase.durationCount },
+        ...(phase.trial ? { trial: true } : {}),
+        proration_behavior: phase.proration ?? "create_prorations",
+        ...(metadata ? { metadata } : {}),
+      });
+    }
     await ctx.stripe.updateSchedulePhases(
       scheduleId,
       { phases: [currentPhase, ...futurePhases], endBehavior: p.endBehavior ?? "release" },
@@ -1468,6 +1593,7 @@ export const BILLING_ACTIONS: BillingActionDef[] = [
   subscriptionChangePlan,
   subscriptionTerms,
   subscriptionCreate,
+  subscriptionRepairSync,
   subscriptionItems,
   subscriptionSchedule,
   invoiceCollect,

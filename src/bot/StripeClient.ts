@@ -867,6 +867,7 @@ export class StripeClient {
       promotionCodeId?: string;
       trialDays?: number;
       collection: "charge" | "invoice";
+      metadata?: Record<string, string>;
     },
     idempotencyKey: string
   ): Promise<Stripe.Subscription> {
@@ -874,6 +875,7 @@ export class StripeClient {
       {
         customer: params.customerId,
         items: [{ price: params.priceId, ...(params.quantity ? { quantity: params.quantity } : {}) }],
+        ...(params.metadata ? { metadata: params.metadata } : {}),
         ...(params.couponId
           ? { discounts: [{ coupon: params.couponId }] }
           : params.promotionCodeId
@@ -903,6 +905,7 @@ export class StripeClient {
       quantity?: number;
       billingCycleAnchor?: "now";
       prorationDate?: number;
+      metadata?: Record<string, string>;
     },
     idempotencyKey: string
   ): Promise<Stripe.Subscription> {
@@ -911,6 +914,7 @@ export class StripeClient {
       {
         items: [{ id: params.itemId, price: params.priceId, ...(params.quantity ? { quantity: params.quantity } : {}) }],
         proration_behavior: params.prorationBehavior,
+        ...(params.metadata ? { metadata: params.metadata } : {}),
         ...(params.billingCycleAnchor === "now" ? { billing_cycle_anchor: "now" as const } : {}),
         ...(params.prorationDate && params.prorationBehavior === "create_prorations"
           ? { proration_date: params.prorationDate }
@@ -925,6 +929,17 @@ export class StripeClient {
       },
       { idempotencyKey }
     );
+  }
+
+  // Metadata-only update (merge-by-key: absent keys survive, null values
+  // delete). Fires customer.subscription.updated — the Postiz repair path
+  // relies on that event re-syncing the platform immediately.
+  async updateSubscriptionMetadata(
+    subscriptionId: string,
+    metadata: Record<string, string>,
+    idempotencyKey: string
+  ): Promise<Stripe.Subscription> {
+    return this.stripe.subscriptions.update(subscriptionId, { metadata }, { idempotencyKey });
   }
 
   async listInvoices(
@@ -2455,12 +2470,17 @@ export function rebuildCurrentPhase(schedule: Stripe.SubscriptionSchedule): {
     });
   }
   if (current.default_payment_method) unsupported.push("a phase-level default payment method");
+  // Phase metadata is response-only unless re-sent — dropping it here would
+  // silently strip the Postiz sync keys (service/billing/period/uniqueId)
+  // from the current phase on every schedule edit.
+  const metadata = current.metadata && Object.keys(current.metadata).length ? current.metadata : null;
   const phase: Stripe.SubscriptionScheduleUpdateParams.Phase = {
     items,
     start_date: current.start_date,
     end_date: current.end_date,
     ...(current.trial_end ? { trial_end: current.trial_end } : {}),
     ...(discounts.length ? { discounts } : {}),
+    ...(metadata ? { metadata } : {}),
   };
   return { phase, unsupported };
 }

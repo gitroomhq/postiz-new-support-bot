@@ -85,6 +85,7 @@ export class DashboardActionGateway {
       case "subscription.terms":
       case "subscription.items":
       case "subscription.schedule":
+      case "subscription.repair_sync":
       case "customer.coupon": {
         // coupon op:"remove" may target the CUSTOMER-level discount instead of
         // a subscription — bind via the explicit customer id then.

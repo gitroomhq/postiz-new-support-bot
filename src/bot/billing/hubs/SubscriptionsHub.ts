@@ -26,6 +26,7 @@ import {
   textInput,
 } from "../ui";
 import { pushNav, type BillAdminSession, type Panel, type RenderInteraction, type RouteEntry } from "../types";
+import { buildPostizMetadata, derivePostizPlan, isGitroomSub, postizUniqueId } from "../postizPlan";
 import type { HubContext } from "./HubContext";
 
 // Plain-language descriptions of Stripe's three pause_collection behaviors.
@@ -341,6 +342,17 @@ export class SubscriptionsHub {
           const choice = session.discountChoice ?? "keep";
           const isPromo = choice.startsWith("pc:");
           const noDiscount = choice === "keep" || choice === "remove";
+          // Postiz sync: the platform only recognizes subscriptions carrying
+          // the gitroom metadata, with the tier derived from the price.
+          // Non-canonical price → created unsynced, with a loud warning.
+          const price = await this.ctx.stripe.getPrice(session.newPriceId!).catch(() => null);
+          const postizPlan = price ? derivePostizPlan(price) : null;
+          const metadata = postizPlan
+            ? buildPostizMetadata(postizPlan, postizUniqueId(`billadmin-createsub-${interaction.id}`))
+            : undefined;
+          const syncLine = postizPlan
+            ? `Postiz sync ${postizPlan.tier}/${postizPlan.period}`
+            : "⚠ NOT a canonical Postiz price — this subscription will NOT sync to the Postiz platform";
           const sub = await this.ctx.stripe.createSubscription(
             {
               customerId: session.customerId!,
@@ -349,6 +361,7 @@ export class SubscriptionsHub {
               promotionCodeId: isPromo ? choice.slice(3) : undefined,
               trialDays: session.trialDays,
               collection: mode === "invoice" ? "invoice" : "charge",
+              metadata,
             },
             `billadmin-createsub-${interaction.id}`
           );
@@ -359,14 +372,16 @@ export class SubscriptionsHub {
             outcome:
               `${session.planTo} — status ${sub.status}` +
               (mode === "invoice" ? " (invoice emailed, due in 7 days)" : "") +
-              (session.trialDays ? ` — trial ${session.trialDays} days` : ""),
+              (session.trialDays ? ` — trial ${session.trialDays} days` : "") +
+              ` — ${syncLine}`,
             severity: "success",
           });
           await interaction.editReply({
             embeds: [
               makeEmbed(
                 `✅ Created \`${sub.id}\` — **${session.planTo}**, status **${sub.status}**.` +
-                  (mode === "invoice" ? "\n📧 An invoice (due in 7 days) is emailed to the customer." : ""),
+                  (mode === "invoice" ? "\n📧 An invoice (due in 7 days) is emailed to the customer." : "") +
+                  `\n${syncLine}`,
                 COLORS.success
               ),
             ],
@@ -386,6 +401,25 @@ export class SubscriptionsHub {
         await interaction.deferUpdate();
         await this.ctx.sessions.tryRender(interaction, async () => {
           const choice = session.discountChoice ?? "keep";
+          // Postiz sync: on gitroom subs the platform trusts metadata over the
+          // price, so billing/period ride the SAME update (uniqueId preserved).
+          // Non-canonical target → metadata untouched, loud warning instead.
+          const liveSub = await this.ctx.stripe.getSubscription(session.subscriptionId!).catch(() => null);
+          let metadata: Record<string, string> | undefined;
+          let syncLine = "";
+          if (liveSub && isGitroomSub(liveSub)) {
+            const price = await this.ctx.stripe.getPrice(session.newPriceId!).catch(() => null);
+            const postizPlan = price ? derivePostizPlan(price) : null;
+            if (postizPlan) {
+              metadata = buildPostizMetadata(
+                postizPlan,
+                liveSub.metadata?.uniqueId || postizUniqueId(`billadmin-plan-${interaction.id}`)
+              );
+              syncLine = `Postiz sync ${postizPlan.tier}/${postizPlan.period}`;
+            } else {
+              syncLine = "⚠ NOT a canonical Postiz price — the platform keeps the OLD tier (metadata unchanged)";
+            }
+          }
           await this.ctx.stripe.changeSubscriptionPlan(
             {
               subscriptionId: session.subscriptionId!,
@@ -395,6 +429,7 @@ export class SubscriptionsHub {
               discounts: choice === "remove" ? "clear" : choice === "keep" ? undefined : choice,
               // Pin prorations to the previewed timestamp so the charge matches it.
               prorationDate: mode === "prorate" ? subExtra.get(session)?.prorationDate : undefined,
+              metadata,
             },
             `billadmin-plan-${interaction.id}`
           );
@@ -404,7 +439,8 @@ export class SubscriptionsHub {
             objectId: session.subscriptionId,
             outcome:
               `${session.planFrom ?? "?"} → ${session.planTo ?? "?"} (${mode === "prorate" ? "prorated" : "no proration"}). ` +
-              `Discount ${choice === "keep" ? "unchanged" : choice === "remove" ? "removed" : `set to \`${choice}\``}`,
+              `Discount ${choice === "keep" ? "unchanged" : choice === "remove" ? "removed" : `set to \`${choice}\``}` +
+              (syncLine ? ` — ${syncLine}` : ""),
             severity: "info",
           });
           await interaction.editReply({
@@ -413,7 +449,8 @@ export class SubscriptionsHub {
                 `✅ \`${session.subscriptionId}\` changed to **${session.planTo}** ` +
                   `(${mode === "prorate" ? "prorated" : "no proration"}). Discount ${
                     choice === "keep" ? "unchanged" : choice === "remove" ? "removed" : `set to \`${choice}\``
-                  }.`,
+                  }.` +
+                  (syncLine ? `\n${syncLine}` : ""),
                 COLORS.success
               ),
             ],

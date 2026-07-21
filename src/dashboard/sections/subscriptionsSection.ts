@@ -1,5 +1,12 @@
 import type Stripe from "stripe";
 import type { ActionActor } from "../../bot/billing/actions/BillingActionService";
+import {
+  derivePostizPlan,
+  isGitroomSub,
+  postizSyncStatus,
+  readPostizMeta,
+  type PostizSyncStatus,
+} from "../../bot/billing/postizPlan";
 import { ActionButton, ActionResult, Badge, Block, Cell, FilterDef, TableBlock } from "../renderer/contract";
 import { DashboardCtx, DashboardSectionModule, SectionPage, str, validCursor, validId } from "./types";
 import { bookmarkButton, isBookmarkedSafe, toggleBookmarkAction } from "./bookmarks";
@@ -101,6 +108,15 @@ function registryButton(ctx: DashboardCtx, button: ActionButton): ActionButton {
   return { ...button, mode: mode === "queue" ? "queue" : "direct" };
 }
 
+// Postiz sync badge: "missing" means the platform webhook drops every event
+// for this sub (it never syncs, and a cancel never downgrades the org);
+// "mismatch" means the recorded tier disagrees with what the price charges.
+function syncBadge(status: PostizSyncStatus): Badge {
+  if (status === "synced") return { kind: "ok", text: "Postiz synced" };
+  if (status === "missing") return { kind: "warn", text: "No Postiz sync" };
+  return { kind: "error", text: "Postiz mismatch" };
+}
+
 function planLabel(sub: Stripe.Subscription): { name: string; per?: string } {
   const item = sub.items.data[0];
   const price = item?.price;
@@ -124,6 +140,7 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
   const { createdGte, createdLt } = parseDateFilter(createdRaw);
   const collection =
     filters.collection === "charge_automatically" || filters.collection === "send_invoice" ? filters.collection : "";
+  const syncFilter = filters.sync === "unsynced" ? "unsynced" : "";
 
   const cursorId = validId("subscription", validCursor(cursor) ?? "") ?? undefined;
 
@@ -186,6 +203,7 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
 
   const filtered = subs.filter((s) => {
     if (collection && s.collection_method !== collection) return false;
+    if (syncFilter === "unsynced" && postizSyncStatus(s) === "synced") return false;
     if (!status) return true;
     if (status === "paused") return !!s.pause_collection;
     return s.status === status;
@@ -207,6 +225,10 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
           ? ({ t: "link", v: customer, ref: { page: "customers.detail", params: { id: customer } } } as Cell)
           : text("—"),
         { t: "flags", badges: flags } as Cell,
+        (() => {
+          const s = syncBadge(postizSyncStatus(sub));
+          return badgeCell(s.kind, s.text);
+        })(),
         dateCell(sub.created),
         item?.current_period_end ? dateCell(item.current_period_end) : text("—"),
         idCell(sub.id, { copy: true }),
@@ -237,6 +259,7 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
           { key: "plan", label: "Product" },
           { key: "customer", label: "Customer" },
           { key: "status", label: "Status" },
+          { key: "sync", label: "Postiz" },
           { key: "created", label: "Started" },
           { key: "next", label: "Next invoice" },
           { key: "id", label: "ID" },
@@ -271,10 +294,20 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
               { value: "send_invoice", label: "Send invoice" },
             ],
           },
+          {
+            key: "sync",
+            label: "Postiz sync",
+            kind: "select",
+            value: syncFilter || undefined,
+            options: [{ value: "unsynced", label: "Unsynced only" }],
+          },
         ],
         rows,
         nextCursor: subsRes.hasMore && subs.length > 0 ? subs[subs.length - 1].id : null,
-        empty: status || collection ? "No subscriptions match this filter (within this window)." : "No subscriptions yet.",
+        empty:
+          status || collection || syncFilter
+            ? "No subscriptions match this filter (within this window)."
+            : "No subscriptions yet.",
         ...(rows.length ? { footer: `${rows.length} item${rows.length === 1 ? "" : "s"}` } : {}),
         notice: scoped
           ? `Customer/price/collection filters aren't searchable — chip counts cover this window only ("N+" on overflow).`
@@ -312,6 +345,14 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
   const plan = planLabel(sub);
   const item = sub.items.data[0];
   const cancelable = sub.status !== "canceled";
+  const syncStatus = postizSyncStatus(sub);
+  const postizMeta = readPostizMeta(sub.metadata);
+  // Without service:gitroom the platform DROPS the delete event — the org
+  // would stay on its paid tier despite the Stripe cancellation.
+  const cancelSyncWarning =
+    syncStatus === "missing"
+      ? " ⚠ This subscription has NO Postiz sync metadata — the cancellation will NOT downgrade the Postiz org. Repair sync first."
+      : "";
   // Stripe titles subscription pages "Customer on Product".
   const customerName = customer && !customer.deleted ? customer.name ?? customer.email ?? customerId : customerId;
   const title = customerName ? `${customerName} on ${plan.name}` : plan.name;
@@ -346,7 +387,7 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
         label: "Cancel at period end",
         dangerous: true,
         params: { subscriptionId: id, when: "period_end" },
-        summary: `The subscription stays active until ${item?.current_period_end ? new Date(item.current_period_end * 1000).toISOString().slice(0, 10) : "the period end"}, then ends.`,
+        summary: `The subscription stays active until ${item?.current_period_end ? new Date(item.current_period_end * 1000).toISOString().slice(0, 10) : "the period end"}, then ends.${cancelSyncWarning}`,
         disabledReason: sub.cancel_at_period_end ? "Already set to cancel at period end." : undefined,
       })
     );
@@ -358,7 +399,7 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
         dangerous: true,
         stepUp: true,
         params: { subscriptionId: id, when: "now" },
-        summary: "Ends the subscription IMMEDIATELY (no proration refund). Requires a fresh factor.",
+        summary: `Ends the subscription IMMEDIATELY (no proration refund). Requires a fresh factor.${cancelSyncWarning}`,
       })
     );
     actions.push(
@@ -440,9 +481,40 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
       subBadge(sub.status),
       ...(sub.pause_collection ? [{ kind: "warn", text: "Paused" } as Badge] : []),
       ...(sub.cancel_at_period_end ? [{ kind: "warn", text: "Cancels at period end" } as Badge] : []),
+      ...(syncStatus !== "synced" ? [syncBadge(syncStatus)] : []),
     ],
     actions,
   });
+
+  // Postiz desync warning + one-click repair. Repair derives the tier from the
+  // item's price, so a non-canonical price cannot be repaired — only moved.
+  if (syncStatus !== "synced" && cancelable) {
+    const repairable = !!(item?.price && derivePostizPlan(item.price));
+    main.push({
+      type: "notice",
+      badge: { kind: syncStatus === "mismatch" ? "error" : "warn", text: syncStatus === "mismatch" ? "POSTIZ MISMATCH" : "NO POSTIZ SYNC" },
+      text:
+        (syncStatus === "mismatch"
+          ? `The Postiz metadata (${postizMeta.billing ?? "?"}/${postizMeta.period ?? "?"}) does not match what this subscription's price charges — the customer pays one amount but the platform grants another tier's limits.`
+          : "This subscription carries no Postiz sync metadata — the platform ignores every event for it: it never syncs, and cancelling it will NOT downgrade the Postiz org.") +
+        (repairable
+          ? " Repair stamps service/billing/period/uniqueId (tier derived from the price) and re-syncs the platform via the update event."
+          : " Its price is not a canonical Postiz price, so the tier cannot be derived — move it to a canonical price (Update subscription) before it can sync."),
+      actions: repairable
+        ? [
+            registryButton(ctx, {
+              key: "subscription.repair_sync",
+              label: "Repair Postiz sync",
+              style: "primary",
+              dangerous: true,
+              params: { subscriptionId: id },
+              summary:
+                "Writes the gitroom sync metadata onto this subscription (metadata-only update, no billing change). The platform re-applies the tier on the update event.",
+            }),
+          ]
+        : [],
+    });
+  }
 
   // Sub-stat strip (Started · Next invoice · Auto-cancels), Stripe-style.
   main.push({
@@ -619,6 +691,17 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
             },
           ]
         : []),
+    ],
+  });
+  rail.push({
+    type: "kv",
+    title: "Postiz sync",
+    rows: [
+      { label: "Status", cell: badgeCell(syncBadge(syncStatus).kind, syncBadge(syncStatus).text) },
+      { label: "service", cell: text(postizMeta.service ?? "—") },
+      { label: "billing", cell: text(postizMeta.billing ?? "—") },
+      { label: "period", cell: text(postizMeta.period ?? "—") },
+      { label: "uniqueId", cell: postizMeta.uniqueId ? idCell(postizMeta.uniqueId, { copy: true }) : text("—") },
     ],
   });
   rail.push({
@@ -827,11 +910,35 @@ async function updatePage(ctx: DashboardCtx, id: string, filters: Record<string,
         text: "Stripe could not preview this change (incompatible currency/interval?). Pick a different change set.",
       });
     } else {
+      // Gitroom subs may only MOVE to canonical Postiz prices — the metadata
+      // (which the platform trusts over the price) is recomputed in the same
+      // update call, so tier and price never drift apart.
+      const gitroom = isGitroomSub(sub);
+      const targetPriceObj = candidates.find((p) => p.id === effectiveTarget) ?? null;
+      const postizPlan = gitroom && targetPriceObj ? derivePostizPlan(targetPriceObj) : null;
+      const postizBlocked = gitroom && priceChanged && !postizPlan;
+      if (postizBlocked) {
+        blocks.push({
+          type: "notice",
+          badge: { kind: "error", text: "NOT SYNCABLE" },
+          text: "This subscription syncs to Postiz — the target price must be a canonical Postiz price ($29/$278, $39/$374, $49/$470, $99/$950 USD) or the platform would desync from what the customer pays. Use a promo for discounts.",
+        });
+      } else if (gitroom && qtyChanged && quantity != null && quantity > 1) {
+        blocks.push({
+          type: "notice",
+          badge: { kind: "warn", text: "QUANTITY" },
+          text: `Quantity ×${quantity} on a Postiz-synced subscription: tiers don't multiply — the customer pays ${quantity}× for the same tier limits.`,
+        });
+      }
+      const currentTier = readPostizMeta(sub.metadata).billing;
       const changeBits = [
         priceChanged ? `price → ${effectiveTarget}` : null,
         qtyChanged ? `quantity → ${quantity}` : null,
         promo ? `promo ${promo} (applied at execution — not in the preview)` : null,
         cycle === "now" ? "billing cycle resets to now" : null,
+        gitroom && postizPlan && priceChanged
+          ? `Postiz sync ${currentTier ?? "?"} → ${postizPlan.tier}/${postizPlan.period} (uniqueId preserved)`
+          : null,
       ].filter(Boolean);
       blocks.push({
         type: "table",
@@ -847,26 +954,28 @@ async function updatePage(ctx: DashboardCtx, id: string, filters: Record<string,
         })),
         notice: `Next invoice would be ${ctx.stripe.formatAmount(preview.amount_due, preview.currency)}. Estimate — the committed prorations are computed at execution time.`,
       });
-      const confirmParams: Record<string, unknown> = { subscriptionId: id, priceId: effectiveTarget };
-      if (itemFilter && itemFilter !== sub.items.data[0]?.id) confirmParams.itemId = itemFilter;
-      if (qtyChanged) confirmParams.quantity = quantity;
-      if (promo) confirmParams.promoCode = promo;
-      if (cycle === "now") confirmParams.cycleAnchor = "now";
-      blocks.push({
-        type: "notice",
-        badge: { kind: "info", text: "REVIEWED" },
-        text: `Update ${sub.id}: ${changeBits.join(", ")}.`,
-        actions: [
-          registryButton(ctx, {
-            key: "subscription.change_plan",
-            label: "Update subscription",
-            style: "primary",
-            dangerous: true,
-            params: confirmParams,
-            summary: `Apply ${changeBits.join(", ")} with create_prorations — you reviewed the preview above.`,
-          }),
-        ],
-      });
+      if (!postizBlocked) {
+        const confirmParams: Record<string, unknown> = { subscriptionId: id, priceId: effectiveTarget };
+        if (itemFilter && itemFilter !== sub.items.data[0]?.id) confirmParams.itemId = itemFilter;
+        if (qtyChanged) confirmParams.quantity = quantity;
+        if (promo) confirmParams.promoCode = promo;
+        if (cycle === "now") confirmParams.cycleAnchor = "now";
+        blocks.push({
+          type: "notice",
+          badge: { kind: "info", text: "REVIEWED" },
+          text: `Update ${sub.id}: ${changeBits.join(", ")}.`,
+          actions: [
+            registryButton(ctx, {
+              key: "subscription.change_plan",
+              label: "Update subscription",
+              style: "primary",
+              dangerous: true,
+              params: confirmParams,
+              summary: `Apply ${changeBits.join(", ")} with create_prorations — you reviewed the preview above.`,
+            }),
+          ],
+        });
+      }
     }
   } else if (targetPrice && !dirty) {
     blocks.push({
@@ -926,6 +1035,15 @@ async function addItemMode(
 
   const blocks: Block[] = [
     { type: "header", title: "Update subscription", sub: `Add item · ${plan.name} · ${sub.id}` },
+    ...(isGitroomSub(sub)
+      ? [
+          {
+            type: "notice",
+            badge: { kind: "warn", text: "POSTIZ" },
+            text: "This subscription syncs to Postiz, which reads its tier from metadata on the FIRST item's price — extra items bill the customer without granting anything on the platform.",
+          } as Block,
+        ]
+      : []),
     {
       type: "table",
       key: "prices",
@@ -1137,6 +1255,9 @@ async function composer(ctx: DashboardCtx, filters: Record<string, string>): Pro
   const trialRaw = str(filters.trial, 4).trim();
   const trialDays = /^\d{1,3}$/.test(trialRaw) && Number.parseInt(trialRaw, 10) > 0 ? Number.parseInt(trialRaw, 10) : null;
   const collection: "charge" | "invoice" = filters.collection === "invoice" ? "invoice" : "charge";
+  // Postiz sync is the default — "off" is the deliberate opt-out for subs
+  // that should NOT appear on the platform.
+  const postizOff = filters.postiz === "off";
 
   const [prices, customer] = await Promise.all([
     ctx.stripe.listRecurringPrices(50).catch(() => [] as Stripe.Price[]),
@@ -1155,6 +1276,7 @@ async function composer(ctx: DashboardCtx, filters: Record<string, string>): Pro
     ...(promo ? { promo } : {}),
     ...(trialRaw ? { trial: trialRaw } : {}),
     ...(filters.collection === "invoice" ? { collection: "invoice" } : {}),
+    ...(postizOff ? { postiz: "off" } : {}),
   };
 
   const blocks: Block[] = [
@@ -1221,6 +1343,16 @@ async function composer(ctx: DashboardCtx, filters: Record<string, string>): Pro
           { value: "invoice", label: "Email invoice (due in 7 days)" },
         ],
       },
+      {
+        key: "postiz",
+        label: "Postiz sync",
+        kind: "select",
+        value: postizOff ? "off" : undefined,
+        options: [
+          { value: "", label: "Sync to Postiz (tier from price)" },
+          { value: "off", label: "No sync (non-Postiz subscription)" },
+        ],
+      },
     ],
     rows: candidates.slice(0, 25).map((p) => ({
       id: p.id,
@@ -1259,11 +1391,45 @@ async function composer(ctx: DashboardCtx, filters: Record<string, string>): Pro
         text: "Stripe could not preview this subscription (currency mismatch with the customer?). Pick a different price.",
       });
     } else {
+      // Postiz sync resolution: tier/period derive from the picked price.
+      // Non-canonical price + sync = no confirm button (the registry refuses
+      // independently — the notice just explains why).
+      const targetPriceObj = prices.find((p) => p.id === targetPrice) ?? null;
+      const postizPlan = !postizOff && targetPriceObj ? derivePostizPlan(targetPriceObj) : null;
+      const postizBlocked = !postizOff && !postizPlan;
+      if (postizOff) {
+        blocks.push({
+          type: "notice",
+          badge: { kind: "warn", text: "NO POSTIZ SYNC" },
+          text: "This subscription will NOT sync to the Postiz platform — no org gets a plan from it. Use only for genuinely non-Postiz billing.",
+        });
+      } else if (postizPlan) {
+        const caveats = [
+          quantity && quantity > 1
+            ? ` ⚠ Quantity ×${quantity}: Postiz tiers don't multiply — the customer pays ${quantity}× for the same ${postizPlan.tier} limits.`
+            : "",
+          trialDays
+            ? " Trial note: if the Postiz org still has its trial available (allowTrial) and no card is attached, the trial won't sync — the bot cannot check that field."
+            : "",
+        ].join("");
+        blocks.push({
+          type: "notice",
+          badge: { kind: "info", text: "POSTIZ SYNC" },
+          text: `Syncs to Postiz as ${postizPlan.tier} / ${postizPlan.period} — metadata service/billing/period/uniqueId is attached at creation.${caveats}`,
+        });
+      } else {
+        blocks.push({
+          type: "notice",
+          badge: { kind: "error", text: "NOT SYNCABLE" },
+          text: "This price is not a canonical Postiz price ($29/$278, $39/$374, $49/$470, $99/$950 USD) — the tier cannot be derived. Pick a canonical price, use a promo for discounts, or set Postiz sync to No sync.",
+        });
+      }
       const bits = [
         `${targetPrice}${quantity ? ` ×${quantity}` : ""}`,
         trialDays ? `${trialDays}-day trial` : null,
         promo ? `promo ${promo} (applied at creation — not in the preview)` : null,
         collection === "invoice" ? "collected by emailed invoice" : "charges the default payment method",
+        postizOff ? "no Postiz sync" : postizPlan ? `Postiz sync ${postizPlan.tier}/${postizPlan.period}` : null,
       ].filter(Boolean);
       blocks.push({
         type: "table",
@@ -1279,29 +1445,32 @@ async function composer(ctx: DashboardCtx, filters: Record<string, string>): Pro
         })),
         notice: `First invoice would be ${ctx.stripe.formatAmount(preview.amount_due, preview.currency)}. Estimate — computed again at creation time.`,
       });
-      blocks.push({
-        type: "notice",
-        badge: { kind: "info", text: "REVIEWED" },
-        text: `Create a subscription for ${customerId}: ${bits.join(", ")}.`,
-        actions: [
-          registryButton(ctx, {
-            key: "subscription.create",
-            label: "Create subscription",
-            style: "primary",
-            dangerous: true,
-            ...(collection === "charge" ? { stepUp: true } : {}),
-            params: {
-              customerId,
-              priceId: targetPrice,
-              ...(quantity ? { quantity } : {}),
-              ...(promo ? { promoCode: promo } : {}),
-              ...(trialDays ? { trialDays } : {}),
-              collection,
-            },
-            summary: `Creates the subscription now — ${collection === "charge" ? "the default payment method is charged immediately (unless trialing)" : "an invoice is emailed, due in 7 days"}. You reviewed the preview above.`,
-          }),
-        ],
-      });
+      if (!postizBlocked) {
+        blocks.push({
+          type: "notice",
+          badge: { kind: "info", text: "REVIEWED" },
+          text: `Create a subscription for ${customerId}: ${bits.join(", ")}.`,
+          actions: [
+            registryButton(ctx, {
+              key: "subscription.create",
+              label: "Create subscription",
+              style: "primary",
+              dangerous: true,
+              ...(collection === "charge" ? { stepUp: true } : {}),
+              params: {
+                customerId,
+                priceId: targetPrice,
+                ...(quantity ? { quantity } : {}),
+                ...(promo ? { promoCode: promo } : {}),
+                ...(trialDays ? { trialDays } : {}),
+                collection,
+                postizSync: !postizOff,
+              },
+              summary: `Creates the subscription now — ${collection === "charge" ? "the default payment method is charged immediately (unless trialing)" : "an invoice is emailed, due in 7 days"}${postizOff ? ", WITHOUT Postiz sync" : ""}. You reviewed the preview above.`,
+            }),
+          ],
+        });
+      }
     }
   }
 
@@ -1468,6 +1637,14 @@ async function schedulePage(ctx: DashboardCtx, id: string, filters: Record<strin
 
   const priceById = new Map(prices.map((p) => [p.id, p]));
   const plan = planLabel(sub);
+  // On a gitroom sub every phase becomes the live tier at its boundary, so
+  // every phase price must derive a canonical Postiz tier (hard-block rule).
+  const gitroom = isGitroomSub(sub);
+  const phasePlan = (priceId: string) => {
+    const p = priceById.get(priceId);
+    return p ? derivePostizPlan(p) : null;
+  };
+  const postizBlockedPhases = gitroom ? phases.filter((ph) => !phasePlan(ph.priceId)) : [];
 
   const blocks: Block[] = [
     {
@@ -1549,6 +1726,10 @@ async function schedulePage(ctx: DashboardCtx, id: string, filters: Record<strin
       const flags: Badge[] = [];
       if (ph.trial) flags.push({ kind: "neutral", text: "Trial" });
       if (ph.prorationNone) flags.push({ kind: "info", text: "No proration" });
+      if (gitroom) {
+        const pplan = phasePlan(ph.priceId);
+        flags.push(pplan ? { kind: "neutral", text: `Postiz ${pplan.tier}/${pplan.period}` } : { kind: "error", text: "Not a Postiz price" });
+      }
       const reordered = (swap: number) => {
         const next = phases.map((x) => x.token);
         [next[i], next[swap]] = [next[swap], next[i]];
@@ -1610,7 +1791,14 @@ async function schedulePage(ctx: DashboardCtx, id: string, filters: Record<strin
   }
 
   // Confirm card — params are the SERVER's parse of the tokens.
-  if (editable && phases.length > 0) {
+  if (editable && phases.length > 0 && postizBlockedPhases.length > 0) {
+    blocks.push({
+      type: "notice",
+      badge: { kind: "error", text: "NOT SYNCABLE" },
+      text: `This subscription syncs to Postiz — ${postizBlockedPhases.length} composed phase(s) use a non-canonical price, so the platform would strand on a stale tier at that boundary. Every phase must use a canonical Postiz price ($29/$278, $39/$374, $49/$470, $99/$950 USD).`,
+    });
+  }
+  if (editable && phases.length > 0 && postizBlockedPhases.length === 0) {
     blocks.push({
       type: "kv",
       title: "Confirm",
@@ -1642,7 +1830,9 @@ async function schedulePage(ctx: DashboardCtx, id: string, filters: Record<strin
           },
           summary: `Applies ${phases.length} future phase(s) after the current one${
             endBehavior === "cancel" ? ", then CANCELS the subscription" : ""
-          }. The current phase is preserved exactly as-is.`,
+          }. The current phase is preserved exactly as-is.${
+            gitroom ? " Each phase carries Postiz sync metadata for its own price's tier (uniqueId preserved)." : ""
+          }`,
         }),
       ],
     });

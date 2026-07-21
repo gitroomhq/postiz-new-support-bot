@@ -1350,9 +1350,11 @@ function subsCtx(overrides: { previewThrows?: boolean; testMode?: boolean; testC
         ],
         hasMore: false,
       }),
+      // Canonical Postiz USD amounts so the composer's default sync path
+      // (tier derived from the price) has something to derive.
       listRecurringPrices: async () => [
-        { id: "price_old", nickname: "Postiz Pro", currency: "eur", unit_amount: 2900, recurring: { interval: "month", interval_count: 1 } },
-        { id: "price_new", nickname: "Postiz Ultra", currency: "eur", unit_amount: 4900, recurring: { interval: "month", interval_count: 1 } },
+        { id: "price_old", nickname: "Postiz Pro", currency: "usd", unit_amount: 2900, recurring: { interval: "month", interval_count: 1 } },
+        { id: "price_new", nickname: "Postiz Ultra", currency: "usd", unit_amount: 4900, recurring: { interval: "month", interval_count: 1 } },
       ],
       getSubscription: async () => sub,
       isTestMode: () => overrides.testMode === true,
@@ -1438,7 +1440,8 @@ test("subscription detail: stat strip, pricing footer → change-plan page, canc
   const pricing = page!.blocks.find((b) => b.type === "table" && b.key === "pricing") as TableBlock;
   assert.deepEqual(pricing.footerRef, { page: "subscriptions.changeplan", params: { id: "sub_1" } });
   assert.ok(page!.blocks.some((b) => b.type === "table" && b.key === "upcoming"));
-  assert.equal(page!.rail!.length, 2);
+  // Details + Postiz sync + Customer.
+  assert.equal(page!.rail!.length, 3);
 });
 
 test("change plan: confirm button exists ONLY after a successful proration preview", async () => {
@@ -3052,7 +3055,7 @@ test("create-subscription composer: confirm exists ONLY after a successful first
   const btn = confirm.actions[0];
   assert.equal(btn.dangerous, true);
   assert.equal(btn.stepUp, true);
-  assert.deepEqual(btn.params, { customerId: "cus_a", priceId: "price_new", quantity: 2, trialDays: 14, collection: "charge" });
+  assert.deepEqual(btn.params, { customerId: "cus_a", priceId: "price_new", quantity: 2, trialDays: 14, collection: "charge", postizSync: true });
   // Invoice collection → no step-up flag.
   const invoiceMode = await section.buildPage(subsCtx(), {
     page: "subscriptions.new",
