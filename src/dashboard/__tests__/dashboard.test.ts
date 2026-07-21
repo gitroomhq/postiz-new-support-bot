@@ -1440,8 +1440,7 @@ test("subscription detail: stat strip, pricing footer → change-plan page, canc
   const pricing = page!.blocks.find((b) => b.type === "table" && b.key === "pricing") as TableBlock;
   assert.deepEqual(pricing.footerRef, { page: "subscriptions.changeplan", params: { id: "sub_1" } });
   assert.ok(page!.blocks.some((b) => b.type === "table" && b.key === "upcoming"));
-  // Details + Postiz sync + Customer.
-  assert.equal(page!.rail!.length, 3);
+  assert.equal(page!.rail!.length, 2);
 });
 
 test("change plan: confirm button exists ONLY after a successful proration preview", async () => {

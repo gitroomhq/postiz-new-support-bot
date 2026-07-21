@@ -22,7 +22,7 @@ import {
   paymentMethodCell,
   sentence,
   strong,
-  subBadge,
+  subStatusFlags,
   text,
 } from "./cells";
 
@@ -897,9 +897,7 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
         price?.unit_amount != null
           ? `${ctx.stripe.formatAmount(price.unit_amount * (item?.quantity ?? 1), price.currency)}/${price.recurring?.interval ?? "?"}`
           : undefined;
-      const statusBadges: Badge[] = [subBadge(sub.status)];
-      if (sub.pause_collection) statusBadges.push({ kind: "warn", text: "Paused" });
-      if (sub.cancel_at_period_end) statusBadges.push({ kind: "warn", text: "Cancels at period end" });
+      const statusBadges: Badge[] = subStatusFlags(sub);
       return {
         id: sub.id,
         ref: { page: "subscriptions.detail", params: { id: sub.id } },

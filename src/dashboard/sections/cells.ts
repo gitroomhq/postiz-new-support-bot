@@ -177,6 +177,22 @@ export function subBadge(status: Stripe.Subscription.Status): Badge {
   return { kind, text: sentence(status) };
 }
 
+// Full status flag set for a subscription row/header. A sub that already
+// ended via a scheduled period-end cancel keeps cancel_at_period_end=true
+// forever — "Canceled" + future-tense "Cancels at period end" side by side
+// reads as a contradiction, so that pair collapses into one past-tense badge.
+export function subStatusFlags(
+  sub: Pick<Stripe.Subscription, "status" | "cancel_at_period_end" | "pause_collection">
+): Badge[] {
+  if (sub.status === "canceled" && sub.cancel_at_period_end) {
+    return [{ kind: "neutral", text: "Canceled at period end" }];
+  }
+  const flags: Badge[] = [subBadge(sub.status)];
+  if (sub.pause_collection) flags.push({ kind: "warn", text: "Paused" });
+  if (sub.cancel_at_period_end) flags.push({ kind: "warn", text: "Cancels at period end" });
+  return flags;
+}
+
 export function invoiceBadge(status: Stripe.Invoice.Status | null): Badge {
   const s = status ?? "draft";
   const kind: Badge["kind"] =

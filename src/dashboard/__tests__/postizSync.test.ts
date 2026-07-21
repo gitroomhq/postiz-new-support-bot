@@ -13,6 +13,7 @@ import {
 import { rebuildCurrentPhase } from "../../bot/StripeClient";
 import { actionByKey, ActionExecCtx } from "../../bot/billing/actions/ActionRegistry";
 import { DashboardCtx } from "../sections/types";
+import { subStatusFlags } from "../sections/cells";
 import { makeSubscriptionsSection } from "../sections/subscriptionsSection";
 import type { Block, KeyValueBlock, NoticeBlock, TableBlock } from "../renderer/contract";
 
@@ -418,15 +419,30 @@ function findCreateButton(blocks: Block[]): { params?: Record<string, unknown>; 
   return null;
 }
 
-test("composer: canonical price → POSTIZ SYNC notice + postizSync baked true; No sync bakes false", async () => {
+test("composer: happy sync path is silent (postizSync baked true, no notice); caveats and No sync do surface", async () => {
   const section = makeSubscriptionsSection();
   const page = await section.buildPage(sectionCtx(), {
     page: "subscriptions.new",
     filters: { customer: "cus_a", price: "price_prom" },
   });
-  assert.ok(noticeTexts(page!.blocks).some((t) => t.includes("PRO / MONTHLY")));
+  // Background QoS: a cleanly-syncing create shows NO dedicated Postiz
+  // notice — the tier only rides quietly in the REVIEWED line.
+  const postizBadges = page!.blocks
+    .filter((b) => b.type === "notice")
+    .map((b) => (b as NoticeBlock).badge?.text ?? "")
+    .filter((t) => t.includes("POSTIZ") || t.includes("SYNC"));
+  assert.deepEqual(postizBadges, []);
+  assert.ok(noticeTexts(page!.blocks).some((t) => t.includes("Postiz sync PRO/MONTHLY")));
   const btn = findCreateButton(page!.blocks)!;
   assert.equal(btn.params!.postizSync, true);
+  assert.ok(btn.summary!.includes("You reviewed"));
+
+  // Real caveats still surface (qty multiplication warning).
+  const qty = await section.buildPage(sectionCtx(), {
+    page: "subscriptions.new",
+    filters: { customer: "cus_a", price: "price_prom", qty: "3" },
+  });
+  assert.ok(noticeTexts(qty!.blocks).some((t) => t.includes("don't multiply")));
 
   const off = await section.buildPage(sectionCtx(), {
     page: "subscriptions.new",
@@ -465,9 +481,10 @@ test("detail: unsynced sub shows warn badge, repair button, sync rail card and w
     const btn = header.actions.find((a) => a.label === label)!;
     assert.ok(btn.summary!.includes("NOT downgrade the Postiz org"), `${label} summary must warn`);
   }
-  const railCard = page!.rail!.find((b) => b.type === "kv" && (b as KeyValueBlock).title === "Postiz sync") as KeyValueBlock;
-  assert.ok(railCard, "expected the Postiz sync rail card");
-  assert.ok(railCard.rows.some((r) => r.label === "uniqueId"));
+  // Background QoS: no dedicated rail card — one quiet row in Details.
+  const details = page!.rail!.find((b) => b.type === "kv" && (b as KeyValueBlock).title === "Details") as KeyValueBlock;
+  assert.ok(details.rows.some((r) => r.label === "Postiz"));
+  assert.ok(!page!.rail!.some((b) => b.type === "kv" && (b as KeyValueBlock).title === "Postiz sync"));
 });
 
 test("detail: synced sub gets no repair button and clean cancel summaries; non-canonical price is called unrepairable", async () => {
@@ -494,15 +511,48 @@ test("detail: synced sub gets no repair button and clean cancel summaries; non-c
   );
 });
 
-test("list: Postiz column present and the unsynced filter hides synced subs", async () => {
+test("list: sync surfaces only as a flag on broken fixable subs; unsynced filter is the repair worklist", async () => {
   const section = makeSubscriptionsSection();
-  const page = await section.buildPage(sectionCtx(), { page: "subscriptions", filters: {} });
+  const ctx = sectionCtx();
+  (ctx.stripe as unknown as Record<string, unknown>).listAllSubscriptions = async () => ({
+    subscriptions: [fakeSub(), fakeSub({ id: "sub_synced", metadata: gitroomMeta() }), fakeSub({ id: "sub_gone", status: "canceled" })],
+    hasMore: false,
+  });
+  const page = await section.buildPage(ctx, { page: "subscriptions", filters: {} });
   const table = page!.blocks.find((b) => b.type === "table") as TableBlock;
-  assert.ok(table.columns.some((c) => c.key === "sync"));
-  assert.equal(table.rows.length, 2);
-  const filteredPage = await section.buildPage(sectionCtx(), { page: "subscriptions", filters: { sync: "unsynced" } });
+  // No dedicated column — background QoS.
+  assert.ok(!table.columns.some((c) => c.key === "sync"));
+  const flagsOf = (id: string) =>
+    ((table.rows.find((r) => r.id === id)!.cells.find((c) => (c as { t: string }).t === "flags") as { badges: Array<{ text: string }> })
+      .badges).map((b) => b.text);
+  assert.ok(flagsOf("sub_1").includes("No Postiz sync")); // broken + fixable → flagged
+  assert.ok(!flagsOf("sub_synced").includes("No Postiz sync")); // healthy → silent
+  assert.ok(!flagsOf("sub_gone").includes("No Postiz sync")); // canceled → past fixing, silent
+  const filteredPage = await section.buildPage(ctx, { page: "subscriptions", filters: { sync: "unsynced" } });
   const filtered = filteredPage!.blocks.find((b) => b.type === "table") as TableBlock;
-  assert.deepEqual(filtered.rows.map((r) => r.id), ["sub_1"]); // sub_synced hidden
+  assert.deepEqual(filtered.rows.map((r) => r.id), ["sub_1"]); // synced AND canceled hidden
+});
+
+test("subStatusFlags: an already-canceled period-end sub collapses to one past-tense badge", () => {
+  const ended = fakeSub({ status: "canceled", cancel_at_period_end: true });
+  assert.deepEqual(subStatusFlags(ended), [{ kind: "neutral", text: "Canceled at period end" }]);
+  // Still-active scheduled cancel keeps the future-tense warning.
+  const pending = fakeSub({ cancel_at_period_end: true });
+  assert.deepEqual(subStatusFlags(pending).map((b) => b.text), ["Active", "Cancels at period end"]);
+  // Plain canceled sub stays plain.
+  assert.deepEqual(subStatusFlags(fakeSub({ status: "canceled" })).map((b) => b.text), ["Canceled"]);
+});
+
+test("list: Create subscription carries a customer-scoped list's customer into the composer", async () => {
+  const section = makeSubscriptionsSection();
+  const findCreate = (blocks: Block[]) =>
+    blocks
+      .flatMap((b) => (b as { actions?: Array<{ key: string; ref?: { page: string; filters?: Record<string, string> } }> }).actions ?? [])
+      .find((a) => a.key === "nav:subscriptions.new")!;
+  const scoped = await section.buildPage(sectionCtx(), { page: "subscriptions", filters: { customer: "cus_a" } });
+  assert.deepEqual(findCreate(scoped!.blocks).ref, { page: "subscriptions.new", filters: { customer: "cus_a" } });
+  const unscoped = await section.buildPage(sectionCtx(), { page: "subscriptions", filters: {} });
+  assert.deepEqual(findCreate(unscoped!.blocks).ref, { page: "subscriptions.new" });
 });
 
 test("changeplan page: gitroom sub moving to canonical price shows the tier transition; custom price withholds confirm", async () => {

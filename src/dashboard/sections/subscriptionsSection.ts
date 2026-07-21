@@ -23,6 +23,7 @@ import {
   sentence,
   strong,
   subBadge,
+  subStatusFlags,
   text,
 } from "./cells";
 
@@ -203,7 +204,9 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
 
   const filtered = subs.filter((s) => {
     if (collection && s.collection_method !== collection) return false;
-    if (syncFilter === "unsynced" && postizSyncStatus(s) === "synced") return false;
+    // "Unsynced only" is the repair worklist: canceled subs can't be
+    // repaired anymore, so they don't belong on it.
+    if (syncFilter === "unsynced" && (s.status === "canceled" || postizSyncStatus(s) === "synced")) return false;
     if (!status) return true;
     if (status === "paused") return !!s.pause_collection;
     return s.status === status;
@@ -212,9 +215,10 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
   const rows = filtered.map((sub) => {
     const plan = planLabel(sub);
     const item = sub.items.data[0];
-    const flags: Badge[] = [subBadge(sub.status)];
-    if (sub.pause_collection) flags.push({ kind: "warn", text: "Paused" });
-    if (sub.cancel_at_period_end) flags.push({ kind: "warn", text: "Cancels at period end" });
+    const flags: Badge[] = subStatusFlags(sub);
+    // Postiz sync is background QoS — it only surfaces when something is
+    // actually broken on a sub that can still be fixed.
+    if (sub.status !== "canceled" && postizSyncStatus(sub) !== "synced") flags.push(syncBadge(postizSyncStatus(sub)));
     const customer = typeof sub.customer === "string" ? sub.customer : sub.customer?.id ?? null;
     return {
       id: sub.id,
@@ -225,10 +229,6 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
           ? ({ t: "link", v: customer, ref: { page: "customers.detail", params: { id: customer } } } as Cell)
           : text("—"),
         { t: "flags", badges: flags } as Cell,
-        (() => {
-          const s = syncBadge(postizSyncStatus(sub));
-          return badgeCell(s.kind, s.text);
-        })(),
         dateCell(sub.created),
         item?.current_period_end ? dateCell(item.current_period_end) : text("—"),
         idCell(sub.id, { copy: true }),
@@ -248,7 +248,9 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
             key: "nav:subscriptions.new",
             label: "Create subscription",
             style: "primary",
-            ref: { page: "subscriptions.new" },
+            // A customer-scoped list (e.g. arriving via Customer-360 "view
+            // all") pre-selects that customer in the composer.
+            ref: { page: "subscriptions.new", ...(customerScope ? { filters: { customer: customerScope } } : {}) },
           },
         ],
       },
@@ -259,7 +261,6 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
           { key: "plan", label: "Product" },
           { key: "customer", label: "Customer" },
           { key: "status", label: "Status" },
-          { key: "sync", label: "Postiz" },
           { key: "created", label: "Started" },
           { key: "next", label: "Next invoice" },
           { key: "id", label: "ID" },
@@ -477,12 +478,7 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
     type: "header",
     title,
     ...(plan.per ? { sub: plan.per } : {}),
-    badges: [
-      subBadge(sub.status),
-      ...(sub.pause_collection ? [{ kind: "warn", text: "Paused" } as Badge] : []),
-      ...(sub.cancel_at_period_end ? [{ kind: "warn", text: "Cancels at period end" } as Badge] : []),
-      ...(syncStatus !== "synced" ? [syncBadge(syncStatus)] : []),
-    ],
+    badges: [...subStatusFlags(sub), ...(syncStatus !== "synced" && cancelable ? [syncBadge(syncStatus)] : [])],
     actions,
   });
 
@@ -656,6 +652,15 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
         label: "Collection",
         cell: text(sub.collection_method === "send_invoice" ? "Email invoice" : "Charge automatically"),
       },
+      // Background QoS: one quiet row — the loud treatment (notice + repair)
+      // only appears when sync is actually broken on a fixable sub.
+      {
+        label: "Postiz",
+        cell: badgeCell(
+          syncBadge(syncStatus).kind,
+          syncStatus === "synced" ? `Synced · ${postizMeta.billing}/${postizMeta.period}` : syncBadge(syncStatus).text
+        ),
+      },
       { label: "Payment method", cell: pmCell ?? text("—") },
       ...(sub.discounts?.length
         ? [
@@ -691,17 +696,6 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
             },
           ]
         : []),
-    ],
-  });
-  rail.push({
-    type: "kv",
-    title: "Postiz sync",
-    rows: [
-      { label: "Status", cell: badgeCell(syncBadge(syncStatus).kind, syncBadge(syncStatus).text) },
-      { label: "service", cell: text(postizMeta.service ?? "—") },
-      { label: "billing", cell: text(postizMeta.billing ?? "—") },
-      { label: "period", cell: text(postizMeta.period ?? "—") },
-      { label: "uniqueId", cell: postizMeta.uniqueId ? idCell(postizMeta.uniqueId, { copy: true }) : text("—") },
     ],
   });
   rail.push({
@@ -1404,19 +1398,23 @@ async function composer(ctx: DashboardCtx, filters: Record<string, string>): Pro
           text: "This subscription will NOT sync to the Postiz platform — no org gets a plan from it. Use only for genuinely non-Postiz billing.",
         });
       } else if (postizPlan) {
+        // Sync working as intended is background QoS — no notice. Only real
+        // caveats surface; the REVIEWED line below still names the tier.
         const caveats = [
           quantity && quantity > 1
-            ? ` ⚠ Quantity ×${quantity}: Postiz tiers don't multiply — the customer pays ${quantity}× for the same ${postizPlan.tier} limits.`
+            ? `Quantity ×${quantity}: Postiz tiers don't multiply — the customer pays ${quantity}× for the same ${postizPlan.tier} limits.`
             : "",
           trialDays
-            ? " Trial note: if the Postiz org still has its trial available (allowTrial) and no card is attached, the trial won't sync — the bot cannot check that field."
+            ? "If the Postiz org still has its trial available (allowTrial) and no card is attached, the trial won't sync — the bot cannot check that field."
             : "",
-        ].join("");
-        blocks.push({
-          type: "notice",
-          badge: { kind: "info", text: "POSTIZ SYNC" },
-          text: `Syncs to Postiz as ${postizPlan.tier} / ${postizPlan.period} — metadata service/billing/period/uniqueId is attached at creation.${caveats}`,
-        });
+        ].filter(Boolean);
+        if (caveats.length) {
+          blocks.push({
+            type: "notice",
+            badge: { kind: "warn", text: "POSTIZ" },
+            text: caveats.join(" "),
+          });
+        }
       } else {
         blocks.push({
           type: "notice",
@@ -1726,10 +1724,8 @@ async function schedulePage(ctx: DashboardCtx, id: string, filters: Record<strin
       const flags: Badge[] = [];
       if (ph.trial) flags.push({ kind: "neutral", text: "Trial" });
       if (ph.prorationNone) flags.push({ kind: "info", text: "No proration" });
-      if (gitroom) {
-        const pplan = phasePlan(ph.priceId);
-        flags.push(pplan ? { kind: "neutral", text: `Postiz ${pplan.tier}/${pplan.period}` } : { kind: "error", text: "Not a Postiz price" });
-      }
+      // Background QoS: only flag phases that would BREAK the Postiz sync.
+      if (gitroom && !phasePlan(ph.priceId)) flags.push({ kind: "error", text: "Not a Postiz price" });
       const reordered = (swap: number) => {
         const next = phases.map((x) => x.token);
         [next[i], next[swap]] = [next[swap], next[i]];
