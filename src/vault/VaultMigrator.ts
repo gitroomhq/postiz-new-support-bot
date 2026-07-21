@@ -63,7 +63,7 @@ export class VaultMigrator {
         ok: false,
         items: [],
         sessions: { converted: 0, failed: 0 },
-        error: "Vault is not reachable — run Test Connection and fix the connection first.",
+        error: "Vault is not reachable. Run Test Connection and fix the connection first.",
       };
     }
     // Seed the Stripe API key from the env var on demand too — pressing
@@ -87,7 +87,7 @@ export class VaultMigrator {
       // Local enc:v1 (or legacy plaintext, which passes through verbatim).
       const plaintext = decryptSecret(raw);
       if (!plaintext) {
-        items.push({ name, outcome: "unreadable", detail: "Local ciphertext no longer decrypts — re-enter the value, then re-run." });
+        items.push({ name, outcome: "unreadable", detail: "Local ciphertext no longer decrypts. Re-enter the value, then re-run." });
         continue;
       }
       const { integration, field } = GLOBAL_SECRETS[column];
@@ -134,7 +134,7 @@ export class VaultMigrator {
         ok: false,
         items: [],
         sessions: { converted: 0, failed: 0 },
-        error: "Vault must be reachable to pull the secrets back out — fix the connection first.",
+        error: "Vault must be reachable to pull the secrets back out. Fix the connection first.",
       };
     }
     const items: MigrateItemResult[] = [];
@@ -152,7 +152,7 @@ export class VaultMigrator {
         // Sentinel with no value behind it — nothing to restore; clear the
         // column so the panel honestly shows "not set".
         await this.settings.setSecretColumnRaw(column, null);
-        items.push({ name, outcome: "skipped-empty", detail: "No value found in Vault — column cleared." });
+        items.push({ name, outcome: "skipped-empty", detail: "No value found in Vault. Column cleared." });
         continue;
       }
       await this.settings.setSecretColumnRaw(column, encryptSecret(value));
@@ -175,7 +175,7 @@ export class VaultMigrator {
         items.push({
           name: "KV cleanup",
           outcome: "failed",
-          detail: `Could not delete: ${missed.join(", ")} — remove them in the Vault UI (stale copies, the bot no longer reads them).`,
+          detail: `Could not delete: ${missed.join(", ")}. Remove them in the Vault UI (stale copies, the bot no longer reads them).`,
         });
       }
       await this.vault.reconfigure();

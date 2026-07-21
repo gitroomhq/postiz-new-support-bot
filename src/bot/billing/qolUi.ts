@@ -49,10 +49,10 @@ export async function renderNotesPanel(
   const page = Math.max(0, p.page ?? 0);
   const { rows, total } = await ctx.qolStore.listNotes(p.type, p.objectId, page * NOTES_PAGE_SIZE, NOTES_PAGE_SIZE);
   const lines = rows.map(
-    (n) => `<t:${Math.floor(n.createdAt.getTime() / 1000)}:R> **${n.authorName}** — ${n.text.slice(0, 300)}`
+    (n) => `<t:${Math.floor(n.createdAt.getTime() / 1000)}:R> **${n.authorName}**: ${n.text.slice(0, 300)}`
   );
   const embed = new EmbedBuilder()
-    .setTitle(`📝 Notes — ${TYPE_TITLES[p.type]} \`${p.objectId}\` (${total})`)
+    .setTitle(`📝 Notes: ${TYPE_TITLES[p.type]} \`${p.objectId}\` (${total})`)
     .setColor(COLORS.brand)
     .setDescription(
       [p.notice, lines.length ? lines.join("\n") : "No notes yet."].filter(Boolean).join("\n\n").slice(0, 4096)

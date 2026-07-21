@@ -61,7 +61,7 @@ export class AuditLogger {
       }
       for (const field of event.fields ?? []) {
         // Field values are capped at 1024 chars by Discord; notes/comments can exceed it.
-        embed.addFields({ ...field, value: field.value.slice(0, 1024) || "—" });
+        embed.addFields({ ...field, value: field.value.slice(0, 1024) || "N/A" });
       }
 
       await channel.send({ embeds: [embed] });

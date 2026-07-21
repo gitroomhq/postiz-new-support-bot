@@ -121,7 +121,7 @@ export class SlaRuleStore {
     patch: { name?: string; target?: string; enabled?: boolean; conditions?: SlaCondition[]; expression?: string }
   ): Promise<SlaRule> {
     const existing = this.byId(id);
-    if (!existing) throw new Error("Rule not found — it may have been deleted.");
+    if (!existing) throw new Error("Rule not found. It may have been deleted.");
     const merged: SlaRuleInput = {
       name: patch.name ?? existing.name,
       target: patch.target ?? existing.target,

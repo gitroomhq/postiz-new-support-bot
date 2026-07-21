@@ -23,7 +23,7 @@ const DEFAULT_AGENT_NOTE = (days: number): string =>
   `⏰ This conversation has been waiting on an agent reply for ${days} day(s).`;
 const DEFAULT_TICKET_NOTE = (days: number): string => `⏰ This ticket has had no activity for ${days} day(s).`;
 const DEFAULT_CUSTOMER_NAG =
-  "Are you still there? We haven't heard back from you — this conversation will be closed automatically if we don't hear from you.";
+  "Are you still there? We haven't heard back from you; this conversation will be closed automatically if we don't hear from you.";
 const renderDays = (template: string, days: number): string => template.split("{days}").join(String(days));
 
 // Workspace inactivity automation for NATIVE (unbridged) Intercom

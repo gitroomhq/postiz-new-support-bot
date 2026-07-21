@@ -51,7 +51,7 @@ export class AdminPanel implements AdminPanelRoute {
     if (!this.allow(`page:${payload.sub}`)) return { status: 429, message: "Too many requests." };
     if (!this.sessions.consumeJti(payload.jti)) {
       panelLog.warn("admin panel link replay rejected", { "discord.user_id": payload.sub });
-      return { status: 401, message: "This panel link was already used — re-run /config or /intercom for a fresh one." };
+      return { status: 401, message: "This panel link was already used. Re-run /config or /intercom for a fresh one." };
     }
     const { sessionId } = this.sessions.create({
       discordUserId: payload.sub,
@@ -140,7 +140,7 @@ export class AdminPanel implements AdminPanelRoute {
         "adminpanel.endpoint": endpoint,
         "error.message": e instanceof Error ? e.message : String(e),
       });
-      return { status: 200, json: { ok: false, error: "Internal error — check the bot logs." } };
+      return { status: 200, json: { ok: false, error: "Internal error. Check the bot logs." } };
     }
   }
 

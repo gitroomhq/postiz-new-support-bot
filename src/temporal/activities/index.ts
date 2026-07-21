@@ -501,7 +501,7 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
               actLog.error("404 self-heal failed", healError, { "ticket.thread_id": threadId });
             });
             throw ApplicationFailure.create({
-              message: `404 — remote object recreated, retrying: ${e.message}`,
+              message: `404. Remote object recreated, retrying: ${e.message}`,
               type: "IntercomHttpError",
               nonRetryable: true, // the delivery workflow owns retries
               details: [{ status: e.status, retryAfterSeconds: null, permanent: false }],
@@ -555,7 +555,7 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
             embeds: [
               embed(
                 "⚠️ A message in this thread could not be synced to Intercom (all retries failed). " +
-                  "Agents working in Intercom will not see it — check /config → Intercom.",
+                  "Agents working in Intercom will not see it. Check /config → Intercom.",
                 COLORS.warn
               ),
             ],

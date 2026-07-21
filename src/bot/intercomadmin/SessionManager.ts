@@ -36,7 +36,7 @@ export class SessionManager {
     if (!session) {
       await interaction
         .reply({
-          embeds: [makeEmbed("This /intercom session has expired — run /intercom again.", COLORS.warn)],
+          embeds: [makeEmbed("This /intercom session has expired. Run /intercom again.", COLORS.warn)],
           flags: 64,
         })
         .catch(() => undefined);

@@ -85,7 +85,7 @@ export function promoCoupon(promo: Stripe.PromotionCode): Stripe.Coupon | null {
 
 export function promoCouponId(promo: Stripe.PromotionCode): string {
   const coupon = promo.promotion?.coupon;
-  return typeof coupon === "string" ? coupon : coupon?.id ?? "—";
+  return typeof coupon === "string" ? coupon : coupon?.id ?? "N/A";
 }
 
 export function couponDesc(stripe: StripeClient, coupon: Stripe.Coupon): string {
@@ -93,7 +93,7 @@ export function couponDesc(stripe: StripeClient, coupon: Stripe.Coupon): string 
     ? `${coupon.percent_off}% off`
     : coupon.amount_off != null
       ? `${stripe.formatAmount(coupon.amount_off, coupon.currency ?? "usd")} off`
-      : "—";
+      : "N/A";
 }
 
 // Everything that would make Stripe reject the code at create time — checked
@@ -124,7 +124,7 @@ export function priceLabel(stripe: StripeClient, price: Stripe.Price): string {
   const interval = price.recurring
     ? `/${price.recurring.interval_count > 1 ? `${price.recurring.interval_count} ` : ""}${price.recurring.interval}`
     : "";
-  return `${name} — ${amount}${interval}`;
+  return `${name} · ${amount}${interval}`;
 }
 
 export function subPlanLabel(stripe: StripeClient, sub: Stripe.Subscription, priceMap?: Map<string, string>): string {
@@ -140,7 +140,7 @@ export function describeDiscounts(stripe: StripeClient, sub: Stripe.Subscription
     const couponObj = coupon && typeof coupon !== "string" ? coupon : null;
     const couponId = typeof coupon === "string" ? coupon : couponObj?.id;
     const off = couponObj ? couponDesc(stripe, couponObj) : "";
-    return `\`${couponId ?? d.id}\`${couponObj?.name ? ` (${couponObj.name})` : ""}${off && off !== "—" ? ` · ${off}` : ""}`;
+    return `\`${couponId ?? d.id}\`${couponObj?.name ? ` (${couponObj.name})` : ""}${off && off !== "N/A" ? ` · ${off}` : ""}`;
   });
 }
 
@@ -168,11 +168,11 @@ export function chargeLine(stripe: StripeClient, charge: Stripe.Charge, showCust
 export function invoiceLine(stripe: StripeClient, invoice: Stripe.Invoice): string {
   const total = stripe.formatAmount(invoice.total, invoice.currency);
   const link = invoice.hosted_invoice_url ? ` · [open](${invoice.hosted_invoice_url})` : "";
-  return `\`${invoice.number ?? invoice.id ?? "draft"}\` · ${invoice.status ?? "—"} · **${total}** · <t:${invoice.created}:D>${link}`;
+  return `\`${invoice.number ?? invoice.id ?? "draft"}\` · ${invoice.status ?? "N/A"} · **${total}** · <t:${invoice.created}:D>${link}`;
 }
 
 export function formatAddress(address: Stripe.Address | null | undefined): string {
-  if (!address) return "—";
+  if (!address) return "N/A";
   const parts = [
     address.line1,
     address.line2,
@@ -180,7 +180,7 @@ export function formatAddress(address: Stripe.Address | null | undefined): strin
     address.state,
     address.country,
   ].filter(Boolean);
-  return parts.length ? parts.join(", ") : "—";
+  return parts.length ? parts.join(", ") : "N/A";
 }
 
 // Which hub a detail flow's Back button returns to.
@@ -220,17 +220,17 @@ export function buildRootPanel(stripe: StripeClient): Panel {
     .setColor(COLORS.brand)
     .setDescription(
       [
-        "🔍 **Find Customer** — the main entry: resolves a Discord user / email / cus_ / Postiz ID to the",
+        "🔍 **Find Customer**, the main entry: resolves a Discord user / email / cus_ / Postiz ID to the",
         "**Customer 360**, which links to their cards, charges, invoices, subscriptions, fraud signals and all actions.",
         "",
-        "👤 **Customers** — search by name/email, create, edit (VAT/address), link, delete",
-        "🔄 **Subscriptions** — create, or manage one (plan, discount, trial, pause, cancel)",
-        "💰 **Payments** — charges, refunds, disputes & fraud, balance credits, manual charges",
-        "🧾 **Invoices** — per-customer & open invoices, one-off invoices, credit notes",
-        "💳 **Cards** — card hunts by fingerprint / last 4 · set default · detach",
-        "🎟️ **Promos** — promo codes & coupons · 🏢 **Business** — our own company data (name, address, VAT)",
-        "🛡️ **Disputes** — account-wide dispute console: ratio, evidence, accept, block cards/users",
-        "🔖 **Bookmarks** — the team's pinned disputes/customers/charges · **Jump to ID** — open any Stripe id",
+        "👤 **Customers**: search by name/email, create, edit (VAT/address), link, delete",
+        "🔄 **Subscriptions**: create, or manage one (plan, discount, trial, pause, cancel)",
+        "💰 **Payments**: charges, refunds, disputes & fraud, balance credits, manual charges",
+        "🧾 **Invoices**: per-customer & open invoices, one-off invoices, credit notes",
+        "💳 **Cards**: card hunts by fingerprint / last 4 · set default · detach",
+        "🎟️ **Promos**: promo codes & coupons · 🏢 **Business**: our own company data (name, address, VAT)",
+        "🛡️ **Disputes**, account-wide dispute console: ratio, evidence, accept, block cards/users",
+        "🔖 **Bookmarks**: the team's pinned disputes/customers/charges · **Jump to ID**: open any Stripe id",
       ].join("\n")
     )
     .setFooter({
@@ -275,10 +275,10 @@ export function buildHubPanel(area: string, stripe: StripeClient): Panel {
       .setColor(COLORS.brand)
       .setDescription(
         [
-          "**Read** — a user's cards, or hunt cards account-wide by fingerprint / last 4.",
-          "**Update / Delete** — open *User's Cards* and pick a saved card to set it as default or detach it.",
+          "**Read**: a user's cards, or hunt cards account-wide by fingerprint / last 4.",
+          "**Update / Delete**: open *User's Cards* and pick a saved card to set it as default or detach it.",
           "",
-          "Looking for a **declined / bank-blocked** payment? Those never become a charge — use",
+          "Looking for a **declined / bank-blocked** payment? Those never become a charge. Use",
           "💰 Payments → *Find by Amount*. Customer search by name/email lives under 👤 Customers.",
         ].join("\n")
       );
@@ -301,11 +301,11 @@ export function buildHubPanel(area: string, stripe: StripeClient): Panel {
       .setColor(COLORS.brand)
       .setDescription(
         [
-          "**Read** — full overview (360): pick a Discord user, or enter a cus_ ID / **email** / Postiz ID manually,",
+          "**Read**, full overview (360): pick a Discord user, or enter a cus_ ID / **email** / Postiz ID manually,",
           "or **search** account-wide by partial name / email.",
-          "**Create** — a bare Stripe customer.",
-          "**Update** — details, address, VAT/tax IDs · link/unlink the Discord ↔ Stripe mapping.",
-          "**Delete** — permanently remove a customer (cancels their subscriptions).",
+          "**Create**: a bare Stripe customer.",
+          "**Update**: details, address, VAT/tax IDs · link/unlink the Discord ↔ Stripe mapping.",
+          "**Delete**: permanently remove a customer (cancels their subscriptions).",
         ].join("\n")
       );
     return {
@@ -336,13 +336,13 @@ export function buildHubPanel(area: string, stripe: StripeClient): Panel {
       .setColor(COLORS.brand)
       .setDescription(
         [
-          "**Read** — a user's charge history · disputes & fraud signals · customer balance history.",
-          "**Disputes Overview** — the account-wide dispute console: ratio, evidence, accept, blocklist.",
-          "**Find by Amount** — account-wide payment attempts **including declined / bank-blocked** ones",
+          "**Read**: a user's charge history · disputes & fraud signals · customer balance history.",
+          "**Disputes Overview**, the account-wide dispute console: ratio, evidence, accept, blocklist.",
+          "**Find by Amount**: account-wide payment attempts **including declined / bank-blocked** ones",
           "(those never become a charge, so they only show up here).",
-          "**Adjust Balance** — grant an account credit or add a debit; applied to future invoices.",
-          "**Refund** — full or partial refund of a charge, optionally cancelling the subscription.",
-          "**Charge Card Now** — charge a saved card immediately, off-session (no 3DS possible).",
+          "**Adjust Balance**: grant an account credit or add a debit; applied to future invoices.",
+          "**Refund**: full or partial refund of a charge, optionally cancelling the subscription.",
+          "**Charge Card Now**: charge a saved card immediately, off-session (no 3DS possible).",
         ].join("\n")
       );
     return {
@@ -370,10 +370,10 @@ export function buildHubPanel(area: string, stripe: StripeClient): Panel {
       .setColor(COLORS.brand)
       .setDescription(
         [
-          "**Create** — start a new subscription: plan, optional coupon & trial, charge now or email an invoice.",
-          "**Manage** — everything on an existing subscription lives in one place: change plan, quantity,",
+          "**Create**, start a new subscription: plan, optional coupon & trial, charge now or email an invoice.",
+          "**Manage**, everything on an existing subscription lives in one place: change plan, quantity,",
           "trial, pause/resume, schedule, apply/remove discount, cancel.",
-          "**Cancel by ID** — the quick path when you already have the `sub_…` id (e.g. from a webhook).",
+          "**Cancel by ID**: the quick path when you already have the `sub_…` id (e.g. from a webhook).",
         ].join("\n")
       );
     return {

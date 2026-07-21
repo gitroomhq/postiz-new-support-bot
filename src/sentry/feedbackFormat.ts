@@ -40,7 +40,7 @@ export interface FeedbackNoteInput {
 // project is visible behind the Sentry link.
 export function buildMetadataNote(input: FeedbackNoteInput): string {
   const lines: string[] = [];
-  lines.push(`<p><b>Sentry feedback</b>${input.shortId ? ` — ${escapeHtmlText(input.shortId)}` : ""}</p>`);
+  lines.push(`<p><b>Sentry feedback</b>${input.shortId ? ` · ${escapeHtmlText(input.shortId)}` : ""}</p>`);
   if (input.pageUrl) {
     lines.push(`<p>Page: <a href="${escapeHtmlText(input.pageUrl)}">${escapeHtmlText(input.pageUrl)}</a></p>`);
   }

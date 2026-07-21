@@ -79,7 +79,7 @@ export class StripeWebhookHandler {
     if (!this.settings.stripeWebhookEnabled()) return { status: "disabled" };
     const base = this.settings.resolvedPublicBaseUrl();
     if (!base) {
-      hookLog.warn("stripe webhook: no public base URL configured — registration skipped");
+      hookLog.warn("stripe webhook: no public base URL configured; registration skipped");
       return { status: "no-url" };
     }
     const url = `${base}/stripe/webhook`;
@@ -153,7 +153,7 @@ export class StripeWebhookHandler {
   async handle(event: Stripe.Event): Promise<void> {
     if (this.temporalProducers?.routable()) {
       const r = await this.temporalProducers.stripeEvent(event.id, JSON.stringify(event), event.type);
-      if (!r.ok && r.buffered) throw new TemporalBufferedError("stripe event buffered — Stripe should redeliver");
+      if (!r.ok && r.buffered) throw new TemporalBufferedError("stripe event buffered; Stripe should redeliver");
       return;
     }
     await this.handleDirect(event);
@@ -245,7 +245,7 @@ export class StripeWebhookHandler {
           if (result.failed.length) throw new Error(`auto-cancel failed for: ${result.failed.join(", ")}`);
         } catch (e) {
           await this.sessionStore.releaseBillingAction(`dispute-autocancel-${dispute.id}`).catch(() => {});
-          notes.push("⚠️ Auto-cancel subscriptions FAILED — will retry");
+          notes.push("⚠️ Auto-cancel subscriptions FAILED. Will retry");
           autoActionError = e;
         }
       }
@@ -267,7 +267,7 @@ export class StripeWebhookHandler {
           if (failed.length) throw new Error(`auto-block failed for: ${failed.map((r) => `${r.kind} (${r.error})`).join("; ")}`);
         } catch (e) {
           await this.sessionStore.releaseBillingAction(`dispute-autoblock-${dispute.id}`).catch(() => {});
-          notes.push("⚠️ Auto-block FAILED — will retry");
+          notes.push("⚠️ Auto-block FAILED. Will retry");
           autoActionError = autoActionError ?? e;
         }
       }
@@ -290,7 +290,7 @@ export class StripeWebhookHandler {
           }
         } catch (e) {
           await this.sessionStore.releaseBillingAction(`dispute-receipt-${dispute.id}`).catch(() => {});
-          notes.push("⚠️ Receipt auto-attach FAILED — will retry");
+          notes.push("⚠️ Receipt auto-attach FAILED. Will retry");
           autoActionError = autoActionError ?? e;
         }
       }
@@ -441,7 +441,7 @@ export class StripeWebhookHandler {
       .setColor(COLORS.danger)
       .addFields(
         { name: "Fraud type", value: efw.fraud_type || "unknown", inline: true },
-        { name: "Actionable", value: efw.actionable ? "yes — may lead to a dispute" : "no", inline: true },
+        { name: "Actionable", value: efw.actionable ? "yes (may lead to a dispute)" : "no", inline: true },
         ...(chargeId ? [{ name: "Charge", value: `\`${chargeId}\``, inline: true }] : []),
         ...(linked ? [{ name: "Customer", value: linked, inline: false }] : [])
       )

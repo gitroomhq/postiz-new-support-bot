@@ -4,5 +4,5 @@
 // appended "assigned team" clause so every reminder round names the team.
 export function applyTeam(text: string, teamName: string): string {
   if (text.includes("{team}")) return text.split("{team}").join(teamName);
-  return `${text} — assigned team: ${teamName}.`;
+  return `${text} (assigned team: ${teamName}).`;
 }

@@ -25,7 +25,7 @@ export function makeIntegrationsHub(deps: IntegrationsHubDeps): HubModule {
       try {
         adminOpts = (await deps.listIntercomAdmins()).map((a) => ({ value: a.id, label: a.name }));
       } catch {
-        adminNote = "Admin list unavailable — check the access token.";
+        adminNote = "Admin list unavailable. Check the access token.";
       }
       const intercom: Section = {
         key: "intercom",

@@ -83,7 +83,7 @@ export class SubscriptionsHub {
           this.ctx.audit.log(interaction, {
             action: "Cancel subscription (now)",
             objectId: session.subscriptionId,
-            outcome: `Cancelled immediately${session.planFrom ? ` — ${session.planFrom}` : ""}`,
+            outcome: `Cancelled immediately${session.planFrom ? ` · ${session.planFrom}` : ""}`,
             severity: "warn",
           });
           await interaction.editReply({
@@ -112,7 +112,7 @@ export class SubscriptionsHub {
           this.ctx.audit.log(interaction, {
             action: "Cancel subscription (at period end)",
             objectId: session.subscriptionId,
-            outcome: `Scheduled to cancel at period end${session.planFrom ? ` — ${session.planFrom}` : ""}`,
+            outcome: `Scheduled to cancel at period end${session.planFrom ? ` · ${session.planFrom}` : ""}`,
             severity: "warn",
           });
           await interaction.editReply({
@@ -261,7 +261,7 @@ export class SubscriptionsHub {
               await interaction.editReply({
                 embeds: [
                   makeEmbed(
-                    "No coupons exist — create one under 🎟️ Promos first, or continue without changing the discount.",
+                    "No coupons exist. Create one under 🎟️ Promos first, or continue without changing the discount.",
                     COLORS.warn
                   ),
                 ],
@@ -352,7 +352,7 @@ export class SubscriptionsHub {
             : undefined;
           const syncLine = postizPlan
             ? `Postiz sync ${postizPlan.tier}/${postizPlan.period}`
-            : "⚠ NOT a canonical Postiz price — this subscription will NOT sync to the Postiz platform";
+            : "⚠ NOT a canonical Postiz price: this subscription will NOT sync to the Postiz platform";
           const sub = await this.ctx.stripe.createSubscription(
             {
               customerId: session.customerId!,
@@ -370,16 +370,16 @@ export class SubscriptionsHub {
             targetCustomerId: session.customerId,
             objectId: sub.id,
             outcome:
-              `${session.planTo} — status ${sub.status}` +
+              `${session.planTo} · status ${sub.status}` +
               (mode === "invoice" ? " (invoice emailed, due in 7 days)" : "") +
-              (session.trialDays ? ` — trial ${session.trialDays} days` : "") +
-              ` — ${syncLine}`,
+              (session.trialDays ? ` · trial ${session.trialDays} days` : "") +
+              ` · ${syncLine}`,
             severity: "success",
           });
           await interaction.editReply({
             embeds: [
               makeEmbed(
-                `✅ Created \`${sub.id}\` — **${session.planTo}**, status **${sub.status}**.` +
+                `✅ Created \`${sub.id}\`: **${session.planTo}**, status **${sub.status}**.` +
                   (mode === "invoice" ? "\n📧 An invoice (due in 7 days) is emailed to the customer." : "") +
                   `\n${syncLine}`,
                 COLORS.success
@@ -417,7 +417,7 @@ export class SubscriptionsHub {
               );
               syncLine = `Postiz sync ${postizPlan.tier}/${postizPlan.period}`;
             } else {
-              syncLine = "⚠ NOT a canonical Postiz price — the platform keeps the OLD tier (metadata unchanged)";
+              syncLine = "⚠ NOT a canonical Postiz price: the platform keeps the OLD tier (metadata unchanged)";
             }
           }
           await this.ctx.stripe.changeSubscriptionPlan(
@@ -440,7 +440,7 @@ export class SubscriptionsHub {
             outcome:
               `${session.planFrom ?? "?"} → ${session.planTo ?? "?"} (${mode === "prorate" ? "prorated" : "no proration"}). ` +
               `Discount ${choice === "keep" ? "unchanged" : choice === "remove" ? "removed" : `set to \`${choice}\``}` +
-              (syncLine ? ` — ${syncLine}` : ""),
+              (syncLine ? ` · ${syncLine}` : ""),
             severity: "info",
           });
           await interaction.editReply({
@@ -471,14 +471,14 @@ export class SubscriptionsHub {
             action: "Update plan allowlist",
             outcome: interaction.values.length
               ? `Allowlist set to ${interaction.values.length} plan(s): ${interaction.values.join(", ")}`
-              : "Allowlist cleared — all active plans are offered",
+              : "Allowlist cleared: all active plans are offered",
             severity: "info",
           });
           await this.renderPlanSettings(
             interaction,
             interaction.values.length
               ? `✅ Allowlist set to ${interaction.values.length} plan(s).`
-              : "✅ Allowlist cleared — all active plans are offered."
+              : "✅ Allowlist cleared: all active plans are offered."
           );
         });
       },
@@ -791,10 +791,10 @@ export class SubscriptionsHub {
           .setColor(COLORS.warn)
           .setDescription(
             `How should \`${session.subscriptionId}\` handle invoices while paused?\n\n` +
-              `**Keep as draft** — ${PAUSE_BEHAVIORS.keep_as_draft}.\n` +
-              `**Mark uncollectible** — ${PAUSE_BEHAVIORS.mark_uncollectible}.\n` +
-              `**Void** — ${PAUSE_BEHAVIORS.void}.\n\n` +
-              "⚠️ Pausing collection does **not** stop the billing cycle — invoices keep being generated " +
+              `**Keep as draft**: ${PAUSE_BEHAVIORS.keep_as_draft}.\n` +
+              `**Mark uncollectible**: ${PAUSE_BEHAVIORS.mark_uncollectible}.\n` +
+              `**Void**: ${PAUSE_BEHAVIORS.void}.\n\n` +
+              "⚠️ Pausing collection does **not** stop the billing cycle: invoices keep being generated " +
               "on schedule; only what happens to them changes."
           );
         await interaction.update({
@@ -822,7 +822,7 @@ export class SubscriptionsHub {
           .setTitle("Confirm pause")
           .setColor(COLORS.danger)
           .setDescription(
-            `Pause collection on \`${session.subscriptionId}\` with behavior **${behavior}** — ` +
+            `Pause collection on \`${session.subscriptionId}\` with behavior **${behavior}**: ` +
               `${PAUSE_BEHAVIORS[behavior]}.\n\n` +
               "⚠️ The billing cycle keeps running; invoices keep being generated on schedule."
           );
@@ -903,7 +903,7 @@ export class SubscriptionsHub {
             action: "Resume collection",
             targetCustomerId: session.customerId,
             objectId: session.subscriptionId,
-            outcome: "pause_collection cleared — invoices collect normally again",
+            outcome: "pause_collection cleared: invoices collect normally again",
             severity: "info",
           });
           await interaction.editReply({
@@ -931,7 +931,7 @@ export class SubscriptionsHub {
             .setTitle("Trial")
             .setColor(COLORS.brand)
             .setDescription(
-              `\`${sub.id}\` — status **${sub.status}**.\n` +
+              `\`${sub.id}\` · status **${sub.status}**.\n` +
                 (sub.trial_end && sub.trial_end > Math.floor(Date.now() / 1000)
                   ? `Current trial end: <t:${sub.trial_end}:F> (<t:${sub.trial_end}:R>)`
                   : "No active trial.") +
@@ -1076,11 +1076,11 @@ export class SubscriptionsHub {
             action: "End trial now",
             targetCustomerId: session.customerId,
             objectId: session.subscriptionId,
-            outcome: "Trial ended immediately — regular billing starts now",
+            outcome: "Trial ended immediately: regular billing starts now",
             severity: "warn",
           });
           await interaction.editReply({
-            embeds: [makeEmbed(`⏱️ Trial on \`${session.subscriptionId}\` ended — billing starts now.`, COLORS.success)],
+            embeds: [makeEmbed(`⏱️ Trial on \`${session.subscriptionId}\` ended: billing starts now.`, COLORS.success)],
             components: [this.subDetailBackRow(token)],
           });
         });
@@ -1143,7 +1143,7 @@ export class SubscriptionsHub {
             )
             .setDescription(
               "**Prorate** credits/bills the seat difference for the rest of the period. " +
-                "**No proration** just changes the quantity — the new amount applies from the next invoice."
+                "**No proration** just changes the quantity: the new amount applies from the next invoice."
             );
           await interaction.editReply({
             embeds: [embed],
@@ -1231,7 +1231,7 @@ export class SubscriptionsHub {
             .setColor(COLORS.brand)
             .setDescription(
               `\`${sub.id}\` is managed by schedule \`${scheduleId}\`.\n${pending}\n\n` +
-                "**Release schedule** discards the pending change — the subscription keeps its current " +
+                "**Release schedule** discards the pending change: the subscription keeps its current " +
                 "plan and is no longer schedule-managed. **Replace next phase** picks a different plan " +
                 "for the switch at period end."
             );
@@ -1369,7 +1369,7 @@ export class SubscriptionsHub {
             .setColor(COLORS.danger)
             .setDescription(
               `⚠️ Release schedule \`${scheduleId}\` on \`${session.subscriptionId}\`?\n` +
-                "The pending plan change is **discarded** — the subscription keeps its current plan and " +
+                "The pending plan change is **discarded**: the subscription keeps its current plan and " +
                 "is no longer schedule-managed."
             );
           await interaction.editReply({
@@ -1408,12 +1408,12 @@ export class SubscriptionsHub {
             action: "Release subscription schedule",
             targetCustomerId: session.customerId,
             objectId: session.subscriptionId,
-            outcome: `Schedule \`${scheduleId}\` released — pending plan change discarded`,
+            outcome: `Schedule \`${scheduleId}\` released: pending plan change discarded`,
             severity: "warn",
           });
           await interaction.editReply({
             embeds: [
-              makeEmbed(`🗓️ Schedule \`${scheduleId}\` released — \`${session.subscriptionId}\` keeps its current plan.`, COLORS.success),
+              makeEmbed(`🗓️ Schedule \`${scheduleId}\` released: \`${session.subscriptionId}\` keeps its current plan.`, COLORS.success),
             ],
             components: [this.subDetailBackRow(token)],
           });
@@ -1490,7 +1490,7 @@ export class SubscriptionsHub {
       return {
         embeds: [
           makeEmbed(
-            `No coupons exist yet — create one under 🎟️ Promos, or **Enter coupon ID** to type one.\nApplying to \`${sub.id}\`.`,
+            `No coupons exist yet. Create one under 🎟️ Promos, or **Enter coupon ID** to type one.\nApplying to \`${sub.id}\`.`,
             COLORS.warn
           ),
         ],
@@ -1628,7 +1628,7 @@ export class SubscriptionsHub {
         embeds: [
           makeEmbed(
             limited
-              ? "No other plans are allowed — adjust the Plan Allowlist in /config → Billing."
+              ? "No other plans are allowed. Adjust the Plan Allowlist in /config → Billing."
               : "No other active recurring prices exist in this Stripe account.",
             COLORS.warn
           ),
@@ -1654,7 +1654,7 @@ export class SubscriptionsHub {
       .setColor(COLORS.brand)
       .setDescription(
         `\`${sub.id}\` is currently on **${session.planFrom}**.` +
-          (sub.items.data.length > 1 ? "\n⚠️ Multi-item subscription — only the first item's plan is changed." : "") +
+          (sub.items.data.length > 1 ? "\n⚠️ Multi-item subscription: only the first item's plan is changed." : "") +
           "\nPick the new plan:" +
           (limited ? "\n-# Plans limited by the Plan Allowlist (/config → Billing)" : "")
       );
@@ -1732,7 +1732,7 @@ export class SubscriptionsHub {
           .slice(0, 5)
           .map(
             (line) =>
-              `${this.ctx.stripe.formatAmount(line.amount, line.currency)} — ${(line.description ?? line.id).slice(0, 80)}`
+              `${this.ctx.stripe.formatAmount(line.amount, line.currency)} · ${(line.description ?? line.id).slice(0, 80)}`
           );
         if (lines.length > 0) {
           previewFields.push({
@@ -1766,17 +1766,17 @@ export class SubscriptionsHub {
       .setColor(COLORS.warn)
       .addFields(
         { name: "Subscription", value: `\`${session?.subscriptionId}\``, inline: false },
-        { name: "From", value: session?.planFrom ?? "—", inline: true },
-        { name: "To", value: session?.planTo ?? "—", inline: true },
+        { name: "From", value: session?.planFrom ?? "N/A", inline: true },
+        { name: "To", value: session?.planTo ?? "N/A", inline: true },
         { name: "Discount", value: discountLine, inline: false },
         ...previewFields.map((f) => ({ ...f, inline: false }))
       )
       .setDescription(
         (previewWarn ? `⚠️ ${previewWarn}\n\n` : "") +
           "**Prorate** credits unused time on the old plan and bills the difference. " +
-          "**No proration** just switches — the new price applies from the next invoice." +
+          "**No proration** just switches: the new price applies from the next invoice." +
           (previewFields.length > 0
-            ? "\n-# Prorations are pinned to the preview timestamp — the prorated charge matches the preview."
+            ? "\n-# Prorations are pinned to the preview timestamp: the prorated charge matches the preview."
             : "")
       );
     return {
@@ -1815,7 +1815,7 @@ export class SubscriptionsHub {
         embeds: [
           makeEmbed(
             limited
-              ? "No plans are allowed — adjust the Plan Allowlist in /config → Billing."
+              ? "No plans are allowed. Adjust the Plan Allowlist in /config → Billing."
               : "No active recurring prices exist in this Stripe account.",
             COLORS.warn
           ),
@@ -1856,7 +1856,7 @@ export class SubscriptionsHub {
       .setDescription(
         `Creating **${session?.planTo ?? "?"}** for \`${session?.customerId}\`.\n\n` +
           "Start it with a discount? Pick an active promo code below, enter one manually, " +
-          "pick a raw coupon — or continue without."
+          "pick a raw coupon, or continue without."
       );
 
     const components: ActionRowBuilder<MessageActionRowComponentBuilder>[] = [];
@@ -1868,7 +1868,7 @@ export class SubscriptionsHub {
           promos.slice(0, 25).map((p) => {
             const coupon = promoCoupon(p);
             return {
-              label: `${p.code}${coupon ? ` — ${couponDesc(this.ctx.stripe, coupon)}` : ""}`.slice(0, 100),
+              label: `${p.code}${coupon ? ` · ${couponDesc(this.ctx.stripe, coupon)}` : ""}`.slice(0, 100),
               description: `${p.times_redeemed}/${p.max_redemptions ?? "∞"} used · ${p.id}`.slice(0, 100),
               value: p.id,
             };
@@ -1909,13 +1909,13 @@ export class SubscriptionsHub {
           : `\`${choice}\` (coupon)`;
     const payNote = session?.hasDefaultPm
       ? "**Create & charge** bills the customer's default payment method for the first period now (unless a trial is set)."
-      : "⚠️ The customer has **no default payment method** — **Create & charge** will fail. Use **Create + email invoice** (due in 7 days), or set a trial.";
+      : "⚠️ The customer has **no default payment method**: **Create & charge** will fail. Use **Create + email invoice** (due in 7 days), or set a trial.";
     const embed = new EmbedBuilder()
       .setTitle("Confirm new subscription")
       .setColor(COLORS.warn)
       .addFields(
         { name: "Customer", value: `\`${session?.customerId}\``, inline: true },
-        { name: "Plan", value: session?.planTo ?? "—", inline: true },
+        { name: "Plan", value: session?.planTo ?? "N/A", inline: true },
         { name: "Discount", value: discountLine, inline: true },
         { name: "Trial", value: session?.trialDays ? `${session.trialDays} days` : "none", inline: true }
       )
@@ -1959,7 +1959,7 @@ export class SubscriptionsHub {
       const stale = force || this.ctx.priceBook.isPlanUsageStale();
       if (stale) {
         await interaction.editReply({
-          embeds: [makeEmbed("⏳ Counting active subscriptions per plan — this can take a moment…", COLORS.neutral)],
+          embeds: [makeEmbed("⏳ Counting active subscriptions per plan: this can take a moment…", COLORS.neutral)],
           components: [],
         });
       }
@@ -1990,7 +1990,7 @@ export class SubscriptionsHub {
     );
     const lines = sorted.map((p) => {
       const n = usage.counts.get(p.id) ?? 0;
-      return `**${n}×** — ${priceLabel(this.ctx.stripe, p)} — \`${p.id}\`${allowed.has(p.id) ? " ✅" : ""}`;
+      return `**${n}×** · ${priceLabel(this.ctx.stripe, p)} · \`${p.id}\`${allowed.has(p.id) ? " ✅" : ""}`;
     });
     // Prices no longer active but still carrying subscriptions — pure debug info.
     const activeIds = new Set(prices.map((p) => p.id));
@@ -1998,7 +1998,7 @@ export class SubscriptionsHub {
       .filter(([priceId]) => !activeIds.has(priceId))
       .sort((a, b) => b[1] - a[1]);
     for (const [priceId, n] of archived.slice(0, 10)) {
-      lines.push(`**${n}×** — _archived/inactive price_ — \`${priceId}\``);
+      lines.push(`**${n}×** · _archived/inactive price_ · \`${priceId}\``);
     }
 
     const embed = new EmbedBuilder()
@@ -2019,7 +2019,7 @@ export class SubscriptionsHub {
       .setFooter({
         text:
           `${usage.scanned} active subscriptions scanned${usage.truncated ? " (truncated)" : ""} · ` +
-          "counts cached for 5 min — Recount to refresh",
+          "counts cached for 5 min · Recount to refresh",
       });
 
     const options = sorted.slice(0, 25).map((p) => ({
@@ -2120,7 +2120,7 @@ export class SubscriptionsHub {
           inline: true,
         },
         { name: "Status", value: sub.status, inline: true },
-        { name: "Period end", value: periodEnd ? `<t:${periodEnd}:D>` : "—", inline: true },
+        { name: "Period end", value: periodEnd ? `<t:${periodEnd}:D>` : "N/A", inline: true },
         { name: "Cancel at period end?", value: sub.cancel_at_period_end ? "already scheduled" : "no", inline: true }
       )
       .setDescription("⚠️ **Cancel now** ends the subscription immediately; **at period end** lets it run out.");
@@ -2205,7 +2205,7 @@ export class SubscriptionsHub {
         }))
       );
     return {
-      embeds: [makeEmbed(`${subs.length} subscriptions — pick one to manage.`, COLORS.brand)],
+      embeds: [makeEmbed(`${subs.length} subscriptions: pick one to manage.`, COLORS.brand)],
       components: [selectRow(select), backRow(`billadmin_nav_back:${token}`)],
     };
   }
@@ -2218,7 +2218,7 @@ export class SubscriptionsHub {
         new ActionRowBuilder<TextInputBuilder>().addComponents(
           textInput("value", "Days from now, or a date (YYYY-MM-DD)", {
             required: true,
-            placeholder: "e.g. 14 — or 2026-08-01",
+            placeholder: "e.g. 14, or 2026-08-01",
             maxLength: 10,
           })
         )
@@ -2283,7 +2283,7 @@ export class SubscriptionsHub {
         embeds: [
           makeEmbed(
             limited
-              ? "No other plans are allowed — adjust the Plan Allowlist in /config → Billing."
+              ? "No other plans are allowed. Adjust the Plan Allowlist in /config → Billing."
               : "No other active recurring prices exist in this Stripe account.",
             COLORS.warn
           ),
@@ -2344,7 +2344,7 @@ export class SubscriptionsHub {
             `${priceMap.get(it.price.id) ?? priceLabel(this.ctx.stripe, it.price)}` +
             `${it.quantity != null && it.quantity !== 1 ? ` ×${it.quantity}` : ""}`
         )
-        .join("\n") || "—";
+        .join("\n") || "N/A";
     const discounts = describeDiscounts(this.ctx.stripe, sub);
 
     let scheduleLine = "none";
@@ -2366,7 +2366,7 @@ export class SubscriptionsHub {
     const embed = new EmbedBuilder()
       .setTitle("🔄 Manage subscription")
       .setColor(COLORS.brand)
-      .setDescription(`\`${sub.id}\` — customer \`${session.customerId}\``)
+      .setDescription(`\`${sub.id}\` · customer \`${session.customerId}\``)
       .addFields(
         { name: "Plan(s)", value: plans.slice(0, 1024), inline: false },
         {
@@ -2380,9 +2380,9 @@ export class SubscriptionsHub {
           inline: true,
         },
         { name: "Discounts", value: (discounts.join("\n") || "none").slice(0, 1024), inline: true },
-        { name: "Trial end", value: sub.trial_end ? `<t:${sub.trial_end}:F>` : "—", inline: true },
-        { name: "Period end", value: extra.periodEnd ? `<t:${extra.periodEnd}:F>` : "—", inline: true },
-        { name: "Latest invoice", value: latestInvoice ? `\`${latestInvoice}\`` : "—", inline: true },
+        { name: "Trial end", value: sub.trial_end ? `<t:${sub.trial_end}:F>` : "N/A", inline: true },
+        { name: "Period end", value: extra.periodEnd ? `<t:${extra.periodEnd}:F>` : "N/A", inline: true },
+        { name: "Latest invoice", value: latestInvoice ? `\`${latestInvoice}\`` : "N/A", inline: true },
         { name: "Schedule", value: scheduleLine.slice(0, 1024), inline: false }
       );
 

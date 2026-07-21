@@ -168,7 +168,7 @@ export class TemporalProducers {
         startWorkflowOperation: startOp,
       }) as R;
     } catch (e) {
-      prodLog.warn("temporal update failed — caller falls back to legacy path", {
+      prodLog.warn("temporal update failed: caller falls back to legacy path", {
         "temporal.update": updateName,
         "ticket.thread_id": threadId,
         "error.message": e instanceof Error ? e.message : String(e),
@@ -318,14 +318,14 @@ export class TemporalProducers {
         try {
           const r = await reconcileLooperGeneration(client, id, LOOPER_GENERATIONS[id] ?? 1);
           if (r.action === "terminated") {
-            prodLog.info("looper generation changed — restarting singleton", {
+            prodLog.info("looper generation changed: restarting singleton", {
               "temporal.workflow_id": id,
               "looper.gen_from": r.runningGen ?? 0,
               "looper.gen_to": r.wantedGen,
             });
           }
         } catch (e) {
-          prodLog.warn("looper generation check failed — leaving running instance", {
+          prodLog.warn("looper generation check failed: leaving running instance", {
             "temporal.workflow_id": id,
             "error.message": e instanceof Error ? e.message : String(e),
           });
@@ -351,7 +351,7 @@ export class TemporalProducers {
           prodLog.info("retired singleton terminated", { "temporal.workflow_id": workflowId, "retire.reason": reason });
         }
       } catch (e) {
-        prodLog.warn("retired-singleton terminate failed — retried on next baseline", {
+        prodLog.warn("retired-singleton terminate failed: retried on next baseline", {
           "temporal.workflow_id": workflowId,
           "error.message": e instanceof Error ? e.message : String(e),
         });
@@ -362,7 +362,7 @@ export class TemporalProducers {
         const n = await retireByQuery(client, query, reason);
         if (n > 0) prodLog.info("retired workflows terminated by query", { "retire.query": query, "retire.count": n });
       } catch (e) {
-        prodLog.warn("retired-query terminate failed — retried on next baseline", {
+        prodLog.warn("retired-query terminate failed: retried on next baseline", {
           "retire.query": query,
           "error.message": e instanceof Error ? e.message : String(e),
         });

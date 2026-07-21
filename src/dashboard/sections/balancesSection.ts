@@ -107,11 +107,11 @@ export function makeBalancesSection(): DashboardSectionModule {
           const payout = await ctx.stripe.getPayout(id).catch(() => null);
           if (!payout) return { ok: false, error: "This payout does not exist." };
           if (payout.status !== "pending") {
-            return { ok: false, error: `Payout is ${payout.status} — only pending payouts can be canceled.` };
+            return { ok: false, error: `Payout is ${payout.status}; only pending payouts can be canceled.` };
           }
           await ctx.stripe.cancelPayout(id, `dash-pocancel-${id}`);
           await ctx.audit(`Payout ${id} canceled (${ctx.stripe.formatAmount(payout.amount, payout.currency)})`);
-          return { ok: true, text: `Payout ${id} canceled — the funds return to the available balance.` };
+          return { ok: true, text: `Payout ${id} canceled. The funds return to the available balance.` };
         }
         // T3 — reverse a PAID payout (debits the destination bank account).
         // Typed CONFIRM plus the Discord reverse code.
@@ -121,13 +121,13 @@ export function makeBalancesSection(): DashboardSectionModule {
           const payout = await ctx.stripe.getPayout(id).catch(() => null);
           if (!payout) return { ok: false, error: "This payout does not exist." };
           if (payout.status !== "paid") {
-            return { ok: false, error: `Payout is ${payout.status} — only paid payouts can be reversed.` };
+            return { ok: false, error: `Payout is ${payout.status}; only paid payouts can be reversed.` };
           }
           const reversedBy = typeof payout.reversed_by === "string" ? payout.reversed_by : payout.reversed_by?.id ?? null;
           if (reversedBy) return { ok: false, error: `Payout was already reversed (${reversedBy}).` };
           const reversal = await ctx.stripe.reversePayout(id, `dash-poreverse-${id}`);
           await ctx.audit(`Payout ${id} REVERSED → ${reversal.id} (${ctx.stripe.formatAmount(payout.amount, payout.currency)})`);
-          return { ok: true, text: `Payout ${id} reversed — ${reversal.id} debits the destination bank account.` };
+          return { ok: true, text: `Payout ${id} reversed. ${reversal.id} debits the destination bank account.` };
         }
         default:
           return { ok: false, error: "Unknown action." };
@@ -185,7 +185,7 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
             label: "Weekly anchor (weekly only)",
             ...(schedule?.weekly_anchor ? { value: schedule.weekly_anchor } : {}),
             options: [
-              { value: "", label: "—" },
+              { value: "", label: "N/A" },
               { value: "monday", label: "Monday" },
               { value: "tuesday", label: "Tuesday" },
               { value: "wednesday", label: "Wednesday" },
@@ -205,12 +205,12 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
   });
 
   const buckets = (rows: Array<{ amount: number; currency: string }> | undefined) =>
-    (rows ?? []).map((b) => ctx.stripe.formatAmount(b.amount, b.currency)).join(" + ") || "—";
+    (rows ?? []).map((b) => ctx.stripe.formatAmount(b.amount, b.currency)).join(" + ") || "N/A";
   blocks.push({
     type: "stats",
     items: [
-      { label: "Available", value: balance ? buckets(balance.available) : "—", sub: "settled, ready to pay out" },
-      { label: "Pending", value: balance ? buckets(balance.pending) : "—", sub: "settling to available" },
+      { label: "Available", value: balance ? buckets(balance.available) : "N/A", sub: "settled, ready to pay out" },
+      { label: "Pending", value: balance ? buckets(balance.pending) : "N/A", sub: "settling to available" },
       ...(balance?.connect_reserved?.length
         ? [{ label: "Reserved", value: buckets(balance.connect_reserved) }]
         : []),
@@ -286,7 +286,7 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
         money(ctx.stripe, t.net, t.currency, t.net >= 0 ? "pos" : "neg"),
         text(sentence(t.type.replace(/_/g, " "))),
         dateCell(t.available_on),
-        typeof t.source === "string" ? idCell(t.source, { copy: true }) : text("—"),
+        typeof t.source === "string" ? idCell(t.source, { copy: true }) : text("N/A"),
       ] as Cell[],
     })),
     empty: "No balance transactions in this window.",
@@ -295,7 +295,7 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
           footer: `${txRes.transactions.length}${txRes.hasMore ? "+" : ""} item${txRes.transactions.length === 1 ? "" : "s"}`,
         }
       : {}),
-    notice: "Latest transactions only — the payout pager above pages independently.",
+    notice: "Latest transactions only; the payout pager above pages independently.",
   });
 
   return { title: "Balances", crumbs: [{ label: "Balances" }], blocks };
@@ -322,7 +322,7 @@ async function payoutDetail(ctx: DashboardCtx, id: string): Promise<SectionPage>
       dangerous: true,
       stepUp: true,
       params: { id: payout.id },
-      summary: "Cancels this pending payout — the funds return to the available balance. Requires a fresh factor.",
+      summary: "Cancels this pending payout; the funds return to the available balance. Requires a fresh factor.",
     });
   }
   if (payout.status === "paid" && !reversedBy && !originalPayout) {
@@ -369,7 +369,7 @@ async function payoutDetail(ctx: DashboardCtx, id: string): Promise<SectionPage>
           money(ctx.stripe, -t.fee, t.currency, t.fee ? "muted" : undefined),
           money(ctx.stripe, t.net, t.currency, t.net >= 0 ? "pos" : "neg"),
           text(sentence(t.type.replace(/_/g, " "))),
-          typeof t.source === "string" ? idCell(t.source, { copy: true }) : text("—"),
+          typeof t.source === "string" ? idCell(t.source, { copy: true }) : text("N/A"),
         ] as Cell[],
       })),
       empty: "Stripe has not attached transactions to this payout (yet).",

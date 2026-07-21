@@ -95,7 +95,7 @@ export class AgentRipMigration {
     } catch (e) {
       // Discord/DB down mid-sweep: leave the flag unset — next boot re-runs
       // the (convergent) migration from the top.
-      migLog.error("agent-rip phase 2 aborted — will re-run on next boot", e);
+      migLog.error("agent-rip phase 2 aborted: will re-run on next boot", e);
       return;
     }
     await this.settingsStore.recordAgentRipMigration();
@@ -114,7 +114,7 @@ export class AgentRipMigration {
         { name: "Threads closed", value: String(summary.threadsClosed), inline: true },
         { name: "Titles cleaned", value: String(summary.titlesCleaned), inline: true },
         ...(summary.failures > 0
-          ? [{ name: "Failures", value: `${summary.failures} (see logs — deleted threads / permissions)`, inline: true }]
+          ? [{ name: "Failures", value: `${summary.failures} (see logs: deleted threads / permissions)`, inline: true }]
           : []),
       ],
     });
@@ -215,7 +215,7 @@ export class AgentRipMigration {
     return Promise.race([settled, grace]).then((outcome) => {
       clearTimeout(timer);
       if (outcome.pending) {
-        migLog.warn("thread edit rate-limited — continuing, it lands when the limit clears", {
+        migLog.warn("thread edit rate-limited: continuing, it lands when the limit clears", {
           "thread.edit": edit,
           "ticket.thread_id": threadId,
         });

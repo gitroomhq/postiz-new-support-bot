@@ -54,7 +54,7 @@ export function makeBookmarksSection(): DashboardSectionModule {
           };
         }),
         nextCursor: offset + PAGE_SIZE < total ? String(offset + PAGE_SIZE) : null,
-        empty: "Nothing bookmarked yet — every detail page has a Bookmark action.",
+        empty: "Nothing bookmarked yet. Every detail page has a Bookmark action.",
         ...(rows.length ? { footer: `${rows.length} of ${total} bookmark${total === 1 ? "" : "s"}` } : {}),
         notice: "One shared list for the whole team.",
       };

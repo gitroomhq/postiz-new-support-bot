@@ -94,7 +94,7 @@ export class InvoicesHub {
     }
     if (StripeClient.isZeroDecimal(currency)) {
       if (raw.includes(".")) {
-        return { ok: false, error: `\`${currency}\` is a zero-decimal currency — whole amounts only.` };
+        return { ok: false, error: `\`${currency}\` is a zero-decimal currency: whole amounts only.` };
       }
       return { ok: true, minor: Number.parseInt(raw, 10) };
     }
@@ -279,7 +279,7 @@ export class InvoicesHub {
           work: async (invoiceId) => {
             const inv = await this.ctx.stripe.payInvoice(invoiceId, `billadmin-inv-pay-${interaction.id}`);
             return {
-              outcome: `Charged the default payment method — status ${inv.status ?? "paid"}`,
+              outcome: `Charged the default payment method, status ${inv.status ?? "paid"}`,
               notice: "💳 Payment attempted against the default payment method.",
               amountText: this.fmt(inv.amount_paid, inv.currency),
             };
@@ -294,7 +294,7 @@ export class InvoicesHub {
         this.renderConfirm(interaction, interaction.customId.split(":")[1], {
           title: "Void invoice?",
           warning:
-            "Voiding **cannot be undone** — the invoice is treated as zero and can never be paid. " +
+            "Voiding **cannot be undone**: the invoice is treated as zero and can never be paid. " +
             "Amounts already paid are NOT refunded (use a credit note for that).",
           confirmId: "billadmin_inv_void_go",
           confirmLabel: "Void invoice",
@@ -502,9 +502,9 @@ export class InvoicesHub {
       .setColor(COLORS.brand)
       .setDescription(
         [
-          "**Read** — a user's invoice history, or just their open (unpaid) invoices.",
-          "**Manage** — pick an invoice to finalize, resend, collect, void, mark uncollectible or credit-note it.",
-          "**Create** — build a one-off invoice from ad-hoc line items and email it or charge it now.",
+          "**Read**: a user's invoice history, or just their open (unpaid) invoices.",
+          "**Manage**: pick an invoice to finalize, resend, collect, void, mark uncollectible or credit-note it.",
+          "**Create**: build a one-off invoice from ad-hoc line items and email it or charge it now.",
         ].join("\n")
       );
     return {
@@ -575,7 +575,7 @@ export class InvoicesHub {
         await interaction.editReply(
           this.buildTargetPanel(
             mode,
-            `<@${pickedId}> has no bot session — they've never logged in via **Start Here**. ` +
+            `<@${pickedId}> has no bot session. They've never logged in via **Start Here**. ` +
               `Use manual entry (cus_… / email) instead.`
           )
         );
@@ -643,7 +643,7 @@ export class InvoicesHub {
       this.setState(token, { mode });
       const select = new StringSelectMenuBuilder()
         .setCustomId(`billadmin_inv_cuspick:${token}`)
-        .setPlaceholder("Several Stripe customers matched — pick one")
+        .setPlaceholder("Several Stripe customers matched, pick one")
         .addOptions(candidateIds.slice(0, 25).map((id) => ({ label: id.slice(0, 100), value: id })));
       await interaction.editReply({
         embeds: [makeEmbed(`${sourceLabel} maps to ${candidateIds.length} Stripe customers.`, COLORS.warn)],
@@ -689,7 +689,7 @@ export class InvoicesHub {
     if (res.has_more && last?.id) session.cursors[page + 1] = last.id;
 
     const embed = new EmbedBuilder()
-      .setTitle(`${state.listStatus === "open" ? "Open invoices" : "Invoices"} — \`${session.customerId}\``)
+      .setTitle(`${state.listStatus === "open" ? "Open invoices" : "Invoices"}: \`${session.customerId}\``)
       .setColor(COLORS.brand)
       .setDescription(
         invoices.map((inv) => invoiceLine(this.ctx.stripe, inv)).join("\n").slice(0, 4096) || "No invoices found."
@@ -703,7 +703,7 @@ export class InvoicesHub {
         .setPlaceholder("Open an invoice…")
         .addOptions(
           invoices.slice(0, 25).map((inv) => ({
-            label: `${inv.number ?? inv.id} · ${inv.status ?? "—"}`.slice(0, 100),
+            label: `${inv.number ?? inv.id} · ${inv.status ?? "N/A"}`.slice(0, 100),
             description: `${this.fmt(inv.total, inv.currency)} · ${new Date(inv.created * 1000)
               .toISOString()
               .slice(0, 10)}`.slice(0, 100),
@@ -732,7 +732,7 @@ export class InvoicesHub {
 
     // charge/payment ref lives on invoice.payments, which needs an expand the
     // shared StripeClient.getInvoice doesn't request — shown when available.
-    let paymentRef = "—";
+    let paymentRef = "N/A";
     const pay = inv.payments?.data?.[0]?.payment;
     if (pay?.type === "charge" && pay.charge) {
       paymentRef = `\`${typeof pay.charge === "string" ? pay.charge : pay.charge.id}\``;
@@ -741,12 +741,12 @@ export class InvoicesHub {
     }
 
     const subRef = inv.parent?.subscription_details?.subscription;
-    const subText = subRef ? `\`${typeof subRef === "string" ? subRef : subRef.id}\`` : "—";
+    const subText = subRef ? `\`${typeof subRef === "string" ? subRef : subRef.id}\`` : "N/A";
 
     const balanceDelta = inv.ending_balance != null ? inv.ending_balance - inv.starting_balance : 0;
     const balanceText =
       balanceDelta === 0
-        ? "—"
+        ? "N/A"
         : `${fmt(Math.abs(balanceDelta))} ${balanceDelta > 0 ? "applied from balance" : "credited to balance"}`;
 
     const links =
@@ -755,17 +755,17 @@ export class InvoicesHub {
         inv.invoice_pdf ? `[PDF](${inv.invoice_pdf})` : null,
       ]
         .filter(Boolean)
-        .join(" · ") || "—";
+        .join(" · ") || "N/A";
 
     const embed = new EmbedBuilder()
       .setTitle(`Invoice \`${inv.number ?? inv.id}\``)
       .setColor(inv.status === "paid" ? COLORS.success : inv.status === "open" ? COLORS.warn : COLORS.brand)
       .addFields(
-        { name: "Status", value: inv.status ?? "—", inline: true },
+        { name: "Status", value: inv.status ?? "N/A", inline: true },
         { name: "Total", value: fmt(inv.total), inline: true },
         { name: "Paid / Remaining", value: `${fmt(inv.amount_paid)} / ${fmt(inv.amount_remaining)}`, inline: true },
         { name: "Created", value: `<t:${inv.created}:D>`, inline: true },
-        { name: "Due date", value: inv.due_date ? `<t:${inv.due_date}:D>` : "—", inline: true },
+        { name: "Due date", value: inv.due_date ? `<t:${inv.due_date}:D>` : "N/A", inline: true },
         { name: "Applied balance", value: balanceText.slice(0, 1024), inline: true },
         { name: "Charge / Payment", value: paymentRef, inline: true },
         { name: "Subscription", value: subText, inline: true },
@@ -844,7 +844,7 @@ export class InvoicesHub {
             action: opts.action,
             targetCustomerId: session.customerId,
             objectId: state.invoiceId,
-            outcome: `Failed — ${msg.slice(0, 500)}`,
+            outcome: `Failed: ${msg.slice(0, 500)}`,
             severity: "danger",
           });
         }
@@ -876,7 +876,7 @@ export class InvoicesHub {
         .setDescription(opts.warning)
         .addFields(
           { name: "Invoice", value: `\`${inv.number ?? inv.id}\``, inline: true },
-          { name: "Status", value: inv.status ?? "—", inline: true },
+          { name: "Status", value: inv.status ?? "N/A", inline: true },
           { name: "Total", value: this.fmt(inv.total, inv.currency), inline: true }
         );
       await interaction.editReply({
@@ -946,7 +946,7 @@ export class InvoicesHub {
       state.cnReason = undefined;
 
       const embed = new EmbedBuilder()
-        .setTitle(`Credit note — \`${inv.number ?? inv.id}\``)
+        .setTitle(`Credit note: \`${inv.number ?? inv.id}\``)
         .setColor(COLORS.brand)
         .setDescription(
           `Amount paid: **${this.fmt(inv.amount_paid, inv.currency)}**.\n` +
@@ -1020,19 +1020,19 @@ export class InvoicesHub {
 
   private buildCnModePanel(token: string, state: InvState): Panel {
     const amountText =
-      state.cnAmountMinor != null && state.cnCurrency ? this.fmt(state.cnAmountMinor, state.cnCurrency) : "—";
+      state.cnAmountMinor != null && state.cnCurrency ? this.fmt(state.cnAmountMinor, state.cnCurrency) : "N/A";
     const embed = new EmbedBuilder()
-      .setTitle("Credit note — how should the credit be issued?")
+      .setTitle("Credit note: how should the credit be issued?")
       .setColor(COLORS.brand)
       .addFields(
         { name: "Amount", value: `**${amountText}**`, inline: true },
-        { name: "Memo", value: state.cnMemo?.slice(0, 1024) || "—", inline: true },
-        { name: "Reason", value: state.cnReason ?? "—", inline: true }
+        { name: "Memo", value: state.cnMemo?.slice(0, 1024) || "N/A", inline: true },
+        { name: "Reason", value: state.cnReason ?? "N/A", inline: true }
       )
       .setDescription(
         "**Refund to payment method** sends the money back to the card/PM that paid.\n" +
           "**Credit customer balance** applies it to the customer's Stripe balance for future invoices.\n" +
-          "Optionally pick a reason first — you'll see a preview before anything is created."
+          "Optionally pick a reason first. You'll see a preview before anything is created."
       );
     const reasonSelect = new StringSelectMenuBuilder()
       .setCustomId(`billadmin_inv_cn_reason:${token}`)
@@ -1074,14 +1074,14 @@ export class InvoicesHub {
       const embed = new EmbedBuilder()
         .setTitle("Confirm credit note")
         .setColor(COLORS.danger)
-        .setDescription("Preview from Stripe — nothing has been created yet.")
+        .setDescription("Preview from Stripe. Nothing has been created yet.")
         .addFields(
           { name: "Invoice", value: `\`${state.invoiceId}\``, inline: true },
           { name: "Credit note total", value: `**${fmt(preview.total)}**`, inline: true },
           { name: "Mode", value: mode === "refund" ? "Refund to payment method" : "Credit customer balance", inline: true },
           { name: "Refunded to payment method", value: fmt(refundSum), inline: true },
           { name: "Credited to customer balance", value: fmt(creditSum), inline: true },
-          { name: "Reason / Memo", value: `${state.cnReason ?? "—"} / ${state.cnMemo?.slice(0, 500) || "—"}`, inline: true }
+          { name: "Reason / Memo", value: `${state.cnReason ?? "N/A"} / ${state.cnMemo?.slice(0, 500) || "N/A"}`, inline: true }
         );
       await interaction.editReply({
         embeds: [embed],
@@ -1119,7 +1119,7 @@ export class InvoicesHub {
           objectId: cn.id,
           amountText: this.fmt(cn.total, cn.currency),
           outcome:
-            `Credit note \`${cn.number}\` on \`${state.invoiceId}\` — ` +
+            `Credit note \`${cn.number}\` on \`${state.invoiceId}\`: ` +
             `${state.cnMode === "refund" ? "refunded to payment method" : "credited to customer balance"}` +
             `${state.cnReason ? ` (${state.cnReason})` : ""}`,
           severity: "success",
@@ -1127,7 +1127,7 @@ export class InvoicesHub {
         await this.renderDetail(
           interaction,
           token,
-          `✅ Credit note \`${cn.number}\` created — **${this.fmt(cn.total, cn.currency)}** ` +
+          `✅ Credit note \`${cn.number}\` created: **${this.fmt(cn.total, cn.currency)}** ` +
             `${state.cnMode === "refund" ? "refunded to the payment method" : "credited to the customer balance"}. ` +
             `[PDF](${cn.pdf})`
         );
@@ -1138,7 +1138,7 @@ export class InvoicesHub {
           targetCustomerId: session.customerId,
           objectId: state.invoiceId,
           amountText,
-          outcome: `Failed — ${msg.slice(0, 500)}`,
+          outcome: `Failed: ${msg.slice(0, 500)}`,
           severity: "danger",
         });
         await this.renderDetail(interaction, token, `⚠️ Creating the credit note failed: ${msg.slice(0, 300)}`);
@@ -1150,11 +1150,11 @@ export class InvoicesHub {
 
   private buildOneoffStartPanel(token: string, customerId: string): Panel {
     const embed = new EmbedBuilder()
-      .setTitle(`One-off invoice — \`${customerId}\``)
+      .setTitle(`One-off invoice: \`${customerId}\``)
       .setColor(COLORS.brand)
       .setDescription(
         "Add the first line item to create the draft.\n" +
-          "The draft starts as **send by email, due in 7 days** — you can charge it immediately instead when finalizing."
+          "The draft starts as **send by email, due in 7 days**. You can charge it immediately instead when finalizing."
       );
     return {
       embeds: [embed],
@@ -1249,10 +1249,10 @@ export class InvoicesHub {
     const fmt = (v: number) => this.fmt(v, inv.currency);
     const lines = inv.lines.data
       .slice(0, 20)
-      .map((line) => `• ${line.description ?? "item"} — **${fmt(line.amount)}**`);
+      .map((line) => `• ${line.description ?? "item"} · **${fmt(line.amount)}**`);
 
     const embed = new EmbedBuilder()
-      .setTitle(`One-off invoice draft — \`${inv.id}\``)
+      .setTitle(`One-off invoice draft: \`${inv.id}\``)
       .setColor(inv.status === "draft" ? COLORS.brand : COLORS.warn)
       .setDescription(
         [notice, "", ...(lines.length ? lines : ["*No line items yet.*"]), "", `**Total: ${fmt(inv.total)}**`]
@@ -1261,8 +1261,8 @@ export class InvoicesHub {
           .slice(0, 4096)
       )
       .addFields(
-        { name: "Status", value: inv.status ?? "—", inline: true },
-        { name: "Customer", value: `\`${typeof inv.customer === "string" ? inv.customer : inv.customer?.id ?? "—"}\``, inline: true },
+        { name: "Status", value: inv.status ?? "N/A", inline: true },
+        { name: "Customer", value: `\`${typeof inv.customer === "string" ? inv.customer : inv.customer?.id ?? "N/A"}\``, inline: true },
         { name: "Collection", value: inv.collection_method === "send_invoice" ? "email, due in 7 days" : "charge automatically", inline: true }
       );
 
@@ -1342,7 +1342,7 @@ export class InvoicesHub {
             action,
             targetCustomerId: session.customerId,
             objectId: draftId,
-            outcome: `Failed — ${msg.slice(0, 500)}`,
+            outcome: `Failed: ${msg.slice(0, 500)}`,
             severity: "danger",
           });
         }

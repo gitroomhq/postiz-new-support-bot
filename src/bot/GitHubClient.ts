@@ -10,7 +10,7 @@ export class GitHubClient {
     // transcript can never make the API reject the whole request.
     const MAX_BODY = 65_536;
     if (body.length > MAX_BODY) {
-      const notice = "\n\n*(truncated — GitHub length limit)*";
+      const notice = "\n\n*(truncated: GitHub length limit)*";
       body = body.slice(0, MAX_BODY - notice.length) + notice;
     }
     title = title.slice(0, 256);

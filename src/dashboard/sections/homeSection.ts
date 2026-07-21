@@ -52,7 +52,7 @@ export async function computeAttention(
     const overdue = hoursLeft < 0;
     entries.push({
       id: `dispute-${d.id}`,
-      label: `Dispute ${ctx.stripe.formatAmount(d.amount, d.currency)} — ${d.reason.replace(/_/g, " ")}`,
+      label: `Dispute ${ctx.stripe.formatAmount(d.amount, d.currency)} · ${d.reason.replace(/_/g, " ")}`,
       sub: d.id,
       badge: { kind: "error", text: overdue ? "Evidence OVERDUE" : `Due in ${Math.max(1, Math.round(hoursLeft))}h` },
       iso: d.evidenceDueBy.toISOString(),
@@ -65,7 +65,7 @@ export async function computeAttention(
       id: `approval-${a.id}`,
       label: a.summary,
       sub: `requested by ${a.requestedByName} · ${a.origin}`,
-      badge: { kind: a.status === "FAILED" ? "error" : "warn", text: a.status === "FAILED" ? "Failed — retry" : "Awaiting approval" },
+      badge: { kind: a.status === "FAILED" ? "error" : "warn", text: a.status === "FAILED" ? "Failed, retry" : "Awaiting approval" },
       iso: a.createdAt.toISOString(),
       ref: { page: "approvals" },
     });
@@ -133,18 +133,18 @@ export function makeHomeSection(deps: { metrics: HomeMetrics }): DashboardSectio
       // ---- stat tiles ----
       const fmtBuckets = (buckets: Array<{ amount: number; currency: string }> | undefined): string => {
         const parts = (buckets ?? []).filter((b) => b.amount !== 0).map((b) => ctx.stripe.formatAmount(b.amount, b.currency));
-        return parts.join(" + ") || (buckets?.length ? ctx.stripe.formatAmount(0, buckets[0].currency) : "—");
+        return parts.join(" + ") || (buckets?.length ? ctx.stripe.formatAmount(0, buckets[0].currency) : "N/A");
       };
       const openApprovals = inbox.approvalsTotal + inbox.reviewCount;
       blocks.push({
         type: "stats",
         items: [
-          { label: "Available balance", value: balance ? fmtBuckets(balance.available) : "—" },
-          { label: "Pending", value: balance ? fmtBuckets(balance.pending) : "—" },
+          { label: "Available balance", value: balance ? fmtBuckets(balance.available) : "N/A" },
+          { label: "Pending", value: balance ? fmtBuckets(balance.pending) : "N/A" },
           {
             label: "Active subscriptions",
             value: subCount ? `${subCount.count}${subCount.truncated ? "+" : ""}` : "counting…",
-            ...(subCount ? {} : { sub: "full sweep running — refresh in a minute" }),
+            ...(subCount ? {} : { sub: "full sweep running, refresh in a minute" }),
           },
           {
             label: "Open approvals",
@@ -162,7 +162,7 @@ export function makeHomeSection(deps: { metrics: HomeMetrics }): DashboardSectio
         cells: [
           strong(e.label, e.sub),
           badgeCell(e.badge.kind, e.badge.text),
-          e.whenUnknown ? text("—") : ({ t: "date", v: e.iso.slice(0, 10), iso: e.iso } as Cell),
+          e.whenUnknown ? text("N/A") : ({ t: "date", v: e.iso.slice(0, 10), iso: e.iso } as Cell),
         ],
       }));
 
@@ -190,7 +190,7 @@ export function makeHomeSection(deps: { metrics: HomeMetrics }): DashboardSectio
           },
         ],
         rows: inboxRows,
-        empty: "Nothing needs attention — disputes, approvals and fraud warnings show up here.",
+        empty: "Nothing needs attention. Disputes, approvals and fraud warnings show up here.",
         ...(inboxRows.length ? { footer: `${inboxRows.length} item${inboxRows.length === 1 ? "" : "s"}` } : {}),
       });
 

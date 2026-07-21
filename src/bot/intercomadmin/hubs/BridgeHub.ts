@@ -52,10 +52,10 @@ export class BridgeHub {
 
     const modeLine =
       mode === "none"
-        ? "**none** — bridge off, tickets stay Discord-only"
+        ? "**none**: bridge off, tickets stay Discord-only"
         : mode === "push"
-          ? "**push** — one-way mirror Discord → Intercom"
-          : "**bi** — full sync, agent replies & states come back";
+          ? "**push**: one-way mirror Discord → Intercom"
+          : "**bi**: full sync, agent replies & states come back";
 
     const typeMap = s.intercomTicketTypeMap();
     const categoryIds = [...this.ctx.categories().map((c) => c.id), "_default"];
@@ -69,7 +69,7 @@ export class BridgeHub {
         ...(s.intercomConfigured()
           ? []
           : [
-              "⚠️ **Setup incomplete** — the bridge queues events but pushes nothing until token, author and a Default ticket type are set (connection settings live in /config → Integrations → Intercom).",
+              "⚠️ **Setup incomplete**: the bridge queues events but pushes nothing until token, author and a Default ticket type are set (connection settings live in /config → Integrations → Intercom).",
             ]),
         "",
         `**Ticket types:** ${typesLine}`,
@@ -79,9 +79,9 @@ export class BridgeHub {
           s.intercomSnoozeStatusTagId()
             ? (() => {
                 const t = s.tagById(s.intercomSnoozeStatusTagId()!);
-                return t ? `${t.emoji} ${t.label}` : "_deleted tag — re-pick_";
+                return t ? `${t.emoji} ${t.label}` : "_deleted tag, re-pick_";
               })()
-            : "_not set — Intercom snooze is ignored_"
+            : "_not set (Intercom snooze is ignored)_"
         }`,
         `**Bridged tickets:** ${links}/${totalTickets}`,
         "",
@@ -125,7 +125,7 @@ export class BridgeHub {
       await interaction.followUp({
         embeds: [
           makeEmbed(
-            [`Cannot enable **${mode}** — the configuration changed since the preflight:`, ...pf.hard.map((h) => `• ${h}`)].join("\n"),
+            [`Cannot enable **${mode}**. The configuration changed since the preflight:`, ...pf.hard.map((h) => `• ${h}`)].join("\n"),
             COLORS.danger
           ),
         ],
@@ -153,7 +153,7 @@ export class BridgeHub {
         .followUp({
           embeds: [
             makeEmbed(
-              "Bridge off — nothing mirrors in either direction. Intercom agent replies posted while off are healed when you re-enable **bi**; Discord messages sent while off are NOT replayable.",
+              "Bridge off: nothing mirrors in either direction. Intercom agent replies posted while off are healed when you re-enable **bi**; Discord messages sent while off are NOT replayable.",
               COLORS.warn
             ),
           ],
@@ -170,7 +170,7 @@ export class BridgeHub {
     if (pf.hard.length > 0) {
       await this.renderPanel(interaction, true);
       await interaction.followUp({
-        embeds: [makeEmbed([`Cannot enable **${mode}** — fix these first:`, ...pf.hard.map((h) => `• ${h}`)].join("\n"), COLORS.danger)],
+        embeds: [makeEmbed([`Cannot enable **${mode}**. Fix these first:`, ...pf.hard.map((h) => `• ${h}`)].join("\n"), COLORS.danger)],
         flags: 64,
       });
       return;
@@ -208,23 +208,23 @@ export class BridgeHub {
       }
     }
     if (!s.intercomAuthorAdminId()) {
-      hard.push("No authoring admin — Set Secrets auto-detects one, or use Pick Admin (both in /config → Integrations → Intercom).");
+      hard.push("No authoring admin: Set Secrets auto-detects one, or use Pick Admin (both in /config → Integrations → Intercom).");
     }
     if (!s.intercomTicketTypeIdFor(null)) hard.push("No Default ticket type mapped (Map Ticket Types).");
 
     if (mode === "bi") {
       if (!s.intercomClientSecret()) {
-        hard.push("No client secret — every inbound webhook would be rejected, so agent replies could never reach Discord (Set Secrets in /config).");
+        hard.push("No client secret: every inbound webhook would be rejected, so agent replies could never reach Discord (Set Secrets in /config).");
       } else if (!s.intercomLastInboundAt()) {
-        soft.push("No inbound webhook has ever been received — verify the Developer Hub subscription (topics + endpoint URL) before relying on agent replies reaching Discord.");
+        soft.push("No inbound webhook has ever been received; verify the Developer Hub subscription (topics + endpoint URL) before relying on agent replies reaching Discord.");
       }
       if (!s.resolvedPublicBaseUrl()) {
-        soft.push("No public base URL known — set it via /config → Reporting & Audit → Billing → Webhooks → Set Public URL (used in the webhook endpoint instructions).");
+        soft.push("No public base URL known; set it via /config → Reporting & Audit → Billing → Webhooks → Set Public URL (used in the webhook endpoint instructions).");
       }
       if (s.tags().filter((t) => t.intercomTicketStateId).length === 0) {
-        soft.push("No status tags are mapped to Intercom ticket states — state changes will not sync (Map States).");
+        soft.push("No status tags are mapped to Intercom ticket states; state changes will not sync (Map States).");
       }
-      if (!s.closingTag()) soft.push("No closing status tag exists — an Intercom-side close cannot map back to Discord.");
+      if (!s.closingTag()) soft.push("No closing status tag exists; an Intercom-side close cannot map back to Discord.");
       // Agent replies impersonate the agent via a channel webhook; without the
       // permission they degrade to the plainer bot embed.
       const threadsChannelId = s.threadsChannelId();
@@ -233,7 +233,7 @@ export class BridgeHub {
         const channel = await client.channels.fetch(threadsChannelId).catch(() => null);
         const me = channel && "guild" in channel && channel.guild ? channel.guild.members.me : null;
         if (channel && me && !channel.isDMBased() && !channel.permissionsFor(me)?.has(PermissionFlagsBits.ManageWebhooks)) {
-          soft.push("Bot lacks Manage Webhooks in the threads channel — agent replies will render as plain embeds instead of under the agent's name.");
+          soft.push("Bot lacks Manage Webhooks in the threads channel; agent replies will render as plain embeds instead of under the agent's name.");
         }
       }
     }
@@ -281,7 +281,7 @@ export class BridgeHub {
         .followUp({
           embeds: [
             makeEmbed(
-              "Bridge enabled. Existing tickets are NOT auto-backfilled — use **Backfill tickets** in /intercom → Maintenance (it asks for confirmation). Discord messages sent while the bridge was off were never mirrored and cannot be replayed.",
+              "Bridge enabled. Existing tickets are NOT auto-backfilled; use **Backfill tickets** in /intercom → Maintenance (it asks for confirmation). Discord messages sent while the bridge was off were never mirrored and cannot be replayed.",
               COLORS.neutral
             ),
           ],
@@ -339,7 +339,7 @@ export class BridgeHub {
             [
               `Gap heal: scanned ${scanned} open bridged ticket(s); ${conversationsWithParts} had Intercom activity from the off window (agent replies were relayed into their threads; notes/state changes are not healed).`,
               ...(fetchFailures > 0
-                ? [`⚠️ ${fetchFailures} conversation fetch(es) failed — those threads may still be missing agent replies from the off window.`]
+                ? [`⚠️ ${fetchFailures} conversation fetch(es) failed; those threads may still be missing agent replies from the off window.`]
                 : []),
             ].join("\n"),
             fetchFailures > 0 ? COLORS.warn : COLORS.neutral
@@ -364,7 +364,7 @@ export class BridgeHub {
       {
         label: "Default (fallback for everything unmapped)",
         value: "_default",
-        description: typeMap["_default"] ? `mapped → ticket type ${typeMap["_default"]}` : "not mapped — required",
+        description: typeMap["_default"] ? `mapped → ticket type ${typeMap["_default"]}` : "not mapped (required)",
       },
     ];
     const select = new StringSelectMenuBuilder()
@@ -375,9 +375,9 @@ export class BridgeHub {
       embeds: [
         makeEmbed(
           [
-            "Map each ticket category to an Intercom **ticket type**. The **Default** mapping is required — it catches tickets with no category-specific mapping.",
-            '**Customer types are recommended**: the conversation is converted *into* the ticket, so agents work one unified thread instead of a back-office ticket + separate conversation. Pick a Back-office type only if you depend on Intercom\'s "ticket created" workflow trigger — it never fires for API-created Customer tickets.',
-            "Remapping affects **new** tickets only (existing tickets keep the type they were created with). After switching, re-check **Ticket states** — mapped states must be valid for the new type.",
+            "Map each ticket category to an Intercom **ticket type**. The **Default** mapping is required: it catches tickets with no category-specific mapping.",
+            '**Customer types are recommended**: the conversation is converted *into* the ticket, so agents work one unified thread instead of a back-office ticket + separate conversation. Pick a Back-office type only if you depend on Intercom\'s "ticket created" workflow trigger: it never fires for API-created Customer tickets.',
+            "Remapping affects **new** tickets only (existing tickets keep the type they were created with). After switching, re-check **Ticket states**: mapped states must be valid for the new type.",
           ].join("\n"),
           COLORS.neutral
         ),
@@ -401,7 +401,7 @@ export class BridgeHub {
       const pool = [...types].sort((a, b) => rank(a) - rank(b));
       if (pool.length === 0) {
         await interaction.followUp({
-          embeds: [makeEmbed("Intercom returned no ticket types — create one in Intercom first (Customer recommended).", COLORS.warn)],
+          embeds: [makeEmbed("Intercom returned no ticket types. Create one in Intercom first (Customer recommended).", COLORS.warn)],
           flags: 64,
         });
         return;
@@ -470,7 +470,7 @@ export class BridgeHub {
       const states = (await this.ctx.intercomClient.listTicketStates()).filter((s) => !s.archived);
       if (states.length === 0) {
         await interaction.followUp({
-          embeds: [makeEmbed("Intercom returned no ticket states — create them in Intercom first (Settings → Ticket states).", COLORS.warn)],
+          embeds: [makeEmbed("Intercom returned no ticket states. Create them in Intercom first (Settings → Ticket states).", COLORS.warn)],
           flags: 64,
         });
         return;
@@ -480,7 +480,7 @@ export class BridgeHub {
         .setCustomId(`icadmin_bridge_state_pick:${value}`)
         .setPlaceholder(`Intercom state for ${tag ? `${tag.emoji} ${tag.label}` : value}`)
         .addOptions([
-          { label: "— unmapped —", value: "__none__", description: "Don't touch the Intercom state for this tag", default: !tag?.intercomTicketStateId },
+          { label: "(unmapped)", value: "__none__", description: "Don't touch the Intercom state for this tag", default: !tag?.intercomTicketStateId },
           ...states.slice(0, 24).map((s) => ({
             label: s.internalLabel.slice(0, 100),
             value: s.id,
@@ -521,7 +521,7 @@ export class BridgeHub {
         .setCustomId("icadmin_bridge_team_pick")
         .setPlaceholder("Team for new bridged conversations/tickets")
         .addOptions([
-          { label: "— unassigned —", value: "__none__", description: "Don't route; conversations land in the shared inbox", default: !current },
+          { label: "(unassigned)", value: "__none__", description: "Don't route; conversations land in the shared inbox", default: !current },
           ...teams.slice(0, 24).map((t) => ({
             label: t.name.slice(0, 100),
             value: t.id,
@@ -532,7 +532,7 @@ export class BridgeHub {
       await interaction.editReply({
         embeds: [
           makeEmbed(
-            "Every new bridged conversation **and** its ticket get assigned to this team on creation (Intercom workflow triggers can't see API-created conversations, so the bridge routes directly). Agents can reassign afterwards — the bridge never overrides.",
+            "Every new bridged conversation **and** its ticket get assigned to this team on creation (Intercom workflow triggers can't see API-created conversations, so the bridge routes directly). Agents can reassign afterwards; the bridge never overrides.",
             COLORS.neutral
           ),
         ],
@@ -587,7 +587,7 @@ export class BridgeHub {
           [
             "Pick the status tag applied in Discord when an agent **snoozes** the conversation in Intercom. Unsnooze restores the previous tag.",
             "",
-            "The tag should have **no reminders**, **not close the thread**, and **no Intercom state mapping** (a '💤 Snoozed' tag works well — create one under /config → Tags if needed).",
+            "The tag should have **no reminders**, **not close the thread**, and **no Intercom state mapping** (a '💤 Snoozed' tag works well; create one under /config → Tags if needed).",
           ].join("\n"),
           COLORS.neutral
         ),
@@ -665,7 +665,7 @@ export class BridgeHub {
               ? ["", "✗ = API call failed. Fix manually in Intercom: Settings → Ticket types → add a text attribute with exactly that name (or archive it, for retired attributes)."]
               : []),
             "",
-            "Conversations are marked with a **Discord** tag automatically. For the optional `Origin` + `Discord Thread` conversation attributes — and the **SLA Target** attribute (see SLA Manager → Verify Setup) — create them once by hand (Settings → Data → Conversations); the API can't define conversation attributes.",
+            "Conversations are marked with a **Discord** tag automatically. For the optional `Origin` + `Discord Thread` conversation attributes, and the **SLA Target** attribute (see SLA Manager → Verify Setup), create them once by hand (Settings → Data → Conversations); the API can't define conversation attributes.",
           ].join("\n"),
           failed ? COLORS.warn : COLORS.success
         ),

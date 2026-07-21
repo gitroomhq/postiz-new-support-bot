@@ -126,7 +126,7 @@ export function makePaymentsSection(): DashboardSectionModule {
           const ids = [...new Set(rawIds.map((v) => validId("charge", v)).filter((v): v is string => v != null))];
           if (ids.length === 0) return { ok: false, error: "Select at least one charge row first." };
           if (ids.length > BULK_REFUND_MAX) {
-            return { ok: false, error: `Bulk refund is capped at ${BULK_REFUND_MAX} charges per run — select fewer rows.` };
+            return { ok: false, error: `Bulk refund is capped at ${BULK_REFUND_MAX} charges per run; select fewer rows.` };
           }
           const actor = actionActor(ctx);
           let executed = 0;
@@ -139,14 +139,14 @@ export function makePaymentsSection(): DashboardSectionModule {
             else failures.push(`${chargeId}: ${outcome.error}`);
           }
           await ctx.audit(
-            `Bulk refund over ${ids.length} charge(s) — ${executed} refunded, ${queued} queued, ${failures.length} skipped`
+            `Bulk refund over ${ids.length} charge(s): ${executed} refunded, ${queued} queued, ${failures.length} skipped`
           );
           const parts = [
             executed ? `${executed} refunded` : null,
             queued ? `${queued} queued for approval` : null,
             failures.length ? `${failures.length} skipped` : null,
           ].filter(Boolean);
-          const detail = failures.length ? ` — ${failures.slice(0, 3).join("; ")}${failures.length > 3 ? "; …" : ""}` : "";
+          const detail = failures.length ? ` (${failures.slice(0, 3).join("; ")}${failures.length > 3 ? "; …" : ""})` : "";
           if (executed + queued === 0) return { ok: false, error: `Bulk refund: every charge was skipped${detail}` };
           return { ok: true, text: `Bulk refund: ${parts.join(", ")}${detail}` };
         }
@@ -177,10 +177,10 @@ export function makePaymentsSection(): DashboardSectionModule {
               error: instant
                 ? `Instant-available ${currency.toUpperCase()} balance is ${
                     bucket ? ctx.stripe.formatAmount(bucket.amount, currency) : ctx.stripe.formatAmount(0, currency)
-                  } — instant payouts need an eligible debit destination and instant funds.`
+                  }; instant payouts need an eligible debit destination and instant funds.`
                 : `Available ${currency.toUpperCase()} balance is ${
                     bucket ? ctx.stripe.formatAmount(bucket.amount, currency) : ctx.stripe.formatAmount(0, currency)
-                  } — cannot pay out ${ctx.stripe.formatAmount(amountMinor, currency)}.`,
+                  }; cannot pay out ${ctx.stripe.formatAmount(amountMinor, currency)}.`,
             };
           }
           try {
@@ -194,10 +194,10 @@ export function makePaymentsSection(): DashboardSectionModule {
               },
               `dash-payout-${amountMinor}-${currency}-${Date.now().toString(36)}`
             );
-            await ctx.audit(`Payout ${payout.id} created — ${ctx.stripe.formatAmount(amountMinor, currency)}${instant ? " (instant)" : ""}`);
+            await ctx.audit(`Payout ${payout.id} created: ${ctx.stripe.formatAmount(amountMinor, currency)}${instant ? " (instant)" : ""}`);
             return {
               ok: true,
-              text: `Payout ${payout.id} created — ${ctx.stripe.formatAmount(amountMinor, currency)}${
+              text: `Payout ${payout.id} created: ${ctx.stripe.formatAmount(amountMinor, currency)}${
                 instant ? " (instant)" : `, arriving ${new Date(payout.arrival_date * 1000).toISOString().slice(0, 10)}`
               }.`,
             };
@@ -227,8 +227,8 @@ export function makePaymentsSection(): DashboardSectionModule {
               },
               `dash-topup-${amountMinor}-${currency}-${Date.now().toString(36)}`
             );
-            await ctx.audit(`Top-up ${topup.id} created — ${ctx.stripe.formatAmount(amountMinor, currency)} from the default bank`);
-            return { ok: true, text: `Top-up ${topup.id} created — ${ctx.stripe.formatAmount(amountMinor, currency)} (${topup.status}).` };
+            await ctx.audit(`Top-up ${topup.id} created: ${ctx.stripe.formatAmount(amountMinor, currency)} from the default bank`);
+            return { ok: true, text: `Top-up ${topup.id} created: ${ctx.stripe.formatAmount(amountMinor, currency)} (${topup.status}).` };
           } catch (e) {
             // Fails on accounts without a verified default bank / unsupported
             // countries — Stripe's message is the useful part.
@@ -288,7 +288,7 @@ function captureButtons(ctx: DashboardCtx, paymentIntentId: string, capturableMi
           min: 0,
         },
       ],
-      summary: "Charges part of the authorization — the uncaptured remainder is RELEASED back to the customer. Requires a fresh factor.",
+      summary: "Charges part of the authorization; the uncaptured remainder is RELEASED back to the customer. Requires a fresh factor.",
     }),
   ];
 }
@@ -542,7 +542,7 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
       label: "Card fingerprint",
       kind: "text",
       value: fingerprint || undefined,
-      placeholder: "Exact card identity — sweeps ALL customers",
+      placeholder: "Exact card identity · sweeps ALL customers",
     },
     { key: "email", label: "Email", kind: "text", value: emailFilter || undefined, placeholder: "ada@example.com" },
     {
@@ -607,11 +607,11 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
       ref: { page: "payments.detail", params: { id: pi.id } },
       cells: [
         amount(ctx.stripe, pi.amount, pi.currency, piBadge(pi.status)),
-        text(pi.description ?? "—"),
-        text(pi.last_payment_error?.message?.slice(0, 60) ?? "—"),
+        text(pi.description ?? "N/A"),
+        text(pi.last_payment_error?.message?.slice(0, 60) ?? "N/A"),
         typeof pi.customer === "string"
           ? ({ t: "link", v: pi.customer, ref: { page: "customers.detail", params: { id: pi.customer } } } as Cell)
-          : text("—"),
+          : text("N/A"),
         dateCell(pi.created),
       ] as Cell[],
     }));
@@ -700,14 +700,14 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
           ? cardCell(c.payment_method_details.card.brand ?? "card", c.payment_method_details.card.last4 ?? "????")
           : c.payment_method_details?.type
             ? cardCell(c.payment_method_details.type, "") // wallet chip (Link, PayPal, SEPA…)
-            : text("—"),
-        text(c.description ?? (typeof c.payment_intent === "string" ? c.payment_intent : c.payment_intent?.id) ?? "—"),
+            : text("N/A"),
+        text(c.description ?? (typeof c.payment_intent === "string" ? c.payment_intent : c.payment_intent?.id) ?? "N/A"),
         cus
           ? ({ t: "link", v: email ?? cus, ref: { page: "customers.detail", params: { id: cus } } } as Cell)
-          : text(email ?? "—"),
+          : text(email ?? "N/A"),
         dateCell(c.created),
-        c.refunds?.data?.[0]?.created ? dateCell(c.refunds.data[0].created) : text("—"),
-        text(c.failure_message ?? "—"),
+        c.refunds?.data?.[0]?.created ? dateCell(c.refunds.data[0].created) : text("N/A"),
+        text(c.failure_message ?? "N/A"),
         { t: "flags", badges: flags } as Cell,
       ] as Cell[],
     };
@@ -746,22 +746,22 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
         // Search mode has no starting_after cursor — one 100-row page.
         nextCursor: !searchMode && chargeWindow.hasMore && charges.length > 0 ? charges[charges.length - 1].id : null,
         empty: searchFailMsg
-          ? "Stripe Search refused this sweep — the notice below carries Stripe's exact message (also sent to Sentry)."
+          ? "Stripe Search refused this sweep; the notice below carries Stripe's exact message (also sent to Sentry)."
           : hasInMemoryFilter
             ? "No payments match these filters (within this window)."
             : "No payments yet.",
         ...(rows.length ? { footer: `${rows.length} item${rows.length === 1 ? "" : "s"}` } : {}),
         notice:
           (searchFailMsg
-            ? `Stripe Search failed for this card/email sweep — the table is empty, NOT a real zero-matches result. Stripe said: "${searchFailMsg}"`
+            ? `Stripe Search failed for this card/email sweep: the table is empty, NOT a real zero-matches result. Stripe said: "${searchFailMsg}"`
             : fingerprintMode
               ? `Card fingerprint sweeps the WHOLE account via Stripe Search (~1 min lag; first ${WINDOW} matches shown). Incomplete attempts aren't searchable by card.`
               : emailSweep
                 ? `Email sweep: billing-email charge search (guests included) merged with ${emailSweepCustomers} customer${emailSweepCustomers === 1 ? "" : "s"} matched by email. Chips count these results.`
-                : `Counts and filters cover the ${WINDOW} most recent payments${dateKey ? ` of the ${dateKey} window` : ""} per page — use Next for older ones. EFW matching covers the 100 most recent warnings.`) +
+                : `Counts and filters cover the ${WINDOW} most recent payments${dateKey ? ` of the ${dateKey} window` : ""} per page. Use Next for older ones. EFW matching covers the 100 most recent warnings.`) +
           // The wallet blind spot: Link/PayPal charges expose no card digits.
           (last4 || fingerprint || pmFilter
-            ? " Wallet payments (Link/PayPal) expose no card digits — they never match card filters."
+            ? " Wallet payments (Link/PayPal) expose no card digits; they never match card filters."
             : ""),
       },
     ],
@@ -806,7 +806,7 @@ async function transactionsView(
       ctx.stripe.listPayouts({ limit: 25, startingAfter: payoutCursor }),
     ]);
     const buckets = (rows: Array<{ amount: number; currency: string }> | undefined) =>
-      (rows ?? []).map((b) => ctx.stripe.formatAmount(b.amount, b.currency)).join(" + ") || "—";
+      (rows ?? []).map((b) => ctx.stripe.formatAmount(b.amount, b.currency)).join(" + ") || "N/A";
     return {
       title: "Payments",
       crumbs,
@@ -830,13 +830,13 @@ async function transactionsView(
                   label: "Payout speed",
                   options: [
                     { value: "", label: "Standard (free, 1-3 days)" },
-                    { value: "instant", label: "Instant (fee — eligible debit destinations only)" },
+                    { value: "instant", label: "Instant (fee, eligible debit destinations only)" },
                   ],
                 },
                 { type: "text", key: "description", label: "Description (optional)" },
                 { type: "text", key: "statementDescriptor", label: "Bank statement text (optional, ≤22 chars)", maxLength: 22 },
               ],
-              summary: `Pays out from the AVAILABLE balance (${balance ? buckets(balance.available) : "—"}) to the default external account. Requires a fresh factor.`,
+              summary: `Pays out from the AVAILABLE balance (${balance ? buckets(balance.available) : "N/A"}) to the default external account. Requires a fresh factor.`,
             },
           ],
         },
@@ -844,8 +844,8 @@ async function transactionsView(
         {
           type: "stats",
           items: [
-            { label: "Available", value: balance ? buckets(balance.available) : "—", sub: "settled, ready to pay out" },
-            { label: "Pending", value: balance ? buckets(balance.pending) : "—", sub: "settling to available" },
+            { label: "Available", value: balance ? buckets(balance.available) : "N/A", sub: "settled, ready to pay out" },
+            { label: "Pending", value: balance ? buckets(balance.pending) : "N/A", sub: "settling to available" },
           ],
         },
         {
@@ -866,7 +866,7 @@ async function transactionsView(
             cells: [
               amount(ctx.stripe, p.amount, p.currency, payoutBadge(p.status)),
               text(p.method === "instant" ? "Instant" : "Standard"),
-              text(p.description ?? "—"),
+              text(p.description ?? "N/A"),
               dateCell(p.created),
               dateCell(p.arrival_date),
               idCell(p.id, { copy: true }),
@@ -880,7 +880,7 @@ async function transactionsView(
           ...(payoutsRes.payouts.length
             ? { footer: `${payoutsRes.payouts.length}${payoutsRes.hasMore ? "+" : ""} item${payoutsRes.payouts.length === 1 ? "" : "s"}` }
             : {}),
-          notice: "Click a payout for its transactions — cancel (pending) and reverse (paid) live on the payout page.",
+          notice: "Click a payout for its transactions; cancel (pending) and reverse (paid) live on the payout page.",
         },
       ],
     };
@@ -932,14 +932,14 @@ async function transactionsView(
             id: t.id,
             cells: [
               amount(ctx.stripe, t.amount, t.currency, topupBadge(t.status)),
-              text(t.description ?? "—"),
+              text(t.description ?? "N/A"),
               dateCell(t.created),
               idCell(t.id, { copy: true }),
             ] as Cell[],
           })),
           nextCursor:
             topupsRes.hasMore && topupsRes.topups.length > 0 ? topupsRes.topups[topupsRes.topups.length - 1].id : null,
-          empty: "No top-ups — fund the balance via bank transfer or the API.",
+          empty: "No top-ups. Fund the balance via bank transfer or the API.",
           ...(topupsRes.topups.length
             ? { footer: `${topupsRes.topups.length}${topupsRes.hasMore ? "+" : ""} item${topupsRes.topups.length === 1 ? "" : "s"}` }
             : {}),
@@ -983,7 +983,7 @@ async function transactionsView(
             money(ctx.stripe, t.net, t.currency, t.net >= 0 ? "pos" : "neg"),
             text(sentence(t.type.replace(/_/g, " "))),
             dateCell(t.available_on),
-            typeof t.source === "string" ? idCell(t.source, { copy: true }) : text("—"),
+            typeof t.source === "string" ? idCell(t.source, { copy: true }) : text("N/A"),
           ] as Cell[],
         })),
         nextCursor:
@@ -1035,7 +1035,7 @@ async function chargeDetail(ctx: DashboardCtx, id: string): Promise<SectionPage>
         style: "danger",
         dangerous: true, // T1 belt (DASH_T1_EXTRA server-side)
         params: { paymentIntentId: chargePiId },
-        summary: "Releases the hold — the customer is never charged and the authorization is voided.",
+        summary: "Releases the hold; the customer is never charged and the authorization is voided.",
       })
     );
   }
@@ -1069,7 +1069,7 @@ async function chargeDetail(ctx: DashboardCtx, id: string): Promise<SectionPage>
         dangerous: true,
         params: { chargeId: id },
         inputs: [{ type: "number", key: "amountMajor", label: `Amount (${charge.currency.toUpperCase()}, e.g. 5.00)`, min: 0 }],
-        summary: `Refund part of ${ctx.stripe.formatAmount(charge.amount, charge.currency)} — ${ctx.stripe.formatAmount(remaining, charge.currency)} is refundable.`,
+        summary: `Refund part of ${ctx.stripe.formatAmount(charge.amount, charge.currency)}; ${ctx.stripe.formatAmount(remaining, charge.currency)} is refundable.`,
       })
     );
     actions.push(
@@ -1081,7 +1081,7 @@ async function chargeDetail(ctx: DashboardCtx, id: string): Promise<SectionPage>
         stepUp: true,
         params: { chargeId: id },
         inputs: [{ type: "number", key: "amountMajor", label: `Amount (${charge.currency.toUpperCase()})`, min: 0 }],
-        summary: "Refund with reason=fraudulent — feeds Stripe Radar. Requires a fresh factor (passkey/TOTP).",
+        summary: "Refund with reason=fraudulent (feeds Stripe Radar). Requires a fresh factor (passkey/TOTP).",
       })
     );
   }
@@ -1134,7 +1134,7 @@ async function chargeDetail(ctx: DashboardCtx, id: string): Promise<SectionPage>
     main.push({
       type: "notice",
       badge: { kind: disputeDaysLeft != null && disputeDaysLeft <= 2 ? "error" : "warn", text: urgency },
-      text: `The customer disputed this payment (${sentence(chargeDispute.reason)}). Respond with evidence in the Disputes workbench — see the Dispute panel on the right.`,
+      text: `The customer disputed this payment (${sentence(chargeDispute.reason)}). Respond with evidence in the Disputes workbench (see the Dispute panel on the right).`,
     });
   }
 
@@ -1214,7 +1214,7 @@ async function chargeDetail(ctx: DashboardCtx, id: string): Promise<SectionPage>
           ? cardCell(card.brand ?? "card", card.last4 ?? "????")
           : charge.payment_method_details?.type
             ? cardCell(charge.payment_method_details.type, "")
-            : text("—"),
+            : text("N/A"),
       },
       ...(card?.fingerprint
         ? [
@@ -1222,7 +1222,7 @@ async function chargeDetail(ctx: DashboardCtx, id: string): Promise<SectionPage>
               label: "Fingerprint",
               cell: {
                 t: "link",
-                v: `${card.fingerprint} — hunt same card`,
+                v: `${card.fingerprint} · hunt same card`,
                 ref: { page: "fraud", filters: { view: "card", fp: card.fingerprint } },
               } as Cell,
             },
@@ -1238,7 +1238,7 @@ async function chargeDetail(ctx: DashboardCtx, id: string): Promise<SectionPage>
             ? badgeCell("ok", "Passed")
             : card?.checks?.cvc_check
               ? badgeCell("warn", sentence(card.checks.cvc_check))
-              : text("—"),
+              : text("N/A"),
       },
     ],
   });
@@ -1284,7 +1284,7 @@ async function chargeDetail(ctx: DashboardCtx, id: string): Promise<SectionPage>
               charge.outcome.risk_level === "normal" ? "ok" : charge.outcome.risk_level === "elevated" ? "warn" : "error",
               sentence(charge.outcome.risk_level) + (charge.outcome.risk_score != null ? ` (${charge.outcome.risk_score})` : "")
             )
-          : text("—"),
+          : text("N/A"),
       },
       ...(charge.description ? [{ label: "Description", cell: text(charge.description) }] : []),
       ...(charge.calculated_statement_descriptor
@@ -1393,7 +1393,7 @@ async function piDetail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
             params: { paymentIntentId: id },
             summary:
               pi.status === "requires_capture"
-                ? "Releases the hold — the customer is never charged."
+                ? "Releases the hold; the customer is never charged."
                 : `Cancel this ${ctx.stripe.formatAmount(pi.amount, pi.currency)} payment attempt.`,
           }),
         ]
@@ -1489,7 +1489,7 @@ async function guardrailPage(ctx: DashboardCtx, chargeId: string): Promise<Secti
       {
         type: "notice",
         badge: { kind: "info", text: "ADVISORY" },
-        text: "This is the SELF-SERVICE refund gate, evaluated read-only against the same settings and stores. Staff refunds from this dashboard bypass it — exactly like /billing admin refunds do.",
+        text: "This is the SELF-SERVICE refund gate, evaluated read-only against the same settings and stores. Staff refunds from this dashboard bypass it, exactly like /billing admin refunds do.",
       },
       panel,
     ],
@@ -1542,7 +1542,7 @@ export async function buildGuardrailPanel(
   if (maxAgeDays == null) off("Charge age");
   else {
     const ageDays = Math.floor((Date.now() - charge.created * 1000) / 86_400_000);
-    if (ageDays >= maxAgeDays) trip("Charge age", `${ageDays}d old — window is ${maxAgeDays}d`);
+    if (ageDays >= maxAgeDays) trip("Charge age", `${ageDays}d old (window is ${maxAgeDays}d)`);
     else pass("Charge age", `${ageDays}d old (window ${maxAgeDays}d)`);
   }
 
@@ -1559,7 +1559,7 @@ export async function buildGuardrailPanel(
   // Velocity (per user) — needs the Discord link.
   const maxPerUser = deps.settings.refundMaxPer24hPerUser();
   if (maxPerUser == null) off("Velocity (per user)");
-  else if (!discordUserId) unknown("Velocity (per user)", "no Discord link — cannot evaluate");
+  else if (!discordUserId) unknown("Velocity (per user)", "no Discord link; cannot evaluate");
   else {
     const count = await deps.sessionStore
       .countRefundsSinceForUser(discordUserId, new Date(Date.now() - 86_400_000))
@@ -1571,7 +1571,7 @@ export async function buildGuardrailPanel(
 
   // Member age — Discord-only rail.
   if (deps.settings.refundMinMemberAgeDays() == null) off("Member age");
-  else unknown("Member age", "Discord-only guardrail — not checkable from the web");
+  else unknown("Member age", "Discord-only guardrail, not checkable from the web");
 
   // First-refund-only: local ledger + Stripe sweep.
   if (discordUserId && (await deps.sessionStore.hasEverBeenRefunded(discordUserId).catch(() => false))) {

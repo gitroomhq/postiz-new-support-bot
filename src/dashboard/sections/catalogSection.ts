@@ -89,7 +89,7 @@ export function makeCatalogSection(): DashboardSectionModule {
             currency = amountMatch[2].toLowerCase();
             const value = Number.parseFloat(amountMatch[1]);
             if (StripeClient.isZeroDecimal(currency) && amountMatch[1].includes(".")) {
-              return { ok: false, fieldErrors: { amountOff: `${currency} is a zero-decimal currency — whole amounts only.` } };
+              return { ok: false, fieldErrors: { amountOff: `${currency} is a zero-decimal currency: whole amounts only.` } };
             }
             amountOffMinor = StripeClient.isZeroDecimal(currency) ? Math.round(value) : Math.round(value * 100);
           }
@@ -127,7 +127,7 @@ export function makeCatalogSection(): DashboardSectionModule {
             },
             `dash-coupon-${Date.now().toString(36)}`
           );
-          await ctx.audit(`Coupon ${coupon.id} created — ${describeCoupon(ctx.stripe, coupon)} · ${coupon.duration}`);
+          await ctx.audit(`Coupon ${coupon.id} created: ${describeCoupon(ctx.stripe, coupon)} · ${coupon.duration}`);
           return { ok: true, text: `Coupon ${coupon.id} created.` };
         }
 
@@ -163,7 +163,7 @@ export function makeCatalogSection(): DashboardSectionModule {
             minimumAmountCurrency = m[2].toLowerCase();
             const value = Number.parseFloat(m[1]);
             if (StripeClient.isZeroDecimal(minimumAmountCurrency) && m[1].includes(".")) {
-              return { ok: false, fieldErrors: { minimumAmount: `${minimumAmountCurrency} is a zero-decimal currency — whole amounts only.` } };
+              return { ok: false, fieldErrors: { minimumAmount: `${minimumAmountCurrency} is a zero-decimal currency: whole amounts only.` } };
             }
             minimumAmountMinor = StripeClient.isZeroDecimal(minimumAmountCurrency) ? Math.round(value) : Math.round(value * 100);
           }
@@ -201,7 +201,7 @@ export function makeCatalogSection(): DashboardSectionModule {
             return { ok: false, fieldErrors: { percentage: "Percentage must be a number between 0 and 100 (e.g. 19 or 7.7)." } };
           }
           if (country && !/^[A-Z]{2}$/.test(country)) {
-            return { ok: false, fieldErrors: { country: "Country must be a 2-letter code (e.g. DE) — or empty." } };
+            return { ok: false, fieldErrors: { country: "Country must be a 2-letter code (e.g. DE), or empty." } };
           }
           const rate = await ctx.stripe.createTaxRate(
             {
@@ -213,7 +213,7 @@ export function makeCatalogSection(): DashboardSectionModule {
             },
             `dash-taxrate-${Date.now().toString(36)}`
           );
-          await ctx.audit(`Tax rate ${rate.id} created — ${displayName} ${percentage}% (${rate.inclusive ? "inclusive" : "exclusive"})`);
+          await ctx.audit(`Tax rate ${rate.id} created: ${displayName} ${percentage}% (${rate.inclusive ? "inclusive" : "exclusive"})`);
           return { ok: true, text: `Tax rate ${rate.id} created.` };
         }
 
@@ -239,7 +239,7 @@ export function makeCatalogSection(): DashboardSectionModule {
           const currency = amountMatch[2].toLowerCase();
           const value = Number.parseFloat(amountMatch[1]);
           if (StripeClient.isZeroDecimal(currency) && amountMatch[1].includes(".")) {
-            return { ok: false, fieldErrors: { amount: `${currency} is a zero-decimal currency — whole amounts only.` } };
+            return { ok: false, fieldErrors: { amount: `${currency} is a zero-decimal currency: whole amounts only.` } };
           }
           const amountMinor = StripeClient.isZeroDecimal(currency) ? Math.round(value) : Math.round(value * 100);
           const taxBehavior =
@@ -248,7 +248,7 @@ export function makeCatalogSection(): DashboardSectionModule {
             { displayName, amountMinor, currency, ...(taxBehavior ? { taxBehavior } : {}) },
             `dash-shipping-${Date.now().toString(36)}`
           );
-          await ctx.audit(`Shipping rate ${rate.id} created — ${displayName} ${ctx.stripe.formatAmount(amountMinor, currency)}`);
+          await ctx.audit(`Shipping rate ${rate.id} created: ${displayName} ${ctx.stripe.formatAmount(amountMinor, currency)}`);
           return { ok: true, text: `Shipping rate ${rate.id} created.` };
         }
 
@@ -283,11 +283,11 @@ function describeCoupon(stripe: { formatAmount(a: number, c: string): string }, 
     ? `${c.percent_off}% off`
     : c.amount_off != null
       ? `${stripe.formatAmount(c.amount_off, c.currency ?? "usd")} off`
-      : "—";
+      : "N/A";
 }
 
 function priceLabel(stripe: { formatAmount(a: number, c: string): string }, price: Stripe.Price | null): string {
-  if (!price || price.unit_amount == null) return "—";
+  if (!price || price.unit_amount == null) return "N/A";
   const base = stripe.formatAmount(price.unit_amount, price.currency);
   if (!price.recurring) return base;
   const n = price.recurring.interval_count || 1;
@@ -344,7 +344,7 @@ async function productsTable(ctx: DashboardCtx, cursor: string | null): Promise<
     nextCursor: hasMore && products.length ? products[products.length - 1].id : null,
     empty: "No products yet.",
     ...(rows.length ? { footer: `${rows.length} product${rows.length === 1 ? "" : "s"}` } : {}),
-    notice: "Read-only — create and edit products in the Stripe Dashboard.",
+    notice: "Read-only: create and edit products in the Stripe Dashboard.",
   };
 }
 
@@ -415,14 +415,14 @@ async function productDetail(ctx: DashboardCtx, id: string): Promise<SectionPage
         cells: [
           text(priceLabel(ctx.stripe, price), price.nickname ?? undefined),
           text(price.recurring ? `Recurring (${price.recurring.interval})` : "One-time"),
-          text(cnt ? `${cnt} active` : "—"),
+          text(cnt ? `${cnt} active` : "N/A"),
           badgeCell(price.active ? "ok" : "neutral", price.active ? "Active" : "Archived"),
           idCell(price.id, { copy: true }),
         ] as Cell[],
       };
     }),
     empty: "No prices on this product.",
-    notice: `Read-only — subscriptions pick these prices in the change-plan flow.${subCounts.truncated ? " Subscription counts are approximate (sweep truncated)." : ""}`,
+    notice: `Read-only: subscriptions pick these prices in the change-plan flow.${subCounts.truncated ? " Subscription counts are approximate (sweep truncated)." : ""}`,
   });
 
   // Rail: Insights (MRR) / Details / Metadata.
@@ -574,7 +574,7 @@ async function promosBlocks(ctx: DashboardCtx, filters: Record<string, string>):
     key: "promos",
     title: "Promotion codes",
     filters: [
-      { key: "code", label: "Check a code", kind: "search", value: checkQuery || undefined, placeholder: "Check a code or promo_… id — full validity verdict" },
+      { key: "code", label: "Check a code", kind: "search", value: checkQuery || undefined, placeholder: "Check a code or promo_… id · full validity verdict" },
     ],
     columns: [
       { key: "code", label: "Code" },
@@ -603,14 +603,14 @@ async function promosBlocks(ctx: DashboardCtx, filters: Record<string, string>):
     }),
     empty: "No promotion codes exist yet.",
     ...(promos.length ? { footer: `${promos.length} most recent codes` } : {}),
-    notice: "Promotion codes can't be edited or deleted — deactivate and create a replacement.",
+    notice: "Promotion codes can't be edited or deleted; deactivate and create a replacement.",
   };
   blocks.push(table);
   // Creation buttons ride a notice bar (the page header belongs to the tabs).
   blocks.push({
     type: "notice",
     badge: { kind: "info", text: "Create" },
-    text: "New codes apply an existing coupon — create the coupon first on the Coupons tab.",
+    text: "New codes apply an existing coupon; create the coupon first on the Coupons tab.",
     actions: [createButton],
   });
   return blocks;
@@ -636,7 +636,7 @@ async function taxBlocks(ctx: DashboardCtx): Promise<Block[]> {
       cells: [
         { t: "text", v: r.display_name, strong: true, ...(r.description ? { sub: r.description } : {}) } as Cell,
         text(`${r.percentage}% ${r.inclusive ? "incl." : "excl."}`),
-        text(r.country ?? "—"),
+        text(r.country ?? "N/A"),
         badgeCell(r.active ? "ok" : "neutral", r.active ? "Active" : "Archived"),
         idCell(r.id, { copy: true }),
       ] as Cell[],
@@ -646,14 +646,14 @@ async function taxBlocks(ctx: DashboardCtx): Promise<Block[]> {
               key: "section:catalog.tax_toggle",
               label: "Archive",
               params: { id: r.id, active: false },
-              summary: "Hides the rate from new invoices/subscriptions — existing attachments keep it.",
+              summary: "Hides the rate from new invoices/subscriptions; existing attachments keep it.",
             }
           : { key: "section:catalog.tax_toggle", label: "Restore", params: { id: r.id, active: true } },
       ],
     })),
     empty: "No tax rates yet.",
     ...(rates.length ? { footer: `${rates.length} most recent tax rates` } : {}),
-    notice: "Tax rates can't be deleted or have their percentage edited — archive and create a replacement.",
+    notice: "Tax rates can't be deleted or have their percentage edited; archive and create a replacement.",
   };
   const create: Block = {
     type: "notice",
@@ -671,7 +671,7 @@ async function taxBlocks(ctx: DashboardCtx): Promise<Block[]> {
           { type: "text", key: "country", label: "Country (2 letters, optional)", placeholder: "DE" },
           { type: "text", key: "description", label: "Internal description (optional)" },
         ],
-        summary: "Creates the tax rate — the percentage is immutable afterwards.",
+        summary: "Creates the tax rate; the percentage is immutable afterwards.",
       },
     ],
   };
@@ -698,8 +698,8 @@ async function shippingBlocks(ctx: DashboardCtx): Promise<Block[]> {
       id: r.id,
       cells: [
         { t: "text", v: r.display_name ?? r.id, strong: true } as Cell,
-        r.fixed_amount ? text(ctx.stripe.formatAmount(r.fixed_amount.amount, r.fixed_amount.currency)) : text("—"),
-        text(r.tax_behavior && r.tax_behavior !== "unspecified" ? r.tax_behavior : "—"),
+        r.fixed_amount ? text(ctx.stripe.formatAmount(r.fixed_amount.amount, r.fixed_amount.currency)) : text("N/A"),
+        text(r.tax_behavior && r.tax_behavior !== "unspecified" ? r.tax_behavior : "N/A"),
         badgeCell(r.active ? "ok" : "neutral", r.active ? "Active" : "Archived"),
         dateCell(r.created),
         idCell(r.id, { copy: true }),
@@ -710,14 +710,14 @@ async function shippingBlocks(ctx: DashboardCtx): Promise<Block[]> {
               key: "section:catalog.shipping_toggle",
               label: "Archive",
               params: { id: r.id, active: false },
-              summary: "Hides the rate from new checkouts — existing sessions keep it.",
+              summary: "Hides the rate from new checkouts; existing sessions keep it.",
             }
           : { key: "section:catalog.shipping_toggle", label: "Restore", params: { id: r.id, active: true } },
       ],
     })),
     empty: "No shipping rates yet.",
     ...(rates.length ? { footer: `${rates.length} most recent shipping rates` } : {}),
-    notice: "Shipping rates can't be deleted or have their amount edited — archive and create a replacement.",
+    notice: "Shipping rates can't be deleted or have their amount edited; archive and create a replacement.",
   };
   const create: Block = {
     type: "notice",
@@ -742,7 +742,7 @@ async function shippingBlocks(ctx: DashboardCtx): Promise<Block[]> {
             ],
           },
         ],
-        summary: "Creates a fixed-amount shipping rate — the amount is immutable afterwards.",
+        summary: "Creates a fixed-amount shipping rate; the amount is immutable afterwards.",
       },
     ],
   };
@@ -758,7 +758,7 @@ function promoVerdictKv(ctx: DashboardCtx, promo: Stripe.PromotionCode): Block {
   if (promo.max_redemptions != null && promo.times_redeemed >= promo.max_redemptions) reasons.push("max redemptions reached");
   if (coupon && !coupon.valid) reasons.push("underlying coupon is invalid");
   const valid = reasons.length === 0;
-  const discount = coupon ? describeCoupon(ctx.stripe, coupon) : "—";
+  const discount = coupon ? describeCoupon(ctx.stripe, coupon) : "N/A";
   const restrictions = [
     promo.restrictions.first_time_transaction ? "first purchase only" : null,
     promo.restrictions.minimum_amount != null
@@ -768,9 +768,9 @@ function promoVerdictKv(ctx: DashboardCtx, promo: Stripe.PromotionCode): Block {
   ].filter(Boolean);
   return {
     type: "kv",
-    title: `${promo.code} — ${valid ? "valid now" : "NOT valid"}`,
+    title: `${promo.code}: ${valid ? "valid now" : "NOT valid"}`,
     rows: [
-      { label: "Valid now", cell: badgeCell(valid ? "ok" : "error", valid ? "Yes" : `No — ${reasons.join(", ")}`) },
+      { label: "Valid now", cell: badgeCell(valid ? "ok" : "error", valid ? "Yes" : `No: ${reasons.join(", ")}`) },
       { label: "ID", cell: idCell(promo.id, { copy: true }) },
       { label: "Coupon", cell: text(coupon ? `${coupon.id}${coupon.name ? ` (${coupon.name})` : ""} · ${discount} · ${coupon.duration}` : promoCouponId(promo)) },
       { label: "Redemptions", cell: text(`${promo.times_redeemed} / ${promo.max_redemptions ?? "∞"}`) },

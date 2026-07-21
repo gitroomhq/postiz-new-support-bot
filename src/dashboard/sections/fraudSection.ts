@@ -63,7 +63,7 @@ export function makeFraudSection(deps: { hunts: FraudHuntService }): DashboardSe
         if (!review.open) return { ok: false, error: "Review is already closed." };
         await ctx.stripe.approveReview(id, `dash-review-${id}`);
         await ctx.audit(`Radar review ${id} approved`);
-        return { ok: true, text: `Review ${id} approved — the payment is released from the queue.` };
+        return { ok: true, text: `Review ${id} approved; the payment is released from the queue.` };
       }
       return { ok: false, error: "Unknown action." };
     },
@@ -98,7 +98,7 @@ async function reviewsTable(ctx: DashboardCtx): Promise<Block> {
         style: "primary",
         dangerous: true,
         params: { id: review.id },
-        summary: "Closes the review as legitimate — the payment stays as it is.",
+        summary: "Closes the review as legitimate; the payment stays as it is.",
       },
       ...(charge && !charge.refunded && remaining > 0
         ? [
@@ -109,7 +109,7 @@ async function reviewsTable(ctx: DashboardCtx): Promise<Block> {
               dangerous: true,
               stepUp: true,
               params: { chargeId: charge.id, amountMinor: remaining },
-              summary: `Refunds the remaining ${ctx.stripe.formatAmount(remaining, charge.currency)} as FRAUDULENT (feeds Radar) — the decline path for this review.`,
+              summary: `Refunds the remaining ${ctx.stripe.formatAmount(remaining, charge.currency)} as FRAUDULENT (feeds Radar), the decline path for this review.`,
             }),
           ]
         : !charge && piId
@@ -119,7 +119,7 @@ async function reviewsTable(ctx: DashboardCtx): Promise<Block> {
                 label: "Cancel payment",
                 style: "danger",
                 params: { paymentIntentId: piId },
-                summary: "Cancels the uncaptured payment intent — the decline path for this review.",
+                summary: "Cancels the uncaptured payment intent, the decline path for this review.",
               }),
             ]
           : []),
@@ -130,9 +130,9 @@ async function reviewsTable(ctx: DashboardCtx): Promise<Block> {
       cells: [
         charge
           ? amount(ctx.stripe, charge.amount, charge.currency, { kind: "warn", text: "In review" })
-          : text(piId ?? "—"),
+          : text(piId ?? "N/A"),
         text(sentence((review.opened_reason ?? "rule").replace(/_/g, " "))),
-        chargeId ? idCell(chargeId, { ref: { page: "payments.detail", params: { id: chargeId } } }) : text("—"),
+        chargeId ? idCell(chargeId, { ref: { page: "payments.detail", params: { id: chargeId } } }) : text("N/A"),
         dateCell(review.created),
         idCell(review.id, { copy: true }),
       ] as Cell[],
@@ -208,7 +208,7 @@ async function cardHunts(ctx: DashboardCtx, deps: { hunts: FraudHuntService }, f
     type: "table",
     key: "fphunt",
     title: "Same card, every account",
-    filters: [{ key: "fp", label: "Card fingerprint", kind: "search", value: fingerprint || undefined, placeholder: "Card fingerprint (e.g. Xt5EWLLDS7FJjR1c) — exact match across all customers" }],
+    filters: [{ key: "fp", label: "Card fingerprint", kind: "search", value: fingerprint || undefined, placeholder: "Card fingerprint (e.g. Xt5EWLLDS7FJjR1c) · exact match across all customers" }],
     columns: [
       { key: "customer", label: "Customer" },
       { key: "email", label: "Email" },
@@ -216,7 +216,7 @@ async function cardHunts(ctx: DashboardCtx, deps: { hunts: FraudHuntService }, f
       { key: "discord", label: "Discord link" },
     ],
     rows: [],
-    empty: fingerprint ? "No charges match that fingerprint." : "Enter a card fingerprint — you'll find it on any payment's detail rail.",
+    empty: fingerprint ? "No charges match that fingerprint." : "Enter a card fingerprint; you'll find it on any payment's detail rail.",
     notice: SEARCH_LAG_NOTICE,
   };
   if (fingerprint) {
@@ -231,12 +231,12 @@ async function cardHunts(ctx: DashboardCtx, deps: { hunts: FraudHuntService }, f
           r.customerId.startsWith("cus_")
             ? idCell(r.customerId, { ref: { page: "customers.detail", params: { id: r.customerId } } })
             : text(r.customerId),
-          text(r.email ?? "—"),
+          text(r.email ?? "N/A"),
           text(String(r.count)),
           r.discordIds.length ? text(r.discordIds.map((d) => `@${d}`).join(", ")) : text("no Discord link"),
         ] as Cell[],
       }));
-      fpTable.footer = `${result.rows.length} account${result.rows.length === 1 ? "" : "s"} · from the ${result.scanned} most recent matching charges${result.hasMore ? " — more exist" : ""}`;
+      fpTable.footer = `${result.rows.length} account${result.rows.length === 1 ? "" : "s"} · from the ${result.scanned} most recent matching charges${result.hasMore ? " (more exist)" : ""}`;
     }
   }
   blocks.push(fpTable);
@@ -274,9 +274,9 @@ async function cardHunts(ctx: DashboardCtx, deps: { hunts: FraudHuntService }, f
     ],
     rows: [],
     empty: last4
-      ? "No matching charges. Two blind spots: wallet payments (Link/PayPal/Klarna) expose NO card digits on their charges — hunt those by customer email or amount; and never-confirmed attempts (abandoned checkout, unfinished 3DS) have no charge — hunt by amount. Declined attempts DO show up as failed charges."
+      ? "No matching charges. Two blind spots: wallet payments (Link/PayPal/Klarna) expose NO card digits on their charges (hunt those by customer email or amount); and never-confirmed attempts (abandoned checkout, unfinished 3DS) have no charge (hunt by amount). Declined attempts DO show up as failed charges."
       : "Enter the last 4 digits (brand narrows it; Failed only = declined attempts and their payment intents). Wallet-rail payments (Link/PayPal) carry no card digits and can't be found here.",
-    notice: `last4 is not unique — rows are grouped by fingerprint; feed one into the exact hunt above. Wallet payments (Link/PayPal) expose no card digits to any lookup. ${SEARCH_LAG_NOTICE}`,
+    notice: `last4 is not unique. Rows are grouped by fingerprint; feed one into the exact hunt above. Wallet payments (Link/PayPal) expose no card digits to any lookup. ${SEARCH_LAG_NOTICE}`,
   };
   if (last4) {
     const result = await deps.hunts.cardsByLast4(last4, brand || undefined, status || undefined);
@@ -295,17 +295,17 @@ async function cardHunts(ctx: DashboardCtx, deps: { hunts: FraudHuntService }, f
             : text("0"),
           g.lastFailure
             ? text(`${g.lastFailure.reason ?? "no reason given"} · ${g.lastFailure.piId ?? g.lastFailure.chargeId}`)
-            : text("—"),
+            : text("N/A"),
           text(
             g.customers
               .slice(0, 3)
               .map((c) => c.email ?? c.id)
-              .join(", ") + (g.customers.length > 3 ? ` +${g.customers.length - 3}` : "") || "—"
+              .join(", ") + (g.customers.length > 3 ? ` +${g.customers.length - 3}` : "") || "N/A"
           ),
-          g.fingerprint ? idCell(g.fingerprint, { copy: true }) : text("—"),
+          g.fingerprint ? idCell(g.fingerprint, { copy: true }) : text("N/A"),
         ] as Cell[],
       }));
-      l4Table.footer = `${result.rows.length} card${result.rows.length === 1 ? "" : "s"} · from the ${result.scanned} most recent matching charges${result.hasMore ? " — more exist" : ""}`;
+      l4Table.footer = `${result.rows.length} card${result.rows.length === 1 ? "" : "s"} · from the ${result.scanned} most recent matching charges${result.hasMore ? " (more exist)" : ""}`;
     }
   }
   blocks.push(l4Table);
@@ -337,8 +337,8 @@ async function amountHunt(ctx: DashboardCtx, deps: { hunts: FraudHuntService }, 
     rows: [],
     empty: amountRaw
       ? "No payment attempts for that amount (declined ones included). Different currency, or a different Stripe account?"
-      : "Enter the exact amount the customer sees on their statement — declined and issuer-blocked attempts show up here.",
-    notice: `Searches PaymentIntents, so attempts that never produced a charge (abandoned checkout, unfinished 3DS) are included — the ones the card hunts can't see. ${SEARCH_LAG_NOTICE}`,
+      : "Enter the exact amount the customer sees on their statement; declined and issuer-blocked attempts show up here.",
+    notice: `Searches PaymentIntents, so attempts that never produced a charge (abandoned checkout, unfinished 3DS) are included, the ones the card hunts can't see. ${SEARCH_LAG_NOTICE}`,
   };
   if (amountRaw) {
     const result = await deps.hunts.paymentsByAmount(amountRaw, currency || undefined);
@@ -353,15 +353,15 @@ async function amountHunt(ctx: DashboardCtx, deps: { hunts: FraudHuntService }, 
           ref: { page: "payments.detail", params: { id: r.id } },
           cells: [
             amount(ctx.stripe, r.amount, r.currency, badge),
-            r.customerId ? idCell(r.customerId, { ref: { page: "customers.detail", params: { id: r.customerId } } }) : text("—"),
-            text(r.email ?? "—"),
-            r.cardBrand ? cardCell(r.cardBrand, r.cardLast4 ?? "") : text("—"),
+            r.customerId ? idCell(r.customerId, { ref: { page: "customers.detail", params: { id: r.customerId } } }) : text("N/A"),
+            text(r.email ?? "N/A"),
+            r.cardBrand ? cardCell(r.cardBrand, r.cardLast4 ?? "") : text("N/A"),
             dateCell(r.created),
-            text(r.failureReason ?? "—"),
+            text(r.failureReason ?? "N/A"),
           ] as Cell[],
         };
       });
-      table.footer = `${result.rows.length} attempt${result.rows.length === 1 ? "" : "s"}${result.hasMore ? " — more exist" : ""}`;
+      table.footer = `${result.rows.length} attempt${result.rows.length === 1 ? "" : "s"}${result.hasMore ? " (more exist)" : ""}`;
     }
   }
   blocks.push(table);

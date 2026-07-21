@@ -53,23 +53,23 @@ export class BusinessHub {
       ? taxIds
           .map((t) => `\`${t.value}\` · ${t.type.replace(/_/g, " ")}${t.country ? ` (${t.country})` : ""}`)
           .join("\n")
-      : "none on file — the onboarding VAT is write-only in Stripe; IDs shown here are the account tax IDs printed on invoices";
+      : "none on file: the onboarding VAT is write-only in Stripe; IDs shown here are the account tax IDs printed on invoices";
 
     const support = [profile?.support_email, profile?.support_phone, profile?.support_url].filter(Boolean).join(" · ");
     const descriptor = account.settings?.payments?.statement_descriptor;
 
     const embed = new EmbedBuilder()
-      .setTitle("🏢 Business — our Stripe account")
+      .setTitle("🏢 Business: our Stripe account")
       .setColor(COLORS.brand)
       .addFields(
-        { name: "Business name", value: (profile?.name ?? displayName ?? "—").slice(0, 1024), inline: true },
-        { name: "Legal entity", value: (legalName ?? "—").slice(0, 1024), inline: true },
-        { name: "Account", value: `\`${account.id}\` · ${account.country ?? "—"} · ${(account.default_currency ?? "—").toUpperCase()}`, inline: true },
+        { name: "Business name", value: (profile?.name ?? displayName ?? "N/A").slice(0, 1024), inline: true },
+        { name: "Legal entity", value: (legalName ?? "N/A").slice(0, 1024), inline: true },
+        { name: "Account", value: `\`${account.id}\` · ${account.country ?? "N/A"} · ${(account.default_currency ?? "N/A").toUpperCase()}`, inline: true },
         { name: "Address", value: formatAddress(address).slice(0, 1024), inline: false },
         { name: "VAT / Tax IDs", value: taxIdText.slice(0, 1024), inline: false },
-        { name: "Account email", value: (account.email ?? "—").slice(0, 1024), inline: true },
-        { name: "Support", value: (support || "—").slice(0, 1024), inline: true },
-        { name: "Statement descriptor", value: (descriptor ?? "—").slice(0, 1024), inline: true },
+        { name: "Account email", value: (account.email ?? "N/A").slice(0, 1024), inline: true },
+        { name: "Support", value: (support || "N/A").slice(0, 1024), inline: true },
+        { name: "Statement descriptor", value: (descriptor ?? "N/A").slice(0, 1024), inline: true },
         {
           name: "Status",
           value: `charges ${account.charges_enabled ? "✅" : "⛔"} · payouts ${account.payouts_enabled ? "✅" : "⛔"}`,

@@ -135,7 +135,7 @@ async function main() {
   // the first instruction. Idempotent; re-runs until the Discord phase stamps
   // the flag after bot.start().
   const ripPhase1 = await AgentRipMigration.runDbPhase(prisma).catch((e) => {
-    bootLog.error("agent-rip DB migration failed — continuing, retried next boot", e);
+    bootLog.error("agent-rip DB migration failed: continuing, retried next boot", e);
     return { migrated: false, tagsFlipped: 0 };
   });
 
@@ -500,7 +500,7 @@ async function main() {
           case "started": return "Sentry started.";
           case "updated": return r.restartNeeded.length ? `Applied live; restart needed for: ${r.restartNeeded.join(", ")}.` : "Sentry updated live.";
           case "stopped": return "Sentry stopped (DSN cleared).";
-          case "restart-required": return "Saved — a restart is required to apply the DSN change.";
+          case "restart-required": return "Saved: a restart is required to apply the DSN change.";
           case "disabled": return "Sentry is disabled (no DSN set).";
         }
       },
@@ -693,18 +693,18 @@ async function main() {
     } catch (e) {
       // Running workflow timers continue server-side; producers buffer; the
       // onRecovered hook above starts the worker when Temporal comes back.
-      bootLog.error("temporal worker failed to start — background work is paused until it recovers", e);
+      bootLog.error("temporal worker failed to start: background work is paused until it recovers", e);
       void auditLogger.log({
         title: "⏱️ Temporal worker failed to start",
         severity: "warn",
         description:
           "temporalEnabled is on but the worker could not start (Vault certs missing or server unreachable). " +
-          "Background processing is paused — it resumes automatically when the connection recovers.",
+          "Background processing is paused. It resumes automatically when the connection recovers.",
         fields: [{ name: "Error", value: (e instanceof Error ? e.message : String(e)).slice(0, 1024), inline: false }],
       });
     }
   } else {
-    bootLog.warn("temporal worker paused (temporalEnabled off) — background work does not run until it is re-enabled");
+    bootLog.warn("temporal worker paused (temporalEnabled off): background work does not run until it is re-enabled");
   }
 
   // One-time agent-rip migration, Discord phase: lock+archive currently-
@@ -715,7 +715,7 @@ async function main() {
     const ripMigration = new AgentRipMigration(prisma, settingsStore, bot.client, auditLogger);
     void ripMigration
       .runDiscordPhase(ripPhase1.tagsFlipped)
-      .catch((e) => bootLog.error("agent-rip Discord migration failed — retried next boot", e));
+      .catch((e) => bootLog.error("agent-rip Discord migration failed: retried next boot", e));
   }
 
   // Graceful shutdown

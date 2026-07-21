@@ -118,24 +118,24 @@ export class SlaHub {
     const teamHours = s.listTeamOverrides().filter((o) => o.entry.officeHoursJson || o.entry.officeHoursEnabled !== undefined).length;
     const ohLine =
       (oh === undefined
-        ? "default off — clocks run 24/7"
+        ? "default off (clocks run 24/7)"
         : oh === null
-          ? "⚠️ default enabled but INVALID — clocks run 24/7 until fixed"
-          : `default on — ${oh.tz}${oh.holidays.length ? ` · ${oh.holidays.length} holiday(s)` : ""}`) +
+          ? "⚠️ default enabled but INVALID: clocks run 24/7 until fixed"
+          : `default on · ${oh.tz}${oh.holidays.length ? ` · ${oh.holidays.length} holiday(s)` : ""}`) +
       (teamHours ? ` · ${teamHours} team override(s)` : "");
     const embed = panelEmbed(
       "SLA Manager",
       [
         `**SLA:** ${status.enabled ? "**on**" : "**off**"} (covers bridged tickets AND native conversations)`,
         `**Rules:** ${status.ruleCount} (${status.enabledRuleCount} enabled, first match wins)`,
-        `**Default target:** ${status.defaultTarget ? `\`${status.defaultTarget}\`` : "_none — no-match clears the attribute_"}`,
+        `**Default target:** ${status.defaultTarget ? `\`${status.defaultTarget}\`` : "_none (no-match clears the attribute)_"}`,
         `**Targets:** ${targets.length} (${withClocks} with clock durations) · **Pinned:** ${pinned}`,
         `**Attributes:** \`${status.attributeName}\` (target) · \`${s.slaStatusAttributeName()}\` (ok/at_risk/breached)`,
         `**At-risk threshold:** ${s.slaWarnPct()}% of target · **Breach tag:** \`${s.slaBreachTagName()}\``,
         `**Office hours:** ${ohLine}`,
         "",
-        "The bot IS the SLA engine (Advanced tier has no native SLAs): rules pick a target, targets carry business-minute clocks (first reply / next reply / resolution), and a **5-minute enforcement sweep** runs them. **At-risk** flips the status attribute only; **breach** adds the tag + one internal note per clock. All signals stay in Intercom — no Discord pings.",
-        "Triggers: ticket created/mirrored, status change, customer reply, assignee change, Stripe/billing events, native conversation webhooks — plus the 30-min target sweep and the 5-min clock sweep.",
+        "The bot IS the SLA engine (Advanced tier has no native SLAs): rules pick a target, targets carry business-minute clocks (first reply / next reply / resolution), and a **5-minute enforcement sweep** runs them. **At-risk** flips the status attribute only; **breach** adds the tag + one internal note per clock. All signals stay in Intercom: no Discord pings.",
+        "Triggers: ticket created/mirrored, status change, customer reply, assignee change, Stripe/billing events, native conversation webhooks, plus the 30-min target sweep and the 5-min clock sweep.",
       ].join("\n")
     );
     return {
@@ -184,8 +184,8 @@ export class SlaHub {
     const embed = panelEmbed(
       "SLA Rules",
       rules.length
-        ? [`Priority order — the first enabled match wins. Page ${clamped + 1}/${totalPages}.`, "", ...lines].join("\n")
-        : "No rules yet — use **New Rule**."
+        ? [`Priority order: the first enabled match wins. Page ${clamped + 1}/${totalPages}.`, "", ...lines].join("\n")
+        : "No rules yet. Use **New Rule**."
     ).setFooter({ text: `Page ${clamped + 1}/${totalPages} · ${rules.length} rule(s)` });
 
     const components: Panel["components"] = [];
@@ -438,7 +438,7 @@ export class SlaHub {
     const targets = this.ctx.settingsStore.slaTargets();
     if (targets.length === 0) {
       await interaction.reply({
-        embeds: [makeEmbed("Register at least one SLA target first (SLA Manager → Targets) — each target needs a matching Workflow branch in Intercom.", COLORS.warn)],
+        embeds: [makeEmbed("Register at least one SLA target first (SLA Manager → Targets). Each target needs a matching Workflow branch in Intercom.", COLORS.warn)],
         flags: 64,
       });
       return;
@@ -472,7 +472,7 @@ export class SlaHub {
     if (!session) return;
     if (!session.draft) {
       await interaction
-        .reply({ embeds: [makeEmbed("This builder session expired — reopen the rule.", COLORS.warn)], flags: 64 })
+        .reply({ embeds: [makeEmbed("This builder session expired. Reopen the rule.", COLORS.warn)], flags: 64 })
         .catch(() => undefined);
       return;
     }
@@ -497,7 +497,7 @@ export class SlaHub {
         return;
       }
       await interaction.update({
-        embeds: [makeEmbed(`**${descriptor.label}** — pick the comparison:`, COLORS.neutral)],
+        embeds: [makeEmbed(`**${descriptor.label}**. Pick the comparison:`, COLORS.neutral)],
         components: [
           buttonRow(
             ...descriptor.ops.slice(0, 5).map((op) => btn(`icadmin_sla_b_op:${token}:${op.op}`, op.label, ButtonStyle.Primary))
@@ -528,7 +528,7 @@ export class SlaHub {
 
     if (descriptor.kind === "boolean") {
       await interaction.update({
-        embeds: [makeEmbed(`**${descriptor.label}** — true or false?`, COLORS.neutral)],
+        embeds: [makeEmbed(`**${descriptor.label}**. True or false?`, COLORS.neutral)],
         components: [
           buttonRow(
             btn(`icadmin_sla_b_bool:${token}:true`, "true", ButtonStyle.Success),
@@ -578,7 +578,7 @@ export class SlaHub {
     await interaction.editReply({
       embeds: [
         makeEmbed(
-          isAttribute ? `**${descriptor.label}** — pick the attribute:` : `**${descriptor.label}** — pick the value:`,
+          isAttribute ? `**${descriptor.label}**. Pick the attribute:` : `**${descriptor.label}**. Pick the value:`,
           COLORS.neutral
         ),
       ],
@@ -722,7 +722,7 @@ export class SlaHub {
         await interaction.reply({
           embeds: [
             makeEmbed(
-              `Unknown target \`${target}\` — registered: ${this.ctx.settingsStore.slaTargets().map((t) => `\`${t.value}\``).join(", ") || "none"}. Add it under SLA Manager → Targets first.`,
+              `Unknown target \`${target}\`. Registered: ${this.ctx.settingsStore.slaTargets().map((t) => `\`${t.value}\``).join(", ") || "none"}. Add it under SLA Manager → Targets first.`,
               COLORS.danger
             ),
           ],
@@ -836,7 +836,7 @@ export class SlaHub {
 
   private formatErrors(errors: ExpressionError[], text?: string): string {
     const lines = errors.slice(0, 8).map((e) => {
-      const where = text && e.len > 0 ? ` — near \`${text.slice(e.pos, e.pos + Math.min(e.len, 30))}\`` : "";
+      const where = text && e.len > 0 ? ` (near \`${text.slice(e.pos, e.pos + Math.min(e.len, 30))}\`)` : "";
       return `• ${e.message}${where}${e.hint ? `\n  ↳ ${e.hint}` : ""}`;
     });
     return ["Expression has problems:", ...lines].join("\n").slice(0, 4000);
@@ -868,7 +868,7 @@ export class SlaHub {
     const lines = slice.map((t) => {
       const uses = this.ctx.slaRules.list().filter((r) => r.target === t.value).length;
       const marks = [uses ? `${uses} rule(s)` : null, defaultTarget === t.value ? "default" : null].filter(Boolean).join(" · ");
-      return `• \`${t.value}\`${t.note ? ` — ${t.note}` : ""}\n   ⏱️ ${this.clockSummary(t)}${marks ? `  _(${marks})_` : ""}`;
+      return `• \`${t.value}\`${t.note ? ` · ${t.note}` : ""}\n   ⏱️ ${this.clockSummary(t)}${marks ? `  _(${marks})_` : ""}`;
     });
     const embed = panelEmbed(
       "SLA Targets",
@@ -962,7 +962,7 @@ export class SlaHub {
     const value = interaction.fields.getTextInputValue("value").trim();
     const note = interaction.fields.getTextInputValue("note").trim();
     if (!/^[A-Za-z0-9-_]{1,60}$/.test(value)) {
-      await interaction.reply({ embeds: [makeEmbed("Target values are 1-60 chars of a-z, A-Z, 0-9, - and _ (case-sensitive — must match the Intercom list option exactly).", COLORS.danger)], flags: 64 });
+      await interaction.reply({ embeds: [makeEmbed("Target values are 1-60 chars of a-z, A-Z, 0-9, - and _ (case-sensitive: must match the Intercom list option exactly).", COLORS.danger)], flags: 64 });
       return;
     }
     const targets = this.ctx.settingsStore.slaTargets();
@@ -1027,14 +1027,14 @@ export class SlaHub {
     const value = interaction.values[0];
     if (this.ctx.slaRules.targetInUse(value)) {
       await interaction.reply({
-        embeds: [makeEmbed(`\`${value}\` is used by a rule — repoint or delete those rules first.`, COLORS.danger)],
+        embeds: [makeEmbed(`\`${value}\` is used by a rule. Repoint or delete those rules first.`, COLORS.danger)],
         flags: 64,
       });
       return;
     }
     if (this.ctx.settingsStore.slaDefaultTarget() === value) {
       await interaction.reply({
-        embeds: [makeEmbed(`\`${value}\` is the default target — change the default first.`, COLORS.danger)],
+        embeds: [makeEmbed(`\`${value}\` is the default target. Change the default first.`, COLORS.danger)],
         flags: 64,
       });
       return;
@@ -1053,7 +1053,7 @@ export class SlaHub {
       .setCustomId("icadmin_sla_default_pick")
       .setPlaceholder("Default target when no rule matches")
       .addOptions([
-        { label: "— none —", value: "__none__", description: "No match clears a previously-written value", default: !current },
+        { label: "(none)", value: "__none__", description: "No match clears a previously-written value", default: !current },
         ...targets.slice(0, 24).map((t) => ({
           label: t.value,
           value: t.value,
@@ -1064,7 +1064,7 @@ export class SlaHub {
     await interaction.update({
       embeds: [
         makeEmbed(
-          "Written when **no rule matches** a subject. \"None\" clears a previously-written value instead (your Workflow then has no branch to apply — the current SLA stays until it finishes or an agent removes it).",
+          "Written when **no rule matches** a subject. \"None\" clears a previously-written value instead (your Workflow then has no branch to apply; the current SLA stays until it finishes or an agent removes it).",
           COLORS.neutral
         ),
       ],
@@ -1124,7 +1124,7 @@ export class SlaHub {
     const result = await this.ctx.slaService.verifySetup();
     // Enforcement-looper liveness — checked here because the hub has the
     // Temporal producers (SlaService deliberately doesn't).
-    let looperLine = "▫️ Enforcement looper: Temporal not routable — clocks run only while the worker is active.";
+    let looperLine = "▫️ Enforcement looper: Temporal not routable; clocks run only while the worker is active.";
     try {
       if (this.ctx.producers.routable()) {
         const client = await this.ctx.producers.service().client();
@@ -1133,11 +1133,11 @@ export class SlaHub {
           looperLine =
             desc.status.name === "RUNNING"
               ? "✅ Enforcement looper `sla-enforce` is running (5-min cadence)."
-              : `❌ Enforcement looper \`sla-enforce\` status: ${desc.status.name} — toggle the Temporal worker off/on to restart it.`;
+              : `❌ Enforcement looper \`sla-enforce\` status: ${desc.status.name}; toggle the Temporal worker off/on to restart it.`;
         }
       }
     } catch {
-      looperLine = "❌ Enforcement looper `sla-enforce` not found — toggle the Temporal worker off/on to start it.";
+      looperLine = "❌ Enforcement looper `sla-enforce` not found; toggle the Temporal worker off/on to start it.";
     }
     const ok = result.attributeExists && result.statusAttributeExists;
     await interaction.editReply({
@@ -1194,7 +1194,7 @@ export class SlaHub {
 
   private formatWindows(windows: Array<{ start: string; end: string }>): string {
     if (!windows.length) return "_closed_";
-    return windows.map((w) => `${w.start}–${w.end}${w.end <= w.start ? " (+1d)" : ""}`).join(", ");
+    return windows.map((w) => `${w.start}N/A${w.end}${w.end <= w.start ? " (+1d)" : ""}`).join(", ");
   }
 
   // Team-picker root for office hours.
@@ -1210,10 +1210,10 @@ export class SlaHub {
     const embed = panelEmbed(
       "Office Hours",
       [
-        `**Workspace default:** ${defEnabled ? `on — \`${(s.officeHours()?.tz) ?? "?"}\`` : "off (clocks run 24/7)"}`,
+        `**Workspace default:** ${defEnabled ? `on · \`${(s.officeHours()?.tz) ?? "?"}\`` : "off (clocks run 24/7)"}`,
         `**Teams with custom hours:** ${overrides.size || "none"}`,
         "",
-        "SLA clocks count business time only. Each conversation uses **its own team's** office hours; teams without custom hours inherit the workspace default (also the fallback for conversations with no team). Only SLA clocks pause — assignment runs 24/7.",
+        "SLA clocks count business time only. Each conversation uses **its own team's** office hours; teams without custom hours inherit the workspace default (also the fallback for conversations with no team). Only SLA clocks pause; assignment runs 24/7.",
         "",
         "Pick a team below (or the workspace default) to edit its schedule.",
       ].join("\n")
@@ -1281,15 +1281,15 @@ export class SlaHub {
     const clamped = Math.min(Math.max(0, page), totalPages - 1);
     const slice = holidays.slice(clamped * PAGE_SIZE, (clamped + 1) * PAGE_SIZE);
     const embed = panelEmbed(
-      `Office Hours — ${name}`,
+      `Office Hours · ${name}`,
       [
-        teamId && !hasOwn ? "_This team currently inherits the workspace-default schedule shown below — editing anything creates a custom schedule._" : "",
-        `**Status:** ${enabled ? "**on** — SLA clocks count business time only" : "off — clocks run 24/7"}`,
+        teamId && !hasOwn ? "_This team currently inherits the workspace-default schedule shown below; editing anything creates a custom schedule._" : "",
+        `**Status:** ${enabled ? "**on** (SLA clocks count business time only)" : "off (clocks run 24/7)"}`,
         `**Timezone:** \`${schedule.tz}\``,
         "",
         ...dayLines,
         "",
-        `**Holidays** (${holidays.length}) — full-day closed:`,
+        `**Holidays** (${holidays.length}), full-day closed:`,
         slice.length ? slice.map((h) => `• ${h}`).join("\n") : "_none_",
         ...(totalPages > 1 ? [`Page ${clamped + 1}/${totalPages}`] : []),
         "",
@@ -1518,7 +1518,7 @@ export class SlaHub {
       "SLA Pin",
       [
         subjectLine,
-        `**Pinned:** ${state?.pinnedTarget ? `\`${state.pinnedTarget}\` by ${state.pinnedByName ?? "?"} ${state.pinnedAt ? `<t:${Math.floor(state.pinnedAt.getTime() / 1000)}:R>` : ""}` : "_no — rules apply_"}`,
+        `**Pinned:** ${state?.pinnedTarget ? `\`${state.pinnedTarget}\` by ${state.pinnedByName ?? "?"} ${state.pinnedAt ? `<t:${Math.floor(state.pinnedAt.getTime() / 1000)}:R>` : ""}` : "_no (rules apply)_"}`,
         `**Rules would apply:** ${ruleLine}`,
         `**Last written:** ${preview?.lastWrittenTarget ? `\`${preview.lastWrittenTarget}\`` : "_nothing yet_"}`,
         "",
@@ -1551,7 +1551,7 @@ export class SlaHub {
     const ref = this.parseRef(interaction.fields.getTextInputValue("ref"));
     if (!ref) {
       await interaction.reply({
-        embeds: [makeEmbed("Couldn't parse that — paste a thread link, a thread id, or `conv:<conversation id>`.", COLORS.danger)],
+        embeds: [makeEmbed("Couldn't parse that. Paste a thread link, a thread id, or `conv:<conversation id>`.", COLORS.danger)],
         flags: 64,
       });
       return;
@@ -1639,7 +1639,7 @@ export class SlaHub {
     const ref = this.parseRef(interaction.fields.getTextInputValue("ref"));
     if (!ref) {
       await interaction.reply({
-        embeds: [makeEmbed("Couldn't parse that — paste a thread link, a thread id, or `conv:<conversation id>`.", COLORS.danger)],
+        embeds: [makeEmbed("Couldn't parse that. Paste a thread link, a thread id, or `conv:<conversation id>`.", COLORS.danger)],
         flags: 64,
       });
       return;
@@ -1654,14 +1654,14 @@ export class SlaHub {
       if (t.skipped === "disabled") return `▫️ ~~${t.name}~~ (disabled)`;
       const mark = t.matched ? "✅" : "❌";
       const failed = t.conditions.filter((c) => !c.pass).slice(0, 3);
-      const detail = failed.length ? ` — ${failed.map((c) => `${this.ctx.slaRules.renderExpression([c.condition])}: ${c.reason}`).join("; ")}` : "";
+      const detail = failed.length ? ` · ${failed.map((c) => `${this.ctx.slaRules.renderExpression([c.condition])}: ${c.reason}`).join("; ")}` : "";
       return `${mark} **${t.name}** → \`${t.target}\`${detail}`;
     });
     const effective = preview.pinned
       ? `📌 pinned \`${preview.pinned.target}\` (rules bypassed)`
       : preview.effectiveTarget
         ? `\`${preview.effectiveTarget}\`${preview.evaluation.winner ? ` (rule **${preview.evaluation.winner.name}**)` : " (default)"}`
-        : "_none — attribute would be cleared_";
+        : "_none (attribute would be cleared)_";
     await interaction.editReply({
       embeds: [
         makeEmbed(

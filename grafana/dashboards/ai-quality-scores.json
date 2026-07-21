@@ -1,6 +1,6 @@
 {
   "uid": "psb-ai-quality",
-  "title": "AI — Quality Scores (CX / CS)",
+  "title": "AI: Quality Scores (CX / CS)",
   "description": "AI-evaluated support quality: predicted CX, customer sentiment, resolution outcomes, topics and per-staff quality. Points are timestamped at ticket close.",
   "tags": [
     "postiz-support-bot"

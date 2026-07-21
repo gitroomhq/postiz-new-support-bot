@@ -20,25 +20,25 @@ export interface RadarListSpec {
 export const RADAR_LISTS: Record<BlockKind, RadarListSpec> = {
   card_fingerprint: {
     alias: "support_bot_blocked_card_fingerprints",
-    name: "Support bot — blocked card fingerprints",
+    name: "Support bot: blocked card fingerprints",
     itemType: "card_fingerprint",
     settingsKey: "radarListCardId",
   },
   email: {
     alias: "support_bot_blocked_emails",
-    name: "Support bot — blocked emails",
+    name: "Support bot: blocked emails",
     itemType: "email",
     settingsKey: "radarListEmailId",
   },
   customer_id: {
     alias: "support_bot_blocked_customers",
-    name: "Support bot — blocked customers",
+    name: "Support bot: blocked customers",
     itemType: "customer_id",
     settingsKey: "radarListCustomerId",
   },
   ip_address: {
     alias: "support_bot_blocked_ips",
-    name: "Support bot — blocked IPs",
+    name: "Support bot: blocked IPs",
     itemType: "ip_address",
     settingsKey: "radarListIpId",
   },

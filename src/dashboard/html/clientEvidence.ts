@@ -102,7 +102,7 @@ D.renderEvidenceGroup = function (b, g) {
     style: "primary",
     dangerous: true,
     params: { disputeId: b.disputeId, group: g.key },
-    summary: "Stages this group's saved draft fields at Stripe with submit:false — the bank sees nothing until Submit evidence.",
+    summary: "Stages this group's saved draft fields at Stripe with submit:false. The bank sees nothing until Submit evidence.",
     disabledReason: b.editable ? undefined : "Evidence can no longer be changed on this dispute."
   }));
   bodyEl.appendChild(foot);
@@ -146,7 +146,7 @@ D.renderEvidenceSlot = function (b, slot) {
       return;
     }
     if (file.size > b.maxFileBytes) {
-      D.flashErr("File too large — keep each proof under " + Math.floor(b.maxFileBytes / (1024 * 1024)) + "MB.");
+      D.flashErr("File too large: keep each proof under " + Math.floor(b.maxFileBytes / (1024 * 1024)) + "MB.");
       inp.value = "";
       return;
     }
@@ -162,7 +162,7 @@ D.renderEvidenceSlot = function (b, slot) {
         dangerous: true,
         params: { disputeId: b.disputeId, slot: slot.key, filename: file.name, contentType: type, dataB64: dataB64 },
         summary: "Stage \\"" + file.name + "\\" (" + Math.max(1, Math.round(file.size / 1024)) + "KB) as " + slot.key +
-          " \\u2014 it reaches the bank only when you Submit evidence."
+          "; it reaches the bank only when you Submit evidence."
       });
       inp.value = "";
     };
@@ -179,8 +179,8 @@ D.renderEvidence = function (b) {
   box.appendChild(h2);
   if (!b.editable) {
     box.appendChild(D.el("p", "note", b.submitted
-      ? "Evidence was submitted \\u2014 the response is with the bank and can no longer be changed."
-      : "This dispute is not respondable \\u2014 evidence can no longer be changed."));
+      ? "Evidence was submitted; the response is with the bank and can no longer be changed."
+      : "This dispute is not respondable; evidence can no longer be changed."));
   } else {
     box.appendChild(D.el("p", "note",
       "Fields autosave to a local draft when you leave them. \\u2b50 groups matter most for this dispute's reason. " +
@@ -190,7 +190,7 @@ D.renderEvidence = function (b) {
   var fh = D.el("h3", "evfilehead", "Proof files");
   box.appendChild(fh);
   box.appendChild(D.el("p", "note", "PNG, JPEG or PDF, max " + Math.floor(b.maxFileBytes / (1024 * 1024)) +
-    "MB each \\u2014 staged into a bank-visible slot on upload (still submit:false)."));
+    "MB each, staged into a bank-visible slot on upload (still submit:false)."));
   (b.files || []).forEach(function (s) { box.appendChild(D.renderEvidenceSlot(b, s)); });
   return box;
 };

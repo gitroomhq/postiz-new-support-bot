@@ -119,7 +119,7 @@ D.bindJump = function () {
     if (e.key === "Enter") {
       var pick = D.pal.sel >= 0 ? D.pal.hits[D.pal.sel] : D.pal.hits[0];
       if (pick) { D.palGo(pick.hit); return; }
-      D.flashErr("No match \\u2014 try a name, email, amount, last4 or a Stripe id.");
+      D.flashErr("No match: try a name, email, amount, last4 or a Stripe id.");
     }
   });
   document.addEventListener("keydown", function (e) {

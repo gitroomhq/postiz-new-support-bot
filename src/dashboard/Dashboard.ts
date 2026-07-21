@@ -137,7 +137,7 @@ export class Dashboard implements MountedPanelRoute {
             "dashboard.endpoint": endpoint,
             "error.message": e instanceof Error ? e.message : String(e),
           });
-          return { status: 200, json: { ok: false, error: "Internal error — check the bot logs." } };
+          return { status: 200, json: { ok: false, error: "Internal error. Check the bot logs." } };
         }
       }
       return { status: 200, json: { state: "expired", error: "expired" } };
@@ -182,7 +182,7 @@ export class Dashboard implements MountedPanelRoute {
           // consistent Search API (~20 req/s account-wide) — the palette
           // debounces 400ms client-side, this is the server backstop.
           if (!this.allow(`search:${auth.actor.id}`, 30)) {
-            return { status: 200, json: { groups: [], notice: "Search rate limit reached — give it a few seconds." } };
+            return { status: 200, json: { groups: [], notice: "Search rate limit reached. Give it a few seconds." } };
           }
           const term = typeof request.term === "string" ? request.term : "";
           return { status: 200, json: await this.search.run(term) };
@@ -280,7 +280,7 @@ export class Dashboard implements MountedPanelRoute {
         "dashboard.endpoint": endpoint,
         "error.message": e instanceof Error ? e.message : String(e),
       });
-      return { status: 200, json: { ok: false, error: "Internal error — check the bot logs." } };
+      return { status: 200, json: { ok: false, error: "Internal error. Check the bot logs." } };
     }
   }
 

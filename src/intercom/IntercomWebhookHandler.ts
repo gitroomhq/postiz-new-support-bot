@@ -26,7 +26,7 @@ import {
 // anyway (a rare duplicate beats a lost agent reply).
 export class DeferEchoError extends Error {
   constructor() {
-    super("outbound content in flight — deferring echo decision");
+    super("outbound content in flight, deferring echo decision");
     this.name = "DeferEchoError";
   }
 }
@@ -238,7 +238,7 @@ export class IntercomWebhookHandler {
         payload: body,
       });
       if (!r.ok && r.buffered) {
-        throw new TemporalBufferedError("intercom event buffered — Intercom should redeliver");
+        throw new TemporalBufferedError("intercom event buffered; Intercom should redeliver");
       }
       return r.ok;
     }
@@ -495,7 +495,7 @@ export class IntercomWebhookHandler {
           threadId: map.ticketThreadId,
           fields: [
             { name: "Message", value: map.discordMessageId, inline: true },
-            { name: "Reason", value: "Bot lacks Manage Messages — delete the Discord message manually.", inline: false },
+            { name: "Reason", value: "Bot lacks Manage Messages. Delete the Discord message manually.", inline: false },
           ],
         });
         return;
@@ -1018,7 +1018,7 @@ export class IntercomWebhookHandler {
     // mirrored message. Positive agent attribution required for ALL inbound
     // state changes; the damper above only covers states the bridge pushed.
     if (!this.attributedToRealAgent(item.ticket_parts?.ticket_parts)) {
-      this.wbLog.info("inbound state change dropped — no non-bridge agent attribution", {
+      this.wbLog.info("inbound state change dropped: no non-bridge agent attribution", {
         "intercom.ticket_id": String(item.id),
         "ticket.thread_id": link.ticketThreadId,
         "intercom.state_id": stateId,
@@ -1112,7 +1112,7 @@ export class IntercomWebhookHandler {
       return;
     }
     if (!this.attributedToRealAgent(openParts)) {
-      this.wbLog.info("inbound reopen dropped — not attributable to a non-bridge agent", {
+      this.wbLog.info("inbound reopen dropped: not attributable to a non-bridge agent", {
         "intercom.conversation_id": String(item.id),
         "ticket.thread_id": link.ticketThreadId,
       });
@@ -1434,7 +1434,7 @@ export class IntercomWebhookHandler {
       await this.intercomClient
         .replyAsAdmin(link.conversationId, {
           adminId,
-          body: "<p>⚠️ The linked Discord thread was deleted — this conversation is no longer bridged. Replies here will not reach the customer.</p>",
+          body: "<p>⚠️ The linked Discord thread was deleted; this conversation is no longer bridged. Replies here will not reach the customer.</p>",
           note: true,
         })
         .catch(() => {});

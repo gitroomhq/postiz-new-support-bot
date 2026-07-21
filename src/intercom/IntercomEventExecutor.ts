@@ -172,7 +172,7 @@ export class IntercomEventExecutor {
         // event drains without dead-lettering. Transient Intercom failures
         // throw IntercomHttpError → normal delivery retry machinery.
         if (this.slaService) await this.slaService.applyForBridged(threadId, "outbox");
-        else this.execLog.warn("sla event with no SlaService bound — skipped", { "ticket.thread_id": threadId });
+        else this.execLog.warn("sla event with no SlaService bound, skipped", { "ticket.thread_id": threadId });
         return;
       default:
         throw new IntercomHttpError(400, `Unknown outbox event type: ${type}`);
@@ -236,7 +236,7 @@ export class IntercomEventExecutor {
       const opening =
         payload.questionAsOpening !== false && payload.question?.trim()
           ? renderDiscordMarkdownToHtml(payload.question)
-          : `🎫 Discord ticket${payload.categoryLabel ? ` (${payload.categoryLabel})` : ""} — transcript imported from Discord`;
+          : `🎫 Discord ticket${payload.categoryLabel ? ` (${payload.categoryLabel})` : ""}: transcript imported from Discord`;
       const conversationId = await this.client.createConversation(contactId, opening, payload.createdAtIso);
       link = await this.store.createLink(threadId, contactId, externalId, conversationId);
       created = true;
@@ -542,7 +542,7 @@ export class IntercomEventExecutor {
       // Config gap, not a data error — retry transiently until a mapping exists.
       throw new IntercomHttpError(503, "No Intercom ticket type mapped (configure /config → Intercom → Ticket types)");
     }
-    const title = `${payload.customerDisplayName ?? payload.customerId ?? "Discord"} — ${payload.categoryLabel ?? payload.categoryId ?? "Support"}`;
+    const title = `${payload.customerDisplayName ?? payload.customerId ?? "Discord"} · ${payload.categoryLabel ?? payload.categoryId ?? "Support"}`;
     const attributes = {
       _default_title_: title.slice(0, 250),
       _default_description_: (payload.question ?? `Discord ticket thread ${threadId}`).slice(0, 4000),
@@ -586,10 +586,10 @@ export class IntercomEventExecutor {
           await this.postAdminNote(
             threadId,
             conversationId,
-            `🔗 Convert was rejected — created a standalone Intercom ticket instead: ${ticketId}`
+            `🔗 Convert was rejected; created a standalone Intercom ticket instead: ${ticketId}`
           ).catch(() => {});
           void this.audit.log({
-            title: "🌉 Intercom convert failed — unlinked ticket created",
+            title: "🌉 Intercom convert failed: unlinked ticket created",
             severity: "warn",
             actor: "Intercom bridge",
             threadId,
@@ -610,7 +610,7 @@ export class IntercomEventExecutor {
   private async requireLink(threadId: string): Promise<IntercomLink> {
     const link = await this.store.getLink(threadId);
     if (link) return link;
-    throw new IntercomHttpError(410, `No Intercom link for thread ${threadId} (bridge reset/wiped?) — event dropped`);
+    throw new IntercomHttpError(410, `No Intercom link for thread ${threadId} (bridge reset/wiped?); event dropped`);
   }
 
   // Reserve → call → confirm: the pending-post row is written BEFORE the API

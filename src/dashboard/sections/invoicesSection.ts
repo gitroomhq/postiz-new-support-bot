@@ -59,9 +59,9 @@ async function invoiceEditAction(
   if (!invoiceId) return { ok: false, error: "Bad invoice id." };
   const invoice = await ctx.stripe.getInvoice(invoiceId).catch(() => null);
   if (!invoice) return { ok: false, error: "This invoice does not exist." };
-  if (invoice.status !== "draft") return { ok: false, error: `Invoice is ${invoice.status} — only drafts are editable.` };
+  if (invoice.status !== "draft") return { ok: false, error: `Invoice is ${invoice.status}; only drafts are editable.` };
   if (invoice.parent?.subscription_details) {
-    return { ok: false, error: "This draft belongs to a subscription cycle — it is not editable here." };
+    return { ok: false, error: "This draft belongs to a subscription cycle; it is not editable here." };
   }
   const customerId = typeof invoice.customer === "string" ? invoice.customer : invoice.customer?.id ?? null;
   if (!customerId) return { ok: false, error: "This invoice has no customer attached." };
@@ -75,7 +75,7 @@ async function invoiceEditAction(
       const price = await ctx.stripe.getPrice(priceId).catch(() => null);
       if (!price || price.unit_amount == null) return { ok: false, error: "That price does not exist (or has no unit amount)." };
       if (price.currency !== invoice.currency) {
-        return { ok: false, error: `Price is ${price.currency.toUpperCase()} — this invoice bills ${invoice.currency.toUpperCase()}.` };
+        return { ok: false, error: `Price is ${price.currency.toUpperCase()}; this invoice bills ${invoice.currency.toUpperCase()}.` };
       }
       const qty =
         typeof p.quantity === "number" && Number.isSafeInteger(p.quantity) && p.quantity >= 1 && p.quantity <= 999
@@ -128,10 +128,10 @@ async function invoiceEditAction(
         // Quantity edits only make sense on price-based items; amount-based
         // items get their amount edited instead (Stripe errors otherwise).
         if (item.pricing?.price_details?.price) updates.quantity = p.quantity;
-        else return { ok: false, fieldErrors: { quantity: "This line is amount-based — edit the amount instead." } };
+        else return { ok: false, fieldErrors: { quantity: "This line is amount-based; edit the amount instead." } };
       }
       if (updates.amountMinor != null && updates.quantity != null) {
-        return { ok: false, error: "Edit either the amount or the quantity — not both." };
+        return { ok: false, error: "Edit either the amount or the quantity, not both." };
       }
       if (Object.keys(updates).length === 0) return { ok: false, error: "Nothing to change." };
       await ctx.stripe.updateInvoiceItem(itemId, updates, idem());
@@ -168,7 +168,7 @@ async function invoiceEditAction(
       if (memo) params.memo = memo === "-" ? null : memo;
       const footer = str(p.footer, 500).trim();
       if (footer) params.footer = footer === "-" ? null : footer;
-      if (Object.keys(params).length === 0) return { ok: false, error: "Nothing to change — fill at least one field ('-' clears)." };
+      if (Object.keys(params).length === 0) return { ok: false, error: "Nothing to change: fill at least one field ('-' clears)." };
       await ctx.stripe.updateInvoiceDetails(invoiceId, params, idem());
       await ctx.audit(`Invoice ${invoiceId}: details updated (${Object.keys(params).join(", ")})`);
       return { ok: true, text: "Invoice details updated." };
@@ -191,7 +191,7 @@ async function invoiceEditAction(
         if (eq <= 0) return { ok: false, fieldErrors: { metadata: `"${trimmed.slice(0, 40)}" is not key=value.` } };
         const k = trimmed.slice(0, eq).trim();
         const v = trimmed.slice(eq + 1).trim();
-        if (!k || k.length > 40 || v.length > 500) return { ok: false, fieldErrors: { metadata: `"${k.slice(0, 40)}" — keys ≤40 chars, values ≤500.` } };
+        if (!k || k.length > 40 || v.length > 500) return { ok: false, fieldErrors: { metadata: `"${k.slice(0, 40)}": keys ≤40 chars, values ≤500.` } };
         metadata[k] = v;
       }
       if (Object.keys(metadata).length === 0) return { ok: false, error: "No key=value lines found." };
@@ -288,8 +288,8 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
           : text("Draft"),
         customer
           ? ({ t: "link", v: invoice.customer_email ?? customer, ref: { page: "customers.detail", params: { id: customer } } } as Cell)
-          : text(invoice.customer_email ?? "—"),
-        invoice.due_date ? dateCell(invoice.due_date) : text("—"),
+          : text(invoice.customer_email ?? "N/A"),
+        invoice.due_date ? dateCell(invoice.due_date) : text("N/A"),
         dateCell(invoice.created),
       ] as Cell[],
     };
@@ -362,8 +362,8 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
             : "No invoices yet.",
         ...(rows.length ? { footer: `${rows.length} item${rows.length === 1 ? "" : "s"}` } : {}),
         notice: searchable
-          ? `Chip counts are account totals; the table shows ${WINDOW} per page — use Next for older ones.`
-          : `Collection/frequency/subscription filters aren't searchable — chip counts cover this window only ("N+" on overflow).`,
+          ? `Chip counts are account totals; the table shows ${WINDOW} per page. Use Next for older ones.`
+          : `Collection/frequency/subscription filters aren't searchable; chip counts cover this window only ("N+" on overflow).`,
       },
     ],
   };
@@ -395,7 +395,7 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
       .slice(0, 25)
       .map((p) => ({
         value: p.id,
-        label: `${p.nickname ?? p.id.slice(0, 18)} — ${ctx.stripe.formatAmount(p.unit_amount!, p.currency)}${p.recurring ? `/${p.recurring.interval}` : ""}`,
+        label: `${p.nickname ?? p.id.slice(0, 18)}: ${ctx.stripe.formatAmount(p.unit_amount!, p.currency)}${p.recurring ? `/${p.recurring.interval}` : ""}`,
       }));
     actions.push(
       {
@@ -422,9 +422,9 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
         label: "Edit details",
         params: { invoiceId: id },
         inputs: [
-          { type: "text", key: "dueDate", label: `Due date YYYY-MM-DD (now: ${invoice.due_date ? new Date(invoice.due_date * 1000).toISOString().slice(0, 10) : "—"})` },
-          { type: "text", key: "memo", label: `Memo (now: ${invoice.description?.slice(0, 40) ?? "—"}) — '-' clears`, multiline: true, maxLength: 500 },
-          { type: "text", key: "footer", label: `Footer (now: ${invoice.footer?.slice(0, 40) ?? "—"}) — '-' clears`, maxLength: 500 },
+          { type: "text", key: "dueDate", label: `Due date YYYY-MM-DD (now: ${invoice.due_date ? new Date(invoice.due_date * 1000).toISOString().slice(0, 10) : "N/A"})` },
+          { type: "text", key: "memo", label: `Memo (now: ${invoice.description?.slice(0, 40) ?? "N/A"}); '-' clears`, multiline: true, maxLength: 500 },
+          { type: "text", key: "footer", label: `Footer (now: ${invoice.footer?.slice(0, 40) ?? "N/A"}); '-' clears`, maxLength: 500 },
         ],
         summary: "Blank fields stay unchanged; a single '-' clears the field.",
       },
@@ -433,7 +433,7 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
         label: "Metadata",
         params: { invoiceId: id },
         inputs: [
-          { type: "text", key: "metadata", label: "key=value per line — '-' alone clears ALL metadata", multiline: true, maxLength: 2000 },
+          { type: "text", key: "metadata", label: "key=value per line; '-' alone clears ALL metadata", multiline: true, maxLength: 2000 },
         ],
         summary: "Replaces the listed keys (other keys survive); '-' wipes everything.",
       }
@@ -483,7 +483,7 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
         style: "danger",
         dangerous: true,
         params: { invoiceId: id, op: "void" },
-        summary: "Voids the invoice — it can no longer be paid.",
+        summary: "Voids the invoice; it can no longer be paid.",
       }),
       registryButton(ctx, {
         key: "invoice.void",
@@ -617,7 +617,7 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
     main.push({
       type: "table",
       key: "lines",
-      title: "Line items (draft — editable)",
+      title: "Line items (draft, editable)",
       columns: [
         { key: "desc", label: "Description" },
         { key: "qty", label: "Qty", align: "right" },
@@ -637,12 +637,12 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
             params: { invoiceId: id, itemId: item.id },
             inputs: [
               { type: "number", key: "amountMajor", label: `Amount (${invoice.currency.toUpperCase()}, now ${ctx.stripe.formatAmount(item.amount, item.currency)})`, min: 0 },
-              { type: "text", key: "description", label: `Description (now: ${item.description?.slice(0, 40) ?? "—"})`, maxLength: 300 },
+              { type: "text", key: "description", label: `Description (now: ${item.description?.slice(0, 40) ?? "N/A"})`, maxLength: 300 },
               ...(item.pricing?.price_details?.price
                 ? [{ type: "number", key: "quantity", label: `Quantity (now ${item.quantity ?? 1})`, min: 1, max: 999 } as const]
                 : []),
             ],
-            summary: "Blank fields stay unchanged. Edit either the amount or the quantity — not both.",
+            summary: "Blank fields stay unchanged. Edit either the amount or the quantity, not both.",
           },
           {
             key: "section:invoices.line_remove",
@@ -653,7 +653,7 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
           },
         ],
       })),
-      empty: "No lines yet — add one with the header actions.",
+      empty: "No lines yet. Add one with the header actions.",
       ...(editableItems.length ? { footer: `${editableItems.length} line${editableItems.length === 1 ? "" : "s"}` } : {}),
     });
   }
@@ -678,7 +678,7 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
     })),
     empty: "No line items.",
     ...(lines.length ? { footer: `${Math.min(lines.length, 20)} result${lines.length === 1 ? "" : "s"}` } : {}),
-    ...(invoice.lines?.has_more ? { notice: "More lines exist than shown — open the hosted invoice for the full list." } : {}),
+    ...(invoice.lines?.has_more ? { notice: "More lines exist than shown; open the hosted invoice for the full list." } : {}),
   });
 
   // Credit notes.
@@ -700,7 +700,7 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
             kind: note.status === "void" ? "neutral" : "info",
             text: sentence(note.status ?? "issued"),
           }),
-          text(note.memo ?? "—"),
+          text(note.memo ?? "N/A"),
           dateCell(note.created),
           idCell(note.id, { copy: true }),
         ] as Cell[],
@@ -884,7 +884,7 @@ async function composer(ctx: DashboardCtx, filters: Record<string, string>): Pro
     blocks.push({
       type: "notice",
       badge: { kind: "info", text: "Customer" },
-      text: "Set the Customer filter (cus_…) below to scope the invoice — everything else stays as you build.",
+      text: "Set the Customer filter (cus_…) below to scope the invoice; everything else stays as you build.",
     });
   } else if (!customer || customer.deleted) {
     blocks.push({ type: "notice", badge: { kind: "error", text: "Not found" }, text: `Customer ${customerId} does not exist (or was deleted).` });
@@ -904,7 +904,7 @@ async function composer(ctx: DashboardCtx, filters: Record<string, string>): Pro
       blocks.push({
         type: "notice",
         badge: { kind: "info", text: "Custom line" },
-        text: `"${desc}" — ${ctx.stripe.formatAmount(minor, cur)}`,
+        text: `"${desc}": ${ctx.stripe.formatAmount(minor, cur)}`,
         actions: [
           {
             key: "nav:invoices.addcustom",
@@ -918,7 +918,7 @@ async function composer(ctx: DashboardCtx, filters: Record<string, string>): Pro
       blocks.push({
         type: "notice",
         badge: { kind: "warn", text: "Custom line" },
-        text: 'Format: description | amount | currency — e.g. "Setup fee | 49.00 | eur".',
+        text: 'Format: description | amount | currency, e.g. "Setup fee | 49.00 | eur".',
       });
     }
   }
@@ -953,7 +953,7 @@ async function composer(ctx: DashboardCtx, filters: Record<string, string>): Pro
         },
       ],
     })),
-    empty: "No lines yet — add prices from the picker below, or a custom line via the Custom filter.",
+    empty: "No lines yet. Add prices from the picker below, or a custom line via the Custom filter.",
     ...(dropped ? { notice: `${dropped} invalid/unknown line token(s) were dropped.` } : {}),
   });
 
@@ -961,7 +961,7 @@ async function composer(ctx: DashboardCtx, filters: Record<string, string>): Pro
     blocks.push({
       type: "notice",
       badge: { kind: "error", text: "Mixed currencies" },
-      text: "An invoice bills ONE currency — remove lines until a single currency remains.",
+      text: "An invoice bills ONE currency; remove lines until a single currency remains.",
     });
   } else if (lines.length > 0 && lineCurrency) {
     blocks.push({
@@ -985,7 +985,7 @@ async function composer(ctx: DashboardCtx, filters: Record<string, string>): Pro
       rows: [
         { label: "Customer", cell: idCell(customerId, { copy: true, ref: { page: "customers.detail", params: { id: customerId } } }) },
         { label: "Collection", cell: text(`Email invoice, due in ${due} days`) },
-        { label: "Lines", cell: text(`${lines.length} — ${ctx.stripe.formatAmount(totalMinor, lineCurrency!)}`) },
+        { label: "Lines", cell: text(`${lines.length} (${ctx.stripe.formatAmount(totalMinor, lineCurrency!)})`) },
       ],
       actions: [
         registryButton(ctx, {
@@ -1063,7 +1063,7 @@ async function composer(ctx: DashboardCtx, filters: Record<string, string>): Pro
       lines.length >= MAX_LINES
         ? `Line cap reached (${MAX_LINES}).`
         : lineCurrency && !mixed
-          ? `Picker is locked to ${lineCurrency.toUpperCase()} — the invoice's currency.`
+          ? `Picker is locked to ${lineCurrency.toUpperCase()}, the invoice's currency.`
           : "Qty applies to the next Add. Custom lines: description | amount | currency.",
   });
 

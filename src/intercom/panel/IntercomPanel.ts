@@ -81,7 +81,7 @@ export class IntercomPanel {
       panelLog.warn("panel link replay rejected", { "intercom.admin_id": payload.aid, "intercom.conversation_id": payload.cid });
       return {
         status: 401,
-        message: "This panel link was already used — reopen it from the Intercom conversation (Open Stripe Panel).",
+        message: "This panel link was already used. Reopen it from the Intercom conversation (Open Stripe Panel).",
       };
     }
     const { sessionId } = this.panelSessions.create({ aid: payload.aid, an: payload.an, cid: payload.cid, epoch: payload.epo });
@@ -170,7 +170,7 @@ export class IntercomPanel {
         "panel.endpoint": endpoint,
         "error.message": e instanceof Error ? e.message : String(e),
       });
-      return { status: 200, json: { ok: false, error: "Internal error — check the bot logs." } };
+      return { status: 200, json: { ok: false, error: "Internal error. Check the bot logs." } };
     }
   }
 
@@ -293,7 +293,7 @@ export class IntercomPanel {
       rows.push({ cells: ["Stripe customer", cus], actions: [] });
       if (customer && !customer.deleted) {
         rows.push(
-          { cells: ["Email", customer.email ?? "—"], actions: [] },
+          { cells: ["Email", customer.email ?? "N/A"], actions: [] },
           { cells: ["Created", new Date(customer.created * 1000).toISOString().slice(0, 10)], actions: [] },
           {
             cells: [
@@ -316,12 +316,12 @@ export class IntercomPanel {
         this.button(actor, "charge_review", "Approve refund", { decision: "approve" }, [],
           `Approve the blocked refund of ${this.stripe.formatAmount(review.amount, review.currency)} on ${review.chargeId} (refund + cancel subscription).`),
         this.button(actor, "charge_review", "Deny refund", { decision: "deny" }, [],
-          "Deny the blocked refund — the thread stays open for follow-up."),
+          "Deny the blocked refund; the thread stays open for follow-up."),
       ].filter((b): b is PanelActionButton => b != null);
       rows.push({
         cells: [
           "⚠️ Refund review pending",
-          `${this.stripe.formatAmount(review.amount, review.currency)} on ${review.chargeId} — blocked by: ${review.reason}`,
+          `${this.stripe.formatAmount(review.amount, review.currency)} on ${review.chargeId} · blocked by: ${review.reason}`,
         ],
         actions,
       });
@@ -395,7 +395,7 @@ export class IntercomPanel {
           "Refund part of this charge."),
         this.button(actor, "charge.refund_fraud", "Refund as fraud", { chargeId: charge.id },
           [{ key: "amountMinor", label: "Amount (minor units)", type: "number" }],
-          "Refund with reason=fraudulent — feeds Stripe Radar."),
+          "Refund with reason=fraudulent (feeds Stripe Radar)."),
         ...(piId && charge.status === "pending"
           ? [this.button(actor, "payment_intent.cancel", "Cancel PI", { paymentIntentId: piId }, [], "Cancel the open payment intent.")]
           : []),
@@ -425,7 +425,7 @@ export class IntercomPanel {
       const item = sub.items.data[0];
       const price = item?.price;
       const plan = price?.nickname ?? (typeof price?.product === "string" ? price.product : price?.id) ?? "plan";
-      const periodEnd = item?.current_period_end ? new Date(item.current_period_end * 1000).toISOString().slice(0, 10) : "—";
+      const periodEnd = item?.current_period_end ? new Date(item.current_period_end * 1000).toISOString().slice(0, 10) : "N/A";
       const flags = [sub.pause_collection ? "paused" : null, sub.cancel_at_period_end ? "cancels at period end" : null]
         .filter(Boolean)
         .join(" · ");
@@ -456,7 +456,7 @@ export class IntercomPanel {
           ].filter((b): b is PanelActionButton => b != null)
         : [];
       return {
-        cells: [plan, sub.status, periodEnd, flags || "—", sub.id],
+        cells: [plan, sub.status, periodEnd, flags || "N/A", sub.id],
         actions,
       };
     });
@@ -499,7 +499,7 @@ export class IntercomPanel {
       return {
         cells: [
           invoice.number ?? id,
-          invoice.status ?? "—",
+          invoice.status ?? "N/A",
           this.stripe.formatAmount(invoice.total, invoice.currency),
           new Date(invoice.created * 1000).toISOString().slice(0, 10),
         ],
@@ -537,7 +537,7 @@ export class IntercomPanel {
               "Make this the default payment method.")]
           : []),
       ].filter((b): b is PanelActionButton => b != null);
-      return { cells: [label, pm.id === defaultPm ? "default" : "—", pm.id], actions };
+      return { cells: [label, pm.id === defaultPm ? "default" : "N/A", pm.id], actions };
     });
     return {
       columns: ["Method", "Default", "Id"],
@@ -554,7 +554,7 @@ export class IntercomPanel {
       cells: [
         new Date(txn.created * 1000).toISOString().slice(0, 10),
         this.stripe.formatAmount(txn.amount, txn.currency),
-        txn.description ?? "—",
+        txn.description ?? "N/A",
       ],
       actions: [],
     }));
@@ -583,11 +583,11 @@ export class IntercomPanel {
     const disputes = await this.disputeStore.listByCustomer(cus, 10);
     const rows: PanelRow[] = disputes.map((d) => ({
       cells: [
-        d.disputeCreatedAt ? d.disputeCreatedAt.toISOString().slice(0, 10) : "—",
+        d.disputeCreatedAt ? d.disputeCreatedAt.toISOString().slice(0, 10) : "N/A",
         this.stripe.formatAmount(d.amount, d.currency),
         d.status,
         d.reason,
-        d.evidenceDueBy ? `due ${d.evidenceDueBy.toISOString().slice(0, 10)}` : "—",
+        d.evidenceDueBy ? `due ${d.evidenceDueBy.toISOString().slice(0, 10)}` : "N/A",
       ],
       actions: [],
     }));
@@ -597,7 +597,7 @@ export class IntercomPanel {
       hasRowActions: false,
       sectionActions: [],
       nextCursor: null,
-      ...(rows.length === 0 ? { notice: "No disputes on record for this customer (local mirror)." } : { notice: "Read-only — manage disputes in Discord /billing → Disputes." }),
+      ...(rows.length === 0 ? { notice: "No disputes on record for this customer (local mirror)." } : { notice: "Read-only: manage disputes in Discord /billing → Disputes." }),
     };
   }
 

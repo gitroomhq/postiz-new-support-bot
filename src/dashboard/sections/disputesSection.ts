@@ -129,7 +129,7 @@ async function disputeAction(
       const value = str(p.value, 4000);
       if (!EVIDENCE_KEY_SET.has(fieldKey)) return { ok: false, error: "Unknown evidence field." };
       const { saved } = await deps.evidence.saveDraft(disputeId, { [fieldKey]: value });
-      if (!saved) return { ok: false, error: "Nothing to save — the field was empty." };
+      if (!saved) return { ok: false, error: "Nothing to save: the field was empty." };
       return { ok: true, text: "Draft saved." };
     }
 
@@ -141,7 +141,7 @@ async function disputeAction(
       if (!group) return { ok: false, error: "Unknown evidence group." };
       const live = await ctx.stripe.getDispute(disputeId);
       if (!deps.evidence.respondable(live.status)) {
-        return { ok: false, error: `Status is ${live.status} — evidence can no longer be changed.` };
+        return { ok: false, error: `Status is ${live.status}; evidence can no longer be changed.` };
       }
       const row = await ctx.stores.dispute.get(disputeId);
       const draft = (row?.evidenceDraft ?? {}) as Record<string, string>;
@@ -151,10 +151,10 @@ async function disputeAction(
         if (value) evidence[field.key] = value;
       }
       if (Object.keys(evidence).length === 0) {
-        return { ok: false, error: "Nothing drafted in this group yet — fill fields first (they autosave)." };
+        return { ok: false, error: "Nothing drafted in this group yet; fill fields first (they autosave)." };
       }
       await deps.evidence.stageFields(disputeId, evidence, `dash-${Date.now().toString(36)}`);
-      await ctx.audit(`Dispute evidence staged on ${disputeId} — ${Object.keys(evidence).length} field(s) from ${group.label} (NOT submitted)`);
+      await ctx.audit(`Dispute evidence staged on ${disputeId}: ${Object.keys(evidence).length} field(s) from ${group.label} (NOT submitted)`);
       return { ok: true, text: `Staged ${Object.keys(evidence).length} field(s) at Stripe (not submitted).` };
     }
 
@@ -175,11 +175,11 @@ async function disputeAction(
       }
       const outcome = await deps.evidence.uploadProof(disputeId, slot, filename, data, contentType, `dash-${Date.now().toString(36)}`);
       if (outcome.kind === "not_respondable") {
-        return { ok: false, error: `Status is ${outcome.status} — evidence files can no longer be attached.` };
+        return { ok: false, error: `Status is ${outcome.status}; evidence files can no longer be attached.` };
       }
       if (outcome.kind === "invalid") return { ok: false, error: outcome.error };
-      await ctx.audit(`Dispute evidence file staged on ${disputeId} — ${outcome.file!.id} (${filename}) as ${slot} (NOT submitted)`);
-      return { ok: true, text: `${filename} staged as ${slot} — it reaches the bank when you submit evidence.` };
+      await ctx.audit(`Dispute evidence file staged on ${disputeId}: ${outcome.file!.id} (${filename}) as ${slot} (NOT submitted)`);
+      return { ok: true, text: `${filename} staged as ${slot}; it reaches the bank when you submit evidence.` };
     }
 
     // T1 — detach a staged file (stays in the Stripe account).
@@ -188,10 +188,10 @@ async function disputeAction(
       const slot = str(p.slot, 40);
       const outcome = await deps.evidence.removeFile(disputeId, slot, `dash-${Date.now().toString(36)}`);
       if (outcome.kind === "not_respondable") {
-        return { ok: false, error: `Status is ${outcome.status} — evidence can no longer be changed.` };
+        return { ok: false, error: `Status is ${outcome.status}; evidence can no longer be changed.` };
       }
       if (outcome.kind === "invalid") return { ok: false, error: outcome.error };
-      await ctx.audit(`Dispute evidence file removed on ${disputeId} — cleared slot ${slot} (staged only)`);
+      await ctx.audit(`Dispute evidence file removed on ${disputeId}: cleared slot ${slot} (staged only)`);
       return { ok: true, text: `File slot ${slot} cleared.` };
     }
 
@@ -202,13 +202,13 @@ async function disputeAction(
       if (!ctx.reverse?.satisfied) return { ok: false, needsReverse: true };
       const outcome = await deps.evidence.submit(disputeId, ctx.actor.id, await customerHint(ctx, disputeId));
       if (outcome.kind === "not_respondable") {
-        return { ok: false, error: `Status is ${outcome.status} — evidence can no longer be submitted.` };
+        return { ok: false, error: `Status is ${outcome.status}; evidence can no longer be submitted.` };
       }
       if (outcome.kind === "already_claimed") {
         return { ok: false, error: "Evidence for this dispute was already submitted via the bot." };
       }
       const d = outcome.dispute;
-      await ctx.audit(`Dispute evidence SUBMITTED on ${disputeId} (${ctx.stripe.formatAmount(d.amount, d.currency)}) — status now ${d.status}`);
+      await ctx.audit(`Dispute evidence SUBMITTED on ${disputeId} (${ctx.stripe.formatAmount(d.amount, d.currency)}); status now ${d.status}`);
       exportBillingEvent({
         event: "evidence_submitted",
         amountMinor: d.amount,
@@ -231,14 +231,14 @@ async function disputeAction(
         return { ok: false, error: "This dispute was already accepted via the bot." };
       }
       const d = outcome.dispute;
-      await ctx.audit(`Dispute ACCEPTED on ${disputeId} (${ctx.stripe.formatAmount(d.amount, d.currency)}) — closed as ${d.status} (conceded)`);
+      await ctx.audit(`Dispute ACCEPTED on ${disputeId} (${ctx.stripe.formatAmount(d.amount, d.currency)}); closed as ${d.status} (conceded)`);
       exportBillingEvent({
         event: "dispute_accepted",
         amountMinor: d.amount,
         currency: d.currency,
         chargeId: typeof d.charge === "string" ? d.charge : d.charge?.id,
       });
-      return { ok: true, text: "Dispute accepted — closed as lost." };
+      return { ok: true, text: "Dispute accepted; closed as lost." };
     }
 
     // T0 long-running — AI draft (Claude Code CLI over the cloned repos).
@@ -247,20 +247,20 @@ async function disputeAction(
     case "section:disputes.ai_draft": {
       const live = await ctx.stripe.getDispute(disputeId);
       if (!deps.evidence.respondable(live.status)) {
-        return { ok: false, error: `Status is ${live.status} — there is nothing left to draft for.` };
+        return { ok: false, error: `Status is ${live.status}; there is nothing left to draft for.` };
       }
-      if (aiLocks.has(disputeId)) return { ok: false, error: "An AI run is already in progress for this dispute — hang on." };
+      if (aiLocks.has(disputeId)) return { ok: false, error: "An AI run is already in progress for this dispute; hang on." };
       aiLocks.add(disputeId);
       try {
         const result = await deps.evidence.aiDraft(disputeId, await customerHint(ctx, disputeId));
         await ctx.audit(
-          `Dispute AI evidence draft on ${disputeId} — ${result.fields} field(s) saved locally${
+          `Dispute AI evidence draft on ${disputeId}: ${result.fields} field(s) saved locally${
             result.rejected.length ? `, ${result.rejected.length} invalid dropped (${result.rejected.join(", ")})` : ""
           }${result.usedIntercomHistory ? ", with Intercom history" : ""}${result.receiptStaged ? ", receipt staged" : ""} (${result.model})`
         );
         return {
           ok: true,
-          text: `AI draft saved locally — ${result.fields} field(s) on ${result.model}${
+          text: `AI draft saved locally: ${result.fields} field(s) on ${result.model}${
             result.rejected.length ? ` (${result.rejected.length} invalid value(s) dropped: ${result.rejected.join(", ")})` : ""
           }${result.receiptStaged ? " · receipt PDF staged" : ""}. Review the sections below, then stage.`,
         };
@@ -272,25 +272,25 @@ async function disputeAction(
     // T0 long-running — AI review of the staged package (light model, vision
     // over the staged files). Read-only; verdict renders on the page.
     case "section:disputes.ai_review": {
-      if (aiLocks.has(disputeId)) return { ok: false, error: "An AI run is already in progress for this dispute — hang on." };
+      if (aiLocks.has(disputeId)) return { ok: false, error: "An AI run is already in progress for this dispute; hang on." };
       aiLocks.add(disputeId);
       try {
         const result = await deps.evidence.aiReview(disputeId, {
           telemetry: { userId: ctx.actor.id, username: ctx.actor.name },
         });
         if (result.kind === "nothing_staged") {
-          return { ok: false, error: "Nothing staged at Stripe yet — there is nothing to review." };
+          return { ok: false, error: "Nothing staged at Stripe yet; there is nothing to review." };
         }
         const coverage = `${result.stagedFieldCount} field(s) · ${result.filesAttached}/${result.filesTotal} file(s) reviewed${
           result.skipped.length ? ` · skipped: ${result.skipped.map((f) => `${f.slot} (${f.note})`).join(", ")}` : ""
         }`;
         rememberAiReview(disputeId, {
-          review: result.review || "The model returned no review text — try again.",
+          review: result.review || "The model returned no review text; try again.",
           model: result.model,
           coverage,
         });
-        await ctx.audit(`Dispute AI evidence review on ${disputeId} — ${coverage} (${result.model}, read-only)`);
-        return { ok: true, text: "AI review complete — the verdict is rendered on the page." };
+        await ctx.audit(`Dispute AI evidence review on ${disputeId}: ${coverage} (${result.model}, read-only)`);
+        return { ok: true, text: "AI review complete; the verdict is rendered on the page." };
       } finally {
         aiLocks.delete(disputeId);
       }
@@ -301,7 +301,7 @@ async function disputeAction(
       const watching = await ctx.stores.dispute.isWatching(disputeId, ctx.actor.id);
       if (watching) await ctx.stores.dispute.unwatch(disputeId, ctx.actor.id);
       else await ctx.stores.dispute.watch(disputeId, ctx.actor.id);
-      return { ok: true, text: watching ? "Unwatched — no more DMs for this dispute." : "Watching — you'll get a DM when its status changes." };
+      return { ok: true, text: watching ? "Unwatched: no more DMs for this dispute." : "Watching: you'll get a DM when its status changes." };
     }
 
     case "section:disputes.note_add": {
@@ -376,7 +376,7 @@ async function ratioStrip(ctx: DashboardCtx, ratio: CachedRatioEngine): Promise<
     if (pct >= warnPct) return { kind: "warn", text: "warn" };
     return { kind: "ok", text: "ok" };
   };
-  const fmt = (pct: number | null): string => (pct == null ? "—" : `${pct.toFixed(2)}%`);
+  const fmt = (pct: number | null): string => (pct == null ? "N/A" : `${pct.toFixed(2)}%`);
   try {
     const r = await ratio.get();
     const ge = r.truncated ? "≥" : "";
@@ -393,13 +393,13 @@ async function ratioStrip(ctx: DashboardCtx, ratio: CachedRatioEngine): Promise<
   } catch {
     return {
       type: "stats",
-      items: [{ label: "Dispute ratio", value: "—", sub: "ratio engine unavailable right now" }],
+      items: [{ label: "Dispute ratio", value: "N/A", sub: "ratio engine unavailable right now" }],
     };
   }
 }
 
 function dueCells(d: { evidenceDueBy: Date | null }): Cell {
-  if (!d.evidenceDueBy) return text("—");
+  if (!d.evidenceDueBy) return text("N/A");
   const hoursLeft = (d.evidenceDueBy.getTime() - Date.now()) / 3_600_000;
   const badge: Badge =
     hoursLeft < 0
@@ -434,8 +434,8 @@ function disputeRow(ctx: DashboardCtx, d: StripeDispute): TableBlock["rows"][num
       text(sentence(d.reason.replace(/_/g, " "))),
       d.customerId
         ? ({ t: "link", v: d.customerId, ref: { page: "customers.detail", params: { id: d.customerId } } } as Cell)
-        : text("—"),
-      d.evidenceDueBy ? isoDateCell(d.evidenceDueBy) : text("—"),
+        : text("N/A"),
+      d.evidenceDueBy ? isoDateCell(d.evidenceDueBy) : text("N/A"),
       dueCells(d),
       idCell(d.id, { copy: true }),
     ] as Cell[],
@@ -548,7 +548,7 @@ async function historyBlocks(ctx: DashboardCtx, cursor: string | null): Promise<
   ]);
   const fmtAmounts = (buckets: Record<string, number>): string => {
     const parts = Object.entries(buckets).map(([cur, minor]) => ctx.stripe.formatAmount(minor, cur));
-    return parts.join(" + ") || "—";
+    return parts.join(" + ") || "N/A";
   };
 
   const blocks: Block[] = [];
@@ -559,7 +559,7 @@ async function historyBlocks(ctx: DashboardCtx, cursor: string | null): Promise<
       { label: "Lost", value: String(stats.lost), sub: fmtAmounts(stats.lostAmount) },
       {
         label: "Win rate",
-        value: stats.winRatePct == null ? "—" : `${stats.winRatePct.toFixed(0)}%`,
+        value: stats.winRatePct == null ? "N/A" : `${stats.winRatePct.toFixed(0)}%`,
         sub: `${stats.won + stats.lost} decided`,
       },
       {
@@ -588,7 +588,7 @@ async function historyBlocks(ctx: DashboardCtx, cursor: string | null): Promise<
           text(String(r.won)),
           text(String(r.lost)),
           r.winRatePct == null
-            ? text("—")
+            ? text("N/A")
             : badgeCell(r.winRatePct >= 50 ? "ok" : "warn", `${r.winRatePct.toFixed(0)}%`),
         ] as Cell[],
       })),
@@ -614,8 +614,8 @@ async function historyBlocks(ctx: DashboardCtx, cursor: string | null): Promise<
         text(sentence(d.reason.replace(/_/g, " "))),
         d.customerId
           ? ({ t: "link", v: d.customerId, ref: { page: "customers.detail", params: { id: d.customerId } } } as Cell)
-          : text("—"),
-        d.closedAt ? isoDateCell(d.closedAt) : text("—"),
+          : text("N/A"),
+        d.closedAt ? isoDateCell(d.closedAt) : text("N/A"),
         idCell(d.id, { copy: true }),
       ] as Cell[],
     })),
@@ -678,7 +678,7 @@ async function detail(ctx: DashboardCtx, deps: DisputesDeps, id: string): Promis
         params: { chargeId },
         summary:
           dispute.status === "warning_needs_response" || dispute.status === "warning_under_review"
-            ? `Fully refund ${ctx.stripe.formatAmount(dispute.amount, dispute.currency)} now — at the warning stage this prevents the dispute from becoming a formal chargeback.`
+            ? `Fully refund ${ctx.stripe.formatAmount(dispute.amount, dispute.currency)} now; at the warning stage this prevents the dispute from becoming a formal chargeback.`
             : `Fully refund the disputed charge (${ctx.stripe.formatAmount(dispute.amount, dispute.currency)}). Stripe still allows a refund on this dispute.`,
       })
     );
@@ -690,7 +690,7 @@ async function detail(ctx: DashboardCtx, deps: DisputesDeps, id: string): Promis
     dangerous: true,
     reverseConfirm: true,
     params: { disputeId: id },
-    summary: `Accept ${id} (${ctx.stripe.formatAmount(dispute.amount, dispute.currency)}, ${dispute.reason}) — the dispute closes as LOST immediately, the funds stay withdrawn and no evidence can be submitted afterwards. Irreversible. Needs the Discord reverse code (/billing → Show destructive-action code).`,
+    summary: `Accept ${id} (${ctx.stripe.formatAmount(dispute.amount, dispute.currency)}, ${dispute.reason}): the dispute closes as LOST immediately, the funds stay withdrawn and no evidence can be submitted afterwards. Irreversible. Needs the Discord reverse code (/billing → Show destructive-action code).`,
     ...(pkg.terminal ? { disabledReason: `Dispute is already ${dispute.status}.` } : {}),
   });
   actions.push({
@@ -732,27 +732,27 @@ async function detail(ctx: DashboardCtx, deps: DisputesDeps, id: string): Promis
       type: "notice",
       badge: { kind: won ? "ok" : "error", text: sentence(dispute.status.replace(/_/g, " ")) },
       text: won
-        ? "This dispute is closed in your favor — everything below is the submitted record."
+        ? "This dispute is closed in your favor; everything below is the submitted record."
         : "This dispute is closed. The evidence below is the read-only record of what was (or wasn't) sent.",
     });
   } else if (!pkg.respondable) {
     main.push({
       type: "notice",
       badge: { kind: "info", text: "Under review" },
-      text: "The response is with the bank — evidence can no longer be changed. A decision usually takes 60–75 days.",
+      text: "The response is with the bank; evidence can no longer be changed. A decision usually takes 60–75 days.",
     });
   } else if (pastDue) {
     main.push({
       type: "notice",
       badge: { kind: "error", text: "Past due" },
-      text: "The evidence deadline has passed — Stripe may still accept a submission briefly, but the bank can ignore late responses. Submit immediately or accept.",
+      text: "The evidence deadline has passed; Stripe may still accept a submission briefly, but the bank can ignore late responses. Submit immediately or accept.",
     });
   }
   if (pkg.respondable && pkg.unstagedDraft.length > 0) {
     main.push({
       type: "notice",
       badge: { kind: "warn", text: `${pkg.unstagedDraft.length} draft` },
-      text: `Local draft fields not staged at Stripe yet: ${pkg.unstagedDraft.slice(0, 6).join(", ")}${pkg.unstagedDraft.length > 6 ? ", …" : ""} — stage their groups below or they won't reach the bank.`,
+      text: `Local draft fields not staged at Stripe yet: ${pkg.unstagedDraft.slice(0, 6).join(", ")}${pkg.unstagedDraft.length > 6 ? ", …" : ""}; stage their groups below or they won't reach the bank.`,
     });
   }
 
@@ -775,7 +775,7 @@ async function detail(ctx: DashboardCtx, deps: DisputesDeps, id: string): Promis
       { label: "Submissions", value: String(pkg.submissions), ...(pkg.submissions > 0 ? { badge: { kind: "info", text: "sent" } as Badge } : {}) },
       {
         label: "Evidence due",
-        value: dispute.evidence_details?.due_by ? new Date(dispute.evidence_details.due_by * 1000).toISOString().slice(0, 10) : "—",
+        value: dispute.evidence_details?.due_by ? new Date(dispute.evidence_details.due_by * 1000).toISOString().slice(0, 10) : "N/A",
         ...(row.evidenceDueBy ? { badge: dueBadge(row.evidenceDueBy) } : {}),
       },
     ],
@@ -787,7 +787,7 @@ async function detail(ctx: DashboardCtx, deps: DisputesDeps, id: string): Promis
   const timeline: Array<{ label: string; iso: string; text?: string; kind?: Badge["kind"] }> = [];
   if (row.closedAt)
     timeline.push({
-      label: `Closed — ${sentence(row.status.replace(/_/g, " "))}`,
+      label: `Closed: ${sentence(row.status.replace(/_/g, " "))}`,
       iso: row.closedAt.toISOString(),
       kind: row.status === "won" ? "ok" : row.status === "lost" ? "error" : "info",
     });
@@ -834,8 +834,8 @@ async function detail(ctx: DashboardCtx, deps: DisputesDeps, id: string): Promis
   const refundableText = pkg.terminal
     ? "dispute closed"
     : dispute.is_charge_refundable
-      ? "yes — refund prevents/settles this"
-      : "no — respond with evidence";
+      ? "yes, refund prevents/settles this"
+      : "no, respond with evidence";
   rail.push({
     type: "kv",
     title: "Response",
@@ -888,16 +888,16 @@ function submitButton(ctx: DashboardCtx, pkg: StagedPackage, draftFields: number
       : null,
     dueTs ? `Deadline: ${new Date(dueTs * 1000).toISOString().slice(0, 10)}.` : null,
     pkg.submissions > 0
-      ? `⚠ Evidence was already submitted ${pkg.submissions}× — banks typically accept only ONE submission; resubmit only if Stripe support advised it.`
-      : "Banks typically allow exactly one submission — make sure the staged evidence is complete.",
+      ? `⚠ Evidence was already submitted ${pkg.submissions}×: banks typically accept only ONE submission; resubmit only if Stripe support advised it.`
+      : "Banks typically allow exactly one submission; make sure the staged evidence is complete.",
     "This cannot be recalled. Needs the Discord reverse code (/billing → Show destructive-action code).",
   ]
     .filter(Boolean)
     .join(" ");
   const disabled = !pkg.respondable
-    ? `Status is ${d.status} — evidence can no longer be submitted.`
+    ? `Status is ${d.status}; evidence can no longer be submitted.`
     : !(pkg.hasEvidence || draftFields > 0)
-      ? "Nothing staged at Stripe yet — stage evidence first."
+      ? "Nothing staged at Stripe yet; stage evidence first."
       : undefined;
   return {
     key: "section:disputes.submit",
@@ -921,13 +921,13 @@ function aiToolsBlocks(ctx: DashboardCtx, pkg: StagedPackage): Block[] {
   blocks.push({
     type: "notice",
     badge: { kind: "info", text: "AI" },
-    text: `AI draft researches the ⭐ recommended fields from real account data (${ctx.settings.aiModel()}, effort ${ctx.settings.aiEffortAsk()}, ≤$${ctx.settings.aiMaxBudgetUsdAsk()}) and saves a LOCAL draft only. AI review critiques the staged package on ${ctx.settings.aiModelLight()} with the staged files as vision input. Both are advisory — nothing is sent to the bank.`,
+    text: `AI draft researches the ⭐ recommended fields from real account data (${ctx.settings.aiModel()}, effort ${ctx.settings.aiEffortAsk()}, ≤$${ctx.settings.aiMaxBudgetUsdAsk()}) and saves a LOCAL draft only. AI review critiques the staged package on ${ctx.settings.aiModelLight()} with the staged files as vision input. Both are advisory; nothing is sent to the bank.`,
     actions: [
       {
         key: "section:disputes.ai_draft",
         label: "AI draft",
         params: { disputeId: id },
-        ...(pkg.respondable ? {} : { disabledReason: "Dispute is no longer respondable — nothing to draft for." }),
+        ...(pkg.respondable ? {} : { disabledReason: "Dispute is no longer respondable: nothing to draft for." }),
       },
       {
         key: "section:disputes.ai_review",
@@ -1020,14 +1020,14 @@ function mirrorFallback(ctx: DashboardCtx, d: StripeDispute): SectionPage {
       {
         type: "notice",
         badge: { kind: "warn", text: "Live fetch failed" },
-        text: "Stripe is unreachable right now — showing the local mirror, read-only. Reload to retry.",
+        text: "Stripe is unreachable right now; showing the local mirror, read-only. Reload to retry.",
       },
       {
         type: "kv",
         title: "Mirror",
         rows: [
           { label: "Status", cell: badgeCell(statusBadgeFor(d.status).kind, statusBadgeFor(d.status).text) },
-          { label: "Deadline", cell: d.evidenceDueBy ? isoDateCell(d.evidenceDueBy) : text("—") },
+          { label: "Deadline", cell: d.evidenceDueBy ? isoDateCell(d.evidenceDueBy) : text("N/A") },
           { label: "Charge", cell: idCell(d.chargeId, { copy: true, ref: { page: "payments.detail", params: { id: d.chargeId } } }) },
         ],
       },
@@ -1120,7 +1120,7 @@ async function review(ctx: DashboardCtx, deps: DisputesDeps, id: string): Promis
     main.push({
       type: "notice",
       badge: { kind: "warn", text: `${pkg.unstagedDraft.length} unstaged` },
-      text: `Local draft field(s) NOT staged yet: ${pkg.unstagedDraft.slice(0, 8).join(", ")}${pkg.unstagedDraft.length > 8 ? ", …" : ""} — go back to the workbench and stage their groups, or they won't reach the bank.`,
+      text: `Local draft field(s) NOT staged yet: ${pkg.unstagedDraft.slice(0, 8).join(", ")}${pkg.unstagedDraft.length > 8 ? ", …" : ""}; go back to the workbench and stage their groups, or they won't reach the bank.`,
     });
   }
 

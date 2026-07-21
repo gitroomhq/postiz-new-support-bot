@@ -36,12 +36,12 @@ export class MaintenanceHub {
       [
         `**Bridged tickets:** ${links}/${total}`,
         "",
-        "**Backfill tickets** — replay every unbridged ticket (open + closed, full transcripts) into Intercom.",
-        "**Heal Message Gaps** — outage repair over OPEN tickets, both directions (missed outbound messages + dropped agent-reply relays).",
-        "**Sync Closed Tickets** — re-assert the closed state of Discord-closed tickets onto Intercom (fixes incident auto-reopens).",
-        "**Reset bridge data** — wipe the bot's LOCAL bridge state (nothing deleted in Intercom).",
-        "**Wipe Intercom data** — permanently delete bridge-created conversations/tickets from Intercom + clear local state.",
-        "**Revoke Stripe Panel Links** — instantly invalidate every outstanding Stripe-panel link and session.",
+        "**Backfill tickets**: replay every unbridged ticket (open + closed, full transcripts) into Intercom.",
+        "**Heal Message Gaps**: outage repair over OPEN tickets, both directions (missed outbound messages + dropped agent-reply relays).",
+        "**Sync Closed Tickets**: re-assert the closed state of Discord-closed tickets onto Intercom (fixes incident auto-reopens).",
+        "**Reset bridge data**: wipe the bot's LOCAL bridge state (nothing deleted in Intercom).",
+        "**Wipe Intercom data**: permanently delete bridge-created conversations/tickets from Intercom + clear local state.",
+        "**Revoke Stripe Panel Links**: instantly invalidate every outstanding Stripe-panel link and session.",
         "",
         "Destructive tools ask twice.",
       ].join("\n")
@@ -141,7 +141,7 @@ export class MaintenanceHub {
         }
       }
 
-      const summary = `Intercom backfill queued **${enqueuedTickets}** ticket(s) (**${enqueuedEvents}** events), skipped ${skipped} already bridged. The ticket workflows push them in the background — watch the delivery workflows in /config → Temporal.`;
+      const summary = `Intercom backfill queued **${enqueuedTickets}** ticket(s) (**${enqueuedEvents}** events), skipped ${skipped} already bridged. The ticket workflows push them in the background; watch the delivery workflows in /config → Temporal.`;
       await report(summary, COLORS.success);
       void this.ctx.auditLogger.log({
         title: "🌉 Intercom backfill",
@@ -151,7 +151,7 @@ export class MaintenanceHub {
       });
     } catch (error) {
       maintLog.error("intercom backfill failed", error);
-      await report("Intercom backfill failed — check the logs; you can safely run it again from /intercom → Maintenance.", COLORS.danger);
+      await report("Intercom backfill failed. Check the logs; you can safely run it again from /intercom → Maintenance.", COLORS.danger);
     }
   }
 
@@ -162,7 +162,7 @@ export class MaintenanceHub {
     await interaction.deferReply({ flags: 64 });
     if (this.ctx.settingsStore.intercomMode() === "none") {
       await interaction.editReply({
-        embeds: [makeEmbed("The bridge is off — enable Push or Bidirectional first (Bridge hub), then heal.", COLORS.warn)],
+        embeds: [makeEmbed("The bridge is off. Enable Push or Bidirectional first (Bridge hub), then heal.", COLORS.warn)],
       });
       return;
     }
@@ -246,10 +246,10 @@ export class MaintenanceHub {
       const summary = [
         `Gap heal finished over **${tickets.length}** open ticket(s):`,
         `• **${healedMessages}** missed message(s) re-queued across **${healedTickets}** bridged ticket(s)`,
-        `• **${inboundParts}** Intercom agent part(s) re-checked across **${inboundTickets}** bridged ticket(s) — missed replies were relayed into their threads, already-relayed ones no-op`,
+        `• **${inboundParts}** Intercom agent part(s) re-checked across **${inboundTickets}** bridged ticket(s): missed replies were relayed into their threads, already-relayed ones no-op`,
         `• **${bridgedTickets}** unbridged ticket(s) sent to backfill (link + full transcript)`,
         `• ${untouched} needed nothing, ${gone} thread(s) gone`,
-        ...(inboundFailures > 0 ? [`⚠️ ${inboundFailures} ticket(s) failed the inbound re-check — safe to run the heal again.`] : []),
+        ...(inboundFailures > 0 ? [`⚠️ ${inboundFailures} ticket(s) failed the inbound re-check; safe to run the heal again.`] : []),
         "",
         "Delivery is paced through the ticket workflows; replayed parts keep their original timestamps (created_at backdating).",
       ].join("\n");
@@ -262,7 +262,7 @@ export class MaintenanceHub {
       });
     } catch (error) {
       maintLog.error("intercom gap heal failed", error);
-      await report("Gap heal failed — check the audit channel; it is safe to run again from /intercom → Maintenance.", COLORS.danger);
+      await report("Gap heal failed. Check the audit channel; it is safe to run again from /intercom → Maintenance.", COLORS.danger);
     }
   }
 
@@ -275,7 +275,7 @@ export class MaintenanceHub {
     await interaction.deferReply({ flags: 64 });
     if (this.ctx.settingsStore.intercomMode() === "none") {
       await interaction.editReply({
-        embeds: [makeEmbed("The bridge is off — enable Push or Bidirectional first (Bridge hub), then run the sync.", COLORS.warn)],
+        embeds: [makeEmbed("The bridge is off. Enable Push or Bidirectional first (Bridge hub), then run the sync.", COLORS.warn)],
       });
       return;
     }
@@ -301,7 +301,7 @@ export class MaintenanceHub {
           [
             `This deletes the bot's local bridge state: **${links}** link(s) plus the echo/pending ledgers.`,
             "",
-            "Nothing is deleted in Intercom itself. Use this when the Intercom side was cleared or recreated and the bookkeeping is stale — the next **Backfill** rebuilds every ticket from Discord.",
+            "Nothing is deleted in Intercom itself. Use this when the Intercom side was cleared or recreated and the bookkeeping is stale; the next **Backfill** rebuilds every ticket from Discord.",
             "⚠️ If the conversations/tickets still exist in Intercom, the next backfill will create duplicates.",
           ].join("\n"),
           COLORS.warn
@@ -341,10 +341,10 @@ export class MaintenanceHub {
       embeds: [
         makeEmbed(
           [
-            `⚠️ From Intercom this **permanently deletes** **${links.length}** conversation(s) and **${tickets}** converted ticket(s), and **archives** **${contacts}** bridge-created contact(s) (archiving keeps their external_ids reusable — a permanent contact delete would lock them for 7 days and block re-backfilling).`,
+            `⚠️ From Intercom this **permanently deletes** **${links.length}** conversation(s) and **${tickets}** converted ticket(s), and **archives** **${contacts}** bridge-created contact(s) (archiving keeps their external_ids reusable; a permanent contact delete would lock them for 7 days and block re-backfilling).`,
             "",
             "The bot's local bridge state (links + queued events + echo ledger) is wiped too, so a later **Backfill** can rebuild everything cleanly.",
-            "Only bridge-created objects are touched — Intercom-native conversations/contacts and all Discord threads stay untouched.",
+            "Only bridge-created objects are touched; Intercom-native conversations/contacts and all Discord threads stay untouched.",
           ].join("\n"),
           COLORS.danger
         ),
@@ -378,7 +378,7 @@ export class MaintenanceHub {
       const clearTargets = await this.collectClearTargets();
       const local = await this.ctx.intercomStore.resetAll();
       await this.signalClear(clearTargets);
-      await report(`Intercom wipe started — ${links.length} conversation(s) to delete…`);
+      await report(`Intercom wipe started: ${links.length} conversation(s) to delete…`);
 
       let tickets = 0;
       let conversations = 0;
@@ -423,7 +423,7 @@ export class MaintenanceHub {
       const summary = [
         `Intercom wipe done: deleted **${tickets}** ticket(s), **${conversations}** conversation(s); archived **${contacts}** contact(s); local state cleared (${local.links} links).`,
         ...(failures.length > 0
-          ? [`⚠️ ${failures.length} deletion(s) failed — remove these in Intercom by hand: ${failures.slice(0, 10).join(", ")}${failures.length > 10 ? ", …" : ""}`]
+          ? [`⚠️ ${failures.length} deletion(s) failed; remove these in Intercom by hand: ${failures.slice(0, 10).join(", ")}${failures.length > 10 ? ", …" : ""}`]
           : []),
       ].join("\n");
       await report(summary, failures.length > 0 ? COLORS.warn : COLORS.success);
@@ -436,7 +436,7 @@ export class MaintenanceHub {
     } catch (error) {
       maintLog.error("wipe failed", error);
       await report(
-        "Intercom wipe failed — check the logs. Local state may already be cleared; re-running the wipe only affects objects that still have links, so remaining Intercom objects must be removed by hand.",
+        "Intercom wipe failed. Check the logs. Local state may already be cleared; re-running the wipe only affects objects that still have links, so remaining Intercom objects must be removed by hand.",
         COLORS.danger
       );
     }

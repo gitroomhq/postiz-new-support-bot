@@ -380,7 +380,7 @@ export class TemporalService {
         void this.audit.log({
           title: "⏱️ Temporal recovered",
           severity: "success",
-          description: `The Temporal server is reachable again — buffered operations were flushed${
+          description: `The Temporal server is reachable again. Buffered operations were flushed${
             requeued > 0 ? ", but some failed again and were re-buffered" : ""
           }.`,
           fields: [
@@ -443,7 +443,7 @@ export class TemporalService {
     Sentry.withScope((scope) => {
       scope.setFingerprint(["temporal-down"]);
       scope.setContext("temporal", { what, error: msg });
-      Sentry.captureMessage("Temporal unreachable — buffering workflow operations", "warning");
+      Sentry.captureMessage("Temporal unreachable: buffering workflow operations", "warning");
     });
     // Transition embed only when we were actually up before (an unconfigured →
     // down flip at boot has no Discord client bound yet anyway).
@@ -521,7 +521,7 @@ export class TemporalService {
           title: "⏱️ Temporal buffer overflow",
           severity: "warn",
           description:
-            "The in-memory retry buffer is full — oldest operations are being dropped. " +
+            "The in-memory retry buffer is full. Oldest operations are being dropped. " +
             "Webhook-driven work will be redelivered by the sender; timer-driven work self-heals " +
             "from DB state after recovery.",
           fields: [{ name: "Capacity", value: String(this.buffer.capacityOf()), inline: true }],

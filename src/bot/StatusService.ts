@@ -88,7 +88,7 @@ export class StatusService {
     return Promise.race([settled, grace]).then((finished) => {
       clearTimeout(timer);
       if (!finished) {
-        statusLog.warn("thread edit rate-limited — continuing without it, it lands when the limit clears", {
+        statusLog.warn("thread edit rate-limited: continuing without it, it lands when the limit clears", {
           "thread.edit": edit,
           "ticket.thread_id": threadId,
         });
@@ -216,7 +216,7 @@ export class StatusService {
           : wasInactive
             ? ["🔓 Ticket reopened", "warn"]
             : ["🔄 Status changed", "info"];
-    const prevTag = ticket.statusTag ? `${ticket.statusTag.emoji} ${ticket.statusTag.label}` : "—";
+    const prevTag = ticket.statusTag ? `${ticket.statusTag.emoji} ${ticket.statusTag.label}` : "N/A";
     void this.audit.log({
       title,
       severity,

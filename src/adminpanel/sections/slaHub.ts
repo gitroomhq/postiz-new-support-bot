@@ -13,7 +13,7 @@ export function makeSlaHub(deps: { ruleStore: SlaRuleStore }): HubModule {
   const rs = deps.ruleStore;
 
   function targetOpts(targets: SlaTargetEntry[]): Opt[] {
-    return targets.map((t) => ({ value: t.value, label: t.note ? `${t.value} — ${t.note}` : t.value }));
+    return targets.map((t) => ({ value: t.value, label: t.note ? `${t.value}: ${t.note}` : t.value }));
   }
   function numOrU(v: unknown): number | undefined {
     if (v == null || v === "") return undefined;
@@ -64,8 +64,8 @@ export function makeSlaHub(deps: { ruleStore: SlaRuleStore }): HubModule {
               id: t.value,
               cells: [
                 t.value,
-                t.note || "—",
-                [t.firstReplyMins != null ? `first ${t.firstReplyMins}` : null, t.nextReplyMins != null ? `next ${t.nextReplyMins}` : null, t.resolveMins != null ? `resolve ${t.resolveMins}` : null].filter(Boolean).join(", ") || "—",
+                t.note || "N/A",
+                [t.firstReplyMins != null ? `first ${t.firstReplyMins}` : null, t.nextReplyMins != null ? `next ${t.nextReplyMins}` : null, t.resolveMins != null ? `resolve ${t.resolveMins}` : null].filter(Boolean).join(", ") || "N/A",
               ],
               rowActions: [
                 { key: "target_edit", label: "Edit", params: { id: t.value }, inputs: targetInputs(t) },
@@ -98,7 +98,7 @@ export function makeSlaHub(deps: { ruleStore: SlaRuleStore }): HubModule {
               ];
               return {
                 id: r.id,
-                cells: [r.name, r.target, r.enabled ? { kind: "ok" as const, text: "on" } : { kind: "warn" as const, text: "off" }, expr || "—"],
+                cells: [r.name, r.target, r.enabled ? { kind: "ok" as const, text: "on" } : { kind: "warn" as const, text: "off" }, expr || "N/A"],
                 rowActions: [
                   { key: "rule_edit", label: "Edit", params: { id: r.id }, inputs: ruleInputs },
                   { key: r.enabled ? "rule_disable" : "rule_enable", label: r.enabled ? "Disable" : "Enable", params: { id: r.id } },
@@ -180,8 +180,8 @@ export function makeSlaHub(deps: { ruleStore: SlaRuleStore }): HubModule {
             return { ok: true, text: "Saved." };
           }
           case "target_del": {
-            if (rs.targetInUse(id)) return { ok: false, error: "That target is used by a rule — reassign it first." };
-            if (s.slaDefaultTarget() === id) return { ok: false, error: "That target is the default — change the default first." };
+            if (rs.targetInUse(id)) return { ok: false, error: "That target is used by a rule. Reassign it first." };
+            if (s.slaDefaultTarget() === id) return { ok: false, error: "That target is the default. Change the default first." };
             await s.updateSlaTargets(s.slaTargets().filter((t) => t.value !== id));
             await ctx.audit(`delete sla target ${id}`);
             return { ok: true, text: "Deleted." };

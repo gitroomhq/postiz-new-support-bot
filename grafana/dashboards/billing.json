@@ -1,6 +1,6 @@
 {
   "uid": "psb-billing",
-  "title": "Billing — Support Events",
+  "title": "Billing: Support Events",
   "description": "Bot-side billing activity: self-service refunds & discounts, blocked-charge reviews, Stripe disputes and early fraud warnings.",
   "tags": [
     "postiz-support-bot"

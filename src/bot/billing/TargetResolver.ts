@@ -154,7 +154,7 @@ export class TargetResolver {
           await interaction.editReply(
             this.buildTargetPanel(
               "link",
-              "No Discord user is linked to this Stripe customer yet — pick the user to link.",
+              "No Discord user is linked to this Stripe customer yet. Pick the user to link.",
               "customers"
             )
           );
@@ -168,14 +168,14 @@ export class TargetResolver {
   private buildPayBridgePanel(token: string, customerId: string, op: "bal" | "charge"): Panel {
     const isBal = op === "bal";
     const embed = new EmbedBuilder()
-      .setTitle(`${isBal ? "Adjust balance" : "Charge card now"} — \`${customerId}\``)
+      .setTitle(`${isBal ? "Adjust balance" : "Charge card now"}: \`${customerId}\``)
       .setColor(isBal ? COLORS.brand : COLORS.warn)
       .setDescription(
         isBal
           ? "Grant a credit or add a debit on this customer's Stripe balance (negative = credit, applied to " +
-              "future invoices).\nThe customer is already selected — continue into the Payments flow below."
-          : "⚡ Creates an **off-session** charge on a saved card — no 3DS/authentication step is possible; if " +
-              "the bank requires it the charge fails.\nThe customer is already selected — enter the amount to continue."
+              "future invoices).\nThe customer is already selected. Continue into the Payments flow below."
+          : "⚡ Creates an **off-session** charge on a saved card: no 3DS/authentication step is possible; if " +
+              "the bank requires it the charge fails.\nThe customer is already selected. Enter the amount to continue."
       );
     return {
       embeds: [embed],
@@ -270,7 +270,7 @@ export class TargetResolver {
         await interaction.editReply(
           this.buildTargetPanel(
             action,
-            `<@${pickedId}> has no bot session — they've never logged in via **Start Here**. ` +
+            `<@${pickedId}> has no bot session. They've never logged in via **Start Here**. ` +
               `Use manual entry (cus_… / email) instead.`,
             origin
           )
@@ -364,7 +364,7 @@ export class TargetResolver {
       const token = this.ctx.sessions.newSession(interaction, { pendingAction: action, originHub: origin });
       const select = new StringSelectMenuBuilder()
         .setCustomId(`billadmin_cuspick:${token}`)
-        .setPlaceholder("Several Stripe customers are linked — pick one")
+        .setPlaceholder("Several Stripe customers are linked. Pick one")
         .addOptions(
           stripeIds.slice(0, 25).map((id) => ({ label: id, description: "via Postiz link", value: id }))
         );
@@ -435,7 +435,7 @@ export class TargetResolver {
   buildCustomerPickPanel(customers: Stripe.Customer[], token: string, backTarget: string): Panel {
     const select = new StringSelectMenuBuilder()
       .setCustomId(`billadmin_cuspick:${token}`)
-      .setPlaceholder("Several customers matched — pick one")
+      .setPlaceholder("Several customers matched. Pick one")
       .addOptions(
         customers.slice(0, 25).map((c) => ({
           label: (c.email ?? c.id).slice(0, 100),

@@ -268,7 +268,7 @@ export class PaymentsHub {
         await interaction.editReply(
           this.buildTargetPanel(
             op,
-            `<@${pickedId}> has no bot session — they've never logged in via **Start Here**. ` +
+            `<@${pickedId}> has no bot session. They've never logged in via **Start Here**. ` +
               `Use manual entry (cus_… / email) instead.`
           )
         );
@@ -326,7 +326,7 @@ export class PaymentsHub {
         this.newFlow(token, op);
         const select = new StringSelectMenuBuilder()
           .setCustomId(`billadmin_pay_cuspick:${token}`)
-          .setPlaceholder("Several customers matched — pick one")
+          .setPlaceholder("Several customers matched, pick one")
           .addOptions(
             customers.slice(0, 25).map((c) => ({
               label: (c.email ?? c.id).slice(0, 100),
@@ -361,7 +361,7 @@ export class PaymentsHub {
       this.newFlow(token, op);
       const select = new StringSelectMenuBuilder()
         .setCustomId(`billadmin_pay_cuspick:${token}`)
-        .setPlaceholder("Several Stripe customers are linked — pick one")
+        .setPlaceholder("Several Stripe customers are linked, pick one")
         .addOptions(stripeIds.slice(0, 25).map((id) => ({ label: id, description: "via Postiz link", value: id })));
       await interaction.editReply({
         embeds: [makeEmbed(`Postiz user \`${target}\` maps to ${stripeIds.length} Stripe customers.`, COLORS.warn)],
@@ -433,10 +433,10 @@ export class PaymentsHub {
     );
 
     const embed = new EmbedBuilder()
-      .setTitle(`Payment methods — \`${customerId}\``)
+      .setTitle(`Payment methods: \`${customerId}\``)
       .setColor(COLORS.brand)
       .setDescription(lines.join("\n").slice(0, 4096) || "No saved payment methods.")
-      .setFooter({ text: "Read-only here — set default / detach via Manage in Cards hub" });
+      .setFooter({ text: "Read-only here. Set default / detach via Manage in Cards hub" });
 
     await interaction.editReply({
       embeds: [embed],
@@ -476,16 +476,16 @@ export class PaymentsHub {
     const balance = customer.balance ?? 0;
 
     const embed = new EmbedBuilder()
-      .setTitle(`Customer balance — \`${customer.id}\``)
+      .setTitle(`Customer balance: \`${customer.id}\``)
       .setColor(COLORS.brand)
       .setDescription(
         [
           notice,
           `Current balance: **${this.ctx.stripe.formatAmount(balance, displayCurrency)}**` +
-            (customer.currency ? "" : " *(customer has no settled currency yet — shown as USD)*"),
+            (customer.currency ? "" : " *(customer has no settled currency yet, shown as USD)*"),
           "",
-          "ℹ️ **Negative balance = credit** — automatically applied to (reduces) future invoices.",
-          "**Positive balance = debit** — added on top of future invoices.",
+          "ℹ️ **Negative balance = credit**: automatically applied to (reduces) future invoices.",
+          "**Positive balance = debit**: added on top of future invoices.",
         ]
           .filter((line): line is string => line !== undefined)
           .join("\n")
@@ -560,7 +560,7 @@ export class PaymentsHub {
         await interaction.editReply({
           embeds: [
             makeEmbed(
-              `This customer's currency is \`${customer.currency}\` — balance adjustments must use it. ` +
+              `This customer's currency is \`${customer.currency}\`. Balance adjustments must use it. ` +
                 `You entered \`${currency}\`. Stripe would reject the transaction.`,
               COLORS.danger
             ),
@@ -582,8 +582,8 @@ export class PaymentsHub {
       const fmt = this.ctx.stripe.formatAmount(amountMinor, currency);
       const effect =
         kind === "credit"
-          ? `Grants a **${fmt}** credit — applied automatically to future invoices.`
-          : `Adds a **${fmt}** debit — the customer owes this on top of future invoices.`;
+          ? `Grants a **${fmt}** credit, applied automatically to future invoices.`
+          : `Adds a **${fmt}** debit; the customer owes this on top of future invoices.`;
 
       const embed = new EmbedBuilder()
         .setTitle(kind === "credit" ? "Confirm credit" : "Confirm debit")
@@ -620,7 +620,7 @@ export class PaymentsHub {
     await this.ctx.sessions.runExclusive(token, interaction, async () => {
       const kind = flow.kind ?? "credit";
       const fmt = this.ctx.stripe.formatAmount(flow.amountMinor ?? Math.abs(flow.signedMinor!), flow.currency!);
-      const actionName = kind === "credit" ? "Adjust balance — grant credit" : "Adjust balance — add debit";
+      const actionName = kind === "credit" ? "Adjust balance: grant credit" : "Adjust balance: add debit";
 
       let txn: Stripe.CustomerBalanceTransaction;
       try {
@@ -637,7 +637,7 @@ export class PaymentsHub {
           action: actionName,
           targetCustomerId: session.customerId,
           amountText: `${fmt} (${kind})`,
-          outcome: `Failed — ${msg.slice(0, 500)}`,
+          outcome: `Failed: ${msg.slice(0, 500)}`,
           severity: "danger",
         });
         await interaction.editReply({
@@ -657,14 +657,14 @@ export class PaymentsHub {
         targetCustomerId: session.customerId,
         objectId: txn.id,
         amountText: `${fmt} (${kind})`,
-        outcome: `Success — new balance ${this.ctx.stripe.formatAmount(txn.ending_balance, txn.currency)}`,
+        outcome: `Success: new balance ${this.ctx.stripe.formatAmount(txn.ending_balance, txn.currency)}`,
         severity: kind === "debit" ? "warn" : "success",
       });
 
       await this.renderBalancePanel(
         interaction,
         token,
-        `✅ ${kind === "credit" ? "Credited" : "Debited"} **${fmt}** — transaction \`${txn.id}\`.\n`
+        `✅ ${kind === "credit" ? "Credited" : "Debited"} **${fmt}**, transaction \`${txn.id}\`.\n`
       );
     });
   }
@@ -691,7 +691,7 @@ export class PaymentsHub {
     });
 
     const embed = new EmbedBuilder()
-      .setTitle(`Balance history — \`${session.customerId}\``)
+      .setTitle(`Balance history: \`${session.customerId}\``)
       .setColor(COLORS.brand)
       .setDescription(lines.join("\n").slice(0, 4096) || "No balance transactions.")
       .setFooter({ text: `Page ${page + 1} · negative = credit, positive = debit` });
@@ -725,7 +725,7 @@ export class PaymentsHub {
     flow.customerCurrency = customer.currency ?? undefined;
 
     const embed = new EmbedBuilder()
-      .setTitle(`Charge card now — \`${customer.id}\``)
+      .setTitle(`Charge card now: \`${customer.id}\``)
       .setColor(COLORS.warn)
       .setDescription(
         [
@@ -812,7 +812,7 @@ export class PaymentsHub {
       await interaction.editReply({
         embeds: [
           makeEmbed(
-            `\`${session.customerId}\` has no saved payment methods — nothing to charge off-session. ` +
+            `\`${session.customerId}\` has no saved payment methods. Nothing to charge off-session. ` +
               "Send an invoice by email instead (Invoices hub).",
             COLORS.warn
           ),
@@ -839,7 +839,7 @@ export class PaymentsHub {
       );
 
     const embed = new EmbedBuilder()
-      .setTitle(`Charge ${this.ctx.stripe.formatAmount(flow.amountMinor, flow.currency)} — pick a card`)
+      .setTitle(`Charge ${this.ctx.stripe.formatAmount(flow.amountMinor, flow.currency)}: pick a card`)
       .setColor(COLORS.warn)
       .setDescription(
         `Customer \`${session.customerId}\` · ${flow.description ?? "no description"}\n` +
@@ -873,14 +873,14 @@ export class PaymentsHub {
         .setTitle("Confirm manual charge")
         .setColor(COLORS.danger)
         .setDescription(
-          `⚡ Charges **${fmt}** to **${pmLabel}** **immediately, off-session** — no 3DS/authentication ` +
+          `⚡ Charges **${fmt}** to **${pmLabel}** **immediately, off-session**. No 3DS/authentication ` +
             "step is possible. If the bank requires authentication the charge fails."
         )
         .addFields(
           { name: "Customer", value: `\`${session.customerId}\``, inline: true },
           { name: "Payment method", value: `\`${session.paymentMethodId}\``, inline: true },
           { name: "Amount", value: fmt, inline: true },
-          { name: "Description", value: (flow.description ?? "—").slice(0, 1024), inline: false }
+          { name: "Description", value: (flow.description ?? "N/A").slice(0, 1024), inline: false }
         );
 
       await interaction.editReply({
@@ -926,17 +926,17 @@ export class PaymentsHub {
           targetCustomerId: session.customerId,
           objectId: session.paymentMethodId,
           amountText: fmt,
-          outcome: `Failed — ${code}: ${msg.slice(0, 400)}`,
+          outcome: `Failed (${code}): ${msg.slice(0, 400)}`,
           severity: "danger",
         });
         const needs3ds = err.code === "authentication_required" || err.decline_code === "authentication_required";
         const hint = needs3ds
-          ? "\n💡 card requires 3DS — send an invoice by email instead (Invoices hub)."
+          ? "\n💡 card requires 3DS. Send an invoice by email instead (Invoices hub)."
           : "";
         await interaction.editReply({
           embeds: [
             makeEmbed(
-              `❌ Charge failed — decline code \`${code}\`.\n${msg.slice(0, 500)}${hint}`,
+              `❌ Charge failed: decline code \`${code}\`.\n${msg.slice(0, 500)}${hint}`,
               COLORS.danger
             ),
           ],
@@ -955,15 +955,15 @@ export class PaymentsHub {
         targetCustomerId: session.customerId,
         objectId: pi.id,
         amountText: fmt,
-        outcome: `PaymentIntent \`${pi.id}\` — ${pi.status}`,
+        outcome: `PaymentIntent \`${pi.id}\` · ${pi.status}`,
         severity: "success",
       });
 
-      const statusNote = pi.status === "succeeded" ? "" : `\nℹ️ Status: \`${pi.status}\` — not final yet, check Stripe.`;
+      const statusNote = pi.status === "succeeded" ? "" : `\nℹ️ Status: \`${pi.status}\`. Not final yet, check Stripe.`;
       await interaction.editReply({
         embeds: [
           makeEmbed(
-            `✅ Charged **${fmt}** on \`${session.customerId}\` — PaymentIntent \`${pi.id}\` (${pi.status}).${statusNote}`,
+            `✅ Charged **${fmt}** on \`${session.customerId}\`, PaymentIntent \`${pi.id}\` (${pi.status}).${statusNote}`,
             COLORS.success
           ),
         ],
@@ -978,7 +978,7 @@ export class PaymentsHub {
     if (!CURRENCY_RE.test(currency)) return "Currency must be a 3-letter code like `eur` or `usd`.";
     if (!AMOUNT_RE.test(amountRaw)) return "Amount must be a positive number like `12.50`.";
     if (StripeClient.isZeroDecimal(currency) && amountRaw.includes(".")) {
-      return `\`${currency}\` is a zero-decimal currency — whole amounts only.`;
+      return `\`${currency}\` is a zero-decimal currency: whole amounts only.`;
     }
     const minor = this.toMinor(amountRaw, currency);
     if (minor <= 0) return "Amount must be greater than zero.";

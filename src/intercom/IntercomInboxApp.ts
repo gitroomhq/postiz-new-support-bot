@@ -95,7 +95,7 @@ export class IntercomInboxApp {
         return this.buildCanvas(
           body,
           ok
-            ? "✅ Panel unlocked — return to your browser."
+            ? "✅ Panel unlocked. Return to your browser."
             : "⚠️ That code didn't match. Open the panel link and enter the exact code shown."
         );
       }
@@ -118,7 +118,7 @@ export class IntercomInboxApp {
       }
     } catch (e) {
       this.log.warn("canvas submit action failed", { error: e instanceof Error ? e.message : String(e) });
-      return this.buildCanvas(body, "⚠️ Action failed — check the audit log.");
+      return this.buildCanvas(body, "⚠️ Action failed. Check the audit log.");
     }
     return this.buildCanvas(body);
   }
@@ -139,7 +139,7 @@ export class IntercomInboxApp {
   private noticeForRequest(
     outcome: Awaited<ReturnType<BillingActionService["request"]>> | null
   ): string {
-    if (!outcome) return "⏳ Still processing — press Refresh in a few seconds.";
+    if (!outcome) return "⏳ Still processing. Press Refresh in a few seconds.";
     switch (outcome.kind) {
       case "executed":
         return `✅ ${outcome.text}`;
@@ -153,7 +153,7 @@ export class IntercomInboxApp {
   private noticeForApproval(
     outcome: Awaited<ReturnType<BillingActionService["actOnApproval"]>> | null
   ): string {
-    if (!outcome) return "⏳ Still processing — press Refresh in a few seconds.";
+    if (!outcome) return "⏳ Still processing. Press Refresh in a few seconds.";
     switch (outcome.kind) {
       case "executed":
         return `✅ ${outcome.text}`;
@@ -181,7 +181,7 @@ export class IntercomInboxApp {
     });
     const url = `${base}/intercom/panel?t=${encodeURIComponent(token)}`;
     return this.buildCanvas(body, undefined, {
-      label: `Open Stripe Panel — link for ${actor.name}, valid 15 minutes`,
+      label: `Open Stripe Panel · link for ${actor.name}, valid 15 minutes`,
       url,
     });
   }
@@ -204,10 +204,10 @@ export class IntercomInboxApp {
     components.push(header("🎫 Discord ticket"));
 
     if (ticket) {
-      const statusLabel = ticket.statusTag ? `${ticket.statusTag.emoji} ${ticket.statusTag.label}` : "—";
+      const statusLabel = ticket.statusTag ? `${ticket.statusTag.emoji} ${ticket.statusTag.label}` : "N/A";
       components.push(
         dataRow("Customer", ticket.customerDisplayName ?? ticket.customerId ?? "unknown"),
-        dataRow("Category", this.categoryLabelResolver(ticket.categoryId) ?? "—"),
+        dataRow("Category", this.categoryLabelResolver(ticket.categoryId) ?? "N/A"),
         dataRow("Status", statusLabel),
         ...(ticket.csatScore != null ? [dataRow("CSAT", `${ticket.csatScore}/5`)] : [])
       );
@@ -312,7 +312,7 @@ export class IntercomInboxApp {
     const components: CanvasComponent[] = [divider(), header("📋 Pending approvals")];
     for (const approval of pending.slice(0, 3)) {
       const age = Math.max(0, Math.floor((Date.now() - approval.createdAt.getTime()) / (60 * 60 * 1000)));
-      const state = approval.status === "FAILED" ? ` — FAILED: ${approval.errorText ?? "error"} (retryable)` : "";
+      const state = approval.status === "FAILED" ? ` · FAILED: ${approval.errorText ?? "error"} (retryable)` : "";
       components.push(
         text(`${approval.summary}\nRequested by ${approval.requestedByName}, ${age}h ago${state}`),
         {

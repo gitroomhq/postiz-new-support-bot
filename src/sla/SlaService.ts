@@ -236,7 +236,7 @@ export class SlaService {
       title: "🎯 SLA target pinned",
       actor: actor.name,
       threadId: "threadId" in ref ? ref.threadId : undefined,
-      description: `Pinned to \`${target}\`${"conversationId" in ref ? ` (conversation ${ref.conversationId})` : ""} — rules are bypassed until unpinned.`,
+      description: `Pinned to \`${target}\`${"conversationId" in ref ? ` (conversation ${ref.conversationId})` : ""}; rules are bypassed until unpinned.`,
       severity: "info",
     });
     return this.applyRef(ref, "pin");
@@ -320,26 +320,26 @@ export class SlaService {
     const runbook = [
       attributeExists
         ? `✅ Conversation attribute **${attributeName}** exists.`
-        : `❌ Create a **List** conversation attribute named exactly **${attributeName}** (Intercom → Settings → Data → Conversations — the API cannot create it). Options: ${targets.map((t) => `\`${t.value}\``).join(", ") || "add targets first"}.`,
+        : `❌ Create a **List** conversation attribute named exactly **${attributeName}** (Intercom → Settings → Data → Conversations; the API cannot create it). Options: ${targets.map((t) => `\`${t.value}\``).join(", ") || "add targets first"}.`,
       statusAttributeExists
         ? `✅ Conversation attribute **${statusAttributeName}** exists.`
         : `❌ Create a **List** conversation attribute named exactly **${statusAttributeName}** with options \`ok\`, \`at_risk\`, \`breached\` (the enforcement looper writes it; writes 4xx until it exists).`,
       `${withClocks.length > 0 ? "✅" : "❌"} ${withClocks.length}/${targets.length} target(s) have clock durations` +
-        (withClocks.length === 0 ? " — set durations in Targets, or no clock ever runs." : ".") +
+        (withClocks.length === 0 ? ". Set durations in Targets, or no clock ever runs." : ".") +
         (rulesMissingClocks.length > 0
           ? ` ⚠️ Enabled rule target(s) without clocks: ${[...new Set(rulesMissingClocks)].map((t) => `\`${t}\``).join(", ")}.`
           : ""),
       oh === undefined
-        ? "▫️ Office hours disabled — clocks run on wall clock (24/7)."
+        ? "▫️ Office hours disabled: clocks run on wall clock (24/7)."
         : oh === null
-          ? "❌ Office hours are enabled but the schedule is invalid — clocks fall back to wall clock until fixed."
+          ? "❌ Office hours are enabled but the schedule is invalid; clocks fall back to wall clock until fixed."
           : `✅ Office hours: ${oh.tz}, clocks pause outside the schedule.`,
       breachTagExists
         ? `✅ Breach tag **${this.settingsStore.slaBreachTagName()}** exists.`
         : `▫️ Breach tag **${this.settingsStore.slaBreachTagName()}** will be created on first breach.`,
       "Developer Hub → your app → Webhooks: manually subscribe `conversation.user.created`, `conversation.user.replied` and `conversation.admin.assigned` (native rules, reopen-reassignment and the assignee dim need them; bridged target evaluation works without them).",
-      "Old Expert-tier leftovers: delete the two Apply-SLA Workflows in Intercom if they still exist — native SLAs are gone on Advanced and the bot no longer posts kick notes.",
-      "Ticket-attribute mirror: /intercom → Bridge → Ensure Ticket Attributes (unchanged — bridged Customer tickets mirror the target attribute).",
+      "Old Expert-tier leftovers: delete the two Apply-SLA Workflows in Intercom if they still exist; native SLAs are gone on Advanced and the bot no longer posts kick notes.",
+      "Ticket-attribute mirror: /intercom → Bridge → Ensure Ticket Attributes (unchanged; bridged Customer tickets mirror the target attribute).",
     ];
     return { attributeExists, statusAttributeExists, attributeName, runbook };
   }

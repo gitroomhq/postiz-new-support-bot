@@ -58,15 +58,15 @@ export function makeSecuritySection(deps: {
           }
           await deps.credentials.setPassphrase(ctx.actor.id, passphrase);
           await recordAudit(deps.audit, ctx, "passphrase.set", had ? "Passphrase changed" : "Passphrase set");
-          return { ok: true, text: had ? "Passphrase changed." : "Passphrase set — now add a passkey." };
+          return { ok: true, text: had ? "Passphrase changed." : "Passphrase set. Now add a passkey." };
         }
         case "section:security.totp_confirm": {
           prunePending();
           const pending = pendingTotp.get(ctx.actor.id);
-          if (!pending) return { ok: false, error: "Enrollment expired — start over." };
+          if (!pending) return { ok: false, error: "Enrollment expired. Start over." };
           const code = str(p.code, 10);
           const result = verifyTotp(pending.secret, code, null);
-          if (!result.ok) return { ok: false, fieldErrors: { code: "That code didn't match — try the next one." } };
+          if (!result.ok) return { ok: false, fieldErrors: { code: "That code didn't match. Try the next one." } };
           await deps.credentials.setTotp(ctx.actor.id, pending.secret, str(p.label, 80) || "Authenticator");
           pendingTotp.delete(ctx.actor.id);
           await recordAudit(deps.audit, ctx, "totp.enrolled", "Authenticator (TOTP) enrolled");
@@ -94,7 +94,7 @@ export function makeSecuritySection(deps: {
           // this one) by bumping the epoch. Re-entry = fresh sign-in.
           const epoch = await ctx.settings.bumpDashboardEpoch();
           await recordAudit(deps.audit, ctx, "session.signout_everywhere", `Epoch bumped to ${epoch}`);
-          return { ok: true, text: "Signed out everywhere — sign in again." };
+          return { ok: true, text: "Signed out everywhere. Sign in again." };
         }
         default:
           return { ok: false, error: "Unknown action." };
@@ -131,13 +131,13 @@ export function makeSecuritySection(deps: {
       blocks.push({
         type: "notice",
         badge: { kind: "warn", text: "SETUP" },
-        text: "No passphrase yet. Set one (right rail), then register a passkey — after that you sign in at this URL directly, no Discord link needed.",
+        text: "No passphrase yet. Set one (right rail), then register a passkey. After that you sign in at this URL directly, no Discord link needed.",
       });
     } else if (!credentials.some((c) => c.kind === "passkey")) {
       blocks.push({
         type: "notice",
         badge: { kind: "warn", text: "SETUP" },
-        text: "Passphrase is set — now register a passkey (Touch ID / Windows Hello / security key) to finish standing-login setup.",
+        text: "Passphrase is set. Now register a passkey (Touch ID / Windows Hello / security key) to finish standing-login setup.",
       });
     }
 
@@ -177,7 +177,7 @@ export function makeSecuritySection(deps: {
             { type: "text", key: "passphrase", label: `New passphrase (min ${MIN_PASSPHRASE_LENGTH} chars)` },
             { type: "text", key: "confirm", label: "Repeat passphrase" },
           ],
-          summary: "The knowledge factor — asked after every passkey touch at sign-in.",
+          summary: "The knowledge factor, asked after every passkey touch at sign-in.",
         },
         {
           key: "auth-register",
@@ -199,7 +199,7 @@ export function makeSecuritySection(deps: {
         },
         {
           label: "Lockdown",
-          cell: { t: "text", v: "Full lockdown (disable + revoke) lives in Discord: /config → Open Web Panel → Dashboard — the web can only reduce its own access." },
+          cell: { t: "text", v: "Full lockdown (disable + revoke) lives in Discord: /config → Open Web Panel → Dashboard. The web can only reduce its own access." },
         },
       ],
       actions: [
@@ -230,7 +230,7 @@ export function makeSecuritySection(deps: {
           id: c.id,
           cells: [
             { t: "badge", b: { kind: c.kind === "passkey" ? "info" : "neutral", text: c.kind } },
-            { t: "text", v: c.label ?? "—" },
+            { t: "text", v: c.label ?? "N/A" },
             isoDate(c.createdAt),
             c.lastUsedAt ? isoDate(c.lastUsedAt) : { t: "text", v: "never" },
           ] as Cell[],
@@ -293,7 +293,7 @@ export function makeSecuritySection(deps: {
       type: "timeline",
       title: "Recent activity",
       items: events.map((e) => ({
-        label: `${e.action} — ${e.summary}`,
+        label: `${e.action} · ${e.summary}`,
         iso: e.at.toISOString(),
         text: e.ip ? `from ${e.ip}` : undefined,
         kind: e.outcome === "ok" ? ("info" as const) : ("error" as const),

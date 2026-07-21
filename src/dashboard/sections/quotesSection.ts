@@ -52,7 +52,7 @@ export function makeQuotesSection(): DashboardSectionModule {
           `dash-quote-${customerId}-${Date.now().toString(36)}`
         );
         await ctx.audit(`Quote ${quote.id} drafted for ${customerId} (${priceId} ×${quantity})`);
-        return { ok: true, text: `Draft quote ${quote.id} created — finalize it to make it acceptable.` };
+        return { ok: true, text: `Draft quote ${quote.id} created. Finalize it to make it acceptable.` };
       }
 
       const id = typeof p.id === "string" && QUOTE_ID_RE.test(p.id) ? p.id : null;
@@ -69,11 +69,11 @@ export function makeQuotesSection(): DashboardSectionModule {
           const quote = await ctx.stripe.getQuote(id).catch(() => null);
           if (!quote) return { ok: false, error: "This quote does not exist." };
           if (quote.status !== "open" && quote.status !== "accepted") {
-            return { ok: false, error: `Quote is ${quote.status} — PDFs exist for open or accepted quotes only.` };
+            return { ok: false, error: `Quote is ${quote.status}; PDFs exist for open or accepted quotes only.` };
           }
           const pdf = await ctx.stripe.getQuotePdf(id, QUOTE_PDF_MAX_BYTES);
           if (!pdf) {
-            return { ok: false, error: "Could not fetch the PDF (too large or not a PDF) — use the Stripe Dashboard." };
+            return { ok: false, error: "Could not fetch the PDF (too large or not a PDF); use the Stripe Dashboard." };
           }
           await ctx.audit(`Quote ${id} PDF downloaded (${pdf.length} bytes)`);
           return {
@@ -88,11 +88,11 @@ export function makeQuotesSection(): DashboardSectionModule {
           const quote = await ctx.stripe.getQuote(id).catch(() => null);
           if (!quote) return { ok: false, error: "This quote does not exist." };
           if (quote.status !== "draft") {
-            return { ok: false, error: `Quote is ${quote.status} — only draft quotes can be finalized.` };
+            return { ok: false, error: `Quote is ${quote.status}; only draft quotes can be finalized.` };
           }
           const finalized = await ctx.stripe.finalizeQuote(id, `dash-qtfinal-${id}`);
           await ctx.audit(`Quote ${id} finalized (${finalized.number ?? "no number"})`);
-          return { ok: true, text: `Quote ${id} is now open${finalized.number ? ` as ${finalized.number}` : ""} — it can be accepted.` };
+          return { ok: true, text: `Quote ${id} is now open${finalized.number ? ` as ${finalized.number}` : ""}; it can be accepted.` };
         }
         // T1 — kill a draft/open quote (accepted quotes are immutable history).
         case "section:quotes.cancel": {
@@ -100,7 +100,7 @@ export function makeQuotesSection(): DashboardSectionModule {
           const quote = await ctx.stripe.getQuote(id).catch(() => null);
           if (!quote) return { ok: false, error: "This quote does not exist." };
           if (quote.status !== "draft" && quote.status !== "open") {
-            return { ok: false, error: `Quote is ${quote.status} — only draft or open quotes can be canceled.` };
+            return { ok: false, error: `Quote is ${quote.status}; only draft or open quotes can be canceled.` };
           }
           await ctx.stripe.cancelQuote(id, `dash-qtcancel-${id}`);
           await ctx.audit(`Quote ${id} canceled (was ${quote.status})`);
@@ -113,7 +113,7 @@ export function makeQuotesSection(): DashboardSectionModule {
           const quote = await ctx.stripe.getQuote(id).catch(() => null);
           if (!quote) return { ok: false, error: "This quote does not exist." };
           if (quote.status !== "open") {
-            return { ok: false, error: `Quote is ${quote.status} — only open (finalized) quotes can be accepted.` };
+            return { ok: false, error: `Quote is ${quote.status}; only open (finalized) quotes can be accepted.` };
           }
           const accepted = await ctx.stripe.acceptQuote(id, `dash-qtaccept-${id}`);
           const subId = typeof accepted.subscription === "string" ? accepted.subscription : accepted.subscription?.id ?? null;
@@ -123,7 +123,7 @@ export function makeQuotesSection(): DashboardSectionModule {
           );
           return {
             ok: true,
-            text: `Quote ${id} accepted${subId ? ` — subscription ${subId}` : ""}${invId ? `${subId ? "," : " —"} invoice ${invId}` : ""}.`,
+            text: `Quote ${id} accepted${subId ? `: subscription ${subId}` : ""}${invId ? `${subId ? "," : ":"} invoice ${invId}` : ""}.`,
           };
         }
         default:
@@ -146,7 +146,7 @@ function customerBits(q: Stripe.Quote): { id: string | null; label: string } {
     const cust = c as Stripe.Customer;
     return { id: cust.id, label: cust.name ?? cust.email ?? cust.id };
   }
-  return { id: null, label: "—" };
+  return { id: null, label: "N/A" };
 }
 
 async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: string | null): Promise<SectionPage> {
@@ -161,7 +161,7 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
 
   const priceOptions = prices.slice(0, 25).map((p) => ({
     value: p.id,
-    label: `${p.nickname ?? p.id.slice(0, 18)} — ${p.unit_amount != null ? ctx.stripe.formatAmount(p.unit_amount, p.currency) : "?"}${p.recurring ? `/${p.recurring.interval}` : ""}`,
+    label: `${p.nickname ?? p.id.slice(0, 18)}: ${p.unit_amount != null ? ctx.stripe.formatAmount(p.unit_amount, p.currency) : "?"}${p.recurring ? `/${p.recurring.interval}` : ""}`,
   }));
 
   const blocks: Block[] = [
@@ -178,7 +178,7 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
             { type: "select", key: "price", label: "Price", options: priceOptions },
             { type: "number", key: "quantity", label: "Quantity (default 1)", min: 1, max: 999 },
           ],
-          summary: "Creates a DRAFT quote for one price — nothing is billable until it's finalized and accepted.",
+          summary: "Creates a DRAFT quote for one price; nothing is billable until it's finalized and accepted.",
         },
       ],
     },
@@ -220,8 +220,8 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
             } as Cell,
             cust.id
               ? ({ t: "link", v: cust.label, ref: { page: "customers.detail", params: { id: cust.id } } } as Cell)
-              : text("—"),
-            text(q.number ?? "—"),
+              : text("N/A"),
+            text(q.number ?? "N/A"),
             dateCell(q.expires_at),
             idCell(q.id, { copy: true }),
           ] as Cell[],
@@ -229,7 +229,7 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
       }),
       nextCursor:
         quotesRes.hasMore && quotesRes.quotes.length > 0 ? quotesRes.quotes[quotesRes.quotes.length - 1].id : null,
-      empty: statusFilter ? "No quotes match this filter (within this window)." : "No quotes yet — draft one above.",
+      empty: statusFilter ? "No quotes match this filter (within this window)." : "No quotes yet. Draft one above.",
       ...(quotes.length ? { footer: `${quotes.length} item${quotes.length === 1 ? "" : "s"}` } : {}),
       notice: "Counts cover this page's window. Accepting a quote creates its subscription/invoice.",
     },
@@ -260,7 +260,7 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
       style: "primary",
       dangerous: true,
       params: { id: quote.id },
-      summary: "Finalizes the draft — the quote opens, gets its number, and can be accepted.",
+      summary: "Finalizes the draft: the quote opens, gets its number, and can be accepted.",
     });
   }
   if (quote.status === "open") {
@@ -272,7 +272,7 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
       stepUp: true,
       params: { id: quote.id },
       summary:
-        "Accepts on the customer's behalf — Stripe creates the subscription/invoice this quote describes. Requires a fresh factor.",
+        "Accepts on the customer's behalf. Stripe creates the subscription/invoice this quote describes. Requires a fresh factor.",
     });
   }
   if (quote.status === "draft" || quote.status === "open") {
@@ -282,7 +282,7 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
       style: "danger",
       dangerous: true,
       params: { id: quote.id },
-      summary: "Cancels the quote — it can no longer be finalized or accepted.",
+      summary: "Cancels the quote; it can no longer be finalized or accepted.",
     });
   }
   actions.push(bookmarkButton("section:quotes.bookmark", bookmarked, quote.id, quote.number ?? quote.id));
@@ -337,7 +337,7 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
           label: "Customer",
           cell: cust.id
             ? ({ t: "link", v: cust.label, ref: { page: "customers.detail", params: { id: cust.id } } } as Cell)
-            : text("—"),
+            : text("N/A"),
         },
         ...(quote.number ? [{ label: "Number", cell: text(quote.number) }] : []),
         { label: "Expires", cell: dateCell(quote.expires_at) },

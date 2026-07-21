@@ -140,11 +140,11 @@ export class AssignmentHub {
     const override = teamId ? s.teamOverride(teamId) : null;
     const inherits = teamId && !override;
     const embed = panelEmbed(
-      `Assignment — ${name}`,
+      `Assignment · ${name}`,
       [
         this.isDefault(scope)
           ? "The default applies to every team that has no custom settings, and is the fallback for conversations with no team."
-          : `Settings for the **${name}** team.${inherits ? " _(currently inheriting the workspace default — changing anything here creates a custom override)_" : ""}`,
+          : `Settings for the **${name}** team.${inherits ? " _(currently inheriting the workspace default; changing anything here creates a custom override)_" : ""}`,
         "",
         `**Assignment:** ${enabled ? "**on**" : "**off**"}`,
         `**Excluded teammates:** ${excluded.length ? excluded.map((a) => a.name).join(", ") : "none"}`,
@@ -193,7 +193,7 @@ export class AssignmentHub {
     const preview = await this.ctx.assignmentService.poolPreview(teamId).catch(() => null);
     if (!preview) {
       await interaction.editReply({
-        embeds: [makeEmbed("Could not build this team's pool — check the Intercom connection and that the team has members.", COLORS.warn)],
+        embeds: [makeEmbed("Could not build this team's pool. Check the Intercom connection and that the team has members.", COLORS.warn)],
         components: [backRow(`icadmin_assign_scope:${scope}`, "Back")],
       });
       return;
@@ -213,16 +213,16 @@ export class AssignmentHub {
       ]
         .filter(Boolean)
         .join(" · ");
-      return `• **${m.name}** — ${m.openCount} open${badges ? `  _(${badges})_` : ""}`;
+      return `• **${m.name}**: ${m.openCount} open${badges ? `  _(${badges})_` : ""}`;
     });
     const name = await this.scopeName(scope);
     const embed = panelEmbed(
-      `Pool — ${name}`,
+      `Pool · ${name}`,
       [
         `Eligible: **${eligible.length}**/${members.length} · pool average **${avg.toFixed(1)}** open` +
-          (preview.countsFresh ? "" : " · ⚠️ _open counts stale (no recent enforcement tick) — run the stray sweep_"),
+          (preview.countsFresh ? "" : " · ⚠️ _open counts stale (no recent enforcement tick): run the stray sweep_"),
         "",
-        lines.length ? lines.join("\n") : "_pool is empty — check team membership and the exclusion list_",
+        lines.length ? lines.join("\n") : "_pool is empty: check team membership and the exclusion list_",
         ...(totalPages > 1 ? ["", `Page ${clamped + 1}/${totalPages}`] : []),
       ].join("\n")
     );
@@ -247,7 +247,7 @@ export class AssignmentHub {
     const admins = await this.ctx.intercomClient.listAdmins().catch(() => null);
     if (!admins) {
       await interaction.editReply({
-        embeds: [makeEmbed("Could not list teammates — check the Intercom connection.", COLORS.warn)],
+        embeds: [makeEmbed("Could not list teammates. Check the Intercom connection.", COLORS.warn)],
         components: [backRow(`icadmin_assign_scope:${scope}`, "Back")],
       });
       return;
@@ -284,7 +284,7 @@ export class AssignmentHub {
     await interaction.editReply({
       embeds: [
         makeEmbed(
-          `Select the teammates to **exclude** from bot assignment for **${name}** (bench them without touching Intercom team membership). Excluded teammates keep their existing conversations — they just receive no new bot assignments.`,
+          `Select the teammates to **exclude** from bot assignment for **${name}** (bench them without touching Intercom team membership). Excluded teammates keep their existing conversations; they just receive no new bot assignments.`,
           COLORS.neutral
         ),
       ],
@@ -331,7 +331,7 @@ export class AssignmentHub {
       await interaction.editReply({
         embeds: [
           makeEmbed(
-            "Stray sweep triggered — the enforcement looper will assign any open, unassigned conversation to its team's pool this tick (and run the SLA clocks). Re-open a team's **View Pool** in a few seconds to see updated counts.",
+            "Stray sweep triggered: the enforcement looper will assign any open, unassigned conversation to its team's pool this tick (and run the SLA clocks). Re-open a team's **View Pool** in a few seconds to see updated counts.",
             COLORS.success
           ),
         ],

@@ -59,7 +59,7 @@ const chargelessPiCache = new WeakMap<BillAdminSession, Stripe.PaymentIntent[]>(
 // from charge rows and carrying the decline info when Stripe recorded one.
 function piLine(stripe: StripeClient, pi: Stripe.PaymentIntent): string {
   const parts = [
-    `⛔ **${stripe.formatAmount(pi.amount, pi.currency)}** — ${pi.status} (never reached card network)`,
+    `⛔ **${stripe.formatAmount(pi.amount, pi.currency)}** · ${pi.status} (never reached card network)`,
     `<t:${pi.created}:R>`,
   ];
   const decline = pi.last_payment_error?.decline_code ?? pi.last_payment_error?.code;
@@ -93,7 +93,7 @@ export async function renderListPage(
     const last = invoices[invoices.length - 1];
     if (hasMore && last?.id) session.cursors[page + 1] = last.id;
     hasNext = hasMore;
-    title = `Invoices — \`${session.customerId}\``;
+    title = `Invoices: \`${session.customerId}\``;
     lines = invoices.map((inv) => invoiceLine(ctx.stripe, inv));
   } else if (session.view === "fpcharges") {
     session.originHub ??= "cards";
@@ -104,7 +104,7 @@ export async function renderListPage(
     );
     if (nextPage) session.cursors[page + 1] = nextPage;
     hasNext = !!nextPage;
-    title = `Charges — card \`${session.fingerprint}\``;
+    title = `Charges: card \`${session.fingerprint}\``;
     lines = charges.map((c) => chargeLine(ctx.stripe, c, true));
     footerExtra = " · Search data can lag ~1 min";
   } else {
@@ -113,7 +113,7 @@ export async function renderListPage(
     const last = charges[charges.length - 1];
     if (hasMore && last) session.cursors[page + 1] = last.id;
     hasNext = hasMore;
-    title = `Charges — \`${session.customerId}\``;
+    title = `Charges: \`${session.customerId}\``;
     pageCharges = charges;
 
     // PaymentIntents that died before creating a charge (declined at confirm,
@@ -248,32 +248,32 @@ export async function showRefundConfirm(
   if (charge.disputed) {
     if (!dispute) {
       disputeNotes.push(
-        "🚩 **This charge is disputed** — a refund only helps at the inquiry / early-warning stage; Stripe rejects refunds on formal chargebacks."
+        "🚩 **This charge is disputed**: a refund only helps at the inquiry / early-warning stage; Stripe rejects refunds on formal chargebacks."
       );
     } else if (warningStage && dispute.is_charge_refundable) {
       disputeNotes.push(
-        `✅ **This refund can still prevent the chargeback.** Dispute \`${dispute.id}\` is at the early-warning / inquiry stage (\`${dispute.status}\`) — refunding the full remainder closes it before it becomes a formal chargeback. It stays \`${dispute.status}\` until the bank processes the refund (can take a few days).`
+        `✅ **This refund can still prevent the chargeback.** Dispute \`${dispute.id}\` is at the early-warning / inquiry stage (\`${dispute.status}\`); refunding the full remainder closes it before it becomes a formal chargeback. It stays \`${dispute.status}\` until the bank processes the refund (can take a few days).`
       );
       if (amountMinor != null && amountMinor < remaining) {
         disputeNotes.push(
-          "⚠️ **Partial refund selected** — only refunding the **full remainder** reliably prevents the chargeback."
+          "⚠️ **Partial refund selected**: only refunding the **full remainder** reliably prevents the chargeback."
         );
       }
     } else if (warningStage) {
       disputeNotes.push(
-        `⛔ Dispute \`${dispute.id}\` is still at the warning stage, but Stripe reports the charge as **not refundable** — this refund will be rejected.`
+        `⛔ Dispute \`${dispute.id}\` is still at the warning stage, but Stripe reports the charge as **not refundable**; this refund will be rejected.`
       );
     } else if (formalOpen) {
       disputeNotes.push(
-        `⛔ **Too late to prevent — this is a formal chargeback** (\`${dispute.status}\`). Stripe rejects refunds on it, so this refund will fail. Respond with evidence or accept the dispute instead.`
+        `⛔ **Too late to prevent: this is a formal chargeback** (\`${dispute.status}\`). Stripe rejects refunds on it, so this refund will fail. Respond with evidence or accept the dispute instead.`
       );
     } else if (dispute.status === "lost") {
       disputeNotes.push(
-        "⛔ **Dispute already lost** — the bank has already pulled the disputed amount back. Refunding on top would return the money **twice**."
+        "⛔ **Dispute already lost**: the bank has already pulled the disputed amount back. Refunding on top would return the money **twice**."
       );
     } else {
       disputeNotes.push(
-        `🚩 Dispute \`${dispute.id}\` is already closed (**${dispute.status}**) — this refund is goodwill only and doesn't change the dispute outcome.`
+        `🚩 Dispute \`${dispute.id}\` is already closed (**${dispute.status}**); this refund is goodwill only and doesn't change the dispute outcome.`
       );
     }
   }
@@ -282,7 +282,7 @@ export async function showRefundConfirm(
     ...disputeNotes,
     subscriptionId
       ? null
-      : "ℹ️ No subscription attached to this charge — cancel explicitly via Subscriptions if needed.",
+      : "ℹ️ No subscription attached to this charge. Cancel explicitly via Subscriptions if needed.",
     "ℹ️ Admin refunds don't record a self-service lock: the customer's own refund flow could still refund any remainder.",
     "ℹ️ **Refund as Fraudulent** also puts the card + email on Stripe's built-in block lists.",
   ].filter(Boolean);
@@ -292,7 +292,7 @@ export async function showRefundConfirm(
     .setColor(COLORS.danger)
     .addFields(
       { name: "Charge", value: `\`${charge.id}\``, inline: true },
-      { name: "Customer", value: charge.customer ? `\`${typeof charge.customer === "string" ? charge.customer : charge.customer.id}\`` : "—", inline: true },
+      { name: "Customer", value: charge.customer ? `\`${typeof charge.customer === "string" ? charge.customer : charge.customer.id}\`` : "N/A", inline: true },
       { name: "Created", value: `<t:${charge.created}:D>`, inline: true },
       { name: "Original", value: fmt(charge.amount), inline: true },
       { name: "Already refunded", value: fmt(charge.amount_refunded), inline: true },
@@ -305,7 +305,7 @@ export async function showRefundConfirm(
       {
         name: "Subscription",
         value: subscriptionId
-          ? `\`${subscriptionId}\` — cancelled if you pick **Refund + cancel sub**`
+          ? `\`${subscriptionId}\`: cancelled if you pick **Refund + cancel sub**`
           : "none attached to this charge",
         inline: false,
       }
@@ -419,7 +419,7 @@ export class ChargesHub {
         await this.ctx.sessions.tryRender(interaction, async () => {
           const pi = await this.ctx.stripe.getPaymentIntent(session.paymentIntentId!);
           if (!PI_CANCELABLE.has(pi.status)) {
-            await this.renderPiDetail(interaction, token, page, `⚠️ \`${pi.id}\` is **${pi.status}** — no longer cancelable.`);
+            await this.renderPiDetail(interaction, token, page, `⚠️ \`${pi.id}\` is **${pi.status}**, no longer cancelable.`);
             return;
           }
           const embed = new EmbedBuilder()
@@ -427,7 +427,7 @@ export class ChargesHub {
             .setColor(COLORS.danger)
             .setDescription(
               `⚠️ Cancel \`${pi.id}\` (**${this.ctx.stripe.formatAmount(pi.amount, pi.currency)}**, ` +
-                `status **${pi.status}**)?\nThe attempt is closed for good — the customer can no longer ` +
+                `status **${pi.status}**)?\nThe attempt is closed for good. The customer can no longer ` +
                 "complete it (e.g. a pending 3DS challenge stops working). No money has moved on this intent."
             );
           await interaction.editReply({
@@ -635,7 +635,7 @@ export class ChargesHub {
         new ActionRowBuilder<TextInputBuilder>().addComponents(
           textInput("amount", "Amount (empty = full refund)", {
             required: false,
-            placeholder: "e.g. 12.50 — in the charge's currency",
+            placeholder: "e.g. 12.50, in the charge's currency",
           })
         )
       );
@@ -696,7 +696,7 @@ export class ChargesHub {
     });
 
     const embed = new EmbedBuilder()
-      .setTitle(`Disputes & fraud — ${source}`)
+      .setTitle(`Disputes & fraud: ${source}`)
       .setColor(disputedCharges.length || matchedWarnings ? COLORS.warn : COLORS.brand)
       .setDescription(
         [
@@ -729,7 +729,7 @@ export class ChargesHub {
     }
     if (amountRaw && !/^\d+(\.\d{1,2})?$/.test(amountRaw)) {
       await interaction.reply({
-        embeds: [makeEmbed("Amount must be a number like `12.50` — or leave it empty for a full refund.", COLORS.danger)],
+        embeds: [makeEmbed("Amount must be a number like `12.50`, or leave it empty for a full refund.", COLORS.danger)],
         flags: 64,
       });
       return;
@@ -745,7 +745,7 @@ export class ChargesHub {
           if (amountRaw.includes(".")) {
             await interaction.editReply({
               embeds: [
-                makeEmbed(`\`${charge.currency}\` is a zero-decimal currency — whole amounts only.`, COLORS.danger),
+                makeEmbed(`\`${charge.currency}\` is a zero-decimal currency: whole amounts only.`, COLORS.danger),
               ],
               components: [backRow("billadmin_hub:charges")],
             });
@@ -821,21 +821,21 @@ export class ChargesHub {
     const card = charge.payment_method_details?.card;
     const pmText = card
       ? `${card.brand ?? "card"} •••• ${card.last4 ?? "????"}${card.exp_month ? ` · exp ${card.exp_month}/${card.exp_year}` : ""}`
-      : charge.payment_method_details?.type ?? "—";
+      : charge.payment_method_details?.type ?? "N/A";
     const outcome = charge.outcome;
     const riskText = outcome?.risk_level
       ? `${outcome.risk_level}${outcome.risk_score != null ? ` (score ${outcome.risk_score})` : ""}`
-      : "—";
+      : "N/A";
 
     const embed = new EmbedBuilder()
-      .setTitle(`Charge — \`${charge.id}\``)
+      .setTitle(`Charge: \`${charge.id}\``)
       .setColor(blockHit ? COLORS.danger : charge.disputed ? COLORS.warn : COLORS.brand)
       .addFields(
         ...(blockHit
           ? [
               {
                 name: "⛔ BLOCKED",
-                value: `${blockHit.kind} \`${blockHit.value.slice(0, 100)}\` — ${blockHit.reason.slice(0, 300)}`,
+                value: `${blockHit.kind} \`${blockHit.value.slice(0, 100)}\`: ${blockHit.reason.slice(0, 300)}`,
                 inline: false,
               },
             ]
@@ -855,13 +855,13 @@ export class ChargesHub {
         },
         { name: "Risk", value: riskText, inline: true },
         { name: "Payment method", value: pmText.slice(0, 1024), inline: true },
-        { name: "Invoice", value: invoiceId ? `\`${invoiceId}\`` : "—", inline: true },
-        { name: "Receipt", value: charge.receipt_url ? `[open receipt](${charge.receipt_url})` : "—", inline: true },
+        { name: "Invoice", value: invoiceId ? `\`${invoiceId}\`` : "N/A", inline: true },
+        { name: "Receipt", value: charge.receipt_url ? `[open receipt](${charge.receipt_url})` : "N/A", inline: true },
         ...(latestNote
           ? [
               {
                 name: "Latest note",
-                value: `<t:${Math.floor(latestNote.createdAt.getTime() / 1000)}:R> **${latestNote.authorName}** — ${latestNote.text}`.slice(0, 1024),
+                value: `<t:${Math.floor(latestNote.createdAt.getTime() / 1000)}:R> **${latestNote.authorName}**: ${latestNote.text}`.slice(0, 1024),
                 inline: false,
               },
             ]
@@ -908,11 +908,11 @@ export class ChargesHub {
         ]
           .filter(Boolean)
           .join(" · ")
-      : "—";
+      : "N/A";
 
     // payment_method is unexpanded (a string) on retrieve; the failed attempt's
     // full PaymentMethod object often survives on last_payment_error instead.
-    let pmText = "—";
+    let pmText = "N/A";
     const pmRef = pi.payment_method ?? err?.payment_method ?? null;
     if (pmRef && typeof pmRef !== "string") {
       pmText = pmRef.card ? `${pmRef.card.brand} •••• ${pmRef.card.last4}` : pmRef.type;
@@ -924,16 +924,16 @@ export class ChargesHub {
     const cancelable = PI_CANCELABLE.has(pi.status);
 
     const embed = new EmbedBuilder()
-      .setTitle(`⛔ Payment attempt — \`${pi.id}\``)
+      .setTitle(`⛔ Payment attempt: \`${pi.id}\``)
       .setColor(pi.status === "canceled" ? COLORS.neutral : COLORS.warn)
       .addFields(
         { name: "Amount", value: `**${this.ctx.stripe.formatAmount(pi.amount, pi.currency)}**`, inline: true },
         { name: "Status", value: pi.status, inline: true },
         { name: "Created", value: `<t:${pi.created}:D>`, inline: true },
         { name: "Last payment error", value: errText.slice(0, 1024), inline: false },
-        { name: "Cancellation reason", value: pi.cancellation_reason ?? "—", inline: true },
+        { name: "Cancellation reason", value: pi.cancellation_reason ?? "N/A", inline: true },
         { name: "Payment method", value: pmText.slice(0, 1024), inline: true },
-        { name: "Invoice", value: invoiceId ? `\`${invoiceId}\`` : "—", inline: true }
+        { name: "Invoice", value: invoiceId ? `\`${invoiceId}\`` : "N/A", inline: true }
       );
     if (notice) embed.setDescription(notice.slice(0, 4096));
 
@@ -966,7 +966,7 @@ export class ChargesHub {
           action: "Cancel PaymentIntent",
           targetCustomerId: session.customerId,
           objectId: session.paymentIntentId,
-          outcome: `Failed — ${msg.slice(0, 500)}`,
+          outcome: `Failed: ${msg.slice(0, 500)}`,
           severity: "danger",
         });
         await this.renderPiDetail(interaction, token, page, `⚠️ Cancel failed: ${msg.slice(0, 300)}`);
@@ -980,7 +980,7 @@ export class ChargesHub {
         targetCustomerId: session.customerId,
         objectId: pi.id,
         amountText: this.ctx.stripe.formatAmount(pi.amount, pi.currency),
-        outcome: `Canceled (was an incomplete attempt — no money had moved)`,
+        outcome: `Canceled (was an incomplete attempt, no money had moved)`,
         severity: "warn",
       });
       await this.renderPiDetail(interaction, token, page, `🚫 \`${pi.id}\` canceled.`);
@@ -1007,7 +1007,7 @@ export class ChargesHub {
         const claimed = await this.ctx.sessionStore.claimBillingAction(interaction.user.id, session.chargeId!, "admin_refund");
         if (!claimed) lockNote = "\nℹ️ a billing action already existed for this charge";
       } catch (error) {
-        logger.warn("claimBillingAction failed — proceeding (admin override)", {
+        logger.warn("claimBillingAction failed, proceeding (admin override)", {
           chargeId: session.chargeId,
           error: String(error),
         });
@@ -1036,7 +1036,7 @@ export class ChargesHub {
           targetCustomerId: session.customerId,
           objectId: session.chargeId,
           amountText: session.refundAmountMinor != null ? `${session.refundAmountMinor} (minor units)` : "full remainder",
-          outcome: `Failed — ${msg.slice(0, 500)}`,
+          outcome: `Failed: ${msg.slice(0, 500)}`,
           severity: "danger",
         });
         throw error;
@@ -1049,7 +1049,7 @@ export class ChargesHub {
         // about sub_ ids, so never fall back to a customer id here.
         const subId = session.subscriptionId;
         if (!subId?.startsWith("sub_")) {
-          cancelNote = "\n⚠️ No subscription is attached to this charge — nothing was cancelled.";
+          cancelNote = "\n⚠️ No subscription is attached to this charge. Nothing was cancelled.";
         } else {
           try {
             await this.ctx.stripe.cancelSubscription(subId);
@@ -1062,13 +1062,13 @@ export class ChargesHub {
       }
 
       const fraudNote =
-        reason === "fraudulent" ? "\n🚫 Marked fraudulent — Stripe added the card + email to its block lists." : "";
+        reason === "fraudulent" ? "\n🚫 Marked fraudulent: Stripe added the card + email to its block lists." : "";
       // Refunding at the warning stage doesn't flip the dispute immediately —
       // without this note, a still-open dispute panel reads like the refund
       // didn't work.
       const disputeNote =
         session.refundDisputeStage === "warning"
-          ? "\n🛡️ The dispute stays in its `warning_…` status until the bank processes this refund — expect it to close as **prevented / warning_closed** within a few days. No evidence response is needed."
+          ? "\n🛡️ The dispute stays in its `warning_…` status until the bank processes this refund. Expect it to close as **prevented / warning_closed** within a few days. No evidence response is needed."
           : "";
       const amountText = this.ctx.stripe.formatAmount(result.amount, result.currency);
       this.ctx.audit.log(interaction, {
@@ -1077,7 +1077,7 @@ export class ChargesHub {
         objectId: session.chargeId,
         amountText,
         outcome: `Refund \`${result.refundId}\` (${result.status ?? "pending"})${
-          session.refundAmountMinor != null ? " — partial" : " — full remainder"
+          session.refundAmountMinor != null ? " · partial" : " · full remainder"
         }${cancelNote.replace(/\n/g, " ")}${fraudNote.replace(/\n/g, " ")}${lockNote.replace(/\n/g, " ")}`,
         severity: "success",
       });
@@ -1091,7 +1091,7 @@ export class ChargesHub {
       await interaction.editReply({
         embeds: [
           makeEmbed(
-            `↩️ Refunded **${amountText}** on \`${session.chargeId}\` — ` +
+            `↩️ Refunded **${amountText}** on \`${session.chargeId}\`, ` +
               `refund \`${result.refundId}\` (${result.status ?? "pending"}).${disputeNote}${cancelNote}${fraudNote}${lockNote}`,
             COLORS.success
           ),

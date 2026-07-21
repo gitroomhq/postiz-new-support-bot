@@ -32,17 +32,17 @@ const TAX_EXEMPT_LABELS: Record<string, string> = {
 };
 
 const LOCALE_OPTIONS: { value: string; label: string }[] = [
-  { value: "en", label: "en — English" },
-  { value: "de", label: "de — German" },
-  { value: "fr", label: "fr — French" },
-  { value: "es", label: "es — Spanish" },
-  { value: "it", label: "it — Italian" },
-  { value: "nl", label: "nl — Dutch" },
-  { value: "pt", label: "pt — Portuguese" },
-  { value: "pl", label: "pl — Polish" },
-  { value: "sv", label: "sv — Swedish" },
-  { value: "da", label: "da — Danish" },
-  { value: "ja", label: "ja — Japanese" },
+  { value: "en", label: "en · English" },
+  { value: "de", label: "de · German" },
+  { value: "fr", label: "fr · French" },
+  { value: "es", label: "es · Spanish" },
+  { value: "it", label: "it · Italian" },
+  { value: "nl", label: "nl · Dutch" },
+  { value: "pt", label: "pt · Portuguese" },
+  { value: "pl", label: "pl · Polish" },
+  { value: "sv", label: "sv · Swedish" },
+  { value: "da", label: "da · Danish" },
+  { value: "ja", label: "ja · Japanese" },
 ];
 
 type CustSnapshot = NonNullable<BillAdminSession["custSnapshot"]>;
@@ -79,7 +79,7 @@ export class CustomersHub {
           this.ctx.audit.log(interaction, {
             action: "Unlink Discord ↔ Stripe",
             objectId: session.targetDiscordUserId,
-            outcome: "Success — Stripe customer link cleared",
+            outcome: "Success: Stripe customer link cleared",
             severity: "warn",
           });
           await interaction.editReply(await this.buildLinkPanel(token, "✅ Unlinked."));
@@ -342,7 +342,7 @@ export class CustomersHub {
           this.ctx.audit.log(interaction, {
             action: "Delete customer",
             targetCustomerId: session.customerId,
-            outcome: `Deleted in Stripe${unlinked ? ` — cleared the link on ${unlinked} Discord user session(s)` : ""}`,
+            outcome: `Deleted in Stripe${unlinked ? `; cleared the link on ${unlinked} Discord user session(s)` : ""}`,
             severity: "danger",
           });
           await interaction.editReply({
@@ -502,7 +502,7 @@ export class CustomersHub {
     }
     const spendText = lifetime.size
       ? [...lifetime.entries()].map(([cur, amt]) => `**${this.ctx.stripe.formatAmount(amt, cur)}**`).join(" · ")
-      : "—";
+      : "N/A";
 
     const subLines = subscriptions.slice(0, 8).map((sub) => {
       const periodEnd = sub.items.data[0]?.current_period_end;
@@ -542,7 +542,7 @@ export class CustomersHub {
       : "no linked Discord user";
 
     const embed = new EmbedBuilder()
-      .setTitle(`👤 Customer 360 — \`${customer.id}\``)
+      .setTitle(`👤 Customer 360: \`${customer.id}\``)
       .setColor(blocks.length ? COLORS.danger : customer.delinquent || disputedCount ? COLORS.warn : COLORS.brand)
       .addFields(
         ...(blocks.length
@@ -551,15 +551,15 @@ export class CustomersHub {
                 name: "⛔ BLOCKED",
                 value: blocks
                   .slice(0, 5)
-                  .map((b) => `${b.kind} \`${b.value.slice(0, 60)}\` — ${b.reason.slice(0, 120)}`)
+                  .map((b) => `${b.kind} \`${b.value.slice(0, 60)}\`: ${b.reason.slice(0, 120)}`)
                   .join("\n")
                   .slice(0, 1024),
                 inline: false,
               },
             ]
           : []),
-        { name: "Email", value: (customer.email ?? "—").slice(0, 1024), inline: true },
-        { name: "Name", value: (customer.name ?? "—").slice(0, 1024), inline: true },
+        { name: "Email", value: (customer.email ?? "N/A").slice(0, 1024), inline: true },
+        { name: "Name", value: (customer.name ?? "N/A").slice(0, 1024), inline: true },
         { name: "Created", value: `<t:${customer.created}:D>`, inline: true },
         { name: "Delinquent", value: customer.delinquent ? "⚠️ yes" : "no", inline: true },
         {
@@ -569,19 +569,19 @@ export class CustomersHub {
         },
         {
           name: "Default PM",
-          value: defaultPmObj ? this.pmSummary(defaultPmObj).slice(0, 1024) : defaultPmId ? `\`${defaultPmId}\`` : "—",
+          value: defaultPmObj ? this.pmSummary(defaultPmObj).slice(0, 1024) : defaultPmId ? `\`${defaultPmId}\`` : "N/A",
           inline: true,
         },
         { name: "Lifetime spend", value: spendText.slice(0, 1024), inline: false },
         {
           name: `Subscriptions (${subscriptions.length})`,
-          value: subLines.join("\n").slice(0, 1024) || "—",
+          value: subLines.join("\n").slice(0, 1024) || "N/A",
           inline: false,
         },
         { name: `Open invoices (${openInvoices.data.length})`, value: openInvText.slice(0, 1024), inline: false },
         {
           name: `Payment methods (${paymentMethods.length})`,
-          value: pmLines.join("\n").slice(0, 1024) || "—",
+          value: pmLines.join("\n").slice(0, 1024) || "N/A",
           inline: false,
         },
         {
@@ -594,7 +594,7 @@ export class CustomersHub {
           ? [
               {
                 name: "Latest note",
-                value: `<t:${Math.floor(latestNote.createdAt.getTime() / 1000)}:R> **${latestNote.authorName}** — ${latestNote.text}`.slice(0, 1024),
+                value: `<t:${Math.floor(latestNote.createdAt.getTime() / 1000)}:R> **${latestNote.authorName}**: ${latestNote.text}`.slice(0, 1024),
                 inline: false,
               },
             ]
@@ -606,7 +606,7 @@ export class CustomersHub {
       .setCustomId(`billadmin_c360_act:${token}`)
       .setPlaceholder("Action…")
       .addOptions(
-        { label: "New subscription", value: "createsub", description: "Plan, coupon & trial — charge now or invoice" },
+        { label: "New subscription", value: "createsub", description: "Plan, coupon & trial; charge now or invoice" },
         { label: "Adjust balance", value: "bal", description: "Grant credit / add debit (Payments flow)" },
         { label: "Charge card now", value: "charge", description: "Off-session charge on a saved card (Payments flow)" },
         { label: "Edit customer", value: "editcust", description: "Details, address, VAT/tax IDs" },
@@ -710,7 +710,7 @@ export class CustomersHub {
       await interaction.editReply(
         await this.buildLinkPanel(
           token,
-          updated ? `✅ Linked to \`${customerId}\`.` : "⚠️ The user's session row disappeared — nothing updated."
+          updated ? `✅ Linked to \`${customerId}\`.` : "⚠️ The user's session row disappeared. Nothing updated."
         )
       );
     });
@@ -748,45 +748,45 @@ export class CustomersHub {
     const biText =
       [snap.businessName ? `business: ${snap.businessName}` : null, snap.individualName ? `individual: ${snap.individualName}` : null]
         .filter(Boolean)
-        .join(" · ") || "—";
+        .join(" · ") || "N/A";
 
     const shippingText = customer.shipping
       ? [customer.shipping.name, customer.shipping.phone, formatAddress(customer.shipping.address ?? null)]
-          .filter((p) => p && p !== "—")
-          .join(" · ") || "—"
-      : "—";
+          .filter((p) => p && p !== "N/A")
+          .join(" · ") || "N/A"
+      : "N/A";
 
     const taxExempt = customer.tax_exempt ?? "none";
     const locales = customer.preferred_locales ?? [];
     const invoiceText = [
-      `prefix: ${snap.invoicePrefix ? `\`${snap.invoicePrefix}\`` : "—"}`,
-      `next #: ${snap.nextInvoiceSequence ?? "—"}`,
+      `prefix: ${snap.invoicePrefix ? `\`${snap.invoicePrefix}\`` : "N/A"}`,
+      `next #: ${snap.nextInvoiceSequence ?? "N/A"}`,
       `custom fields: ${snap.invoiceCustomFields.length}`,
-      `footer: ${snap.invoiceFooter ? "set" : "—"}`,
-      `tax display: ${snap.amountTaxDisplay === "include_inclusive_tax" ? "incl" : snap.amountTaxDisplay === "exclude_tax" ? "excl" : "—"}`,
+      `footer: ${snap.invoiceFooter ? "set" : "N/A"}`,
+      `tax display: ${snap.amountTaxDisplay === "include_inclusive_tax" ? "incl" : snap.amountTaxDisplay === "exclude_tax" ? "excl" : "N/A"}`,
     ].join(" · ");
 
     const metaKeys = Object.keys(snap.metadata);
     const metaText = metaKeys.length
       ? `${metaKeys.length} key(s): ${metaKeys.slice(0, 10).join(", ")}${metaKeys.length > 10 ? ", …" : ""}`
-      : "—";
+      : "N/A";
 
     const embed = new EmbedBuilder()
-      .setTitle(`Edit customer — \`${customer.id}\``)
+      .setTitle(`Edit customer: \`${customer.id}\``)
       .setColor(COLORS.brand)
       .addFields(
-        { name: "Name / company", value: (customer.name ?? "—").slice(0, 1024), inline: true },
-        { name: "Email", value: (customer.email ?? "—").slice(0, 1024), inline: true },
-        { name: "Phone", value: (customer.phone ?? "—").slice(0, 1024), inline: true },
+        { name: "Name / company", value: (customer.name ?? "N/A").slice(0, 1024), inline: true },
+        { name: "Email", value: (customer.email ?? "N/A").slice(0, 1024), inline: true },
+        { name: "Phone", value: (customer.phone ?? "N/A").slice(0, 1024), inline: true },
         { name: "Business / individual", value: biText.slice(0, 1024), inline: false },
-        { name: "Description", value: (customer.description ?? "—").slice(0, 1024), inline: false },
+        { name: "Description", value: (customer.description ?? "N/A").slice(0, 1024), inline: false },
         { name: "Address", value: formatAddress(customer.address).slice(0, 1024), inline: false },
         { name: "Shipping", value: shippingText.slice(0, 1024), inline: false },
         { name: "Tax exemption", value: TAX_EXEMPT_LABELS[taxExempt] ?? taxExempt, inline: true },
-        { name: "Preferred locales", value: (locales.join(", ") || "—").slice(0, 1024), inline: true },
+        { name: "Preferred locales", value: (locales.join(", ") || "N/A").slice(0, 1024), inline: true },
         { name: "Invoice & branding", value: invoiceText.slice(0, 1024), inline: false },
         { name: "Metadata", value: metaText.slice(0, 1024), inline: false },
-        { name: `Tax IDs (${taxIds.length})`, value: taxIdLines.slice(0, 1024) || "—", inline: false }
+        { name: `Tax IDs (${taxIds.length})`, value: taxIdLines.slice(0, 1024) || "N/A", inline: false }
       );
     if (notice) embed.setDescription(notice.slice(0, 4096));
 
@@ -868,7 +868,7 @@ export class CustomersHub {
         }))
       );
     await interaction.editReply({
-      embeds: [makeEmbed(`Removing a tax ID from \`${session.customerId}\` — pick one:`, COLORS.warn)],
+      embeds: [makeEmbed(`Removing a tax ID from \`${session.customerId}\`. Pick one:`, COLORS.warn)],
       components: [
         selectRow(select),
         buttonRow(btn(`billadmin_editcust_show:${token}`, "Back", ButtonStyle.Secondary)),
@@ -897,7 +897,7 @@ export class CustomersHub {
         await this.rerenderWithWarning(
           interaction,
           token,
-          "⚠️ Business/individual name must start with `b:` or `i:` (e.g. `b: Acme GmbH`, `i: Jane Doe`) — nothing was saved."
+          "⚠️ Business/individual name must start with `b:` or `i:` (e.g. `b: Acme GmbH`, `i: Jane Doe`). Nothing was saved."
         );
         return;
       }
@@ -961,7 +961,7 @@ export class CustomersHub {
             await interaction.editReply({
               embeds: [
                 makeEmbed(
-                  `✅ Address updated — the state/province is currently **cleared**.\n` +
+                  `✅ Address updated. The state/province is currently **cleared**.\n` +
                     `${country && STATE_COUNTRIES.includes(country) ? `\`${country}\` addresses usually carry one. ` : ""}` +
                     `Set it now, or go back to keep the address without a state.`,
                   COLORS.brand
@@ -1032,7 +1032,7 @@ export class CustomersHub {
       await this.rerenderWithWarning(
         interaction,
         token,
-        "⚠️ Stripe requires a **recipient name** when shipping is set (leave every field blank to clear shipping) — nothing was saved."
+        "⚠️ Stripe requires a **recipient name** when shipping is set (leave every field blank to clear shipping). Nothing was saved."
       );
       return;
     }
@@ -1056,7 +1056,7 @@ export class CustomersHub {
         await this.rerenderWithWarning(
           interaction,
           token,
-          `⚠️ Shipping country must be a 2-letter code (got \`${country}\`) — use \`City, Postal, Country\`, e.g. \`Berlin, 10115, DE\`. Nothing was saved.`
+          `⚠️ Shipping country must be a 2-letter code (got \`${country}\`). Use \`City, Postal, Country\`, e.g. \`Berlin, 10115, DE\`. Nothing was saved.`
         );
         return;
       }
@@ -1081,7 +1081,7 @@ export class CustomersHub {
       await this.rerenderWithWarning(
         interaction,
         token,
-        `⚠️ Shipping extras must be \`state: …\` or \`line2: …\` lines — could not parse: ${badExtra
+        `⚠️ Shipping extras must be \`state: …\` or \`line2: …\` lines. Could not parse: ${badExtra
           .map((l) => `\`${l.slice(0, 50)}\``)
           .join(", ")}. Nothing was saved.`
       );
@@ -1118,7 +1118,7 @@ export class CustomersHub {
       await this.rerenderWithWarning(
         interaction,
         token,
-        "⚠️ Invoice prefix must be 3-12 uppercase letters/digits (blank = keep current) — nothing was saved."
+        "⚠️ Invoice prefix must be 3-12 uppercase letters/digits (blank = keep current). Nothing was saved."
       );
       return;
     }
@@ -1131,7 +1131,7 @@ export class CustomersHub {
         await this.rerenderWithWarning(
           interaction,
           token,
-          "⚠️ Next invoice sequence must be a positive integer (blank = keep current) — nothing was saved."
+          "⚠️ Next invoice sequence must be a positive integer (blank = keep current). Nothing was saved."
         );
         return;
       }
@@ -1176,7 +1176,7 @@ export class CustomersHub {
       await this.rerenderWithWarning(
         interaction,
         token,
-        "⚠️ Tax display must be `incl`, `excl` or blank (blank = no override) — nothing was saved."
+        "⚠️ Tax display must be `incl`, `excl` or blank (blank = no override). Nothing was saved."
       );
       return;
     }
@@ -1219,7 +1219,7 @@ export class CustomersHub {
       await this.rerenderWithWarning(
         interaction,
         token,
-        `⚠️ Metadata lines must be \`key: value\` (key ≤40 chars, alnum/_/-, value ≤500 chars) — could not parse: ${bad
+        `⚠️ Metadata lines must be \`key: value\` (key ≤40 chars, alnum/_/-, value ≤500 chars). Could not parse: ${bad
           .map((l) => `\`${l.slice(0, 60)}\``)
           .join(", ")}. Nothing was saved.`
       );
@@ -1247,7 +1247,7 @@ export class CustomersHub {
         action: "Add tax ID",
         targetCustomerId: session.customerId,
         objectId: value,
-        outcome: `Success — ${type}`,
+        outcome: `Success: ${type}`,
         severity: "info",
       });
       await this.renderEditCustomer(interaction, token, "✅ Tax ID added.");
@@ -1331,7 +1331,7 @@ export class CustomersHub {
       this.ctx.audit.log(interaction, {
         action: "Create customer",
         targetCustomerId: customer.id,
-        outcome: `Success${email ? ` — ${email}` : ""}${phone ? " — phone set" : ""}`,
+        outcome: `Success${email ? ` · ${email}` : ""}${phone ? " · phone set" : ""}`,
         severity: "success",
       });
       // Snapshot up front so [Set address…] can open the address modal without
@@ -1440,10 +1440,10 @@ export class CustomersHub {
           })
         ),
         new ActionRowBuilder<TextInputBuilder>().addComponents(
-          textInput("bi_name", "Business/individual — 'b: X' or 'i: X'", {
+          textInput("bi_name", "Business/individual: 'b: X' or 'i: X'", {
             required: false,
             value: biValue,
-            placeholder: "b: Acme GmbH — or — i: Jane Doe (empty = clear both)",
+            placeholder: "b: Acme GmbH, or i: Jane Doe (empty = clear both)",
           })
         )
       );

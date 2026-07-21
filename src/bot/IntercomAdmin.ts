@@ -197,15 +197,15 @@ export class IntercomAdmin {
       [
         `**Bridge mode:** ${mode}${s.intercomConfigured() ? "" : " · ⚠️ setup incomplete (/config → Integrations → Intercom)"}`,
         `**Bridged tickets:** ${links}/${total}`,
-        `**SLA:** ${s.slaEnabled() ? "on" : "off"} — ${this.slaRules.count()} rule(s), ${this.slaRules.enabledCount()} enabled → default ${s.slaDefaultTarget() ? `\`${s.slaDefaultTarget()}\`` : "none"}`,
-        `**Assignment:** ${s.assignEnabled() ? "on" : "off"}${s.assignExcludedAdmins().length ? ` — ${s.assignExcludedAdmins().length} excluded` : ""} · **Inactivity sweeper:** ${s.inactivityEnabled() ? "on" : "off"}`,
+        `**SLA:** ${s.slaEnabled() ? "on" : "off"} · ${this.slaRules.count()} rule(s), ${this.slaRules.enabledCount()} enabled → default ${s.slaDefaultTarget() ? `\`${s.slaDefaultTarget()}\`` : "none"}`,
+        `**Assignment:** ${s.assignEnabled() ? "on" : "off"}${s.assignExcludedAdmins().length ? `, ${s.assignExcludedAdmins().length} excluded` : ""} · **Inactivity sweeper:** ${s.inactivityEnabled() ? "on" : "off"}`,
         "",
-        "**Bridge** — mode, ticket-type & state maps, team routing, snooze tag.",
-        "**SLA Manager** — rules, target clocks (first-reply/next-reply/resolution), office hours; the bot runs the SLAs natively now.",
-        "**Assignment** — balanced (hybrid round-robin) assignment across the routing team, exclusions, stray sweep.",
-        "**Automation** — inactivity sweeper + per-tag reminder texts.",
-        "**Maintenance** — backfill, heal, re-sync, reset/wipe, panel-link revocation.",
-        "**Intercom Admins / Actions** — who counts as admin for canvas/panel billing actions, and each action's access level.",
+        "**Bridge**: mode, ticket-type & state maps, team routing, snooze tag.",
+        "**SLA Manager**: rules, target clocks (first-reply/next-reply/resolution), office hours; the bot runs the SLAs natively now.",
+        "**Assignment**: balanced (hybrid round-robin) assignment across the routing team, exclusions, stray sweep.",
+        "**Automation**: inactivity sweeper + per-tag reminder texts.",
+        "**Maintenance**: backfill, heal, re-sync, reset/wipe, panel-link revocation.",
+        "**Intercom Admins / Actions**: who counts as admin for canvas/panel billing actions, and each action's access level.",
       ].join("\n")
     ).setFooter({ text: "Connection settings (token, client secret, region, fallback admin, webhook) live in /config → Integrations → Intercom" });
     return {
@@ -285,7 +285,7 @@ export class IntercomAdmin {
     if (!interaction.customId.startsWith("icadmin_")) return;
     await interaction
       .reply({
-        embeds: [makeEmbed("This button is from an older version of the panel — run /intercom again.", COLORS.warn)],
+        embeds: [makeEmbed("This button is from an older version of the panel. Run /intercom again.", COLORS.warn)],
         flags: 64,
       })
       .catch(() => undefined);

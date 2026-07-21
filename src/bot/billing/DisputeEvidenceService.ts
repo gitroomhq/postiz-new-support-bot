@@ -267,7 +267,7 @@ export class DisputeEvidenceService {
     if (data.length > PROOF_MAX_BYTES) {
       return {
         kind: "invalid",
-        error: "File too large — Stripe caps combined dispute evidence around 4.5MB, so keep each proof under 4MB.",
+        error: "File too large: Stripe caps combined dispute evidence around 4.5MB, so keep each proof under 4MB.",
       };
     }
     const fresh = await this.stripe.getDispute(disputeId);

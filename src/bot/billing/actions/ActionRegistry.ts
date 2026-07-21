@@ -140,7 +140,7 @@ const chargeReview = defineAction<ChargeReviewParams>({
     if (!review) return "No pending charge review on this ticket (already resolved?).";
     if (p.decision === "approve") {
       const charge = await ctx.stripe.getChargeAmount(review.chargeId);
-      if (charge.refunded) return "Charge is already refunded — use Deny or let it resolve as already processed.";
+      if (charge.refunded) return "Charge is already refunded; use Deny or let it resolve as already processed.";
     }
     return null;
   },
@@ -151,13 +151,13 @@ const chargeReview = defineAction<ChargeReviewParams>({
     const reviewer = `${ctx.actor.kind}:${ctx.actor.id}`;
     if (p.decision === "deny") {
       await ctx.sessionStore.resolvePendingChargeReview(threadId, "DENIED", reviewer);
-      return { ok: true, text: `Refund review denied${p.reason ? ` — ${p.reason}` : ""}.` };
+      return { ok: true, text: `Refund review denied${p.reason ? `: ${p.reason}` : ""}.` };
     }
     // Approve: same path as Discord /charge approve.
     const charge = await ctx.stripe.getChargeAmount(review.chargeId).catch(() => null);
     if (charge?.refunded) {
       await ctx.sessionStore.resolvePendingChargeReview(threadId, "ALREADY_PROCESSED", reviewer);
-      return { ok: true, text: "Charge was already refunded — review resolved as already processed." };
+      return { ok: true, text: "Charge was already refunded; review resolved as already processed." };
     }
     const result = await ctx.refundCore.run({
       customerId: review.customerId,
@@ -167,14 +167,14 @@ const chargeReview = defineAction<ChargeReviewParams>({
     });
     if (result.outcome === "already_processed") {
       await ctx.sessionStore.resolvePendingChargeReview(threadId, "ALREADY_PROCESSED", reviewer);
-      return { ok: true, text: "Refund already processed earlier — review resolved." };
+      return { ok: true, text: "Refund already processed earlier; review resolved." };
     }
     if (result.outcome === "refund_failed") {
       return { ok: false, error: `Refund failed: ${result.error}` };
     }
     await ctx.sessionStore.resolvePendingChargeReview(threadId, "APPROVED", reviewer);
     const cancelNote = result.cancelFailed
-      ? " Subscription cancel FAILED — follow up manually."
+      ? " Subscription cancel FAILED; follow up manually."
       : result.cancelledSubscriptionId
         ? ` Subscription ${result.cancelledSubscriptionId} cancelled.`
         : "";
@@ -315,7 +315,7 @@ const paymentIntentCancel = defineAction<PaymentIntentCancelParams>({
     if (!cus) return "No linked Stripe customer.";
     const pi = await ctx.stripe.getPaymentIntent(p.paymentIntentId);
     if (customerIdOf(pi) !== cus) return "Payment intent does not belong to this customer.";
-    if (!CANCELABLE_PI_STATUSES.has(pi.status)) return `Payment intent is ${pi.status} — not cancelable.`;
+    if (!CANCELABLE_PI_STATUSES.has(pi.status)) return `Payment intent is ${pi.status}, not cancelable.`;
     return null;
   },
   execute: async (ctx, p) => {
@@ -355,7 +355,7 @@ const paymentIntentCapture = defineAction<PaymentIntentCaptureParams>({
     if (!cus) return "No linked Stripe customer.";
     const pi = await ctx.stripe.getPaymentIntent(p.paymentIntentId);
     if (customerIdOf(pi) !== cus) return "Payment intent does not belong to this customer.";
-    if (pi.status !== "requires_capture") return `Payment intent is ${pi.status} — only requires_capture payments can be captured.`;
+    if (pi.status !== "requires_capture") return `Payment intent is ${pi.status}: only requires_capture payments can be captured.`;
     if (p.amountMinor != null && p.amountMinor > (pi.amount_capturable ?? 0)) {
       return `Amount exceeds the capturable remainder (${pi.amount_capturable ?? 0} minor units).`;
     }
@@ -499,12 +499,12 @@ const subscriptionChangePlan = defineAction<SubscriptionChangePlanParams>({
     if (!cus) return "No linked Stripe customer.";
     const sub = await ctx.stripe.getSubscription(p.subscriptionId);
     if (customerIdOf(sub) !== cus) return "Subscription does not belong to this customer.";
-    if (sub.status !== "active" && sub.status !== "trialing") return `Subscription is ${sub.status} — not changeable.`;
+    if (sub.status !== "active" && sub.status !== "trialing") return `Subscription is ${sub.status}, not changeable.`;
     const item = p.itemId ? sub.items.data.find((it) => it.id === p.itemId) : sub.items.data[0];
     if (p.itemId && !item) return "That item does not exist on this subscription.";
     const samePrice = item?.price?.id === p.priceId;
     if (samePrice && p.quantity == null && !p.promoCode && !p.cycleAnchor) {
-      return "Nothing to change — pick a different price, quantity, promo or cycle reset.";
+      return "Nothing to change: pick a different price, quantity, promo or cycle reset.";
     }
     const price = await ctx.stripe.getPrice(p.priceId).catch(() => null);
     if (!price || !price.recurring) return "Target price does not exist or is not recurring.";
@@ -512,7 +512,7 @@ const subscriptionChangePlan = defineAction<SubscriptionChangePlanParams>({
     // applies whatever the metadata says, so a non-canonical price would
     // desync what the customer pays from what they get.
     if (!samePrice && isGitroomSub(sub) && !derivePostizPlan(price)) {
-      return "This subscription syncs to Postiz — the target price must be a canonical Postiz price ($29/$278, $39/$374, $49/$470, $99/$950 USD). Use a promo for discounts.";
+      return "This subscription syncs to Postiz; the target price must be a canonical Postiz price ($29/$278, $39/$374, $49/$470, $99/$950 USD). Use a promo for discounts.";
     }
     const allowlist = ctx.settingsStore.allowedPriceIds();
     // Keeping the CURRENT price (qty/promo/cycle-only update) is always fine —
@@ -551,7 +551,7 @@ const subscriptionChangePlan = defineAction<SubscriptionChangePlanParams>({
         metadata = buildPostizMetadata(plan, sub.metadata?.uniqueId || postizUniqueId(ctx.idemScope));
         syncBit = `Postiz sync ${plan.tier}/${plan.period}`;
       } else if (item.price?.id !== p.priceId) {
-        return { ok: false, error: "Target price is not a canonical Postiz price — cannot keep this subscription synced." };
+        return { ok: false, error: "Target price is not a canonical Postiz price; cannot keep this subscription synced." };
       }
     }
     await ctx.stripe.changeSubscriptionPlan(
@@ -574,7 +574,7 @@ const subscriptionChangePlan = defineAction<SubscriptionChangePlanParams>({
       p.cycleAnchor === "now" ? "billing cycle reset" : null,
       syncBit,
     ].filter(Boolean);
-    return { ok: true, text: `Subscription ${p.subscriptionId} updated — ${bits.join(", ")} (with prorations).` };
+    return { ok: true, text: `Subscription ${p.subscriptionId} updated: ${bits.join(", ")} (with prorations).` };
   },
 });
 
@@ -620,7 +620,7 @@ const subscriptionTerms = defineAction<SubscriptionTermsParams>({
     const sub = await ctx.stripe.getSubscription(p.subscriptionId);
     if (customerIdOf(sub) !== cus) return "Subscription does not belong to this customer.";
     if (sub.status === "canceled") return "Subscription is canceled.";
-    if (p.endTrialNow && sub.status !== "trialing") return `Subscription is ${sub.status} — no trial to end.`;
+    if (p.endTrialNow && sub.status !== "trialing") return `Subscription is ${sub.status}, no trial to end.`;
     if (p.trialEndUnix != null && p.trialEndUnix * 1000 <= Date.now()) return "Trial end must be in the future.";
     return null;
   },
@@ -628,7 +628,7 @@ const subscriptionTerms = defineAction<SubscriptionTermsParams>({
     const done: string[] = [];
     if (p.endTrialNow) {
       await ctx.stripe.setTrialEnd(p.subscriptionId, "now", `panel-trialnow-${p.subscriptionId}-${ctx.idemScope}`);
-      done.push("trial ended — billing starts now");
+      done.push("trial ended; billing starts now");
     }
     if (p.trialEndUnix != null) {
       await ctx.stripe.setTrialEnd(p.subscriptionId, p.trialEndUnix, `panel-trial-${p.subscriptionId}-${p.trialEndUnix}-${ctx.idemScope}`);
@@ -692,7 +692,7 @@ const subscriptionCreate = defineAction<SubscriptionCreateParams>({
     (p.trialDays ? `, ${p.trialDays}-day trial` : "") +
     (p.promoCode ? `, promo ${p.promoCode}` : "") +
     (p.collection === "invoice" ? " (email invoice)" : " (charge the default payment method now)") +
-    (p.postizSync === false ? " — NO Postiz sync" : " — Postiz sync (tier from the price)"),
+    (p.postizSync === false ? ", NO Postiz sync" : ", Postiz sync (tier from the price)"),
   revalidate: async (ctx, p) => {
     const cus = requireCustomer(ctx);
     if (!cus) return "No linked Stripe customer.";
@@ -703,7 +703,7 @@ const subscriptionCreate = defineAction<SubscriptionCreateParams>({
     if (!price || !price.recurring) return "Price does not exist or is not recurring.";
     if (!price.active) return "Price is archived.";
     if (p.postizSync !== false && !derivePostizPlan(price)) {
-      return "Price is not a canonical Postiz price ($29/$278, $39/$374, $49/$470, $99/$950 USD) — pick a canonical price, use a promo for discounts, or set No sync.";
+      return "Price is not a canonical Postiz price ($29/$278, $39/$374, $49/$470, $99/$950 USD): pick a canonical price, use a promo for discounts, or set No sync.";
     }
     const allowlist = ctx.settingsStore.allowedPriceIds();
     if (allowlist.length > 0 && !allowlist.includes(p.priceId)) return "Price is not on the plan allowlist (/config → Billing).";
@@ -718,7 +718,7 @@ const subscriptionCreate = defineAction<SubscriptionCreateParams>({
       !customer.invoice_settings?.default_payment_method &&
       !customer.default_source
     ) {
-      return "Customer has no default payment method — collect by invoice, add a trial, or attach a card first.";
+      return "Customer has no default payment method: collect by invoice, add a trial, or attach a card first.";
     }
     return null;
   },
@@ -735,7 +735,7 @@ const subscriptionCreate = defineAction<SubscriptionCreateParams>({
     if (p.postizSync !== false) {
       const price = await ctx.stripe.getPrice(p.priceId);
       const plan = derivePostizPlan(price);
-      if (!plan) return { ok: false, error: "Price is not a canonical Postiz price — cannot attach sync metadata." };
+      if (!plan) return { ok: false, error: "Price is not a canonical Postiz price; cannot attach sync metadata." };
       metadata = buildPostizMetadata(plan, postizUniqueId(ctx.idemScope));
       syncText = `Postiz sync ${plan.tier}/${plan.period}`;
     }
@@ -783,11 +783,11 @@ const subscriptionRepairSync = defineAction<SubscriptionRepairSyncParams>({
     if (!cus) return "No linked Stripe customer.";
     const sub = await ctx.stripe.getSubscription(p.subscriptionId);
     if (customerIdOf(sub) !== cus) return "Subscription does not belong to this customer.";
-    if (sub.status === "canceled") return "Subscription is already canceled — nothing left to sync.";
+    if (sub.status === "canceled") return "Subscription is already canceled; nothing left to sync.";
     if (postizSyncStatus(sub) === "synced") return "Subscription already carries correct Postiz sync metadata.";
     const price = sub.items.data[0]?.price;
     if (!price || !derivePostizPlan(price)) {
-      return "This subscription's price is not a canonical Postiz price — the tier cannot be derived, so it cannot be synced. Move it to a canonical price first.";
+      return "This subscription's price is not a canonical Postiz price; the tier cannot be derived, so it cannot be synced. Move it to a canonical price first.";
     }
     return null;
   },
@@ -795,7 +795,7 @@ const subscriptionRepairSync = defineAction<SubscriptionRepairSyncParams>({
     const sub = await ctx.stripe.getSubscription(p.subscriptionId);
     const price = sub.items.data[0]?.price;
     const plan = price ? derivePostizPlan(price) : null;
-    if (!plan) return { ok: false, error: "Price is not a canonical Postiz price — tier cannot be derived." };
+    if (!plan) return { ok: false, error: "Price is not a canonical Postiz price; tier cannot be derived." };
     const uniqueId = sub.metadata?.uniqueId || postizUniqueId(ctx.idemScope);
     await ctx.stripe.updateSubscriptionMetadata(
       p.subscriptionId,
@@ -804,7 +804,7 @@ const subscriptionRepairSync = defineAction<SubscriptionRepairSyncParams>({
     );
     return {
       ok: true,
-      text: `Postiz sync metadata repaired on ${p.subscriptionId} — service gitroom, billing ${plan.tier}, period ${plan.period}, uniqueId ${uniqueId}. The platform re-syncs on the update event.`,
+      text: `Postiz sync metadata repaired on ${p.subscriptionId}: service gitroom, billing ${plan.tier}, period ${plan.period}, uniqueId ${uniqueId}. The platform re-syncs on the update event.`,
     };
   },
 });
@@ -845,7 +845,7 @@ const subscriptionItems = defineAction<SubscriptionItemsParams>({
     if (!cus) return "No linked Stripe customer.";
     const sub = await ctx.stripe.getSubscription(p.subscriptionId);
     if (customerIdOf(sub) !== cus) return "Subscription does not belong to this customer.";
-    if (sub.status !== "active" && sub.status !== "trialing") return `Subscription is ${sub.status} — not changeable.`;
+    if (sub.status !== "active" && sub.status !== "trialing") return `Subscription is ${sub.status}, not changeable.`;
     if (p.op === "add") {
       if (sub.items.data.some((it) => it.price?.id === p.priceId)) return "That price is already on this subscription.";
       const price = await ctx.stripe.getPrice(p.priceId!).catch(() => null);
@@ -856,7 +856,7 @@ const subscriptionItems = defineAction<SubscriptionItemsParams>({
       return null;
     }
     if (!sub.items.data.some((it) => it.id === p.itemId)) return "That item does not exist on this subscription.";
-    if (sub.items.data.length <= 1) return "Cannot remove the last item — cancel the subscription instead.";
+    if (sub.items.data.length <= 1) return "Cannot remove the last item; cancel the subscription instead.";
     return null;
   },
   execute: async (ctx, p) => {
@@ -955,7 +955,7 @@ const subscriptionSchedule = defineAction<SubscriptionScheduleOpParams>({
       if (!scheduleId) return "No schedule is attached to this subscription.";
       const schedule = await ctx.stripe.getSubscriptionSchedule(scheduleId);
       if (schedule.status !== "active" && schedule.status !== "not_started") {
-        return `Schedule is ${schedule.status} — nothing to ${p.op}.`;
+        return `Schedule is ${schedule.status}, nothing to ${p.op}.`;
       }
       if (p.op === "cancel" && sub.status === "canceled") return "Subscription is already canceled.";
       return null;
@@ -964,7 +964,7 @@ const subscriptionSchedule = defineAction<SubscriptionScheduleOpParams>({
     if (scheduleId) {
       const schedule = await ctx.stripe.getSubscriptionSchedule(scheduleId);
       if (schedule.status !== "active" && schedule.status !== "not_started") {
-        return `Schedule is ${schedule.status} — release it first.`;
+        return `Schedule is ${schedule.status}; release it first.`;
       }
     }
     const allowlist = ctx.settingsStore.allowedPriceIds();
@@ -976,7 +976,7 @@ const subscriptionSchedule = defineAction<SubscriptionScheduleOpParams>({
       // Each phase becomes the live price at its boundary — on a gitroom sub
       // every phase must stay derivable or the platform strands on a stale tier.
       if (isGitroomSub(sub) && !derivePostizPlan(price)) {
-        return `Price ${phase.priceId} is not a canonical Postiz price — this subscription syncs to Postiz, so every phase must use one.`;
+        return `Price ${phase.priceId} is not a canonical Postiz price; this subscription syncs to Postiz, so every phase must use one.`;
       }
       if (allowlist.length > 0 && !allowlist.includes(phase.priceId)) {
         return `Price ${phase.priceId} is not on the plan allowlist (/config → Billing).`;
@@ -989,11 +989,11 @@ const subscriptionSchedule = defineAction<SubscriptionScheduleOpParams>({
     let scheduleId = typeof sub.schedule === "string" ? sub.schedule : sub.schedule?.id ?? null;
     if (p.op === "release") {
       await ctx.stripe.releaseSchedule(scheduleId!, `panel-schedrel-${p.subscriptionId}-${ctx.idemScope}`);
-      return { ok: true, text: `Schedule released — ${p.subscriptionId} continues on its current terms; future phases are discarded.` };
+      return { ok: true, text: `Schedule released: ${p.subscriptionId} continues on its current terms; future phases are discarded.` };
     }
     if (p.op === "cancel") {
       await ctx.stripe.cancelSchedule(scheduleId!, `panel-schedcancel-${p.subscriptionId}-${ctx.idemScope}`);
-      return { ok: true, text: `Schedule canceled — subscription ${p.subscriptionId} is now CANCELED.` };
+      return { ok: true, text: `Schedule canceled: subscription ${p.subscriptionId} is now CANCELED.` };
     }
     if (!scheduleId) {
       const created = await ctx.stripe.createScheduleFromSubscription(p.subscriptionId, `panel-schedmk-${p.subscriptionId}-${ctx.idemScope}`);
@@ -1002,7 +1002,7 @@ const subscriptionSchedule = defineAction<SubscriptionScheduleOpParams>({
     const schedule = await ctx.stripe.getSubscriptionSchedule(scheduleId);
     const { phase: currentPhase, unsupported } = rebuildCurrentPhase(schedule);
     if (unsupported.length > 0) {
-      return { ok: false, error: `The current phase has settings this editor can't preserve (${unsupported.join("; ")}) — edit in the Stripe dashboard.` };
+      return { ok: false, error: `The current phase has settings this editor can't preserve (${unsupported.join("; ")}): edit in the Stripe dashboard.` };
     }
     // On gitroom subs, each future phase carries the sync contract with the
     // billing/period THAT phase's price charges — the phase boundary fires
@@ -1015,7 +1015,7 @@ const subscriptionSchedule = defineAction<SubscriptionScheduleOpParams>({
       if (gitroom) {
         const price = await ctx.stripe.getPrice(phase.priceId).catch(() => null);
         const plan = price ? derivePostizPlan(price) : null;
-        if (!plan) return { ok: false, error: `Price ${phase.priceId} is not a canonical Postiz price — cannot keep this subscription synced.` };
+        if (!plan) return { ok: false, error: `Price ${phase.priceId} is not a canonical Postiz price; cannot keep this subscription synced.` };
         metadata = buildPostizMetadata(plan, uniqueId);
       }
       futurePhases.push({
@@ -1033,7 +1033,7 @@ const subscriptionSchedule = defineAction<SubscriptionScheduleOpParams>({
     );
     return {
       ok: true,
-      text: `Scheduled ${p.phases!.length} future phase(s) on ${p.subscriptionId} — after the last phase the subscription ${
+      text: `Scheduled ${p.phases!.length} future phase(s) on ${p.subscriptionId}: after the last phase the subscription ${
         p.endBehavior === "cancel" ? "CANCELS" : "continues on that phase's terms"
       }.`,
     };
@@ -1064,7 +1064,7 @@ const invoiceCollect = defineAction<InvoiceCollectParams>({
     if (!cus) return "No linked Stripe customer.";
     const invoice = await ctx.stripe.getInvoice(p.invoiceId);
     if (customerIdOf(invoice) !== cus) return "Invoice does not belong to this customer.";
-    if (invoice.status !== "open") return `Invoice is ${invoice.status} — only open invoices can be ${p.op === "send" ? "sent" : "paid"} (finalize drafts first).`;
+    if (invoice.status !== "open") return `Invoice is ${invoice.status}: only open invoices can be ${p.op === "send" ? "sent" : "paid"} (finalize drafts first).`;
     return null;
   },
   execute: async (ctx, p) => {
@@ -1073,7 +1073,7 @@ const invoiceCollect = defineAction<InvoiceCollectParams>({
       return { ok: true, text: `Invoice ${p.invoiceId} sent to the customer.` };
     }
     const paid = await ctx.stripe.payInvoice(p.invoiceId, `panel-invpay-${p.invoiceId}-${ctx.idemScope}`);
-    return { ok: true, text: `Invoice ${p.invoiceId} payment attempted — status ${paid.status}.` };
+    return { ok: true, text: `Invoice ${p.invoiceId} payment attempted: status ${paid.status}.` };
   },
 });
 
@@ -1098,12 +1098,12 @@ const invoiceFinalize = defineAction<InvoiceFinalizeParams>({
     if (!cus) return "No linked Stripe customer.";
     const invoice = await ctx.stripe.getInvoice(p.invoiceId);
     if (customerIdOf(invoice) !== cus) return "Invoice does not belong to this customer.";
-    if (invoice.status !== "draft") return `Invoice is ${invoice.status} — only drafts can be finalized.`;
+    if (invoice.status !== "draft") return `Invoice is ${invoice.status}: only drafts can be finalized.`;
     return null;
   },
   execute: async (ctx, p) => {
     const finalized = await ctx.stripe.finalizeInvoice(p.invoiceId, `panel-invfinalize-${p.invoiceId}-${ctx.idemScope}`);
-    return { ok: true, text: `Invoice ${p.invoiceId} finalized — status ${finalized.status}.` };
+    return { ok: true, text: `Invoice ${p.invoiceId} finalized: status ${finalized.status}.` };
   },
 });
 
@@ -1136,9 +1136,9 @@ const invoiceVoid = defineAction<InvoiceVoidParams>({
     if (!cus) return "No linked Stripe customer.";
     const invoice = await ctx.stripe.getInvoice(p.invoiceId);
     if (customerIdOf(invoice) !== cus) return "Invoice does not belong to this customer.";
-    if (p.op === "delete_draft" && invoice.status !== "draft") return `Invoice is ${invoice.status} — only drafts can be deleted.`;
-    if (p.op === "void" && invoice.status !== "open" && invoice.status !== "uncollectible") return `Invoice is ${invoice.status} — only open/uncollectible invoices can be voided.`;
-    if (p.op === "uncollectible" && invoice.status !== "open") return `Invoice is ${invoice.status} — only open invoices can be marked uncollectible.`;
+    if (p.op === "delete_draft" && invoice.status !== "draft") return `Invoice is ${invoice.status}: only drafts can be deleted.`;
+    if (p.op === "void" && invoice.status !== "open" && invoice.status !== "uncollectible") return `Invoice is ${invoice.status}: only open/uncollectible invoices can be voided.`;
+    if (p.op === "uncollectible" && invoice.status !== "open") return `Invoice is ${invoice.status}: only open invoices can be marked uncollectible.`;
     return null;
   },
   execute: async (ctx, p) => {
@@ -1508,7 +1508,7 @@ const chargeCreate = defineAction<ChargeCreateParams>({
       const methods = await ctx.stripe.listAllPaymentMethods(cus);
       if (!methods.some((m) => m.id === p.paymentMethodId)) return "Payment method is not attached to this customer.";
     } else if (!customer.invoice_settings?.default_payment_method && !customer.default_source) {
-      return "Customer has no default payment method — pick a saved card explicitly.";
+      return "Customer has no default payment method: pick a saved card explicitly.";
     }
     return null;
   },
@@ -1523,7 +1523,7 @@ const chargeCreate = defineAction<ChargeCreateParams>({
       },
       `panel-charge-${p.amountMinor}-${p.currency}-${ctx.idemScope}`
     );
-    return { ok: true, text: `Charged ${fmt(ctx.stripe, p.amountMinor, p.currency)} — payment intent ${pi.id} (${pi.status}).` };
+    return { ok: true, text: `Charged ${fmt(ctx.stripe, p.amountMinor, p.currency)}: payment intent ${pi.id} (${pi.status}).` };
   },
 });
 
@@ -1548,7 +1548,7 @@ const customerBlock = defineAction<CustomerBlockParams>({
     if (kinds.length === 0) return { ok: false, error: "at least one valid kind required" };
     return { ok: true, params: { reason, cancelSubs: o?.cancelSubs === true, kinds } };
   },
-  summarize: (p) => `Blocklist the customer (${p.kinds.join(", ")})${p.cancelSubs ? " and cancel all subscriptions" : ""} — ${p.reason}`,
+  summarize: (p) => `Blocklist the customer (${p.kinds.join(", ")})${p.cancelSubs ? " and cancel all subscriptions" : ""}: ${p.reason}`,
   revalidate: async (ctx) => {
     const cus = requireCustomer(ctx);
     if (!cus) return "No linked Stripe customer.";
@@ -1576,7 +1576,7 @@ const customerBlock = defineAction<CustomerBlockParams>({
     const lines = results.map((r) =>
       r.ok ? `${r.kind}: ${r.alreadyBlocked ? "already blocked" : "blocked"}${r.cancelledSubs?.length ? `, cancelled ${r.cancelledSubs.length} sub(s)` : ""}` : `${r.kind}: FAILED (${r.error})`
     );
-    return { ok: true, text: `Blocklist result — ${lines.join("; ")}.` };
+    return { ok: true, text: `Blocklist result: ${lines.join("; ")}.` };
   },
 });
 

@@ -1,6 +1,6 @@
 {
   "uid": "psb-ai-cost-usage",
-  "title": "AI — Cost & Usage",
+  "title": "AI: Cost & Usage",
   "description": "Anthropic API spend, tokens, cache efficiency and run outcomes across all AI features (interactive runs, drafts/summaries, batch scoring).",
   "tags": [
     "postiz-support-bot"

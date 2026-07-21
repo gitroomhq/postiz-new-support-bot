@@ -59,7 +59,7 @@ export class AdminPanelDiscord {
       });
     } catch (e) {
       dLog.warn("admin panel mint failed", { "error.message": e instanceof Error ? e.message : String(e) });
-      await interaction.reply({ content: "Could not create a panel link — check the bot logs.", flags: 64 });
+      await interaction.reply({ content: "Could not create a panel link. Check the bot logs.", flags: 64 });
       return;
     }
     const url = `${base}/admin/panel?t=${encodeURIComponent(token)}`;
@@ -73,7 +73,7 @@ export class AdminPanelDiscord {
     );
     await interaction.reply({
       content:
-        `**Configuration panel** — link valid 15 minutes, for you only. Do not share it.\n` +
+        `**Configuration panel**: link valid 15 minutes, for you only. Do not share it.\n` +
         `1. Open the panel. It shows a code and stays locked.\n` +
         `2. Press **Activate session** and enter that code to unlock.\n` +
         `Destructive actions ask for a fresh code via **Show destructive-action code**.`,
@@ -147,10 +147,10 @@ export class AdminPanelDiscord {
     const raw = interaction.fields.getTextInputValue("code");
     const res = this.sessions.activate(interaction.user.id, normalizeCode(raw), this.settings.adminPanelEpoch());
     if (res.ok) {
-      await interaction.reply({ content: "✅ Panel session activated — return to your browser.", flags: 64 });
+      await interaction.reply({ content: "✅ Panel session activated. Return to your browser.", flags: 64 });
     } else if (res.reason === "locked_out") {
       await interaction.reply({
-        content: "Too many incorrect codes — that session was locked. Re-run the command for a fresh link.",
+        content: "Too many incorrect codes. That session was locked. Re-run the command for a fresh link.",
         flags: 64,
       });
     } else {

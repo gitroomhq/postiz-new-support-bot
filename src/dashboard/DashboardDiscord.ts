@@ -50,12 +50,12 @@ export class DashboardDiscord implements LoginNotifier {
     try {
       const user = await this.client.users.fetch(discordUserId);
       const embed = new EmbedBuilder()
-        .setTitle("Dashboard sign-in — confirm to unlock")
+        .setTitle("Dashboard sign-in: confirm to unlock")
         .setColor(COLORS.brand)
         .setDescription(
           "A dashboard sign-in with your credentials is waiting for activation.\n" +
             "**If this was you:** press **Activate session** and enter the code shown in your browser.\n" +
-            "**If this was NOT you:** press **This wasn't me — lock down** immediately."
+            "**If this was NOT you:** press **This wasn't me, lock down** immediately."
         )
         .addFields(
           { name: "Method", value: info.method, inline: true },
@@ -68,7 +68,7 @@ export class DashboardDiscord implements LoginNotifier {
         new ButtonBuilder()
           .setCustomId("dashpanel_lockdown")
           .setStyle(ButtonStyle.Danger)
-          .setLabel("This wasn't me — lock down")
+          .setLabel("This wasn't me, lock down")
       );
       await user.send({ embeds: [embed], components: [row] });
     } catch (e) {
@@ -131,7 +131,7 @@ export class DashboardDiscord implements LoginNotifier {
       });
     } catch (e) {
       dLog.warn("dashboard mint failed", { "error.message": e instanceof Error ? e.message : String(e) });
-      await interaction.reply({ content: "Could not create a dashboard link — check the bot logs.", flags: 64 });
+      await interaction.reply({ content: "Could not create a dashboard link. Check the bot logs.", flags: 64 });
       return;
     }
     const url = `${base}/billing?t=${encodeURIComponent(token)}`;
@@ -145,8 +145,8 @@ export class DashboardDiscord implements LoginNotifier {
     );
     await interaction.reply({
       content:
-        `**Billing dashboard** — ${base}/billing\n` +
-        `Once you've enrolled a passkey (dashboard → Security), just open that URL and sign in — ` +
+        `**Billing dashboard**: ${base}/billing\n` +
+        `Once you've enrolled a passkey (dashboard → Security), just open that URL and sign in; ` +
         `this one-time link is the break-glass/bootstrap path.\n` +
         `1. Open the dashboard. It shows a code and stays locked.\n` +
         `2. Press **Activate session** and enter that code to unlock.\n` +
@@ -204,7 +204,7 @@ export class DashboardDiscord implements LoginNotifier {
       dLog.warn("dashboard LOCKDOWN triggered", { "discord.user_id": interaction.user.id });
       await interaction.reply({
         content:
-          `🚨 **Dashboard locked down** — disabled and all links/sessions revoked (epoch ${epoch}).\n` +
+          `🚨 **Dashboard locked down**: disabled and all links/sessions revoked (epoch ${epoch}).\n` +
           "Re-enable it later in /config → Open Web Panel → Dashboard.",
         flags: 64,
       });
@@ -238,10 +238,10 @@ export class DashboardDiscord implements LoginNotifier {
     const raw = interaction.fields.getTextInputValue("code");
     const res = await this.auth.activate(interaction.user.id, normalizeCode(raw), this.settings.dashboardEpoch());
     if (res.ok) {
-      await interaction.reply({ content: "✅ Dashboard session activated — return to your browser.", flags: 64 });
+      await interaction.reply({ content: "✅ Dashboard session activated. Return to your browser.", flags: 64 });
     } else if (res.reason === "locked_out") {
       await interaction.reply({
-        content: "Too many incorrect codes — that session was locked. Sign in again for a fresh one.",
+        content: "Too many incorrect codes; that session was locked. Sign in again for a fresh one.",
         flags: 64,
       });
     } else {

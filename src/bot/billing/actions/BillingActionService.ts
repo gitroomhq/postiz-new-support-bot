@@ -369,7 +369,7 @@ export class BillingActionService {
     // Dashboard requests have no conversation — scope the double-click guard
     // to the customer (or globally for unscoped actions).
     const flightKey = `${ctx.conversationId ?? ctx.stripeCustomerId ?? ctx.ticketThreadId ?? "global"}:${def.key}`;
-    if (this.inFlight.has(flightKey)) return { ok: false, error: "This action is already running — refresh in a moment." };
+    if (this.inFlight.has(flightKey)) return { ok: false, error: "This action is already running. Refresh in a moment." };
     this.inFlight.add(flightKey);
     try {
       const refusal = await def.revalidate(ctx, params).catch((e) => `Revalidation failed: ${e instanceof Error ? e.message : String(e)}`);
@@ -439,7 +439,7 @@ export class BillingActionService {
           { name: "Summary", value: input.summary.slice(0, 1024), inline: false },
           ...(input.ctx?.stripeCustomerId ? [{ name: "Customer", value: `\`${input.ctx.stripeCustomerId}\``, inline: true }] : []),
           ...(input.ctx?.ticketThreadId ? [{ name: "Ticket", value: `<#${input.ctx.ticketThreadId}>`, inline: true }] : []),
-          ...input.fields.map((f) => ({ ...f, value: f.value.slice(0, 1024) || "—" }))
+          ...input.fields.map((f) => ({ ...f, value: f.value.slice(0, 1024) || "N/A" }))
         )
         .setTimestamp();
       const channelId = this.settingsStore.billingAuditChannelId();

@@ -354,7 +354,7 @@ export class ClaudeCodeRunner {
           const timeoutMs = options.timeoutMs ?? 120_000;
           killTimer = setTimeout(() => {
             timedOut = true;
-            claudeLog.warn("run timed out — terminating", {
+            claudeLog.warn("run timed out: terminating", {
               "ai.agent": agentName,
               "timeout_ms": timeoutMs,
             });

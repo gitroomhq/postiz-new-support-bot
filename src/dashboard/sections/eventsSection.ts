@@ -72,7 +72,7 @@ export function makeEventsSection(): DashboardSectionModule {
               label: "Type query",
               kind: "text",
               value: typeq || undefined,
-              placeholder: "invoice.* — wins over the select",
+              placeholder: "invoice.* (wins over the select)",
             },
           ],
           exportable: true,
@@ -84,7 +84,7 @@ export function makeEventsSection(): DashboardSectionModule {
               id: e.id,
               cells: [
                 { t: "text", v: sentence(e.type.replace(/[._]/g, " ")), strong: true, sub: e.type } as Cell,
-                objId ? idCell(objId, { copy: true, ...(ref ? { ref } : {}) }) : text(obj.object ?? "—"),
+                objId ? idCell(objId, { copy: true, ...(ref ? { ref } : {}) }) : text(obj.object ?? "N/A"),
                 dateCell(e.created),
                 idCell(e.id, { copy: true }),
               ] as Cell[],

@@ -155,7 +155,7 @@ export class HomeMetrics {
       currency: currency.toUpperCase(),
       points: buckets,
       note:
-        (truncated ? "Truncated sweep — some days undercount. " : "") +
+        (truncated ? "Truncated sweep: some days undercount. " : "") +
         (others.length ? `Only ${currency.toUpperCase()} charted (also saw ${others.map((c) => c.toUpperCase()).join(", ")}).` : "") || undefined,
     };
   }
@@ -176,7 +176,7 @@ export class HomeMetrics {
       key: "new_customers",
       unit: "count",
       points: buckets,
-      ...(truncated ? { note: "Truncated sweep — some days undercount." } : {}),
+      ...(truncated ? { note: "Truncated sweep: some days undercount." } : {}),
     };
   }
 
@@ -239,7 +239,7 @@ export class HomeMetrics {
       key: "failed_payments",
       unit: "count",
       points: buckets,
-      ...(truncated ? { note: "Truncated sweep — some days undercount." } : {}),
+      ...(truncated ? { note: "Truncated sweep: some days undercount." } : {}),
     };
   }
 

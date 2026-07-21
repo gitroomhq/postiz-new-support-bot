@@ -62,7 +62,7 @@ export class SentryFeedbackClient {
       const retryAfter = res.status === 429 ? Number(res.headers.get("retry-after")) || undefined : undefined;
       throw new SentryHttpError(
         res.status,
-        `Sentry ${what}: HTTP ${res.status}${text ? ` — ${text.slice(0, 300)}` : ""}`,
+        `Sentry ${what}: HTTP ${res.status}${text ? `: ${text.slice(0, 300)}` : ""}`,
         retryAfter
       );
     }

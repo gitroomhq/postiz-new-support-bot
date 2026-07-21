@@ -41,17 +41,17 @@ export class AutomationHub {
       "Intercom Automation",
       [
         "**Inactivity sweeper** (native/unbridged conversations + tickets):",
-        `**Status:** ${s.inactivityEnabled() ? "**on** — sweeping every 30 minutes" : "**off**"}`,
+        `**Status:** ${s.inactivityEnabled() ? "**on** (sweeping every 30 minutes)" : "**off**"}`,
         `**Agent-idle:** after ${s.inactivityAgentWaitDays()} day(s) waiting on an agent → internal note (≤1 per window)`,
         `**Customer-idle:** after ${s.inactivityCustomerWaitDays()} day(s) of customer silence → outbound reply nag`,
         `**Auto-close:** after ${s.inactivityNagsBeforeClose()} unanswered nag(s) → conversation (and its native ticket) closed`,
         `**Texts:** customer nag ${s.inactivityNagText() ? "custom" : "default"} · agent note ${s.inactivityAgentNoteText() ? "custom" : "default"}`,
         "",
-        "Covers every open, unsnoozed conversation and open ticket in the workspace EXCEPT Discord-bridged tickets (their per-tag reminder settings below own those). Native tickets only get agent-idle notes — never auto-close.",
+        "Covers every open, unsnoozed conversation and open ticket in the workspace EXCEPT Discord-bridged tickets (their per-tag reminder settings below own those). Native tickets only get agent-idle notes, never auto-close.",
         "",
-        "**Per-tag reminder texts** (bridged tickets — agent reminders post as Intercom notes):",
+        "**Per-tag reminder texts** (bridged tickets; agent reminders post as Intercom notes):",
         customTags.length
-          ? customTags.map((t) => `${t.emoji} ${t.label} — custom`).join(" · ")
+          ? customTags.map((t) => `${t.emoji} ${t.label}: custom`).join(" · ")
           : "_all tags use the built-in default texts_",
         "Pick a tag below to edit its customer reminder, agent note, auto-close farewell and repeat cadence. Structural tag settings (label, delays, target) stay in /config → Workflow → Manage Tags.",
       ].join("\n")
@@ -125,7 +125,7 @@ export class AutomationHub {
     await interaction.reply({
       embeds: [
         makeEmbed(
-          `Inactivity thresholds saved — agent-idle ${agentDays}d, customer-idle ${customerDays}d, auto-close after ${nags} unanswered nag(s). Applies on the next sweep.`,
+          `Inactivity thresholds saved: agent-idle ${agentDays}d, customer-idle ${customerDays}d, auto-close after ${nags} unanswered nag(s). Applies on the next sweep.`,
           COLORS.success
         ),
       ],
@@ -186,11 +186,11 @@ export class AutomationHub {
   private async handleTagPick(interaction: StringSelectMenuInteraction): Promise<void> {
     const tag = this.ctx.settingsStore.tagById(interaction.values[0]);
     if (!tag) {
-      await interaction.reply({ embeds: [makeEmbed("This tag no longer exists — reopen /intercom.", COLORS.warn)], flags: 64 });
+      await interaction.reply({ embeds: [makeEmbed("This tag no longer exists. Reopen /intercom.", COLORS.warn)], flags: 64 });
       return;
     }
     const cadence = tag.reminderEnabled
-      ? `every ${tag.reminderDays}d first, then ${tag.reminderRepeatDays ?? tag.reminderDays}d — target ${tag.reminderTarget}`
+      ? `every ${tag.reminderDays}d first, then ${tag.reminderRepeatDays ?? tag.reminderDays}d · target ${tag.reminderTarget}`
       : "reminders off for this tag";
     await interaction.update({
       embeds: [
@@ -219,7 +219,7 @@ export class AutomationHub {
   private async handleTagTextsOpen(interaction: ButtonInteraction): Promise<void> {
     const tag = this.ctx.settingsStore.tagById(interaction.customId.slice("icadmin_auto_tag_texts:".length));
     if (!tag) {
-      await interaction.reply({ embeds: [makeEmbed("This tag no longer exists — reopen /intercom.", COLORS.warn)], flags: 64 });
+      await interaction.reply({ embeds: [makeEmbed("This tag no longer exists. Reopen /intercom.", COLORS.warn)], flags: 64 });
       return;
     }
     // Per-tag reminder/close overrides. Blank input = clear back to default.
@@ -259,7 +259,7 @@ export class AutomationHub {
     const tagId = interaction.customId.slice("icadmin_auto_tag_m:".length);
     const tag = this.ctx.settingsStore.tagById(tagId);
     if (!tag) {
-      await interaction.reply({ embeds: [makeEmbed("This tag no longer exists — reopen /intercom.", COLORS.warn)], flags: 64 });
+      await interaction.reply({ embeds: [makeEmbed("This tag no longer exists. Reopen /intercom.", COLORS.warn)], flags: 64 });
       return;
     }
     const customerText = interaction.fields.getTextInputValue("customer_text").trim();

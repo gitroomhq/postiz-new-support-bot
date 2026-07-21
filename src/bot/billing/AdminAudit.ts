@@ -53,10 +53,10 @@ export class AdminAudit {
       .setColor(SEVERITY_COLORS[entry.severity ?? "info"])
       .addFields(
         { name: "Actor", value: interaction.user.tag, inline: true },
-        { name: "Target customer", value: entry.targetCustomerId ? `\`${entry.targetCustomerId}\`` : "—", inline: true },
-        { name: "Object", value: entry.objectId ? `\`${entry.objectId}\`` : "—", inline: true },
-        { name: "Amount", value: entry.amountText ?? "—", inline: true },
-        { name: "Outcome", value: entry.outcome.slice(0, 1024) || "—", inline: false }
+        { name: "Target customer", value: entry.targetCustomerId ? `\`${entry.targetCustomerId}\`` : "N/A", inline: true },
+        { name: "Object", value: entry.objectId ? `\`${entry.objectId}\`` : "N/A", inline: true },
+        { name: "Amount", value: entry.amountText ?? "N/A", inline: true },
+        { name: "Outcome", value: entry.outcome.slice(0, 1024) || "N/A", inline: false }
       )
       .setTimestamp();
 
@@ -76,9 +76,9 @@ export class AdminAudit {
         title: `🛠️ Billing Admin: ${entry.action}`,
         actor: interaction.user.tag,
         fields: [
-          { name: "Target customer", value: entry.targetCustomerId ? `\`${entry.targetCustomerId}\`` : "—", inline: true },
-          { name: "Object", value: entry.objectId ? `\`${entry.objectId}\`` : "—", inline: true },
-          { name: "Amount", value: entry.amountText ?? "—", inline: true },
+          { name: "Target customer", value: entry.targetCustomerId ? `\`${entry.targetCustomerId}\`` : "N/A", inline: true },
+          { name: "Object", value: entry.objectId ? `\`${entry.objectId}\`` : "N/A", inline: true },
+          { name: "Amount", value: entry.amountText ?? "N/A", inline: true },
           { name: "Outcome", value: entry.outcome, inline: false },
         ],
         severity: entry.severity ?? "info",

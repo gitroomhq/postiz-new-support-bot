@@ -54,7 +54,7 @@ export function makeLinksSection(): DashboardSectionModule {
             `dash-plink-${priceId}-${Date.now().toString(36)}`
           );
           await ctx.audit(`Payment link ${link.id} created on ${priceId}`);
-          return { ok: true, text: `Payment link created — ${link.url}` };
+          return { ok: true, text: `Payment link created: ${link.url}` };
         }
         // T0 — kill/revive the URL (links can't be deleted).
         case "section:links.toggle": {
@@ -62,7 +62,7 @@ export function makeLinksSection(): DashboardSectionModule {
           if (!id) return { ok: false, error: "Bad payment link id." };
           const link = await ctx.stripe.setPaymentLinkActive(id, p.active === true);
           await ctx.audit(`Payment link ${id} ${link.active ? "reactivated" : "deactivated"}`);
-          return { ok: true, text: `${id} is now ${link.active ? "active — the URL works again" : "inactive — the URL is dead"}.` };
+          return { ok: true, text: `${id} is now ${link.active ? "active (the URL works again)" : "inactive (the URL is dead)"}.` };
         }
         default:
           return { ok: false, error: "Unknown action." };
@@ -96,7 +96,7 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
 
   const priceOptions = prices.slice(0, 25).map((p) => ({
     value: p.id,
-    label: `${p.nickname ?? p.id.slice(0, 18)} — ${p.unit_amount != null ? ctx.stripe.formatAmount(p.unit_amount, p.currency) : "?"}${p.recurring ? `/${p.recurring.interval}` : ""}`,
+    label: `${p.nickname ?? p.id.slice(0, 18)}: ${p.unit_amount != null ? ctx.stripe.formatAmount(p.unit_amount, p.currency) : "?"}${p.recurring ? `/${p.recurring.interval}` : ""}`,
   }));
 
   const blocks: Block[] = [
@@ -113,7 +113,7 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
             { type: "number", key: "quantity", label: "Quantity (default 1)", min: 1, max: 999 },
             { type: "toggle", key: "adjustable", label: "Customer can adjust quantity" },
           ],
-          summary: "Creates a Stripe-hosted checkout URL for the picked price — shareable immediately.",
+          summary: "Creates a Stripe-hosted checkout URL for the picked price, shareable immediately.",
         },
       ],
     },
@@ -157,16 +157,16 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
                 key: "section:links.toggle",
                 label: "Deactivate",
                 params: { id: link.id, active: false },
-                summary: "Kills the URL — customers holding it see an error page until reactivation.",
+                summary: "Kills the URL; customers holding it see an error page until reactivation.",
               }
             : { key: "section:links.toggle", label: "Reactivate", params: { id: link.id, active: true } },
         ],
       })),
       nextCursor:
         linksRes.hasMore && linksRes.links.length > 0 ? linksRes.links[linksRes.links.length - 1].id : null,
-      empty: statusFilter ? "No payment links match this filter (within this window)." : "No payment links yet — create one above.",
+      empty: statusFilter ? "No payment links match this filter (within this window)." : "No payment links yet. Create one above.",
       ...(links.length ? { footer: `${links.length} item${links.length === 1 ? "" : "s"}` } : {}),
-      notice: "Counts cover this page's window. Links can't be deleted — deactivate to kill the URL.",
+      notice: "Counts cover this page's window. Links can't be deleted; deactivate to kill the URL.",
     },
   ];
   return { title: "Payment links", crumbs: [{ label: "Payment links" }], blocks };
@@ -245,12 +245,12 @@ async function sessionsList(ctx: DashboardCtx, filters: Record<string, string>, 
             text(sentence(s.mode ?? "payment")),
             custId
               ? ({ t: "link", v: custLabel ?? custId, ref: { page: "customers.detail", params: { id: custId } } } as Cell)
-              : text(custLabel ?? "—"),
+              : text(custLabel ?? "N/A"),
             dateCell(s.created),
             // The checkout URL only works (and only exists) while open.
             s.status === "open" && s.url
               ? ({ t: "external", v: "Open checkout ↗", href: s.url, copy: true } as Cell)
-              : text("—"),
+              : text("N/A"),
             idCell(s.id, { copy: true }),
           ] as Cell[],
         };
@@ -258,7 +258,7 @@ async function sessionsList(ctx: DashboardCtx, filters: Record<string, string>, 
       nextCursor: hasMore && sessions.length > 0 ? sessions[sessions.length - 1].id : null,
       empty: statusFilter ? "No checkout sessions with this status (within this window)." : "No checkout sessions yet.",
       ...(sessions.length ? { footer: `${sessions.length}${hasMore ? "+" : ""} item${sessions.length === 1 ? "" : "s"}` } : {}),
-      notice: "Read-only — sessions are minted by payment links and the API; open URLs die when the session expires.",
+      notice: "Read-only: sessions are minted by payment links and the API; open URLs die when the session expires.",
     },
   ];
   return { title: "Payment links", crumbs: [{ label: "Payment links" }], blocks };
@@ -287,7 +287,7 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
               label: "Deactivate",
               style: "danger",
               params: { id: link.id, active: false },
-              summary: "Kills the URL — customers holding it see an error page until reactivation.",
+              summary: "Kills the URL; customers holding it see an error page until reactivation.",
             }
           : { key: "section:links.toggle", label: "Reactivate", style: "primary", params: { id: link.id, active: true } },
         bookmarkButton("section:links.bookmark", bookmarked, link.id, sellsLabel(link)),

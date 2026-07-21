@@ -52,7 +52,7 @@ export function makeWebhooksSection(): DashboardSectionModule {
                 { type: "text", key: "description", label: "Description (optional)", maxLength: 100 },
               ],
               summary:
-                "Creates the endpoint and shows its signing secret ONCE — copy it immediately, Stripe never returns it again.",
+                "Creates the endpoint and shows its signing secret ONCE: copy it immediately, Stripe never returns it again.",
             },
           ],
         },
@@ -105,7 +105,7 @@ export function makeWebhooksSection(): DashboardSectionModule {
                         style: "danger" as const,
                         dangerous: true,
                         params: { id: ep.id },
-                        summary: "Deletes the endpoint permanently — its signing secret stops working immediately.",
+                        summary: "Deletes the endpoint permanently; its signing secret stops working immediately.",
                       },
                     ],
                   }),
@@ -113,7 +113,7 @@ export function makeWebhooksSection(): DashboardSectionModule {
           }),
           empty: "No webhook endpoints.",
           ...(endpoints.length ? { footer: `${endpoints.length} endpoint${endpoints.length === 1 ? "" : "s"}` } : {}),
-          notice: "The bot-managed endpoint delivers billing alerts to this bot — manage it via the bot, not here.",
+          notice: "The bot-managed endpoint delivers billing alerts to this bot; manage it via the bot, not here.",
         },
       ];
       return { title: "Webhooks", crumbs: [{ label: "Webhooks" }], blocks };
@@ -162,7 +162,7 @@ export function makeWebhooksSection(): DashboardSectionModule {
           return {
             ok: true,
             text: created.secret
-              ? `Endpoint ${created.id} created. Signing secret (copy NOW — never shown again): ${created.secret}`
+              ? `Endpoint ${created.id} created. Signing secret (copy NOW, never shown again): ${created.secret}`
               : `Endpoint ${created.id} created. Stripe did not return a signing secret.`,
           };
         }
@@ -173,7 +173,7 @@ export function makeWebhooksSection(): DashboardSectionModule {
           const id = typeof p.id === "string" && ENDPOINT_ID_RE.test(p.id) ? p.id : null;
           if (!id) return { ok: false, error: "Bad endpoint id." };
           if (id === ctx.settings.stripeWebhookEndpointId()) {
-            return { ok: false, error: "This endpoint is bot-managed — the bot re-creates and reconciles it itself." };
+            return { ok: false, error: "This endpoint is bot-managed: the bot re-creates and reconciles it itself." };
           }
           const live = (await ctx.stripe.listWebhookEndpoints(100)).find((ep) => ep.id === id);
           if (!live) return { ok: false, error: "This endpoint no longer exists." };
@@ -191,13 +191,13 @@ export function makeWebhooksSection(): DashboardSectionModule {
           const id = typeof p.id === "string" && ENDPOINT_ID_RE.test(p.id) ? p.id : null;
           if (!id) return { ok: false, error: "Bad endpoint id." };
           if (id === ctx.settings.stripeWebhookEndpointId()) {
-            return { ok: false, error: "This endpoint is bot-managed — deleting it would sever the bot's billing alerts." };
+            return { ok: false, error: "This endpoint is bot-managed: deleting it would sever the bot's billing alerts." };
           }
           const live = (await ctx.stripe.listWebhookEndpoints(100)).find((ep) => ep.id === id);
           if (!live) return { ok: false, error: "This endpoint no longer exists." };
           await ctx.stripe.deleteWebhookEndpoint(id);
           await ctx.audit(`Webhook endpoint ${id} DELETED (${live.url})`);
-          return { ok: true, text: `${id} deleted — its signing secret is dead.` };
+          return { ok: true, text: `${id} deleted. Its signing secret is dead.` };
         }
         default:
           return { ok: false, error: "Unknown action." };

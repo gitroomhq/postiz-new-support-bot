@@ -511,7 +511,7 @@ test("detail: synced sub gets no repair button and clean cancel summaries; non-c
   );
 });
 
-test("list: Postiz sync has NO surface — no column, no flag, no filter (detail-only concern)", async () => {
+test("list: Postiz sync has NO surface; no column, no flag, no filter (detail-only concern)", async () => {
   const section = makeSubscriptionsSection();
   const page = await section.buildPage(sectionCtx(), { page: "subscriptions", filters: {} });
   const table = page!.blocks.find((b) => b.type === "table") as TableBlock;

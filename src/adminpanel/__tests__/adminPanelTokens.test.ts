@@ -41,7 +41,7 @@ test("mint → verify round-trip carries user, guild, name, panel, adm, jti, epo
   assert.ok(p!.exp > Date.now());
 });
 
-test("admin tokens are version-bound (a1) — a v1-tagged token is rejected", async () => {
+test("admin tokens are version-bound (a1): a v1-tagged token is rejected", async () => {
   const { store } = fakeSettings();
   const tokens = new AdminPanelTokens(store);
   const token = await tokens.mint(MINT_INPUT);

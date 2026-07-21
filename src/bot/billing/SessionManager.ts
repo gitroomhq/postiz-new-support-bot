@@ -37,7 +37,7 @@ export class SessionManager {
     const session = this.sessions.get(token);
     if (!session) {
       await interaction.reply({
-        embeds: [makeEmbed("This /billing session has expired — run /billing again.", COLORS.warn)],
+        embeds: [makeEmbed("This /billing session has expired. Run /billing again.", COLORS.warn)],
         flags: 64,
       });
       return null;

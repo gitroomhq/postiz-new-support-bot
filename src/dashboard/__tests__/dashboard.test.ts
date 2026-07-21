@@ -330,7 +330,7 @@ test("estimateMrr: normalizes intervals, honors quantity/interval_count, skips t
   assert.equal(mrr.get("usd"), 1000);
   const fmt = { formatAmount: (a: number, c: string) => `${(a / 100).toFixed(2)} ${c.toUpperCase()}` };
   assert.equal(formatPerCurrency(fmt, mrr), "53.00 EUR + 10.00 USD");
-  assert.equal(formatPerCurrency(fmt, new Map()), "—");
+  assert.equal(formatPerCurrency(fmt, new Map()), "N/A");
 });
 
 test("charge badges are sentence-case with refund/dispute precedence", () => {
@@ -484,7 +484,7 @@ test("customer 360: Insights/Details/Linked accounts in the rail, atoms in the m
     major: 29,
     badge: { kind: "warn", text: "Partial refund" },
   });
-  assert.equal(payments.footer, "1 result — view all");
+  assert.equal(payments.footer, "1 result · view all");
   const subsTable = page!.blocks.find((b) => b.type === "table" && b.key === "subs") as TableBlock;
   assert.equal(subsTable.rows[0].cells[0].t, "avatar");
 });
@@ -1012,7 +1012,7 @@ test("payments list: Stripe toolbar (select/export/edit-columns) + decline-reaso
   // Every row carries cells for the new refunded-date (5) + decline (6) columns.
   const row1 = table.rows.find((r) => r.id === "ch_1")!;
   assert.equal(row1.cells.length, 8);
-  assert.equal((row1.cells[6] as { v: string }).v, "—");
+  assert.equal((row1.cells[6] as { v: string }).v, "N/A");
 });
 
 test("charge detail: an open dispute surfaces a banner + Dispute rail card + single Disputed pill", async () => {
@@ -1839,7 +1839,7 @@ function fakeAiDeps(opts: { draftJson?: string; reviewText?: string; lightRun?: 
         run: async (_prompt: string, _sys: undefined, runOpts: { attachments?: unknown[] }) => {
           seen.reviewAttachments.push(runOpts.attachments?.length ?? 0);
           if (opts.lightRun) return opts.lightRun();
-          return [opts.reviewText ?? "Solid package — stage the draft narrative too."];
+          return [opts.reviewText ?? "Solid package; stage the draft narrative too."];
         },
       },
       intercom: {},
@@ -2179,7 +2179,7 @@ test("evidence service: uploadProof validates slot/type/size and live status; re
   });
 });
 
-test("evidence service: submit — status guard, cross-admin claim, markSubmitted, claim release on Stripe failure", async () => {
+test("evidence service: submit (status guard, cross-admin claim, markSubmitted, claim release on Stripe failure)", async () => {
   const f = evidenceFakes();
   const r1 = await f.svc.submit("dp_1", "42", "cus_a");
   assert.equal(r1.kind, "submitted");
@@ -2223,7 +2223,7 @@ test("evidence service: accept claims, closes and upserts; packageFrom computes 
 
 // ---- the workbench page + section actions ----
 
-test("dispute workbench: live detail — evidence widget states, submit ceremony, refund-to-prevent baked from the dispute's charge", async () => {
+test("dispute workbench: live detail (evidence widget states, submit ceremony, refund-to-prevent baked from the dispute's charge)", async () => {
   const fakes = evidenceFakes();
   const section = makeDisputesSection(disputesDeps(fakes));
   const page = await section.buildPage(disputesCtx(fakes), { page: "disputes.detail", params: { id: "dp_1" } });
@@ -2271,7 +2271,7 @@ test("dispute workbench: closed dispute renders read-only (submit/accept disable
   assert.equal(widget.editable, false);
 });
 
-test("dispute actions: T3 gating — submit/accept demand the Discord reverse code, then run through the shared claims", async () => {
+test("dispute actions: T3 gating; submit/accept demand the Discord reverse code, then run through the shared claims", async () => {
   const fakes = evidenceFakes();
   const section = makeDisputesSection(disputesDeps(fakes));
 
@@ -2394,7 +2394,7 @@ test("disputes review page: staged read-back tables, per-file remove actions, un
 
 // ---- AI draft + review via the service seams ----
 
-test("AI draft: faked runner — validators drop misshapen values, Stripe-sourced fields override the model, draft merges locally", async () => {
+test("AI draft: faked runner; validators drop misshapen values, Stripe-sourced fields override the model, draft merges locally", async () => {
   const ai = fakeAiDeps({
     draftJson: JSON.stringify({
       product_description: "Postiz is a social scheduler…",
@@ -5728,7 +5728,7 @@ test("checkout sessions: Links page grows tabs; session URL renders only while o
   const urlOpen = table.rows[0].cells[4] as { t: string };
   assert.equal(urlOpen.t, "external");
   const urlDone = table.rows[1].cells[4] as { t: string; v: string };
-  assert.equal(urlDone.v, "—");
+  assert.equal(urlDone.v, "N/A");
   const amountSetup = table.rows[2].cells[0] as { t: string };
   assert.equal(amountSetup.t, "badge");
   const custLink = table.rows[0].cells[2] as { t: string; ref: { page: string } };

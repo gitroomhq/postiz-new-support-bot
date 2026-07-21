@@ -1,6 +1,6 @@
 {
   "uid": "psb-support-overview",
-  "title": "Support — Overview",
+  "title": "Support: Overview",
   "description": "Ticket volume, backlog, response times and CSAT for the Postiz support bot.",
   "tags": [
     "postiz-support-bot"

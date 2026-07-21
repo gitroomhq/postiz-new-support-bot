@@ -60,14 +60,14 @@ export function buildDisputeEvidencePrompt(ctx: DisputeEvidenceContext): string 
         ? `Other charges on this customer with the SAME amount (real candidates for the original charge in duplicate_charge_id):\n${ctx.duplicateCandidates
             .map((c) => `- ${c.id} · ${c.amountText} · created ${c.created}${c.description ? ` · "${c.description}"` : ""}`)
             .join("\n")}`
-        : "Duplicate check: this customer has NO other charge with the same amount — there is no original charge. OMIT duplicate_charge_id entirely and make duplicate_charge_explanation state the factual position: only one charge of this amount exists, so nothing was charged twice."
+        : "Duplicate check: this customer has NO other charge with the same amount. There is no original charge. OMIT duplicate_charge_id entirely and make duplicate_charge_explanation state the factual position: only one charge of this amount exists, so nothing was charged twice."
       : null,
   ]
     .filter(Boolean)
     .join("\n");
 
   const exemplarBlock = ctx.wonExemplars.length
-    ? `\nPAST WON DISPUTES (style/structure reference ONLY — these are OTHER customers' cases; never copy their names, emails, dates, plans or any customer-specific detail into this draft):\n${ctx.wonExemplars
+    ? `\nPAST WON DISPUTES (style/structure reference ONLY: these are OTHER customers' cases; never copy their names, emails, dates, plans or any customer-specific detail into this draft):\n${ctx.wonExemplars
         .map(
           (ex, i) =>
             `--- Won dispute ${i + 1} (reason: ${ex.reason}) ---\n${Object.entries(ex.evidence)
@@ -79,23 +79,23 @@ export function buildDisputeEvidencePrompt(ctx: DisputeEvidenceContext): string 
 
   return `You draft chargeback-dispute evidence for Postiz (a social-media scheduling SaaS, sold as a subscription; the merchant is the Postiz team).
 
-You are working inside the Postiz knowledge base: Read/Glob/Grep the product source at ./postiz-app and the documentation at ./postiz-docs. Search them for real, quotable material — refund/cancellation/terms policy pages, pricing and plan descriptions, feature docs, subscription/billing behavior in the code.
+You are working inside the Postiz knowledge base: Read/Glob/Grep the product source at ./postiz-app and the documentation at ./postiz-docs. Search them for real, quotable material: refund/cancellation/terms policy pages, pricing and plan descriptions, feature docs, subscription/billing behavior in the code.
 
-Write from the merchant's perspective, factual and concise — evidence text is read by bank analysts who skim.
+Write from the merchant's perspective, factual and concise. Evidence text is read by bank analysts who skim.
 RULES:
-- Fill every field you can ground in the FACTS or the knowledge base with substantive text. OMIT any field you would have to guess — leave it out of the JSON entirely; a missing field is far better than an invented one (bank analysts reject responses over one provably wrong claim).
+- Fill every field you can ground in the FACTS or the knowledge base with substantive text. OMIT any field you would have to guess. Leave it out of the JSON entirely; a missing field is far better than an invented one (bank analysts reject responses over one provably wrong claim).
 - Every field's value must match that field's MEANING. duplicate_charge_id takes ONLY a real Stripe charge id (ch_… / py_…) taken verbatim from the FACTS; service_date and shipping_date take ONLY a date; customer_email_address takes ONLY an email address. Never spill a description, an email, or narrative text into an id/date field.
 - The reader is a BANK ANALYST, not a developer. NEVER include internal artifacts in the evidence text: no file paths, repository or folder names, code identifiers, function/variable names, "./postiz-docs/…" style references, or any mention that you searched a codebase. Cite policies by their public location only (e.g. "as published on the Postiz documentation site" or "shown during checkout"), in plain business language.
-- Policy fields (refund_policy_disclosure, cancellation_policy_disclosure, cancellation_rebuttal): find the actual published policy/terms in the docs or source and quote or faithfully paraphrase them. If no explicit policy document exists, accurately describe how the product verifiably behaves per the code/docs (e.g. self-service cancellation available anytime from the billing settings, subscriptions bill per period until cancelled) — never present behavior the code doesn't have.
-- NEVER invent customer-specific facts: no fabricated order numbers, IP addresses, raw log lines, dates or communications. Customer-specific content comes ONLY from the FACTS below — service_date is the charge date; customer_email_address is the customer's email; access_activity_log describes the factual account/billing history from the FACTS (signup date, subscription plan/status, renewal charges) in prose, not fabricated log lines.
-- If the FACTS include real support conversations, they are strong evidence: quote or faithfully summarize the relevant exchanges (what the customer asked, what was delivered/answered, dates) — especially where they show the customer actively used the product, acknowledged the subscription, or was helped. Never quote anything from a conversation that isn't in the FACTS.
-- If past won disputes are provided, mirror what made them effective (structure, tone, which facts they led with) — but every customer-specific detail in this draft must come from THIS dispute's FACTS.
+- Policy fields (refund_policy_disclosure, cancellation_policy_disclosure, cancellation_rebuttal): find the actual published policy/terms in the docs or source and quote or faithfully paraphrase them. If no explicit policy document exists, accurately describe how the product verifiably behaves per the code/docs (e.g. self-service cancellation available anytime from the billing settings, subscriptions bill per period until cancelled). Never present behavior the code doesn't have.
+- NEVER invent customer-specific facts: no fabricated order numbers, IP addresses, raw log lines, dates or communications. Customer-specific content comes ONLY from the FACTS below: service_date is the charge date; customer_email_address is the customer's email; access_activity_log describes the factual account/billing history from the FACTS (signup date, subscription plan/status, renewal charges) in prose, not fabricated log lines.
+- If the FACTS include real support conversations, they are strong evidence: quote or faithfully summarize the relevant exchanges (what the customer asked, what was delivered/answered, dates), especially where they show the customer actively used the product, acknowledged the subscription, or was helped. Never quote anything from a conversation that isn't in the FACTS.
+- If past won disputes are provided, mirror what made them effective (structure, tone, which facts they led with), but every customer-specific detail in this draft must come from THIS dispute's FACTS.
 - Each field at most 3500 characters.
 ${exemplarBlock}
 FACTS:
 ${facts}
 
-FINAL ANSWER: after your research, respond with ONLY a JSON object (no code fences, no commentary before or after it). Allowed keys, in this order: ${ctx.fields.join(", ")}. Include only the keys you could ground in real material — omit the rest.`;
+FINAL ANSWER: after your research, respond with ONLY a JSON object (no code fences, no commentary before or after it). Allowed keys, in this order: ${ctx.fields.join(", ")}. Include only the keys you could ground in real material; omit the rest.`;
 }
 
 export interface DisputeEvidenceReviewContext {
@@ -150,27 +150,27 @@ export function buildDisputeEvidenceReviewPrompt(ctx: DisputeEvidenceReviewConte
     ? ctx.files
         .map(
           (f, i) =>
-            `${i + 1}. slot ${f.slot} · "${f.filename}" — ${f.attached ? "ATTACHED above (in this order)" : `NOT attached (${f.note ?? "unavailable"}) — flag that you could not verify it`}`
+            `${i + 1}. slot ${f.slot} · "${f.filename}" · ${f.attached ? "ATTACHED above (in this order)" : `NOT attached (${f.note ?? "unavailable"}): flag that you could not verify it`}`
         )
         .join("\n")
     : "(no evidence files)";
 
   const draftBlock = ctx.unstagedDraft.length
-    ? `\nLOCAL DRAFT NOT YET STAGED (the bank will NOT see these unless staged first — compare against the staged text and say whether staging them would help):\n${ctx.unstagedDraft
+    ? `\nLOCAL DRAFT NOT YET STAGED (the bank will NOT see these unless staged first; compare against the staged text and say whether staging them would help):\n${ctx.unstagedDraft
         .map((f) => `--- ${f.key} (draft) ---\n${f.text}`)
         .join("\n")}\n`
     : "";
 
-  return `You are a veteran chargeback-evidence reviewer working for the merchant (Postiz, a social-media scheduling SaaS sold as a subscription). Below is the evidence package currently staged at Stripe for a dispute — exactly what the issuing bank's analyst would receive on Submit. Attached before this text are the evidence files, in the order listed under FILES.
+  return `You are a veteran chargeback-evidence reviewer working for the merchant (Postiz, a social-media scheduling SaaS sold as a subscription). Below is the evidence package currently staged at Stripe for a dispute: exactly what the issuing bank's analyst would receive on Submit. Attached before this text are the evidence files, in the order listed under FILES.
 
 Review it the way a skeptical bank analyst would, and report to the staff member deciding whether to submit:
-1. VERDICT — one line: "Ready to submit", "Submit after fixes", or "Not ready", with the single most important reason.
-2. FACT CHECK — anything in the evidence that contradicts the FACTS, sits in the wrong field for its meaning (e.g. narrative text in an id or date field), or reads as invented/unverifiable. This is the top rejection risk; check every field.
-3. FILES — for each attached file: what it actually shows and whether it supports the slot it sits in; call out unreadable, irrelevant or mislabeled files. Mention any file you could not see.
-4. GAPS — the strongest evidence for a "${ctx.reason}" dispute that is missing or weak, most valuable first.
-5. POLISH — internal artifacts a bank must never see (file paths, repo/code names), unprofessional tone, or filler that dilutes the case.
+1. VERDICT. One line: "Ready to submit", "Submit after fixes", or "Not ready", with the single most important reason.
+2. FACT CHECK. Anything in the evidence that contradicts the FACTS, sits in the wrong field for its meaning (e.g. narrative text in an id or date field), or reads as invented/unverifiable. This is the top rejection risk; check every field.
+3. FILES. For each attached file: what it actually shows and whether it supports the slot it sits in; call out unreadable, irrelevant or mislabeled files. Mention any file you could not see.
+4. GAPS. The strongest evidence for a "${ctx.reason}" dispute that is missing or weak, most valuable first.
+5. POLISH. Internal artifacts a bank must never see (file paths, repo/code names), unprofessional tone, or filler that dilutes the case.
 
-Be concrete: name the field key or file, quote the offending words. If something is genuinely strong, say so in one line — don't pad. Plain text with short headings, no preamble, UNDER 3200 characters total.
+Be concrete: name the field key or file, quote the offending words. If something is genuinely strong, say so in one line; don't pad. Plain text with short headings, no preamble, UNDER 3200 characters total.
 
 FACTS (source of truth):
 ${facts}

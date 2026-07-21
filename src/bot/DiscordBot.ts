@@ -324,7 +324,7 @@ export class DiscordBot {
     tickets: TicketWithTag[],
     closingTag: StatusTag
   ): Promise<void> {
-    const MEMBER_LEFT_NOTE = "Closed automatically — the customer left the Discord server.";
+    const MEMBER_LEFT_NOTE = "Closed automatically. The customer left the Discord server.";
     for (const ticket of tickets) {
       const channel = await this.client.channels.fetch(ticket.threadId).catch(() => null);
       if (channel?.isThread()) {
@@ -848,8 +848,8 @@ export class DiscordBot {
     const categoryLabels = new Map(this.categoryRegistry.getAll().map((c) => [c.id, c.label]));
 
     const lines = tickets.map((t) => {
-      const status = t.statusTag ? `${t.statusTag.emoji} ${t.statusTag.label}` : "—";
-      const category = t.categoryId ? categoryLabels.get(t.categoryId) ?? t.categoryId : "—";
+      const status = t.statusTag ? `${t.statusTag.emoji} ${t.statusTag.label}` : "N/A";
+      const category = t.categoryId ? categoryLabels.get(t.categoryId) ?? t.categoryId : "N/A";
       const who = t.customerId ? `<@${t.customerId}>` : t.customerDisplayName ?? "unknown user";
       const session = t.customerId ? sessionByDiscordId.get(t.customerId) : undefined;
       const postiz = session?.postizUserId ? ` · Postiz \`${session.postizUserId}\`` : "";
@@ -861,11 +861,11 @@ export class DiscordBot {
         filters.text && t.question
           ? `\n> ${t.question.replace(/\s+/g, " ").slice(0, 80)}${t.question.length > 80 ? "…" : ""}`
           : "";
-      return `${status} — <#${t.threadId}> — ${category}\n${who}${postiz}${stripe} · ${created}${closedMark}${snippet}`;
+      return `${status} · <#${t.threadId}> · ${category}\n${who}${postiz}${stripe} · ${created}${closedMark}${snippet}`;
     });
 
     const embed = new EmbedBuilder()
-      .setTitle(`Ticket search — ${total} result${total === 1 ? "" : "s"}`)
+      .setTitle(`Ticket search: ${total} result${total === 1 ? "" : "s"}`)
       .setDescription(lines.join("\n\n").slice(0, 4096))
       .setColor(COLORS.brand)
       .setFooter({ text: `Page ${page + 1}/${totalPages}` });
@@ -967,7 +967,7 @@ export class DiscordBot {
       await interaction.reply({
         embeds: [
           makeEmbed(
-            "This button belongs to a retired bot feature — support now runs through the ticket thread itself.",
+            "This button belongs to a retired bot feature; support now runs through the ticket thread itself.",
             COLORS.neutral
           ),
         ],
@@ -1205,7 +1205,7 @@ export class DiscordBot {
       if (latest) {
         const readyAt = latest.createdAt.getTime() + cooldownMin * 60_000;
         if (Date.now() < readyAt) {
-          return `You're opening tickets too quickly — you can open another one <t:${Math.floor(readyAt / 1000)}:R>.`;
+          return `You're opening tickets too quickly; you can open another one <t:${Math.floor(readyAt / 1000)}:R>.`;
         }
       }
     }
@@ -1543,7 +1543,7 @@ export class DiscordBot {
       const doneRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
         new ButtonBuilder()
           .setCustomId("csat_done")
-          .setLabel(`Rated ${score} ⭐ — thank you!`)
+          .setLabel(`Rated ${score} ⭐, thank you!`)
           .setStyle(ButtonStyle.Success)
           .setDisabled(true)
       );
@@ -1558,14 +1558,14 @@ export class DiscordBot {
 
     const ticket = await this.ticketStore.getByThreadId(threadId).catch(() => null);
     if (!ticket || ticket.csatScore == null) {
-      await interaction.reply({ embeds: [makeEmbed("This rating prompt has expired — thanks anyway!", COLORS.neutral)], flags: 64 });
+      await interaction.reply({ embeds: [makeEmbed("This rating prompt has expired, thanks anyway!", COLORS.neutral)], flags: 64 });
       return;
     }
 
     if (comment) {
       const stored = await this.ticketStore.setCsatComment(threadId, comment).catch(() => false);
       if (!stored) {
-        await interaction.reply({ embeds: [makeEmbed("You've already left feedback for this ticket — thank you!", COLORS.warn)], flags: 64 });
+        await interaction.reply({ embeds: [makeEmbed("You've already left feedback for this ticket, thank you!", COLORS.warn)], flags: 64 });
         return;
       }
       safe(this.intercomSync.onCsat(threadId, ticket.csatScore, comment), "intercom-sync", {
@@ -1730,7 +1730,7 @@ export class DiscordBot {
         {
           name: "Integrations",
           value: [
-            `Intercom: ${s.intercomMode() === "none" ? "off" : `${s.intercomMode()}${s.intercomConfigured() ? "" : " ⚠️ not configured"}`} — bridge/SLA/automation via /intercom`,
+            `Intercom: ${s.intercomMode() === "none" ? "off" : `${s.intercomMode()}${s.intercomConfigured() ? "" : " ⚠️ not configured"}`} · bridge/SLA/automation via /intercom`,
             `Sentry: ${
               s.sentryDsn()
                 ? `${sentryActive() ? "on" : "configured ⚠️ restart pending"} · traces ${s.sentryTracesSampleRate()} · logs ${s.sentryLogsEnabled() ? "on" : "off"}`
@@ -1867,7 +1867,7 @@ export class DiscordBot {
           }`,
           `**Sentry Feedback:** ${
             !s.sentryReadToken() || !s.sentryOrgSlug()
-              ? "off — not configured"
+              ? "off: not configured"
               : s.sentryReadEnabled()
                 ? `on${s.sentryFeedbackLastSyncAt() ? ` · last sync <t:${Math.floor(s.sentryFeedbackLastSyncAt()!.getTime() / 1000)}:R>` : ""}`
                 : "configured · off"
@@ -1947,7 +1947,7 @@ export class DiscordBot {
       .setColor(0x5865f2)
       .setDescription(
         [
-          `**Audit channel:** ${s.billingAuditChannelId() ? `<#${s.billingAuditChannelId()}>` : "_not set — audit embeds ping the support role in the refund thread_"}`,
+          `**Audit channel:** ${s.billingAuditChannelId() ? `<#${s.billingAuditChannelId()}>` : "_not set: audit embeds ping the support role in the refund thread_"}`,
           `**Max self-service refund:** ${
             s.refundMaxAmount() != null
               ? `${this.formatMinorAmount(s.refundMaxAmount()!, s.refundMaxAmountCurrency())} (charges in other currencies go to manual review)`
@@ -1957,10 +1957,10 @@ export class DiscordBot {
           `**Max refunds per 24h (per user):** ${s.refundMaxPer24hPerUser() ?? "_no limit_"}`,
           `**Min server membership age:** ${s.refundMinMemberAgeDays() != null ? `${s.refundMinMemberAgeDays()} day(s)` : "_no minimum_"}`,
           `**Max charge age for self-service refund:** ${s.refundMaxChargeAgeDays() != null ? `${s.refundMaxChargeAgeDays()} day(s)` : "_no limit_"}`,
-          `**First-refund-only:** always on — users/customers with any prior refund (bot ledger or Stripe history) go to manual review`,
+          `**First-refund-only:** always on: users/customers with any prior refund (bot ledger or Stripe history) go to manual review`,
           `**Plan allowlist:** ${s.allowedPriceIds().length ? `${s.allowedPriceIds().length} plan(s) offered in /billing pickers` : "_all active plans offered_"}`,
           "",
-          "Refunds that trip a limit are not executed — the ticket is handed to the support team for manual review.",
+          "Refunds that trip a limit are not executed; the ticket is handed to the support team for manual review.",
           "Intercom canvas/panel action access (admins + per-action levels) moved to **/intercom**.",
         ].join("\n")
       );
@@ -1994,7 +1994,7 @@ export class DiscordBot {
     const listLine = (kind: BlockKind) => {
       const spec = RADAR_LISTS[kind];
       const id = s.radarListId(kind);
-      return `• \`@${spec.alias}\` (${kind}) — ${id ? `provisioned \`${id}\`` : "_not provisioned_"}`;
+      return `• \`@${spec.alias}\` (${kind}): ${id ? `provisioned \`${id}\`` : "_not provisioned_"}`;
     };
     const embed = new EmbedBuilder()
       .setTitle("Dispute Settings")
@@ -2003,16 +2003,16 @@ export class DiscordBot {
         [
           `**Auto-cancel subscriptions on dispute:** ${s.disputeAutoCancelSub() ? "on" : "off"}`,
           `**Auto-block card+email+customer on dispute:** ${s.disputeAutoBlock() ? "on" : "off"}`,
-          `**Auto-attach receipt as evidence on dispute:** ${s.disputeAutoAttachReceipt() ? "on" : "off"} — stages the charge's receipt/invoice PDF in the \`receipt\` slot (submit stays manual)`,
+          `**Auto-attach receipt as evidence on dispute:** ${s.disputeAutoAttachReceipt() ? "on" : "off"}. Stages the charge's receipt/invoice PDF in the \`receipt\` slot (submit stays manual)`,
           `**Evidence-due reminder lead:** ${s.disputeReminderDays()} day(s) before the deadline (≤1 ping / 24h / dispute)`,
           `**Urgent tier:** < ${s.disputeUrgentHours()}h to deadline with nothing submitted → red alert${
-            s.disputeUrgentRoleId() ? ` + <@&${s.disputeUrgentRoleId()}> mention` : " (no role set — select one below to get pinged)"
+            s.disputeUrgentRoleId() ? ` + <@&${s.disputeUrgentRoleId()}> mention` : " (no role set; select one below to get pinged)"
           }`,
-          `**Ratio thresholds:** warn ≥ ${s.disputeRatioWarnPct()}% · critical ≥ ${s.disputeRatioCriticalPct()}% (month VAMP-style figure) — current level: **${s.disputeRatioLastLevel()}**`,
+          `**Ratio thresholds:** warn ≥ ${s.disputeRatioWarnPct()}% · critical ≥ ${s.disputeRatioCriticalPct()}% (month VAMP-style figure) · current level: **${s.disputeRatioLastLevel()}**`,
           `**History backfill:** ${
             s.disputeBackfillDoneAt()
               ? `last run <t:${Math.floor(s.disputeBackfillDoneAt()!.getTime() / 1000)}:R>`
-              : "_never run_ — /billing → Disputes → Stats only covers disputes seen since the mirror existed"
+              : "_never run_: /billing → Disputes → Stats only covers disputes seen since the mirror existed"
           }`,
           "",
           "**Radar value lists** (the Stripe half of the blocklist):",
@@ -2021,14 +2021,14 @@ export class DiscordBot {
           listLine("customer_id"),
           listLine("ip_address"),
           "",
-          "⚠️ Value lists only block payments once a **Radar rule references them** — rules can't be created via API. One-time setup in the Stripe Dashboard → Radar → Rules (needs **Radar for Fraud Teams**), e.g.:",
+          "⚠️ Value lists only block payments once a **Radar rule references them**; rules can't be created via API. One-time setup in the Stripe Dashboard → Radar → Rules (needs **Radar for Fraud Teams**), e.g.:",
           "```",
           `Block if :card_fingerprint: in @${RADAR_LISTS.card_fingerprint.alias}`,
           `Block if :email: in @${RADAR_LISTS.email.alias}`,
           `Block if :customer: in @${RADAR_LISTS.customer_id.alias}`,
           `Block if :ip_address: in @${RADAR_LISTS.ip_address.alias}`,
           "```",
-          "_Verify the attribute names against the rule editor's autocomplete — Stripe occasionally renames them._",
+          "_Verify the attribute names against the rule editor's autocomplete; Stripe occasionally renames them._",
           "",
           "Reminders + ratio alerts post to the billing audit channel. The dispute looper ticks every 6h (**Run Check Now** forces one).",
         ].join("\n")
@@ -2078,11 +2078,11 @@ export class DiscordBot {
       .setDescription(
         [
           `**Status:** ${s.stripeWebhookEnabled() ? "on" : "off"}`,
-          `**Endpoint URL:** ${base ? `\`${base}/stripe/webhook\`` : "⚠️ _no public URL — set one below_"}`,
+          `**Endpoint URL:** ${base ? `\`${base}/stripe/webhook\`` : "⚠️ _no public URL: set one below_"}`,
           `**Registered endpoint:** ${s.stripeWebhookEndpointId() ? `\`${s.stripeWebhookEndpointId()}\`` : "_none_"}`,
           `**Signing secret:** ${s.stripeWebhookSecret() ? "stored ✅" : "_not set_"}`,
           "",
-          "Alerts for **disputes** and **early-fraud warnings** post to the billing audit channel (or the audit log). The endpoint is registered automatically via the Stripe API — no dashboard needed.",
+          "Alerts for **disputes** and **early-fraud warnings** post to the billing audit channel (or the audit log). The endpoint is registered automatically via the Stripe API (no dashboard needed).",
           "The signing secret is returned only once at creation; use **Rotate Secret** if it is ever lost.",
         ].join("\n")
       );
@@ -2108,10 +2108,10 @@ export class DiscordBot {
       .setColor(0x5865f2)
       .setDescription(
         [
-          `**Channel:** ${s.auditLogChannelId() ? `<#${s.auditLogChannelId()}>` : "_not set — audit trail disabled_"}`,
+          `**Channel:** ${s.auditLogChannelId() ? `<#${s.auditLogChannelId()}>` : "_not set: audit trail disabled_"}`,
           "",
           "Every action is posted here: tickets opened/closed/resolved/reopened, status changes, staff notes, canned responses, CSAT ratings, reminders, GitHub issues, and config changes.",
-          "⚠️ Staff notes appear in this channel — make sure it is **staff-only**.",
+          "⚠️ Staff notes appear in this channel; make sure it is **staff-only**.",
         ].join("\n")
       );
 
@@ -2144,14 +2144,14 @@ export class DiscordBot {
       ? `Operator/Fin \`${operator}\`${admin ? ` (fallback admin \`${admin}\`)` : " \u26a0\ufe0f no fallback admin"}`
       : admin
         ? `Admin \`${admin}\``
-        : "\u26a0\ufe0f _none — set secrets (auto-detect) or pick an admin_";
+        : "\u26a0\ufe0f _none: set secrets (auto-detect) or pick an admin_";
 
     const embed = new EmbedBuilder()
       .setTitle("Intercom Connection")
       .setColor(0x5865f2)
       .setDescription(
         [
-          "Connection settings only — everything else lives in **/intercom** (Bridge · SLA Manager · Automation · Maintenance).",
+          "Connection settings only; everything else lives in **/intercom** (Bridge · SLA Manager · Automation · Maintenance).",
           "",
           `**Mode:** ${s.intercomMode()} _(change it in /intercom → Bridge)_`,
           `**Region:** ${s.intercomRegion().toUpperCase()}`,
@@ -2162,12 +2162,12 @@ export class DiscordBot {
           `**Last inbound webhook:** ${(() => {
             const at = s.intercomLastInboundAt();
             if (at) return `<t:${Math.floor(at.getTime() / 1000)}:R>`;
-            return s.intercomClientSecret() ? "_never — check the Developer Hub subscription + endpoint URL_" : "_n/a (no client secret)_";
+            return s.intercomClientSecret() ? "_never: check the Developer Hub subscription + endpoint URL_" : "_n/a (no client secret)_";
           })()}`,
           "",
           s.intercomClientSecret()
-            ? `Webhook endpoint: \`POST <public-url>/intercom/webhook\` (signed via X-Hub-Signature). Topics needed: ${INTERCOM_WEBHOOK_TOPICS.join(", ")}. Extra subscriptions are ignored at the door — subscribing everything is fine. Canvas inbox app: \`POST <public-url>/intercom/inbox-app/initialize\` + \`/submit\`.`
-            : "_No client secret set — the inbound webhook stays disabled (needed for bi mode and the push-mode agent warning)._",
+            ? `Webhook endpoint: \`POST <public-url>/intercom/webhook\` (signed via X-Hub-Signature). Topics needed: ${INTERCOM_WEBHOOK_TOPICS.join(", ")}. Extra subscriptions are ignored at the door; subscribing everything is fine. Canvas inbox app: \`POST <public-url>/intercom/inbox-app/initialize\` + \`/submit\`.`
+            : "_No client secret set; the inbound webhook stays disabled (needed for bi mode and the push-mode agent warning)._",
         ].join("\n")
       );
 
@@ -2196,13 +2196,13 @@ export class DiscordBot {
       .setColor(0x5865f2)
       .setDescription(
         [
-          `**Model:** \`${s.aiModel()}\` — dispute-evidence drafts (/billing → Disputes)`,
+          `**Model:** \`${s.aiModel()}\` · dispute-evidence drafts (/billing → Disputes)`,
           `**Speed limits:** effort \`${s.aiEffortAsk()}\`, ≤ $${s.aiMaxBudgetUsdAsk()}/run`,
           "",
-          `**Knowledge-base auto-refresh:** ${s.kbRefreshEnabled() ? `on — every ${s.kbRefreshIntervalHours()}h` : "off"}`,
+          `**Knowledge-base auto-refresh:** ${s.kbRefreshEnabled() ? `on, every ${s.kbRefreshIntervalHours()}h` : "off"}`,
           `**Last refresh:** ${last ? `<t:${Math.floor(last.getTime() / 1000)}:R>` : "_never_"}`,
           "",
-          "Evidence drafts ground policy text by searching the Postiz source + docs snapshots in `search/`; the refresh downloads fresh GitHub tarballs so drafts track upstream. The model is free-text — any Claude alias/id the CLI accepts works.",
+          "Evidence drafts ground policy text by searching the Postiz source + docs snapshots in `search/`; the refresh downloads fresh GitHub tarballs so drafts track upstream. The model is free-text; any Claude alias/id the CLI accepts works.",
         ].join("\n")
       );
 
@@ -2230,10 +2230,10 @@ export class DiscordBot {
     const mask = (value: string | null) => (value ? `••••${value.slice(-8)}` : "_not set_");
     const dsn = s.sentryDsn();
     const statusLine = !dsn
-      ? "**off** — no DSN configured"
+      ? "**off**: no DSN configured"
       : sentryActive()
-        ? "**live** — errors, traces, logs, metrics and profiles are being sent"
-        : "**configured, not active** ⚠️ — restart the bot to apply";
+        ? "**live**: errors, traces, logs, metrics and profiles are being sent"
+        : "**configured, not active** ⚠️. Restart the bot to apply";
 
     const embed = new EmbedBuilder()
       .setTitle("Sentry Observability")
@@ -2246,7 +2246,7 @@ export class DiscordBot {
           `**Environment:** \`${s.sentryEnvironment()}\` · **Release:** \`${appRelease()}\``,
           `**Traces sample rate:** ${s.sentryTracesSampleRate()} · **Profiles sample rate:** ${s.sentryProfilesSampleRate()}`,
           `**Logs:** ${s.sentryLogsEnabled() ? "on" : "off"} · **Debug:** ${s.sentryDebug() ? "on" : "off"} · **Default PII:** ${s.sentrySendDefaultPii() ? "on" : "off"}`,
-          `**AI content capture:** ${s.sentryAiRecordContent() ? "on — prompts/responses/tool I/O recorded on AI spans" : "off — AI metadata only (tokens, cost, tools)"}`,
+          `**AI content capture:** ${s.sentryAiRecordContent() ? "on: prompts/responses/tool I/O recorded on AI spans" : "off: AI metadata only (tokens, cost, tools)"}`,
           "",
           "First-time enable and rate/environment/logs/PII/AI changes apply live. Changing an **active DSN**, toggling **debug**, and first-enabling **console capture** or **profiling** need a restart.",
           "Traces 0 = keep instrumentation but send nothing; fully off = clear the DSN + restart.",
@@ -2297,7 +2297,7 @@ export class DiscordBot {
     const stateLabel: Record<SecretState, string> = {
       none: "_not set_",
       local: "stored (local encryption)",
-      "local-unreadable": "⚠️ stored but unreadable — re-enter",
+      "local-unreadable": "⚠️ stored but unreadable: re-enter",
       vault: "stored (Vault)",
       "vault-unreachable": "stored (Vault) ⚠️ unreachable right now",
     };
@@ -2317,11 +2317,11 @@ export class DiscordBot {
 
     const statusLine =
       !s.sentryReadToken() || !s.sentryOrgSlug()
-        ? "**not configured** — set the read token and org slug below"
+        ? "**not configured**: set the read token and org slug below"
         : !watermark
-          ? "**never enabled** — toggling on stamps the import floor (older feedback never imports)"
+          ? "**never enabled**: toggling on stamps the import floor (older feedback never imports)"
           : s.sentryReadEnabled()
-            ? "**on** — webhook accelerator + 15-min poll"
+            ? "**on**: webhook accelerator + 15-min poll"
             : "**off** (Sync Now still runs a one-shot test)";
 
     const embed = new EmbedBuilder()
@@ -2337,9 +2337,9 @@ export class DiscordBot {
           `**Ticket type:** ${ticketTypeLabel} · **Team routing:** ${teamId ? (teamName ?? `id ${teamId}`) : "_unassigned_"}`,
           `**Import floor:** ${watermark ? `<t:${Math.floor(watermark.getTime() / 1000)}:f>` : "_not stamped_"} · **Last sync:** ${lastSync ? `<t:${Math.floor(lastSync.getTime() / 1000)}:R>` : "_never_"}`,
           `**Imported:** ${counts?.imported ?? 0} · **Skipped (no email):** ${counts?.skippedNoEmail ?? 0}`,
-          `**Webhook URL:** ${base ? `\`${base}/sentry/webhook\`` : "⚠️ _no public URL — set one via Billing → Stripe Webhooks_"}`,
+          `**Webhook URL:** ${base ? `\`${base}/sentry/webhook\`` : "⚠️ _no public URL: set one via Billing → Stripe Webhooks_"}`,
           "",
-          "Each User Feedback widget item becomes an Intercom conversation authored by the submitter (email contact): replies are emailed to them and their answers thread back. Anonymous feedback is skipped. Create a Sentry **internal integration** (token scopes `org:read project:read event:read`), point its webhook at the URL above and paste its client secret here — unsigned posts are rejected and the 15-min poll covers delivery.",
+          "Each User Feedback widget item becomes an Intercom conversation authored by the submitter (email contact): replies are emailed to them and their answers thread back. Anonymous feedback is skipped. Create a Sentry **internal integration** (token scopes `org:read project:read event:read`), point its webhook at the URL above and paste its client secret here; unsigned posts are rejected and the 15-min poll covers delivery.",
           "Feedback conversations get agent-idle notes but are never nagged, auto-closed or SLA-clocked. Disabling keeps the import floor: a re-enable imports the gap.",
         ].join("\n")
       );
@@ -2367,11 +2367,11 @@ export class DiscordBot {
     const s = this.settingsStore;
     const mask = (value: string | null) => (value ? `••••${value.slice(-6)}` : "_not set_");
     const tokenLine = s.influxTokenUnreadable()
-      ? "⚠️ stored token can't be decrypted (key source rotated) — re-enter it"
+      ? "⚠️ stored token can't be decrypted (key source rotated): re-enter it"
       : mask(s.influxToken());
 
     const embed = new EmbedBuilder()
-      .setTitle("Analytics — InfluxDB")
+      .setTitle("Analytics: InfluxDB")
       .setColor(0x5865f2)
       .setDescription(
         [
@@ -2379,7 +2379,7 @@ export class DiscordBot {
             influxActive()
               ? `**live** → \`${s.influxUrl()}\` org \`${s.influxOrg()}\` bucket \`${s.influxBucket()}\``
               : s.influxEnabled()
-                ? "**enabled but inactive** ⚠️ — set url, org, bucket and token"
+                ? "**enabled but inactive** ⚠️. Set url, org, bucket and token"
                 : "**off**"
           }`,
           `**Token:** ${tokenLine}`,
@@ -2418,7 +2418,7 @@ export class DiscordBot {
       case "unconfigured":
         return "enabled ⚠️ incomplete config";
       default:
-        return s.vaultMigratedAt() ? "on → secrets in Vault" : "connected — not migrated";
+        return s.vaultMigratedAt() ? "on → secrets in Vault" : "connected, not migrated";
     }
   }
 
@@ -2444,9 +2444,9 @@ export class DiscordBot {
       const configError = svc.configError();
       lines.push(
         `**Connection:** ${
-          state === "up" ? "✅ up" : state === "down" ? `❌ down${svc.downSince() ? ` since ${rel(svc.downSince()!)}` : ""}` : `⚪ not configured${configError ? ` — ${configError}` : ""}`
+          state === "up" ? "✅ up" : state === "down" ? `❌ down${svc.downSince() ? ` since ${rel(svc.downSince()!)}` : ""}` : `⚪ not configured${configError ? `: ${configError}` : ""}`
         }`,
-        `**Address / namespace:** \`${cfg.address || "—"}\` · \`${cfg.namespace || "—"}\` · queue \`${cfg.taskQueue}\`${
+        `**Address / namespace:** \`${cfg.address || "N/A"}\` · \`${cfg.namespace || "N/A"}\` · queue \`${cfg.taskQueue}\`${
           cfg.tlsServerName ? ` · SNI \`${cfg.tlsServerName}\`` : ""
         }`
       );
@@ -2466,8 +2466,8 @@ export class DiscordBot {
       lines.push(
         `**Worker:** ${ops.workerManager.running() ? "✅ polling" : "⏹️ stopped"} · build \`${v.buildId}\` (deployment \`${v.deploymentName}\`)${
           promoted === true ? " · current" : promoted === false ? " · ⚠️ NOT promoted to current" : ""
-        }${buildIdIsDegenerate(v.buildId) ? " · ⚠️ degenerate build id (package version — every deploy looks identical; rebuild with the stamped buildInfo.json in dist)" : ""}`,
-        `**Background work:** ${s.temporalEnabled() ? "running (worker active)" : "⏸️ paused — signals park server-side until resumed"}`
+        }${buildIdIsDegenerate(v.buildId) ? " · ⚠️ degenerate build id (package version: every deploy looks identical; rebuild with the stamped buildInfo.json in dist)" : ""}`,
+        `**Background work:** ${s.temporalEnabled() ? "running (worker active)" : "⏸️ paused: signals park server-side until resumed"}`
       );
 
       // Live readouts, best-effort with a short budget — a down server must
@@ -2546,7 +2546,7 @@ export class DiscordBot {
         await interaction.followUp({
           embeds: [
             makeEmbed(
-              `Switching failed — the toggle was rolled back: ${(e instanceof Error ? e.message : String(e)).slice(0, 500)}`,
+              `Switching failed; the toggle was rolled back: ${(e instanceof Error ? e.message : String(e)).slice(0, 500)}`,
               COLORS.danger
             ),
           ],
@@ -2561,7 +2561,7 @@ export class DiscordBot {
       await interaction.deferReply({ flags: 64 });
       const r = await ops.service.testConnection();
       const line = (label: string, ok: boolean, err?: string | null, extra?: string) =>
-        `**${label}:** ${ok ? `✅ ok${extra ? ` — ${extra}` : ""}` : `❌ ${err ?? "failed"}`}`;
+        `**${label}:** ${ok ? `✅ ok${extra ? `: ${extra}` : ""}` : `❌ ${err ?? "failed"}`}`;
       await interaction.editReply({
         embeds: [
           makeEmbed(
@@ -2748,7 +2748,7 @@ export class DiscordBot {
       await interaction.editReply({
         embeds: [
           makeEmbed(
-            "Couldn't write to Vault — the certs are Vault-only (no local fallback). Bring Vault up (/config → Vault) and try again, or enter them directly in the Vault UI (picked up within 10 minutes).",
+            "Couldn't write to Vault; the certs are Vault-only (no local fallback). Bring Vault up (/config → Vault) and try again, or enter them directly in the Vault UI (picked up within 10 minutes).",
             COLORS.danger
           ),
         ],
@@ -2763,7 +2763,7 @@ export class DiscordBot {
           [
             "Certificates stored in Vault KV (`temporal` entry).",
             `Fingerprint: \`${info.fingerprint256.replace(/:/g, "").slice(0, 16).toLowerCase()}…\` · expires <t:${Math.floor(info.notAfter.getTime() / 1000)}:R>.`,
-            "Note: the running worker keeps its old connection — toggle Temporal off/on (or restart) to apply a rotation. Long CA chains that exceed the 4000-char modal limit go directly into the Vault UI.",
+            "Note: the running worker keeps its old connection; toggle Temporal off/on (or restart) to apply a rotation. Long CA chains that exceed the 4000-char modal limit go directly into the Vault UI.",
           ].join("\n"),
           COLORS.success
         ),
@@ -2783,19 +2783,19 @@ export class DiscordBot {
         : service.state() === "up"
           ? "**connected** ✅"
           : service.state() === "denied"
-            ? "**token rejected (403)** ⚠️ — check the token/policy, probes keep retrying"
+            ? "**token rejected (403)** ⚠️. Check the token/policy, probes keep retrying"
             : service.state() === "down"
-              ? `**unreachable** ⚠️${service.downSince() ? ` since <t:${Math.floor(service.downSince()!.getTime() / 1000)}:R>` : ""} — serving cached secrets, retrying every 30s`
-              : "**enabled but incomplete** ⚠️ — set address + token";
+              ? `**unreachable** ⚠️${service.downSince() ? ` since <t:${Math.floor(service.downSince()!.getTime() / 1000)}:R>` : ""}. Serving cached secrets, retrying every 30s`
+              : "**enabled but incomplete** ⚠️. Set address + token";
 
     const tokenLine = s.vaultTokenUnreadable()
-      ? "⚠️ stored token can't be decrypted (key source rotated) — re-enter it"
+      ? "⚠️ stored token can't be decrypted (key source rotated): re-enter it"
       : mask(s.vaultToken());
 
     const stateLabel: Record<SecretState, string> = {
       none: "_not set_",
       local: "local encryption",
-      "local-unreadable": "⚠️ local ciphertext unreadable — re-enter",
+      "local-unreadable": "⚠️ local ciphertext unreadable: re-enter",
       vault: "in Vault",
       "vault-unreachable": "in Vault ⚠️ unreachable right now",
     };
@@ -2808,7 +2808,7 @@ export class DiscordBot {
     const cacheAge = service?.kvCacheAgeMs();
 
     const embed = new EmbedBuilder()
-      .setTitle("Vault — Secret Storage")
+      .setTitle("Vault: Secret Storage")
       .setColor(0x5865f2)
       .setDescription(
         [
@@ -2821,8 +2821,8 @@ export class DiscordBot {
           "",
           `**Storage:** ${
             migratedAt
-              ? `**Vault** since <t:${Math.floor(migratedAt.getTime() / 1000)}:d> — globals in KV, user tokens on Transit`
-              : "**Postgres columns** (local encryption) — run *Migrate secrets to Vault* to cut over"
+              ? `**Vault** since <t:${Math.floor(migratedAt.getTime() / 1000)}:d>: globals in KV, user tokens on Transit`
+              : "**Postgres columns** (local encryption): run *Migrate secrets to Vault* to cut over"
           }`,
           ...secretLines.map((l) => `> ${l}`),
           `**User tokens:** ${tokens.transit} on Transit · ${tokens.local} local${tokens.legacy ? ` · ${tokens.legacy} legacy plaintext` : ""}`,
@@ -2874,7 +2874,7 @@ export class DiscordBot {
       }`,
       `**Token:** ${
         report.tokenOk
-          ? `✅ ok${report.displayName ? ` (\`${report.displayName}\`)` : ""} · policies: ${report.policies.join(", ") || "—"} · TTL: ${ttlLabel}`
+          ? `✅ ok${report.displayName ? ` (\`${report.displayName}\`)` : ""} · policies: ${report.policies.join(", ") || "N/A"} · TTL: ${ttlLabel}`
           : `❌ ${report.tokenError ?? "lookup failed"}`
       }`,
     ];
@@ -2883,12 +2883,12 @@ export class DiscordBot {
         `**Transit round-trip:** ${report.transitOk ? "✅ ok" : `❌ ${report.transitError ?? "failed"}`}`,
         `**KV entries:** ${
           report.kvOk
-            ? `✅ readable — ${report.kvEntriesFound.length}/${VAULT_INTEGRATIONS.length} present${report.kvEntriesFound.length ? ` (${report.kvEntriesFound.join(", ")})` : ""}`
+            ? `✅ readable: ${report.kvEntriesFound.length}/${VAULT_INTEGRATIONS.length} present${report.kvEntriesFound.length ? ` (${report.kvEntriesFound.join(", ")})` : ""}`
             : `❌ ${report.kvError ?? "read failed"}`
         }`
       );
       if (ttl != null && ttl > 0 && ttl < 7 * 86_400) {
-        lines.push("", "⚠️ The token has a finite TTL and will expire — create an orphan token without a TTL for unattended use.");
+        lines.push("", "⚠️ The token has a finite TTL and will expire; create an orphan token without a TTL for unattended use.");
       }
     }
     const allOk = report.healthOk && report.tokenOk && report.transitOk && report.kvOk;
@@ -2900,11 +2900,11 @@ export class DiscordBot {
     const outcomeLabel: Record<MigrateItemResult["outcome"], string> = {
       migrated: "✅ moved",
       already: "✓ already done",
-      "skipped-empty": "— not set",
-      unreadable: "⚠️ unreadable — re-enter the value, then re-run",
+      "skipped-empty": "not set",
+      unreadable: "⚠️ unreadable: re-enter the value, then re-run",
       failed: "❌ failed",
     };
-    const lines = report.items.map((i) => `**${i.name}:** ${outcomeLabel[i.outcome]}${i.detail ? ` — ${i.detail}` : ""}`);
+    const lines = report.items.map((i) => `**${i.name}:** ${outcomeLabel[i.outcome]}${i.detail ? `: ${i.detail}` : ""}`);
     lines.push(
       "",
       `**User tokens:** ${report.sessions.converted} converted${
@@ -2913,7 +2913,7 @@ export class DiscordBot {
           : ""
       }`
     );
-    if (!report.ok) lines.push("", "Some items did not move — fix the cause and run the button again (already-moved items are skipped).");
+    if (!report.ok) lines.push("", "Some items did not move; fix the cause and run the button again (already-moved items are skipped).");
     return makeEmbed([`**${title}**`, "", ...lines].join("\n"), report.ok ? COLORS.success : COLORS.warn);
   }
 
@@ -3041,7 +3041,7 @@ export class DiscordBot {
               `• **${pending.length}** global secret(s) → KV \`${s.vaultKvMount()}/${s.vaultKvBasePath()}/…\`${pending.length ? ` (${pending.map((c) => COLUMN_LABELS[c]).join(", ")})` : ""}`,
               `• **${tokens.local + tokens.legacy}** user token(s) → Transit ciphertext (rows stay in Postgres)`,
               "",
-              "Each value is verified with a read-back before the local copy is replaced. From then on, new secrets are written to Vault (with automatic local fallback while Vault is down). Re-run anytime — finished items are skipped.",
+              "Each value is verified with a read-back before the local copy is replaced. From then on, new secrets are written to Vault (with automatic local fallback while Vault is down). Re-run anytime; finished items are skipped.",
             ].join("\n"),
             COLORS.warn
           ),
@@ -3057,7 +3057,7 @@ export class DiscordBot {
       const moved = report.items.filter((i) => i.outcome === "migrated").length;
       this.auditConfig(
         interaction,
-        `Vault migration → ${moved} secret(s) moved, ${report.sessions.converted} user token(s) converted${report.ok ? "" : " (partial — re-run pending)"}`
+        `Vault migration → ${moved} secret(s) moved, ${report.sessions.converted} user token(s) converted${report.ok ? "" : " (partial: re-run pending)"}`
       );
       await interaction.editReply(await this.buildVaultPanel());
       await interaction.followUp({ embeds: [this.buildMigrateReportEmbed("Migration to Vault", report)], flags: 64 });
@@ -3094,7 +3094,7 @@ export class DiscordBot {
       const restored = report.items.filter((i) => i.outcome === "migrated").length;
       this.auditConfig(
         interaction,
-        `Vault reverse migration → ${restored} secret(s) restored, ${report.sessions.converted} user token(s) converted${report.ok ? ", Vault disabled" : " (partial — re-run pending)"}`
+        `Vault reverse migration → ${restored} secret(s) restored, ${report.sessions.converted} user token(s) converted${report.ok ? ", Vault disabled" : " (partial: re-run pending)"}`
       );
       await interaction.editReply(await this.buildVaultPanel());
       await interaction.followUp({ embeds: [this.buildMigrateReportEmbed("Reverse migration", report)], flags: 64 });
@@ -3115,11 +3115,11 @@ export class DiscordBot {
       const state = this.vault!.service.state();
       const note =
         state === "up"
-          ? `${prefix} — Vault is **connected**.`
+          ? `${prefix}. Vault is **connected**.`
           : state === "denied"
-            ? `${prefix}, but the token was **rejected (403)** — check the token/policy. Probes keep retrying.`
+            ? `${prefix}, but the token was **rejected (403)**. Check the token/policy. Probes keep retrying.`
             : state === "down"
-              ? `${prefix}, but Vault is **unreachable** — the probe loop retries every 30s.`
+              ? `${prefix}, but Vault is **unreachable**. The probe loop retries every 30s.`
               : `${prefix}. Turn the Vault toggle on to activate the connection.`;
       await interaction.reply({ embeds: [makeEmbed(note, state === "up" ? COLORS.success : COLORS.warn)], flags: 64 });
     };
@@ -3143,7 +3143,7 @@ export class DiscordBot {
       // The Influx token may be vault-held — a now-working connection revives it.
       await reconfigureInflux(s.influxConfig());
       // Deliberately no token value in the audit line.
-      this.auditConfig(interaction, `Vault connection updated (addr ${addr || "—"}${token ? ", token set" : ""})`);
+      this.auditConfig(interaction, `Vault connection updated (addr ${addr || "N/A"}${token ? ", token set" : ""})`);
       await replyWithState("Vault connection saved");
       return;
     }
@@ -3178,14 +3178,14 @@ export class DiscordBot {
       case "started":
         return { result, note: "Sentry is now **live** (errors, traces, logs, metrics). Use *Send test event* to verify." };
       case "stopped":
-        return { result, note: "Sentry **disabled** — event delivery stopped. Restart to drop residual instrumentation." };
+        return { result, note: "Sentry **disabled**: event delivery stopped. Restart to drop residual instrumentation." };
       case "restart-required":
         return { result, note: "⚠️ Saved, but switching the active DSN needs a **bot restart** (traces can't be re-pointed at runtime)." };
       case "updated":
         return {
           result,
           note: result.restartNeeded.length
-            ? `Applied live, except: ${result.restartNeeded.join(", ")} — those need a **restart**.`
+            ? `Applied live, except: ${result.restartNeeded.join(", ")}; those need a **restart**.`
             : null,
         };
       case "disabled":
@@ -3204,7 +3204,7 @@ export class DiscordBot {
 
     if (MOVED_TO_INTERCOM.some((prefix) => id.startsWith(prefix))) {
       await interaction.reply({
-        embeds: [makeEmbed("This setting moved to **/intercom** — run /intercom and open the matching hub.", COLORS.neutral)],
+        embeds: [makeEmbed("This setting moved to **/intercom**. Run /intercom and open the matching hub.", COLORS.neutral)],
         flags: 64,
       });
       return;
@@ -3281,7 +3281,7 @@ export class DiscordBot {
                 const reminder = t.reminderEnabled
                   ? `${cadence} → ${t.reminderTarget === "CUSTOMER" ? "customer (Discord ping)" : "agents (Intercom note)"}`
                   : "no reminders";
-                return `${t.emoji} **${t.label}** — ${reminder}${flags ? ` (${flags})` : ""}`;
+                return `${t.emoji} **${t.label}**: ${reminder}${flags ? ` (${flags})` : ""}`;
               })
               .join("\n")
           : "_No tags yet._"
@@ -3324,8 +3324,8 @@ export class DiscordBot {
               : "off"
           }`,
           `**Auto-close after:** ${tag.autoCloseAfter == null ? "never" : `${tag.autoCloseAfter} unanswered customer reminder(s)`}`,
-          `**Custom texts:** customer ${tag.reminderTextCustomer ? "custom" : "default"} · agent ${tag.reminderTextSupport ? "custom" : "default"} · close ${tag.autoCloseMessage ? "custom" : "default"} — edit in /intercom → Automation`,
-          `**Customer-reply target:** ${tag.isCustomerReplyTarget ? "yes — a customer reply to a Waiting-for-Customer ticket lands here" : "no"}`,
+          `**Custom texts:** customer ${tag.reminderTextCustomer ? "custom" : "default"} · agent ${tag.reminderTextSupport ? "custom" : "default"} · close ${tag.autoCloseMessage ? "custom" : "default"}. Edit in /intercom → Automation`,
+          `**Customer-reply target:** ${tag.isCustomerReplyTarget ? "yes: a customer reply to a Waiting-for-Customer ticket lands here" : "no"}`,
         ].join("\n")
       );
 
@@ -3367,8 +3367,8 @@ export class DiscordBot {
       .setColor(0x5865f2)
       .setDescription(
         tiers.length
-          ? tiers.map((t) => `${t.name} — <@&${t.roleId}>`).join("\n")
-          : "_No roles yet — the legacy support role is used as fallback._"
+          ? tiers.map((t) => `${t.name}: <@&${t.roleId}>`).join("\n")
+          : "_No roles yet; the legacy support role is used as fallback._"
       )
       .setFooter({
         text: "Members of any role here count as staff: /charge authorization, ticket rate-limit exemption, staff/customer classification for the Intercom bridge, and the blocked-charge review ping (first role).",
@@ -3404,7 +3404,7 @@ export class DiscordBot {
       .setDescription(
         [
           `**Role:** <@&${tier.roleId}>`,
-          `**Position:** ${position + 1} of ${tiers.length} — the first role receives the blocked-charge review ping`,
+          `**Position:** ${position + 1} of ${tiers.length}. The first role receives the blocked-charge review ping`,
         ].join("\n")
       );
 
@@ -3432,7 +3432,7 @@ export class DiscordBot {
     // time — answer their buttons with a pointer instead of dead-ending.
     if (MOVED_TO_INTERCOM.some((prefix) => id.startsWith(prefix))) {
       await interaction.reply({
-        embeds: [makeEmbed("This setting moved to **/intercom** — run /intercom and open the matching hub.", COLORS.neutral)],
+        embeds: [makeEmbed("This setting moved to **/intercom**. Run /intercom and open the matching hub.", COLORS.neutral)],
         flags: 64,
       });
       return;
@@ -3493,7 +3493,7 @@ export class DiscordBot {
           makeEmbed(
             failed === 0
               ? `Knowledge base refreshed (${ok} repo(s) updated).`
-              : `Knowledge base refresh: ${ok} updated, ${failed} failed — see logs. Answers continue on the last good checkout.`,
+              : `Knowledge base refresh: ${ok} updated, ${failed} failed. See logs. Answers continue on the last good checkout.`,
             failed === 0 ? COLORS.success : COLORS.warn
           ),
         ],
@@ -3656,11 +3656,11 @@ export class DiscordBot {
         await interaction.editReply({
           embeds: [
             makeEmbed(
-              `✅ Backfill complete — swept **${result.swept}** dispute(s) from Stripe (all-time), **${result.terminal}** closed.` +
+              `✅ Backfill complete: swept **${result.swept}** dispute(s) from Stripe (all-time), **${result.terminal}** closed.` +
                 (result.points
                   ? ` Wrote **${result.points}** historical outcome point(s) to InfluxDB.`
-                  : " Influx exporter inactive — no analytics points written (re-run after enabling it).") +
-                (result.truncated ? "\n⚠️ Sweep hit the page cap — run again to continue." : ""),
+                  : " Influx exporter inactive: no analytics points written (re-run after enabling it).") +
+                (result.truncated ? "\n⚠️ Sweep hit the page cap. Run again to continue." : ""),
               COLORS.success
             ),
           ],
@@ -3679,7 +3679,7 @@ export class DiscordBot {
       // List ids are plain rsl_… identifiers, not secrets — safe to display.
       const results = await this.disputes.blockService.ensureRadarLists();
       const summary = results
-        .map((r) => `${r.kind}: ${r.listId ? `${r.created ? "created" : "ok"} (\`${r.listId}\`)` : `FAILED — ${r.error?.slice(0, 100)}`}`)
+        .map((r) => `${r.kind}: ${r.listId ? `${r.created ? "created" : "ok"} (\`${r.listId}\`)` : `FAILED: ${r.error?.slice(0, 100)}`}`)
         .join(" · ");
       this.auditConfig(interaction, `Radar value lists provisioned → ${summary.slice(0, 400)}`);
       await interaction.editReply(this.buildDisputesConfigPanel());
@@ -3739,7 +3739,7 @@ export class DiscordBot {
       });
       this.auditConfig(
         interaction,
-        `Sentry feedback import → ${enabling ? "on" : "off"}${firstEnable ? " (import floor stamped — older feedback never imports)" : ""}`
+        `Sentry feedback import → ${enabling ? "on" : "off"}${firstEnable ? " (import floor stamped: older feedback never imports)" : ""}`
       );
       await interaction.update(await this.buildSentryFeedbackPanel());
       return;
@@ -3819,7 +3819,7 @@ export class DiscordBot {
           .setPlaceholder("Ticket type for imported feedback")
           .addOptions([
             {
-              label: "— conversation only —",
+              label: "(conversation only)",
               value: "__none__",
               description: "Import as plain conversations (no ticket)",
               default: !current,
@@ -3834,7 +3834,7 @@ export class DiscordBot {
         await interaction.editReply({
           embeds: [
             makeEmbed(
-              "New imports are converted into a ticket of this type right after creation (Customer category recommended — one unified inbox object). Existing imports stay as they are.",
+              "New imports are converted into a ticket of this type right after creation (Customer category recommended: one unified inbox object). Existing imports stay as they are.",
               COLORS.neutral
             ),
           ],
@@ -3864,7 +3864,7 @@ export class DiscordBot {
           .setPlaceholder("Team for imported feedback conversations")
           .addOptions([
             {
-              label: "— unassigned —",
+              label: "(unassigned)",
               value: "__none__",
               description: "Imports land in the shared inbox",
               default: !current,
@@ -3999,8 +3999,8 @@ export class DiscordBot {
             !res
               ? "Sentry is not active in this process. Set a DSN (first-time enable is live), or restart if you changed an existing one."
               : res.flushed
-                ? `✅ Test event delivered — id \`${res.eventId}\`. It shows up in Sentry → Issues as an *info* message within seconds.`
-                : `⚠️ Test event queued (id \`${res.eventId}\`) but the flush timed out — check the DSN and outbound network.`,
+                ? `✅ Test event delivered: id \`${res.eventId}\`. It shows up in Sentry → Issues as an *info* message within seconds.`
+                : `⚠️ Test event queued (id \`${res.eventId}\`) but the flush timed out. Check the DSN and outbound network.`,
             !res ? COLORS.warn : res.flushed ? COLORS.success : COLORS.danger
           ),
         ],
@@ -4077,7 +4077,7 @@ export class DiscordBot {
       try {
         await pingInflux();
         await interaction.editReply({
-          embeds: [makeEmbed("✅ Test point written and flushed — check the `bot_health` measurement.", COLORS.success)],
+          embeds: [makeEmbed("✅ Test point written and flushed. Check the `bot_health` measurement.", COLORS.success)],
         });
       } catch (error) {
         await interaction.editReply({
@@ -4131,7 +4131,7 @@ export class DiscordBot {
           options.push({ label: `${me.name ?? "Token owner"} (token owner)`, value: me.id, description: me.email ?? undefined, default: me.id === current });
         }
         if (options.length === 0) {
-          await interaction.followUp({ embeds: [makeEmbed("Intercom returned no admins — check the access token.", COLORS.danger)], flags: 64 });
+          await interaction.followUp({ embeds: [makeEmbed("Intercom returned no admins. Check the access token.", COLORS.danger)], flags: 64 });
           return;
         }
         const select = new StringSelectMenuBuilder()
@@ -4146,7 +4146,7 @@ export class DiscordBot {
             makeEmbed(
               [
                 "Pick the admin the bridge authors as when the Operator/Fin bot is rejected (or was never detected).",
-                "The bridge prefers the auto-detected Operator — this admin is the fallback. Echo suppression is part-id based, so even an admin who actually answers tickets is safe to pick.",
+                "The bridge prefers the auto-detected Operator; this admin is the fallback. Echo suppression is part-id based, so even an admin who actually answers tickets is safe to pick.",
               ].join("\n"),
               COLORS.neutral
             ),
@@ -4379,7 +4379,7 @@ export class DiscordBot {
       // Doubles as the tombstone for removed config controls sitting on stale
       // ephemeral panels.
       await interaction.reply({
-        embeds: [makeEmbed("This control no longer exists — run /config again.", COLORS.warn)],
+        embeds: [makeEmbed("This control no longer exists. Run /config again.", COLORS.warn)],
         flags: 64,
       });
       return;
@@ -4477,7 +4477,7 @@ export class DiscordBot {
 
     if (MOVED_TO_INTERCOM.some((prefix) => interaction.customId.startsWith(prefix))) {
       await interaction.reply({
-        embeds: [makeEmbed("This setting moved to **/intercom** — run /intercom and open the matching hub.", COLORS.neutral)],
+        embeds: [makeEmbed("This setting moved to **/intercom**. Run /intercom and open the matching hub.", COLORS.neutral)],
         flags: 64,
       });
       return;
@@ -4516,7 +4516,7 @@ export class DiscordBot {
           makeEmbed(
             this.settingsStore.sentryWebhookSecret()
               ? "Sentry feedback credentials saved. Point the internal integration's webhook at `POST <public-url>/sentry/webhook`."
-              : "Sentry feedback credentials saved. No webhook secret set — the webhook endpoint rejects everything and the 15-min poll carries imports alone.",
+              : "Sentry feedback credentials saved. No webhook secret set; the webhook endpoint rejects everything and the 15-min poll carries imports alone.",
             COLORS.success
           ),
         ],
@@ -4551,7 +4551,7 @@ export class DiscordBot {
       });
       this.auditConfig(
         interaction,
-        `Sentry feedback scope → org ${org || "—"}, projects ${projectList.length ? projectList.join(", ") : "all"}, region ${(
+        `Sentry feedback scope → org ${org || "N/A"}, projects ${projectList.length ? projectList.join(", ") : "all"}, region ${(
           region || this.settingsStore.sentryReadRegion()
         ).toUpperCase()}`
       );
@@ -4589,7 +4589,7 @@ export class DiscordBot {
       const validRate = (n: number) => Number.isFinite(n) && n >= 0 && n <= 1;
       if (!environment || !validRate(traces) || !validRate(profiles)) {
         await interaction.reply({
-          embeds: [makeEmbed("Invalid values — environment must be non-empty and both rates between 0.0 and 1.0.", COLORS.danger)],
+          embeds: [makeEmbed("Invalid values: environment must be non-empty and both rates between 0.0 and 1.0.", COLORS.danger)],
           flags: 64,
         });
         return;
@@ -4602,7 +4602,7 @@ export class DiscordBot {
       const { note } = await this.applySentrySettings();
       this.auditConfig(interaction, `Sentry options → env \`${environment}\`, traces ${traces}, profiles ${profiles}`);
       await interaction.reply({
-        embeds: [makeEmbed(note ?? `Sentry options saved — environment \`${environment}\`, traces ${traces}, profiles ${profiles}.`, COLORS.success)],
+        embeds: [makeEmbed(note ?? `Sentry options saved: environment \`${environment}\`, traces ${traces}, profiles ${profiles}.`, COLORS.success)],
         flags: 64,
       });
       return;
@@ -4640,14 +4640,14 @@ export class DiscordBot {
         temporalTlsServerName: tlsServerName || null,
       });
       await this.temporalOps?.service.reconfigure();
-      this.auditConfig(interaction, `Temporal connection → \`${address || "—"}\` / \`${namespace || "—"}\` (queue \`${taskQueue}\`)`);
+      this.auditConfig(interaction, `Temporal connection → \`${address || "N/A"}\` / \`${namespace || "N/A"}\` (queue \`${taskQueue}\`)`);
       await interaction.editReply({
         embeds: [
           makeEmbed(
             [
-              `Connection saved — address \`${address || "—"}\`, namespace \`${namespace || "—"}\`, task queue \`${taskQueue}\`, deployment \`${deployment}\`${tlsServerName ? `, TLS server name \`${tlsServerName}\`` : ""}.`,
+              `Connection saved: address \`${address || "N/A"}\`, namespace \`${namespace || "N/A"}\`, task queue \`${taskQueue}\`, deployment \`${deployment}\`${tlsServerName ? `, TLS server name \`${tlsServerName}\`` : ""}.`,
               this.settingsStore.temporalEnabled() && this.temporalOps?.workerManager.running()
-                ? "⚠️ The running worker keeps its old connection — toggle Temporal off/on to apply the change."
+                ? "⚠️ The running worker keeps its old connection. Toggle Temporal off/on to apply the change."
                 : "",
             ]
               .filter(Boolean)
@@ -4682,14 +4682,14 @@ export class DiscordBot {
       // Deliberately no token value in the audit line.
       this.auditConfig(
         interaction,
-        `Influx connection updated (url ${url || "—"}, org ${org || "—"}, bucket ${bucket || "—"}${token ? ", token set" : ""})`
+        `Influx connection updated (url ${url || "N/A"}, org ${org || "N/A"}, bucket ${bucket || "N/A"}${token ? ", token set" : ""})`
       );
       await interaction.reply({
         embeds: [
           makeEmbed(
             influxActive()
-              ? "InfluxDB connection saved — exporter is **live**. Use *Send test point* to verify end-to-end."
-              : "InfluxDB connection saved — exporter still inactive (need url + org + bucket + token, and the Influx toggle on).",
+              ? "InfluxDB connection saved: exporter is **live**. Use *Send test point* to verify end-to-end."
+              : "InfluxDB connection saved: exporter still inactive (need url + org + bucket + token, and the Influx toggle on).",
             influxActive() ? COLORS.success : COLORS.warn
           ),
         ],
@@ -4722,10 +4722,10 @@ export class DiscordBot {
         embeds: [
           makeEmbed(
             [
-              "Intercom secrets saved — probing the workspace…",
+              "Intercom secrets saved: probing the workspace…",
               clientSecret
                 ? `Point the app's webhook at \`POST <public-url>/intercom/webhook\` and subscribe at least: ${INTERCOM_WEBHOOK_TOPICS.join(", ")}. Extra subscriptions are ignored at the door.`
-                : "No client secret set — the inbound webhook endpoint stays disabled (needed for bi mode and the push-mode agent warning).",
+                : "No client secret set; the inbound webhook endpoint stays disabled (needed for bi mode and the push-mode agent warning).",
             ].join("\n"),
             COLORS.success
           ),
@@ -4745,7 +4745,7 @@ export class DiscordBot {
           }
           const region = this.settingsStore.intercomRegion();
           if (me.region && me.region.toLowerCase() !== region) {
-            notes.push(`⚠️ Workspace region is **${me.region.toUpperCase()}** but the bridge is set to **${region.toUpperCase()}** — fix it via the Region button.`);
+            notes.push(`⚠️ Workspace region is **${me.region.toUpperCase()}** but the bridge is set to **${region.toUpperCase()}**. Fix it via the Region button.`);
           }
         } catch (e) {
           notes.push(`⚠️ Token check failed: ${e instanceof Error ? e.message : e}`);
@@ -4755,9 +4755,9 @@ export class DiscordBot {
           const operator = admins.find((a) => /^(operator|fin)(\s|$)/i.test(a.name ?? ""));
           if (operator) {
             await this.settingsStore.updateIntercom({ intercomOperatorAdminId: operator.id });
-            notes.push(`Operator/Fin detected: **${operator.name}** (\`${operator.id}\`) — the bridge authors as it (no seat needed).`);
+            notes.push(`Operator/Fin detected: **${operator.name}** (\`${operator.id}\`). The bridge authors as it (no seat needed).`);
           } else {
-            notes.push("Operator/Fin bot not found in the admin list — the bridge authors as the fallback admin.");
+            notes.push("Operator/Fin bot not found in the admin list; the bridge authors as the fallback admin.");
           }
         } catch {
           // Token check above already reported the failure.
@@ -4952,7 +4952,7 @@ export class DiscordBot {
       await this.settingsStore.updateGeneral({ aiModel: model });
       this.auditConfig(interaction, `AI model → \`${model}\``);
       await interaction.reply({
-        embeds: [makeEmbed(`AI model updated — \`${model}\`. Applies to the next evidence draft.`, COLORS.success)],
+        embeds: [makeEmbed(`AI model updated: \`${model}\`. Applies to the next evidence draft.`, COLORS.success)],
         flags: 64,
       });
       return;
@@ -4984,7 +4984,7 @@ export class DiscordBot {
       this.auditConfig(interaction, `AI speed limits → effort ${effortAsk}, ≤ $${budgetAsk}/run`);
       await interaction.reply({
         embeds: [
-          makeEmbed(`AI speed limits updated — effort \`${effortAsk}\`, ≤ $${budgetAsk}/run. Applies to the next evidence draft.`, COLORS.success),
+          makeEmbed(`AI speed limits updated: effort \`${effortAsk}\`, ≤ $${budgetAsk}/run. Applies to the next evidence draft.`, COLORS.success),
         ],
         flags: 64,
       });
@@ -5518,8 +5518,8 @@ export class DiscordBot {
         const last = attempt === delays.length - 1;
         this.discordLog.error(
           last
-            ? "slash command registration failed — continuing with previously registered commands"
-            : "slash command registration failed — retrying",
+            ? "slash command registration failed, continuing with previously registered commands"
+            : "slash command registration failed, retrying",
           e,
           { "commands.attempt": attempt + 1 }
         );

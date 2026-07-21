@@ -214,7 +214,7 @@ export class DisputeMonitor {
     const dueTs = row.evidenceDueBy ? Math.floor(row.evidenceDueBy.getTime() / 1000) : null;
     const linked = row.customerId ? await this.linkedMention(row.customerId) : null;
     const embed = new EmbedBuilder()
-      .setTitle(isUrgent ? "🚨 URGENT — dispute evidence deadline imminent" : "⏰ Dispute evidence due soon")
+      .setTitle(isUrgent ? "🚨 URGENT: dispute evidence deadline imminent" : "⏰ Dispute evidence due soon")
       .setColor(isUrgent ? COLORS.danger : COLORS.warn)
       .addFields(
         { name: "Dispute", value: `\`${row.id}\``, inline: true },
@@ -226,7 +226,7 @@ export class DisputeMonitor {
       .setTimestamp();
     if (isUrgent) {
       embed.setDescription(
-        `Less than **${urgentHours}h** remain and **no evidence has been submitted**. Submit evidence or accept the dispute — after the deadline the bank decides on an empty response.`
+        `Less than **${urgentHours}h** remain and **no evidence has been submitted**. Submit evidence or accept the dispute. After the deadline the bank decides on an empty response.`
       );
     }
     const roleId = isUrgent ? this.settings.disputeUrgentRoleId() : null;

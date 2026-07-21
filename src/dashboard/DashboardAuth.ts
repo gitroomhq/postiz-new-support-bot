@@ -144,7 +144,7 @@ export class StandingDashboardAuth implements DashboardAuthProvider {
       }
       if (!this.consumeJti(payload.jti)) {
         authLog.warn("dashboard link replay rejected", { "discord.user_id": payload.sub });
-        return { kind: "reject", status: 401, message: "This dashboard link was already used — mint a fresh one from /billing." };
+        return { kind: "reject", status: 401, message: "This dashboard link was already used. Mint a fresh one from /billing." };
       }
       const { token } = await this.sessions.create({
         discordUserId: payload.sub,
@@ -242,7 +242,7 @@ export class StandingDashboardAuth implements DashboardAuthProvider {
             actorName: this.nameFor(row.discordUserId),
             kind: "auth",
             action: "passkey.signcount_regressed",
-            summary: `Sign counter regressed on "${row.label ?? row.id}" — possible cloned authenticator`,
+            summary: `Sign counter regressed on "${row.label ?? row.id}": possible cloned authenticator`,
             outcome: "ok",
             ip: meta.ip,
           });
@@ -264,7 +264,7 @@ export class StandingDashboardAuth implements DashboardAuthProvider {
         const passphrase = typeof request.passphrase === "string" ? request.passphrase : "";
         this.prunePendingLogins();
         const pending = this.pendingLogins.get(loginId);
-        if (!pending) return { status: 200, json: { ok: false, error: "Sign-in expired — start over." } };
+        if (!pending) return { status: 200, json: { ok: false, error: "Sign-in expired. Start over." } };
         const locked = this.lockedFor(pending.userId);
         if (locked) return { status: 200, json: { ok: false, error: locked } };
         if (!(await this.credentials.checkPassphrase(pending.userId, passphrase))) {
@@ -532,7 +532,7 @@ export class StandingDashboardAuth implements DashboardAuthProvider {
   private lockedFor(userId: string): string | null {
     const f = this.failures.get(userId);
     if (!f) return null;
-    if (Date.now() < f.lockedUntil) return "Too many attempts — try again later.";
+    if (Date.now() < f.lockedUntil) return "Too many attempts. Try again later.";
     return null;
   }
 

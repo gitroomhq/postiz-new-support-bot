@@ -90,11 +90,11 @@ ${dashboardCss()}
   <div class="mainwrap">
     <header class="topbar">
       <button class="btn sm" id="menubtn" type="button" aria-label="Menu" aria-expanded="false">☰</button>
-      <span class="jumpwrap"><input type="text" id="jump" placeholder="Search — name, email, amount, last4 or Stripe id (Ctrl+K)" autocomplete="off"><div id="palpop" class="palpop"></div></span>
+      <span class="jumpwrap"><input type="text" id="jump" placeholder="Search: name, email, amount, last4 or Stripe id (Ctrl+K)" autocomplete="off"><div id="palpop" class="palpop"></div></span>
       <span class="who" id="who"></span>
       <span class="morewrap bellwrap"><button class="btn sm" id="bellbtn" type="button" title="Needs attention" aria-label="Needs attention"></button><div id="bellpop" class="morepop"></div></span>
       <span class="morewrap createwrap"><button class="btn sm primary" id="createbtn" type="button">+ Create</button><div id="createmenu" class="morepop"></div></span>
-      <button class="btn sm" id="themebtn" type="button" title="Color theme — click to switch">Auto</button>
+      <button class="btn sm" id="themebtn" type="button" title="Color theme: click to switch">Auto</button>
       <button class="btn sm" id="logout" type="button">End session</button>
     </header>
     <main>
@@ -124,7 +124,7 @@ ${dashboardCss()}
 <dialog id="modal">
   <h2 id="modalTitle"></h2>
   <div class="summary" id="modalSummary"></div>
-  <p class="muted" id="modalQueue" hidden>You are not an admin for this action — it will be queued for admin approval.</p>
+  <p class="muted" id="modalQueue" hidden>You are not an admin for this action; it will be queued for admin approval.</p>
   <div id="modalInputs"></div>
   <div id="modalReverse" hidden>
     <label>Reverse code from Discord</label>
@@ -132,7 +132,7 @@ ${dashboardCss()}
     <input type="text" id="reverseCode" autocomplete="off">
   </div>
   <div id="modalConfirm" hidden>
-    <label>This action is destructive — type CONFIRM to proceed</label>
+    <label>This action is destructive; type CONFIRM to proceed</label>
     <input type="text" id="confirmWord" autocomplete="off">
   </div>
   <div id="modalErr" class="error" hidden></div>

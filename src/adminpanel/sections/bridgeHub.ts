@@ -31,7 +31,7 @@ export function makeBridgeHub(deps: {
         teamOpts = (await deps.listTeams()).map((t) => ({ value: t.id, label: t.name }));
         tagOpts = (await deps.listTags()).map((t) => ({ value: t.id, label: t.name }));
       } catch {
-        note = "Intercom lists unavailable — check the access token.";
+        note = "Intercom lists unavailable. Check the access token.";
       }
       return [
         {

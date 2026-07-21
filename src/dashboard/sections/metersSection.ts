@@ -58,7 +58,7 @@ export function makeMetersSection(): DashboardSectionModule {
             `dash-meter-${eventName}-${Date.now().toString(36)}`
           );
           await ctx.audit(`Meter ${meter.id} created (${eventName}, ${formula})`);
-          return { ok: true, text: `Meter ${meter.id} created — events named "${eventName}" now aggregate by ${formula}.` };
+          return { ok: true, text: `Meter ${meter.id} created. Events named "${eventName}" now aggregate by ${formula}.` };
         }
         // T1 — deactivate stops ingestion (events sent meanwhile are DROPPED);
         // reactivate resumes it. Live status revalidation, payout precedent.
@@ -77,8 +77,8 @@ export function makeMetersSection(): DashboardSectionModule {
           return {
             ok: true,
             text: wantActive
-              ? `${id} is active again — "${meter.event_name}" events are ingested.`
-              : `${id} is inactive — "${meter.event_name}" events are now rejected until reactivation.`,
+              ? `${id} is active again; "${meter.event_name}" events are ingested.`
+              : `${id} is inactive; "${meter.event_name}" events are now rejected until reactivation.`,
           };
         }
         default:
@@ -99,7 +99,7 @@ function toggleAction(meter: Stripe.Billing.Meter) {
         label: "Deactivate",
         dangerous: true,
         params: { id: meter.id, active: false },
-        summary: "Stops ingestion — meter events with this event name are rejected until reactivation.",
+        summary: "Stops ingestion: meter events with this event name are rejected until reactivation.",
       }
     : {
         key: "section:meters.toggle",
@@ -130,9 +130,9 @@ async function list(ctx: DashboardCtx): Promise<SectionPage> {
               key: "formula",
               label: "Aggregation",
               options: [
-                { value: "sum", label: "Sum — add each event's value" },
-                { value: "count", label: "Count — number of events" },
-                { value: "last", label: "Last — most recent event's value" },
+                { value: "sum", label: "Sum: add each event's value" },
+                { value: "count", label: "Count: number of events" },
+                { value: "last", label: "Last: most recent event's value" },
               ],
             },
           ],
@@ -159,14 +159,14 @@ async function list(ctx: DashboardCtx): Promise<SectionPage> {
           strong(m.display_name),
           badgeCell(meterBadge(m.status).kind, meterBadge(m.status).text),
           idCell(m.event_name, { copy: true }),
-          text(sentence(m.default_aggregation?.formula ?? "—")),
+          text(sentence(m.default_aggregation?.formula ?? "N/A")),
           dateCell(m.created),
         ] as Cell[],
         actions: [toggleAction(m)],
       })),
-      empty: "No usage meters — create one above to start metering billing events.",
+      empty: "No usage meters. Create one above to start metering billing events.",
       ...(meters.length ? { footer: `${meters.length} item${meters.length === 1 ? "" : "s"}` } : {}),
-      notice: "Meters can't be deleted — deactivate to stop ingestion. Attach a meter to a usage-based price to bill on it.",
+      notice: "Meters can't be deleted; deactivate to stop ingestion. Attach a meter to a usage-based price to bill on it.",
     },
   ];
   return { title: "Meters", crumbs: [{ label: "Meters" }], blocks };
@@ -198,7 +198,7 @@ async function detail(ctx: DashboardCtx, id: string, filters: Record<string, str
         granularity: win.granularity,
       });
     } catch {
-      summariesError = "Stripe rejected the summary query — check the customer id.";
+      summariesError = "Stripe rejected the summary query. Check the customer id.";
     }
   }
 
@@ -243,8 +243,8 @@ async function detail(ctx: DashboardCtx, id: string, filters: Record<string, str
         summariesError ??
         (customerId
           ? "No usage recorded for this customer in this window."
-          : "Enter a customer id (cus_…) above — Stripe scopes meter event summaries to one customer."),
-      notice: `Complete ${win.granularity}s only (UTC) — the current partial ${win.granularity} is excluded.`,
+          : "Enter a customer id (cus_…) above. Stripe scopes meter event summaries to one customer."),
+      notice: `Complete ${win.granularity}s only (UTC); the current partial ${win.granularity} is excluded.`,
     },
   ];
 
@@ -256,7 +256,7 @@ async function detail(ctx: DashboardCtx, id: string, filters: Record<string, str
         { label: "Meter ID", cell: idCell(meter.id, { copy: true }) },
         { label: "Status", cell: badgeCell(meterBadge(meter.status).kind, meterBadge(meter.status).text) },
         { label: "Event name", cell: idCell(meter.event_name, { copy: true }) },
-        { label: "Aggregation", cell: text(sentence(meter.default_aggregation?.formula ?? "—")) },
+        { label: "Aggregation", cell: text(sentence(meter.default_aggregation?.formula ?? "N/A")) },
         ...(meter.value_settings?.event_payload_key
           ? [{ label: "Value key", cell: idCell(meter.value_settings.event_payload_key) }]
           : []),

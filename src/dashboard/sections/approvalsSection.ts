@@ -51,10 +51,10 @@ export function makeApprovalsSection(): DashboardSectionModule {
               badgeCell(a.origin === "dashboard" ? "info" : "neutral", a.origin),
               a.stripeCustomerId
                 ? idCell(a.stripeCustomerId, { ref: { page: "customers.detail", params: { id: a.stripeCustomerId } } })
-                : text("—"),
+                : text("N/A"),
               isoDateCell(a.createdAt),
               a.status === "FAILED"
-                ? ({ t: "text", v: "Failed — retryable", sub: (a.errorText ?? "").slice(0, 100) } as Cell)
+                ? ({ t: "text", v: "Failed (retryable)", sub: (a.errorText ?? "").slice(0, 100) } as Cell)
                 : ({ t: "badge", b: { kind: "warn", text: "Pending" } } as Cell),
             ] as Cell[],
             actions: [
@@ -84,7 +84,7 @@ export function makeApprovalsSection(): DashboardSectionModule {
         ...(approvals.rows.length
           ? { footer: `${approvals.rows.length} of ${approvals.total} item${approvals.total === 1 ? "" : "s"}` }
           : {}),
-        notice: "Queued actions expire after 7 days. Approving revalidates against live Stripe state — a stale request refuses instead of executing.",
+        notice: "Queued actions expire after 7 days. Approving revalidates against live Stripe state. A stale request refuses instead of executing.",
       });
 
       blocks.push({
@@ -114,7 +114,7 @@ export function makeApprovalsSection(): DashboardSectionModule {
               style: "primary" as const,
               dangerous: true,
               params: { threadId: r.threadId, decision: "approve" },
-              summary: `Refund ${ctx.stripe.formatAmount(r.amount, r.currency)} (${r.chargeId}) and cancel the linked subscription — the guardrail-blocked self-service path, executed via the refund core.`,
+              summary: `Refund ${ctx.stripe.formatAmount(r.amount, r.currency)} (${r.chargeId}) and cancel the linked subscription: the guardrail-blocked self-service path, executed via the refund core.`,
             },
             {
               key: "charge_review",
@@ -169,7 +169,7 @@ export function makeApprovalsSection(): DashboardSectionModule {
           const approval = await ctx.billing.actions.getApproval(id);
           if (!approval) return { ok: false, error: "Approval not found (already handled?)." };
           const refusal = await ctx.billing.actions.previewRevalidation(approval);
-          return { ok: true, text: refusal ? `Would refuse: ${refusal}` : "Would still execute — live revalidation passes." };
+          return { ok: true, text: refusal ? `Would refuse: ${refusal}` : "Would still execute: live revalidation passes." };
         }
         default:
           return { ok: false, error: "Unknown action." };

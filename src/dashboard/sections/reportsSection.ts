@@ -44,7 +44,7 @@ export function makeReportsSection(): DashboardSectionModule {
                 { type: "text", key: "start", label: "Interval start (YYYY-MM-DD)", placeholder: "2026-06-01", maxLength: 10 },
                 { type: "text", key: "end", label: "Interval end (YYYY-MM-DD)", placeholder: "2026-07-01", maxLength: 10 },
               ],
-              summary: "Starts an asynchronous report run over the given interval — Refresh the page to watch it finish.",
+              summary: "Starts an asynchronous report run over the given interval. Refresh the page to watch it finish.",
             },
             // No-op section action: dispatchAction reloads the page on ok, so
             // "Refresh" needs zero client changes.
@@ -83,9 +83,9 @@ export function makeReportsSection(): DashboardSectionModule {
                 }
               : {}),
           })),
-          empty: "No report runs yet — start one above.",
+          empty: "No report runs yet. Start one above.",
           ...(runs.length ? { footer: `${runs.length} most recent runs` } : {}),
-          notice: "Reports run asynchronously — Refresh to update. Download links expire after 10 minutes.",
+          notice: "Reports run asynchronously. Refresh to update. Download links expire after 10 minutes.",
         },
       ];
       return { title: "Reports", crumbs: [{ label: "Reports" }], blocks };
@@ -109,7 +109,7 @@ export function makeReportsSection(): DashboardSectionModule {
           }
           if (intervalStart >= intervalEnd) return { ok: false, fieldErrors: { end: "End must be after start." } };
           if (intervalEnd > Math.floor(Date.now() / 1000)) {
-            return { ok: false, fieldErrors: { end: "End cannot be in the future — reports cover settled data." } };
+            return { ok: false, fieldErrors: { end: "End cannot be in the future: reports cover settled data." } };
           }
           let run: Stripe.Reporting.ReportRun;
           try {
@@ -123,8 +123,8 @@ export function makeReportsSection(): DashboardSectionModule {
             const msg = e instanceof Error ? e.message : "Stripe refused the report run.";
             return { ok: false, error: `Stripe refused the run: ${msg.slice(0, 300)}` };
           }
-          await ctx.audit(`Report run ${run.id} started — ${reportType} ${startRaw}..${endRaw}`);
-          return { ok: true, text: `Report run ${run.id} started — it will appear as Succeeded when ready.` };
+          await ctx.audit(`Report run ${run.id} started: ${reportType} ${startRaw}..${endRaw}`);
+          return { ok: true, text: `Report run ${run.id} started. It will appear as Succeeded when ready.` };
         }
         // T0 + audit — mint a 10-minute FileLink for a SUCCEEDED run. Live
         // re-read: the run id is client-supplied, the status check is ours.
@@ -134,14 +134,14 @@ export function makeReportsSection(): DashboardSectionModule {
           const run = await ctx.stripe.getReportRun(id).catch(() => null);
           if (!run) return { ok: false, error: "This report run does not exist." };
           if (run.status !== "succeeded" || !run.result?.id) {
-            return { ok: false, error: `Run is ${run.status} — download links exist for succeeded runs only.` };
+            return { ok: false, error: `Run is ${run.status}; download links exist for succeeded runs only.` };
           }
           const link = await ctx.stripe.createFileLink(run.result.id, Math.floor(Date.now() / 1000) + LINK_TTL_SECONDS);
           if (!link.url) return { ok: false, error: "Stripe returned no URL for this file." };
           await ctx.audit(`Report run ${id} download link minted (expires in ${LINK_TTL_SECONDS / 60}m)`);
           return {
             ok: true,
-            text: `Download link ready — expires in ${LINK_TTL_SECONDS / 60} minutes.`,
+            text: `Download link ready, expires in ${LINK_TTL_SECONDS / 60} minutes.`,
             link: { href: link.url, label: "Download report" },
           };
         }
@@ -167,7 +167,7 @@ function runBadge(status: string): Badge {
 
 function intervalLabel(run: Stripe.Reporting.ReportRun): string {
   const params = run.parameters;
-  if (!params?.interval_start || !params?.interval_end) return "—";
+  if (!params?.interval_start || !params?.interval_end) return "N/A";
   const day = (unix: number) => new Date(unix * 1000).toISOString().slice(0, 10);
   return `${day(params.interval_start)} → ${day(params.interval_end)}`;
 }

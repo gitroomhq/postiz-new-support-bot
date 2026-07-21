@@ -260,7 +260,7 @@ export function parseExpression(text: string, ctx: ParseContext): ParseResult {
     if (!name) {
       const nameTok = tokens[i + 1];
       if (!nameTok || nameTok.kind !== "string") {
-        errors.push({ pos: key.pos, len: tokenLen(key), message: 'attr: needs a name — attr:Sentiment or attr:"AI Title"' });
+        errors.push({ pos: key.pos, len: tokenLen(key), message: 'attr: needs a name (attr:Sentiment or attr:"AI Title")' });
         return false;
       }
       name = nameTok.text;
@@ -382,7 +382,7 @@ export function parseExpression(text: string, ctx: ParseContext): ParseResult {
       errors.push({
         pos: joiner.pos,
         len: tokenLen(joiner),
-        message: "OR is not supported — conditions are AND-ed",
+        message: "OR is not supported; conditions are AND-ed",
         hint: "express OR as a second rule",
       });
       return { ok: false, errors };

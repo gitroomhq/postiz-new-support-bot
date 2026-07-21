@@ -97,7 +97,7 @@ export class PromosHub {
           this.ctx.audit.log(interaction, {
             action: dir === "on" ? "Activate promo code" : "Deactivate promo code",
             objectId: promo.id,
-            outcome: `Success — \`${promo.code}\` is now ${promo.active ? "active" : "inactive"}`,
+            outcome: `Success: \`${promo.code}\` is now ${promo.active ? "active" : "inactive"}`,
             severity: dir === "on" ? "success" : "warn",
           });
           await interaction.editReply(this.buildPromoDetailPanel(promo, token));
@@ -179,7 +179,7 @@ export class PromosHub {
       .setDescription(
         "Check whether a promo code is valid, create new codes, deactivate/reactivate them, " +
           "and manage the coupons they apply.\n\n" +
-          "ℹ️ Stripe promotion codes can't be **edited or deleted** — only deactivated. To change one, " +
+          "ℹ️ Stripe promotion codes can't be **edited or deleted**, only deactivated. To change one, " +
           "deactivate it and create a replacement. Coupons *can* be deleted."
       );
     return {
@@ -249,7 +249,7 @@ export class PromosHub {
         ? `${c.percent_off}% off`
         : c.amount_off != null
           ? `${this.ctx.stripe.formatAmount(c.amount_off, c.currency ?? "usd")} off`
-          : "—";
+          : "N/A";
     const lines = coupons.map(
       (c) =>
         `\`${c.id}\`${c.name ? ` (${c.name})` : ""} · ${describe(c)} · ${c.duration}` +
@@ -322,7 +322,7 @@ export class PromosHub {
       const value = Number.parseFloat(amountMatch[1]);
       if (StripeClient.isZeroDecimal(currency) && amountMatch[1].includes(".")) {
         await interaction.reply({
-          embeds: [makeEmbed(`\`${currency}\` is a zero-decimal currency — whole amounts only.`, COLORS.danger)],
+          embeds: [makeEmbed(`\`${currency}\` is a zero-decimal currency: whole amounts only.`, COLORS.danger)],
           flags: 64,
         });
         return;
@@ -347,7 +347,7 @@ export class PromosHub {
       this.ctx.audit.log(interaction, {
         action: "Create coupon",
         objectId: coupon.id,
-        outcome: `Success — ${couponDesc(this.ctx.stripe, coupon)} · ${coupon.duration}${coupon.duration_in_months ? ` (${coupon.duration_in_months}m)` : ""}`,
+        outcome: `Success: ${couponDesc(this.ctx.stripe, coupon)} · ${coupon.duration}${coupon.duration_in_months ? ` (${coupon.duration_in_months}m)` : ""}`,
         severity: "success",
       });
       await this.renderCouponList(interaction, `✅ Coupon \`${coupon.id}\` created.`);
@@ -382,7 +382,7 @@ export class PromosHub {
       const token = this.ctx.sessions.newSession(interaction, {});
       const select = new StringSelectMenuBuilder()
         .setCustomId(`billadmin_promopick:${token}`)
-        .setPlaceholder("Several promo codes matched — pick one")
+        .setPlaceholder("Several promo codes matched. Pick one")
         .addOptions(
           promos.slice(0, 25).map((p) => ({
             label: p.code.slice(0, 100),
@@ -431,7 +431,7 @@ export class PromosHub {
       this.ctx.audit.log(interaction, {
         action: "Create promo code",
         objectId: promo.id,
-        outcome: `Success — \`${promo.code}\` on coupon \`${coupon}\``,
+        outcome: `Success: \`${promo.code}\` on coupon \`${coupon}\``,
         severity: "success",
       });
       const token = this.ctx.sessions.newSession(interaction, { promoCodeId: promo.id });
@@ -456,7 +456,7 @@ export class PromosHub {
         ? `${coupon.percent_off}% off`
         : coupon?.amount_off != null
           ? `${this.ctx.stripe.formatAmount(coupon.amount_off, coupon.currency ?? "usd")} off`
-          : "—";
+          : "N/A";
     const restrictions = [
       promo.restrictions.first_time_transaction ? "first purchase only" : null,
       promo.restrictions.minimum_amount != null
@@ -466,10 +466,10 @@ export class PromosHub {
     ].filter(Boolean);
 
     const embed = new EmbedBuilder()
-      .setTitle(`Promo code — ${promo.code}`)
+      .setTitle(`Promo code · ${promo.code}`)
       .setColor(valid ? COLORS.success : COLORS.warn)
       .addFields(
-        { name: "Valid now", value: valid ? "✅ yes" : `❌ no — ${reasons.join(", ")}`, inline: false },
+        { name: "Valid now", value: valid ? "✅ yes" : `❌ no: ${reasons.join(", ")}`, inline: false },
         { name: "ID", value: `\`${promo.id}\``, inline: true },
         { name: "Active flag", value: promo.active ? "active" : "deactivated", inline: true },
         { name: "Expires", value: promo.expires_at ? `<t:${promo.expires_at}:f>` : "never", inline: true },
@@ -562,7 +562,7 @@ export class PromosHub {
         new ActionRowBuilder<TextInputBuilder>().addComponents(
           textInput("duration", "Duration: once / forever / repeating:N", {
             required: false,
-            placeholder: "default: once — repeating:3 = 3 months",
+            placeholder: "default: once · repeating:3 = 3 months",
           })
         )
       );

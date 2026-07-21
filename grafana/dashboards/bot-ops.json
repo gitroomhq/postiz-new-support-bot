@@ -1,6 +1,6 @@
 {
   "uid": "psb-bot-ops",
-  "title": "Bot — Operations",
+  "title": "Bot: Operations",
   "description": "Bot health, Intercom bridge queues, AI run reliability and the scoring pipeline.",
   "tags": [
     "postiz-support-bot"

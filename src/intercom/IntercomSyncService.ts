@@ -42,13 +42,13 @@ export function isIntercomExempt(shape: {
 }
 
 export const AGENT_WARNING_TEXT =
-  "⚠️ One-way mirror: this conversation is pushed from Discord. Replies here are NOT delivered to the customer — answer in the Discord thread instead.";
+  "⚠️ One-way mirror: this conversation is pushed from Discord. Replies here are NOT delivered to the customer; answer in the Discord thread instead.";
 
 // Posted on a push→bi flip into every conversation that previously received
 // AGENT_WARNING_TEXT — that note is now the most prominent (and wrong)
 // instruction agents see.
 export const BI_CORRECTION_TEXT =
-  "✅ Bi-directional sync is now ON: replies in this conversation ARE delivered to the customer in Discord. (An earlier note here said otherwise — it no longer applies.)";
+  "✅ Bi-directional sync is now ON: replies in this conversation ARE delivered to the customer in Discord. (An earlier note here said otherwise; it no longer applies.)";
 
 // Composes and enqueues outbox events for everything the bridge mirrors.
 // Enqueue-only and no-throw: Intercom being down or misconfigured must never
@@ -132,7 +132,7 @@ export class IntercomSyncService {
       return;
     }
     if (!this.executor) {
-      syncLog.warn("intercom mirror event dropped — temporal unconfigured, no executor bound", {
+      syncLog.warn("intercom mirror event dropped: temporal unconfigured, no executor bound", {
         "ticket.thread_id": threadId,
         "queue.event_type": type,
       });
@@ -141,7 +141,7 @@ export class IntercomSyncService {
     try {
       await this.executor.execute(threadId, type, payload);
     } catch (e) {
-      syncLog.warn("intercom direct delivery failed — event dropped (temporal unconfigured)", {
+      syncLog.warn("intercom direct delivery failed: event dropped (temporal unconfigured)", {
         "ticket.thread_id": threadId,
         "queue.event_type": type,
         "error.message": e instanceof Error ? e.message : String(e),
@@ -272,15 +272,15 @@ export class IntercomSyncService {
   // Discord markdown — the note executor renders it to HTML. Every line is
   // best-effort: a data gap degrades to a shorter note, never a throw.
   private async buildRefundContextNote(ticket: TicketWithTag): Promise<string> {
-    const lines: string[] = ["💳 **Refund ticket — flipped to mirrored** (customer sent a typed message)"];
+    const lines: string[] = ["💳 **Refund ticket: flipped to mirrored** (customer sent a typed message)"];
     const review = await this.sessionStore.getChargeReviewAnyStatus(ticket.threadId).catch(() => null);
     const action = ticket.customerId
       ? await this.sessionStore.latestBillingActionForUserSince(ticket.customerId, ticket.createdAt).catch(() => null)
       : null;
 
     if (review) {
-      lines.push(`**Charge:** \`${review.chargeId}\` — ${this.amountFormatter(review.amount, review.currency)}`);
-      lines.push(`**Guardrail:** ${review.reason} — review ${review.status}`);
+      lines.push(`**Charge:** \`${review.chargeId}\` · ${this.amountFormatter(review.amount, review.currency)}`);
+      lines.push(`**Guardrail:** ${review.reason} · review ${review.status}`);
     } else {
       if (action) lines.push(`**Charge:** \`${action.stripeInvoiceId}\``);
       lines.push("**Guardrail:** none tripped");
@@ -293,7 +293,7 @@ export class IntercomSyncService {
     } else if (review) {
       lines.push(`**Discount:** offered → declined · **Refund:** blocked, manual review ${review.status}`);
     } else {
-      lines.push("**Discount:** offered — no decision recorded yet");
+      lines.push("**Discount:** offered, no decision recorded yet");
     }
     return lines.join("\n");
   }

@@ -193,7 +193,7 @@ export class DisputesHub {
             interaction,
             token,
             0,
-            `🔄 Synced ${result.synced} dispute(s) from Stripe — ${result.open} open · ${result.won} won · ${result.lost} lost${
+            `🔄 Synced ${result.synced} dispute(s) from Stripe: ${result.open} open · ${result.won} won · ${result.lost} lost${
               result.otherClosed ? ` · ${result.otherClosed} other closed` : ""
             }${result.truncated ? " (sweep truncated)" : ""}. Only open disputes are listed below.`
           );
@@ -234,7 +234,7 @@ export class DisputesHub {
         const staged = (dispute.evidence ?? {}) as unknown as Record<string, unknown>;
         const modal = new ModalBuilder()
           .setCustomId(`billadmin_dp_evm:${token}`)
-          .setTitle(`${group.label} — ${session.disputeId}`.slice(0, 45));
+          .setTitle(`${group.label}: ${session.disputeId}`.slice(0, 45));
         for (const field of group.fields) {
           const stagedValue = typeof staged[field.key] === "string" ? (staged[field.key] as string) : undefined;
           modal.addComponents(
@@ -272,7 +272,7 @@ export class DisputesHub {
         await this.ctx.sessions.ackModal(interaction);
         await this.ctx.sessions.tryRender(interaction, async () => {
           if (Object.keys(evidence).length === 0) {
-            await this.renderEvidenceEditor(interaction, token, "Nothing to save — all evidence fields were empty.");
+            await this.renderEvidenceEditor(interaction, token, "Nothing to save: all evidence fields were empty.");
             return;
           }
           await this.ctx.disputeEvidence.saveDraft(disputeId, evidence);
@@ -301,7 +301,7 @@ export class DisputesHub {
         await this.ctx.sessions.tryRender(interaction, async () => {
           const dispute = await this.ctx.stripe.getDispute(session.disputeId!);
           if (!RESPONDABLE.has(dispute.status)) {
-            await this.renderDetail(interaction, token, `⚠️ Status is **${dispute.status}** — evidence can no longer be submitted.`);
+            await this.renderDetail(interaction, token, `⚠️ Status is **${dispute.status}**: evidence can no longer be submitted.`);
             return;
           }
           const submissions = dispute.evidence_details?.submission_count ?? 0;
@@ -314,8 +314,8 @@ export class DisputesHub {
                 `Submit the staged evidence for \`${dispute.id}\` (**${this.ctx.stripe.formatAmount(dispute.amount, dispute.currency)}**, ${dispute.reason})?`,
                 dueTs ? `Evidence deadline: <t:${dueTs}:R>.` : null,
                 submissions > 0
-                  ? `⚠️ Evidence was already submitted **${submissions}×** — banks typically accept only ONE submission; resubmit only if Stripe support advised it.`
-                  : "Stripe typically allows exactly one submission — make sure the staged evidence is complete (use Edit Evidence first).",
+                  ? `⚠️ Evidence was already submitted **${submissions}×**: banks typically accept only ONE submission; resubmit only if Stripe support advised it.`
+                  : "Stripe typically allows exactly one submission. Make sure the staged evidence is complete (use Edit Evidence first).",
                 "This sends everything currently staged at Stripe. It cannot be recalled.",
               ]
                 .filter(Boolean)
@@ -348,7 +348,7 @@ export class DisputesHub {
           // service (runExclusive only serializes this panel session).
           const outcome = await this.ctx.disputeEvidence.submit(disputeId, interaction.user.id, session.customerId ?? null);
           if (outcome.kind === "not_respondable") {
-            await this.renderDetail(interaction, token, `⚠️ Status changed to **${outcome.status}** — nothing was submitted.`);
+            await this.renderDetail(interaction, token, `⚠️ Status changed to **${outcome.status}**: nothing was submitted.`);
             return;
           }
           if (outcome.kind === "already_claimed") {
@@ -361,7 +361,7 @@ export class DisputesHub {
             targetCustomerId: session.customerId,
             objectId: disputeId,
             amountText: this.ctx.stripe.formatAmount(result.amount, result.currency),
-            outcome: `Submitted to the bank — status now ${result.status}`,
+            outcome: `Submitted to the bank, status now ${result.status}`,
             severity: "warn",
           });
           exportBillingEvent({ event: "evidence_submitted", amountMinor: result.amount, currency: result.currency, chargeId: session.chargeId });
@@ -426,7 +426,7 @@ export class DisputesHub {
             .setTitle("Remove staged evidence file")
             .setColor(COLORS.warn)
             .setDescription(
-              `Clear the **${slot}** slot for \`${session.disputeId}\`?\n\nThe uploaded file stays in your Stripe account but is detached from this dispute — it will NOT reach the bank. You can attach a new proof afterwards.`
+              `Clear the **${slot}** slot for \`${session.disputeId}\`?\n\nThe uploaded file stays in your Stripe account but is detached from this dispute: it will NOT reach the bank. You can attach a new proof afterwards.`
             );
           await interaction.editReply({
             embeds: [embed],
@@ -456,7 +456,7 @@ export class DisputesHub {
           // re-check inside the service).
           const outcome = await this.ctx.disputeEvidence.removeFile(disputeId, slot, interaction.id);
           if (outcome.kind === "not_respondable") {
-            await this.renderReviewStaged(interaction, token, 0, `⚠️ Status is **${outcome.status}** — evidence can no longer be changed.`);
+            await this.renderReviewStaged(interaction, token, 0, `⚠️ Status is **${outcome.status}**: evidence can no longer be changed.`);
             return;
           }
           if (outcome.kind === "invalid") {
@@ -467,7 +467,7 @@ export class DisputesHub {
             action: "Dispute evidence file removed",
             targetCustomerId: session.customerId,
             objectId: disputeId,
-            outcome: `Cleared file slot ${slot} (staged only — nothing was submitted)`,
+            outcome: `Cleared file slot ${slot} (staged only, nothing was submitted)`,
             severity: "info",
           });
           await this.renderReviewStaged(interaction, token, 0, `🗑️ File slot **${slot}** cleared.`);
@@ -611,7 +611,7 @@ export class DisputesHub {
           await interaction.reply({
             embeds: [
               makeEmbed(
-                "File too large — Stripe caps combined dispute evidence around 4.5MB, so keep each proof under **4MB**.",
+                "File too large: Stripe caps combined dispute evidence around 4.5MB, so keep each proof under **4MB**.",
                 COLORS.danger
               ),
             ],
@@ -636,7 +636,7 @@ export class DisputesHub {
             interaction.id
           );
           if (outcome.kind === "not_respondable") {
-            await this.renderDetail(interaction, token, `⚠️ Status is **${outcome.status}** — evidence files can no longer be attached.`);
+            await this.renderDetail(interaction, token, `⚠️ Status is **${outcome.status}**: evidence files can no longer be attached.`);
             return;
           }
           if (outcome.kind === "invalid") {
@@ -654,7 +654,7 @@ export class DisputesHub {
           await this.renderDetail(
             interaction,
             token,
-            `📎 \`${attachment.name}\` uploaded and staged as **${slot}** — it reaches the bank when you Submit Evidence.`
+            `📎 \`${attachment.name}\` uploaded and staged as **${slot}**: it reaches the bank when you Submit Evidence.`
           );
         });
       },
@@ -720,7 +720,7 @@ export class DisputesHub {
             severity: "danger",
           });
           exportBillingEvent({ event: "dispute_accepted", amountMinor: result.amount, currency: result.currency, chargeId: session.chargeId });
-          await this.renderDetail(interaction, token, "🏳️ Dispute accepted — closed as lost.");
+          await this.renderDetail(interaction, token, "🏳️ Dispute accepted, closed as lost.");
         });
       },
     },
@@ -737,7 +737,7 @@ export class DisputesHub {
         await this.ctx.sessions.tryRender(interaction, async () => {
           const dispute = await this.ctx.stripe.getDispute(session.disputeId!);
           if (!dispute.is_charge_refundable) {
-            await this.renderDetail(interaction, token, "⚠️ Stripe reports this charge as no longer refundable — a refund can't prevent this dispute.");
+            await this.renderDetail(interaction, token, "⚠️ Stripe reports this charge as no longer refundable: a refund can't prevent this dispute.");
             return;
           }
           const chargeId = typeof dispute.charge === "string" ? dispute.charge : dispute.charge?.id;
@@ -768,7 +768,7 @@ export class DisputesHub {
           await this.renderDetail(
             interaction,
             token,
-            watching ? "🔕 Unwatched — no more DMs for this dispute." : "🔔 Watching — you'll get a DM when its status changes."
+            watching ? "🔕 Unwatched: no more DMs for this dispute." : "🔔 Watching: you'll get a DM when its status changes."
           );
         });
       },
@@ -925,7 +925,7 @@ export class DisputesHub {
               new ActionRowBuilder<TextInputBuilder>().addComponents(
                 textInput("ip", "IP address (IPv4 or IPv6)", {
                   required: true,
-                  placeholder: "Stripe never exposes the payment IP via API — enter it manually",
+                  placeholder: "Stripe never exposes the payment IP via API. Enter it manually",
                   maxLength: 45,
                 })
               )
@@ -1004,7 +1004,7 @@ export class DisputesHub {
               [
                 "These identifiers go on the Radar value lists (blocking future payments once the Dashboard rules reference the lists) AND the bot's local blocklist (self-service refunds denied, panels flagged):",
                 "",
-                ...entries.map((e) => `• **${BLOCK_KIND_LABELS[e.kind]}** — \`${e.value.slice(0, 90)}\``),
+                ...entries.map((e) => `• **${BLOCK_KIND_LABELS[e.kind]}**: \`${e.value.slice(0, 90)}\``),
                 "",
                 `Reason: ${session.blockReason}`,
                 cancelsSubs ? "⚠️ Blocking the **customer** also cancels ALL their active subscriptions." : null,
@@ -1051,7 +1051,7 @@ export class DisputesHub {
               objectId: `${r.kind}:${r.value.slice(0, 60)}`,
               outcome: r.ok
                 ? `${r.alreadyBlocked ? "Already blocked (refreshed)" : "Blocked"}${r.cancelledSubs?.length ? ` · cancelled ${r.cancelledSubs.length} sub(s)` : ""}${r.failedSubs?.length ? ` · ⚠️ ${r.failedSubs.length} cancel(s) FAILED` : ""}`
-                : `FAILED — ${r.error?.slice(0, 300)}`,
+                : `FAILED: ${r.error?.slice(0, 300)}`,
               severity: r.ok ? "warn" : "danger",
             });
             if (r.ok) exportBillingEvent({ event: "block", chargeId: session.chargeId });
@@ -1061,7 +1061,7 @@ export class DisputesHub {
               ? `✅ ${BLOCK_KIND_LABELS[r.kind]} \`${r.value.slice(0, 80)}\`${r.alreadyBlocked ? " (was already blocked)" : ""}${
                   r.cancelledSubs?.length ? ` · ${r.cancelledSubs.length} sub(s) cancelled` : ""
                 }${r.failedSubs?.length ? ` · ⚠️ ${r.failedSubs.length} sub cancel(s) failed` : ""}`
-              : `⚠️ ${BLOCK_KIND_LABELS[r.kind]} \`${r.value.slice(0, 80)}\` — ${r.error?.slice(0, 150)}`
+              : `⚠️ ${BLOCK_KIND_LABELS[r.kind]} \`${r.value.slice(0, 80)}\`: ${r.error?.slice(0, 150)}`
           );
           const embed = new EmbedBuilder()
             .setTitle("Block result")
@@ -1210,7 +1210,7 @@ export class DisputesHub {
             await interaction.editReply({
               embeds: [
                 makeEmbed(
-                  `Dispute \`${dispute.id}\` is **${dispute.status}** and Stripe reports the charge as no longer refundable — a refund can't prevent it anymore.`,
+                  `Dispute \`${dispute.id}\` is **${dispute.status}** and Stripe reports the charge as no longer refundable: a refund can't prevent it anymore.`,
                   COLORS.warn
                 ),
               ],
@@ -1294,7 +1294,7 @@ export class DisputesHub {
         const type = CUSTOMER_ID_RE.test(raw) ? "c" : CHARGE_ID_RE.test(raw) ? "h" : DISPUTE_ID_RE.test(raw) ? "d" : null;
         if (!type) {
           await interaction.reply({
-            embeds: [makeEmbed("Unrecognized id — expected `cus_…`, `ch_…`/`py_…`, or `dp_…`/`du_…`.", COLORS.danger)],
+            embeds: [makeEmbed("Unrecognized id: expected `cus_…`, `ch_…`/`py_…`, or `dp_…`/`du_…`.", COLORS.danger)],
             flags: 64,
           });
           return;
@@ -1340,7 +1340,7 @@ export class DisputesHub {
           describeRatioWindow("Trailing 30d", ratios.d30, ratios.truncated),
           describeRatioWindow("Trailing 90d", ratios.d90, ratios.truncated),
         ].join("\n")
-      : "*Ratio unavailable (charges.search failed — see logs).*";
+      : "*Ratio unavailable (charges.search failed; see logs).*";
     const cachedAt = this.ctx.ratio.cachedAt();
 
     const embed = new EmbedBuilder()
@@ -1468,7 +1468,7 @@ export class DisputesHub {
           bts.reduce((sum, bt) => sum + (bt.net ?? 0), 0),
           bts[0].currency
         )}`
-      : "—";
+      : "N/A";
     const ed = dispute.evidence_details;
     const dueText = ed?.due_by ? `<t:${ed.due_by}:R> (<t:${ed.due_by}:f>)${ed.past_due ? " · ⚠️ PAST DUE" : ""}` : "no response window";
     const draftFields = Object.keys((local.evidenceDraft ?? {}) as Record<string, string>).length;
@@ -1488,12 +1488,12 @@ export class DisputesHub {
     const card = dispute.payment_method_details?.card;
     const cardText = card
       ? `${card.brand ?? "card"}${card.case_type ? ` · ${card.case_type}` : ""}${card.network_reason_code ? ` · network code ${card.network_reason_code}` : ""}`
-      : "—";
+      : "N/A";
     const linked = linkedIds.length
       ? `${linkedIds.map((id) => `<@${id}>`).join(", ")} (\`${customerId}\`)`
       : customerId
         ? `\`${customerId}\` (no linked Discord user)`
-        : "—";
+        : "N/A";
     const respondable = RESPONDABLE.has(dispute.status);
     const terminal = TERMINAL.has(dispute.status);
     // Stage-aware refundable text: a bare "yes/no" hides the two states that
@@ -1502,18 +1502,18 @@ export class DisputesHub {
     const warningStage = dispute.status === "warning_needs_response" || dispute.status === "warning_under_review";
     let refundableText: string;
     if (terminal) {
-      refundableText = "— dispute closed";
+      refundableText = "dispute closed";
     } else if (dispute.is_charge_refundable) {
       refundableText = warningStage
-        ? "yes — a **full refund now** prevents this from becoming a formal chargeback"
+        ? "yes: a **full refund now** prevents this from becoming a formal chargeback"
         : "yes";
     } else if (warningStage) {
       const detailCharge = chargeId ? await this.ctx.stripe.getCharge(chargeId).catch(() => null) : null;
       refundableText = detailCharge?.refunded
-        ? "already fully refunded ✅ — waiting for the bank to close this warning (can take a few days)"
-        : "no — Stripe no longer allows a refund on this charge";
+        ? "already fully refunded ✅: waiting for the bank to close this warning (can take a few days)"
+        : "no: Stripe no longer allows a refund on this charge";
     } else {
-      refundableText = "no — formal chargeback: Stripe rejects refunds, respond with evidence instead";
+      refundableText = "no, formal chargeback: Stripe rejects refunds, respond with evidence instead";
     }
     const eligibility = ed && "enhanced_eligibility_types" in ed && Array.isArray(ed.enhanced_eligibility_types) && ed.enhanced_eligibility_types.length
       ? ed.enhanced_eligibility_types.join(", ")
@@ -1521,7 +1521,7 @@ export class DisputesHub {
 
     const statusEmoji = dispute.status === "won" ? "🏆" : dispute.status === "lost" ? "❌" : dispute.status === "prevented" ? "🛑" : "🚩";
     const embed = new EmbedBuilder()
-      .setTitle(`${statusEmoji} Dispute — \`${dispute.id}\``)
+      .setTitle(`${statusEmoji} Dispute: \`${dispute.id}\``)
       .setColor(terminal ? (dispute.status === "won" || dispute.status === "prevented" ? COLORS.success : COLORS.neutral) : COLORS.danger)
       .addFields(
         { name: "Amount", value: `**${fmt(dispute.amount)}**`, inline: true },
@@ -1531,18 +1531,18 @@ export class DisputesHub {
         { name: "Opened", value: `<t:${dispute.created}:D>`, inline: true },
         { name: "Evidence due", value: dueText, inline: true },
         { name: "Evidence", value: evidenceState.slice(0, 1024), inline: false },
-        { name: "Charge", value: chargeId ? `\`${chargeId}\`` : "—", inline: true },
+        { name: "Charge", value: chargeId ? `\`${chargeId}\`` : "N/A", inline: true },
         { name: "Card", value: cardText.slice(0, 1024), inline: true },
         { name: "Refundable", value: refundableText.slice(0, 1024), inline: true },
         { name: "Customer", value: linked.slice(0, 1024), inline: false },
         ...(eligibility
-          ? [{ name: "Enhanced eligibility", value: `${eligibility} — compelling-evidence flows live in the Stripe Dashboard`.slice(0, 1024), inline: false }]
+          ? [{ name: "Enhanced eligibility", value: `${eligibility}: compelling-evidence flows live in the Stripe Dashboard`.slice(0, 1024), inline: false }]
           : []),
         ...(latestNote
           ? [
               {
                 name: `Latest note (${noteCount})`,
-                value: `<t:${Math.floor(latestNote.createdAt.getTime() / 1000)}:R> **${latestNote.authorName}** — ${latestNote.text}`.slice(0, 1024),
+                value: `<t:${Math.floor(latestNote.createdAt.getTime() / 1000)}:R> **${latestNote.authorName}**: ${latestNote.text}`.slice(0, 1024),
                 inline: false,
               },
             ]
@@ -1602,7 +1602,7 @@ export class DisputesHub {
         `${stagedCount}/${g.fields.length} staged`,
         draftDiffers ? `✏️ ${draftDiffers} draft field(s) not staged yet` : null,
       ].filter(Boolean);
-      return `${g.emoji} **${g.label}**${star} — ${parts.join(" · ")}`;
+      return `${g.emoji} **${g.label}**${star}: ${parts.join(" · ")}`;
     };
 
     // Recommended groups first, in their recommendation order.
@@ -1613,17 +1613,17 @@ export class DisputesHub {
     });
 
     const embed = new EmbedBuilder()
-      .setTitle(`📝 Evidence — \`${dispute.id}\``)
+      .setTitle(`📝 Evidence: \`${dispute.id}\``)
       .setColor(respondable ? COLORS.brand : COLORS.warn)
       .setDescription(
         [
           notice,
-          `Reason **${dispute.reason}** — ⭐ marks the sections that matter most for it. Pick a section to edit; **Save stages at Stripe** (submit:false, the bank sees nothing until Submit Evidence).`,
+          `Reason **${dispute.reason}**: ⭐ marks the sections that matter most for it. Pick a section to edit; **Save stages at Stripe** (submit:false, the bank sees nothing until Submit Evidence).`,
           "",
           ...ordered.map(groupLine),
           "",
-          "Empty inputs are left untouched — existing staged text is never cleared by saving a blank field.",
-          respondable ? null : `⚠️ Status is **${dispute.status}** — evidence can no longer be changed.`,
+          "Empty inputs are left untouched: existing staged text is never cleared by saving a blank field.",
+          respondable ? null : `⚠️ Status is **${dispute.status}**: evidence can no longer be changed.`,
         ]
           .filter((line) => line !== null && line !== undefined)
           .join("\n")
@@ -1694,12 +1694,12 @@ export class DisputesHub {
       const value = (staged[key] as string).trim();
       const differs = unstagedDraft.includes(key) ? " · ✏️ local draft differs" : "";
       const shown = value.length > 350 ? `${value.slice(0, 350)}… _(${value.length} chars total)_` : value;
-      return `**${key}** — ${value.length} chars${differs}\n> ${shown.replace(/\n/g, "\n> ")}`;
+      return `**${key}**: ${value.length} chars${differs}\n> ${shown.replace(/\n/g, "\n> ")}`;
     };
 
     const submissions = ed?.submission_count ?? 0;
     const embed = new EmbedBuilder()
-      .setTitle(`🔎 Staged evidence — \`${dispute.id}\``)
+      .setTitle(`🔎 Staged evidence: \`${dispute.id}\``)
       .setColor(respondable ? COLORS.brand : COLORS.warn)
       .setDescription(
         [
@@ -1714,10 +1714,10 @@ export class DisputesHub {
           ...pageFields.map(fieldBlock),
           "",
           files.length
-            ? `**Files (${files.length})**\n${files.map((key) => `📎 **${key}** — \`${staged[key]}\``).join("\n")}`
+            ? `**Files (${files.length})**\n${files.map((key) => `📎 **${key}**: \`${staged[key]}\``).join("\n")}`
             : "**No evidence files attached.**",
           unstagedDraft.length
-            ? `\n✏️ **${unstagedDraft.length} local draft field(s) are NOT staged yet** (${unstagedDraft.slice(0, 6).join(", ")}${unstagedDraft.length > 6 ? ", …" : ""}) — open Edit Evidence and save them, or they won't reach the bank.`
+            ? `\n✏️ **${unstagedDraft.length} local draft field(s) are NOT staged yet** (${unstagedDraft.slice(0, 6).join(", ")}${unstagedDraft.length > 6 ? ", …" : ""}). Open Edit Evidence and save them, or they won't reach the bank.`
             : null,
         ]
           .filter((line) => line !== null && line !== undefined)
@@ -1785,7 +1785,7 @@ export class DisputesHub {
           lines.length ? lines.join("\n") : "No closed disputes recorded yet.",
           backfilledAt
             ? null
-            : "\nℹ️ Only disputes seen since the mirror existed are listed — run **/config → Billing → Disputes → Backfill History** to import the full Stripe history.",
+            : "\nℹ️ Only disputes seen since the mirror existed are listed. Run **/config → Billing → Disputes → Backfill History** to import the full Stripe history.",
         ]
           .filter((line) => line !== null && line !== undefined)
           .join("\n")
@@ -1857,12 +1857,12 @@ export class DisputesHub {
 
     const fmtAmounts = (amounts: Record<string, number>) => {
       const parts = Object.entries(amounts).map(([currency, minor]) => this.ctx.stripe.formatAmount(minor, currency));
-      return parts.length ? parts.join(" + ") : "—";
+      return parts.length ? parts.join(" + ") : "N/A";
     };
     const fmtRate = (pct: number | null) => (pct == null ? "n/a (nothing decided)" : `${pct.toFixed(1)}%`);
     const windowBlock = (label: string, s: typeof allTime) =>
       [
-        `**${label}** — ${s.won + s.lost + s.other} closed`,
+        `**${label}**: ${s.won + s.lost + s.other} closed`,
         `🏆 won **${s.won}** · ❌ lost **${s.lost}** · ⚪ other **${s.other}** · win rate **${fmtRate(s.winRatePct)}**`,
         `recovered ${fmtAmounts(s.wonAmount)} · conceded ${fmtAmounts(s.lostAmount)}`,
         s.lostUnanswered > 0 ? `⚠️ **${s.lostUnanswered}** lost without any evidence response` : null,
@@ -1872,7 +1872,7 @@ export class DisputesHub {
 
     const reasonLines = byReason
       .slice(0, 10)
-      .map((r) => `• **${r.reason}** — 🏆 ${r.won} / ❌ ${r.lost}${r.other ? ` / ⚪ ${r.other}` : ""} · win rate ${fmtRate(r.winRatePct)}`);
+      .map((r) => `• **${r.reason}**: 🏆 ${r.won} / ❌ ${r.lost}${r.other ? ` / ⚪ ${r.other}` : ""} · win rate ${fmtRate(r.winRatePct)}`);
 
     const backfilledAt = this.ctx.settingsStore.disputeBackfillDoneAt();
     const embed = new EmbedBuilder()
@@ -1884,11 +1884,11 @@ export class DisputesHub {
           "",
           windowBlock("Last 90 days (by close date)", d90),
           "",
-          reasonLines.length ? `**By reason (all time)**\n${reasonLines.join("\n")}` : "**By reason** — no closed disputes yet.",
+          reasonLines.length ? `**By reason (all time)**\n${reasonLines.join("\n")}` : "**By reason**: no closed disputes yet.",
           "",
           backfilledAt
             ? `History backfilled <t:${Math.floor(backfilledAt.getTime() / 1000)}:R>. Win rate = won ÷ (won + lost); "other" (prevented / closed inquiries) doesn't count against you.`
-            : "⚠️ Stats only cover disputes seen since the mirror existed — run **/config → Billing → Disputes → Backfill History** for lifetime numbers. Win rate = won ÷ (won + lost).",
+            : "⚠️ Stats only cover disputes seen since the mirror existed. Run **/config → Billing → Disputes → Backfill History** for lifetime numbers. Win rate = won ÷ (won + lost).",
         ].join("\n").slice(0, 4096)
       );
 
@@ -1921,16 +1921,16 @@ export class DisputesHub {
         result.usedIntercomHistory ? ", with Intercom history" : ""
       }${result.exemplars ? `, ${result.exemplars} won-dispute exemplar(s)` : ""}${
         result.receiptStaged ? ", receipt staged" : ""
-      }) — draft text not sent to Stripe`,
+      }). Draft text not sent to Stripe`,
       severity: "info",
     });
     await this.renderEvidenceEditor(
       interaction,
       token,
       [
-        "🤖 AI draft saved **locally** — open the sections below to review/adjust and **Save** to stage, then Submit. No draft text was sent to Stripe.",
+        "🤖 AI draft saved **locally**. Open the sections below to review/adjust and **Save** to stage, then Submit. No draft text was sent to Stripe.",
         result.rejected.length
-          ? `⚠️ Dropped ${result.rejected.length} field(s) whose value didn't fit the field's meaning (${result.rejected.join(", ")}) — fill them manually if needed.`
+          ? `⚠️ Dropped ${result.rejected.length} field(s) whose value didn't fit the field's meaning (${result.rejected.join(", ")}). Fill them manually if needed.`
           : null,
         receiptNote,
       ]
@@ -1948,14 +1948,14 @@ export class DisputesHub {
     if (!session?.disputeId) return;
     const pkg = await this.ctx.disputeEvidence.stagedPackage(session.disputeId);
     if (!pkg.textFields.length && !pkg.files.length) {
-      await this.renderReviewStaged(interaction, token, 0, "Nothing staged at Stripe yet — there is nothing to review.");
+      await this.renderReviewStaged(interaction, token, 0, "Nothing staged at Stripe yet: there is nothing to review.");
       return;
     }
 
     await interaction.editReply({
       embeds: [
         makeEmbed(
-          `🤖 Reviewing the staged evidence for \`${pkg.dispute.id}\`${pkg.files.length ? ` — downloading ${pkg.files.length} evidence file(s)…` : "…"}`,
+          `🤖 Reviewing the staged evidence for \`${pkg.dispute.id}\`${pkg.files.length ? `, downloading ${pkg.files.length} evidence file(s)…` : "…"}`,
           COLORS.brand
         ),
       ],
@@ -1967,7 +1967,7 @@ export class DisputesHub {
       telemetry: { userId: interaction.user.id, username: interaction.user.username },
     });
     if (result.kind === "nothing_staged") {
-      await this.renderReviewStaged(interaction, token, 0, "Nothing staged at Stripe yet — there is nothing to review.");
+      await this.renderReviewStaged(interaction, token, 0, "Nothing staged at Stripe yet: there is nothing to review.");
       return;
     }
 
@@ -1975,14 +1975,14 @@ export class DisputesHub {
       action: "Dispute AI evidence review",
       targetCustomerId: result.customerId ?? undefined,
       objectId: pkg.dispute.id,
-      outcome: `Reviewed ${result.stagedFieldCount} staged field(s) + ${result.filesAttached}/${result.filesTotal} file(s) on the light model — read-only`,
+      outcome: `Reviewed ${result.stagedFieldCount} staged field(s) + ${result.filesAttached}/${result.filesTotal} file(s) on the light model · read-only`,
       severity: "info",
     });
 
     const embed = new EmbedBuilder()
-      .setTitle(`🧐 AI evidence review — \`${pkg.dispute.id}\``)
+      .setTitle(`🧐 AI evidence review: \`${pkg.dispute.id}\``)
       .setColor(COLORS.brand)
-      .setDescription(result.review.slice(0, 4096) || "The model returned no review text — try again.")
+      .setDescription(result.review.slice(0, 4096) || "The model returned no review text. Try again.")
       .setFooter({
         text: `${result.model} · ${result.stagedFieldCount} field(s) · ${result.filesAttached}/${result.filesTotal} file(s) reviewed${
           result.skipped.length ? ` · skipped: ${result.skipped.map((f) => `${f.slot} (${f.note})`).join(", ")}` : ""
@@ -2045,15 +2045,15 @@ export class DisputesHub {
       .setDescription(
         [
           notice,
-          "Pick which identifiers to block. Each goes on a **Stripe Radar value list** (blocks future payments once the Dashboard rules reference the lists — see /config → Billing → Disputes) and the bot's **local blocklist** (self-service refunds denied, staff panels flagged).",
+          "Pick which identifiers to block. Each goes on a **Stripe Radar value list** (blocks future payments once the Dashboard rules reference the lists; see /config → Billing → Disputes) and the bot's **local blocklist** (self-service refunds denied, staff panels flagged).",
           "",
           candidates.length
             ? candidates
-                .map((c, idx) => `${selected.has(`i:${idx}`) ? "☑️" : "▫️"} **${BLOCK_KIND_LABELS[c.kind as BlockKind] ?? c.kind}** — \`${c.value.slice(0, 90)}\``)
+                .map((c, idx) => `${selected.has(`i:${idx}`) ? "☑️" : "▫️"} **${BLOCK_KIND_LABELS[c.kind as BlockKind] ?? c.kind}**: \`${c.value.slice(0, 90)}\``)
                 .join("\n")
-            : "*No identifiers derivable — add an IP manually or open the flow from a charge.*",
+            : "*No identifiers derivable. Add an IP manually or open the flow from a charge.*",
           "",
-          "The payment IP is never exposed by Stripe's API — use **Add IP** to enter one manually.",
+          "The payment IP is never exposed by Stripe's API. Use **Add IP** to enter one manually.",
         ]
           .filter((line) => line !== undefined)
           .join("\n")
@@ -2139,12 +2139,12 @@ export class DisputesHub {
     const typeEmoji: Record<string, string> = { dispute: "🚩", customer: "👤", charge: "💳" };
     const lines = rows.map(
       (b) =>
-        `${typeEmoji[b.objectType] ?? "🔖"} \`${b.objectId}\`${b.label ? ` — ${b.label.slice(0, 80)}` : ""} · added by ${b.addedByName} <t:${Math.floor(b.createdAt.getTime() / 1000)}:R>`
+        `${typeEmoji[b.objectType] ?? "🔖"} \`${b.objectId}\`${b.label ? ` · ${b.label.slice(0, 80)}` : ""} · added by ${b.addedByName} <t:${Math.floor(b.createdAt.getTime() / 1000)}:R>`
     );
     const embed = new EmbedBuilder()
       .setTitle(`🔖 Team Bookmarks (${total})`)
       .setColor(COLORS.brand)
-      .setDescription(lines.length ? lines.join("\n").slice(0, 4096) : "Nothing bookmarked yet — use the Bookmark button on a dispute, customer or charge panel.")
+      .setDescription(lines.length ? lines.join("\n").slice(0, 4096) : "Nothing bookmarked yet. Use the Bookmark button on a dispute, customer or charge panel.")
       .setFooter({ text: `Page ${page + 1}/${Math.max(1, Math.ceil(total / PAGE_SIZE))} · one shared list for the whole team` });
 
     const components: Panel["components"] = [];

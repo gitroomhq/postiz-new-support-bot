@@ -70,7 +70,7 @@ D.dispatchAction = function (body, onErr) {
       D.stepUpFlow(function () { D.dispatchAction(body, onErr); });
     } else if (j.needsReverse) {
       if (onErr) onErr("reverse");
-      else D.flashErr("This action needs the Discord reverse code — reopen it.");
+      else D.flashErr("This action needs the Discord reverse code; reopen it.");
     } else {
       if (onErr) onErr(j.error || "Action failed.");
       else D.flashErr(j.error || "Action failed.");

@@ -27,7 +27,7 @@ test("buildMetadataNote is minimal: short id header + escaped links only", () =>
     shortId: "POSTIZ-1X",
     permalink: "https://sentry.io/organizations/acme/issues/42/",
   });
-  assert.ok(note.includes("<b>Sentry feedback</b> — POSTIZ-1X"));
+  assert.ok(note.includes("<b>Sentry feedback</b> · POSTIZ-1X"));
   assert.ok(note.includes('href="https://app.example.com/x?a=1&amp;b=2"'));
   assert.ok(note.includes("Open in Sentry"));
   // Operator-trimmed: no timestamp, no From line, no project slug, no footer

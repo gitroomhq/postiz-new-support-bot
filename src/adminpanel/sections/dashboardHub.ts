@@ -30,7 +30,7 @@ export function makeDashboardHub(deps: { resetCredentials: (userId: string) => P
             key: "dashboardEnabled",
             label: "Enable the web dashboard",
             value: s.dashboardEnabled(),
-            help: "Re-enabling always happens here — a dashboard session can disable but never enable.",
+            help: "Re-enabling always happens here. A dashboard session can disable but never enable.",
           },
           {
             type: "static",
@@ -55,7 +55,7 @@ export function makeDashboardHub(deps: { resetCredentials: (userId: string) => P
             dangerous: true,
             reverseConfirm: true,
             summary:
-              "Disables the dashboard AND bumps the epoch — the surface goes dark instantly. " +
+              "Disables the dashboard AND bumps the epoch: the surface goes dark instantly. " +
               "Re-enable it afterwards with the toggle above.",
           },
           {
@@ -163,12 +163,12 @@ export function makeDashboardHub(deps: { resetCredentials: (userId: string) => P
           if (!entry) return { ok: false, error: "Not on the allowlist." };
           await s.updateDashboardAdmins(admins.filter((a) => a.id !== id));
           await ctx.audit(`dashboard admin removed: ${entry.name}`);
-          return { ok: true, text: "Removed — their live sessions die on the next request." };
+          return { ok: true, text: "Removed. Their live sessions die on the next request." };
         }
         case "dash_revoke": {
           const epoch = await s.bumpDashboardEpoch();
           await ctx.audit(`dashboard links revoked (epoch ${epoch})`);
-          return { ok: true, text: `Revoked — dashboard epoch is now ${epoch}.` };
+          return { ok: true, text: `Revoked. Dashboard epoch is now ${epoch}.` };
         }
         case "dash_lockdown": {
           if (!ctx.reverse?.satisfied) return { ok: false, needsReverse: true };

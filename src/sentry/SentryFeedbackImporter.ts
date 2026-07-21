@@ -192,7 +192,7 @@ export class SentryFeedbackImporter {
             await this.store.setTicketId(issue.id, ticketId);
           } catch (e) {
             ticketId = null;
-            syncLog.warn("sentry feedback import: ticket conversion failed — staying a conversation", {
+            syncLog.warn("sentry feedback import: ticket conversion failed, staying a conversation", {
               "intercom.conversation_id": conversationId,
               "error.message": e instanceof Error ? e.message : String(e),
             });

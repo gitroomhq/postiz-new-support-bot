@@ -205,7 +205,7 @@ export class TemporalWorkerManager {
         // conflictToken → FAILED_PRECONDITION → refetch next attempt.
         if (attempt === PROMOTE_ATTEMPTS) {
           this.promotedVal = false;
-          workerLog.warn("temporal deployment auto-promote failed — worker still polls, panel shows drift", {
+          workerLog.warn("temporal deployment auto-promote failed: worker still polls, panel shows drift", {
             "temporal.error": e instanceof Error ? e.message : String(e),
           });
           return;

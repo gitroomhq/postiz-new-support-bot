@@ -47,7 +47,7 @@ export function buildActionLevelsPanel(settings: SettingsStore, page: number, ba
     const stored = settings.billingActionLevels()[def.key];
     const level = settings.billingActionLevel(def.key, def.defaultLevel);
     const suffix = stored === undefined ? " _(default)_" : "";
-    return `**${def.group} · ${def.label}** — ${LEVEL_LABEL[level]}${suffix}`;
+    return `**${def.group} · ${def.label}**: ${LEVEL_LABEL[level]}${suffix}`;
   });
 
   const embed = new EmbedBuilder()
@@ -62,7 +62,7 @@ export function buildActionLevelsPanel(settings: SettingsStore, page: number, ba
         ...lines,
       ].join("\n")
     )
-    .setFooter({ text: `Page ${clamped + 1}/${pages} — pick an action below to change its level` });
+    .setFooter({ text: `Page ${clamped + 1}/${pages}: pick an action below to change its level` });
 
   const select = new StringSelectMenuBuilder()
     .setCustomId(`config_bact_pick:${clamped}`)
@@ -70,7 +70,7 @@ export function buildActionLevelsPanel(settings: SettingsStore, page: number, ba
     .addOptions(
       slice.map((def) => ({
         label: def.label.slice(0, 100),
-        description: `${def.group} — ${LEVEL_LABEL[settings.billingActionLevel(def.key, def.defaultLevel)]}`.slice(0, 100),
+        description: `${def.group}: ${LEVEL_LABEL[settings.billingActionLevel(def.key, def.defaultLevel)]}`.slice(0, 100),
         value: def.key,
       }))
     );
@@ -111,10 +111,10 @@ export function buildActionDetailPanel(settings: SettingsStore, key: string, pag
         `**Registry default:** ${LEVEL_LABEL[def.defaultLevel]}`,
         def.dangerous ? "**Dangerous:** panel requires typed CONFIRM." : "",
         "",
-        "None — nobody can run it (admins included).",
-        "Agent Approval — agents queue for admin approval; admins execute directly.",
-        "Admin Only — admins execute directly; agents get nothing (not even a queue request).",
-        "All — agents execute directly too.",
+        "None: nobody can run it (admins included).",
+        "Agent Approval: agents queue for admin approval; admins execute directly.",
+        "Admin Only: admins execute directly; agents get nothing (not even a queue request).",
+        "All: agents execute directly too.",
       ]
         .filter(Boolean)
         .join("\n")
@@ -147,7 +147,7 @@ export function buildIntercomAdminsPanel(
   const lines =
     marked.length > 0
       ? marked.map((a) => `• **${a.name}** (\`${a.id}\`)`)
-      : ["_none — nobody can approve or execute admin-gated actions from Intercom (Discord /billing still works)_"];
+      : ["_none: nobody can approve or execute admin-gated actions from Intercom (Discord /billing still works)_"];
 
   const embed = new EmbedBuilder()
     .setTitle("Intercom Billing Admins")
@@ -168,7 +168,7 @@ export function buildIntercomAdminsPanel(
   if (teammates === null) {
     embed.addFields({
       name: "Teammate list unavailable",
-      value: "Could not fetch the workspace teammates from Intercom — check the Intercom connection in /config → Intercom.",
+      value: "Could not fetch the workspace teammates from Intercom. Check the Intercom connection in /config → Intercom.",
     });
   } else if (teammates.length === 0) {
     embed.addFields({ name: "No teammates", value: "The Intercom workspace returned no teammates." });
@@ -191,7 +191,7 @@ export function buildIntercomAdminsPanel(
         }))
       );
     components.push(new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(select));
-    if (pages > 1) embed.setFooter({ text: `Teammates page ${clamped + 1}/${pages} — selection saves per page` });
+    if (pages > 1) embed.setFooter({ text: `Teammates page ${clamped + 1}/${pages}: selection saves per page` });
   }
 
   const nav = new ActionRowBuilder<ButtonBuilder>().addComponents(

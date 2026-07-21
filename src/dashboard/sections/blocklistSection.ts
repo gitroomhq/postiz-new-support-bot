@@ -66,7 +66,7 @@ export function makeBlocklistSection(deps: { blockService: BlockService }): Dash
             return { ok: false, fieldErrors: { value: "That doesn't look like a valid IPv4/IPv6 address." } };
           }
           if (kind !== "email" && kind !== "card_fingerprint" && kind !== "ip_address") {
-            return { ok: false, error: "Unknown kind — customers are blocked via the Block customer action." };
+            return { ok: false, error: "Unknown kind. Customers are blocked via the Block customer action." };
           }
           const results = await deps.blockService.block([{ kind: kind as BlockKind, value }], {
             reason,
@@ -78,10 +78,10 @@ export function makeBlocklistSection(deps: { blockService: BlockService }): Dash
             cancelSubs: false,
           });
           const r = results[0];
-          if (!r?.ok) return { ok: false, error: `Block failed — ${r?.error?.slice(0, 200) ?? "unknown error"}` };
-          await ctx.audit(`Blocked ${kind} ${value.slice(0, 60)}${r.alreadyBlocked ? " (was already blocked)" : ""} — ${reason.slice(0, 120)}`);
+          if (!r?.ok) return { ok: false, error: `Block failed: ${r?.error?.slice(0, 200) ?? "unknown error"}` };
+          await ctx.audit(`Blocked ${kind} ${value.slice(0, 60)}${r.alreadyBlocked ? " (was already blocked)" : ""}: ${reason.slice(0, 120)}`);
           exportBillingEvent({ event: "block" });
-          return { ok: true, text: `${BLOCK_KIND_LABELS[kind as BlockKind]} blocked${r.alreadyBlocked ? " (was already blocked — refreshed)" : ""}.` };
+          return { ok: true, text: `${BLOCK_KIND_LABELS[kind as BlockKind]} blocked${r.alreadyBlocked ? " (was already blocked, refreshed)" : ""}.` };
         }
 
         // T1 — remove an entry (also removes the Radar list item).
@@ -143,7 +143,7 @@ async function list(ctx: DashboardCtx, cursor: string | null): Promise<SectionPa
         { type: "text", key: "value", label: "Value" },
         { type: "text", key: "reason", label: "Reason (shown on panels + audit)", maxLength: 300 },
       ],
-      summary: "Adds the value to the matching Radar value list and the local blocklist. The payment IP is never exposed by Stripe's API — enter it from your own logs.",
+      summary: "Adds the value to the matching Radar value list and the local blocklist. The payment IP is never exposed by Stripe's API; enter it from your own logs.",
     },
   ];
 

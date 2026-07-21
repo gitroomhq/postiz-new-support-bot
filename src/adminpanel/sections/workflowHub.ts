@@ -52,7 +52,7 @@ export function makeWorkflowHub(deps: { tiers: EscalationTierStore }): HubModule
         ].filter(Boolean).join(" · ");
         return {
           id: t.id,
-          cells: [`${t.emoji} ${t.label}`, flags || "—"],
+          cells: [`${t.emoji} ${t.label}`, flags || "N/A"],
           rowActions: [
             { key: "tag_edit", label: "Edit", params: { id: t.id }, inputs: tagEditInputs(t) },
             { key: "tag_up", label: "↑", params: { id: t.id } },

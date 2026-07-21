@@ -28,7 +28,7 @@ export function makeAccessHub(deps: { listIntercomAdmins: () => Promise<Array<{ 
       try {
         adminOpts = (await deps.listIntercomAdmins()).map((a) => ({ value: a.id, label: a.name }));
       } catch {
-        note = "Teammate list unavailable — check the Intercom access token.";
+        note = "Teammate list unavailable. Check the Intercom access token.";
       }
       const admins: Section = {
         key: "admins",
@@ -51,7 +51,7 @@ export function makeAccessHub(deps: { listIntercomAdmins: () => Promise<Array<{ 
       for (const def of BILLING_ACTIONS) {
         let sec = groups.get(def.group);
         if (!sec) {
-          sec = { key: `actions_${def.group}`, title: `Action levels — ${def.group}`, fields: [] };
+          sec = { key: `actions_${def.group}`, title: `Action levels: ${def.group}`, fields: [] };
           groups.set(def.group, sec);
         }
         sec.fields.push({

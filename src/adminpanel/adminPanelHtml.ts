@@ -93,7 +93,7 @@ ${panelThemeCss()}
     <input type="text" id="reverseCode" autocomplete="off">
   </div>
   <div id="modalConfirm" hidden>
-    <label>This action is destructive — type CONFIRM to proceed</label>
+    <label>This action is destructive: type CONFIRM to proceed</label>
     <input type="text" id="confirmWord" autocomplete="off">
   </div>
   <div id="modalErr" class="error" hidden></div>
@@ -251,7 +251,7 @@ ${panelThemeCss()}
     } else if (f.type === "select" || f.type === "channel-select" || f.type === "role-select") {
       wrap.appendChild(labelFor(id, f.label));
       var sel = document.createElement("select"); sel.id = id; sel.disabled = !!f.disabled;
-      if (f.nullable) sel.appendChild(opt("", "— none —"));
+      if (f.nullable) sel.appendChild(opt("", "(none)"));
       (f.options || []).forEach(function (o) { sel.appendChild(opt(o.value, o.label)); });
       sel.value = f.value == null ? "" : f.value;
       sel.addEventListener("change", function () { saveField(state.hub, sec.key, f.key, sel.value === "" ? null : sel.value, wrap); });
@@ -369,7 +369,7 @@ ${panelThemeCss()}
     api("action", body).then(function (res) {
       var j = handle(res); if (!j) return;
       if (j.ok) { if (modal.open) modal.close(); flashOk(j.text || "Done."); if (j.view) { state.view = j.view; renderView(j.view); } else loadHub(state.hub); }
-      else if (j.needsReverse) { if (onErr) onErr("reverse"); else flashErr("This action needs the Discord reverse code — reopen it."); }
+      else if (j.needsReverse) { if (onErr) onErr("reverse"); else flashErr("This action needs the Discord reverse code. Reopen it."); }
       else { if (onErr) onErr(j.error || "Action failed."); else flashErr(j.error || "Action failed."); }
     });
   }
@@ -389,7 +389,7 @@ ${panelThemeCss()}
       var l = document.createElement("label"); l.textContent = inp.label; inputsEl.appendChild(l);
       if (inp.type === "select") {
         var sel = document.createElement("select"); sel.id = "mi_" + inp.key;
-        if (inp.nullable) sel.appendChild(opt("", "— none —"));
+        if (inp.nullable) sel.appendChild(opt("", "(none)"));
         (inp.options || []).forEach(function (o) { sel.appendChild(opt(o.value, o.label)); });
         sel.value = inp.value == null ? "" : inp.value;
         inputsEl.appendChild(sel);
@@ -438,10 +438,10 @@ ${panelThemeCss()}
   function opt(value, label) { var o = document.createElement("option"); o.value = value; o.textContent = label; return o; }
   function badge(b) { return el("span", "badge " + (b.kind || "info"), b.text); }
   function secretPlaceholder(stateStr) {
-    if (stateStr === "local") return "configured — leave blank to keep";
-    if (stateStr === "vault") return "configured (vault) — leave blank to keep";
+    if (stateStr === "local") return "configured: leave blank to keep";
+    if (stateStr === "vault") return "configured (vault): leave blank to keep";
     if (stateStr === "vault-unreachable") return "configured (vault unreachable)";
-    if (stateStr === "local-unreadable") return "configured (unreadable — re-enter)";
+    if (stateStr === "local-unreadable") return "configured (unreadable: re-enter)";
     return "not set";
   }
   function commitOnBlur(inp, fn) {

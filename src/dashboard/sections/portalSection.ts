@@ -43,7 +43,7 @@ export function makePortalSection(): DashboardSectionModule {
         blocks.push({
           type: "notice",
           badge: { kind: "info", text: "Not configured" },
-          text: "The customer portal has no configuration yet — create the default one to enable self-serve billing.",
+          text: "The customer portal has no configuration yet. Create the default one to enable self-serve billing.",
           actions: [
             {
               key: "section:portal.config_create",
@@ -140,7 +140,7 @@ export function makePortalSection(): DashboardSectionModule {
             f.payment_method_update?.enabled ? "PM update" : null,
             f.subscription_cancel?.enabled ? "cancel" : null,
           ].filter(Boolean);
-          await ctx.audit(`Portal configuration ${id} updated — ${summary.join(", ") || "all core features off"}`);
+          await ctx.audit(`Portal configuration ${id} updated: ${summary.join(", ") || "all core features off"}`);
           return { ok: true, text: `Portal configuration updated (${summary.join(", ") || "all core features off"}).` };
         }
         default:

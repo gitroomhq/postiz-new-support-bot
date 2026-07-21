@@ -421,7 +421,7 @@ D.renderTable = function (b) {
       merged.params = {}; for (var p in (a.params || {})) merged.params[p] = a.params[p];
       merged.params.ids = ids;
       merged.summary = ids.length + " row" + (ids.length === 1 ? "" : "s") + " selected" +
-        (totalStr ? " — total " + totalStr : "") + ". " + (a.summary || "");
+        (totalStr ? ", total " + totalStr : "") + ". " + (a.summary || "");
       var btn = D.actionBtn(merged); btn.classList.add("sm");
       bulkbar.appendChild(btn);
     });

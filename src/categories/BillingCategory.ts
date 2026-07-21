@@ -433,7 +433,7 @@ export class BillingCategory extends BaseCategory {
         `Your refund of **${amount}** has been processed${cancelFailed ? "" : " and your subscription has been cancelled"}.\n\n` +
         `Refund ID: \`${refund.refundId}\`\n\n` +
         (cancelFailed
-          ? `We couldn't cancel your subscription automatically — a support member will take care of it shortly.\n\n`
+          ? `We couldn't cancel your subscription automatically. A support member will take care of it shortly.\n\n`
           : "") +
         `It may take 5-10 business days to appear on your statement.`
       )
@@ -444,7 +444,7 @@ export class BillingCategory extends BaseCategory {
     await this.notifyBillingAudit(interaction, {
       action: "Refund",
       outcome: cancelFailed
-        ? "⚠️ Refund processed, but subscription cancellation FAILED — manual action needed"
+        ? "⚠️ Refund processed, but subscription cancellation FAILED: manual action needed"
         : cancelledSubscriptionId
           ? `Refund processed, subscription \`${cancelledSubscriptionId}\` cancelled`
           : "Refund processed, subscription cancelled",
@@ -573,7 +573,7 @@ export class BillingCategory extends BaseCategory {
     await interaction.editReply({
       embeds: [
         makeEmbed(
-          "Your refund request needs a manual review by our team — a support member will follow up here shortly.",
+          "Your refund request needs a manual review by our team. A support member will follow up here shortly.",
           COLORS.warn
         ),
       ],
@@ -608,7 +608,7 @@ export class BillingCategory extends BaseCategory {
           content: pingRoleId ? `<@&${pingRoleId}>` : undefined,
           embeds: [
             makeEmbed(
-              `Self-service refund blocked — manual review needed.\n\n**Reason:** ${reason}\n**Amount:** ${amountText}\n**Charge:** \`${chargeId}\`\n\nStaff: run \`/charge approve\` or \`/charge deny\` in this thread.`,
+              `Self-service refund blocked: manual review needed.\n\n**Reason:** ${reason}\n**Amount:** ${amountText}\n**Charge:** \`${chargeId}\`\n\nStaff: run \`/charge approve\` or \`/charge deny\` in this thread.`,
               COLORS.warn
             ),
           ],
@@ -619,7 +619,7 @@ export class BillingCategory extends BaseCategory {
 
     await this.notifyBillingAudit(interaction, {
       action: "Refund",
-      outcome: `Blocked — manual review. ${reason}`,
+      outcome: `Blocked: manual review. ${reason}`,
       amountText,
       chargeId,
       customerId: interaction.user.id,
@@ -642,7 +642,7 @@ export class BillingCategory extends BaseCategory {
           { name: "Customer", value: `<@${payload.customerId}>`, inline: true },
           { name: "Amount", value: payload.amountText, inline: true },
           { name: "Charge", value: `\`${payload.chargeId}\``, inline: true },
-          { name: "Ticket", value: thread ? `<#${thread.id}>` : "—", inline: true },
+          { name: "Ticket", value: thread ? `<#${thread.id}>` : "N/A", inline: true },
           { name: "Outcome", value: payload.outcome, inline: false }
         )
         .setTimestamp();
@@ -757,7 +757,7 @@ export class BillingCategory extends BaseCategory {
 
     if (charge.refunded) {
       await this.sessionStore.resolvePendingChargeReview(thread.id, "ALREADY_PROCESSED", member.id);
-      await interaction.editReply({ embeds: [makeEmbed("This charge has already been refunded on Stripe — nothing to do.", COLORS.warn)] });
+      await interaction.editReply({ embeds: [makeEmbed("This charge has already been refunded on Stripe. Nothing to do.", COLORS.warn)] });
       return;
     }
 
@@ -808,7 +808,7 @@ export class BillingCategory extends BaseCategory {
           .setDescription(
             `After manual review, your refund of **${amount}** has been approved and processed${cancelFailed ? "" : ", and your subscription has been cancelled"}.\n\n` +
               `Refund ID: \`${refund.refundId}\`\n\n` +
-              (cancelFailed ? "We couldn't cancel your subscription automatically — a support member will take care of it shortly.\n\n" : "") +
+              (cancelFailed ? "We couldn't cancel your subscription automatically. A support member will take care of it shortly.\n\n" : "") +
               `It may take 5-10 business days to appear on your statement.`
           )
           .setColor(0x57f287),
@@ -820,7 +820,7 @@ export class BillingCategory extends BaseCategory {
       action: "Refund (manual approval)",
       outcome: `Approved by ${member.displayName}${
         cancelFailed
-          ? " — ⚠️ subscription cancellation FAILED, manual action needed"
+          ? ": ⚠️ subscription cancellation FAILED, manual action needed"
           : cancelledSubscriptionId
             ? `, subscription \`${cancelledSubscriptionId}\` cancelled`
             : ", subscription cancelled"
@@ -876,7 +876,7 @@ export class BillingCategory extends BaseCategory {
 
     await this.notifyBillingAudit(interaction, {
       action: "Refund (manual review)",
-      outcome: `Denied by ${member.displayName}${reason ? ` — ${reason}` : ""}`,
+      outcome: `Denied by ${member.displayName}${reason ? `: ${reason}` : ""}`,
       amountText,
       chargeId: review.chargeId,
       customerId: review.customerId,

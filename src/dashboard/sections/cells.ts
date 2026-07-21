@@ -249,5 +249,5 @@ export function estimateMrr(subs: Stripe.Subscription[]): Map<string, number> {
 // Per-currency totals joined for display ("€152.00 + $10.00"), or an em dash.
 export function formatPerCurrency(fmt: AmountFormatter, byCurrency: Map<string, number>): string {
   const parts = [...byCurrency.entries()].filter(([, v]) => v !== 0).map(([cur, v]) => fmt.formatAmount(v, cur));
-  return parts.join(" + ") || "—";
+  return parts.join(" + ") || "N/A";
 }

@@ -67,7 +67,7 @@ function parseAddressInput(
   if (input === "-") return { ok: true, value: "" };
   const parts = input.split("|").map((s) => s.trim());
   const expected = shipping ? 7 : 6;
-  if (parts.length > expected) return { ok: false, error: `Too many segments — expected at most ${expected} '|'-separated parts.` };
+  if (parts.length > expected) return { ok: false, error: `Too many segments: expected at most ${expected} '|'-separated parts.` };
   while (parts.length < expected) parts.push("");
   const name = shipping ? parts.shift()! : null;
   if (shipping && !name) return { ok: false, error: "Shipping needs a recipient name as the first segment." };
@@ -107,7 +107,7 @@ function pmFingerprintCell(pm: Stripe.PaymentMethod): Cell {
   if (walletEmail) {
     return { t: "link", v: walletEmail, ref: { page: "payments", filters: { email: walletEmail } } };
   }
-  return WALLET_PM_TYPES.has(pm.type) ? text("—", "wallet-vaulted") : text("—");
+  return WALLET_PM_TYPES.has(pm.type) ? text("N/A", "wallet-vaulted") : text("N/A");
 }
 
 function actionActor(ctx: DashboardCtx): ActionActor {
@@ -196,7 +196,7 @@ async function customerAction(
       ...(name ? { name } : {}),
       ...(description ? { description } : {}),
     });
-    await ctx.audit(`Customer created — ${customer.id} (${email || name})`);
+    await ctx.audit(`Customer created: ${customer.id} (${email || name})`);
     return { ok: true, text: `Customer ${customer.id} created.` };
   }
 
@@ -212,7 +212,7 @@ async function customerAction(
       await ctx.audit(`SetupIntent ${si.id} created for ${customerId}`);
       return {
         ok: true,
-        text: `SetupIntent ${si.id} created (${si.status}). Confirm it via Stripe.js/Elements or the API — the client secret is not shown here.`,
+        text: `SetupIntent ${si.id} created (${si.status}). Confirm it via Stripe.js/Elements or the API; the client secret is not shown here.`,
       };
     }
 
@@ -231,9 +231,9 @@ async function customerAction(
       if (typeof updates.email === "string" && updates.email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(updates.email)) {
         return { ok: false, fieldErrors: { email: "That doesn't look like an email address." } };
       }
-      if (Object.keys(updates).length === 0) return { ok: false, error: "Nothing to change — fill at least one field ('-' clears)." };
+      if (Object.keys(updates).length === 0) return { ok: false, error: "Nothing to change: fill at least one field ('-' clears)." };
       await ctx.stripe.updateCustomer(customerId, updates);
-      await ctx.audit(`Customer ${customerId} updated — ${Object.keys(updates).join(", ")}`);
+      await ctx.audit(`Customer ${customerId} updated: ${Object.keys(updates).join(", ")}`);
       return { ok: true, text: "Customer updated." };
     }
 
@@ -267,12 +267,12 @@ async function customerAction(
         if (eq <= 0) return { ok: false, fieldErrors: { metadata: `"${trimmed.slice(0, 40)}" is not key=value.` } };
         const k = trimmed.slice(0, eq).trim();
         const v = trimmed.slice(eq + 1).trim();
-        if (!k || k.length > 40 || v.length > 500) return { ok: false, fieldErrors: { metadata: `"${k.slice(0, 40)}" — keys ≤40 chars, values ≤500.` } };
+        if (!k || k.length > 40 || v.length > 500) return { ok: false, fieldErrors: { metadata: `"${k.slice(0, 40)}": keys ≤40 chars, values ≤500.` } };
         metadata[k] = v;
       }
       if (Object.keys(metadata).length === 0) return { ok: false, error: "No key=value lines found." };
       await ctx.stripe.updateCustomer(customerId, { metadata });
-      await ctx.audit(`Customer ${customerId} metadata updated — ${Object.keys(metadata).length} key(s)`);
+      await ctx.audit(`Customer ${customerId} metadata updated: ${Object.keys(metadata).length} key(s)`);
       return { ok: true, text: `Metadata updated (${Object.keys(metadata).length} key(s)).` };
     }
 
@@ -375,7 +375,7 @@ async function customerAction(
       }
       await ctx.stripe.voidCreditGrant(grantId, `dash-credvoid-${grantId}`);
       await ctx.audit(`Credit grant ${grantId} VOIDED for ${customerId}`);
-      return { ok: true, text: `Credit grant ${grantId} voided — remaining credit is gone; already-applied credit stays.` };
+      return { ok: true, text: `Credit grant ${grantId} voided: remaining credit is gone; already-applied credit stays.` };
     }
 
     // T1 — link a Discord user to this Stripe customer.
@@ -385,7 +385,7 @@ async function customerAction(
       if (!/^\d{5,32}$/.test(discordId)) return { ok: false, fieldErrors: { discordUserId: "Discord user ids are 5-32 digits." } };
       const updated = await ctx.stores.session.updateStripeCustomerId(discordId, customerId);
       if (!updated) {
-        return { ok: false, error: "That Discord user has no session row yet — they need to interact with the bot once first." };
+        return { ok: false, error: "That Discord user has no session row yet; they need to interact with the bot once first." };
       }
       await ctx.audit(`Linked Discord ${discordId} ↔ ${customerId}`);
       return { ok: true, text: `Linked Discord user ${discordId} to ${customerId}.` };
@@ -406,7 +406,7 @@ async function customerAction(
       if (!ctx.reverse?.satisfied) return { ok: false, needsReverse: true };
       await ctx.stripe.deleteCustomer(customerId);
       const unlinked = await ctx.stores.session.unlinkStripeCustomerEverywhere(customerId);
-      await ctx.audit(`Customer ${customerId} DELETED in Stripe${unlinked ? ` — cleared the link on ${unlinked} Discord user session(s)` : ""}`);
+      await ctx.audit(`Customer ${customerId} DELETED in Stripe${unlinked ? `; cleared the link on ${unlinked} Discord user session(s)` : ""}`);
       return { ok: true, text: `Customer ${customerId} deleted in Stripe.${unlinked ? ` Cleared ${unlinked} Discord link(s).` : ""}` };
     }
 
@@ -430,7 +430,7 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
   let notice: string | undefined;
   if (q) {
     customers = await ctx.stripe.searchCustomersByTerm(q, PAGE_SIZE);
-    notice = "Search results (name/email fuzzy match) — may lag Stripe by ~1 minute.";
+    notice = "Search results (name/email fuzzy match). May lag Stripe by ~1 minute.";
   } else {
     const page = await ctx.stripe.listCustomersPage({
       limit: PAGE_SIZE,
@@ -503,10 +503,10 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
       id: c.id,
       ref: { page: "customers.detail", params: { id: c.id } },
       cells: [
-        strong(c.name ?? "—"),
-        text(c.email ?? "—"),
+        strong(c.name ?? "N/A"),
+        text(c.email ?? "N/A"),
         { t: "flags", badges: c.delinquent ? [{ kind: "warn", text: "Delinquent" }] : [] },
-        text(c.address?.country ?? "—"),
+        text(c.address?.country ?? "N/A"),
         dateCell(c.created),
         idCell(c.id, { copy: true }),
       ] as Cell[],
@@ -516,7 +516,7 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
     ...(n > 0 ? { footer: q ? `${n} result${n === 1 ? "" : "s"}` : `${n}${hasMore ? "+" : ""} item${n === 1 ? "" : "s"}` } : {}),
     notice:
       (notice ? `${notice} ` : "") +
-      (delinquentF || countryF || hasSubF ? "Delinquent/country/subscription filters slice the fetched page — page onward for more." : "") || undefined,
+      (delinquentF || countryF || hasSubF ? "Delinquent/country/subscription filters slice the fetched page; page onward for more." : "") || undefined,
   };
 
   const header: Block = {
@@ -599,7 +599,7 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
         label: "Create SetupIntent",
         params: { customerId: id },
         summary:
-          "Mints an off-session SetupIntent for saving a card via Stripe.js/Elements or the API. Only the seti_ id is shown — never the client secret.",
+          "Mints an off-session SetupIntent for saving a card via Stripe.js/Elements or the API. Only the seti_ id is shown, never the client secret.",
       },
       bookmarkButton("section:customers.bookmark", bookmarked, id, title),
     ],
@@ -612,7 +612,7 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
       type: "notice",
       badge: { kind: "error", text: "BLOCKED" },
       text:
-        `${b.kind} "${b.value}" — ${b.reason}` +
+        `${b.kind} "${b.value}" · ${b.reason}` +
         (b.actorName ? ` · added by ${b.actorName}` : "") +
         ` · ${b.createdAt.toISOString().slice(0, 10)}` +
         (blocks.length > 1 ? ` (+${blocks.length - 1} more entries)` : ""),
@@ -681,8 +681,8 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
     rows: [
       { label: "Customer ID", cell: idCell(customer.id, { copy: true }) },
       { label: "Customer since", cell: dateCell(customer.created) },
-      { label: "Billing email", cell: text(customer.email ?? "—") },
-      { label: "Currency", cell: text(customer.currency?.toUpperCase() ?? "—") },
+      { label: "Billing email", cell: text(customer.email ?? "N/A") },
+      { label: "Currency", cell: text(customer.currency?.toUpperCase() ?? "N/A") },
       ...(customer.delinquent ? [{ label: "Delinquent", cell: badgeCell("warn", "Yes") }] : []),
       ...(customer.tax_exempt && customer.tax_exempt !== "none"
         ? [{ label: "Tax exempt", cell: text(customer.tax_exempt) }]
@@ -692,7 +692,7 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
         : []),
       {
         label: "Default payment method",
-        cell: defaultPmObj ? paymentMethodCell(defaultPmObj) : defaultPm ? idCell(defaultPm, { copy: true }) : text("—"),
+        cell: defaultPmObj ? paymentMethodCell(defaultPmObj) : defaultPm ? idCell(defaultPm, { copy: true }) : text("N/A"),
       },
       ...(customer.discount
         ? [
@@ -717,9 +717,9 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
         label: "Edit details",
         params: { customerId: id },
         inputs: [
-          { type: "text", key: "name", label: `Name (now: ${customer.name ?? "—"}) — blank keeps, '-' clears` },
-          { type: "text", key: "email", label: `Email (now: ${customer.email ?? "—"})` },
-          { type: "text", key: "description", label: `Description (now: ${customer.description?.slice(0, 60) ?? "—"})` },
+          { type: "text", key: "name", label: `Name (now: ${customer.name ?? "N/A"}) · blank keeps, '-' clears` },
+          { type: "text", key: "email", label: `Email (now: ${customer.email ?? "N/A"})` },
+          { type: "text", key: "description", label: `Description (now: ${customer.description?.slice(0, 60) ?? "N/A"})` },
         ],
         summary: "Blank fields stay unchanged; a single '-' clears the field.",
       },
@@ -739,7 +739,7 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
               { value: "reverse", label: "Reverse charge" },
             ],
           },
-          { type: "text", key: "locale", label: `Preferred locale (now: ${customer.preferred_locales?.[0] ?? "—"}) — '-' clears` },
+          { type: "text", key: "locale", label: `Preferred locale (now: ${customer.preferred_locales?.[0] ?? "N/A"}) · '-' clears` },
         ],
       },
       {
@@ -747,7 +747,7 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
         label: "Metadata",
         params: { customerId: id },
         inputs: [
-          { type: "text", key: "metadata", label: "key=value per line — '-' alone clears ALL metadata", multiline: true, maxLength: 2000 },
+          { type: "text", key: "metadata", label: "key=value per line · '-' alone clears ALL metadata", multiline: true, maxLength: 2000 },
         ],
         summary: "Replaces the listed keys (other keys survive); '-' wipes everything.",
       },
@@ -758,7 +758,7 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
               label: "Remove discount",
               dangerous: true, // T1 param-aware (needsConfirmExtra) server-side
               params: { customerId: id, op: "remove" },
-              summary: "Removes the CUSTOMER-level discount — every future invoice bills full price.",
+              summary: "Removes the CUSTOMER-level discount; every future invoice bills full price.",
             }),
           ]
         : []),
@@ -809,7 +809,7 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
                   type: "select" as const,
                   key: "taxIdId",
                   label: "Tax ID",
-                  options: taxIds.slice(0, 25).map((t) => ({ value: t.id, label: `${t.type.replace(/_/g, " ")} — ${t.value}` })),
+                  options: taxIds.slice(0, 25).map((t) => ({ value: t.id, label: `${t.type.replace(/_/g, " ")} · ${t.value}` })),
                 },
               ],
               summary: "Removes the tax ID from future invoices (already-issued invoices keep it).",
@@ -826,8 +826,8 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
     type: "kv",
     title: "Addresses",
     rows: [
-      { label: "Billing", cell: text(billAddr ?? "—") },
-      { label: "Shipping", cell: text(shipAddr ?? "—", customer.shipping?.name ?? undefined) },
+      { label: "Billing", cell: text(billAddr ?? "N/A") },
+      { label: "Shipping", cell: text(shipAddr ?? "N/A", customer.shipping?.name ?? undefined) },
     ],
     actions: [
       {
@@ -838,7 +838,7 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
           {
             type: "text",
             key: "address",
-            label: "line1 | line2 | city | state | postal | country(2) — '-' clears",
+            label: "line1 | line2 | city | state | postal | country(2) · '-' clears",
             multiline: true,
             maxLength: 400,
           },
@@ -853,7 +853,7 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
           {
             type: "text",
             key: "address",
-            label: "name | line1 | line2 | city | state | postal | country(2) — '-' clears",
+            label: "name | line1 | line2 | city | state | postal | country(2) · '-' clears",
             multiline: true,
             maxLength: 400,
           },
@@ -904,7 +904,7 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
         cells: [
           avatarCell("subscription", plan, { sub: per }),
           { t: "flags", badges: statusBadges },
-          item?.current_period_end ? dateCell(item.current_period_end) : text("—"),
+          item?.current_period_end ? dateCell(item.current_period_end) : text("N/A"),
           idCell(sub.id, { copy: true }),
         ] as Cell[],
         // Update jumps into the change-plan flow; cancel keeps its full
@@ -925,7 +925,7 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
     empty: "No subscriptions.",
     ...(subs.length > 0
       ? {
-          footer: `${Math.min(subs.length, 25)} result${subs.length === 1 ? "" : "s"} — view all`,
+          footer: `${Math.min(subs.length, 25)} result${subs.length === 1 ? "" : "s"} · view all`,
           footerRef: { page: "subscriptions", filters: { customer: id } },
         }
       : {}),
@@ -949,7 +949,7 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
       ref: { page: "payments.detail", params: { id: charge.id } },
       cells: [
         amount(ctx.stripe, charge.amount, charge.currency, chargeBadge(charge)),
-        text(charge.description ?? pmIntentId(charge) ?? "—"),
+        text(charge.description ?? pmIntentId(charge) ?? "N/A"),
         dateCell(charge.created),
         idCell(charge.id, { copy: true }),
       ] as Cell[],
@@ -957,7 +957,7 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
     empty: "No payments.",
     ...(recentCharges.length > 0
       ? {
-          footer: `${recentCharges.length}${chargesPage.charges.length > 10 || chargesPage.hasMore ? "+" : ""} result${recentCharges.length === 1 ? "" : "s"} — view all`,
+          footer: `${recentCharges.length}${chargesPage.charges.length > 10 || chargesPage.hasMore ? "+" : ""} result${recentCharges.length === 1 ? "" : "s"} · view all`,
           footerRef: { page: "payments", filters: { customer: id } },
         }
       : {}),
@@ -979,8 +979,8 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
       id: pm.id,
       cells: [
         paymentMethodCell(pm),
-        pm.id === defaultPm ? badgeCell("info", "Default") : text("—"),
-        pm.type === "card" && pm.card ? text(`${pm.card.exp_month}/${pm.card.exp_year}`) : text("—"),
+        pm.id === defaultPm ? badgeCell("info", "Default") : text("N/A"),
+        pm.type === "card" && pm.card ? text(`${pm.card.exp_month}/${pm.card.exp_year}`) : text("N/A"),
         pmFingerprintCell(pm),
         idCell(pm.id, { copy: true }),
       ] as Cell[],
@@ -1014,7 +1014,7 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
           label: "Detach",
           dangerous: true,
           params: { customerId: id, paymentMethodId: pm.id, op: "detach" },
-          summary: "Removes the payment method from this customer (it cannot be re-attached — a new one must be saved).",
+          summary: "Removes the payment method from this customer (it cannot be re-attached; a new one must be saved).",
         }),
       ],
     })),
@@ -1047,7 +1047,7 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
     empty: "No invoices.",
     ...(invoices.invoices.length > 0
       ? {
-          footer: `${invoices.invoices.length}${invoices.hasMore ? "+" : ""} result${invoices.invoices.length === 1 ? "" : "s"} — view all`,
+          footer: `${invoices.invoices.length}${invoices.hasMore ? "+" : ""} result${invoices.invoices.length === 1 ? "" : "s"} · view all`,
           footerRef: { page: "invoices", filters: { customer: id } },
         }
       : {}),
@@ -1078,8 +1078,8 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
         cells: [
           g.amount.monetary
             ? amount(ctx.stripe, g.amount.monetary.value, g.amount.monetary.currency, grantBadge(g))
-            : text("—"),
-          text(g.name ?? "—"),
+            : text("N/A"),
+          text(g.name ?? "N/A"),
           text(g.category === "paid" ? "Paid" : "Promotional"),
           g.expires_at ? dateCell(g.expires_at) : text("Never"),
           idCell(g.id, { copy: true }),
@@ -1092,7 +1092,7 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
                   label: "Void",
                   dangerous: true,
                   params: { customerId: id, grantId: g.id },
-                  summary: "Zeroes the REMAINING credit on this grant — already-applied credit stays applied.",
+                  summary: "Zeroes the REMAINING credit on this grant; already-applied credit stays applied.",
                 },
               ]
             : [],
@@ -1124,7 +1124,7 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
         ] as Cell[],
       })),
       footer: `${balanceTxns.length} most recent`,
-      notice: "Customer credit ledger — negative = credit toward future invoices.",
+      notice: "Customer credit ledger: negative = credit toward future invoices.",
     });
   }
 
@@ -1149,8 +1149,8 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
             text: d.status.replace(/_/g, " "),
           }),
           text(d.reason),
-          d.disputeCreatedAt ? isoDateCell(d.disputeCreatedAt) : text("—"),
-          d.evidenceDueBy ? isoDateCell(d.evidenceDueBy) : text("—"),
+          d.disputeCreatedAt ? isoDateCell(d.disputeCreatedAt) : text("N/A"),
+          d.evidenceDueBy ? isoDateCell(d.evidenceDueBy) : text("N/A"),
         ] as Cell[],
       })),
       footer: `${disputes.length} result${disputes.length === 1 ? "" : "s"}`,
@@ -1202,8 +1202,8 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
             key: "mode",
             label: "Direction",
             options: [
-              { value: "credit", label: "Credit — customer owes less" },
-              { value: "debit", label: "Debit — customer owes more" },
+              { value: "credit", label: "Credit: customer owes less" },
+              { value: "debit", label: "Debit: customer owes more" },
             ],
           },
           { type: "number", key: "amountMajor", label: "Amount (major units, e.g. 10.00)", min: 0 },
@@ -1242,7 +1242,7 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
         dangerous: true,
         params: { customerId: id },
         inputs: [{ type: "text", key: "discordUserId", label: "Discord user id (digits)" }],
-        summary: "Points that Discord user's session at this Stripe customer — self-service billing then acts on it.",
+        summary: "Points that Discord user's session at this Stripe customer; self-service billing then acts on it.",
       },
       {
         key: "section:customers.unlink",
@@ -1259,7 +1259,7 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
         dangerous: true,
         reverseConfirm: true,
         params: { customerId: id },
-        summary: `Permanently deletes ${id} in Stripe — active subscriptions are canceled and this cannot be undone. Discord links are cleared afterwards. Needs the Discord reverse code (/billing → Show destructive-action code).`,
+        summary: `Permanently deletes ${id} in Stripe; active subscriptions are canceled and this cannot be undone. Discord links are cleared afterwards. Needs the Discord reverse code (/billing → Show destructive-action code).`,
       },
     ],
   });
@@ -1324,7 +1324,7 @@ function invoiceRowActions(ctx: DashboardCtx, invoice: Stripe.Invoice): ActionBu
         label: "Void",
         dangerous: true,
         params: { invoiceId, op: "void" },
-        summary: "Voids the invoice — it can no longer be paid.",
+        summary: "Voids the invoice; it can no longer be paid.",
       }),
     ];
   }
@@ -1351,7 +1351,7 @@ async function portalLinkPage(ctx: DashboardCtx, id: string): Promise<SectionPag
     blocks.push({
       type: "notice",
       badge: { kind: "error", text: "FAILED" },
-      text: "Stripe could not create a portal session — is the portal configured? (Operate → Customer portal.)",
+      text: "Stripe could not create a portal session. Is the portal configured? (Operate → Customer portal.)",
     });
   } else {
     await ctx.audit(`Portal login link minted for ${id}`);
@@ -1366,7 +1366,7 @@ async function portalLinkPage(ctx: DashboardCtx, id: string): Promise<SectionPag
     blocks.push({
       type: "notice",
       badge: { kind: "info", text: "Short-lived" },
-      text: "The link expires a few minutes after minting and is meant for ONE hand-off — send it to the customer, don't store it. Reload this page to mint a fresh one.",
+      text: "The link expires a few minutes after minting and is meant for ONE hand-off: send it to the customer, don't store it. Reload this page to mint a fresh one.",
     });
   }
   return {

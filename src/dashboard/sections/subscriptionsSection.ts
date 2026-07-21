@@ -220,10 +220,10 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
         avatarCell("subscription", plan.name, { sub: plan.per }),
         customer
           ? ({ t: "link", v: customer, ref: { page: "customers.detail", params: { id: customer } } } as Cell)
-          : text("—"),
+          : text("N/A"),
         { t: "flags", badges: flags } as Cell,
         dateCell(sub.created),
-        item?.current_period_end ? dateCell(item.current_period_end) : text("—"),
+        item?.current_period_end ? dateCell(item.current_period_end) : text("N/A"),
         idCell(sub.id, { copy: true }),
       ] as Cell[],
     };
@@ -294,8 +294,8 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
         empty: status || collection ? "No subscriptions match this filter (within this window)." : "No subscriptions yet.",
         ...(rows.length ? { footer: `${rows.length} item${rows.length === 1 ? "" : "s"}` } : {}),
         notice: scoped
-          ? `Customer/price/collection filters aren't searchable — chip counts cover this window only ("N+" on overflow).`
-          : `Chip counts are account totals (Paused counts this page's window); the table shows ${WINDOW} per page — use Next for older ones.`,
+          ? `Customer/price/collection filters aren't searchable; chip counts cover this window only ("N+" on overflow).`
+          : `Chip counts are account totals (Paused counts this page's window); the table shows ${WINDOW} per page. Use Next for older ones.`,
       },
     ],
   };
@@ -335,7 +335,7 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
   // would stay on its paid tier despite the Stripe cancellation.
   const cancelSyncWarning =
     syncStatus === "missing"
-      ? " ⚠ This subscription has NO Postiz sync metadata — the cancellation will NOT downgrade the Postiz org. Repair sync first."
+      ? " ⚠ This subscription has NO Postiz sync metadata; the cancellation will NOT downgrade the Postiz org. Repair sync first."
       : "";
   // Stripe titles subscription pages "Customer on Product".
   const customerName = customer && !customer.deleted ? customer.name ?? customer.email ?? customerId : customerId;
@@ -394,7 +394,7 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
         params: { subscriptionId: id, op: sub.pause_collection ? "resume" : "pause" },
         summary: sub.pause_collection
           ? "Invoices are collected normally again."
-          : "Invoices are voided while paused — the subscription stays active.",
+          : "Invoices are voided while paused; the subscription stays active.",
       })
     );
     actions.push(
@@ -427,7 +427,7 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
           dangerous: true, // T1 param-aware (needsConfirmExtra) server-side
           params: { subscriptionId: id, op: "remove" },
           summary:
-            "Removes the discount from this subscription — the next invoice bills full price. A customer-level discount (if any) is untouched.",
+            "Removes the discount from this subscription; the next invoice bills full price. A customer-level discount (if any) is untouched.",
         })
       );
     }
@@ -440,7 +440,7 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
           dangerous: true,
           stepUp: true,
           params: { subscriptionId: id, endTrialNow: true },
-          summary: "Ends the trial IMMEDIATELY — the first invoice is generated and charged now. Requires a fresh factor.",
+          summary: "Ends the trial IMMEDIATELY; the first invoice is generated and charged now. Requires a fresh factor.",
         })
       );
     }
@@ -474,11 +474,11 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
       badge: { kind: syncStatus === "mismatch" ? "error" : "warn", text: syncStatus === "mismatch" ? "POSTIZ MISMATCH" : "NO POSTIZ SYNC" },
       text:
         (syncStatus === "mismatch"
-          ? `The Postiz metadata (${postizMeta.billing ?? "?"}/${postizMeta.period ?? "?"}) does not match what this subscription's price charges — the customer pays one amount but the platform grants another tier's limits.`
-          : "This subscription carries no Postiz sync metadata — the platform ignores every event for it: it never syncs, and cancelling it will NOT downgrade the Postiz org.") +
+          ? `The Postiz metadata (${postizMeta.billing ?? "?"}/${postizMeta.period ?? "?"}) does not match what this subscription's price charges: the customer pays one amount but the platform grants another tier's limits.`
+          : "This subscription carries no Postiz sync metadata; the platform ignores every event for it: it never syncs, and cancelling it will NOT downgrade the Postiz org.") +
         (repairable
           ? " Repair stamps service/billing/period/uniqueId (tier derived from the price) and re-syncs the platform via the update event."
-          : " Its price is not a canonical Postiz price, so the tier cannot be derived — move it to a canonical price (Update subscription) before it can sync."),
+          : " Its price is not a canonical Postiz price, so the tier cannot be derived; move it to a canonical price (Update subscription) before it can sync."),
       actions: repairable
         ? [
             registryButton(ctx, {
@@ -506,7 +506,7 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
           ? ctx.stripe.formatAmount(upcoming.amount_due, upcoming.currency)
           : item?.current_period_end
             ? new Date(item.current_period_end * 1000).toISOString().slice(0, 10)
-            : "—",
+            : "N/A",
         sub: upcoming?.next_payment_attempt
           ? `on ${new Date(upcoming.next_payment_attempt * 1000).toISOString().slice(0, 10)}`
           : item?.current_period_end
@@ -519,7 +519,7 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
           ? new Date(sub.cancel_at * 1000).toISOString().slice(0, 10)
           : sub.cancel_at_period_end && item?.current_period_end
             ? new Date(item.current_period_end * 1000).toISOString().slice(0, 10)
-            : "—",
+            : "N/A",
       },
       ...(sub.trial_end && sub.trial_end * 1000 > Date.now()
         ? [{ label: "Trial ends", value: new Date(sub.trial_end * 1000).toISOString().slice(0, 10) }]
@@ -549,9 +549,9 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
         cells: [
           avatarCell("subscription", name),
           text(String(qty)),
-          p?.unit_amount != null ? money(ctx.stripe, p.unit_amount, p.currency) : text("—"),
-          p?.unit_amount != null ? money(ctx.stripe, p.unit_amount * qty, p.currency) : text("—"),
-          text(p?.recurring ? `every ${p.recurring.interval_count ?? 1} ${p.recurring.interval}` : "—"),
+          p?.unit_amount != null ? money(ctx.stripe, p.unit_amount, p.currency) : text("N/A"),
+          p?.unit_amount != null ? money(ctx.stripe, p.unit_amount * qty, p.currency) : text("N/A"),
+          text(p?.recurring ? `every ${p.recurring.interval_count ?? 1} ${p.recurring.interval}` : "N/A"),
           idCell(it.id, { copy: true }),
         ] as Cell[],
       };
@@ -619,7 +619,7 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
         upcoming.next_payment_attempt
           ? `Collects ${new Date(upcoming.next_payment_attempt * 1000).toISOString().slice(0, 10)}. `
           : ""
-      }Preview — amounts can still change.`,
+      }Preview: amounts can still change.`,
     });
   }
 
@@ -644,7 +644,7 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
           syncStatus === "synced" ? `Synced · ${postizMeta.billing}/${postizMeta.period}` : syncBadge(syncStatus).text
         ),
       },
-      { label: "Payment method", cell: pmCell ?? text("—") },
+      { label: "Payment method", cell: pmCell ?? text("N/A") },
       ...(sub.discounts?.length
         ? [
             {
@@ -703,7 +703,7 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
       rows: [
         {
           label: "Test clock",
-          cell: clockId ? idCell(clockId, { copy: true }) : text("none — clocks attach at customer creation"),
+          cell: clockId ? idCell(clockId, { copy: true }) : text("none (clocks attach at customer creation)"),
         },
       ],
       ...(clockId
@@ -715,7 +715,7 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
                 inputs: [{ type: "number", key: "days", label: "Advance by days (1–365)", min: 1, max: 365 }],
                 params: { id: sub.id },
                 summary:
-                  "Advances the customer's test clock — Stripe replays renewals, invoices and dunning up to the new time. Test mode only.",
+                  "Advances the customer's test clock; Stripe replays renewals, invoices and dunning up to the new time. Test mode only.",
               },
             ],
           }
@@ -748,7 +748,7 @@ async function updatePage(ctx: DashboardCtx, id: string, filters: Record<string,
   const sub = await ctx.stripe.getSubscription(id).catch(() => null);
   if (!sub) return notFound("This subscription does not exist.");
   if (sub.status !== "active" && sub.status !== "trialing") {
-    return notFound(`Subscription is ${sub.status} — only active/trialing subscriptions can be updated.`);
+    return notFound(`Subscription is ${sub.status}; only active/trialing subscriptions can be updated.`);
   }
   const customerId = typeof sub.customer === "string" ? sub.customer : sub.customer?.id ?? null;
   const itemFilter = ITEM_RE.test(filters.item ?? "") ? filters.item : "";
@@ -854,15 +854,15 @@ async function updatePage(ctx: DashboardCtx, id: string, filters: Record<string,
             : p.id === effectiveTarget
               ? badgeCell("info", "Selected")
               : text(""),
-          p.unit_amount != null ? money(ctx.stripe, p.unit_amount, p.currency) : text("—"),
-          text(p.recurring ? `every ${p.recurring.interval_count ?? 1} ${p.recurring.interval}` : "—"),
+          p.unit_amount != null ? money(ctx.stripe, p.unit_amount, p.currency) : text("N/A"),
+          text(p.recurring ? `every ${p.recurring.interval_count ?? 1} ${p.recurring.interval}` : "N/A"),
           idCell(p.id, { copy: true }),
         ] as Cell[],
       })),
       empty: allowlist.length
         ? "No prices on the plan allowlist (/config → Billing)."
         : "No recurring prices found.",
-      notice: "Pick a price and/or set quantity, promo or cycle — then confirm below the proration preview.",
+      notice: "Pick a price and/or set quantity, promo or cycle, then confirm below the proration preview.",
     },
   ];
 
@@ -898,20 +898,20 @@ async function updatePage(ctx: DashboardCtx, id: string, filters: Record<string,
         blocks.push({
           type: "notice",
           badge: { kind: "error", text: "NOT SYNCABLE" },
-          text: "This subscription syncs to Postiz — the target price must be a canonical Postiz price ($29/$278, $39/$374, $49/$470, $99/$950 USD) or the platform would desync from what the customer pays. Use a promo for discounts.",
+          text: "This subscription syncs to Postiz: the target price must be a canonical Postiz price ($29/$278, $39/$374, $49/$470, $99/$950 USD) or the platform would desync from what the customer pays. Use a promo for discounts.",
         });
       } else if (gitroom && qtyChanged && quantity != null && quantity > 1) {
         blocks.push({
           type: "notice",
           badge: { kind: "warn", text: "QUANTITY" },
-          text: `Quantity ×${quantity} on a Postiz-synced subscription: tiers don't multiply — the customer pays ${quantity}× for the same tier limits.`,
+          text: `Quantity ×${quantity} on a Postiz-synced subscription: tiers don't multiply; the customer pays ${quantity}× for the same tier limits.`,
         });
       }
       const currentTier = readPostizMeta(sub.metadata).billing;
       const changeBits = [
         priceChanged ? `price → ${effectiveTarget}` : null,
         qtyChanged ? `quantity → ${quantity}` : null,
-        promo ? `promo ${promo} (applied at execution — not in the preview)` : null,
+        promo ? `promo ${promo} (applied at execution, not in the preview)` : null,
         cycle === "now" ? "billing cycle resets to now" : null,
         gitroom && postizPlan && priceChanged
           ? `Postiz sync ${currentTier ?? "?"} → ${postizPlan.tier}/${postizPlan.period} (uniqueId preserved)`
@@ -929,7 +929,7 @@ async function updatePage(ctx: DashboardCtx, id: string, filters: Record<string,
           id: line.id ?? String(i),
           cells: [text(line.description ?? "line"), money(ctx.stripe, line.amount, line.currency)] as Cell[],
         })),
-        notice: `Next invoice would be ${ctx.stripe.formatAmount(preview.amount_due, preview.currency)}. Estimate — the committed prorations are computed at execution time.`,
+        notice: `Next invoice would be ${ctx.stripe.formatAmount(preview.amount_due, preview.currency)}. Estimate: the committed prorations are computed at execution time.`,
       });
       if (!postizBlocked) {
         const confirmParams: Record<string, unknown> = { subscriptionId: id, priceId: effectiveTarget };
@@ -948,7 +948,7 @@ async function updatePage(ctx: DashboardCtx, id: string, filters: Record<string,
               style: "primary",
               dangerous: true,
               params: confirmParams,
-              summary: `Apply ${changeBits.join(", ")} with create_prorations — you reviewed the preview above.`,
+              summary: `Apply ${changeBits.join(", ")} with create_prorations; you reviewed the preview above.`,
             }),
           ],
         });
@@ -958,7 +958,7 @@ async function updatePage(ctx: DashboardCtx, id: string, filters: Record<string,
     blocks.push({
       type: "notice",
       badge: { kind: "info", text: "NO CHANGE" },
-      text: "That is already the current price — set a different price, quantity, promo or cycle reset.",
+      text: "That is already the current price; set a different price, quantity, promo or cycle reset.",
     });
   }
 
@@ -1017,7 +1017,7 @@ async function addItemMode(
           {
             type: "notice",
             badge: { kind: "warn", text: "POSTIZ" },
-            text: "This subscription syncs to Postiz, which reads its tier from metadata on the FIRST item's price — extra items bill the customer without granting anything on the platform.",
+            text: "This subscription syncs to Postiz, which reads its tier from metadata on the FIRST item's price: extra items bill the customer without granting anything on the platform.",
           } as Block,
         ]
       : []),
@@ -1042,12 +1042,12 @@ async function addItemMode(
         cells: [
           avatarCell("subscription", p.nickname ?? p.id),
           p.id === targetPrice ? badgeCell("info", "Selected") : text(""),
-          p.unit_amount != null ? money(ctx.stripe, p.unit_amount, p.currency) : text("—"),
-          text(p.recurring ? `every ${p.recurring.interval_count ?? 1} ${p.recurring.interval}` : "—"),
+          p.unit_amount != null ? money(ctx.stripe, p.unit_amount, p.currency) : text("N/A"),
+          text(p.recurring ? `every ${p.recurring.interval_count ?? 1} ${p.recurring.interval}` : "N/A"),
           idCell(p.id, { copy: true }),
         ] as Cell[],
       })),
-      empty: "No addable prices — every allowlisted recurring price is already on this subscription.",
+      empty: "No addable prices: every allowlisted recurring price is already on this subscription.",
       notice: "Prices already on the subscription are hidden. Pick one to preview the proration, then confirm.",
     },
   ];
@@ -1080,7 +1080,7 @@ async function addItemMode(
           id: line.id ?? String(i),
           cells: [text(line.description ?? "line"), money(ctx.stripe, line.amount, line.currency)] as Cell[],
         })),
-        notice: `Next invoice would be ${ctx.stripe.formatAmount(preview.amount_due, preview.currency)}. Estimate — computed again at execution time.`,
+        notice: `Next invoice would be ${ctx.stripe.formatAmount(preview.amount_due, preview.currency)}. Estimate: computed again at execution time.`,
       });
       blocks.push({
         type: "notice",
@@ -1093,7 +1093,7 @@ async function addItemMode(
             style: "primary",
             dangerous: true,
             params: { subscriptionId: id, op: "add", priceId: targetPrice, ...(quantity ? { quantity } : {}) },
-            summary: `Adds ${targetPrice}${quantity ? ` ×${quantity}` : ""} with create_prorations — you reviewed the preview above.`,
+            summary: `Adds ${targetPrice}${quantity ? ` ×${quantity}` : ""} with create_prorations; you reviewed the preview above.`,
           }),
         ],
       });
@@ -1150,7 +1150,7 @@ async function removeItemMode(
             avatarCell("subscription", name),
             it.id === itemSel ? badgeCell("error", "Removing") : text(""),
             text(String(qty)),
-            p?.unit_amount != null ? money(ctx.stripe, p.unit_amount * qty, p.currency) : text("—"),
+            p?.unit_amount != null ? money(ctx.stripe, p.unit_amount * qty, p.currency) : text("N/A"),
             idCell(it.id, { copy: true }),
           ] as Cell[],
         };
@@ -1158,7 +1158,7 @@ async function removeItemMode(
       empty: "No items.",
       notice: removable
         ? "Click an item to preview the removal proration, then confirm below."
-        : "This subscription has a single item — the last item cannot be removed (cancel the subscription instead).",
+        : "This subscription has a single item; the last item cannot be removed (cancel the subscription instead).",
     },
   ];
 
@@ -1190,7 +1190,7 @@ async function removeItemMode(
           id: line.id ?? String(i),
           cells: [text(line.description ?? "line"), money(ctx.stripe, line.amount, line.currency)] as Cell[],
         })),
-        notice: `Next invoice would be ${ctx.stripe.formatAmount(preview.amount_due, preview.currency)}. Estimate — computed again at execution time.`,
+        notice: `Next invoice would be ${ctx.stripe.formatAmount(preview.amount_due, preview.currency)}. Estimate: computed again at execution time.`,
       });
       blocks.push({
         type: "notice",
@@ -1203,7 +1203,7 @@ async function removeItemMode(
             style: "danger",
             dangerous: true,
             params: { subscriptionId: id, op: "remove", itemId: selected.id },
-            summary: `Removes ${selected.id} with create_prorations — you reviewed the preview above.`,
+            summary: `Removes ${selected.id} with create_prorations; you reviewed the preview above.`,
           }),
         ],
       });
@@ -1260,7 +1260,7 @@ async function composer(ctx: DashboardCtx, filters: Record<string, string>): Pro
     {
       type: "header",
       title: "Create subscription",
-      sub: "Pick a customer and a price — the first-invoice preview is the mandatory review step.",
+      sub: "Pick a customer and a price; the first-invoice preview is the mandatory review step.",
     },
   ];
 
@@ -1287,7 +1287,7 @@ async function composer(ctx: DashboardCtx, filters: Record<string, string>): Pro
             label: "Default payment method",
             cell: pm
               ? paymentMethodCell(pm)
-              : text(pmId ?? "none", pmId ? undefined : "charge-now needs a card — use invoice or a trial"),
+              : text(pmId ?? "none", pmId ? undefined : "charge-now needs a card; use invoice or a trial"),
           },
         ],
       });
@@ -1337,8 +1337,8 @@ async function composer(ctx: DashboardCtx, filters: Record<string, string>): Pro
       cells: [
         avatarCell("subscription", p.nickname ?? p.id),
         p.id === targetPrice ? badgeCell("info", "Selected") : text(""),
-        p.unit_amount != null ? money(ctx.stripe, p.unit_amount, p.currency) : text("—"),
-        text(p.recurring ? `every ${p.recurring.interval_count ?? 1} ${p.recurring.interval}` : "—"),
+        p.unit_amount != null ? money(ctx.stripe, p.unit_amount, p.currency) : text("N/A"),
+        text(p.recurring ? `every ${p.recurring.interval_count ?? 1} ${p.recurring.interval}` : "N/A"),
         idCell(p.id, { copy: true }),
       ] as Cell[],
     })),
@@ -1378,17 +1378,17 @@ async function composer(ctx: DashboardCtx, filters: Record<string, string>): Pro
         blocks.push({
           type: "notice",
           badge: { kind: "warn", text: "NO POSTIZ SYNC" },
-          text: "This subscription will NOT sync to the Postiz platform — no org gets a plan from it. Use only for genuinely non-Postiz billing.",
+          text: "This subscription will NOT sync to the Postiz platform; no org gets a plan from it. Use only for genuinely non-Postiz billing.",
         });
       } else if (postizPlan) {
         // Sync working as intended is background QoS — no notice. Only real
         // caveats surface; the REVIEWED line below still names the tier.
         const caveats = [
           quantity && quantity > 1
-            ? `Quantity ×${quantity}: Postiz tiers don't multiply — the customer pays ${quantity}× for the same ${postizPlan.tier} limits.`
+            ? `Quantity ×${quantity}: Postiz tiers don't multiply; the customer pays ${quantity}× for the same ${postizPlan.tier} limits.`
             : "",
           trialDays
-            ? "If the Postiz org still has its trial available (allowTrial) and no card is attached, the trial won't sync — the bot cannot check that field."
+            ? "If the Postiz org still has its trial available (allowTrial) and no card is attached, the trial won't sync (the bot cannot check that field)."
             : "",
         ].filter(Boolean);
         if (caveats.length) {
@@ -1402,13 +1402,13 @@ async function composer(ctx: DashboardCtx, filters: Record<string, string>): Pro
         blocks.push({
           type: "notice",
           badge: { kind: "error", text: "NOT SYNCABLE" },
-          text: "This price is not a canonical Postiz price ($29/$278, $39/$374, $49/$470, $99/$950 USD) — the tier cannot be derived. Pick a canonical price, use a promo for discounts, or set Postiz sync to No sync.",
+          text: "This price is not a canonical Postiz price ($29/$278, $39/$374, $49/$470, $99/$950 USD); the tier cannot be derived. Pick a canonical price, use a promo for discounts, or set Postiz sync to No sync.",
         });
       }
       const bits = [
         `${targetPrice}${quantity ? ` ×${quantity}` : ""}`,
         trialDays ? `${trialDays}-day trial` : null,
-        promo ? `promo ${promo} (applied at creation — not in the preview)` : null,
+        promo ? `promo ${promo} (applied at creation, not in the preview)` : null,
         collection === "invoice" ? "collected by emailed invoice" : "charges the default payment method",
         postizOff ? "no Postiz sync" : postizPlan ? `Postiz sync ${postizPlan.tier}/${postizPlan.period}` : null,
       ].filter(Boolean);
@@ -1424,7 +1424,7 @@ async function composer(ctx: DashboardCtx, filters: Record<string, string>): Pro
           id: line.id ?? String(i),
           cells: [text(line.description ?? "line"), money(ctx.stripe, line.amount, line.currency)] as Cell[],
         })),
-        notice: `First invoice would be ${ctx.stripe.formatAmount(preview.amount_due, preview.currency)}. Estimate — computed again at creation time.`,
+        notice: `First invoice would be ${ctx.stripe.formatAmount(preview.amount_due, preview.currency)}. Estimate: computed again at creation time.`,
       });
       if (!postizBlocked) {
         blocks.push({
@@ -1447,7 +1447,7 @@ async function composer(ctx: DashboardCtx, filters: Record<string, string>): Pro
                 collection,
                 postizSync: !postizOff,
               },
-              summary: `Creates the subscription now — ${collection === "charge" ? "the default payment method is charged immediately (unless trialing)" : "an invoice is emailed, due in 7 days"}${postizOff ? ", WITHOUT Postiz sync" : ""}. You reviewed the preview above.`,
+              summary: `Creates the subscription now: ${collection === "charge" ? "the default payment method is charged immediately (unless trialing)" : "an invoice is emailed, due in 7 days"}${postizOff ? ", WITHOUT Postiz sync" : ""}. You reviewed the preview above.`,
             }),
           ],
         });
@@ -1640,7 +1640,7 @@ async function schedulePage(ctx: DashboardCtx, id: string, filters: Record<strin
               label: "Release schedule",
               dangerous: true,
               params: { subscriptionId: id, op: "release" },
-              summary: "Removes the schedule — the subscription continues on its CURRENT terms; future phases are discarded.",
+              summary: "Removes the schedule: the subscription continues on its CURRENT terms; future phases are discarded.",
             }),
             registryButton(ctx, {
               key: "subscription.schedule",
@@ -1742,7 +1742,7 @@ async function schedulePage(ctx: DashboardCtx, id: string, filters: Record<strin
         ],
       };
     }),
-    empty: "No composed phases yet — add prices from the picker below.",
+    empty: "No composed phases yet; add prices from the picker below.",
     ...(dropped ? { notice: `${dropped} invalid phase token(s) were dropped.` } : {}),
   });
 
@@ -1755,7 +1755,7 @@ async function schedulePage(ctx: DashboardCtx, id: string, filters: Record<strin
     for (const [i, ph] of phases.entries()) {
       const price = priceById.get(ph.priceId);
       timeline.push({
-        label: `Phase ${i + 1} starts — ${price?.nickname ?? ph.priceId}${ph.trial ? " (trial)" : ""}`,
+        label: `Phase ${i + 1} starts: ${price?.nickname ?? ph.priceId}${ph.trial ? " (trial)" : ""}`,
         iso: new Date(cursor).toISOString(),
         kind: "info",
       });
@@ -1774,7 +1774,7 @@ async function schedulePage(ctx: DashboardCtx, id: string, filters: Record<strin
     blocks.push({
       type: "notice",
       badge: { kind: "error", text: "NOT SYNCABLE" },
-      text: `This subscription syncs to Postiz — ${postizBlockedPhases.length} composed phase(s) use a non-canonical price, so the platform would strand on a stale tier at that boundary. Every phase must use a canonical Postiz price ($29/$278, $39/$374, $49/$470, $99/$950 USD).`,
+      text: `This subscription syncs to Postiz: ${postizBlockedPhases.length} composed phase(s) use a non-canonical price, so the platform would strand on a stale tier at that boundary. Every phase must use a canonical Postiz price ($29/$278, $39/$374, $49/$470, $99/$950 USD).`,
     });
   }
   if (editable && phases.length > 0 && postizBlockedPhases.length === 0) {
@@ -1856,7 +1856,7 @@ async function schedulePage(ctx: DashboardCtx, id: string, filters: Record<strin
         kind: "select",
         value: endBehavior === "cancel" ? "cancel" : undefined,
         options: [
-          { value: "", label: "Release — continue on last phase" },
+          { value: "", label: "Release: continue on last phase" },
           { value: "cancel", label: "Cancel the subscription" },
         ],
       },
@@ -1865,8 +1865,8 @@ async function schedulePage(ctx: DashboardCtx, id: string, filters: Record<strin
       id: p.id,
       cells: [
         strong(p.nickname ?? p.id, p.id),
-        p.unit_amount != null ? money(ctx.stripe, p.unit_amount, p.currency) : text("—"),
-        text(p.recurring ? `every ${p.recurring.interval_count ?? 1} ${p.recurring.interval}` : "—"),
+        p.unit_amount != null ? money(ctx.stripe, p.unit_amount, p.currency) : text("N/A"),
+        text(p.recurring ? `every ${p.recurring.interval_count ?? 1} ${p.recurring.interval}` : "N/A"),
       ] as Cell[],
       actions:
         phases.length >= SCHEDULE_MAX || !editable
@@ -1889,7 +1889,7 @@ async function schedulePage(ctx: DashboardCtx, id: string, filters: Record<strin
     notice:
       phases.length >= SCHEDULE_MAX
         ? `Phase cap reached (${SCHEDULE_MAX}).`
-        : "One price per phase — multi-item changes live in Update subscription. Qty/Duration/Trial apply to the next Add.",
+        : "One price per phase; multi-item changes live in Update subscription. Qty/Duration/Trial apply to the next Add.",
   });
 
   return {

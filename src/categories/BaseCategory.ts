@@ -130,7 +130,7 @@ export abstract class BaseCategory {
       });
       const ephemeralEmbed = thread
         ? makeEmbed(
-            `Your support thread ${thread} was created, but something went wrong — a support member will help you there shortly.`,
+            `Your support thread ${thread} was created, but something went wrong. A support member will help you there shortly.`,
             COLORS.warn
           )
         : makeEmbed("Something went wrong while processing your request. Please try again later.", COLORS.danger);

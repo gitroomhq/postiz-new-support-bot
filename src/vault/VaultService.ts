@@ -238,7 +238,7 @@ export class VaultService {
         void this.audit.log({
           title: "🔐 Vault recovered",
           severity: "success",
-          description: "Vault is reachable again — cached secrets refreshed and fallback-written secrets are being upgraded.",
+          description: "Vault is reachable again. Cached secrets refreshed and fallback-written secrets are being upgraded.",
           fields: outageMs != null ? [{ name: "Outage", value: formatDurationMs(outageMs), inline: true }] : [],
         });
       }
@@ -283,7 +283,7 @@ export class VaultService {
       scope.setFingerprint([next === "denied" ? "vault-denied" : "vault-down"]);
       scope.setContext("vault", { what, error: msg, state: next });
       Sentry.captureMessage(
-        next === "denied" ? "Vault token rejected (403)" : "Vault unreachable — serving cached secrets",
+        next === "denied" ? "Vault token rejected (403)" : "Vault unreachable: serving cached secrets",
         "warning"
       );
     });
@@ -296,7 +296,7 @@ export class VaultService {
         severity: "warn",
         description:
           next === "denied"
-            ? "Vault answered 403 — the token was revoked or its policy changed. Check /config → Vault. Cached secrets keep working; new secret writes fall back to local encryption."
+            ? "Vault answered 403. The token was revoked or its policy changed. Check /config → Vault. Cached secrets keep working; new secret writes fall back to local encryption."
             : "Serving secrets from the in-memory cache until Vault recovers. New secret writes fall back to local encryption and are upgraded automatically.",
         fields: [{ name: "Failure", value: msg.slice(0, 1024), inline: false }],
       });

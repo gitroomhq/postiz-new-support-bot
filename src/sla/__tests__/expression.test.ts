@@ -13,7 +13,7 @@ const ctx: ParseContext = {
 
 function parseOk(text: string): SlaCondition[] {
   const res = parseExpression(text, ctx);
-  assert.equal(res.ok, true, `expected ok parse for: ${text} — ${JSON.stringify(res)}`);
+  assert.equal(res.ok, true, `expected ok parse for: ${text} (${JSON.stringify(res)})`);
   return (res as { ok: true; conditions: SlaCondition[] }).conditions;
 }
 
@@ -148,7 +148,7 @@ test("serialize ⇄ parse round-trip for every dimension", () => {
   ];
   const text = serializeExpression(conditions, ctx);
   const back = parseExpression(text, ctx);
-  assert.equal(back.ok, true, `round-trip parse failed: ${text} — ${JSON.stringify(back)}`);
+  assert.equal(back.ok, true, `round-trip parse failed: ${text} (${JSON.stringify(back)})`);
   assert.deepEqual((back as { ok: true; conditions: SlaCondition[] }).conditions, conditions);
 });
 

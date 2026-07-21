@@ -384,7 +384,7 @@ export class BillingAdmin {
     if (!interaction.customId.startsWith("billadmin_")) return;
     await interaction
       .reply({
-        embeds: [makeEmbed("This button is from an older version of the panel — run /billing again.", COLORS.warn)],
+        embeds: [makeEmbed("This button is from an older version of the panel. Run /billing again.", COLORS.warn)],
         flags: 64,
       })
       .catch(() => undefined);

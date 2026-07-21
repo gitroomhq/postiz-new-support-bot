@@ -169,13 +169,13 @@ export class CardsHub {
         new ActionRowBuilder<TextInputBuilder>().addComponents(
           textInput("brand", "Brand filter (optional)", {
             required: false,
-            placeholder: "visa / mastercard / amex — narrows results",
+            placeholder: "visa / mastercard / amex, narrows results",
           })
         ),
         new ActionRowBuilder<TextInputBuilder>().addComponents(
           textInput("status", "Status filter (optional)", {
             required: false,
-            placeholder: "failed / succeeded / pending — blank = all",
+            placeholder: "failed / succeeded / pending, blank = all",
             maxLength: 9,
           })
         )
@@ -193,7 +193,7 @@ export class CardsHub {
         new ActionRowBuilder<TextInputBuilder>().addComponents(
           textInput("currency", "Currency (optional, e.g. eur)", {
             required: false,
-            placeholder: "eur — narrows results",
+            placeholder: "eur, narrows results",
             maxLength: 3,
           })
         )
@@ -251,7 +251,7 @@ export class CardsHub {
             makeEmbed(
               `No payment attempts found for **${label}** (this includes declined ones).\n\n` +
                 "If the customer is sure of the amount, it may be on a **different Stripe account** or a " +
-                "different currency — try leaving the currency blank, or search by name instead.",
+                "different currency: try leaving the currency blank, or search by name instead.",
               COLORS.neutral
             ),
           ],
@@ -287,12 +287,12 @@ export class CardsHub {
     });
 
     const embed = new EmbedBuilder()
-      .setTitle(`Payment attempts — ${label}`)
+      .setTitle(`Payment attempts · ${label}`)
       .setColor(COLORS.brand)
       .setDescription(lines.join("\n\n").slice(0, 4096))
       .setFooter({
         text:
-          `${pis.length} attempt(s)${nextPage ? " — more exist" : ""} · ⛔ = declined/incomplete · ` +
+          `${pis.length} attempt(s)${nextPage ? " · more exist" : ""} · ⛔ = declined/incomplete · ` +
           "pick a customer to open their overview · Search data can lag ~1 min",
       });
 
@@ -416,7 +416,7 @@ export class CardsHub {
             makeEmbed(
               `No ${status ? `**${status}** ` : ""}charges found for cards ending \`${last4}\`${brand ? ` (${brand})` : ""}.\n\n` +
                 "⚠️ Declined and Radar-blocked payments **do** show up here as failed charges. What this search can't " +
-                "see is an attempt that never reached confirmation (abandoned checkout, unfinished 3DS) — use " +
+                "see is an attempt that never reached confirmation (abandoned checkout, unfinished 3DS). Use " +
                 "**Find by Amount** for those.",
               COLORS.neutral
             ),
@@ -486,18 +486,18 @@ export class CardsHub {
           : "";
         return (
           `**${g.label}** · exp ${g.exp} · ${g.count} charge(s)${g.failed ? ` · ⛔ ${g.failed} failed` : ""}\n` +
-          `fingerprint: ${g.fp ? `\`${g.fp}\`` : "—"}\ncustomers: ${customers || "—"}${more}${lastFail}`
+          `fingerprint: ${g.fp ? `\`${g.fp}\`` : "N/A"}\ncustomers: ${customers || "N/A"}${more}${lastFail}`
         );
       });
 
       const embed = new EmbedBuilder()
-        .setTitle(`Cards ending •••• ${last4}${brand ? ` (${brand})` : ""}${status ? ` — ${status} only` : ""}`)
+        .setTitle(`Cards ending •••• ${last4}${brand ? ` (${brand})` : ""}${status ? ` · ${status} only` : ""}`)
         .setColor(COLORS.brand)
         .setDescription(lines.join("\n\n").slice(0, 4096))
         .setFooter({
           text:
-            `From the ${charges.length} most recent matching charges${nextPage ? " — more exist" : ""} · ` +
-            "last4 is not unique — use the fingerprint tools for exact matches · Search data can lag ~1 min",
+            `From the ${charges.length} most recent matching charges${nextPage ? " · more exist" : ""} · ` +
+            "last4 is not unique · use the fingerprint tools for exact matches · Search data can lag ~1 min",
         });
       await interaction.editReply({ embeds: [embed], components: [backRow("billadmin_hub:cards")] });
     });
@@ -536,7 +536,7 @@ export class CardsHub {
       .setFooter({
         text:
           `Aggregated from the ${charges.length} most recent matching charges` +
-          `${nextPage ? " — more exist" : ""} · Search data can lag ~1 min`,
+          `${nextPage ? " · more exist" : ""} · Search data can lag ~1 min`,
       });
     await interaction.editReply({ embeds: [embed], components: [backRow("billadmin_hub:cards")] });
   }
@@ -568,7 +568,7 @@ export class CardsHub {
         last4: card.last4,
         exp: `${card.exp_month}/${card.exp_year}`,
         funding: card.funding,
-        country: card.country ?? "—",
+        country: card.country ?? "N/A",
         saved: true,
         count: 0,
       });
@@ -584,8 +584,8 @@ export class CardsHub {
           brand: card.brand ?? "card",
           last4: card.last4 ?? "????",
           exp: `${card.exp_month ?? "?"}/${card.exp_year ?? "?"}`,
-          funding: card.funding ?? "—",
-          country: card.country ?? "—",
+          funding: card.funding ?? "N/A",
+          country: card.country ?? "N/A",
           saved: false,
           count: 1,
         });
@@ -614,7 +614,7 @@ export class CardsHub {
     );
 
     const embed = new EmbedBuilder()
-      .setTitle(`Cards — \`${customerId}\``)
+      .setTitle(`Cards · \`${customerId}\``)
       .setColor(COLORS.brand)
       .setDescription(
         [notice, lines.join("\n\n"), pmLines.length ? `\n**Saved payment methods**\n${pmLines.join("\n")}` : null]

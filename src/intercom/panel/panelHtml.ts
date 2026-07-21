@@ -86,7 +86,7 @@ ${panelThemeCss()}
   <div class="summary" id="modalSummary"></div>
   <div id="modalInputs"></div>
   <div id="modalConfirm" hidden>
-    <label>This action is destructive — type CONFIRM to proceed</label>
+    <label>This action is destructive: type CONFIRM to proceed</label>
     <input type="text" id="confirmWord" class="confirmWord" autocomplete="off">
   </div>
   <div class="row">

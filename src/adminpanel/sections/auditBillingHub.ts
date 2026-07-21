@@ -49,7 +49,7 @@ export function makeAuditBillingHub(deps: AuditBillingHubDeps): HubModule {
           { type: "number", key: "refundMaxPer24h", label: "Max refunds / 24h (global)", value: s.refundMaxPer24h(), min: 0, max: 10000, nullable: true },
           { type: "number", key: "refundMaxPer24hPerUser", label: "Max refunds / 24h / user", value: s.refundMaxPer24hPerUser(), min: 0, max: 1000, nullable: true },
           { type: "number", key: "refundMinMemberAgeDays", label: "Min member age (days)", value: s.refundMinMemberAgeDays(), min: 0, max: 3650, nullable: true },
-          { type: "number", key: "refundMaxChargeAgeDays", label: "Max charge age (days) — eligibility", value: s.refundMaxChargeAgeDays(), min: 0, max: 3650, nullable: true },
+          { type: "number", key: "refundMaxChargeAgeDays", label: "Max charge age (days): eligibility", value: s.refundMaxChargeAgeDays(), min: 0, max: 3650, nullable: true },
           { type: "text", key: "allowedPriceIds", label: "Allowed plan price ids", value: pricesStr, placeholder: "price_abc, price_def", help: "Comma-separated. Blank = all." },
         ],
       };

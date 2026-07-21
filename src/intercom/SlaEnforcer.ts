@@ -426,7 +426,7 @@ export class SlaEnforcer {
       const clockLabel = CLOCK_LABELS[note.clock];
       const targetMs = ev.clocks.find((c) => c.kind === note.clock)?.targetMs ?? 0;
       const due = note.deadline ? ` · was due ${note.deadline.toISOString().slice(0, 16).replace("T", " ")} UTC` : "";
-      const body = `⏱️ <b>SLA breached — ${clockLabel}</b> · target <b>${target.value}</b> (${formatDuration(targetMs)} business)${due} — <i>${AUTOMATION_MARKER}</i>`;
+      const body = `⏱️ <b>SLA breached: ${clockLabel}</b> · target <b>${target.value}</b> (${formatDuration(targetMs)} business)${due} · <i>${AUTOMATION_MARKER}</i>`;
       const { partId } = await this.withAuthor((a) => this.client.replyAsAdmin(conv.id, { adminId: a, body, note: true }));
       if (link && partId) {
         // Echo-register so the noted-webhook never relays the breach note
