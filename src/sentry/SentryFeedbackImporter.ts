@@ -187,12 +187,7 @@ export class SentryFeedbackImporter {
             ticketId = await this.convertFeedbackConversation(
               conversationId,
               ticketTypeId,
-              buildTicketAttributes({
-                name: context.name,
-                email,
-                message: context.message,
-                projectSlug: issue.projectSlug,
-              })
+              buildTicketAttributes({ message: context.message })
             );
             await this.store.setTicketId(issue.id, ticketId);
           } catch (e) {

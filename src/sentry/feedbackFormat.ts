@@ -51,17 +51,11 @@ export function buildMetadataNote(input: FeedbackNoteInput): string {
 }
 
 // Ticket attributes for the customer-ticket conversion — same default-field
-// keys the bridge's attachTicket uses.
-export function buildTicketAttributes(input: {
-  name: string | null;
-  email: string;
-  message: string | null;
-  projectSlug: string | null;
-}): Record<string, string> {
-  const who = input.name?.trim() || input.email;
-  const title = `${who} — Feedback${input.projectSlug ? ` (${input.projectSlug})` : ""}`;
+// keys the bridge's attachTicket uses. Title is a plain "Feedback"
+// (operator-tuned): the inbox already shows the contact next to it.
+export function buildTicketAttributes(input: { message: string | null }): Record<string, string> {
   return {
-    _default_title_: title.slice(0, 250),
+    _default_title_: "Feedback",
     _default_description_: (input.message?.trim() || "(empty feedback message)").slice(0, 4000),
   };
 }

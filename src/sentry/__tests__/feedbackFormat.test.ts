@@ -40,28 +40,13 @@ test("buildMetadataNote is minimal: short id header + escaped links only", () =>
   assert.equal(bare, "<p><b>Sentry feedback</b></p>");
 });
 
-test("buildTicketAttributes composes title/description with caps and fallbacks", () => {
-  const attrs = buildTicketAttributes({
-    name: "Someone",
-    email: "a@b.c",
-    message: "  It broke  ",
-    projectSlug: "postiz-web",
-  });
-  assert.equal(attrs._default_title_, "Someone — Feedback (postiz-web)");
+test("buildTicketAttributes: plain Feedback title, capped description with fallback", () => {
+  const attrs = buildTicketAttributes({ message: "  It broke  " });
+  assert.equal(attrs._default_title_, "Feedback");
   assert.equal(attrs._default_description_, "It broke");
 
-  const bare = buildTicketAttributes({ name: null, email: "a@b.c", message: null, projectSlug: null });
-  assert.equal(bare._default_title_, "a@b.c — Feedback");
-  assert.equal(bare._default_description_, "(empty feedback message)");
-
-  const long = buildTicketAttributes({
-    name: "n".repeat(400),
-    email: "a@b.c",
-    message: "m".repeat(5000),
-    projectSlug: null,
-  });
-  assert.equal(long._default_title_.length, 250);
-  assert.equal(long._default_description_.length, 4000);
+  assert.equal(buildTicketAttributes({ message: null })._default_description_, "(empty feedback message)");
+  assert.equal(buildTicketAttributes({ message: "m".repeat(5000) })._default_description_.length, 4000);
 });
 
 test("parseSentryLinkHeader extracts the next cursor only when results are pending", () => {
