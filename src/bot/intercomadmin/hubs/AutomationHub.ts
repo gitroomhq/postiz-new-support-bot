@@ -10,6 +10,7 @@ import {
   type StringSelectMenuInteraction,
 } from "discord.js";
 import { embed as makeEmbed, COLORS } from "../../../util/embeds";
+import { isLikelyEmail } from "../../../intercom/forwardedEmailParse";
 import { btn, buttonRow, backRow, selectRow, panelEmbed, textInput } from "../ui";
 import type { Panel, RouteEntry } from "../types";
 import type { HubContext } from "./HubContext";
@@ -30,7 +31,6 @@ export class AutomationHub {
     { kind: "button", id: "icadmin_auto_tag_texts:", match: "prefix", handler: (i) => this.handleTagTextsOpen(i) },
     { kind: "select", id: "icadmin_auto_tag_pick", match: "exact", handler: (i) => this.handleTagPick(i) },
     { kind: "button", id: "icadmin_auto_fwd_toggle", match: "exact", handler: (i) => this.handleFwdToggle(i) },
-    { kind: "button", id: "icadmin_auto_fwd_level", match: "exact", handler: (i) => this.handleFwdLevelCycle(i) },
     { kind: "button", id: "icadmin_auto_fwd_opts", match: "exact", handler: (i) => this.handleFwdOptsOpen(i) },
     { kind: "button", id: "icadmin_auto_fwd_list", match: "exact", handler: (i) => this.handleFwdList(i) },
     { kind: "modal", id: "icadmin_auto_sweep_opts_m", match: "exact", handler: (i) => this.handleSweepOptsSubmit(i) },
@@ -60,9 +60,9 @@ export class AutomationHub {
         "Pick a tag below to edit its customer reminder, auto-close farewell and repeat cadence. Structural tag settings (label, delays, target) stay in /config → Workflow → Manage Tags.",
         "",
         "**Forwarded-email conversion** (lite-seat forwards → ticket for the original sender):",
-        `**Status:** ${s.forwardConvertEnabled() ? "**on**" : "**off**"} · tag: ${s.forwardConvertTagName()} · manual level: ${s.forwardConvertActionLevel()}`,
-        `**Close note:** ${s.forwardConvertCloseNote() ? "custom" : "default"}`,
-        "New conversations authored by a lite-seat teammate with a Fwd: subject are recreated for the parsed original sender and closed (Intercom's own detection skips lite seats). The inbox sidebar app offers a manual convert for anything the parser misses; Manual Level gates who may click it.",
+        `**Status:** ${s.forwardConvertEnabled() ? "**on**" : "**off**"} · tag: ${s.forwardConvertTagName()}`,
+        `**Close note:** ${s.forwardConvertCloseNote() ? "custom" : "default"} · **extra forwarders:** ${s.forwardConvertExtraEmails().length || "none"}`,
+        "New conversations authored by a lite-seat teammate (or a listed extra address) with a Fwd: subject are recreated for the parsed original sender and closed (Intercom's own detection skips lite seats). A forward the parser misses stays attributed to the forwarder; re-forwarding with the standard Fwd: block retries it.",
       ].join("\n")
     );
 
@@ -90,7 +90,6 @@ export class AutomationHub {
         `Fwd Convert: ${s.forwardConvertEnabled() ? "on" : "off"}`,
         s.forwardConvertEnabled() ? ButtonStyle.Success : ButtonStyle.Secondary
       ),
-      btn("icadmin_auto_fwd_level", `Manual Level: ${s.forwardConvertActionLevel()}`, ButtonStyle.Primary),
       btn("icadmin_auto_fwd_opts", "Tag & Note", ButtonStyle.Primary),
       btn("icadmin_auto_fwd_list", "List Forwarders", ButtonStyle.Secondary)
     );
@@ -291,14 +290,6 @@ export class AutomationHub {
     await this.renderPanel(interaction);
   }
 
-  private async handleFwdLevelCycle(interaction: ButtonInteraction): Promise<void> {
-    const cycle: Record<string, "none" | "admin" | "all"> = { admin: "all", all: "none", none: "admin" };
-    const next = cycle[this.ctx.settingsStore.forwardConvertActionLevel()];
-    await this.ctx.settingsStore.updateForwardConvert({ forwardConvertActionLevel: next });
-    this.ctx.auditConfig(interaction, `Forwarded-email manual convert level → ${next}`);
-    await this.renderPanel(interaction);
-  }
-
   private async handleFwdOptsOpen(interaction: ButtonInteraction): Promise<void> {
     const s = this.ctx.settingsStore;
     const modal = new ModalBuilder().setCustomId("icadmin_auto_fwd_opts_m").setTitle("Forwarded-email Conversion");
@@ -313,6 +304,14 @@ export class AutomationHub {
           maxLength: 1000,
           value: s.forwardConvertCloseNote() ?? undefined,
         })
+      ),
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        textInput("extra_emails", "Extra forwarder emails, comma-separated (blank = none)", {
+          required: false,
+          style: TextInputStyle.Paragraph,
+          maxLength: 1000,
+          value: s.forwardConvertExtraEmails().join(", ") || undefined,
+        })
       )
     );
     await interaction.showModal(modal);
@@ -321,26 +320,49 @@ export class AutomationHub {
   private async handleFwdOptsSubmit(interaction: ModalSubmitInteraction): Promise<void> {
     const tagName = interaction.fields.getTextInputValue("tag_name").trim();
     const closeNote = interaction.fields.getTextInputValue("close_note").trim();
+    const extraRaw = interaction.fields.getTextInputValue("extra_emails").trim();
     if (!tagName) {
       await interaction.reply({ embeds: [makeEmbed("Tag name cannot be empty.", COLORS.danger)], flags: 64 });
+      return;
+    }
+    const extras = [...new Set(extraRaw.split(",").map((e) => e.trim().toLowerCase()).filter(Boolean))];
+    const invalid = extras.filter((e) => !isLikelyEmail(e));
+    if (invalid.length) {
+      await interaction.reply({
+        embeds: [makeEmbed(`These entries are not email addresses: ${invalid.join(", ")}`, COLORS.danger)],
+        flags: 64,
+      });
       return;
     }
     await this.ctx.settingsStore.updateForwardConvert({
       forwardConvertTagName: tagName,
       forwardConvertCloseNote: closeNote || null,
+      forwardConvertExtraEmails: extras.join(","),
     });
-    this.ctx.auditConfig(interaction, `Forwarded-email conversion → tag "${tagName}", close note ${closeNote ? "custom" : "default"}`);
+    this.ctx.auditConfig(
+      interaction,
+      `Forwarded-email conversion → tag "${tagName}", close note ${closeNote ? "custom" : "default"}, ${extras.length} extra forwarder(s)`
+    );
     await interaction.reply({
-      embeds: [makeEmbed(`Forwarded-email settings saved: tag "${tagName}", close note ${closeNote ? "custom" : "default"}.`, COLORS.success)],
+      embeds: [
+        makeEmbed(
+          `Forwarded-email settings saved: tag "${tagName}", close note ${closeNote ? "custom" : "default"}, extra forwarders: ${extras.length ? extras.join(", ") : "none"}.`,
+          COLORS.success
+        ),
+      ],
       flags: 64,
     });
   }
 
-  // Current lite-seat teammates = the auto path's forwarder set (live from
-  // Intercom, nothing to configure). Ephemeral one-shot list; a workspace with
-  // more than 20 shows a documented remainder count.
+  // The auto path's forwarder set: lite-seat teammates (live from Intercom)
+  // plus the configured extra addresses. Ephemeral one-shot list; a workspace
+  // with more than 20 lite seats shows a documented remainder count.
   private async handleFwdList(interaction: ButtonInteraction): Promise<void> {
     await interaction.deferReply({ flags: 64 });
+    const extras = this.ctx.settingsStore.forwardConvertExtraEmails();
+    const extrasBlock = extras.length
+      ? `\n\nExtra addresses (Tag & Note modal):\n${extras.map((e) => `• ${e}`).join("\n")}`
+      : "";
     try {
       const admins = await this.ctx.intercomClient.listAdmins();
       const lite = admins.filter((a) => !a.hasInboxSeat && a.email);
@@ -349,16 +371,21 @@ export class AutomationHub {
       await interaction.editReply({
         embeds: [
           makeEmbed(
-            lite.length
+            (lite.length
               ? `Lite-seat teammates whose forwards auto-convert (${lite.length}):\n${shown.join("\n")}${more}`
-              : "No lite-seat teammates found — the auto path has nothing to match against.",
+              : "No lite-seat teammates found.") + (extrasBlock || (lite.length ? "" : "\n\nNo extra addresses configured either — the auto path has nothing to match against.")),
             COLORS.neutral
           ),
         ],
       });
     } catch (e) {
       await interaction.editReply({
-        embeds: [makeEmbed(`Couldn't fetch the teammate list: ${e instanceof Error ? e.message : String(e)}`, COLORS.danger)],
+        embeds: [
+          makeEmbed(
+            `Couldn't fetch the teammate list: ${e instanceof Error ? e.message : String(e)}${extrasBlock}`,
+            COLORS.danger
+          ),
+        ],
       });
     }
   }

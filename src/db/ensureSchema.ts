@@ -873,7 +873,7 @@ const STATEMENTS: string[] = [
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "forwardConvertEnabled" BOOLEAN NOT NULL DEFAULT false`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "forwardConvertTagName" TEXT NOT NULL DEFAULT 'email'`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "forwardConvertCloseNote" TEXT`,
-  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "forwardConvertActionLevel" TEXT NOT NULL DEFAULT 'admin'`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "forwardConvertExtraEmails" TEXT NOT NULL DEFAULT ''`,
 ];
 
 export async function ensureSchema(prisma: PrismaClient): Promise<void> {

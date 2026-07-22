@@ -4,12 +4,7 @@ import { log } from "../util/logger";
 import type { ForwardConvertStore } from "./ForwardConvertStore";
 import { IntercomHttpError, type IntercomClient } from "./IntercomClient";
 import { archivedContactId, escapeHtmlText } from "./IntercomEventExecutor";
-import {
-  buildForwardConversationBody,
-  isLikelyEmail,
-  parseForwardedEmail,
-  stripForwardPrefix,
-} from "./forwardedEmailParse";
+import { buildForwardConversationBody, parseForwardedEmail } from "./forwardedEmailParse";
 import type { IntercomAdmin } from "./types";
 
 const cvLog = log.child("intercom:fwdconvert");
@@ -22,27 +17,14 @@ const ATTACHMENT_CHUNK = 10;
 
 type PayloadSource = { subject?: string | null; author?: { type?: string; email?: string | null } };
 
-export type ConvertOutcome =
-  | { kind: "converted"; newConversationId: string; customerEmail: string; already: boolean }
-  | { kind: "skipped"; reason: string };
-
-// Canvas preview for a native (unbridged) conversation.
-export interface ForwardPreview {
-  converted: { newConversationId: string | null; customerEmail: string } | null; // ledger row by ORIGINAL id
-  isConvertedNew: boolean; // this conversation IS a recreation
-  forwarderEmail: string | null;
-  forwarderLiteSeat: boolean;
-  detected: { email: string; name: string | null } | null;
-  parseReason: string | null;
-  agentEngaged: boolean;
-  open: boolean;
-}
-
 // Replicates Intercom's "Detect customers in forwarded emails" for lite-seat
-// teammates (the native feature only runs for full-seat admins): recreate the
-// conversation authored as the original sender, close the misattributed one.
-// Auto path = conversation.user.created webhook; manual path = the Canvas
-// inbox app on the misattributed conversation.
+// teammates and listed extra addresses (the native feature only runs for
+// full-seat admins): recreate the conversation authored as the original
+// sender, close the misattributed one. Fully automatic on the
+// conversation.user.created webhook — there is deliberately no manual surface
+// (a canvas repair card existed briefly and was cut as unused); a forward the
+// parser misses stays attributed to the forwarder, exactly like before this
+// feature.
 export class ForwardedEmailConverter {
   private adminsCache: { at: number; admins: IntercomAdmin[] } | null = null;
 
@@ -73,13 +55,13 @@ export class ForwardedEmailConverter {
       const subject = payloadSource.subject;
       if (typeof subject === "string" && !/^\s*(?:fwd|fw)\s*:/i.test(subject)) return "skipped";
       const email = payloadSource.author?.email?.trim().toLowerCase();
-      if (email && !(await this.isLiteSeatEmail(email))) return "skipped";
+      if (email && !(await this.isForwarderEmail(email))) return "skipped";
     }
 
     const src = await this.client.getConversationSource(conversationId);
     if (!src.open) return "skipped";
     if (src.hasAgentPart) return "skipped"; // an agent already engaged — repair manually if needed
-    if (!src.authorEmail || !(await this.isLiteSeatEmail(src.authorEmail))) return "skipped";
+    if (!src.authorEmail || !(await this.isForwarderEmail(src.authorEmail))) return "skipped";
     const parsed = parseForwardedEmail(src.subject, src.bodyPlain);
     if (!parsed.ok) {
       cvLog.info("fwdconvert.auto_skip", {
@@ -89,12 +71,12 @@ export class ForwardedEmailConverter {
       return "skipped";
     }
     if (parsed.email === src.authorEmail) return "skipped";
-    if (await this.isAnyAdminEmail(parsed.email)) {
-      // Forward of an internal thread — a conversation authored as a teammate's
-      // contact record would be wrong in every direction.
+    if (await this.isProtectedTargetEmail(parsed.email)) {
+      // Forward of an internal thread — a conversation authored as a teammate
+      // (or listed forwarder) contact record would be wrong in every direction.
       cvLog.info("fwdconvert.auto_skip", {
         "intercom.conversation_id": conversationId,
-        "fwdconvert.reason": "parsed sender is a workspace teammate",
+        "fwdconvert.reason": "parsed sender is a workspace teammate or listed forwarder",
       });
       return "skipped";
     }
@@ -104,126 +86,8 @@ export class ForwardedEmailConverter {
       name: parsed.name,
       subject: parsed.subject,
       bodyText: parsed.bodyText,
-      trigger: "auto",
-      actorLabel: null,
     });
     return "converted";
-  }
-
-  // Manual canvas trigger: independent of the auto toggle (the action-level
-  // setting gates it instead) and of the auto-only guards — an operator can
-  // repair closed/agent-touched conversations and non-lite-seat forwards.
-  // Never rejects: canvas callers time-box and re-render from the ledger.
-  async convertManual(conversationId: string, input: { overrideEmail?: string | null; actorLabel: string }): Promise<ConvertOutcome> {
-    try {
-      if (!this.settingsStore.intercomConfigured()) return { kind: "skipped", reason: "Intercom is not configured." };
-      const adminId = this.settingsStore.intercomAdminId() ?? this.settingsStore.intercomAuthorAdminId();
-      if (!adminId) return { kind: "skipped", reason: "No author admin configured." };
-
-      const existing = await this.store.getByOriginalConversationId(conversationId);
-      if (existing) {
-        return {
-          kind: "converted",
-          newConversationId: existing.newConversationId ?? "",
-          customerEmail: existing.customerEmail,
-          already: true,
-        };
-      }
-      if (await this.store.getByNewConversationId(conversationId)) {
-        return { kind: "skipped", reason: "This conversation was itself created by a conversion." };
-      }
-
-      const src = await this.client.getConversationSource(conversationId);
-      const override = input.overrideEmail?.trim().toLowerCase() || null;
-      if (override && !isLikelyEmail(override)) {
-        return { kind: "skipped", reason: "That does not look like an email address." };
-      }
-
-      let email = override;
-      let name: string | null = null;
-      let subject = src.subject ? stripForwardPrefix(src.subject) || null : null;
-      let bodyText = src.bodyPlain;
-      if (!email) {
-        const parsed = parseForwardedEmail(src.subject, src.bodyPlain, { requireForwardSubject: false });
-        if (!parsed.ok) {
-          return { kind: "skipped", reason: `Could not detect the original sender (${parsed.reason}). Enter the email manually.` };
-        }
-        email = parsed.email;
-        name = parsed.name;
-        subject = parsed.subject;
-        bodyText = parsed.bodyText;
-      }
-      if (src.authorEmail && email === src.authorEmail) {
-        return { kind: "skipped", reason: "Target email equals the conversation author." };
-      }
-
-      const newConversationId = await this.convert(conversationId, src, adminId, {
-        email,
-        name,
-        subject,
-        bodyText,
-        trigger: "manual",
-        actorLabel: input.actorLabel,
-      });
-      return { kind: "converted", newConversationId, customerEmail: email, already: false };
-    } catch (e) {
-      cvLog.warn("fwdconvert.manual_failed", {
-        "intercom.conversation_id": conversationId,
-        "error.message": e instanceof Error ? e.message : String(e),
-      });
-      return { kind: "skipped", reason: "Conversion failed. Check the logs and press Refresh." };
-    }
-  }
-
-  // Canvas initialize data for a native conversation. Callers time-box this.
-  async preview(conversationId: string): Promise<ForwardPreview> {
-    const byOriginal = await this.store.getByOriginalConversationId(conversationId);
-    if (byOriginal) {
-      return {
-        converted: { newConversationId: byOriginal.newConversationId, customerEmail: byOriginal.customerEmail },
-        isConvertedNew: false,
-        forwarderEmail: byOriginal.forwarderEmail,
-        forwarderLiteSeat: false,
-        detected: null,
-        parseReason: null,
-        agentEngaged: false,
-        open: false,
-      };
-    }
-    const byNew = await this.store.getByNewConversationId(conversationId);
-    if (byNew) {
-      return {
-        converted: null,
-        isConvertedNew: true,
-        forwarderEmail: null,
-        forwarderLiteSeat: false,
-        detected: null,
-        parseReason: null,
-        agentEngaged: false,
-        open: true,
-      };
-    }
-    const src = await this.client.getConversationSource(conversationId);
-    const parsed = parseForwardedEmail(src.subject, src.bodyPlain, { requireForwardSubject: false });
-    return {
-      converted: null,
-      isConvertedNew: false,
-      forwarderEmail: src.authorEmail,
-      forwarderLiteSeat: src.authorEmail ? await this.isLiteSeatEmail(src.authorEmail) : false,
-      detected: parsed.ok ? { email: parsed.email, name: parsed.name } : null,
-      parseReason: parsed.ok ? null : parsed.reason,
-      agentEngaged: src.hasAgentPart,
-      open: src.open,
-    };
-  }
-
-  // Current lite-seat teammates (the auto path's forwarder set) — also powers
-  // the /intercom → Automation "List Forwarders" button.
-  async listForwarderAdmins(): Promise<Array<{ id: string; name: string | null; email: string }>> {
-    const admins = await this.admins();
-    return admins
-      .filter((a) => !a.hasInboxSeat && a.email)
-      .map((a) => ({ id: a.id, name: a.name ?? null, email: (a.email as string).toLowerCase() }));
   }
 
   // The conversion core. Caller supplies the target identity; this method owns
@@ -239,8 +103,6 @@ export class ForwardedEmailConverter {
       name: string | null;
       subject: string | null;
       bodyText: string;
-      trigger: "auto" | "manual";
-      actorLabel: string | null;
     }
   ): Promise<string> {
     // Contact: prefer an existing user-role match (real customer record); a
@@ -287,8 +149,8 @@ export class ForwardedEmailConverter {
       customerName: input.name,
       intercomContactId: match.id,
       contactRole: fromType,
-      trigger: input.trigger,
-      actorLabel: input.actorLabel,
+      trigger: "auto",
+      actorLabel: null,
       attachmentsCount: src.attachments.length,
     });
 
@@ -315,7 +177,7 @@ export class ForwardedEmailConverter {
       await this.client.replyAsAdmin(newConversationId, {
         adminId,
         note: true,
-        body: this.provenanceNote(originalConversationId, src, input),
+        body: this.provenanceNote(originalConversationId, src),
       });
     } catch (e) {
       this.warnDecoration("provenance note", newConversationId, e);
@@ -334,7 +196,6 @@ export class ForwardedEmailConverter {
     cvLog.info("fwdconvert.converted", {
       "intercom.conversation_id": originalConversationId,
       "fwdconvert.new_conversation_id": newConversationId,
-      "fwdconvert.trigger": input.trigger,
       "fwdconvert.contact_role": fromType,
       "fwdconvert.attachments": src.attachments.length,
     });
@@ -344,7 +205,6 @@ export class ForwardedEmailConverter {
         `Original conversation ${originalConversationId} (forwarded by ${src.authorEmail ?? "unknown"}) was closed;`,
         `recreated as conversation ${newConversationId} for the original sender.`,
       ].join(" "),
-      fields: [{ name: "Trigger", value: input.actorLabel ? `manual · ${input.actorLabel}` : "auto", inline: true }],
       severity: "info",
     });
     return newConversationId;
@@ -408,8 +268,7 @@ export class ForwardedEmailConverter {
 
   private provenanceNote(
     originalConversationId: string,
-    src: Awaited<ReturnType<IntercomClient["getConversationSource"]>>,
-    input: { trigger: "auto" | "manual"; actorLabel: string | null }
+    src: Awaited<ReturnType<IntercomClient["getConversationSource"]>>
   ): string {
     const lines = [
       `<p><b>Forwarded-email conversion</b></p>`,
@@ -417,7 +276,6 @@ export class ForwardedEmailConverter {
       `<p>Original conversation id: ${escapeHtmlText(originalConversationId)}</p>`,
     ];
     if (src.attachments.length > 0) lines.push(`<p>Attachments in original: ${src.attachments.length}</p>`);
-    if (input.trigger === "manual" && input.actorLabel) lines.push(`<p>Converted by: ${escapeHtmlText(input.actorLabel)}</p>`);
     return lines.join("");
   }
 
@@ -452,5 +310,21 @@ export class ForwardedEmailConverter {
   private async isAnyAdminEmail(email: string): Promise<boolean> {
     const admins = await this.admins();
     return admins.some((a) => a.email?.toLowerCase() === email);
+  }
+
+  // Forwarder set = lite-seat teammates (dynamic) ∪ the configured extra
+  // addresses (personal mailboxes etc.). Listed entries check first — no
+  // roster fetch needed when they match.
+  private async isForwarderEmail(email: string): Promise<boolean> {
+    if (this.settingsStore.forwardConvertExtraEmails().includes(email)) return true;
+    return this.isLiteSeatEmail(email);
+  }
+
+  // Addresses that must never become the conversion TARGET: teammates and the
+  // listed forwarders themselves (a "customer" conversation for either would
+  // be wrong in every direction).
+  private async isProtectedTargetEmail(email: string): Promise<boolean> {
+    if (this.settingsStore.forwardConvertExtraEmails().includes(email)) return true;
+    return this.isAnyAdminEmail(email);
   }
 }

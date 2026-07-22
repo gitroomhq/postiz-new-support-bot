@@ -1478,18 +1478,19 @@ export class SettingsStore {
     return this.settings.forwardConvertCloseNote?.trim() || null;
   }
 
-  // Manual canvas trigger gate. Unknown values coerce to the safe default —
-  // a bad stored value must never widen access.
-  forwardConvertActionLevel(): "none" | "admin" | "all" {
-    const v = this.settings.forwardConvertActionLevel;
-    return v === "none" || v === "all" ? v : "admin";
+  // Extra forwarder addresses treated like lite-seat teammates (personal
+  // mailboxes, addresses without a seat). Comma-separated column, normalized
+  // like sentryFeedbackProjectSlugs.
+  forwardConvertExtraEmails(): string[] {
+    const raw = this.settings.forwardConvertExtraEmails ?? "";
+    return [...new Set(raw.split(",").map((s) => s.trim().toLowerCase()).filter(Boolean))];
   }
 
   async updateForwardConvert(data: {
     forwardConvertEnabled?: boolean;
     forwardConvertTagName?: string;
     forwardConvertCloseNote?: string | null;
-    forwardConvertActionLevel?: string;
+    forwardConvertExtraEmails?: string;
   }): Promise<void> {
     this.settings = await this.prisma.botSettings.update({ where: { id: "global" }, data });
   }

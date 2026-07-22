@@ -50,6 +50,7 @@ interface HarnessOpts {
   ledgerNew?: string | null; // pre-seed a row keyed by this NEW id
   tagFails?: boolean;
   contactReplyFails?: boolean;
+  extraEmails?: string[];
 }
 
 interface Harness {
@@ -69,6 +70,7 @@ function makeHarness(opts: HarnessOpts = {}): Harness {
     intercomAuthorAdminId: () => null,
     forwardConvertTagName: () => "email",
     forwardConvertCloseNote: () => null,
+    forwardConvertExtraEmails: () => opts.extraEmails ?? [],
   } as unknown as SettingsStore;
 
   const byOriginal = new Map<string, Record<string, unknown>>();
@@ -302,27 +304,27 @@ test("auto: failed re-upload degrades to a link note and skips the flag", async 
   assert.ok(!h.ops.some((o) => o.startsWith("store.reuploaded")));
 });
 
-test("manual: override email wins, already-converted resolves from the ledger, self-target refused", async () => {
-  const h = makeHarness();
-  const converted = await h.converter.convertManual("orig-1", { overrideEmail: "typed@example.com", actorLabel: "Enno" });
-  assert.equal(converted.kind, "converted");
-  if (converted.kind === "converted") assert.equal(converted.customerEmail, "typed@example.com");
-  assert.equal(h.inserted[0].trigger, "manual");
-  assert.equal(h.inserted[0].actorLabel, "Enno");
-
-  const again = await h.converter.convertManual("orig-1", { overrideEmail: null, actorLabel: "Enno" });
-  assert.equal(again.kind, "converted");
-  if (again.kind === "converted") assert.equal(again.already, true);
-
-  const h2 = makeHarness();
-  const self = await h2.converter.convertManual("orig-2", { overrideEmail: "nevo@postiz.com", actorLabel: "Enno" });
-  assert.equal(self.kind, "skipped");
+test("auto: a listed extra address counts as a forwarder without any seat", async () => {
+  const h = makeHarness({
+    extraEmails: ["nevo.personal@gmail.com"],
+    src: makeSrc({ authorEmail: "nevo.personal@gmail.com" }),
+  });
+  assert.equal(
+    await h.converter.maybeConvertOnCreate("orig-1", { subject: "Fwd: x", author: { email: "nevo.personal@gmail.com" } }),
+    "converted"
+  );
+  assert.equal(h.inserted[0].forwarderEmail, "nevo.personal@gmail.com");
 });
 
-test("manual: unparseable body without an override reports the reason instead of converting", async () => {
-  const h = makeHarness({ src: makeSrc({ bodyPlain: "no headers here", subject: "whatever" }) });
-  const r = await h.converter.convertManual("orig-1", { overrideEmail: null, actorLabel: "Enno" });
-  assert.equal(r.kind, "skipped");
-  if (r.kind === "skipped") assert.match(r.reason, /Could not detect/);
+test("auto: a listed extra address is refused as the conversion TARGET", async () => {
+  const toListed = GMAIL_BODY.replace("jane@example.com", "nevo.personal@gmail.com");
+  const h = makeHarness({ extraEmails: ["nevo.personal@gmail.com"], src: makeSrc({ bodyPlain: toListed }) });
+  assert.equal(await h.converter.maybeConvertOnCreate("orig-1"), "skipped");
+  assert.ok(!h.ops.some((o) => o.startsWith("ic.createConv")));
+});
+
+test("auto: an unparseable forward stays untouched (no conversion, no writes)", async () => {
+  const h = makeHarness({ src: makeSrc({ bodyPlain: "no headers here" }) });
+  assert.equal(await h.converter.maybeConvertOnCreate("orig-1"), "skipped");
   assert.ok(!h.ops.some((o) => o.startsWith("ic.createConv")));
 });

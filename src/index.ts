@@ -430,8 +430,7 @@ async function main() {
     categoryLabelResolver,
     billingActionService,
     panelTokens,
-    panelSessions,
-    forwardedEmailConverter
+    panelSessions
   );
 
   const bot = new DiscordBot(

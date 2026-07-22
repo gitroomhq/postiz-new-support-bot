@@ -173,7 +173,7 @@ model BotSettings {
   forwardConvertEnabled     Boolean @default(false)
   forwardConvertTagName     String  @default("email") // tag applied to the recreated conversation
   forwardConvertCloseNote   String? // close-note override on the misattributed original ({email} supported); null = built-in default
-  forwardConvertActionLevel String  @default("admin") // manual canvas trigger: "none" | "admin" | "all"
+  forwardConvertExtraEmails String  @default("") // comma-separated forwarder addresses treated like lite-seat teammates (personal mailboxes etc.)
   // AI models (edited via /config → AI & Knowledge). Free-text so new model ids
   // work without a code change. Light model runs the tool-less /ai summarize|draft.
   aiModel               String  @default("sonnet")

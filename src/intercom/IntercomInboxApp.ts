@@ -10,7 +10,6 @@ import type { BillingActionService } from "../bot/billing/actions/BillingActionS
 import type { ActionActor } from "../bot/billing/actions/ActionRegistry";
 import type { PanelTokens } from "./panel/PanelTokens";
 import type { PanelSessions } from "./panel/PanelSessions";
-import type { ForwardedEmailConverter } from "./ForwardedEmailConverter";
 
 // Canvas Kit inbox app: renders a live context card in the Intercom inbox
 // sidebar. Everything is fetched at render time (plan, charges, ticket state)
@@ -59,8 +58,7 @@ export class IntercomInboxApp {
     private categoryLabelResolver: (id: string | null) => string | null,
     private billingActions: BillingActionService,
     private panelTokens: PanelTokens,
-    private panelSessions: PanelSessions,
-    private forwardConverter: ForwardedEmailConverter
+    private panelSessions: PanelSessions
   ) {}
 
   bindClient(client: Client): void {
@@ -100,9 +98,6 @@ export class IntercomInboxApp {
             ? "✅ Panel unlocked. Return to your browser."
             : "⚠️ That code didn't match. Open the panel link and enter the exact code shown."
         );
-      }
-      if (componentId === "fwd_convert") {
-        return await this.handleForwardConvert(body, String(conversationId), actor);
       }
       if (componentId === "review_approve" || componentId === "review_deny") {
         const decision = componentId === "review_approve" ? "approve" : "deny";
@@ -197,7 +192,7 @@ export class IntercomInboxApp {
     if (conversationId == null) return canvas([text("No conversation context.")]);
 
     const link = await this.store.getLinkByConversationId(String(conversationId)).catch(() => null);
-    if (!link) return this.buildForwardCanvas(String(conversationId), notice);
+    if (!link) return canvas([text("Not a Discord-bridged conversation.")]);
 
     const ticket = await this.ticketStore.getByThreadId(link.ticketThreadId).catch(() => null);
     const session = ticket?.customerId
@@ -421,85 +416,6 @@ export class IntercomInboxApp {
     const channel = await this.client.channels.fetch(threadId).catch(() => null);
     return channel?.isThread() ? (channel.url ?? null) : null;
   }
-
-  // Native (unbridged) conversation card: forwarded-email tools. This is
-  // exactly where a misattributed lite-seat forward surfaces (those are never
-  // bridged), so the card offers the conversion instead of a dead end.
-  private async buildForwardCanvas(conversationId: string, notice?: string): Promise<object> {
-    const components: CanvasComponent[] = [];
-    if (notice) components.push(text(notice), divider());
-    components.push(header("📨 Forwarded-email tools"), text("Not a Discord-bridged conversation."));
-
-    const preview = await timeBox(this.forwardConverter.preview(conversationId), FETCH_TIMEOUT_MS).catch((e) => {
-      this.log.warn("forward preview failed", { error: e instanceof Error ? e.message : String(e) });
-      return null;
-    });
-    if (!preview) {
-      components.push(text("Preview unavailable — press Refresh."), refreshButton());
-      return canvas(components);
-    }
-    if (preview.converted) {
-      components.push(
-        dataRow("Converted for", preview.converted.customerEmail),
-        dataRow("New conversation", preview.converted.newConversationId ?? "unknown"),
-        text("This conversation was closed by the conversion — reply in the new one."),
-        refreshButton()
-      );
-      return canvas(components);
-    }
-    if (preview.isConvertedNew) {
-      components.push(
-        text("This conversation was created from a forwarded email (provenance is in the first note)."),
-        refreshButton()
-      );
-      return canvas(components);
-    }
-
-    if (preview.forwarderEmail) {
-      components.push(dataRow("Author", `${preview.forwarderEmail}${preview.forwarderLiteSeat ? " · lite seat" : ""}`));
-    }
-    components.push(
-      preview.detected
-        ? dataRow("Detected original sender", `${preview.detected.name ? `${preview.detected.name} · ` : ""}${preview.detected.email}`)
-        : text(`Original sender not detected${preview.parseReason ? ` (${preview.parseReason})` : ""}.`)
-    );
-    if (preview.agentEngaged) components.push(text("⚠️ A teammate already replied here — converting closes this conversation."));
-    if (!preview.open) components.push(text("⚠️ This conversation is closed."));
-    components.push(
-      { type: "input", id: "fwd_email", label: "Original sender email (blank = use detected)", placeholder: "customer@example.com" },
-      { type: "button", id: "fwd_convert", label: "Create for original sender", style: "primary", action: { type: "submit" } },
-      refreshButton()
-    );
-    return canvas(components);
-  }
-
-  // Conversion from the canvas. The level gate is enforced HERE — component
-  // ids are client-supplied, so render-side hiding is cosmetic only.
-  private async handleForwardConvert(body: unknown, conversationId: string, actor: ActionActor): Promise<object> {
-    const level = this.settingsStore.forwardConvertActionLevel();
-    if (level === "none" || (level === "admin" && !actor.isAdmin)) {
-      return this.buildCanvas(body, "⚠️ You are not allowed to run the conversion.");
-    }
-    const request = body as CanvasRequestBody;
-    const raw =
-      request.input_values && typeof request.input_values["fwd_email"] === "string"
-        ? String(request.input_values["fwd_email"]).trim()
-        : "";
-    const outcome = await timeBox(
-      this.forwardConverter.convertManual(conversationId, { overrideEmail: raw || null, actorLabel: actor.name }),
-      ACTION_TIMEOUT_MS
-    ).catch(() => null);
-    if (!outcome) return this.buildCanvas(body, "⏳ Still processing. Press Refresh in a few seconds.");
-    if (outcome.kind === "converted") {
-      return this.buildCanvas(
-        body,
-        outcome.already
-          ? `✅ Already converted for ${outcome.customerEmail}.`
-          : `✅ Created conversation ${outcome.newConversationId} for ${outcome.customerEmail}; this one is closed.`
-      );
-    }
-    return this.buildCanvas(body, `⚠️ ${outcome.reason}`);
-  }
 }
 
 // ---- Canvas Kit JSON helpers ----
@@ -524,10 +440,6 @@ function dataRow(label: string, value: string): CanvasComponent {
 
 function divider(): CanvasComponent {
   return { type: "divider" };
-}
-
-function refreshButton(): CanvasComponent {
-  return { type: "button", id: "refresh", label: "🔄 Refresh", style: "secondary", action: { type: "submit" } };
 }
 
 function timeBox<T>(promise: Promise<T>, ms: number): Promise<T> {
