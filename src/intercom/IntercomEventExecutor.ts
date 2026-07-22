@@ -1003,7 +1003,9 @@ function isAlreadyAssignedError(e: unknown): boolean {
 
 // The create-contact 409 for an archived record embeds its id, e.g. "An
 // archived contact matching those details already exists with id=abc123".
-function archivedContactId(e: unknown): string | null {
+// Exported: the forwarded-email converter hits the same conflict on
+// createEmailContact.
+export function archivedContactId(e: unknown): string | null {
   if (!(e instanceof IntercomHttpError)) return null;
   const m = /archived contact.*?id=(\w+)/i.exec(e.message);
   return m ? m[1] : null;

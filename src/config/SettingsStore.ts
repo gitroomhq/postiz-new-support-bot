@@ -1460,6 +1460,40 @@ export class SettingsStore {
     });
   }
 
+  // Forwarded-email conversion (lite-seat teammate forwards → conversation
+  // recreated for the original sender). Edited via /intercom → Automation.
+
+  forwardConvertEnabled(): boolean {
+    return this.settings.forwardConvertEnabled;
+  }
+
+  // Tag applied to the recreated conversation (find-or-create by name).
+  forwardConvertTagName(): string {
+    return this.settings.forwardConvertTagName?.trim() || "email";
+  }
+
+  // Close-note override for the misattributed original ({email} supported);
+  // null = built-in default text.
+  forwardConvertCloseNote(): string | null {
+    return this.settings.forwardConvertCloseNote?.trim() || null;
+  }
+
+  // Manual canvas trigger gate. Unknown values coerce to the safe default —
+  // a bad stored value must never widen access.
+  forwardConvertActionLevel(): "none" | "admin" | "all" {
+    const v = this.settings.forwardConvertActionLevel;
+    return v === "none" || v === "all" ? v : "admin";
+  }
+
+  async updateForwardConvert(data: {
+    forwardConvertEnabled?: boolean;
+    forwardConvertTagName?: string;
+    forwardConvertCloseNote?: string | null;
+    forwardConvertActionLevel?: string;
+  }): Promise<void> {
+    this.settings = await this.prisma.botSettings.update({ where: { id: "global" }, data });
+  }
+
   async updateIntercom(data: {
     intercomMode?: IntercomMode;
     intercomRegion?: IntercomRegion;

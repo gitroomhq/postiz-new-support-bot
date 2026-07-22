@@ -166,6 +166,14 @@ model BotSettings {
   sentryFeedbackLastSyncAt   DateTime? // last completed sync tick — /config status line
   sentryWebhookSecret        String?   // Sentry internal-integration client secret — encrypted (crypto.ts/Vault)
   sentryFeedbackTicketTypeId String?   // convert imports into customer tickets of this type; null = plain conversations
+  // Forwarded-email conversion (lite-seat teammate forwards a customer email to
+  // support@ → recreate the conversation for the original sender; edited via
+  // /intercom → Automation). Replicates Intercom's "Detect customers in
+  // forwarded emails", which does not run for lite-seat forwarders.
+  forwardConvertEnabled     Boolean @default(false)
+  forwardConvertTagName     String  @default("email") // tag applied to the recreated conversation
+  forwardConvertCloseNote   String? // close-note override on the misattributed original ({email} supported); null = built-in default
+  forwardConvertActionLevel String  @default("admin") // manual canvas trigger: "none" | "admin" | "all"
   // AI models (edited via /config → AI & Knowledge). Free-text so new model ids
   // work without a code change. Light model runs the tool-less /ai summarize|draft.
   aiModel               String  @default("sonnet")
@@ -982,4 +990,30 @@ model SentryFeedbackImport {
 
   @@index([importedAt])
   @@map("sentry_feedback_imports")
+}
+
+// Forwarded-email conversion ledger: one row per converted conversation.
+// originalConversationId = the misattributed teammate-authored conversation
+// (unique = idempotency across webhook retries); newConversationId = the
+// recreated customer-authored one (unique = self-trigger belt + canvas reverse
+// lookup). Also powers the SLA exemption when Intercom reopens the closed
+// original on a repeat forward into the same thread.
+model ForwardedEmailConvert {
+  id                     String   @id @default(cuid())
+  originalConversationId String   @unique
+  newConversationId      String?  @unique
+  forwarderAdminId       String?
+  forwarderEmail         String?
+  customerEmail          String
+  customerName           String?
+  intercomContactId      String?
+  contactRole            String? // "user" | "lead" — decides the attachment re-upload author
+  trigger                String // "auto" | "manual"
+  actorLabel             String? // manual trigger: the acting teammate
+  attachmentsCount       Int      @default(0)
+  attachmentsReuploaded  Boolean  @default(false)
+  convertedAt            DateTime @default(now())
+
+  @@index([convertedAt])
+  @@map("forwarded_email_converts")
 }

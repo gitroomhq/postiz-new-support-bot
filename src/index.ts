@@ -27,6 +27,8 @@ import { IntercomSyncService } from "./intercom/IntercomSyncService";
 import { IntercomEventExecutor } from "./intercom/IntercomEventExecutor";
 import { IntercomWebhookHandler } from "./intercom/IntercomWebhookHandler";
 import { IntercomInboxApp } from "./intercom/IntercomInboxApp";
+import { ForwardConvertStore } from "./intercom/ForwardConvertStore";
+import { ForwardedEmailConverter } from "./intercom/ForwardedEmailConverter";
 import { initSentry, shutdownSentry, captureFatal, log, reconfigureSentry } from "./util/logger";
 import { safe, setAiRecordContent } from "./util/instrument";
 import { initInflux, reconfigureInflux, shutdownInflux } from "./metrics/InfluxWriter";
@@ -341,6 +343,16 @@ async function main() {
   // Sentry feedback import ledger — also the exemption source for the
   // inactivity sweeper (notes-only) and the SLA engines (fully exempt).
   const sentryFeedbackStore = new SentryFeedbackStore(prisma);
+  // Forwarded-email conversion (lite-seat forwards → conversation recreated
+  // for the original sender): ledger + service. The ledger also exempts the
+  // closed originals from native SLA evaluation when Intercom reopens them.
+  const forwardConvertStore = new ForwardConvertStore(prisma);
+  const forwardedEmailConverter = new ForwardedEmailConverter(
+    settingsStore,
+    intercomClient,
+    forwardConvertStore,
+    auditLogger
+  );
   const slaService = new SlaService(
     prisma,
     settingsStore,
@@ -352,7 +364,8 @@ async function main() {
     sessionStore,
     auditLogger,
     temporalProducers,
-    sentryFeedbackStore
+    sentryFeedbackStore,
+    forwardConvertStore
   );
   slaRuleStore.setOnChange(() => slaService.onRulesChanged());
   intercomExecutor.setSlaService(slaService);
@@ -360,6 +373,7 @@ async function main() {
   stripeWebhookHandler.setSlaService(slaService);
   intercomWebhookHandler.setSlaService(slaService);
   intercomWebhookHandler.setSentryFeedbackStore(sentryFeedbackStore);
+  intercomWebhookHandler.setForwardedEmailConverter(forwardedEmailConverter);
   sessionStore.setSlaHook((threadId) => slaService.onTicketTrigger(threadId, "refund_review"));
 
   // ---- Balanced assignment + bot-native SLA enforcement (Advanced tier:
@@ -416,7 +430,8 @@ async function main() {
     categoryLabelResolver,
     billingActionService,
     panelTokens,
-    panelSessions
+    panelSessions,
+    forwardedEmailConverter
   );
 
   const bot = new DiscordBot(

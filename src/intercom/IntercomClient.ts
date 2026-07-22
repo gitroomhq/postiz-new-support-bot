@@ -410,6 +410,61 @@ export class IntercomClient {
     );
   }
 
+  // Source-level view of one conversation for the forwarded-email converter:
+  // plaintext bodies (display_as=plaintext — no HTML stripping needed), the
+  // opening message's author identity, attachments (signed URLs expire, so
+  // fetch fresh right before re-uploading), and whether a human teammate
+  // already engaged (comment/note part authored by admin/team — assignment and
+  // state parts don't count as engagement).
+  async getConversationSource(conversationId: string): Promise<{
+    createdAt: Date | null;
+    open: boolean;
+    state: string | null;
+    subject: string | null;
+    authorType: string | null;
+    authorId: string | null;
+    authorEmail: string | null;
+    bodyPlain: string;
+    attachments: Array<{ name: string; url: string; contentType: string | null }>;
+    teamAssigneeId: string | null;
+    hasAgentPart: boolean;
+  }> {
+    const data = await this.json<{
+      created_at?: number;
+      open?: boolean;
+      state?: string;
+      team_assignee_id?: number | string | null;
+      source?: {
+        subject?: string | null;
+        body?: string | null;
+        author?: { type?: string; id?: string | number; email?: string | null };
+        attachments?: Array<{ name?: string | null; url?: string | null; content_type?: string | null }>;
+      };
+      conversation_parts?: { conversation_parts?: IntercomWebhookPart[] };
+    }>(`/conversations/${encodeURIComponent(conversationId)}?display_as=plaintext`, "GET", undefined, "conversation get");
+    const parts = data.conversation_parts?.conversation_parts ?? [];
+    return {
+      createdAt: data.created_at ? new Date(data.created_at * 1000) : null,
+      open: data.open === true,
+      state: data.state ?? null,
+      subject: data.source?.subject?.trim() || null,
+      authorType: data.source?.author?.type ?? null,
+      authorId: data.source?.author?.id != null ? String(data.source.author.id) : null,
+      authorEmail: data.source?.author?.email?.trim().toLowerCase() || null,
+      bodyPlain: data.source?.body ?? "",
+      attachments: (data.source?.attachments ?? [])
+        .filter((a): a is { name?: string | null; url: string; content_type?: string | null } => typeof a.url === "string" && a.url.length > 0)
+        .map((a) => ({ name: a.name?.trim() || "attachment", url: a.url, contentType: a.content_type ?? null })),
+      teamAssigneeId:
+        data.team_assignee_id != null && String(data.team_assignee_id) !== "0" ? String(data.team_assignee_id) : null,
+      hasAgentPart: parts.some(
+        (p) =>
+          (p.author?.type === "admin" || p.author?.type === "team") &&
+          (p.part_type === "comment" || p.part_type === "note")
+      ),
+    };
+  }
+
   // Contact-initiated conversation. The response is a Message object; the
   // conversation id lives in its conversation_id field. fromType must match
   // the contact's role — Intercom rejects type "user" with a lead id (the

@@ -194,6 +194,17 @@ export class IntercomWebhookHandler {
     this.sentryFeedbackStore = store;
   }
 
+  private forwardedEmailConverter: {
+    maybeConvertOnCreate(
+      conversationId: string,
+      payloadSource?: { subject?: string | null; author?: { type?: string; email?: string | null } }
+    ): Promise<"converted" | "skipped">;
+  } | null = null;
+
+  setForwardedEmailConverter(converter: NonNullable<IntercomWebhookHandler["forwardedEmailConverter"]>): void {
+    this.forwardedEmailConverter = converter;
+  }
+
   // SLA enforcement engine — bound late; owns the unsnooze re-anchor for the
   // next-reply clock.
   private slaEnforcer: { reanchorAfterUnsnooze(conversationId: string): Promise<void> } | null = null;
@@ -316,6 +327,15 @@ export class IntercomWebhookHandler {
     const conversationId = item?.id != null ? String(item.id) : null;
     if (!conversationId) return;
     const link = await this.store.getLinkByConversationId(conversationId).catch(() => null);
+    // Forwarded-email conversion: a lite-seat teammate's forward gets recreated
+    // for the original sender and THIS conversation closed — the balancer and
+    // SLA below must not touch the husk. "converted" also covers retried
+    // deliveries of an already-converted original (ledger hit). Throws ride the
+    // inbox activity's retry like every other transient failure here.
+    if (topic === "conversation.user.created" && !link && this.forwardedEmailConverter) {
+      const outcome = await this.forwardedEmailConverter.maybeConvertOnCreate(conversationId, item?.source);
+      if (outcome === "converted") return;
+    }
     // The conversation's team scopes its balanced-assignment pool + config
     // (Intercom's own routing rules set team_assignee_id; bridged tickets carry
     // the bot's routing team).
@@ -863,8 +883,10 @@ export class IntercomWebhookHandler {
 
   // Positive attribution gate for inbound events that would REOPEN a closed
   // Discord ticket: true only when the newest authored part is a non-bridge
-  // admin/team. Contact ("user"/"lead") activity is by definition the bridge's
-  // own mirror (customers have no Intercom access), bot/workflow and
+  // admin/team. Contact ("user"/"lead") activity on BRIDGED conversations is by
+  // definition the bridge's own mirror (customers have no Intercom access; the
+  // forwarded-email converter also posts contact parts, but only on native
+  // conversations, and every caller here is link-gated), bot/workflow and
   // unattributed parts are Intercom reacting to bridge activity — none of
   // those may boot a closed ticket. Better to drop a rare ambiguous agent
   // action (they can reopen in Discord) than to mass-reopen on every replay.

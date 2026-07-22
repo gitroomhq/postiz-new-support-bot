@@ -848,6 +848,32 @@ const STATEMENTS: string[] = [
   // ledger's ticket-id column for the sweeper/enforcer exemption lookups.
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "sentryFeedbackTicketTypeId" TEXT`,
   `ALTER TABLE "sentry_feedback_imports" ADD COLUMN IF NOT EXISTS "intercomTicketId" TEXT`,
+  // Forwarded-email conversion (lite-seat forwards → conversation recreated for
+  // the original sender): ledger table + the /intercom → Automation knobs.
+  `CREATE TABLE IF NOT EXISTS "forwarded_email_converts" (
+    "id" TEXT NOT NULL,
+    "originalConversationId" TEXT NOT NULL,
+    "newConversationId" TEXT,
+    "forwarderAdminId" TEXT,
+    "forwarderEmail" TEXT,
+    "customerEmail" TEXT NOT NULL,
+    "customerName" TEXT,
+    "intercomContactId" TEXT,
+    "contactRole" TEXT,
+    "trigger" TEXT NOT NULL,
+    "actorLabel" TEXT,
+    "attachmentsCount" INTEGER NOT NULL DEFAULT 0,
+    "attachmentsReuploaded" BOOLEAN NOT NULL DEFAULT false,
+    "convertedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT "forwarded_email_converts_pkey" PRIMARY KEY ("id")
+  )`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS "forwarded_email_converts_originalConversationId_key" ON "forwarded_email_converts"("originalConversationId")`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS "forwarded_email_converts_newConversationId_key" ON "forwarded_email_converts"("newConversationId")`,
+  `CREATE INDEX IF NOT EXISTS "forwarded_email_converts_convertedAt_idx" ON "forwarded_email_converts"("convertedAt")`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "forwardConvertEnabled" BOOLEAN NOT NULL DEFAULT false`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "forwardConvertTagName" TEXT NOT NULL DEFAULT 'email'`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "forwardConvertCloseNote" TEXT`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "forwardConvertActionLevel" TEXT NOT NULL DEFAULT 'admin'`,
 ];
 
 export async function ensureSchema(prisma: PrismaClient): Promise<void> {

@@ -207,6 +207,7 @@ export interface IntercomWebhookAuthor {
   id?: string | number;
   type?: string; // "admin" | "bot" | "team" | "user" | "lead"
   name?: string | null;
+  email?: string | null; // present on contact authors in webhook payloads
   avatar?: { image_url?: string | null } | string | null;
 }
 
@@ -226,6 +227,9 @@ export interface IntercomWebhookPart {
 export interface IntercomConversationItem {
   type?: string;
   id?: string | number;
+  // Opening message, present in created payloads — the forwarded-email
+  // converter's cheap pre-filter (authoritative data comes from a fresh GET).
+  source?: { subject?: string | null; author?: IntercomWebhookAuthor };
   conversation_parts?: { conversation_parts?: IntercomWebhookPart[] };
   admin_assignee_id?: number | string | null; // balanced assignment + assignee SLA dim
   team_assignee_id?: number | string | null; // scopes the balanced-assignment pool + per-team config

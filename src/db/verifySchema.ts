@@ -47,6 +47,7 @@ const EXPECTED_COLUMNS: Record<string, string[]> = {
     "sentryReadEnabled", "sentryReadToken", "sentryOrgSlug", "sentryProjectSlug", "sentryReadRegion",
     "sentryFeedbackTeamId", "sentryFeedbackWatermarkAt", "sentryFeedbackLastSyncAt", "sentryWebhookSecret",
     "sentryFeedbackTicketTypeId",
+    "forwardConvertEnabled", "forwardConvertTagName", "forwardConvertCloseNote", "forwardConvertActionLevel",
     "aiModel", "aiModelLight",
     "aiEffortAsk", "aiEffortCause", "aiMaxBudgetUsdAsk", "aiMaxBudgetUsdCause", "aiPostizPrefetchEnabled",
     "aiPreviousRunsEnabled",
@@ -120,6 +121,11 @@ const EXPECTED_COLUMNS: Record<string, string[]> = {
   sentry_feedback_imports: [
     "id", "sentryIssueId", "sentryShortId", "projectSlug", "status", "contactEmail", "contactName",
     "intercomContactId", "intercomConversationId", "intercomTicketId", "pageUrl", "feedbackAt", "importedAt",
+  ],
+  forwarded_email_converts: [
+    "id", "originalConversationId", "newConversationId", "forwarderAdminId", "forwarderEmail", "customerEmail",
+    "customerName", "intercomContactId", "contactRole", "trigger", "actorLabel", "attachmentsCount",
+    "attachmentsReuploaded", "convertedAt",
   ],
   ai_runs: [
     "id", "agentName", "kind", "source", "model", "outcome", "sessionId", "batchId", "numTurns", "durationMs",

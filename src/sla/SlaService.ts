@@ -11,6 +11,7 @@ import { SessionStore } from "../auth/SessionStore";
 import { AuditLogger } from "../bot/AuditLogger";
 import { TemporalProducers } from "../temporal/producers";
 import type { SentryFeedbackStore } from "../sentry/SentryFeedbackStore";
+import type { ForwardConvertStore } from "../intercom/ForwardConvertStore";
 import { log } from "../util/logger";
 import { metricCount } from "../util/instrument";
 
@@ -56,7 +57,8 @@ export class SlaService {
     private sessionStore: SessionStore,
     private auditLogger: AuditLogger,
     private producers: TemporalProducers | null,
-    private feedbackStore: SentryFeedbackStore | null = null
+    private feedbackStore: SentryFeedbackStore | null = null,
+    private forwardConvertStore: ForwardConvertStore | null = null
   ) {}
 
   // ---- trigger entry points (fire-and-forget safe, never throw) ----
@@ -149,6 +151,14 @@ export class SlaService {
     // webhook hooks and manual apply all route through here.
     if (this.feedbackStore && (await this.feedbackStore.getByConversationId(conversationId))) {
       return this.skipped("sentry-feedback-import");
+    }
+    // A converted forward's ORIGINAL is a closed teammate-authored husk; when
+    // the forwarder mails the same thread again Intercom auto-reopens it and
+    // the replied hook lands here — it must never grow SLA targets or clocks.
+    // (The RECREATED conversation has no ledger row by original id, so it
+    // flows through as a normal native subject.)
+    if (this.forwardConvertStore && (await this.forwardConvertStore.getByOriginalConversationId(conversationId))) {
+      return this.skipped("forward-converted-original");
     }
 
     const stateId = `c:${conversationId}`;
