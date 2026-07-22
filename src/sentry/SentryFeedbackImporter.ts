@@ -23,7 +23,7 @@ const MAX_PAGES = 10;
 // Import cap per tick (each import = up to ~5 Intercom writes). Overflow is
 // logged and picked up next tick — never a silent drop.
 const MAX_IMPORTS_PER_TICK = 25;
-// Politeness pacing between Intercom writes (InactivitySweeper idiom).
+// Politeness pacing between Intercom writes (shared sweep idiom).
 const WRITE_SPACING_MS = 400;
 const FEEDBACK_TAG = "sentry-feedback";
 

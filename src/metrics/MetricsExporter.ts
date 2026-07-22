@@ -132,27 +132,8 @@ export function exportIntercomWebhook(outcome: "accepted" | "rejected" | "buffer
 
 // One point per workspace inactivity sweep (native/unbridged conversations +
 // tickets) — errors > 0 is the alertable field.
-export function exportIntercomSweep(p: {
-  scanned: number;
-  agentReminders: number;
-  customerNags: number;
-  closed: number;
-  errors: number;
-}): void {
-  writePoint(
-    "intercom_sweep",
-    {},
-    {
-      scanned: p.scanned,
-      agent_reminders: p.agentReminders,
-      customer_nags: p.customerNags,
-      closed: p.closed,
-      errors: p.errors,
-    }
-  );
-}
-
-// One point per SLA enforcement tick (bot-native clocks + assignment) —
+// One point per SLA enforcement tick (bot-native clocks + assignment +
+// customer-idle nag/auto-close, the former inactivity sweep folded in) —
 // errors > 0 is the alertable field; capped = the write budget ran out.
 export function exportSlaEnforce(p: {
   scanned: number;
@@ -160,6 +141,8 @@ export function exportSlaEnforce(p: {
   breaches: number;
   recoveries: number;
   assigned: number;
+  customerNags: number;
+  closed: number;
   errors: number;
   capped: number;
 }): void {
@@ -172,6 +155,8 @@ export function exportSlaEnforce(p: {
       breaches: p.breaches,
       recoveries: p.recoveries,
       assigned: p.assigned,
+      customer_nags: p.customerNags,
+      closed: p.closed,
       errors: p.errors,
       capped: p.capped,
     }

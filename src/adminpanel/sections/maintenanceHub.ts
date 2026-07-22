@@ -8,7 +8,6 @@ import { AdminHubContext, ActionRequest, HubModule, SaveRequest } from "./types"
 
 export function makeMaintenanceHub(deps: {
   resetBridgeData: () => Promise<string>;
-  runInactivityNow: () => Promise<string>;
   runSlaNow: () => Promise<string>;
 }): HubModule {
   return {
@@ -23,8 +22,7 @@ export function makeMaintenanceHub(deps: {
           title: "Run now",
           fields: [],
           actions: [
-            { key: "run_inactivity", label: "Run inactivity sweep now", style: "secondary" },
-            { key: "run_sla", label: "Run SLA / assignment sweep now", style: "secondary" },
+            { key: "run_sla", label: "Run SLA / customer-idle / assignment sweep now", style: "secondary" },
           ],
         },
         {
@@ -55,11 +53,8 @@ export function makeMaintenanceHub(deps: {
 
     async action(ctx: AdminHubContext, req: ActionRequest): Promise<ActionResult> {
       switch (req.key) {
-        case "run_inactivity":
-          await ctx.audit("manual inactivity sweep");
-          return { ok: true, text: await deps.runInactivityNow() };
         case "run_sla":
-          await ctx.audit("manual sla/assignment sweep");
+          await ctx.audit("manual sla/customer-idle/assignment sweep");
           return { ok: true, text: await deps.runSlaNow() };
         case "revoke_admin": {
           const n = await ctx.settings.bumpAdminPanelEpoch();

@@ -6,6 +6,8 @@ import { zonedTimeToUtc, type OfficeHoursSchedule } from "../businessTime";
 
 const MIN = 60_000;
 const HOUR = 60 * MIN;
+// Recurring-nag interval used across the clock tests (4h of business time).
+const NAG = 240 * MIN;
 
 const T0 = new Date("2026-07-13T09:00:00Z"); // Monday
 
@@ -27,9 +29,11 @@ function markers(overrides: Partial<ClockMarkers> = {}): ClockMarkers {
     frVerifyNoneAt: null,
     frWarnedAt: null,
     frBreachedAt: null,
+    frLastNaggedAt: null,
     nrCycleAnchor: null,
     nrWarnedAt: null,
     nrBreachedAt: null,
+    nrLastNaggedAt: null,
     resWarnedAt: null,
     resBreachedAt: null,
     ...overrides,
@@ -50,35 +54,52 @@ function clock(ev: ReturnType<typeof evaluateClocks>, kind: string) {
 
 test("FR progresses ok → at_risk → breached with exact warnPct boundary", () => {
   const t = target({ firstReplyMins: 60 });
-  const ok = evaluateClocks(input(), t, 80, null, markers(), at(47 * MIN));
+  const ok = evaluateClocks(input(), t, 80, null, markers(), at(47 * MIN), NAG);
   assert.equal(ok.overall, "ok");
   assert.deepEqual(ok.actions.newMarkers, {});
   assert.equal(ok.actions.breachNotes.length, 0);
 
-  const warn = evaluateClocks(input(), t, 80, null, markers(), at(48 * MIN)); // exactly 80%
+  const warn = evaluateClocks(input(), t, 80, null, markers(), at(48 * MIN), NAG); // exactly 80%
   assert.equal(warn.overall, "at_risk");
   assert.ok(warn.actions.newMarkers.frWarnedAt);
   assert.equal(warn.actions.breachNotes.length, 0);
 
-  const breach = evaluateClocks(input(), t, 80, null, markers({ frWarnedAt: at(48 * MIN) }), at(60 * MIN));
+  const breach = evaluateClocks(input(), t, 80, null, markers({ frWarnedAt: at(48 * MIN) }), at(60 * MIN), NAG);
   assert.equal(breach.overall, "breached");
   assert.ok(breach.actions.newMarkers.frBreachedAt);
+  assert.ok(breach.actions.newMarkers.frLastNaggedAt); // first nag stamped
   assert.deepEqual(breach.actions.breachNotes.map((n) => n.clock), ["first_reply"]);
 });
 
-test("FR breach note is emitted exactly once (marker dedup)", () => {
+test("FR breach re-nags on the business-time cadence, not before", () => {
   const t = target();
-  const again = evaluateClocks(
+  // Nagged 30 min ago (< NAG) → no re-nag yet, breach marker untouched.
+  const soon = evaluateClocks(
     input(),
     t,
     80,
     null,
-    markers({ frWarnedAt: at(48 * MIN), frBreachedAt: at(60 * MIN) }),
+    markers({ frWarnedAt: at(48 * MIN), frBreachedAt: at(60 * MIN), frLastNaggedAt: at(60 * MIN) }),
     at(90 * MIN),
+    NAG,
   );
-  assert.equal(again.overall, "breached");
-  assert.equal(again.actions.breachNotes.length, 0);
-  assert.equal(again.actions.newMarkers.frBreachedAt, undefined);
+  assert.equal(soon.overall, "breached");
+  assert.equal(soon.actions.breachNotes.length, 0);
+  assert.equal(soon.actions.newMarkers.frLastNaggedAt, undefined);
+  assert.equal(soon.actions.newMarkers.frBreachedAt, undefined);
+
+  // A full NAG interval after the last nag → re-nag fires and restamps.
+  const due = evaluateClocks(
+    input(),
+    t,
+    80,
+    null,
+    markers({ frWarnedAt: at(48 * MIN), frBreachedAt: at(60 * MIN), frLastNaggedAt: at(60 * MIN) }),
+    at(60 * MIN + NAG),
+    NAG,
+  );
+  assert.deepEqual(due.actions.breachNotes.map((n) => n.clock), ["first_reply"]);
+  assert.equal(due.actions.newMarkers.frLastNaggedAt?.getTime(), at(60 * MIN + NAG).getTime());
 });
 
 test("bridged FR satisfied by raw stats; recovery after breach stops alerting", () => {
@@ -88,8 +109,9 @@ test("bridged FR satisfied by raw stats; recovery after breach stops alerting", 
     t,
     80,
     null,
-    markers({ frWarnedAt: at(48 * MIN), frBreachedAt: at(60 * MIN) }),
+    markers({ frWarnedAt: at(48 * MIN), frBreachedAt: at(60 * MIN), frLastNaggedAt: at(60 * MIN) }),
     at(120 * MIN),
+    NAG,
   );
   // Satisfied → FR contributes nothing (overall ok, no actions)
   assert.equal(ev.overall, "ok");
@@ -106,6 +128,7 @@ test("native FR with unverified admin reply emits needsFirstReplyVerify and supp
     null,
     markers(),
     at(90 * MIN),
+    NAG,
   );
   assert.equal(ev.needsFirstReplyVerify, true);
   assert.equal(ev.overall, "ok"); // suppressed until verified
@@ -122,6 +145,7 @@ test("native FR verified human reply satisfies; verified-none alerts without re-
     null,
     markers({ frHumanReplyAt: at(5 * MIN) }),
     at(90 * MIN),
+    NAG,
   );
   assert.equal(satisfied.overall, "ok");
   assert.equal(satisfied.needsFirstReplyVerify, false);
@@ -134,6 +158,7 @@ test("native FR verified human reply satisfies; verified-none alerts without re-
     null,
     markers({ frVerifyNoneAt: at(10 * MIN) }),
     at(90 * MIN),
+    NAG,
   );
   assert.equal(verifiedNone.needsFirstReplyVerify, false);
   assert.equal(verifiedNone.overall, "breached");
@@ -147,6 +172,7 @@ test("native FR verified human reply satisfies; verified-none alerts without re-
     null,
     markers({ frVerifyNoneAt: at(10 * MIN) }),
     at(90 * MIN),
+    NAG,
   );
   assert.equal(reverify.needsFirstReplyVerify, true);
   assert.equal(reverify.overall, "ok");
@@ -154,20 +180,20 @@ test("native FR verified human reply satisfies; verified-none alerts without re-
 
 test("native FR with NO admin reply at all alerts directly (nothing to verify)", () => {
   const t = target();
-  const ev = evaluateClocks(input({ kind: "native" }), t, 80, null, markers(), at(90 * MIN));
+  const ev = evaluateClocks(input({ kind: "native" }), t, 80, null, markers(), at(90 * MIN), NAG);
   assert.equal(ev.needsFirstReplyVerify, false);
   assert.equal(ev.overall, "breached");
 });
 
 test("NRT is idle until FR satisfied when an FR clock exists", () => {
   const t = target({ firstReplyMins: 60, nextReplyMins: 30 });
-  const ev = evaluateClocks(input({ waitingSince: T0 }), t, 80, null, markers(), at(50 * MIN));
+  const ev = evaluateClocks(input({ waitingSince: T0 }), t, 80, null, markers(), at(50 * MIN), NAG);
   assert.equal(clock(ev, "next_reply"), undefined); // FR owns the first wait
   assert.ok(clock(ev, "first_reply"));
 
   // Without an FR clock on the target, NRT runs from waiting_since immediately
   const nrOnly = target({ firstReplyMins: undefined, nextReplyMins: 30 });
-  const ev2 = evaluateClocks(input({ waitingSince: T0 }), nrOnly, 80, null, markers(), at(50 * MIN));
+  const ev2 = evaluateClocks(input({ waitingSince: T0 }), nrOnly, 80, null, markers(), at(50 * MIN), NAG);
   const nr = clock(ev2, "next_reply");
   assert.ok(nr);
   assert.equal(nr.state, "breached");
@@ -175,35 +201,51 @@ test("NRT is idle until FR satisfied when an FR clock exists", () => {
 
 test("NRT cycles: new waiting_since resets markers and re-alerts; recovery clears the cycle", () => {
   const t = target({ firstReplyMins: undefined, nextReplyMins: 30 });
-  // Cycle 1 breached and noted
-  const cycle1 = evaluateClocks(input({ waitingSince: T0 }), t, 80, null, markers(), at(40 * MIN));
+  // Cycle 1 breached and nagged
+  const cycle1 = evaluateClocks(input({ waitingSince: T0 }), t, 80, null, markers(), at(40 * MIN), NAG);
   assert.deepEqual(cycle1.actions.breachNotes.map((n) => n.clock), ["next_reply"]);
   assert.equal(cycle1.actions.newMarkers.nrCycleAnchor?.getTime(), T0.getTime());
+  assert.equal(cycle1.actions.newMarkers.nrLastNaggedAt?.getTime(), at(40 * MIN).getTime());
 
-  // Same cycle later → no re-note
+  // Same cycle, nagged recently → no re-note
   const same = evaluateClocks(
     input({ waitingSince: T0 }),
     t,
     80,
     null,
-    markers({ nrCycleAnchor: T0, nrWarnedAt: at(24 * MIN), nrBreachedAt: at(30 * MIN) }),
+    markers({ nrCycleAnchor: T0, nrWarnedAt: at(24 * MIN), nrBreachedAt: at(30 * MIN), nrLastNaggedAt: at(40 * MIN) }),
     at(50 * MIN),
+    NAG,
   );
   assert.equal(same.actions.breachNotes.length, 0);
 
-  // Teammate replied → waiting_since clears → cycle cleared
+  // Same cycle, a full NAG interval later → re-nag
+  const renag = evaluateClocks(
+    input({ waitingSince: T0 }),
+    t,
+    80,
+    null,
+    markers({ nrCycleAnchor: T0, nrWarnedAt: at(24 * MIN), nrBreachedAt: at(30 * MIN), nrLastNaggedAt: at(40 * MIN) }),
+    at(40 * MIN + NAG),
+    NAG,
+  );
+  assert.deepEqual(renag.actions.breachNotes.map((n) => n.clock), ["next_reply"]);
+
+  // Teammate replied → waiting_since clears → cycle cleared (incl. nag marker)
   const recovered = evaluateClocks(
     input({ waitingSince: null }),
     t,
     80,
     null,
-    markers({ nrCycleAnchor: T0, nrWarnedAt: at(24 * MIN), nrBreachedAt: at(30 * MIN) }),
+    markers({ nrCycleAnchor: T0, nrWarnedAt: at(24 * MIN), nrBreachedAt: at(30 * MIN), nrLastNaggedAt: at(40 * MIN) }),
     at(60 * MIN),
+    NAG,
   );
   assert.equal(recovered.overall, "ok");
   assert.equal(recovered.actions.newMarkers.nrCycleAnchor, null);
   assert.equal(recovered.actions.newMarkers.nrWarnedAt, null);
   assert.equal(recovered.actions.newMarkers.nrBreachedAt, null);
+  assert.equal(recovered.actions.newMarkers.nrLastNaggedAt, null);
 
   // Customer writes again → NEW cycle (fresh anchor, re-alert at threshold)
   const waiting2 = at(2 * HOUR);
@@ -214,6 +256,7 @@ test("NRT cycles: new waiting_since resets markers and re-alerts; recovery clear
     null,
     markers(),
     new Date(waiting2.getTime() + 31 * MIN),
+    NAG,
   );
   assert.deepEqual(cycle2.actions.breachNotes.map((n) => n.clock), ["next_reply"]);
   assert.equal(cycle2.actions.newMarkers.nrCycleAnchor?.getTime(), waiting2.getTime());
@@ -229,6 +272,7 @@ test("NRT unsnooze re-anchor: stored anchor later than waiting_since wins", () =
     null,
     markers({ nrCycleAnchor: reanchoredTo }),
     new Date(reanchoredTo.getTime() + 10 * MIN),
+    NAG,
   );
   const nr = clock(ev, "next_reply");
   assert.ok(nr);
@@ -236,18 +280,30 @@ test("NRT unsnooze re-anchor: stored anchor later than waiting_since wins", () =
   assert.equal(nr.state, "ok"); // only 10 min into the re-anchored cycle
 });
 
-test("resolution clock runs from createdAt and notes once", () => {
+test("resolution clock runs from createdAt and notes once (no re-nag)", () => {
   const t = target({ firstReplyMins: undefined, resolveMins: 120 });
-  const ev = evaluateClocks(input(), t, 80, null, markers(), at(121 * MIN));
+  const ev = evaluateClocks(input(), t, 80, null, markers(), at(121 * MIN), NAG);
   const res = clock(ev, "resolution");
   assert.ok(res);
   assert.equal(res.state, "breached");
   assert.deepEqual(ev.actions.breachNotes.map((n) => n.clock), ["resolution"]);
+
+  // Already stamped → resolution never re-notes, no matter how long it stays breached.
+  const later = evaluateClocks(
+    input(),
+    t,
+    80,
+    null,
+    markers({ resWarnedAt: at(96 * MIN), resBreachedAt: at(120 * MIN) }),
+    at(120 * MIN + 2 * NAG),
+    NAG,
+  );
+  assert.equal(later.actions.breachNotes.length, 0);
 });
 
 test("snoozed conversations are inert", () => {
   const t = target({ firstReplyMins: 60, nextReplyMins: 30, resolveMins: 120 });
-  const ev = evaluateClocks(input({ snoozed: true, waitingSince: T0 }), t, 80, null, markers(), at(10 * HOUR));
+  const ev = evaluateClocks(input({ snoozed: true, waitingSince: T0 }), t, 80, null, markers(), at(10 * HOUR), NAG);
   assert.equal(ev.overall, "ok");
   assert.equal(ev.clocks.length, 0);
   assert.deepEqual(ev.actions.newMarkers, {});
@@ -272,7 +328,7 @@ test("office-hours schedule pauses elapsed time", () => {
   const friday16 = new Date(zonedTimeToUtc(2026, 7, 10, 16, 0, "UTC"));
   const monday0930 = new Date(zonedTimeToUtc(2026, 7, 13, 9, 30, "UTC"));
   const t = target({ firstReplyMins: 240 }); // 4h business
-  const ev = evaluateClocks(input({ createdAt: friday16 }), t, 80, s, markers(), monday0930);
+  const ev = evaluateClocks(input({ createdAt: friday16 }), t, 80, s, markers(), monday0930, NAG);
   const fr = clock(ev, "first_reply");
   assert.ok(fr);
   // 1h Friday + 0.5h Monday = 1.5h elapsed — far from the 4h target
@@ -282,9 +338,43 @@ test("office-hours schedule pauses elapsed time", () => {
   assert.equal(fr.deadline?.getTime(), zonedTimeToUtc(2026, 7, 13, 12, 0, "UTC"));
 });
 
+test("re-nag cadence honors office hours (overnight gap does not count)", () => {
+  const s: OfficeHoursSchedule = {
+    tz: "UTC",
+    week: {
+      mon: [{ start: "09:00", end: "17:00" }],
+      tue: [{ start: "09:00", end: "17:00" }],
+      wed: [{ start: "09:00", end: "17:00" }],
+      thu: [{ start: "09:00", end: "17:00" }],
+      fri: [{ start: "09:00", end: "17:00" }],
+      sat: [],
+      sun: [],
+    },
+    holidays: [],
+  };
+  const t = target({ firstReplyMins: 60 });
+  // Nagged Monday 16:30; next business tick Tuesday 09:30. Wall-clock gap is
+  // 17h, but business time between them is only 30min (16:30→17:00) + 30min
+  // (09:00→09:30) = 1h < 4h → NOT due yet, even though a full day passed.
+  const lastNag = new Date(zonedTimeToUtc(2026, 7, 13, 16, 30, "UTC"));
+  const tue0930 = new Date(zonedTimeToUtc(2026, 7, 14, 9, 30, "UTC"));
+  const created = new Date(zonedTimeToUtc(2026, 7, 13, 9, 0, "UTC"));
+  const ev = evaluateClocks(
+    input({ createdAt: created }),
+    t,
+    80,
+    s,
+    markers({ frWarnedAt: created, frBreachedAt: created, frLastNaggedAt: lastNag }),
+    tue0930,
+    NAG,
+  );
+  assert.equal(clock(ev, "first_reply")?.state, "breached");
+  assert.equal(ev.actions.breachNotes.length, 0); // business-time gap < NAG
+});
+
 test("overall is worst-of and per-target warnPct override applies", () => {
   const t = target({ firstReplyMins: 60, resolveMins: 600, warnPct: 50 });
-  const ev = evaluateClocks(input(), t, 80, null, markers(), at(31 * MIN));
+  const ev = evaluateClocks(input(), t, 80, null, markers(), at(31 * MIN), NAG);
   // FR at 31/60 min with warnPct 50 → at_risk; RES at 31/600 → ok
   assert.equal(clock(ev, "first_reply")?.state, "at_risk");
   assert.equal(clock(ev, "resolution")?.state, "ok");

@@ -24,9 +24,12 @@ import type { SlaTargetEntry } from "./types";
 //   conversations, so a closed subject simply leaves the population (status
 //   attribute + tag intentionally keep their last value as history).
 //
-// at_risk fires at warnPct% of the target, breached at 100%. Both are
-// transition-edged via the markers (one warn + one breach per clock per
-// cycle). Snoozed conversations are inert.
+// at_risk fires at warnPct% of the target, breached at 100%. at_risk is
+// transition-edged (one warn per clock per cycle). Breach of the first_reply /
+// next_reply clocks RE-NAGS: the breach note is re-emitted every nagRepeatMs of
+// business time while the clock stays breached (the *LastNaggedAt markers pace
+// it). The resolution clock keeps a single one-shot breach note. Snoozed
+// conversations are inert.
 
 export type ClockKind = "first_reply" | "next_reply" | "resolution";
 export type ClockState = "ok" | "at_risk" | "breached";
@@ -45,9 +48,11 @@ export interface ClockMarkers {
   frVerifyNoneAt: Date | null; // last parts-verify that found none
   frWarnedAt: Date | null;
   frBreachedAt: Date | null;
+  frLastNaggedAt: Date | null; // last recurring agent nag for a breached first-reply clock
   nrCycleAnchor: Date | null;
   nrWarnedAt: Date | null;
   nrBreachedAt: Date | null;
+  nrLastNaggedAt: Date | null; // last recurring agent nag for a breached next-reply clock (reset with the cycle)
   resWarnedAt: Date | null;
   resBreachedAt: Date | null;
 }
@@ -95,6 +100,7 @@ export function evaluateClocks(
   schedule: OfficeHoursSchedule | null,
   markers: ClockMarkers,
   now: Date,
+  nagRepeatMs: number,
 ): ClockEvaluation {
   const empty: ClockEvaluation = {
     overall: "ok",
@@ -110,6 +116,10 @@ export function evaluateClocks(
   const breachNotes: Array<{ clock: ClockKind; deadline: Date | null }> = [];
   let needsFirstReplyVerify = false;
   const states: ClockState[] = [];
+  // Recurring nag is due when we never nagged this breach cycle, or a full
+  // nagRepeatMs of BUSINESS time has elapsed since the last nag.
+  const nagDue = (lastNaggedAt: Date | null): boolean =>
+    lastNaggedAt == null || businessMsBetween(schedule, lastNaggedAt, now) >= nagRepeatMs;
 
   // ---- first reply ----
   const frTargetMs = (target.firstReplyMins ?? 0) * MIN_MS;
@@ -137,9 +147,12 @@ export function evaluateClocks(
         clocks.push({ kind: "first_reply", state, elapsedBizMs: elapsed, targetMs: frTargetMs, deadline, anchor: input.createdAt });
         states.push(state);
         if (state !== "ok" && markers.frWarnedAt == null) newMarkers.frWarnedAt = now;
-        if (state === "breached" && markers.frBreachedAt == null) {
-          newMarkers.frBreachedAt = now;
-          breachNotes.push({ clock: "first_reply", deadline });
+        if (state === "breached") {
+          if (markers.frBreachedAt == null) newMarkers.frBreachedAt = now;
+          if (nagDue(markers.frLastNaggedAt)) {
+            newMarkers.frLastNaggedAt = now;
+            breachNotes.push({ clock: "first_reply", deadline });
+          }
         }
       } else {
         clocks.push({ kind: "first_reply", state: "ok", elapsedBizMs: elapsed, targetMs: frTargetMs, deadline, anchor: input.createdAt });
@@ -159,6 +172,7 @@ export function evaluateClocks(
         newMarkers.nrCycleAnchor = null;
         newMarkers.nrWarnedAt = null;
         newMarkers.nrBreachedAt = null;
+        newMarkers.nrLastNaggedAt = null;
       }
     } else {
       const waiting = input.waitingSince as Date;
@@ -169,10 +183,12 @@ export function evaluateClocks(
       const anchor = isNewCycle ? waiting : (stored as Date);
       const warned = isNewCycle ? null : markers.nrWarnedAt;
       const breached = isNewCycle ? null : markers.nrBreachedAt;
+      const lastNagged = isNewCycle ? null : markers.nrLastNaggedAt;
       if (isNewCycle) {
         newMarkers.nrCycleAnchor = waiting;
         newMarkers.nrWarnedAt = null;
         newMarkers.nrBreachedAt = null;
+        newMarkers.nrLastNaggedAt = null;
       }
       const elapsed = businessMsBetween(schedule, anchor, now);
       const warnMs = (nrTargetMs * warnPct) / 100;
@@ -181,9 +197,12 @@ export function evaluateClocks(
       clocks.push({ kind: "next_reply", state, elapsedBizMs: elapsed, targetMs: nrTargetMs, deadline, anchor });
       states.push(state);
       if (state !== "ok" && warned == null) newMarkers.nrWarnedAt = now;
-      if (state === "breached" && breached == null) {
-        newMarkers.nrBreachedAt = now;
-        breachNotes.push({ clock: "next_reply", deadline });
+      if (state === "breached") {
+        if (breached == null) newMarkers.nrBreachedAt = now;
+        if (nagDue(lastNagged)) {
+          newMarkers.nrLastNaggedAt = now;
+          breachNotes.push({ clock: "next_reply", deadline });
+        }
       }
     }
   }

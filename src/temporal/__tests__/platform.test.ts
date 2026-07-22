@@ -109,11 +109,6 @@ test("disputes-loop starts at generation 1", () => {
   assert.equal(LOOPER_GENERATIONS[SINGLETONS.disputesLoop], 1);
 });
 
-test("intercom-inactivity-loop starts at generation 1", () => {
-  // Bump IN THE SAME COMMIT as any history-incompatible inactivityLoopWorkflow change.
-  assert.equal(LOOPER_GENERATIONS[SINGLETONS.inactivityLoop], 1);
-});
-
 test("looperStartOptions stamps the code generation into the memo", () => {
   const opts = looperStartOptions(SINGLETONS.disputesLoop);
   assert.deepEqual(opts, { memo: { [LOOPER_GEN_MEMO_KEY]: 1 } });

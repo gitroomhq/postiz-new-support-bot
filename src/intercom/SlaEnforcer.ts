@@ -6,7 +6,7 @@ import type { IntercomSweepConversation } from "./types";
 import type { AssignmentService, WithAuthor } from "./AssignmentService";
 import type { SentryFeedbackStore } from "../sentry/SentryFeedbackStore";
 import type { SlaEnforceResult } from "../temporal/types";
-import { evaluateClocks, CLOCK_LABELS, type ClockEvaluation, type ClockInput, type ClockMarkers } from "../sla/clocks";
+import { evaluateClocks, CLOCK_LABELS, type ClockEvaluation, type ClockInput, type ClockKind, type ClockMarkers } from "../sla/clocks";
 import { hasClockDurations, type SlaTargetEntry } from "../sla/types";
 import { exportSlaEnforce } from "../metrics/MetricsExporter";
 import { formatDuration } from "../util/format";
@@ -14,16 +14,23 @@ import { log } from "../util/logger";
 
 const enforceLog = log.child("sla:enforce");
 
-// Same politeness budget as the inactivity sweeper: paced writes, hard cap
-// per tick (later ticks finish the backlog), logged when hit.
+// Paced writes, hard cap per tick (later ticks finish the backlog), logged when
+// hit. Shared across the assignment, clock (recurring nag) and customer-idle
+// passes so no single tick can outrun the spacing or the write cap.
 const WRITE_SPACING_MS = 400;
 const MAX_WRITES_PER_SWEEP = 100;
 // 150/page → 12k open conversations. Beyond that we stop scanning (and say so).
 const MAX_PAGES = 80;
 // Chunk size for `IN (...)` batch lookups.
 const DB_CHUNK = 500;
+const DAY_MS = 24 * 60 * 60 * 1000;
 
 const AUTOMATION_MARKER = "automated by the support bot";
+
+// Customer-idle nag default copy; /config text overrides ({days}) replace it.
+const DEFAULT_CUSTOMER_NAG =
+  "Are you still there? We haven't heard back from you; this conversation will be closed automatically if we don't hear from you.";
+const renderDays = (template: string, days: number): string => template.split("{days}").join(String(days));
 
 function chunk<T>(items: T[], size: number): T[][] {
   const out: T[][] = [];
@@ -40,9 +47,11 @@ interface StateRow {
   frVerifyNoneAt: Date | null;
   frWarnedAt: Date | null;
   frBreachedAt: Date | null;
+  frLastNaggedAt: Date | null;
   nrCycleAnchor: Date | null;
   nrWarnedAt: Date | null;
   nrBreachedAt: Date | null;
+  nrLastNaggedAt: Date | null;
   resWarnedAt: Date | null;
   resBreachedAt: Date | null;
   lastStatusWritten: string | null;
@@ -52,15 +61,24 @@ interface StateRow {
 }
 
 // The bot-native SLA engine's enforcement tick (Intercom Advanced has no
-// native SLAs). One paged open-conversation scan powers BOTH jobs:
+// native SLAs). ONE paged open-conversation scan powers all three jobs:
 //  - assignment stray sweep: open conversations with no admin assignee are
 //    routed through the hybrid balancer (AssignmentService);
 //  - SLA clocks: per-conversation business-time clock evaluation with
-//    Intercom-only alerting — the SLA Status attribute (ok/at_risk/breached),
-//    the breach tag (added on breach, removed on recovery) and ONE internal
-//    note per breached clock per cycle. at_risk flips the attribute only.
-// All state markers live in sla_states; every write is transition-edged and
-// idempotent, every item is best-effort.
+//    Intercom-only alerting — the SLA Status attribute (ok/at_risk/breached)
+//    and the breach tag (added on breach, removed on recovery). at_risk flips
+//    the attribute only; a breached first-reply/next-reply clock RE-NAGS with
+//    an internal note every slaNagRepeatMins of business time while it stays
+//    breached (the recurring "agent nag" — bridged + native alike, gated on
+//    breach: a conversation with no SLA target never nags). Resolution keeps
+//    its single one-shot note;
+//  - customer-idle sweep (NATIVE conversations only, gated on inactivityEnabled
+//    — bridged tickets are the per-ticket workflow's job): after the agent
+//    spoke last and the customer went silent, an outbound nag, then auto-close
+//    (+ native ticket) after N unanswered nags. Calendar-time, independent of
+//    the SLA clocks; dampers live in intercom_sweep_state.
+// SLA markers live in sla_states; every write is transition-edged/idempotent
+// and every item is best-effort. The three passes share one write budget.
 export class SlaEnforcer {
   private tagIdCache: { name: string; id: string } | null = null;
 
@@ -81,7 +99,7 @@ export class SlaEnforcer {
     await this.prisma.slaState
       .updateMany({
         where: { conversationId },
-        data: { nrCycleAnchor: new Date(), nrWarnedAt: null, nrBreachedAt: null },
+        data: { nrCycleAnchor: new Date(), nrWarnedAt: null, nrBreachedAt: null, nrLastNaggedAt: null },
       })
       .catch(() => undefined);
   }
@@ -96,6 +114,8 @@ export class SlaEnforcer {
       tagged: 0,
       untagged: 0,
       notes: 0,
+      customerNags: 0,
+      closed: 0,
       verifies: 0,
       errors: 0,
       capped: false,
@@ -104,7 +124,12 @@ export class SlaEnforcer {
     if (!this.settingsStore.intercomConfigured()) return result;
     const doClocks = this.settingsStore.slaEnabled() || force;
     const doAssign = this.settingsStore.anyAssignmentEnabled() || force;
-    if (!doClocks && !doAssign) return result;
+    // Customer-idle nag + auto-close (native conversations). Outbound nags are
+    // customer-visible, so they need a human admin author; without one the pass
+    // is inert even when enabled.
+    const inactivityAuthorId = this.settingsStore.intercomAdminId() ?? this.settingsStore.intercomAuthorAdminId();
+    const doInactivity = (this.settingsStore.inactivityEnabled() || force) && !!inactivityAuthorId;
+    if (!doClocks && !doAssign && !doInactivity) return result;
     result.skipped = false;
 
     // ---- one paged scan of every open conversation ----
@@ -210,6 +235,8 @@ export class SlaEnforcer {
     if (doClocks) {
       const targets = new Map(this.settingsStore.slaTargets().map((t) => [t.value, t]));
       const warnPct = this.settingsStore.slaWarnPct();
+      const nagRepeatMs = this.settingsStore.slaNagRepeatMins() * 60_000;
+      const nagNoteText = this.settingsStore.slaNagNoteText();
       const attrName = this.settingsStore.slaAttributeName();
       const statusAttrName = this.settingsStore.slaStatusAttributeName();
       // Office-hours schedule is resolved per conversation from its team
@@ -219,6 +246,13 @@ export class SlaEnforcer {
         const key = teamId ?? "";
         if (!scheduleCache.has(key)) scheduleCache.set(key, this.settingsStore.resolveOfficeHours(teamId));
         return scheduleCache.get(key) ?? null;
+      };
+      // {team} in a custom nag note names the conversation's assigned team;
+      // /teams is client-cached, so this is ~one API call per team per tick.
+      const teamNameFor = async (teamId: string | null): Promise<string> => {
+        const id = teamId ?? this.settingsStore.intercomTeamId();
+        const name = id ? await this.client.getTeamNameCached(id).catch(() => null) : null;
+        return name ?? "the support team";
       };
       // One warn per tick when the status attribute definition is missing —
       // not one per conversation per tick.
@@ -250,6 +284,9 @@ export class SlaEnforcer {
             budget,
             paced,
             result,
+            nagRepeatMs,
+            nagNoteText,
+            teamNameFor,
             statusAttrBroken: () => statusAttrBroken,
             markStatusAttrBroken: () => {
               statusAttrBroken = true;
@@ -266,12 +303,41 @@ export class SlaEnforcer {
       }
     }
 
+    // ---- customer-idle pass (native conversations only) ----
+    if (doInactivity && inactivityAuthorId) {
+      const customerWaitMs = Math.max(1, this.settingsStore.inactivityCustomerWaitDays()) * DAY_MS;
+      const nagsBeforeClose = Math.max(1, this.settingsStore.inactivityNagsBeforeClose());
+      const nagText = this.settingsStore.inactivityNagText();
+      for (const conv of items) {
+        if (!budget()) break;
+        if (!notSnoozed(conv)) continue;
+        // Bridged tickets are the per-ticket workflow's job (Discord-side
+        // customer reminders); their agent nag is the clock pass above.
+        if (linkByConv.has(conv.id)) continue;
+        try {
+          await this.enforceCustomerIdle(conv, inactivityAuthorId, customerWaitMs, nagsBeforeClose, nagText, feedbackByConv, now, {
+            budget,
+            paced,
+            result,
+          });
+        } catch (e) {
+          result.errors++;
+          enforceLog.warn("sla.enforce.customer_idle_failed", {
+            "intercom.conversation_id": conv.id,
+            "error.message": e instanceof Error ? e.message : String(e),
+          });
+        }
+      }
+    }
+
     exportSlaEnforce({
       scanned: result.scanned,
       statusWrites: result.statusWrites,
       breaches: result.notes,
       recoveries: result.untagged,
       assigned: result.assigned,
+      customerNags: result.customerNags,
+      closed: result.closed,
       errors: result.errors,
       capped: result.capped ? 1 : 0,
     });
@@ -283,6 +349,8 @@ export class SlaEnforcer {
       "sla.tagged": result.tagged,
       "sla.untagged": result.untagged,
       "sla.notes": result.notes,
+      "sla.customer_nags": result.customerNags,
+      "sla.closed": result.closed,
       "sla.verifies": result.verifies,
       "sla.errors": result.errors,
     });
@@ -295,9 +363,11 @@ export class SlaEnforcer {
       frVerifyNoneAt: state?.frVerifyNoneAt ?? null,
       frWarnedAt: state?.frWarnedAt ?? null,
       frBreachedAt: state?.frBreachedAt ?? null,
+      frLastNaggedAt: state?.frLastNaggedAt ?? null,
       nrCycleAnchor: state?.nrCycleAnchor ?? null,
       nrWarnedAt: state?.nrWarnedAt ?? null,
       nrBreachedAt: state?.nrBreachedAt ?? null,
+      nrLastNaggedAt: state?.nrLastNaggedAt ?? null,
       resWarnedAt: state?.resWarnedAt ?? null,
       resBreachedAt: state?.resBreachedAt ?? null,
     };
@@ -317,6 +387,9 @@ export class SlaEnforcer {
       budget: () => boolean;
       paced: () => Promise<void>;
       result: SlaEnforceResult;
+      nagRepeatMs: number;
+      nagNoteText: string | null;
+      teamNameFor: (teamId: string | null) => Promise<string>;
       statusAttrBroken: () => boolean;
       markStatusAttrBroken: () => void;
     }
@@ -331,7 +404,7 @@ export class SlaEnforcer {
       snoozed: false,
     };
     let markers = this.markersOf(state);
-    let ev: ClockEvaluation = evaluateClocks(input, target, warnPct, schedule, markers, now);
+    let ev: ClockEvaluation = evaluateClocks(input, target, warnPct, schedule, markers, now, ctx.nagRepeatMs);
     const verifyMarkers: Partial<ClockMarkers> = {};
 
     // Native first-reply humanness verify: one bounded parts fetch, cached.
@@ -343,7 +416,7 @@ export class SlaEnforcer {
       if (human) verifyMarkers.frHumanReplyAt = human;
       else verifyMarkers.frVerifyNoneAt = now;
       markers = { ...markers, ...verifyMarkers } as ClockMarkers;
-      ev = evaluateClocks(input, target, warnPct, schedule, markers, now);
+      ev = evaluateClocks(input, target, warnPct, schedule, markers, now, ctx.nagRepeatMs);
     }
 
     const statusValue = ev.overall;
@@ -412,7 +485,10 @@ export class SlaEnforcer {
       }
     }
 
-    // ---- breach notes (one per clock per cycle) ----
+    // ---- recurring agent nag: internal note per due breached clock (clocks.ts
+    // re-emits first_reply/next_reply every nagRepeatMs of business time;
+    // resolution appears once). The *LastNaggedAt markers in ev.actions.newMarkers
+    // persist the cadence. ----
     for (const note of ev.actions.breachNotes) {
       if (!ctx.budget()) {
         if (dirty) await this.persistState(conv.id, kind, link, persisted, now);
@@ -425,11 +501,10 @@ export class SlaEnforcer {
       if (note.clock === "next_reply" && liveNow.waitingSince == null) continue;
       const clockLabel = CLOCK_LABELS[note.clock];
       const targetMs = ev.clocks.find((c) => c.kind === note.clock)?.targetMs ?? 0;
-      const due = note.deadline ? ` · was due ${note.deadline.toISOString().slice(0, 16).replace("T", " ")} UTC` : "";
-      const body = `⏱️ <b>SLA breached: ${clockLabel}</b> · target <b>${target.value}</b> (${formatDuration(targetMs)} business)${due} · <i>${AUTOMATION_MARKER}</i>`;
+      const body = await this.buildNagBody(note, clockLabel, target, targetMs, ctx.nagNoteText, conv.teamAssigneeId, ctx.teamNameFor);
       const { partId } = await this.withAuthor((a) => this.client.replyAsAdmin(conv.id, { adminId: a, body, note: true }));
       if (link && partId) {
-        // Echo-register so the noted-webhook never relays the breach note
+        // Echo-register so the noted-webhook never relays the nag note
         // into the Discord thread (same pattern the kick notes used).
         await this.store.recordEchoPart("c", partId, link.ticketThreadId).catch(() => undefined);
       }
@@ -440,6 +515,125 @@ export class SlaEnforcer {
 
     if (dirty) await this.persistState(conv.id, kind, link, { ...persisted, lastEnforcedAt: now } as Partial<StateRow>, now);
     return "done";
+  }
+
+  // Recurring-nag body: the built-in rich SLA-breach format, or the
+  // slaNagNoteText override with {clock}/{target}/{overdue}/{team} placeholders.
+  // {team} is resolved lazily — no /teams call unless the copy actually uses it.
+  private async buildNagBody(
+    note: { clock: ClockKind; deadline: Date | null },
+    clockLabel: string,
+    target: SlaTargetEntry,
+    targetMs: number,
+    override: string | null,
+    teamId: string | null,
+    teamNameFor: (teamId: string | null) => Promise<string>
+  ): Promise<string> {
+    const overdue = note.deadline ? `${note.deadline.toISOString().slice(0, 16).replace("T", " ")} UTC` : "unknown";
+    if (override && override.trim()) {
+      let text = override;
+      if (text.includes("{team}")) text = text.split("{team}").join(await teamNameFor(teamId));
+      return text.split("{clock}").join(clockLabel).split("{target}").join(target.value).split("{overdue}").join(overdue);
+    }
+    const due = note.deadline ? ` · was due ${overdue}` : "";
+    return `⏱️ <b>SLA breached: ${clockLabel}</b> · target <b>${target.value}</b> (${formatDuration(targetMs)} business)${due} · <i>${AUTOMATION_MARKER}</i>`;
+  }
+
+  // Customer-idle nag + auto-close for ONE native conversation (the agent
+  // replied last and the customer went silent). Verbatim port of the former
+  // InactivitySweeper conversation loop's customer branch — its agent-idle
+  // branch is retired (the SLA clock pass owns agent nags). Calendar-time; every
+  // step idempotent via intercom_sweep_state; shares the tick's write budget.
+  private async enforceCustomerIdle(
+    conv: IntercomSweepConversation,
+    adminId: string,
+    customerWaitMs: number,
+    nagsBeforeClose: number,
+    nagText: string | null,
+    feedbackByConv: Map<string, string | null>,
+    now: Date,
+    ctx: { budget: () => boolean; paced: () => Promise<void>; result: SlaEnforceResult }
+  ): Promise<void> {
+    const nowMs = now.getTime();
+    let state = await this.store.getSweepState(conv.id);
+    // Reopened after a sweeper auto-close (agent/customer reopened) → fresh
+    // cycle. Mirror the reset locally too, or the nag math below still sees the
+    // exhausted pre-close counter and re-closes the just-reopened conversation.
+    if (state?.sweepClosedAt) {
+      await this.store.upsertSweepState(conv.id, "conversation", {
+        sweepClosedAt: null,
+        customerNagCount: 0,
+        lastCustomerNagAt: null,
+      });
+      state = { ...state, sweepClosedAt: null, customerNagCount: 0, lastCustomerNagAt: null };
+    }
+    // The opening message is contact activity even before any reply.
+    const lastCustomerMs = conv.lastContactReplyAt?.getTime() ?? conv.createdAt?.getTime() ?? 0;
+    const lastAdminMs = conv.lastAdminReplyAt?.getTime() ?? 0;
+    // Agent-idle (customer waiting) belongs to the SLA clock pass now. Only the
+    // customer-idle case (agent spoke last: lastCustomer <= lastAdmin) is handled
+    // here; imported feedback is notes-only, never nagged/closed (a nag would
+    // email the submitter).
+    if (lastAdminMs <= 0 || lastCustomerMs > lastAdminMs || feedbackByConv.has(conv.id)) return;
+
+    const customerRepliedSinceNag =
+      state?.lastCustomerNagAt != null &&
+      conv.lastContactReplyAt != null &&
+      conv.lastContactReplyAt.getTime() > state.lastCustomerNagAt.getTime();
+    const nagCount = customerRepliedSinceNag ? 0 : state?.customerNagCount ?? 0;
+    const waitedSince = Math.max(lastAdminMs, customerRepliedSinceNag ? 0 : state?.lastCustomerNagAt?.getTime() ?? 0);
+
+    if (nowMs - waitedSince >= customerWaitMs) {
+      if (!ctx.budget()) return;
+      if (nagCount >= nagsBeforeClose) {
+        // The page snapshot can be minutes stale by now — never close on stale
+        // data. Re-fetch: if gone, no longer open, or the customer replied
+        // meanwhile, skip (and restart the nag cycle on a genuine reply). Any
+        // fetch error also skips the close; the next tick retries.
+        const fresh = await this.client.getConversationIdleStats(conv.id).catch(() => null);
+        const freshCustomerMs = fresh?.lastContactReplyAt?.getTime() ?? fresh?.createdAt?.getTime() ?? 0;
+        const freshAdminMs = fresh?.lastAdminReplyAt?.getTime() ?? 0;
+        if (!fresh || fresh.state !== "open" || freshCustomerMs > freshAdminMs) {
+          if (fresh && freshCustomerMs > freshAdminMs) {
+            await this.store.upsertSweepState(conv.id, "conversation", {
+              customerNagCount: 0,
+              lastCustomerNagAt: null,
+              sweepClosedAt: null,
+            });
+          }
+          return;
+        }
+        await this.client.setConversationOpen(conv.id, false, adminId);
+        await ctx.paced();
+        const nativeTicketId = await this.client.getConversationTicketId(conv.id).catch(() => null);
+        if (nativeTicketId && ctx.budget()) {
+          // Second Intercom write of this close — pace and count it too, so a
+          // close burst can't defeat the spacing or the sweep-wide write cap.
+          await this.client.updateTicket(nativeTicketId, { open: false, adminId }).catch(() => {});
+          await ctx.paced();
+        }
+        await this.store.upsertSweepState(conv.id, "conversation", { sweepClosedAt: new Date(nowMs) });
+        ctx.result.closed++;
+      } else {
+        const nagDays = Math.floor((nowMs - waitedSince) / DAY_MS);
+        await this.client.replyAsAdmin(conv.id, {
+          adminId,
+          note: false,
+          body: nagText ? renderDays(nagText, nagDays) : DEFAULT_CUSTOMER_NAG,
+        });
+        await ctx.paced();
+        await this.store.upsertSweepState(conv.id, "conversation", {
+          customerNagCount: nagCount + 1,
+          lastCustomerNagAt: new Date(nowMs),
+          sweepClosedAt: null,
+        });
+        ctx.result.customerNags++;
+      }
+    } else if (customerRepliedSinceNag && state) {
+      // Not due yet, but the reply must reset the counter so a later silence
+      // starts a fresh nag cycle.
+      await this.store.upsertSweepState(conv.id, "conversation", { customerNagCount: 0 });
+    }
   }
 
   // Any comment authored by a non-Operator admin counts as a human reply

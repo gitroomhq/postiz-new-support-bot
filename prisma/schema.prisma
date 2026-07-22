@@ -341,6 +341,12 @@ model BotSettings {
   slaStatusAttributeName String  @default("SLA Status")
   slaBreachTagName       String  @default("sla-breached") // tagged on breach, untagged on recovery
   slaWarnPct             Int     @default(80)             // at_risk threshold, % of target (per-target override in slaTargetsJson)
+  // Recurring agent nag: while a first-reply/next-reply clock is breached, the
+  // enforcement sweep re-posts the breach note every slaNagRepeatMins of
+  // BUSINESS time (office-hours aware). slaNagNoteText overrides the built-in
+  // note copy ({clock}/{target}/{overdue}/{team} placeholders); null = default.
+  slaNagRepeatMins       Int     @default(240)
+  slaNagNoteText         String?
   // WORKSPACE-DEFAULT office hours + balanced assignment. Per-team overrides
   // (teamSettingsJson) layer on top per-field; a team with no override inherits
   // these. Office hours: SLA clocks count business time only while enabled —
@@ -861,9 +867,11 @@ model SlaState {
   frVerifyNoneAt    DateTime? // last parts-verify that found NO human reply (re-check only after a newer admin reply)
   frWarnedAt        DateTime?
   frBreachedAt      DateTime?
+  frLastNaggedAt    DateTime? // last recurring agent nag posted for a breached first-reply clock (paces the re-nag)
   nrCycleAnchor     DateTime?
   nrWarnedAt        DateTime?
   nrBreachedAt      DateTime?
+  nrLastNaggedAt    DateTime? // last recurring agent nag posted for a breached next-reply clock (reset with the cycle)
   resWarnedAt       DateTime?
   resBreachedAt     DateTime?
   lastStatusWritten String? // last SLA Status attribute value actually PUT (write damper)

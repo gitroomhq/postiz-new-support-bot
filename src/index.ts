@@ -27,7 +27,6 @@ import { IntercomSyncService } from "./intercom/IntercomSyncService";
 import { IntercomEventExecutor } from "./intercom/IntercomEventExecutor";
 import { IntercomWebhookHandler } from "./intercom/IntercomWebhookHandler";
 import { IntercomInboxApp } from "./intercom/IntercomInboxApp";
-import { InactivitySweeper } from "./intercom/InactivitySweeper";
 import { initSentry, shutdownSentry, captureFatal, log, reconfigureSentry } from "./util/logger";
 import { safe, setAiRecordContent } from "./util/instrument";
 import { initInflux, reconfigureInflux, shutdownInflux } from "./metrics/InfluxWriter";
@@ -487,8 +486,10 @@ async function main() {
   const fmtReport = (r: unknown): string =>
     r && typeof r === "object" ? Object.entries(r).map(([k, v]) => `${k}: ${v}`).join(", ") : String(r);
   const listIntercomAdmins = () => intercomClient.listAdmins().then((a) => a.map((x) => ({ id: x.id, name: x.name ?? x.id })));
-  const runInactivityNow = async () => fmtReport(await temporalProducers.inactivityRunNow());
+  // The former inactivity sweep is folded into the SLA enforce tick, so both
+  // "Run Now" buttons trigger the same merged sweep.
   const runSlaNow = async () => fmtReport(await temporalProducers.slaEnforceRunNow());
+  const runInactivityNow = runSlaNow;
   const adminHubs = [
     generalHub,
     makeWorkflowHub({ tiers: tierStore }),
@@ -528,7 +529,6 @@ async function main() {
     makeAutomationHub({ runInactivityNow }),
     makeMaintenanceHub({
       resetBridgeData: async () => fmtReport(await intercomStore.resetAll()),
-      runInactivityNow,
       runSlaNow,
     }),
   ];
@@ -608,8 +608,6 @@ async function main() {
 
   // Influx gauge snapshot body for the metricsSnapshotWorkflow's snapshotTick.
   const snapshotScheduler = new SnapshotScheduler(prisma, settingsStore);
-  // Workspace inactivity sweeper body (native/unbridged Intercom objects).
-  const inactivitySweeper = new InactivitySweeper(intercomClient, intercomStore, settingsStore, sentryFeedbackStore);
   // SLA safety-sweep body (slaSweepWorkflow's slaSweepTick).
   const slaSweeper = new SlaSweeper(intercomClient, intercomStore, settingsStore, slaService);
   // Sentry feedback → Intercom import body (sentryFeedbackWorkflow's tick).
@@ -635,7 +633,6 @@ async function main() {
     intercomSync,
     intercomExecutor,
     intercomWebhookHandler,
-    inactivitySweeper,
     slaSweeper,
     slaEnforcer,
     sentryFeedbackImporter,

@@ -79,6 +79,8 @@ export class SlaHub {
     { kind: "button", id: "icadmin_sla_toggle", match: "exact", handler: (i) => this.handleToggle(i) },
     { kind: "button", id: "icadmin_sla_warnpct", match: "exact", handler: (i) => this.handleWarnPctOpen(i) },
     { kind: "modal", id: "icadmin_sla_warnpct_m", match: "exact", handler: (i) => this.handleWarnPctSubmit(i) },
+    { kind: "button", id: "icadmin_sla_nag", match: "exact", handler: (i) => this.handleNagOpen(i) },
+    { kind: "modal", id: "icadmin_sla_nag_m", match: "exact", handler: (i) => this.handleNagSubmit(i) },
     { kind: "button", id: "icadmin_sla_verify", match: "exact", handler: (i) => this.handleVerify(i) },
     // office hours (per-team: picker → scoped panel)
     { kind: "select", id: "icadmin_sla_hours_pick", match: "exact", handler: (i) => this.handleHoursScopePick(i) },
@@ -132,10 +134,11 @@ export class SlaHub {
         `**Targets:** ${targets.length} (${withClocks} with clock durations) · **Pinned:** ${pinned}`,
         `**Attributes:** \`${status.attributeName}\` (target) · \`${s.slaStatusAttributeName()}\` (ok/at_risk/breached)`,
         `**At-risk threshold:** ${s.slaWarnPct()}% of target · **Breach tag:** \`${s.slaBreachTagName()}\``,
+        `**Agent nag:** re-post every ${formatDuration(s.slaNagRepeatMins() * 60_000)} business while a first/next-reply clock is breached · note ${s.slaNagNoteText() ? "custom" : "default"}`,
         `**Office hours:** ${ohLine}`,
         "",
-        "The bot IS the SLA engine (Advanced tier has no native SLAs): rules pick a target, targets carry business-minute clocks (first reply / next reply / resolution), and a **5-minute enforcement sweep** runs them. **At-risk** flips the status attribute only; **breach** adds the tag + one internal note per clock. All signals stay in Intercom: no Discord pings.",
-        "Triggers: ticket created/mirrored, status change, customer reply, assignee change, Stripe/billing events, native conversation webhooks, plus the 30-min target sweep and the 5-min clock sweep.",
+        "The bot IS the SLA engine (Advanced tier has no native SLAs): rules pick a target, targets carry business-minute clocks (first reply / next reply / resolution), and a **5-minute enforcement sweep** runs them. **At-risk** flips the status attribute only; **breach** adds the tag and re-posts an internal agent nag note every nag interval while a first/next-reply clock stays breached (resolution notes once). A conversation with no SLA target never nags. All signals stay in Intercom: no Discord pings.",
+        "Triggers: ticket created/mirrored, status change, customer reply, assignee change, Stripe/billing events, native conversation webhooks, plus the 30-min target sweep and the 5-min clock/nag sweep.",
       ].join("\n")
     );
     return {
@@ -150,6 +153,7 @@ export class SlaHub {
         buttonRow(
           btn("icadmin_sla_toggle", `SLA: ${status.enabled ? "on" : "off"}`, status.enabled ? ButtonStyle.Success : ButtonStyle.Secondary),
           btn("icadmin_sla_warnpct", `Warn at ${s.slaWarnPct()}%`, ButtonStyle.Secondary),
+          btn("icadmin_sla_nag", "Nag Cadence", ButtonStyle.Secondary),
           btn("icadmin_sla_hours", "Office Hours", ButtonStyle.Secondary),
           btn("icadmin_sla_verify", "Verify Setup", ButtonStyle.Secondary)
         ),
@@ -1115,6 +1119,43 @@ export class SlaHub {
     }
     await this.ctx.settingsStore.updateSla({ slaWarnPct: pct });
     this.ctx.auditConfig(interaction, `SLA at-risk threshold → ${pct}% of target`);
+    await this.ctx.sessions.ackModal(interaction);
+    await interaction.editReply(await this.buildPanel());
+  }
+
+  private async handleNagOpen(interaction: ButtonInteraction): Promise<void> {
+    const s = this.ctx.settingsStore;
+    const modal = new ModalBuilder().setCustomId("icadmin_sla_nag_m").setTitle("Agent Nag Cadence");
+    modal.addComponents(
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        textInput("mins", "Re-nag every N business minutes (min 1)", {
+          required: true,
+          placeholder: "240",
+          maxLength: 6,
+          value: String(s.slaNagRepeatMins()),
+        })
+      ),
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        textInput("note", "Nag note: {clock}/{target}/{overdue}/{team} ok", {
+          required: false,
+          style: TextInputStyle.Paragraph,
+          maxLength: 1000,
+          value: s.slaNagNoteText() ?? undefined,
+        })
+      )
+    );
+    await interaction.showModal(modal);
+  }
+
+  private async handleNagSubmit(interaction: ModalSubmitInteraction): Promise<void> {
+    const mins = Number(interaction.fields.getTextInputValue("mins").trim());
+    if (!Number.isInteger(mins) || mins < 1 || mins > 100_000) {
+      await interaction.reply({ embeds: [makeEmbed("Enter a whole number of business minutes (1-100000).", COLORS.danger)], flags: 64 });
+      return;
+    }
+    const note = interaction.fields.getTextInputValue("note").trim();
+    await this.ctx.settingsStore.updateSla({ slaNagRepeatMins: mins, slaNagNoteText: note || null });
+    this.ctx.auditConfig(interaction, `SLA agent nag → every ${mins} min business, note ${note ? "custom" : "default"}`);
     await this.ctx.sessions.ackModal(interaction);
     await interaction.editReply(await this.buildPanel());
   }

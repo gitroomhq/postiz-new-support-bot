@@ -182,31 +182,46 @@ test("workflow suite (time-skipping)", { skip: !ENABLED && "set TEMPORAL_TEST=1 
     });
   });
 
-  // ---- inactivity looper (30-minute cadence + run-now signal) ----
+  // ---- SLA enforce looper (5-minute cadence + run-now signal) ----
+  // The former inactivity looper is retired (its customer-idle sweep folded
+  // into slaEnforceTick); the SLA enforce looper is the surviving cadence test.
 
-  await t.test("inactivityLoopWorkflow ticks on its cadence and inactivityRunNow forces a sweep", async () => {
+  await t.test("slaEnforceWorkflow ticks on its cadence and slaEnforceRunNow forces a sweep", async () => {
     const forces: boolean[] = [];
     const activities: AnyRecord = {
-      inactivitySweepTick: async (force: boolean) => {
+      slaEnforceTick: async (force: boolean) => {
         forces.push(force);
-        return { scanned: 0, agentReminders: 0, customerNags: 0, closed: 0, skipped: true };
+        return {
+          scanned: 0,
+          assigned: 0,
+          statusWrites: 0,
+          tagged: 0,
+          untagged: 0,
+          notes: 0,
+          customerNags: 0,
+          closed: 0,
+          verifies: 0,
+          errors: 0,
+          capped: false,
+          skipped: true,
+        };
       },
     };
     const worker = await makeWorker(activities);
     await worker.runUntil(async () => {
-      const handle = await env.client.workflow.start("inactivityLoopWorkflow", {
+      const handle = await env.client.workflow.start("slaEnforceWorkflow", {
         taskQueue,
-        workflowId: "inactivity-loop-t1",
+        workflowId: "sla-enforce-t1",
       });
       // The first tick fires immediately on start, unforced.
       await env.sleep("1 minute");
       assert.deepEqual(forces, [false], `expected one immediate unforced tick, saw [${forces.join(",")}]`);
-      // Run-now wakes the 30-minute wait early and forces that sweep.
-      await handle.signal("inactivityRunNow");
+      // Run-now wakes the 5-minute wait early and forces that sweep.
+      await handle.signal("slaEnforceRunNow");
       await env.sleep("1 minute");
       assert.deepEqual(forces, [false, true], `run-now must force the next tick, saw [${forces.join(",")}]`);
-      // The following cadence tick (~30 minutes later) is unforced again.
-      await env.sleep("31 minutes");
+      // The following cadence tick (~5 minutes later) is unforced again.
+      await env.sleep("6 minutes");
       assert.deepEqual(forces, [false, true, false], `expected the unforced cadence tick, saw [${forces.join(",")}]`);
       const desc = await handle.describe();
       assert.equal(desc.status.name, "RUNNING", "the looper must keep running between ticks");

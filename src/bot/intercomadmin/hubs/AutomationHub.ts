@@ -14,11 +14,11 @@ import { btn, buttonRow, backRow, selectRow, panelEmbed, textInput } from "../ui
 import type { Panel, RouteEntry } from "../types";
 import type { HubContext } from "./HubContext";
 
-// /intercom → Automation: the workspace inactivity sweeper (native/unbridged
-// conversations + tickets) and the per-tag reminder texts (moved here from
-// /config → Workflow → Manage Tags — support reminders post as Intercom
-// notes, so they are Intercom-behavioral). Structural tag settings (emoji,
-// label, delays, target, closes-thread) stay with the tags in /config.
+// /intercom → Automation: the workspace customer-idle sweeper (native/unbridged
+// conversations) and the per-tag customer reminder texts (moved here from
+// /config → Workflow → Manage Tags). Agent nags are no longer here — the SLA
+// enforcer owns them (SLA Manager → Nag Cadence). Structural tag settings
+// (emoji, label, delays, target, closes-thread) stay with the tags in /config.
 export class AutomationHub {
   constructor(private ctx: HubContext) {}
 
@@ -36,31 +36,30 @@ export class AutomationHub {
 
   buildPanel(): Panel {
     const s = this.ctx.settingsStore;
-    const customTags = s.tags().filter((t) => t.reminderTextCustomer || t.reminderTextSupport || t.autoCloseMessage);
+    const customTags = s.tags().filter((t) => t.reminderTextCustomer || t.autoCloseMessage);
     const embed = panelEmbed(
       "Intercom Automation",
       [
-        "**Inactivity sweeper** (native/unbridged conversations + tickets):",
-        `**Status:** ${s.inactivityEnabled() ? "**on** (sweeping every 30 minutes)" : "**off**"}`,
-        `**Agent-idle:** after ${s.inactivityAgentWaitDays()} day(s) waiting on an agent → internal note (≤1 per window)`,
+        "**Customer-idle sweeper** (native/unbridged conversations):",
+        `**Status:** ${s.inactivityEnabled() ? "**on** (runs on the 5-minute SLA enforce tick)" : "**off**"}`,
         `**Customer-idle:** after ${s.inactivityCustomerWaitDays()} day(s) of customer silence → outbound reply nag`,
         `**Auto-close:** after ${s.inactivityNagsBeforeClose()} unanswered nag(s) → conversation (and its native ticket) closed`,
-        `**Texts:** customer nag ${s.inactivityNagText() ? "custom" : "default"} · agent note ${s.inactivityAgentNoteText() ? "custom" : "default"}`,
+        `**Nag text:** ${s.inactivityNagText() ? "custom" : "default"}`,
         "",
-        "Covers every open, unsnoozed conversation and open ticket in the workspace EXCEPT Discord-bridged tickets (their per-tag reminder settings below own those). Native tickets only get agent-idle notes, never auto-close.",
+        "Covers every open, unsnoozed native conversation EXCEPT Discord-bridged tickets (their per-tag customer reminders below own those) and imported Sentry feedback. Agent nags are SLA-driven now: see **SLA Manager → Nag Cadence**.",
         "",
-        "**Per-tag reminder texts** (bridged tickets; agent reminders post as Intercom notes):",
+        "**Per-tag customer reminder texts** (bridged tickets):",
         customTags.length
           ? customTags.map((t) => `${t.emoji} ${t.label}: custom`).join(" · ")
           : "_all tags use the built-in default texts_",
-        "Pick a tag below to edit its customer reminder, agent note, auto-close farewell and repeat cadence. Structural tag settings (label, delays, target) stay in /config → Workflow → Manage Tags.",
+        "Pick a tag below to edit its customer reminder, auto-close farewell and repeat cadence. Structural tag settings (label, delays, target) stay in /config → Workflow → Manage Tags.",
       ].join("\n")
     );
 
     const sweeperRow = buttonRow(
       btn("icadmin_auto_sweep_toggle", `Sweeper: ${s.inactivityEnabled() ? "on" : "off"}`, s.inactivityEnabled() ? ButtonStyle.Success : ButtonStyle.Secondary),
       btn("icadmin_auto_sweep_opts", "Set Thresholds", ButtonStyle.Primary),
-      btn("icadmin_auto_sweep_texts", "Sweeper Texts", ButtonStyle.Primary),
+      btn("icadmin_auto_sweep_texts", "Nag Text", ButtonStyle.Primary),
       btn("icadmin_auto_sweep_run", "Run Now", ButtonStyle.Secondary)
     );
 
@@ -71,7 +70,7 @@ export class AutomationHub {
         this.ctx.settingsStore.tags().slice(0, 25).map((t) => ({
           label: `${t.emoji} ${t.label}`.slice(0, 100),
           value: t.id,
-          description: (t.reminderTextCustomer || t.reminderTextSupport || t.autoCloseMessage ? "custom texts" : "default texts").slice(0, 100),
+          description: (t.reminderTextCustomer || t.autoCloseMessage ? "custom texts" : "default texts").slice(0, 100),
         }))
       );
 
@@ -92,11 +91,8 @@ export class AutomationHub {
 
   private async handleSweepOptsOpen(interaction: ButtonInteraction): Promise<void> {
     const s = this.ctx.settingsStore;
-    const modal = new ModalBuilder().setCustomId("icadmin_auto_sweep_opts_m").setTitle("Inactivity Thresholds");
+    const modal = new ModalBuilder().setCustomId("icadmin_auto_sweep_opts_m").setTitle("Customer-idle Thresholds");
     modal.addComponents(
-      new ActionRowBuilder<TextInputBuilder>().addComponents(
-        textInput("agent_days", "Agent-idle days before a note (1-30)", { required: true, value: String(s.inactivityAgentWaitDays()) })
-      ),
       new ActionRowBuilder<TextInputBuilder>().addComponents(
         textInput("customer_days", "Customer-idle days before a nag (1-30)", { required: true, value: String(s.inactivityCustomerWaitDays()) })
       ),
@@ -108,24 +104,22 @@ export class AutomationHub {
   }
 
   private async handleSweepOptsSubmit(interaction: ModalSubmitInteraction): Promise<void> {
-    const agentDays = Number.parseInt(interaction.fields.getTextInputValue("agent_days").trim(), 10);
     const customerDays = Number.parseInt(interaction.fields.getTextInputValue("customer_days").trim(), 10);
     const nags = Number.parseInt(interaction.fields.getTextInputValue("nags").trim(), 10);
     const inRange = (n: number, lo: number, hi: number) => Number.isInteger(n) && n >= lo && n <= hi;
-    if (!inRange(agentDays, 1, 30) || !inRange(customerDays, 1, 30) || !inRange(nags, 1, 10)) {
+    if (!inRange(customerDays, 1, 30) || !inRange(nags, 1, 10)) {
       await interaction.reply({ embeds: [makeEmbed("Days must be 1-30 and nags 1-10 (whole numbers).", COLORS.danger)], flags: 64 });
       return;
     }
     await this.ctx.settingsStore.updateInactivity({
-      inactivityAgentWaitDays: agentDays,
       inactivityCustomerWaitDays: customerDays,
       inactivityNagsBeforeClose: nags,
     });
-    this.ctx.auditConfig(interaction, `Inactivity thresholds → agent ${agentDays}d, customer ${customerDays}d, close after ${nags} nag(s)`);
+    this.ctx.auditConfig(interaction, `Customer-idle thresholds → customer ${customerDays}d, close after ${nags} nag(s)`);
     await interaction.reply({
       embeds: [
         makeEmbed(
-          `Inactivity thresholds saved: agent-idle ${agentDays}d, customer-idle ${customerDays}d, auto-close after ${nags} unanswered nag(s). Applies on the next sweep.`,
+          `Customer-idle thresholds saved: ${customerDays}d of silence before a nag, auto-close after ${nags} unanswered nag(s). Applies on the next sweep.`,
           COLORS.success
         ),
       ],
@@ -135,45 +129,32 @@ export class AutomationHub {
 
   private async handleSweepTextsOpen(interaction: ButtonInteraction): Promise<void> {
     const s = this.ctx.settingsStore;
-    const modal = new ModalBuilder().setCustomId("icadmin_auto_sweep_texts_m").setTitle("Sweeper Texts");
-    const nagText = textInput("nag_text", "Customer nag text (blank = default)", {
+    const modal = new ModalBuilder().setCustomId("icadmin_auto_sweep_texts_m").setTitle("Customer Nag Text");
+    const nagText = textInput("nag_text", "Customer nag text, {days} ok (blank = default)", {
       required: false,
       style: TextInputStyle.Paragraph,
       maxLength: 1000,
       value: s.inactivityNagText() ?? undefined,
     });
-    const agentNoteText = textInput("agent_note_text", "Agent-idle note, {days}/{team} ok", {
-      required: false,
-      style: TextInputStyle.Paragraph,
-      maxLength: 1000,
-      value: s.inactivityAgentNoteText() ?? undefined,
-    });
-    modal.addComponents(
-      new ActionRowBuilder<TextInputBuilder>().addComponents(nagText),
-      new ActionRowBuilder<TextInputBuilder>().addComponents(agentNoteText)
-    );
+    modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(nagText));
     await interaction.showModal(modal);
   }
 
   private async handleSweepTextsSubmit(interaction: ModalSubmitInteraction): Promise<void> {
     const nagText = interaction.fields.getTextInputValue("nag_text").trim();
-    const agentNoteText = interaction.fields.getTextInputValue("agent_note_text").trim();
-    await this.ctx.settingsStore.updateInactivity({
-      inactivityNagText: nagText || null,
-      inactivityAgentNoteText: agentNoteText || null,
-    });
-    this.ctx.auditConfig(interaction, `Sweeper texts → nag ${nagText ? "custom" : "default"}, agent note ${agentNoteText ? "custom" : "default"}`);
-    await interaction.reply({ embeds: [makeEmbed("Sweeper texts saved. Applies on the next sweep.", COLORS.success)], flags: 64 });
+    await this.ctx.settingsStore.updateInactivity({ inactivityNagText: nagText || null });
+    this.ctx.auditConfig(interaction, `Customer nag text → ${nagText ? "custom" : "default"}`);
+    await interaction.reply({ embeds: [makeEmbed("Customer nag text saved. Applies on the next sweep.", COLORS.success)], flags: 64 });
   }
 
   private async handleSweepRun(interaction: ButtonInteraction): Promise<void> {
     await interaction.deferReply({ flags: 64 });
-    const r = await this.ctx.producers.inactivityRunNow();
+    const r = await this.ctx.producers.slaEnforceRunNow();
     await interaction.editReply({
       embeds: [
         makeEmbed(
           r?.ok
-            ? "Triggered an inactivity sweep (bypasses the enabled toggle for this one run). Results land in the audit channel."
+            ? "Triggered the merged SLA/customer-idle sweep (bypasses the enabled toggles for this one run). Results land in the audit channel."
             : `Couldn't trigger the sweep: ${r?.error ?? "Temporal unreachable"}.`,
           r?.ok ? COLORS.success : COLORS.danger
         ),
@@ -200,9 +181,10 @@ export class AutomationHub {
             `Cadence: ${cadence}${tag.autoCloseAfter != null ? ` · auto-close after ${tag.autoCloseAfter}` : ""}`,
             "",
             `Customer reminder: ${tag.reminderTextCustomer ? "custom" : "default"}`,
-            `Agent note ({days}/{team} ok): ${tag.reminderTextSupport ? "custom" : "default"}`,
             `Auto-close farewell: ${tag.autoCloseMessage ? "custom" : "default"}`,
             `Repeat cadence: ${tag.reminderRepeatDays != null ? `${tag.reminderRepeatDays}d` : "= first delay"}`,
+            "",
+            "_Agent (SUPPORT) reminders are SLA-driven now (SLA Manager → Nag Cadence)._",
           ].join("\n"),
           COLORS.neutral
         ),
@@ -222,19 +204,14 @@ export class AutomationHub {
       await interaction.reply({ embeds: [makeEmbed("This tag no longer exists. Reopen /intercom.", COLORS.warn)], flags: 64 });
       return;
     }
-    // Per-tag reminder/close overrides. Blank input = clear back to default.
+    // Per-tag customer reminder/close overrides. Blank input = clear back to
+    // default. (Agent/SUPPORT reminders are SLA-driven now — no field here.)
     const modal = new ModalBuilder().setCustomId(`icadmin_auto_tag_m:${tag.id}`).setTitle("Reminder Texts");
     const customerText = textInput("customer_text", "Customer reminder text (blank = default)", {
       required: false,
       style: TextInputStyle.Paragraph,
       maxLength: 1000,
       value: tag.reminderTextCustomer ?? undefined,
-    });
-    const supportText = textInput("support_text", "Agent note text, {days}/{team} ok", {
-      required: false,
-      style: TextInputStyle.Paragraph,
-      maxLength: 1000,
-      value: tag.reminderTextSupport ?? undefined,
     });
     const autocloseMsg = textInput("autoclose_msg", "Auto-close farewell (blank = default)", {
       required: false,
@@ -248,7 +225,6 @@ export class AutomationHub {
     });
     modal.addComponents(
       new ActionRowBuilder<TextInputBuilder>().addComponents(customerText),
-      new ActionRowBuilder<TextInputBuilder>().addComponents(supportText),
       new ActionRowBuilder<TextInputBuilder>().addComponents(autocloseMsg),
       new ActionRowBuilder<TextInputBuilder>().addComponents(repeatDays)
     );
@@ -263,7 +239,6 @@ export class AutomationHub {
       return;
     }
     const customerText = interaction.fields.getTextInputValue("customer_text").trim();
-    const supportText = interaction.fields.getTextInputValue("support_text").trim();
     const autocloseMsg = interaction.fields.getTextInputValue("autoclose_msg").trim();
     const repeatRaw = interaction.fields.getTextInputValue("repeat_days").trim();
     const repeatNum = repeatRaw ? Number(repeatRaw) : null;
@@ -276,13 +251,12 @@ export class AutomationHub {
     }
     await this.ctx.settingsStore.editTag(tag.id, {
       reminderTextCustomer: customerText || null,
-      reminderTextSupport: supportText || null,
       autoCloseMessage: autocloseMsg || null,
       reminderRepeatDays: repeatNum,
     });
     this.ctx.auditConfig(
       interaction,
-      `Status tag ${tag.emoji} ${tag.label} → reminder texts updated (customer ${customerText ? "custom" : "default"}, agent ${supportText ? "custom" : "default"}, close ${autocloseMsg ? "custom" : "default"}, repeat ${repeatNum ?? "= first"})`
+      `Status tag ${tag.emoji} ${tag.label} → reminder texts updated (customer ${customerText ? "custom" : "default"}, close ${autocloseMsg ? "custom" : "default"}, repeat ${repeatNum ?? "= first"})`
     );
     await interaction.reply({ embeds: [makeEmbed(`Reminder texts for ${tag.emoji} ${tag.label} updated.`, COLORS.success)], flags: 64 });
   }

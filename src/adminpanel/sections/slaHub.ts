@@ -47,6 +47,8 @@ export function makeSlaHub(deps: { ruleStore: SlaRuleStore }): HubModule {
         fields: [
           { type: "toggle", key: "slaEnabled", label: "Enabled", value: s.slaEnabled() },
           { type: "number", key: "slaWarnPct", label: "At-risk threshold %", value: s.slaWarnPct(), min: 1, max: 99, unit: "%" },
+          { type: "number", key: "slaNagRepeatMins", label: "Agent re-nag interval (business mins)", value: s.slaNagRepeatMins(), min: 1, max: 100000, help: "First/next-reply breaches re-post a nag note this often while breached." },
+          { type: "text", key: "slaNagNoteText", label: "Agent nag note", value: s.slaNagNoteText() ?? "", multiline: true, help: "Blank = built-in default. {clock}/{target}/{overdue}/{team} supported." },
           { type: "select", key: "slaDefaultTarget", label: "Default target (no rule matches)", value: s.slaDefaultTarget(), options: tOpts, nullable: true },
         ],
       };
@@ -139,6 +141,17 @@ export function makeSlaHub(deps: { ruleStore: SlaRuleStore }): HubModule {
           await ctx.audit(`sla warn% → ${parsed.value}`);
           return { ok: true };
         }
+        case "slaNagRepeatMins": {
+          const parsed = asBoundedInt(v, 1, 100000);
+          if (!parsed.ok) return { ok: false, fieldErrors: { slaNagRepeatMins: parsed.error } };
+          await s.updateSla({ slaNagRepeatMins: parsed.value });
+          await ctx.audit(`sla re-nag interval → ${parsed.value} business mins`);
+          return { ok: true };
+        }
+        case "slaNagNoteText":
+          await s.updateSla({ slaNagNoteText: asString(v) || null });
+          await ctx.audit("set sla nag note");
+          return { ok: true };
         case "slaDefaultTarget":
           await s.updateSla({ slaDefaultTarget: asString(v) || null });
           await ctx.audit("set sla default target");

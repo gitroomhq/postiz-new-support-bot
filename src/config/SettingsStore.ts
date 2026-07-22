@@ -462,14 +462,14 @@ export class SettingsStore {
     });
   }
 
-  // ---- Workspace inactivity sweeper (native/unbridged conversations + tickets) ----
+  // ---- Workspace customer-idle sweeper (native/unbridged conversations) ----
+  // The agent-idle half is retired: agent nags are SLA-breach-driven now (see
+  // the SLA enforcer + slaNagRepeatMins/slaNagNoteText). The inactivityAgentWaitDays
+  // and inactivityAgentNoteText columns are retained (unused) to avoid a
+  // no-runtime-migration drop; nothing reads them.
 
   inactivityEnabled(): boolean {
     return this.settings.inactivityEnabled;
-  }
-
-  inactivityAgentWaitDays(): number {
-    return this.settings.inactivityAgentWaitDays;
   }
 
   inactivityCustomerWaitDays(): number {
@@ -480,23 +480,16 @@ export class SettingsStore {
     return this.settings.inactivityNagsBeforeClose;
   }
 
-  // Text overrides for the sweeper's customer nag / agent-idle note ({days}
-  // placeholder). Null = built-in default.
+  // Customer-idle nag text override ({days} placeholder). Null = built-in default.
   inactivityNagText(): string | null {
     return this.settings.inactivityNagText;
   }
 
-  inactivityAgentNoteText(): string | null {
-    return this.settings.inactivityAgentNoteText;
-  }
-
   async updateInactivity(data: {
     inactivityEnabled?: boolean;
-    inactivityAgentWaitDays?: number;
     inactivityCustomerWaitDays?: number;
     inactivityNagsBeforeClose?: number;
     inactivityNagText?: string | null;
-    inactivityAgentNoteText?: string | null;
   }): Promise<void> {
     this.settings = await this.prisma.botSettings.update({ where: { id: "global" }, data });
   }
@@ -800,6 +793,21 @@ export class SettingsStore {
     return Math.min(99, Math.max(1, Math.trunc(raw)));
   }
 
+  // Recurring agent-nag cadence in BUSINESS minutes: while a first-reply or
+  // next-reply clock is breached, the enforcement sweep re-posts the breach
+  // note once per this interval of business time. Floored at 1 minute.
+  slaNagRepeatMins(): number {
+    const raw = this.settings.slaNagRepeatMins;
+    if (!Number.isFinite(raw)) return 240;
+    return Math.max(1, Math.trunc(raw));
+  }
+
+  // Override copy for the recurring agent nag ({clock}/{target}/{overdue}/{team}
+  // placeholders). Null = built-in rich SLA-breach format.
+  slaNagNoteText(): string | null {
+    return this.settings.slaNagNoteText;
+  }
+
   // Managed target registry: every rule target and the default target must
   // reference an entry. Durations are business minutes; a clock left unset is
   // disabled for that target.
@@ -836,6 +844,8 @@ export class SettingsStore {
     slaStatusAttributeName?: string;
     slaBreachTagName?: string;
     slaWarnPct?: number;
+    slaNagRepeatMins?: number;
+    slaNagNoteText?: string | null;
   }): Promise<void> {
     this.settings = await this.prisma.botSettings.update({ where: { id: "global" }, data });
   }

@@ -13,7 +13,6 @@ export { intercomDeliveryWorkflow, intercomInboxWorkflow } from "./intercom.work
 export { autoAnswerWorkflow, aiRunWorkflow, scoreOneWorkflow } from "./ai.workflow";
 export {
   kbRefreshWorkflow,
-  inactivityLoopWorkflow,
   slaSweepWorkflow,
   slaEnforceWorkflow,
   sentryFeedbackWorkflow,

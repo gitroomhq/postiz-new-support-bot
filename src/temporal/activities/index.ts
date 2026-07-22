@@ -16,7 +16,6 @@ import type { DisputeMonitor } from "../../bot/billing/DisputeMonitor";
 import type { IntercomStore } from "../../intercom/IntercomStore";
 import { isIntercomExempt, type IntercomSyncService } from "../../intercom/IntercomSyncService";
 import type { IntercomEventExecutor } from "../../intercom/IntercomEventExecutor";
-import type { InactivitySweeper } from "../../intercom/InactivitySweeper";
 import type { SlaSweeper } from "../../intercom/SlaSweeper";
 import type { SlaEnforcer } from "../../intercom/SlaEnforcer";
 import { IntercomHttpError } from "../../intercom/IntercomClient";
@@ -63,7 +62,6 @@ export interface ActivityDeps {
   intercomSync: IntercomSyncService;
   intercomExecutor: IntercomEventExecutor;
   intercomWebhookHandler: IntercomWebhookHandler;
-  inactivitySweeper: InactivitySweeper;
   slaSweeper: SlaSweeper;
   slaEnforcer: SlaEnforcer;
   sentryFeedbackImporter: SentryFeedbackImporter;
@@ -93,7 +91,6 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
     intercomSync,
     intercomExecutor,
     intercomWebhookHandler,
-    inactivitySweeper,
     slaSweeper,
     slaEnforcer,
     sentryFeedbackImporter,
@@ -335,14 +332,19 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
           // this special case and rejoins the normal reminder machinery.
           const target =
             isIntercomExempt(ticket) || tag.reminderTarget === "CUSTOMER" ? "CUSTOMER" : "SUPPORT";
-          if (!(target === "CUSTOMER" && !ticket.customerId)) {
+          // Agent (SUPPORT) nags are retired here: the bot-native SLA enforcer
+          // owns them now, re-posting on the linked Intercom conversation while
+          // an SLA clock is breached (a bridged ticket with no SLA target no
+          // longer gets an agent nag, by design). Only CUSTOMER reminders +
+          // auto-close stay per-ticket. onAgentReminder + the "agent_reminder"
+          // IcEvent are kept as deploy-safe tombstones for any in-flight outbox.
+          if (target === "CUSTOMER" && ticket.customerId) {
             // Agent replies bridged from Intercom land in Discord as BOT
             // messages — invisible to the human scan. The relay ledger
-            // ("in" message-map rows) supplies the agent's real last reply
-            // for the SUPPORT idle clock and the staff-spoke-last guard.
+            // ("in" message-map rows) supplies the agent's real last reply for
+            // the staff-spoke-last guard in the auto-close path below.
             const relayAtMs = (await intercomSync.lastAgentRelayAt(threadId).catch(() => null))?.getTime() ?? 0;
-            const scanAt = await lastAwaitedMessageAt(thread, target, ticket.customerId);
-            const awaitedAt = target === "SUPPORT" ? Math.max(scanAt ?? 0, relayAtMs) || null : scanAt;
+            const awaitedAt = await lastAwaitedMessageAt(thread, target, ticket.customerId);
             const reference = Math.max(
               ticket.lastStatusChangeAt.getTime(),
               awaitedAt ?? 0,
@@ -356,7 +358,7 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
               // Auto-close stale Waiting-for-Customer tickets once N reminders
               // went unanswered.
               const closingTag = settingsStore.closingTag();
-              if (target === "CUSTOMER" && tag.autoCloseAfter != null && ticket.reminderCount >= tag.autoCloseAfter && closingTag) {
+              if (tag.autoCloseAfter != null && ticket.reminderCount >= tag.autoCloseAfter && closingTag) {
                 // Never close a ticket whose customer actually spoke last: the
                 // Waiting-for-Customer tag can be stale when the reply-time
                 // auto-flip was missed (bot down, unusable flip target).
@@ -620,25 +622,6 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
         }
         await kbScheduler.tick();
         return { refreshed: false, ok: 0, failed: 0 };
-      } finally {
-        clearInterval(keepalive);
-      }
-    },
-
-    // Workspace inactivity sweep: native (unbridged) conversations/tickets get
-    // the agent-idle note+reopen and customer-idle nag/auto-close treatment.
-    // The sweeper applies the enable + intercomConfigured gate itself.
-    async inactivitySweepTick(force) {
-      heartbeat();
-      const keepalive = setInterval(() => {
-        try {
-          heartbeat();
-        } catch {
-          /* worker shutting down — the sweep finishes on its own */
-        }
-      }, 30_000);
-      try {
-        return await inactivitySweeper.sweep(force);
       } finally {
         clearInterval(keepalive);
       }

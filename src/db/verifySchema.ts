@@ -70,7 +70,8 @@ const EXPECTED_COLUMNS: Record<string, string[]> = {
     "agentRipMigratedAt", "intercomPanelAdminsJson", "billingActionLevelsJson", "panelTokenSecret",
     "panelTokenEpoch", "adminPanelEpoch", "dashboardEnabled", "dashboardAdminsJson", "dashboardTokenSecret", "dashboardEpoch",
     "slaEnabled", "slaNativeEnabled", "slaDefaultTarget", "slaAttributeName", "slaTargetsJson", "slaNoteKickEnabled", "slaNoteAdminId",
-    "slaStatusAttributeName", "slaBreachTagName", "slaWarnPct", "officeHoursEnabled", "officeHoursJson",
+    "slaStatusAttributeName", "slaBreachTagName", "slaWarnPct", "slaNagRepeatMins", "slaNagNoteText",
+    "officeHoursEnabled", "officeHoursJson",
     "assignEnabled", "assignExcludedAdminsJson", "assignRotationCursorsJson", "teamSettingsJson",
     "updatedAt",
   ],
@@ -142,8 +143,8 @@ const EXPECTED_COLUMNS: Record<string, string[]> = {
   sla_states: [
     "id", "kind", "conversationId", "lastTarget", "lastWrittenTarget", "lastRuleId", "lastEvaluatedAt",
     "lastWriteError", "lastKickPartId", "pinnedTarget", "pinnedById", "pinnedByName", "pinnedAt", "updatedAt",
-    "frHumanReplyAt", "frVerifyNoneAt", "frWarnedAt", "frBreachedAt", "nrCycleAnchor", "nrWarnedAt", "nrBreachedAt",
-    "resWarnedAt", "resBreachedAt", "lastStatusWritten", "breachTagged", "lastEnforcedAt",
+    "frHumanReplyAt", "frVerifyNoneAt", "frWarnedAt", "frBreachedAt", "frLastNaggedAt", "nrCycleAnchor", "nrWarnedAt",
+    "nrBreachedAt", "nrLastNaggedAt", "resWarnedAt", "resBreachedAt", "lastStatusWritten", "breachTagged", "lastEnforcedAt",
   ],
 };
 

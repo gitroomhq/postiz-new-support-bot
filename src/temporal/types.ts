@@ -25,7 +25,6 @@ export const SINGLETONS = {
   metricsSnapshot: "metrics-snapshot",
   cleanupLoop: "cleanup-loop",
   disputesLoop: "disputes-loop",
-  inactivityLoop: "intercom-inactivity-loop",
   slaSweep: "sla-sweep",
   slaEnforce: "sla-enforce",
   sentryFeedback: "sentry-feedback-sync",
@@ -41,6 +40,7 @@ export const STATUS_REPORT_SCHEDULE_ID = "status-report";
 // workflow task until the next boot retires it again.
 export const RETIRED_SINGLETONS = [
   { workflowId: "scoring-loop", reason: "agent-rip: AI ticket scoring removed" },
+  { workflowId: "intercom-inactivity-loop", reason: "inactivity sweep folded into the SLA enforce tick" },
 ] as const;
 // Children of retired singletons that may have been orphaned by a crash race
 // (parent-close TERMINATE normally kills them with the parent).
@@ -66,7 +66,6 @@ export const LOOPER_GENERATIONS: Record<string, number> = {
   [SINGLETONS.metricsSnapshot]: 1,
   [SINGLETONS.cleanupLoop]: 1,
   [SINGLETONS.disputesLoop]: 1,
-  [SINGLETONS.inactivityLoop]: 1,
   [SINGLETONS.slaSweep]: 1,
   [SINGLETONS.slaEnforce]: 1,
   [SINGLETONS.sentryFeedback]: 1,
@@ -109,7 +108,6 @@ export const SIG_NOOP = "noop";
 export const SIG_INBOUND_EVENT = "inboundEvent";
 export const SIG_KB_REFRESH_NOW = "kbRefreshNow";
 export const SIG_DISPUTES_RUN_NOW = "disputesRunNow";
-export const SIG_INACTIVITY_RUN_NOW = "inactivityRunNow";
 export const SIG_SLA_RUN_NOW = "slaRunNow";
 export const SIG_SLA_ENFORCE_RUN_NOW = "slaEnforceRunNow";
 export const SIG_SENTRY_FEEDBACK_RUN_NOW = "sentryFeedbackRunNow";
@@ -128,8 +126,10 @@ export type IcEventType =
   // skips them. Removable once no in-flight workflow can still carry it.
   | "priority"
   | "csat"
-  // Agent-idle reminder: internal note + reopen so the conversation resurfaces
-  // in the Intercom inbox.
+  // Retired bridged agent-idle reminder (internal note + reopen). No longer
+  // emitted — the SLA enforcer owns agent nags — but the executor still handles
+  // it so any event queued in an in-flight ticket outbox across the deploy
+  // still delivers. Removable once no in-flight workflow can carry it.
   | "agent_reminder"
   | "message_edit"
   | "message_delete"
@@ -348,16 +348,6 @@ export interface DisputesTickResult {
   ratioLevel: "ok" | "warn" | "critical" | "skipped";
 }
 
-// ---- Inactivity sweeper (native/unbridged Intercom conversations + tickets) ----
-
-export interface InactivitySweepResult {
-  scanned: number;
-  agentReminders: number;
-  customerNags: number;
-  closed: number;
-  skipped: boolean; // disabled or Intercom unconfigured
-}
-
 export interface SentryFeedbackTickResult {
   listed: number;
   imported: number;
@@ -376,18 +366,21 @@ export interface SlaSweepResult {
   skipped: boolean; // SLA disabled or Intercom unconfigured
 }
 
-// Bot-native SLA enforcement + assignment stray sweep (5-min looper).
+// Bot-native SLA enforcement + assignment stray sweep + customer-idle
+// nag/auto-close (5-min looper — the former inactivity sweep folded in).
 export interface SlaEnforceResult {
   scanned: number;
   assigned: number;
   statusWrites: number;
   tagged: number;
   untagged: number;
-  notes: number;
+  notes: number; // recurring agent nag notes posted this tick
+  customerNags: number; // outbound customer-idle nags
+  closed: number; // conversations auto-closed after N unanswered nags
   verifies: number;
   errors: number;
   capped: boolean; // write budget exhausted — later ticks finish
-  skipped: boolean; // both engines disabled or Intercom unconfigured
+  skipped: boolean; // all passes disabled or Intercom unconfigured
 }
 
 // Kept for the publishStatusReport tombstone stub (goes away with the
@@ -420,7 +413,6 @@ export interface CoreActivities {
   // loopers
   kbTick(force: boolean): Promise<KbTickResult>;
   disputesTick(force: boolean): Promise<DisputesTickResult>;
-  inactivitySweepTick(force: boolean): Promise<InactivitySweepResult>;
   slaSweepTick(force: boolean): Promise<SlaSweepResult>;
   slaEnforceTick(force: boolean): Promise<SlaEnforceResult>;
   sentryFeedbackTick(force: boolean): Promise<SentryFeedbackTickResult>;

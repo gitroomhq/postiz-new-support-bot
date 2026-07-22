@@ -15,7 +15,6 @@ import {
   SA_TICKET_THREAD_ID,
   SIG_DISPUTES_RUN_NOW,
   SIG_HUMAN_MESSAGE,
-  SIG_INACTIVITY_RUN_NOW,
   SIG_SLA_RUN_NOW,
   SIG_SLA_ENFORCE_RUN_NOW,
   SIG_SENTRY_FEEDBACK_RUN_NOW,
@@ -254,15 +253,6 @@ export class TemporalProducers {
     });
   }
 
-  async inactivityRunNow(): Promise<GatewayResult> {
-    return this.temporal.signalWithStart({
-      workflowType: "inactivityLoopWorkflow",
-      workflowId: SINGLETONS.inactivityLoop,
-      signalName: SIG_INACTIVITY_RUN_NOW,
-      options: looperStartOptions(SINGLETONS.inactivityLoop),
-    });
-  }
-
   async slaRunNow(): Promise<GatewayResult> {
     return this.temporal.signalWithStart({
       workflowType: "slaSweepWorkflow",
@@ -308,7 +298,6 @@ export class TemporalProducers {
       ["metricsSnapshotWorkflow", SINGLETONS.metricsSnapshot],
       ["cleanupLoopWorkflow", SINGLETONS.cleanupLoop],
       ["disputesLoopWorkflow", SINGLETONS.disputesLoop],
-      ["inactivityLoopWorkflow", SINGLETONS.inactivityLoop],
       ["slaSweepWorkflow", SINGLETONS.slaSweep],
       ["slaEnforceWorkflow", SINGLETONS.slaEnforce],
       ["sentryFeedbackWorkflow", SINGLETONS.sentryFeedback],

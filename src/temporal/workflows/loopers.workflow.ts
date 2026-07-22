@@ -10,7 +10,6 @@ import {
 import type { CoreActivities } from "../types";
 import {
   disputesRunNowSignal,
-  inactivityRunNowSignal,
   kbRefreshNowSignal,
   sentryFeedbackRunNowSignal,
   slaEnforceRunNowSignal,
@@ -68,34 +67,14 @@ export async function kbRefreshWorkflow(): Promise<void> {
   }
 }
 
+// Shared proxy for the workspace-scoped Intercom sweeps (SLA safety sweep +
+// SLA enforcement): each pages every open conversation with pacing + per-item
+// Intercom writes, so it needs the long start-to-close + heartbeat budget.
 const inactivityActs = proxyActivities<CoreActivities>({
-  // A sweep pages the whole workspace's open conversations/tickets with
-  // pacing + per-item Intercom writes.
   startToCloseTimeout: "10 minutes",
   heartbeatTimeout: "2 minutes",
   retry: { maximumAttempts: 1 }, // the next tick retries naturally
 });
-
-// Workspace inactivity sweeper: native (unbridged) Intercom conversations +
-// tickets get agent-idle reminders (note + reopen) and customer-idle nags with
-// auto-close — the automation Intercom itself cannot run on API-created
-// conversations (workflow triggers are channel-gated). Bridged tickets are
-// excluded here; the per-ticket workflow owns their timers. The activity
-// applies the enable/config gate itself, so /config changes take effect on the
-// next tick without any looper plumbing.
-export async function inactivityLoopWorkflow(): Promise<void> {
-  let runNow = false;
-  setHandler(inactivityRunNowSignal, () => {
-    runNow = true;
-  });
-  for (;;) {
-    const force = runNow;
-    runNow = false;
-    await inactivityActs.inactivitySweepTick(force).catch(() => {});
-    await canIfDue(() => continueWithMemo<typeof inactivityLoopWorkflow>());
-    await condition(() => runNow, 30 * 60_000);
-  }
-}
 
 // SLA safety sweep: pages the workspace's open conversations and re-runs the
 // SLA rules against each (bridged → via thread id, native → directly). Dedup
