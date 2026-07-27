@@ -710,6 +710,8 @@ export class DiscordBot {
       await this.billingAdmin.handleCommand(interaction);
     } else if (interaction.commandName === "intercom") {
       await this.intercomAdmin?.handleCommand(interaction);
+    } else if (interaction.commandName === "attribute-test") {
+      await this.handleAttributeTestCommand(interaction);
     }
   }
 
@@ -724,6 +726,41 @@ export class DiscordBot {
       await billing.approveBlockedCharge(interaction, member);
     } else {
       await billing.denyBlockedCharge(interaction, member);
+    }
+  }
+
+  // ---- /attribute-test: set a single conversation custom attribute in Intercom ----
+
+  private async handleAttributeTestCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+    if (!this.isAdmin(interaction)) {
+      await interaction.reply({ embeds: [makeEmbed("Administrator permission required.", COLORS.danger)], flags: 64 });
+      return;
+    }
+
+    const name = interaction.options.getString("name", true).trim();
+    const value = interaction.options.getString("value", true).trim();
+
+    const link = await this.intercomStore.getLink(interaction.channelId);
+    if (!link) {
+      await interaction.reply({
+        embeds: [makeEmbed("No Intercom conversation is linked to this thread.", COLORS.warn)],
+        flags: 64,
+      });
+      return;
+    }
+
+    await interaction.deferReply({ flags: 64 });
+
+    try {
+      await this.intercomClient.setConversationAttributes(link.conversationId, { [name]: value });
+      await interaction.editReply({
+        embeds: [makeEmbed(`Set \`${name}\` = \`${value}\` on conversation \`${link.conversationId}\`.`, COLORS.success)],
+      });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      await interaction.editReply({
+        embeds: [makeEmbed(`Failed to set attribute: ${msg}`, COLORS.danger)],
+      });
     }
   }
 
@@ -5498,6 +5535,25 @@ export class DiscordBot {
         name: "intercom",
         description: "Intercom bridge, SLA and automation admin panel (admin only)",
         default_member_permissions: "8", // ADMINISTRATOR
+      },
+      {
+        name: "attribute-test",
+        description: "Set a conversation custom attribute in Intercom (admin only)",
+        default_member_permissions: "8", // ADMINISTRATOR
+        options: [
+          {
+            type: 3, // STRING
+            name: "name",
+            description: "Attribute name (must be predefined in Intercom Settings → Data → Conversations)",
+            required: true,
+          },
+          {
+            type: 3, // STRING
+            name: "value",
+            description: "Attribute value",
+            required: true,
+          },
+        ],
       },
     ];
 
