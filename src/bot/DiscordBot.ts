@@ -35,6 +35,11 @@ import {
 } from "discord.js";
 import { BotConfig } from "../config";
 import { embed as makeEmbed, COLORS } from "../util/embeds";
+import {
+  coerceConversationAttributeValue,
+  formatStoredAttributeValue,
+  resolveConversationAttribute,
+} from "../intercom/conversationAttributeWrite";
 import { SettingsStore, isUnicodeEmoji, ReminderTarget, type GlobalSecretColumn, type SecretState } from "../config/SettingsStore";
 import type { SentryFeedbackStore } from "../sentry/SentryFeedbackStore";
 import { EscalationTier, StatusTag } from "../generated/prisma/client";
@@ -710,6 +715,98 @@ export class DiscordBot {
       await this.billingAdmin.handleCommand(interaction);
     } else if (interaction.commandName === "intercom") {
       await this.intercomAdmin?.handleCommand(interaction);
+    } else if (interaction.commandName === "debug-attribute") {
+      await this.handleDebugAttributeCommand(interaction);
+    }
+  }
+
+  // ---- /debug-attribute: write one conversation custom attribute straight
+  // into Intercom, for debugging attribute-driven behaviour (SLA rules, ticket
+  // mirrors) without waiting for the automation that normally sets it. ----
+
+  private async handleDebugAttributeCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+    // default_member_permissions only HIDES the command; a channel override can
+    // still surface it, and this writes to production Intercom data.
+    if (!this.isAdmin(interaction)) {
+      await interaction.reply({ embeds: [makeEmbed("Administrator permission required.", COLORS.danger)], flags: 64 });
+      return;
+    }
+
+    const rawName = interaction.options.getString("name", true);
+    const rawValue = interaction.options.getString("value", true);
+    const explicitConversationId = interaction.options.getString("conversation_id")?.trim() || null;
+
+    await interaction.deferReply({ flags: 64 });
+
+    // Target: an explicit conversation id, else the one bridged to this thread.
+    let conversationId = explicitConversationId;
+    if (!conversationId) {
+      const link = await this.intercomStore.getLink(interaction.channelId);
+      if (!link) {
+        await interaction.editReply({
+          embeds: [
+            makeEmbed(
+              "This channel has no bridged Intercom conversation. Run it inside a ticket thread, or pass `conversation_id`.",
+              COLORS.warn
+            ),
+          ],
+        });
+        return;
+      }
+      conversationId = link.conversationId;
+    }
+
+    try {
+      const defs = await this.intercomClient.listConversationDataAttributesCached();
+      const resolved = resolveConversationAttribute(defs, rawName);
+      if (!resolved.ok) {
+        await interaction.editReply({ embeds: [makeEmbed(resolved.error, COLORS.warn)] });
+        return;
+      }
+
+      const coerced = coerceConversationAttributeValue(resolved.def.dataType, rawValue);
+      if (!coerced.ok) {
+        await interaction.editReply({
+          embeds: [makeEmbed(`${coerced.error} \`${resolved.def.name}\` is a \`${resolved.def.dataType ?? "text"}\` attribute.`, COLORS.warn)],
+        });
+        return;
+      }
+
+      await this.intercomClient.setConversationAttributes(conversationId, { [resolved.def.name]: coerced.value });
+
+      // Read back what Intercom actually stored: the PUT accepts values it then
+      // coerces or drops, so echoing the input alone can lie.
+      const facts = await this.intercomClient.getConversationSlaFacts(conversationId).catch(() => null);
+      const stored = facts ? formatStoredAttributeValue(facts.customAttributes[resolved.def.name], resolved.def.dataType) : null;
+
+      void this.audit.log({
+        title: "🧪 Conversation attribute set",
+        severity: "warn",
+        actor: interaction.user.displayName,
+        actorIconUrl: interaction.user.displayAvatarURL(),
+        description: `Manual \`/debug-attribute\` write on conversation \`${conversationId}\`.`,
+        fields: [
+          { name: "Attribute", value: `${resolved.def.name} (${resolved.def.dataType ?? "text"})`, inline: true },
+          { name: "Value", value: coerced.display, inline: true },
+        ],
+      });
+
+      await interaction.editReply({
+        embeds: [
+          makeEmbed(
+            [
+              `Set **${resolved.def.name}** (\`${resolved.def.dataType ?? "text"}\`) on conversation \`${conversationId}\`.`,
+              `**Sent:** ${coerced.display}`,
+              `**Now stored:** ${stored ?? "_read-back failed; the write itself succeeded_"}`,
+            ].join("\n"),
+            COLORS.success
+          ),
+        ],
+      });
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      this.discordLog.error("debug-attribute write failed", e, { "intercom.conversation_id": conversationId });
+      await interaction.editReply({ embeds: [makeEmbed(`Intercom rejected the write: ${message}`, COLORS.danger)] });
     }
   }
 
@@ -742,6 +839,18 @@ export class DiscordBot {
         .slice(0, 25)
         .map((t) => ({ name: `${t.emoji} ${t.label}`, value: t.id }));
       await interaction.respond(tags).catch(() => {});
+      return;
+    }
+    // /debug-attribute name: the live conversation-attribute definitions, so
+    // the write can't miss on a typo. Archived ones are not offered.
+    if (interaction.commandName === "debug-attribute" && focused.name === "name") {
+      const query = focused.value.toLowerCase();
+      const defs = await this.intercomClient.listConversationDataAttributesCached().catch(() => []);
+      const options = defs
+        .filter((d) => !d.archived && (!query || d.name.toLowerCase().includes(query)))
+        .slice(0, 25)
+        .map((d) => ({ name: `${d.name} (${d.dataType ?? "text"})`.slice(0, 100), value: d.name.slice(0, 100) }));
+      await interaction.respond(options).catch(() => {});
       return;
     }
     await interaction.respond([]).catch(() => {});
@@ -5498,6 +5607,35 @@ export class DiscordBot {
         name: "intercom",
         description: "Intercom bridge, SLA and automation admin panel (admin only)",
         default_member_permissions: "8", // ADMINISTRATOR
+      },
+      {
+        name: "debug-attribute",
+        description: "Set a conversation custom attribute in Intercom (admin only)",
+        default_member_permissions: "8", // ADMINISTRATOR
+        options: [
+          {
+            type: 3, // STRING
+            name: "name",
+            description: "Attribute name (must exist in Intercom → Settings → Data → Conversations)",
+            required: true,
+            autocomplete: true,
+            max_length: 100,
+          },
+          {
+            type: 3, // STRING
+            name: "value",
+            description: "Value to write, typed to match the attribute; \"null\" clears it",
+            required: true,
+            max_length: 500,
+          },
+          {
+            type: 3, // STRING
+            name: "conversation_id",
+            description: "Intercom conversation to write to (default: the one bridged to this thread)",
+            required: false,
+            max_length: 64,
+          },
+        ],
       },
     ];
 

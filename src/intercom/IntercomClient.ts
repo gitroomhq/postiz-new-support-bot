@@ -1038,6 +1038,27 @@ export class IntercomClient {
       .map((a) => ({ name: a.name as string, archived: a.archived === true, dataType: a.data_type ?? null }));
   }
 
+  private conversationAttrCache: { fetchedAt: number; defs: Array<{ name: string; archived: boolean; dataType: string | null }> } | null =
+    null;
+
+  // Same list behind a ~60s TTL: /debug-attribute autocompletes on it, and
+  // Discord fires autocomplete on every keystroke. Throws on a cold miss so
+  // the write path can report the API failure; a warm cache absorbs blips.
+  async listConversationDataAttributesCached(): Promise<Array<{ name: string; archived: boolean; dataType: string | null }>> {
+    const TTL_MS = 60_000;
+    if (this.conversationAttrCache && Date.now() - this.conversationAttrCache.fetchedAt < TTL_MS) {
+      return this.conversationAttrCache.defs;
+    }
+    try {
+      const defs = await this.listConversationDataAttributes();
+      this.conversationAttrCache = { fetchedAt: Date.now(), defs };
+      return defs;
+    } catch (e) {
+      if (this.conversationAttrCache) return this.conversationAttrCache.defs;
+      throw e;
+    }
+  }
+
   // Everything the SLA rule evaluator needs about a (native) conversation in
   // one GET: team, tags, source body, attributes, linked ticket, state — plus
   // the currently applied SLA (read-only, preview display only).
