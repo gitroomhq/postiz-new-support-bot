@@ -20,8 +20,8 @@ export type VaultState = "unconfigured" | "up" | "down" | "denied";
 // holds the mTLS client cert material (clientCertPem/clientKeyPem/caPem) —
 // Vault-only by design, no local-encryption fallback: a cold cache simply
 // leaves the Temporal connection down until Vault recovers.
-export type VaultIntegration = "intercom" | "stripe" | "sentry" | "influx" | "temporal";
-export const VAULT_INTEGRATIONS: readonly VaultIntegration[] = ["intercom", "stripe", "sentry", "influx", "temporal"];
+export type VaultIntegration = "intercom" | "stripe" | "sentry" | "influx" | "temporal" | "yubico";
+export const VAULT_INTEGRATIONS: readonly VaultIntegration[] = ["intercom", "stripe", "sentry", "influx", "temporal", "yubico"];
 
 // Runtime config resolved from BotSettings (see SettingsStore.vaultConfig()).
 export interface VaultRuntimeConfig {

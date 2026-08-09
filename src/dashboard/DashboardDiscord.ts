@@ -45,26 +45,42 @@ export class DashboardDiscord implements LoginNotifier {
 
   // ---- LoginNotifier (DM push on standing login) ----
 
-  async notifyLogin(discordUserId: string, info: { method: string; ip?: string; ua?: string }): Promise<void> {
+  async notifyLogin(
+    discordUserId: string,
+    info: { method: string; ip?: string; ua?: string; pending: boolean }
+  ): Promise<void> {
     if (!this.client) return;
     try {
       const user = await this.client.users.fetch(discordUserId);
       const embed = new EmbedBuilder()
-        .setTitle("Dashboard sign-in: confirm to unlock")
         .setColor(COLORS.brand)
-        .setDescription(
-          "A dashboard sign-in with your credentials is waiting for activation.\n" +
-            "**If this was you:** press **Activate session** and enter the code shown in your browser.\n" +
-            "**If this was NOT you:** press **This wasn't me, lock down** immediately."
-        )
         .addFields(
           { name: "Method", value: info.method, inline: true },
           { name: "IP", value: info.ip ?? "unknown", inline: true },
           { name: "Device", value: (info.ua ?? "unknown").slice(0, 100), inline: false }
         )
         .setTimestamp(new Date());
-      const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-        new ButtonBuilder().setCustomId("dashpanel_activate").setStyle(ButtonStyle.Primary).setLabel("Activate session"),
+      const row = new ActionRowBuilder<ButtonBuilder>();
+      if (info.pending) {
+        embed
+          .setTitle("Dashboard sign-in: confirm to unlock")
+          .setDescription(
+            "A dashboard sign-in with your credentials is waiting for activation.\n" +
+              "**If this was you:** press **Activate session** and enter the code shown in your browser.\n" +
+              "**If this was NOT you:** press **This wasn't me, lock down** immediately."
+          );
+        row.addComponents(
+          new ButtonBuilder().setCustomId("dashpanel_activate").setStyle(ButtonStyle.Primary).setLabel("Activate session")
+        );
+      } else {
+        embed
+          .setTitle("New dashboard sign-in")
+          .setDescription(
+            "A dashboard session was opened with one of your trusted factors.\n" +
+              "**If this was NOT you:** press **This wasn't me, lock down** immediately."
+          );
+      }
+      row.addComponents(
         new ButtonBuilder()
           .setCustomId("dashpanel_lockdown")
           .setStyle(ButtonStyle.Danger)

@@ -691,6 +691,11 @@ const STATEMENTS: string[] = [
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "dashboardAdminsJson" JSONB`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "dashboardTokenSecret" TEXT`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "dashboardEpoch" INTEGER NOT NULL DEFAULT 0`,
+  // YubiKey OTP sign-in: Yubico API client id, vault-routed API secret and an
+  // optional self-hosted validation-server URL (blank = YubiCloud).
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "yubicoClientId" TEXT`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "yubicoApiSecret" TEXT`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "yubicoValidationUrl" TEXT`,
   // Dashboard standing auth: per-admin credentials (passkeys / TOTP /
   // passphrase), DB-backed sessions (survive deploys; id = SHA-256 of the
   // cookie token) and the append-only audit trail.
@@ -707,11 +712,14 @@ const STATEMENTS: string[] = [
     "secretEnc" TEXT,
     "lastUsedStep" INTEGER,
     "hash" TEXT,
+    "trusted" BOOLEAN NOT NULL DEFAULT false,
     "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "lastUsedAt" TIMESTAMP(3),
     "revokedAt" TIMESTAMP(3),
     CONSTRAINT "dashboard_credentials_pkey" PRIMARY KEY ("id")
   )`,
+  // Trusted-passkey flag for tables created before the column existed.
+  `ALTER TABLE "dashboard_credentials" ADD COLUMN IF NOT EXISTS "trusted" BOOLEAN NOT NULL DEFAULT false`,
   `CREATE UNIQUE INDEX IF NOT EXISTS "dashboard_credentials_credentialId_key" ON "dashboard_credentials"("credentialId")`,
   `CREATE INDEX IF NOT EXISTS "dashboard_credentials_discordUserId_kind_idx" ON "dashboard_credentials"("discordUserId", "kind")`,
   `CREATE TABLE IF NOT EXISTS "dashboard_sessions" (

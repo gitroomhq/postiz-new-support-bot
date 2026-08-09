@@ -25,7 +25,7 @@ const EXPECTED_COLUMNS: Record<string, string[]> = {
   pending_auths: ["id", "state", "discordUserId", "channelId", "interactionToken", "createdAt"],
   dashboard_credentials: [
     "id", "discordUserId", "kind", "label", "credentialId", "publicKey", "signCount", "transports", "backupState",
-    "secretEnc", "lastUsedStep", "hash", "createdAt", "lastUsedAt", "revokedAt",
+    "secretEnc", "lastUsedStep", "hash", "trusted", "createdAt", "lastUsedAt", "revokedAt",
   ],
   dashboard_sessions: [
     "id", "discordUserId", "adminName", "epoch", "state", "authMethod", "credentialIdUsed", "activationCode",
@@ -70,6 +70,7 @@ const EXPECTED_COLUMNS: Record<string, string[]> = {
     "inactivityNagText", "inactivityAgentNoteText", "refundMaxChargeAgeDays",
     "agentRipMigratedAt", "intercomPanelAdminsJson", "billingActionLevelsJson", "panelTokenSecret",
     "panelTokenEpoch", "adminPanelEpoch", "dashboardEnabled", "dashboardAdminsJson", "dashboardTokenSecret", "dashboardEpoch",
+    "yubicoClientId", "yubicoApiSecret", "yubicoValidationUrl",
     "slaEnabled", "slaNativeEnabled", "slaDefaultTarget", "slaAttributeName", "slaTargetsJson", "slaNoteKickEnabled", "slaNoteAdminId",
     "slaStatusAttributeName", "slaBreachTagName", "slaWarnPct", "slaNagRepeatMins", "slaNagNoteText",
     "officeHoursEnabled", "officeHoursJson",

@@ -523,7 +523,7 @@ test("security page: factors + emergency in the rail, tables in main", async () 
   });
   const ctx = {
     actor: { id: "42", name: "Ada", role: "admin", isAdmin: true },
-    settings: { dashboardEpoch: () => 0 } as never,
+    settings: { dashboardEpoch: () => 0, yubicoClientId: () => null } as never,
     audit: async () => {},
     security: { sessionIdHash: "h", authMethod: "passkey", stepUpFresh: () => false },
   } as unknown as DashboardCtx;
@@ -2928,7 +2928,9 @@ test("client JS modules parse and the shell embeds them nonced", () => {
   assert.ok(html.includes('<script nonce="test-nonce-123">'));
   assert.ok(html.includes('id="lock"'));
   assert.ok(html.includes('id="login"'));
+  assert.ok(html.includes('id="loginYubi"'));
   assert.ok(html.includes('id="stepup"'));
+  assert.ok(html.includes('id="stepupYubi"'));
   assert.ok(html.includes('id="modal"'));
   // Chrome: bell, hamburger + scrim, help dialog, peek module.
   assert.ok(html.includes('id="bellbtn"'));

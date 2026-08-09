@@ -1,6 +1,7 @@
 import qrcode from "qrcode-generator";
 import { MIN_PASSPHRASE_LENGTH } from "../auth/passphrase";
 import { base32Encode, newTotpSecret, otpauthUri, verifyTotp } from "../auth/totp";
+import { parseYubiOtp, verifyYubiOtp } from "../auth/yubikeyOtp";
 import { CredentialStore } from "../auth/CredentialStore";
 import { DashboardDbSessions } from "../auth/DashboardDbSessions";
 import { DashboardAudit } from "../auth/DashboardAudit";
@@ -72,6 +73,45 @@ export function makeSecuritySection(deps: {
           await recordAudit(deps.audit, ctx, "totp.enrolled", "Authenticator (TOTP) enrolled");
           return { ok: true, text: "Authenticator enrolled." };
         }
+        case "section:security.yubikey_add": {
+          // Enrolling a yubikey mints a bypass factor (direct sign-in), so it
+          // rides the same fresh-factor rule as trusted passkeys.
+          if (!ctx.security.stepUpFresh() && ctx.security.authMethod !== "breakglass") {
+            return { ok: false, needsStepUp: true };
+          }
+          const clientId = ctx.settings.yubicoClientId();
+          if (!clientId) {
+            return { ok: false, error: "YubiKey sign-in is not configured (/config → Open Web Panel → Dashboard)." };
+          }
+          const parsed = parseYubiOtp(str(p.otp, 64));
+          if (!parsed) return { ok: false, fieldErrors: { otp: "That doesn't look like a YubiKey OTP. Click the field and touch the key." } };
+          if (await deps.credentials.findYubikeyByPublicId(parsed.publicId)) {
+            return { ok: false, fieldErrors: { otp: "This key is already enrolled." } };
+          }
+          const verified = await verifyYubiOtp(parsed.otp, {
+            clientId,
+            apiSecret: ctx.settings.yubicoApiSecret(),
+            verifyUrl: ctx.settings.yubicoValidationUrl(),
+          });
+          if (!verified.ok) {
+            return {
+              ok: false,
+              fieldErrors: {
+                otp:
+                  verified.reason === "unreachable" || verified.reason === "backend_error"
+                    ? "Verification service unreachable. Try again."
+                    : "That OTP didn't verify. Touch the key again.",
+              },
+            };
+          }
+          await deps.credentials.addYubikey({
+            discordUserId: ctx.actor.id,
+            label: str(p.label, 80) || "YubiKey",
+            publicId: parsed.publicId,
+          });
+          await recordAudit(deps.audit, ctx, "yubikey.enrolled", `YubiKey enrolled (${parsed.publicId})`);
+          return { ok: true, text: "YubiKey enrolled. A touch now signs you in directly." };
+        }
         case "section:security.revoke_credential": {
           const id = str(p.id, 64);
           if (!ctx.reverse?.satisfied && !ctx.security.stepUpFresh() && ctx.security.authMethod !== "breakglass") {
@@ -142,6 +182,7 @@ export function makeSecuritySection(deps: {
     }
 
     // Passphrase + enrollment (rail card).
+    const yubiConfigured = ctx.settings.yubicoClientId() != null;
     rail.push({
       type: "kv",
       title: "Sign-in factors",
@@ -152,6 +193,13 @@ export function makeSecuritySection(deps: {
           cell: badgeCell(
             credentials.some((c) => c.kind === "passkey") ? "ok" : "warn",
             String(credentials.filter((c) => c.kind === "passkey").length)
+          ),
+        },
+        {
+          label: "YubiKeys (OTP)",
+          cell: badgeCell(
+            credentials.some((c) => c.kind === "yubikey") ? "ok" : "neutral",
+            yubiConfigured ? String(credentials.filter((c) => c.kind === "yubikey").length) : "not configured"
           ),
         },
         {
@@ -177,13 +225,38 @@ export function makeSecuritySection(deps: {
             { type: "text", key: "passphrase", label: `New passphrase (min ${MIN_PASSPHRASE_LENGTH} chars)` },
             { type: "text", key: "confirm", label: "Repeat passphrase" },
           ],
-          summary: "The knowledge factor, asked after every passkey touch at sign-in.",
+          summary: "The knowledge factor, asked after every untrusted passkey touch at sign-in.",
         },
         {
           key: "auth-register",
           label: "Register passkey on this device",
           special: "passkey-register",
           disabledReason: hasPassphrase ? undefined : "Set a passphrase first.",
+        },
+        {
+          key: "auth-register-trusted",
+          label: "Register trusted passkey",
+          special: "passkey-register",
+          params: { trusted: true },
+          summary:
+            "A trusted passkey signs you in directly: no passphrase, no Discord confirmation " +
+            "(you still get a sign-in DM with a lockdown button). Requires a fresh step-up.",
+          disabledReason: hasPassphrase ? undefined : "Set a passphrase first.",
+        },
+        {
+          key: "section:security.yubikey_add",
+          label: "Add YubiKey",
+          stepUp: true,
+          inputs: [
+            { type: "text", key: "otp", label: "Click here, then touch your YubiKey" },
+            { type: "text", key: "label", label: "Label (optional)", placeholder: "e.g. Keychain YubiKey 5" },
+          ],
+          summary:
+            "A YubiKey OTP touch signs you in directly: no passphrase, no Discord confirmation " +
+            "(you still get a sign-in DM with a lockdown button).",
+          disabledReason: yubiConfigured
+            ? undefined
+            : "Set the Yubico API client ID first: /config → Open Web Panel → Dashboard.",
         },
       ],
     });
@@ -229,7 +302,13 @@ export function makeSecuritySection(deps: {
         .map((c) => ({
           id: c.id,
           cells: [
-            { t: "badge", b: { kind: c.kind === "passkey" ? "info" : "neutral", text: c.kind } },
+            {
+              t: "badge",
+              b:
+                c.kind === "passkey" && c.trusted
+                  ? { kind: "warn", text: "passkey (trusted)" }
+                  : { kind: c.kind === "passkey" ? "info" : c.kind === "yubikey" ? "warn" : "neutral", text: c.kind },
+            },
             { t: "text", v: c.label ?? "N/A" },
             isoDate(c.createdAt),
             c.lastUsedAt ? isoDate(c.lastUsedAt) : { t: "text", v: "never" },
@@ -285,7 +364,7 @@ export function makeSecuritySection(deps: {
         };
       }),
       empty: "No live sessions.",
-      notice: "Sessions: 8h idle / 3 days maximum. Revoking a session signs that device out immediately.",
+      notice: "Sessions: 7 days idle / 30 days maximum. Revoking a session signs that device out immediately.",
     });
 
     // Recent activity.

@@ -325,6 +325,7 @@ export interface ActivationStatusResponse {
   adminName: string;
   activationCode?: string; // present only while locked
   passkey?: boolean; // login mode: is the passkey ceremony available?
+  yubikey?: boolean; // login mode: is YubiKey OTP sign-in configured?
 }
 
 export interface NavBadgesResponse {

@@ -1,6 +1,6 @@
 import { DashboardAdminRole } from "../../config/SettingsStore";
 import { ActionResult, Section, SaveResult } from "../renderer/contract";
-import { AdminHubContext, HubModule, SaveRequest, asBool } from "./types";
+import { AdminHubContext, HubModule, SaveRequest, asBool, asString } from "./types";
 
 // Dashboard hub (config group): the Discord-anchored control surface for the
 // Stripe dashboard (/dashboard). Enable/disable, the allowlist, and the
@@ -118,7 +118,41 @@ export function makeDashboardHub(deps: { resetCredentials: (userId: string) => P
         ],
       };
 
-      return [enabled, allowlist];
+      const yubikey: Section = {
+        key: "yubikey",
+        title: "YubiKey OTP sign-in",
+        description:
+          "Yubico OTP as a trusted dashboard factor: an enrolled key signs its owner in directly " +
+          "(no passphrase, no Discord confirmation; a sign-in DM with a lockdown button is still sent). " +
+          "Admins enroll their keys on the dashboard's Security page once a client ID is set.",
+        fields: [
+          {
+            type: "text",
+            key: "yubicoClientId",
+            label: "Yubico API client ID",
+            value: s.yubicoClientId() ?? "",
+            help: "From upgrade.yubico.com/getapikey. Blank disables YubiKey sign-in.",
+          },
+          {
+            type: "text",
+            key: "yubicoApiSecret",
+            label: "Yubico API secret key",
+            value: "",
+            secret: true,
+            secretState: s.secretState("yubicoApiSecret"),
+            help: "Write-only; signs verify requests and authenticates responses. Leave blank to keep; type 'none' to clear.",
+          },
+          {
+            type: "text",
+            key: "yubicoValidationUrl",
+            label: "Validation server URL",
+            value: s.yubicoValidationUrl() ?? "",
+            help: "Optional self-hosted verify endpoint (public https). Blank = YubiCloud.",
+          },
+        ],
+      };
+
+      return [enabled, allowlist, yubikey];
     },
 
     async save(ctx: AdminHubContext, req: SaveRequest): Promise<SaveResult> {
@@ -126,6 +160,27 @@ export function makeDashboardHub(deps: { resetCredentials: (userId: string) => P
         const on = asBool(req.value);
         await ctx.settings.updateDashboardEnabled(on);
         await ctx.audit(`dashboard ${on ? "enabled" : "disabled"}`);
+        return { ok: true };
+      }
+      if (req.field === "yubicoClientId") {
+        await ctx.settings.updateYubicoSettings({ yubicoClientId: asString(req.value) || null });
+        await ctx.audit("updated yubico client id");
+        return { ok: true };
+      }
+      if (req.field === "yubicoApiSecret") {
+        const val = asString(req.value);
+        if (!val) return { ok: true }; // blank = keep
+        await ctx.settings.updateYubicoSettings({ yubicoApiSecret: val === "none" ? null : val });
+        await ctx.audit("updated yubico api secret");
+        return { ok: true };
+      }
+      if (req.field === "yubicoValidationUrl") {
+        const url = asString(req.value) || null;
+        if (url && !/^https:\/\//.test(url)) {
+          return { ok: false, fieldErrors: { yubicoValidationUrl: "Must be an https:// URL (or blank for YubiCloud)." } };
+        }
+        await ctx.settings.updateYubicoSettings({ yubicoValidationUrl: url });
+        await ctx.audit(`set yubico validation url → ${url ?? "YubiCloud"}`);
         return { ok: true };
       }
       return { ok: false, error: "Unknown field." };

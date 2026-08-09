@@ -83,6 +83,7 @@ D.showLogin = function (info) {
   D.q("loginStep3").hidden = true;
   D.q("loginStep1").hidden = false;
   D.q("loginPasskey").disabled = !(info && info.passkey && window.PublicKeyCredential);
+  D.q("loginYubiWrap").hidden = !(info && info.yubikey);
 };
 
 D.passkeyLogin = function () {
@@ -93,6 +94,13 @@ D.passkeyLogin = function () {
       return D.api("auth-passkey", { response: D.credToJSON(cred) });
     }).then(function (res2) {
       if (!res2.j || !res2.j.ok) { D.loginErr((res2.j && res2.j.error) || "Sign-in failed."); return; }
+      if (res2.j.state) {
+        // Trusted passkey: session is already active (or locked); hand over
+        // to the activation poll instead of the passphrase step.
+        D.q("login").hidden = true;
+        D.poll();
+        return;
+      }
       D.loginState.loginId = res2.j.loginId;
       D.q("loginStep1").hidden = true;
       D.q("loginStep3").hidden = true;
@@ -115,6 +123,22 @@ D.passphraseSubmit = function () {
   });
 };
 
+// YubiKey OTP: the key types the OTP and presses Enter for us.
+D.yubiLoginSubmit = function () {
+  D.loginErr(null);
+  var otp = D.q("loginYubi").value.trim();
+  if (!otp) return;
+  D.api("auth-yubikey-login", { otp: otp }).then(function (res) {
+    if (!res.j || !res.j.ok) {
+      D.q("loginYubi").value = "";
+      D.loginErr((res.j && res.j.error) || "Sign-in failed.");
+      return;
+    }
+    D.q("login").hidden = true;
+    D.poll();
+  });
+};
+
 D.totpLoginSubmit = function () {
   D.loginErr(null);
   D.api("auth-totp-login", {
@@ -130,6 +154,7 @@ D.totpLoginSubmit = function () {
 
 D.bindLogin = function () {
   D.q("loginPasskey").addEventListener("click", D.passkeyLogin);
+  D.q("loginYubi").addEventListener("keydown", function (e) { if (e.key === "Enter") D.yubiLoginSubmit(); });
   D.q("loginPassGo").addEventListener("click", D.passphraseSubmit);
   D.q("loginPassphrase").addEventListener("keydown", function (e) { if (e.key === "Enter") D.passphraseSubmit(); });
   D.q("loginTotpGo").addEventListener("click", D.totpLoginSubmit);
@@ -146,33 +171,53 @@ D.bindLogin = function () {
 };
 
 // ---- passkey registration (Security page, special button) ----
-D.passkeyRegister = function (label, onDone) {
+// params carries the server-baked action params ({ trusted: true } on the
+// trusted-passkey button).
+D.passkeyRegister = function (label, params) {
   D.api("auth-register-options", {}).then(function (res) {
     if (!res.j || !res.j.options) { D.flashErr((res.j && res.j.error) || "Could not start registration."); return; }
     return navigator.credentials.create({ publicKey: D.parseCreateOptions(res.j.options) }).then(function (cred) {
-      return D.api("auth-register", { response: D.credToJSON(cred), label: label || "" });
+      return D.api("auth-register", {
+        response: D.credToJSON(cred),
+        label: label || "",
+        trusted: !!(params && params.trusted)
+      });
     }).then(function (res2) {
-      if (res2.j && res2.j.ok) { D.flashOk(res2.j.text || "Passkey enrolled."); if (onDone) onDone(); D.loadPage(); }
-      else D.flashErr((res2.j && res2.j.error) || "Registration failed.");
+      if (res2.j && res2.j.ok) { D.flashOk(res2.j.text || "Passkey enrolled."); D.loadPage(); return; }
+      if (res2.j && res2.j.needsStepUp) {
+        // Trusted enrollment wants a fresh factor: step up, then rerun the
+        // whole ceremony (the first attestation was consumed server-side).
+        D.stepUpFlow(function () { D.passkeyRegister(label, params); });
+        return;
+      }
+      D.flashErr((res2.j && res2.j.error) || "Registration failed.");
     });
   }).catch(function () { D.flashErr("Passkey ceremony was cancelled or failed."); });
 };
 
 // ---- T2 step-up (fresh factor re-assert) ----
-// Tries a one-touch passkey assert; falls back to the TOTP dialog. onDone runs
-// after the server confirmed the step-up.
+// Tries a one-touch passkey assert; falls back to the TOTP/YubiKey dialog.
+// onDone runs after the server confirmed the step-up.
 D.stepUpFlow = function (onDone) {
   var fallback = function () {
     var dlg = D.q("stepup");
     D.q("stepupErr").hidden = true;
     D.q("stepupCode").value = "";
+    D.q("stepupYubi").value = "";
     dlg.showModal();
-    D.q("stepupGo").onclick = function () {
-      D.api("auth-stepup", { totp: D.q("stepupCode").value.trim() }).then(function (res) {
+    var submit = function () {
+      var yubi = D.q("stepupYubi").value.trim();
+      var body = yubi ? { yubikeyOtp: yubi } : { totp: D.q("stepupCode").value.trim() };
+      D.api("auth-stepup", body).then(function (res) {
         if (res.j && res.j.ok) { dlg.close(); onDone(); }
-        else { var e = D.q("stepupErr"); e.textContent = (res.j && res.j.error) || "That code didn't match."; e.hidden = false; }
+        else {
+          D.q("stepupYubi").value = "";
+          var e = D.q("stepupErr"); e.textContent = (res.j && res.j.error) || "That code didn't match."; e.hidden = false;
+        }
       });
     };
+    D.q("stepupGo").onclick = submit;
+    D.q("stepupYubi").onkeydown = function (e) { if (e.key === "Enter") { e.preventDefault(); submit(); } };
     D.q("stepupCancel").onclick = function () { dlg.close(); };
   };
   if (!window.PublicKeyCredential) { fallback(); return; }

@@ -38,7 +38,7 @@ export interface DashboardCtx {
   // Session security context (ceremony enforcement + the Security page).
   security: {
     sessionIdHash: string;
-    authMethod: "passkey" | "totp" | "breakglass";
+    authMethod: "passkey" | "totp" | "breakglass" | "yubikey";
     stepUpFresh(): boolean; // T2: fresh factor asserted within the window?
   };
 }

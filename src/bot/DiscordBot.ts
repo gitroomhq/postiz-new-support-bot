@@ -5730,8 +5730,8 @@ export class DiscordBot {
         : undefined,
       this.dashboard
         ? {
-            page: (token, cookie) => this.dashboard!.page(token, cookie),
-            api: (endpoint, sessionId, body) => this.dashboard!.api(endpoint, sessionId, body),
+            page: (token, cookie, meta) => this.dashboard!.page(token, cookie, meta),
+            api: (endpoint, sessionId, body, meta) => this.dashboard!.api(endpoint, sessionId, body, meta),
           }
         : undefined,
       {

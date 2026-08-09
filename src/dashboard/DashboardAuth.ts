@@ -14,6 +14,7 @@ import {
   rpFromBaseUrl,
 } from "./auth/webauthnSupport";
 import type { AuthenticationResponseJSON, RegistrationResponseJSON } from "@simplewebauthn/server";
+import { parseYubiOtp, verifyYubiOtp, YubiFetch, YubiVerifyConfig } from "./auth/yubikeyOtp";
 import { log } from "../util/logger";
 
 const authLog = log.child("dashboard:auth");
@@ -33,7 +34,7 @@ export interface DashboardAuthResult {
   state: DashboardUiState; // "locked" | "active" (never "expired" — that's null)
   activationCode?: string; // present while locked (rendered by the lock overlay)
   sessionIdHash: string;
-  authMethod: "passkey" | "totp" | "breakglass";
+  authMethod: "passkey" | "totp" | "breakglass" | "yubikey";
   // T2 ceremonies: was a fresh factor asserted within the window?
   stepUpFresh(windowMs?: number): boolean;
   // Verify + consume a Discord reverse code for THIS request (T3 ceremonies).
@@ -88,10 +89,12 @@ const LOCKOUT_STEPS: Array<{ fails: number; lockMs: number }> = [
 ];
 
 export interface LoginNotifier {
-  // DM the admin about a fresh LOCKED session (activation buttons live in the
-  // DM). Best-effort — login proceeds even if the DM fails (the /billing
-  // Activate button is the fallback).
-  notifyLogin(discordUserId: string, info: { method: string; ip?: string; ua?: string }): Promise<void>;
+  // DM the admin about a fresh session. pending=true → LOCKED session, the DM
+  // carries the activation buttons (the /billing Activate button is the
+  // fallback). pending=false → already-active session (trusted factor), the
+  // DM is a notification with only the lockdown button. Best-effort: login
+  // proceeds even if the DM fails.
+  notifyLogin(discordUserId: string, info: { method: string; ip?: string; ua?: string; pending: boolean }): Promise<void>;
   // Alert on lockout-ladder escalation.
   notifyLockout(discordUserId: string, fails: number): Promise<void>;
 }
@@ -111,7 +114,9 @@ export class StandingDashboardAuth implements DashboardAuthProvider {
     private tokens: DashboardTokens,
     private sessions: DashboardDbSessions,
     private credentials: CredentialStore,
-    private audit: DashboardAudit
+    private audit: DashboardAudit,
+    // Test seam only; production uses the safeFetch default.
+    private yubiFetch?: YubiFetch
   ) {}
 
   bindNotifier(notifier: LoginNotifier): void {
@@ -150,6 +155,7 @@ export class StandingDashboardAuth implements DashboardAuthProvider {
         discordUserId: payload.sub,
         adminName: payload.an,
         epoch: this.settings.dashboardEpoch(),
+        state: "locked",
         authMethod: "breakglass",
         ip: input.ip,
         ua: input.ua,
@@ -208,7 +214,7 @@ export class StandingDashboardAuth implements DashboardAuthProvider {
     switch (endpoint) {
       // The shell's first poll when no session exists → login mode.
       case "activation-status": {
-        return { status: 200, json: { state: "login", passkey: this.rp() != null } };
+        return { status: 200, json: { state: "login", passkey: this.rp() != null, yubikey: this.yubiConfig() != null } };
       }
       case "auth-passkey-options": {
         const rp = this.rp();
@@ -247,6 +253,14 @@ export class StandingDashboardAuth implements DashboardAuthProvider {
             ip: meta.ip,
           });
         }
+        // Trusted passkey → active session immediately (no passphrase, no
+        // Discord activation; the DM is notification-only).
+        if (row.trusted) {
+          this.clearFailures(row.discordUserId);
+          return this.startSession(row.discordUserId, this.nameFor(row.discordUserId), "passkey", row.credentialId, meta, {
+            locked: false,
+          });
+        }
         // Passkey good → passphrase step (knowledge factor).
         const loginId = hashSessionToken(`${row.id}:${Date.now()}:${Math.random()}`).slice(0, 32);
         this.prunePendingLogins();
@@ -273,7 +287,7 @@ export class StandingDashboardAuth implements DashboardAuthProvider {
         }
         this.pendingLogins.delete(loginId);
         this.clearFailures(pending.userId);
-        return this.startLockedSession(pending.userId, pending.name, "passkey", pending.credentialId, meta);
+        return this.startSession(pending.userId, pending.name, "passkey", pending.credentialId, meta, { locked: true });
       }
       case "auth-totp-login": {
         // Fallback path (no passkey available): identity + passphrase + code
@@ -292,7 +306,33 @@ export class StandingDashboardAuth implements DashboardAuthProvider {
           return { status: 200, json: { ok: false, error: "Sign-in failed. Try again." } };
         }
         this.clearFailures(userId);
-        return this.startLockedSession(userId, this.nameFor(userId), "totp", null, meta);
+        return this.startSession(userId, this.nameFor(userId), "totp", null, meta, { locked: true });
+      }
+      case "auth-yubikey-login": {
+        // "Special" factor: one key touch signs its owner in directly. The
+        // OTP prefix resolves the key (usernameless); verification is remote
+        // and fails closed. Anti-oracle: every failure is the same string,
+        // and unknown keys never trigger a remote call.
+        const config = this.yubiConfig();
+        const parsed = typeof request.otp === "string" ? parseYubiOtp(request.otp) : null;
+        const fail = { status: 200, json: { ok: false, error: "Sign-in failed. Try again." } };
+        if (!config || !parsed) return fail;
+        const row = await this.credentials.findYubikeyByPublicId(parsed.publicId);
+        if (!row) return fail;
+        const userId = row.discordUserId;
+        const locked = this.lockedFor(userId);
+        if (locked) return { status: 200, json: { ok: false, error: locked } };
+        if (!this.settings.dashboardAdminRole(userId)) return fail;
+        const verified = await verifyYubiOtp(parsed.otp, config, this.yubiFetch);
+        if (!verified.ok) {
+          await this.recordFailure(userId, "login.yubikey", meta);
+          return verified.reason === "unreachable" || verified.reason === "backend_error"
+            ? { status: 200, json: { ok: false, error: "Verification service unreachable. Try again." } }
+            : fail;
+        }
+        this.clearFailures(userId);
+        await this.credentials.recordYubikeyUse(row.id);
+        return this.startSession(userId, this.nameFor(userId), "yubikey", row.credentialId, meta, { locked: false });
       }
       default:
         return null;
@@ -317,10 +357,25 @@ export class StandingDashboardAuth implements DashboardAuthProvider {
         return { status: 200, json: { options } };
       }
       case "auth-stepup": {
-        // Fresh factor re-assert (T2): a passkey assertion by THIS admin, or
-        // a current TOTP code.
+        // Fresh factor re-assert (T2): a passkey assertion by THIS admin, a
+        // current TOTP code, or a YubiKey OTP touch from an enrolled key.
         const totp = typeof request.totp === "string" ? request.totp : null;
-        if (totp != null) {
+        const yubikeyOtp = typeof request.yubikeyOtp === "string" ? request.yubikeyOtp : null;
+        if (yubikeyOtp != null) {
+          const config = this.yubiConfig();
+          const parsed = parseYubiOtp(yubikeyOtp);
+          const row = parsed ? await this.credentials.findYubikeyByPublicId(parsed.publicId) : null;
+          // The touched key must belong to the SESSION's admin.
+          if (!config || !parsed || !row || row.discordUserId !== auth.actor.id) {
+            return { status: 200, json: { ok: false, error: "That code didn't match." } };
+          }
+          const verified = await verifyYubiOtp(parsed.otp, config, this.yubiFetch);
+          if (!verified.ok) {
+            await this.recordFailure(auth.actor.id, "stepup.yubikey", meta);
+            return { status: 200, json: { ok: false, error: "That code didn't match." } };
+          }
+          await this.credentials.recordYubikeyUse(row.id);
+        } else if (totp != null) {
           if (!(await this.credentials.checkTotp(auth.actor.id, totp))) {
             await this.recordFailure(auth.actor.id, "stepup.totp", meta);
             return { status: 200, json: { ok: false, error: "That code didn't match." } };
@@ -348,7 +403,7 @@ export class StandingDashboardAuth implements DashboardAuthProvider {
           actorName: auth.actor.name,
           kind: "auth",
           action: "stepup",
-          summary: `Fresh factor re-asserted (${totp != null ? "totp" : "passkey"})`,
+          summary: `Fresh factor re-asserted (${yubikeyOtp != null ? "yubikey" : totp != null ? "totp" : "passkey"})`,
           outcome: "ok",
           ip: meta.ip,
           sessionIdHash: auth.sessionIdHash,
@@ -372,12 +427,22 @@ export class StandingDashboardAuth implements DashboardAuthProvider {
         const response = request.response as RegistrationResponseJSON | undefined;
         const challenge = this.challengeFrom(response);
         const label = typeof request.label === "string" && request.label.trim() ? request.label.trim() : "Passkey";
+        const trusted = request.trusted === true;
         if (!rp || !response || !challenge || !this.challenges.consume(challenge)) {
           return { status: 200, json: { ok: false, error: "Registration failed. Try again." } };
         }
         // Passphrase-before-first-credential rule.
         if (!(await this.credentials.hasPassphrase(auth.actor.id))) {
           return { status: 200, json: { ok: false, error: "Set a passphrase first." } };
+        }
+        // A trusted passkey bypasses passphrase + Discord activation at login,
+        // so minting one needs a fresh factor (mirror of the passphrase-change
+        // rule): a hijacked idle session must not plant bypass credentials.
+        if (trusted && auth.authMethod !== "breakglass" && !auth.stepUpFresh()) {
+          return {
+            status: 200,
+            json: { ok: false, needsStepUp: true, error: "Trusted passkeys need a fresh step-up first." },
+          };
         }
         const verified = await checkRegistration(rp, response, challenge);
         if (!verified) return { status: 200, json: { ok: false, error: "Registration failed. Try again." } };
@@ -386,18 +451,19 @@ export class StandingDashboardAuth implements DashboardAuthProvider {
           label,
           credential: verified.credential,
           backedUp: verified.backedUp,
+          trusted,
         });
         await this.audit.record({
           actorId: auth.actor.id,
           actorName: auth.actor.name,
           kind: "auth",
           action: "passkey.enrolled",
-          summary: `Passkey enrolled: ${label}`,
+          summary: `Passkey enrolled: ${label}${trusted ? " (trusted)" : ""}`,
           outcome: "ok",
           ip: meta.ip,
           sessionIdHash: auth.sessionIdHash,
         });
-        return { status: 200, json: { ok: true, text: "Passkey enrolled." } };
+        return { status: 200, json: { ok: true, text: trusted ? "Trusted passkey enrolled." : "Passkey enrolled." } };
       }
       default:
         return null;
@@ -470,17 +536,23 @@ export class StandingDashboardAuth implements DashboardAuthProvider {
 
   // ---- internals ----
 
-  private async startLockedSession(
+  // locked=true → Discord activation ceremony (weaker factors: passphrase
+  // after an untrusted passkey, TOTP fallback). locked=false → active
+  // immediately, Discord gets a notify-only DM (trusted passkey, yubikey).
+  private async startSession(
     userId: string,
     name: string,
-    method: "passkey" | "totp",
+    method: "passkey" | "totp" | "yubikey",
     credentialId: string | null,
-    meta: { ip?: string; ua?: string }
+    meta: { ip?: string; ua?: string },
+    opts: { locked: boolean }
   ): Promise<AuthEndpointResult> {
+    const state = opts.locked ? "locked" : "active";
     const { token } = await this.sessions.create({
       discordUserId: userId,
       adminName: name,
       epoch: this.settings.dashboardEpoch(),
+      state,
       authMethod: method,
       credentialIdUsed: credentialId,
       ip: meta.ip,
@@ -491,14 +563,17 @@ export class StandingDashboardAuth implements DashboardAuthProvider {
       actorName: name,
       kind: "auth",
       action: `login.${method}`,
-      summary: `Standing login (locked; awaiting Discord activation) from ${meta.ip ?? "unknown ip"}`,
+      summary: opts.locked
+        ? `Standing login (locked; awaiting Discord activation) from ${meta.ip ?? "unknown ip"}`
+        : `Standing login (direct; trusted factor) from ${meta.ip ?? "unknown ip"}`,
       outcome: "ok",
       ip: meta.ip,
       sessionIdHash: hashSessionToken(token),
     });
-    // Push the activation DM (best-effort).
-    this.notifier?.notifyLogin(userId, { method, ip: meta.ip, ua: meta.ua }).catch(() => {});
-    return { status: 200, json: { ok: true, state: "locked" }, setCookie: this.cookieFor(token) };
+    // Push the Discord DM (best-effort): activation ceremony when locked,
+    // notification-only when the session is already active.
+    this.notifier?.notifyLogin(userId, { method, ip: meta.ip, ua: meta.ua, pending: opts.locked }).catch(() => {});
+    return { status: 200, json: { ok: true, state }, setCookie: this.cookieFor(token) };
   }
 
   private cookieFor(token: string): string {
@@ -510,6 +585,18 @@ export class StandingDashboardAuth implements DashboardAuthProvider {
 
   private rp() {
     return rpFromBaseUrl(this.settings.resolvedPublicBaseUrl());
+  }
+
+  // null = YubiKey OTP not configured (no client id) → the login/step-up/
+  // enrollment paths are all dark.
+  private yubiConfig(): YubiVerifyConfig | null {
+    const clientId = this.settings.yubicoClientId();
+    if (!clientId) return null;
+    return {
+      clientId,
+      apiSecret: this.settings.yubicoApiSecret(),
+      verifyUrl: this.settings.yubicoValidationUrl(),
+    };
   }
 
   private nameFor(userId: string): string {

@@ -21,7 +21,7 @@ D.actionBtn = function (a) {
     b.addEventListener("click", function (e) {
       e.stopPropagation();
       var label = window.prompt("Name this passkey (e.g. MacBook Touch ID):", "") || "";
-      D.passkeyRegister(label);
+      D.passkeyRegister(label, a.params || {});
     });
     return b;
   }

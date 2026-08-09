@@ -2,13 +2,13 @@ import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { DashboardSession as DbRow, PrismaClient } from "../../generated/prisma/client";
 
 // DB-backed standing sessions for the dashboard (dashboard_sessions): survive
-// deploy restarts, 8h sliding idle / 3d absolute (user-chosen), row id =
+// deploy restarts, 7d sliding idle / 30d absolute (user-chosen), row id =
 // SHA-256 hex of the cookie token so a DB dump yields nothing usable. An
 // in-memory read-through cache keeps the hot path off the DB; lastSeenAt is
 // written behind (≥60s between writes).
 
-export const IDLE_TTL_MS = 8 * 60 * 60 * 1000;
-export const ABSOLUTE_TTL_MS = 3 * 24 * 60 * 60 * 1000;
+export const IDLE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+export const ABSOLUTE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const LAST_SEEN_WRITE_INTERVAL_MS = 60_000;
 const MAX_SESSIONS_PER_ADMIN = 10;
 const MAX_SESSIONS_GLOBAL = 50;
@@ -18,7 +18,7 @@ const LOCKED_TTL_MS = 10 * 60 * 1000; // unactivated sessions die after 10 min
 // Crockford base32 (no I/L/O/U).
 const CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
-export type StandingAuthMethod = "passkey" | "totp" | "breakglass";
+export type StandingAuthMethod = "passkey" | "totp" | "breakglass" | "yubikey";
 
 export interface StandingSession {
   idHash: string;
@@ -46,20 +46,23 @@ export class DashboardDbSessions {
 
   constructor(private prisma: PrismaClient) {}
 
-  // Creates a LOCKED session and returns the raw cookie token (exists only in
-  // the Set-Cookie header from here on) + the activation code for the page.
+  // Creates a session and returns the raw cookie token (exists only in the
+  // Set-Cookie header from here on). state "locked" sessions carry an
+  // activation code for the Discord ceremony; "active" sessions (trusted
+  // factors: trusted passkey, yubikey) are usable immediately.
   async create(input: {
     discordUserId: string;
     adminName: string;
     epoch: number;
+    state: "locked" | "active";
     authMethod: StandingAuthMethod;
     credentialIdUsed?: string | null;
     ua?: string | null;
     ip?: string | null;
-  }): Promise<{ token: string; activationCode: string }> {
+  }): Promise<{ token: string; activationCode: string | null }> {
     await this.enforceCaps(input.discordUserId);
     const token = randomBytes(32).toString("base64url");
-    const activationCode = newActivationCode();
+    const activationCode = input.state === "locked" ? newActivationCode() : null;
     const now = new Date();
     await this.prisma.dashboardSession.create({
       data: {
@@ -67,7 +70,7 @@ export class DashboardDbSessions {
         discordUserId: input.discordUserId,
         adminName: input.adminName,
         epoch: input.epoch,
-        state: "locked",
+        state: input.state,
         authMethod: input.authMethod,
         credentialIdUsed: input.credentialIdUsed ?? null,
         activationCode,

@@ -16,6 +16,7 @@ export const COLUMN_LABELS: Record<GlobalSecretColumn, string> = {
   sentryReadToken: "Sentry read token",
   sentryWebhookSecret: "Sentry webhook secret",
   influxToken: "InfluxDB token",
+  yubicoApiSecret: "Yubico API secret",
 };
 
 export interface MigrateItemResult {

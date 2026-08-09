@@ -327,6 +327,15 @@ model BotSettings {
   // LOCKDOWN) kills every outstanding dashboard link and session instantly,
   // independent of the other two panels.
   dashboardEpoch          Int     @default(0)
+  // YubiKey OTP sign-in (Yubico validation protocol). Client ID from
+  // upgrade.yubico.com/getapikey; blank disables the yubikey login path.
+  yubicoClientId          String?
+  // Yubico API secret (8th global secret: Vault KV sentinel / enc:v1 local).
+  // Optional; without it verify responses are TLS-trusted but unsigned.
+  yubicoApiSecret         String?
+  // Optional self-hosted validation server (public https verify URL).
+  // Blank = YubiCloud (https://api.yubico.com/wsapi/2.0/verify).
+  yubicoValidationUrl     String?
   // SLA manager (edited via /intercom → SLA Manager). The bot IS the SLA
   // engine (Intercom Advanced has no native SLAs): rules pick a target, the
   // bot writes it to the slaAttributeName conversation attribute (inbox
@@ -893,21 +902,26 @@ model SlaState {
 
 // ---- Stripe dashboard standing auth ----
 
-// Per-admin dashboard credentials: any number of passkey/totp rows plus one
-// passphrase row (upserted). Passkey public keys and scrypt hashes are NOT
-// secrets (rotation-immune); the TOTP secret is encrypted (Vault Transit
-// envelope when active, local enc:v1 otherwise).
+// Per-admin dashboard credentials: any number of passkey/totp/yubikey rows
+// plus one passphrase row (upserted). Passkey public keys and scrypt hashes
+// are NOT secrets (rotation-immune); the TOTP secret is encrypted (Vault
+// Transit envelope when active, local enc:v1 otherwise). YubiKey OTP rows
+// store only the key's public ID (in credentialId); verification is remote.
 model DashboardCredential {
   id                 String    @id @default(cuid())
   discordUserId      String
-  kind               String // "passkey" | "totp" | "passphrase"
+  kind               String // "passkey" | "totp" | "passphrase" | "yubikey"
   label              String?
-  // passkey rows
-  credentialId       String?   @unique // base64url
+  // passkey rows (credentialId also carries the yubikey public ID)
+  credentialId       String?   @unique // base64url (yubikey: modhex public ID)
   publicKey          String? // base64url-encoded COSE public key
   signCount          Int?
   transports         String? // comma-joined transport hints
   backupState        Boolean?
+  // trusted passkeys sign in directly (no passphrase, no Discord activation);
+  // set at enrollment only, behind a fresh step-up. yubikey rows are
+  // implicitly trusted and ignore this flag.
+  trusted            Boolean   @default(false)
   // totp rows
   secretEnc          String?
   lastUsedStep       Int? // accepted-code replay guard
@@ -922,7 +936,7 @@ model DashboardCredential {
 }
 
 // DB-backed standing sessions (survive deploys). id = SHA-256 hex of the
-// cookie token — a DB dump yields no usable session. 8h idle / 3d absolute.
+// cookie token — a DB dump yields no usable session. 7d idle / 30d absolute.
 model DashboardSession {
   id                 String    @id
   discordUserId      String

@@ -77,7 +77,7 @@ const DEFAULT_TAGS: TagInput[] = [
   { emoji: "📁", label: "Closed", closesThread: true, reminderEnabled: false },
 ];
 
-// The seven global secrets and their Vault KV home (one KV entry per
+// The eight global secrets and their Vault KV home (one KV entry per
 // integration; field names live inside the entry). Shared by the read
 // resolver, the write router, the panel state helper and the migrator.
 export type GlobalSecretColumn =
@@ -87,7 +87,8 @@ export type GlobalSecretColumn =
   | "stripeSecretKey"
   | "sentryReadToken"
   | "sentryWebhookSecret"
-  | "influxToken";
+  | "influxToken"
+  | "yubicoApiSecret";
 
 export const GLOBAL_SECRETS: Record<GlobalSecretColumn, { integration: VaultIntegration; field: string }> = {
   intercomAccessToken: { integration: "intercom", field: "accessToken" },
@@ -97,6 +98,7 @@ export const GLOBAL_SECRETS: Record<GlobalSecretColumn, { integration: VaultInte
   sentryReadToken: { integration: "sentry", field: "readToken" },
   sentryWebhookSecret: { integration: "sentry", field: "webhookSecret" },
   influxToken: { integration: "influx", field: "token" },
+  yubicoApiSecret: { integration: "yubico", field: "apiSecret" },
 };
 
 // Panel-facing storage state of a global secret column.
@@ -125,7 +127,7 @@ export class SettingsStore {
     this.vault = vault;
   }
 
-  // ---- Vault secret plumbing (the seven GLOBAL_SECRETS columns) ----
+  // ---- Vault secret plumbing (the eight GLOBAL_SECRETS columns) ----
 
   // Read path. A column holds one of: null/"" (not set), the vault:kv sentinel
   // (value lives in Vault KV → serve from the in-memory cache, null while the
@@ -753,6 +755,43 @@ export class SettingsStore {
       data: { dashboardEpoch: { increment: 1 } },
     });
     return this.settings.dashboardEpoch;
+  }
+
+  // ---- YubiKey OTP sign-in (dashboard) ----
+
+  // Yubico validation-protocol client id (upgrade.yubico.com/getapikey).
+  // Blank disables the yubikey login/step-up/enrollment paths entirely.
+  yubicoClientId(): string | null {
+    return this.settings.yubicoClientId?.trim() || null;
+  }
+
+  // Optional API secret (base64): signs verify requests and authenticates
+  // responses. Vault-routed like every global secret.
+  yubicoApiSecret(): string | null {
+    return this.resolveSecret(this.settings.yubicoApiSecret, "yubicoApiSecret");
+  }
+
+  // Optional self-hosted validation server (public https verify URL).
+  // Blank = YubiCloud.
+  yubicoValidationUrl(): string | null {
+    return this.settings.yubicoValidationUrl?.trim() || null;
+  }
+
+  async updateYubicoSettings(data: {
+    yubicoClientId?: string | null;
+    yubicoApiSecret?: string | null;
+    yubicoValidationUrl?: string | null;
+  }): Promise<void> {
+    const { yubicoApiSecret, ...rest } = data;
+    this.settings = await this.prisma.botSettings.update({
+      where: { id: "global" },
+      data: {
+        ...rest,
+        ...(yubicoApiSecret !== undefined
+          ? { yubicoApiSecret: await this.routeSecretWrite("yubicoApiSecret", yubicoApiSecret) }
+          : {}),
+      },
+    });
   }
 
   // ---- SLA manager (/intercom → SLA Manager) ----

@@ -59,10 +59,14 @@ ${dashboardCss()}
 <div id="login" class="overlay" hidden>
   <div class="card logincard">
     <h2>Sign in</h2>
-    <p class="muted">Passkey + passphrase, then confirm in Discord.</p>
+    <p class="muted">Trusted passkey or YubiKey signs in directly; other factors confirm in Discord.</p>
     <div id="loginErr" class="error" hidden></div>
     <div id="loginStep1">
       <button class="btn primary wide" id="loginPasskey" type="button">Sign in with passkey</button>
+      <div id="loginYubiWrap" hidden>
+        <label for="loginYubi">or click below and touch your YubiKey</label>
+        <input type="text" id="loginYubi" autocomplete="off" spellcheck="false">
+      </div>
       <p class="muted small"><a id="loginTotpLink" href="#">Use authenticator code instead</a></p>
     </div>
     <div id="loginStep2" hidden>
@@ -143,9 +147,11 @@ ${dashboardCss()}
 </dialog>
 <dialog id="stepup">
   <h2>Verify it's you</h2>
-  <div class="summary">This action needs a fresh factor. No passkey on this device? Enter an authenticator code:</div>
+  <div class="summary">This action needs a fresh factor. No passkey on this device? Enter an authenticator code or touch your YubiKey:</div>
   <label>Authenticator code</label>
   <input type="text" id="stepupCode" autocomplete="one-time-code" inputmode="numeric">
+  <label>Or click here and touch your YubiKey</label>
+  <input type="text" id="stepupYubi" autocomplete="off" spellcheck="false">
   <div id="stepupErr" class="error" hidden></div>
   <div class="drow">
     <button class="btn" id="stepupCancel" type="button">Cancel</button>

@@ -62,6 +62,10 @@ export class CredentialStore {
     label: string;
     credential: WebAuthnCredential;
     backedUp: boolean;
+    // Trusted passkeys sign in directly (no passphrase, no Discord
+    // activation). Set at enrollment only; the caller enforces the fresh
+    // step-up that gates it.
+    trusted: boolean;
   }): Promise<void> {
     await this.prisma.dashboardCredential.create({
       data: {
@@ -73,6 +77,7 @@ export class CredentialStore {
         signCount: input.credential.counter,
         transports: input.credential.transports?.join(",") ?? null,
         backupState: input.backedUp,
+        trusted: input.trusted,
       },
     });
   }
@@ -110,6 +115,33 @@ export class CredentialStore {
       data: { signCount: newCounter, lastUsedAt: new Date() },
     });
     return { regressed };
+  }
+
+  // ---- YubiKey OTP ----
+  // Rows store only the key's modhex public ID (in credentialId; public IDs
+  // are globally unique, so the existing unique index carries them). The OTP
+  // itself is verified remotely; nothing secret lives here.
+
+  async addYubikey(input: { discordUserId: string; label: string; publicId: string }): Promise<void> {
+    await this.prisma.dashboardCredential.create({
+      data: {
+        discordUserId: input.discordUserId,
+        kind: "yubikey",
+        label: input.label.slice(0, 80),
+        credentialId: input.publicId,
+      },
+    });
+  }
+
+  // Login lookup: the OTP prefix identifies the key across ALL admins
+  // (usernameless, like passkeys).
+  async findYubikeyByPublicId(publicId: string): Promise<DashboardCredential | null> {
+    const row = await this.prisma.dashboardCredential.findUnique({ where: { credentialId: publicId } });
+    return row && row.kind === "yubikey" && !row.revokedAt ? row : null;
+  }
+
+  async recordYubikeyUse(id: string): Promise<void> {
+    await this.prisma.dashboardCredential.update({ where: { id }, data: { lastUsedAt: new Date() } });
   }
 
   // ---- TOTP ----

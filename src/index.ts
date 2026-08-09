@@ -552,7 +552,7 @@ async function main() {
 
   // Stripe dashboard (/dashboard) — the account-wide web surface replacing
   // /billing over time. Third panel on the panelMount substrate. Standing auth:
-  // passkey → passphrase → Discord DM activation, DB-backed 8h/3d sessions;
+  // passkey → passphrase → Discord DM activation, DB-backed 7d/30d sessions;
   // the Discord-minted link + passcode stays as break-glass/bootstrap.
   const dashboardTokens = new DashboardTokens(settingsStore);
   const dashboardCredentials = new CredentialStore(prisma);
