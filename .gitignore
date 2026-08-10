@@ -12,3 +12,6 @@ node_modules
 .vscode
 
 dist/
+# pnpm 11 scaffolds this placeholder locally (build-script approval moved out of package.json).
+# Deploy pnpm chokes on it (workspace file without a packages field) - never commit it.
+pnpm-workspace.yaml

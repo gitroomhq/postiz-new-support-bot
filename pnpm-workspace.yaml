@@ -1,6 +1,0 @@
-allowBuilds:
-  '@prisma/engines': set this to true or false
-  '@sentry/node-cpu-profiler': set this to true or false
-  '@swc/core': set this to true or false
-  prisma: set this to true or false
-  protobufjs: set this to true or false
