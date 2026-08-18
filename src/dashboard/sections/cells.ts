@@ -182,7 +182,7 @@ export function subBadge(status: Stripe.Subscription.Status): Badge {
 // forever — "Canceled" + future-tense "Cancels at period end" side by side
 // reads as a contradiction, so that pair collapses into one past-tense badge.
 export function subStatusFlags(
-  sub: Pick<Stripe.Subscription, "status" | "cancel_at_period_end" | "pause_collection">
+  sub: Pick<Stripe.Subscription, "status" | "cancel_at" | "cancel_at_period_end" | "pause_collection">
 ): Badge[] {
   if (sub.status === "canceled" && sub.cancel_at_period_end) {
     return [{ kind: "neutral", text: "Canceled at period end" }];
@@ -190,6 +190,11 @@ export function subStatusFlags(
   const flags: Badge[] = [subBadge(sub.status)];
   if (sub.pause_collection) flags.push({ kind: "warn", text: "Paused" });
   if (sub.cancel_at_period_end) flags.push({ kind: "warn", text: "Cancels at period end" });
+  // A dated cancel is otherwise invisible in the list: the sub reads "Active"
+  // right up to the day it disappears.
+  if (sub.cancel_at && sub.status !== "canceled") {
+    flags.push({ kind: "warn", text: `Cancels ${new Date(sub.cancel_at * 1000).toISOString().slice(0, 10)}` });
+  }
   return flags;
 }
 

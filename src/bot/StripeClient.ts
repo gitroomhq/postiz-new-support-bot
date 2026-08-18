@@ -858,6 +858,9 @@ export class StripeClient {
 
   // "charge" bills the default payment method immediately and errors visibly if
   // that isn't possible; "invoice" emails an invoice due in 7 days instead.
+  // cancelAtUnix schedules the hard end up front; cancelIfNoPaymentMethod makes
+  // a trial that never got a card die at trial end instead of falling into
+  // past_due (Stripe's default is to invoice anyway).
   async createSubscription(
     params: {
       customerId: string;
@@ -866,6 +869,8 @@ export class StripeClient {
       couponId?: string;
       promotionCodeId?: string;
       trialDays?: number;
+      cancelAtUnix?: number;
+      cancelIfNoPaymentMethod?: boolean;
       collection: "charge" | "invoice";
       metadata?: Record<string, string>;
     },
@@ -882,6 +887,11 @@ export class StripeClient {
             ? { discounts: [{ promotion_code: params.promotionCodeId }] }
             : {}),
         ...(params.trialDays ? { trial_period_days: params.trialDays } : {}),
+        ...(params.cancelAtUnix ? { cancel_at: params.cancelAtUnix } : {}),
+        // trial_settings only means anything alongside a trial.
+        ...(params.trialDays && params.cancelIfNoPaymentMethod
+          ? { trial_settings: { end_behavior: { missing_payment_method: "cancel" as const } } }
+          : {}),
         ...(params.collection === "invoice"
           ? { collection_method: "send_invoice", days_until_due: 7 }
           : { payment_behavior: "error_if_incomplete" }),
@@ -1869,6 +1879,33 @@ export class StripeClient {
 
   async cancelSubscriptionAtPeriodEnd(subscriptionId: string): Promise<void> {
     await this.stripe.subscriptions.update(subscriptionId, { cancel_at_period_end: true });
+  }
+
+  // Hard end at an absolute moment. Unlike cancel_at_period_end this can land
+  // mid-period (Stripe does NOT prorate or refund the unused part) and it
+  // overrides a running trial, which is the point: a trial nobody paid for can
+  // be given a fixed expiry date.
+  async setSubscriptionCancelAt(
+    subscriptionId: string,
+    cancelAtUnix: number,
+    idempotencyKey?: string
+  ): Promise<Stripe.Subscription> {
+    return this.stripe.subscriptions.update(
+      subscriptionId,
+      { cancel_at: cancelAtUnix },
+      idempotencyKey ? { idempotencyKey } : undefined
+    );
+  }
+
+  // Clears BOTH scheduled-cancel mechanisms — a sub can carry cancel_at and
+  // cancel_at_period_end independently, so an undo that only cleared one would
+  // silently leave the other armed.
+  async clearScheduledCancel(subscriptionId: string, idempotencyKey?: string): Promise<Stripe.Subscription> {
+    return this.stripe.subscriptions.update(
+      subscriptionId,
+      { cancel_at: null, cancel_at_period_end: false },
+      idempotencyKey ? { idempotencyKey } : undefined
+    );
   }
 
   async addTaxId(customerId: string, type: string, value: string): Promise<Stripe.TaxId> {

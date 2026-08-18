@@ -388,6 +388,39 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
     );
     actions.push(
       registryButton(ctx, {
+        key: "subscription.cancel",
+        label: "Cancel on a date",
+        dangerous: true,
+        params: { subscriptionId: id, when: "at" },
+        inputs: [
+          { type: "number", key: "cancelInDays", label: "Cancel after (days from now)", min: 1, max: 730 },
+          { type: "number", key: "cancelAtUnix", label: "Exact unix timestamp (optional, overrides the days)" },
+        ],
+        summary:
+          "Ends the subscription on that date, mid-period if that is where the date falls: Stripe does NOT prorate or refund the unused time." +
+          (sub.cancel_at ? ` Replaces the cancellation currently set for ${new Date(sub.cancel_at * 1000).toISOString().slice(0, 10)}.` : "") +
+          cancelSyncWarning,
+        ...(scheduleId
+          ? { disabledReason: "Driven by a schedule; set the end behaviour in the schedule editor instead." }
+          : {}),
+      })
+    );
+    if (sub.cancel_at || sub.cancel_at_period_end) {
+      actions.push(
+        registryButton(ctx, {
+          key: "subscription.cancel",
+          label: "Don't cancel",
+          // The registry marks every subscription.cancel param shape dangerous,
+          // so the undo carries the typed-CONFIRM flag too: the client modal has
+          // to match, or the server rejects the submission.
+          dangerous: true,
+          params: { subscriptionId: id, when: "never" },
+          summary: "Clears the scheduled cancellation (both the dated one and the period-end flag); the subscription keeps renewing.",
+        })
+      );
+    }
+    actions.push(
+      registryButton(ctx, {
         key: "subscription.pause_resume",
         label: sub.pause_collection ? "Resume collection" : "Pause collection",
         dangerous: true,
@@ -1232,9 +1265,13 @@ async function composer(ctx: DashboardCtx, filters: Record<string, string>): Pro
   const trialRaw = str(filters.trial, 4).trim();
   const trialDays = /^\d{1,3}$/.test(trialRaw) && Number.parseInt(trialRaw, 10) > 0 ? Number.parseInt(trialRaw, 10) : null;
   const collection: "charge" | "invoice" = filters.collection === "invoice" ? "invoice" : "charge";
-  // Postiz sync is the default — "off" is the deliberate opt-out for subs
-  // that should NOT appear on the platform.
-  const postizOff = filters.postiz === "off";
+  // Optional hard end armed at creation ("trial for a week, then stop"), and
+  // what a trial does at its end when no card ever arrived. Every subscription
+  // created here syncs to Postiz; there is no opt-out.
+  const cancelRaw = str(filters.cancel, 4).trim();
+  const cancelDays = /^\d{1,3}$/.test(cancelRaw) && Number.parseInt(cancelRaw, 10) > 0 ? Number.parseInt(cancelRaw, 10) : null;
+  const cancelAtUnix = cancelDays ? Math.floor(Date.now() / 1000) + cancelDays * 86400 : null;
+  const cancelIfNoPaymentMethod = filters.trialend === "cancel";
 
   const [prices, customer] = await Promise.all([
     ctx.stripe.listRecurringPrices(50).catch(() => [] as Stripe.Price[]),
@@ -1253,7 +1290,8 @@ async function composer(ctx: DashboardCtx, filters: Record<string, string>): Pro
     ...(promo ? { promo } : {}),
     ...(trialRaw ? { trial: trialRaw } : {}),
     ...(filters.collection === "invoice" ? { collection: "invoice" } : {}),
-    ...(postizOff ? { postiz: "off" } : {}),
+    ...(cancelRaw ? { cancel: cancelRaw } : {}),
+    ...(cancelIfNoPaymentMethod ? { trialend: "cancel" } : {}),
   };
 
   const blocks: Block[] = [
@@ -1310,6 +1348,17 @@ async function composer(ctx: DashboardCtx, filters: Record<string, string>): Pro
       { key: "qty", label: "Quantity", kind: "text", value: qtyRaw || undefined, placeholder: "1" },
       { key: "promo", label: "Promo code", kind: "text", value: promo || undefined, placeholder: "SAVE20" },
       { key: "trial", label: "Trial days", kind: "text", value: trialRaw || undefined, placeholder: "0" },
+      { key: "cancel", label: "Cancel after (days)", kind: "text", value: cancelRaw || undefined, placeholder: "never" },
+      {
+        key: "trialend",
+        label: "Trial end, no card",
+        kind: "select",
+        value: cancelIfNoPaymentMethod ? "cancel" : undefined,
+        options: [
+          { value: "", label: "Invoice anyway (Stripe default)" },
+          { value: "cancel", label: "Cancel the subscription" },
+        ],
+      },
       {
         key: "collection",
         label: "Collection",
@@ -1318,16 +1367,6 @@ async function composer(ctx: DashboardCtx, filters: Record<string, string>): Pro
         options: [
           { value: "", label: "Charge automatically" },
           { value: "invoice", label: "Email invoice (due in 7 days)" },
-        ],
-      },
-      {
-        key: "postiz",
-        label: "Postiz sync",
-        kind: "select",
-        value: postizOff ? "off" : undefined,
-        options: [
-          { value: "", label: "Sync to Postiz (tier from price)" },
-          { value: "off", label: "No sync (non-Postiz subscription)" },
         ],
       },
     ],
@@ -1350,6 +1389,14 @@ async function composer(ctx: DashboardCtx, filters: Record<string, string>): Pro
       : "Set the Customer filter (cus_…) first, then pick a price.",
   });
 
+  if (cancelIfNoPaymentMethod && !trialDays) {
+    blocks.push({
+      type: "notice",
+      badge: { kind: "warn", text: "NEEDS A TRIAL" },
+      text: "\"Trial end, no card → cancel\" only applies to a trial. Set Trial days, or use Cancel after (days) for an unconditional end date.",
+    });
+  }
+
   // MANDATORY preview: confirm exists ONLY after a successful first-invoice
   // preview for the exact customer+price(+qty/trial) combination.
   if (customerId && customer && !customer.deleted && targetPrice) {
@@ -1369,18 +1416,12 @@ async function composer(ctx: DashboardCtx, filters: Record<string, string>): Pro
       });
     } else {
       // Postiz sync resolution: tier/period derive from the picked price.
-      // Non-canonical price + sync = no confirm button (the registry refuses
+      // A non-canonical price = no confirm button (the registry refuses
       // independently — the notice just explains why).
       const targetPriceObj = prices.find((p) => p.id === targetPrice) ?? null;
-      const postizPlan = !postizOff && targetPriceObj ? derivePostizPlan(targetPriceObj) : null;
-      const postizBlocked = !postizOff && !postizPlan;
-      if (postizOff) {
-        blocks.push({
-          type: "notice",
-          badge: { kind: "warn", text: "NO POSTIZ SYNC" },
-          text: "This subscription will NOT sync to the Postiz platform; no org gets a plan from it. Use only for genuinely non-Postiz billing.",
-        });
-      } else if (postizPlan) {
+      const postizPlan = targetPriceObj ? derivePostizPlan(targetPriceObj) : null;
+      const postizBlocked = !postizPlan;
+      if (postizPlan) {
         // Sync working as intended is background QoS — no notice. Only real
         // caveats surface; the REVIEWED line below still names the tier.
         const caveats = [
@@ -1389,6 +1430,9 @@ async function composer(ctx: DashboardCtx, filters: Record<string, string>): Pro
             : "",
           trialDays
             ? "If the Postiz org still has its trial available (allowTrial) and no card is attached, the trial won't sync (the bot cannot check that field)."
+            : "",
+          cancelDays && trialDays && cancelDays <= trialDays
+            ? `Cancel after ${cancelDays} days lands on or before the ${trialDays}-day trial ends: this subscription never bills.`
             : "",
         ].filter(Boolean);
         if (caveats.length) {
@@ -1408,9 +1452,11 @@ async function composer(ctx: DashboardCtx, filters: Record<string, string>): Pro
       const bits = [
         `${targetPrice}${quantity ? ` ×${quantity}` : ""}`,
         trialDays ? `${trialDays}-day trial` : null,
+        trialDays && cancelIfNoPaymentMethod ? "cancels at trial end if no card is on file" : null,
+        cancelAtUnix ? `cancels on ${new Date(cancelAtUnix * 1000).toISOString().slice(0, 10)}` : null,
         promo ? `promo ${promo} (applied at creation, not in the preview)` : null,
         collection === "invoice" ? "collected by emailed invoice" : "charges the default payment method",
-        postizOff ? "no Postiz sync" : postizPlan ? `Postiz sync ${postizPlan.tier}/${postizPlan.period}` : null,
+        postizPlan ? `Postiz sync ${postizPlan.tier}/${postizPlan.period}` : null,
       ].filter(Boolean);
       blocks.push({
         type: "table",
@@ -1444,10 +1490,11 @@ async function composer(ctx: DashboardCtx, filters: Record<string, string>): Pro
                 ...(quantity ? { quantity } : {}),
                 ...(promo ? { promoCode: promo } : {}),
                 ...(trialDays ? { trialDays } : {}),
+                ...(cancelAtUnix ? { cancelAtUnix } : {}),
+                ...(trialDays && cancelIfNoPaymentMethod ? { cancelIfNoPaymentMethod: true } : {}),
                 collection,
-                postizSync: !postizOff,
               },
-              summary: `Creates the subscription now: ${collection === "charge" ? "the default payment method is charged immediately (unless trialing)" : "an invoice is emailed, due in 7 days"}${postizOff ? ", WITHOUT Postiz sync" : ""}. You reviewed the preview above.`,
+              summary: `Creates the subscription now: ${collection === "charge" ? "the default payment method is charged immediately (unless trialing)" : "an invoice is emailed, due in 7 days"}${cancelAtUnix ? `, ending on ${new Date(cancelAtUnix * 1000).toISOString().slice(0, 10)}` : ""}. You reviewed the preview above.`,
             }),
           ],
         });

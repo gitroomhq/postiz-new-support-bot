@@ -377,7 +377,20 @@ const paymentIntentCapture = defineAction<PaymentIntentCaptureParams>({
 
 interface SubscriptionCancelParams {
   subscriptionId: string;
-  when: "now" | "period_end";
+  // "at" = hard end on an absolute date (cancel_at), "never" = disarm whatever
+  // cancel is scheduled. Both live on this key so they inherit the cancel
+  // permission level: whoever may end a subscription may also re-date it.
+  when: "now" | "period_end" | "at" | "never";
+  cancelAtUnix?: number;
+}
+
+// A scheduled cancel is capped at two years out — the same horizon trialDays
+// uses, and far enough that a fat-fingered timestamp (milliseconds pasted as
+// seconds) is refused instead of silently parking the sub forever.
+const MAX_CANCEL_HORIZON_SECONDS = 730 * 86_400;
+
+function cancelDate(unix: number): string {
+  return new Date(unix * 1000).toISOString().slice(0, 16).replace("T", " ") + " UTC";
 }
 
 const subscriptionCancel = defineAction<SubscriptionCancelParams>({
@@ -389,11 +402,22 @@ const subscriptionCancel = defineAction<SubscriptionCancelParams>({
   parseParams: (raw) => {
     const o = obj(raw);
     const subscriptionId = o ? idWithPrefix(o.subscriptionId, "sub_") : null;
-    const when = o && (o.when === "now" || o.when === "period_end") ? o.when : null;
-    if (!subscriptionId || !when) return { ok: false, error: "subscriptionId (sub_…) and when (now|period_end) required" };
-    return { ok: true, params: { subscriptionId, when } };
+    const when =
+      o && (o.when === "now" || o.when === "period_end" || o.when === "at" || o.when === "never") ? o.when : null;
+    if (!subscriptionId || !when) {
+      return { ok: false, error: "subscriptionId (sub_…) and when (now|period_end|at|never) required" };
+    }
+    if (when !== "at") return { ok: true, params: { subscriptionId, when } };
+    const cancelAtUnix = posInt(o!.cancelAtUnix);
+    if (cancelAtUnix == null) return { ok: false, error: "cancelAtUnix (unix seconds) required for when=at" };
+    return { ok: true, params: { subscriptionId, when, cancelAtUnix } };
   },
-  summarize: (p) => `Cancel subscription ${p.subscriptionId} ${p.when === "now" ? "immediately" : "at period end"}`,
+  summarize: (p) =>
+    p.when === "at"
+      ? `Cancel subscription ${p.subscriptionId} on ${cancelDate(p.cancelAtUnix!)} (no proration refund)`
+      : p.when === "never"
+        ? `Clear the scheduled cancellation on ${p.subscriptionId} (it keeps renewing)`
+        : `Cancel subscription ${p.subscriptionId} ${p.when === "now" ? "immediately" : "at period end"}`,
   revalidate: async (ctx, p) => {
     const cus = requireCustomer(ctx);
     if (!cus) return "No linked Stripe customer.";
@@ -401,12 +425,35 @@ const subscriptionCancel = defineAction<SubscriptionCancelParams>({
     if (customerIdOf(sub) !== cus) return "Subscription does not belong to this customer.";
     if (sub.status === "canceled") return "Subscription is already canceled.";
     if (p.when === "period_end" && sub.cancel_at_period_end) return "Subscription is already set to cancel at period end.";
+    if (p.when === "never" && !sub.cancel_at && !sub.cancel_at_period_end) {
+      return "Nothing is scheduled: this subscription is not set to cancel.";
+    }
+    if (p.when === "at") {
+      // A schedule owns its subscription's phases; Stripe refuses cancel_at on
+      // one, and the schedule editor already has an end-behavior of "cancel".
+      if (sub.schedule) return "This subscription is driven by a schedule; set the end behaviour in the schedule editor instead.";
+      const nowSec = Math.floor(Date.now() / 1000);
+      if (p.cancelAtUnix! <= nowSec) return "The cancellation date must be in the future.";
+      if (p.cancelAtUnix! > nowSec + MAX_CANCEL_HORIZON_SECONDS) return "The cancellation date must be within two years.";
+    }
     return null;
   },
   execute: async (ctx, p) => {
     if (p.when === "now") {
       await ctx.stripe.cancelSubscription(p.subscriptionId);
       return { ok: true, text: `Subscription ${p.subscriptionId} cancelled immediately.` };
+    }
+    if (p.when === "at") {
+      await ctx.stripe.setSubscriptionCancelAt(
+        p.subscriptionId,
+        p.cancelAtUnix!,
+        `panel-cancelat-${p.subscriptionId}-${p.cancelAtUnix}-${ctx.idemScope}`
+      );
+      return { ok: true, text: `Subscription ${p.subscriptionId} will cancel on ${cancelDate(p.cancelAtUnix!)}.` };
+    }
+    if (p.when === "never") {
+      await ctx.stripe.clearScheduledCancel(p.subscriptionId, `panel-uncancel-${p.subscriptionId}-${ctx.idemScope}`);
+      return { ok: true, text: `Subscription ${p.subscriptionId} is no longer scheduled to cancel; it renews normally.` };
     }
     await ctx.stripe.cancelSubscriptionAtPeriodEnd(p.subscriptionId);
     return { ok: true, text: `Subscription ${p.subscriptionId} will cancel at period end.` };
@@ -651,10 +698,11 @@ interface SubscriptionCreateParams {
   quantity?: number;
   promoCode?: string;
   trialDays?: number;
+  // Absolute hard end, armed at creation: "trial for a week, then stop".
+  cancelAtUnix?: number;
+  // Trial that never got a card: cancel at trial end instead of invoicing.
+  cancelIfNoPaymentMethod?: boolean;
   collection: "charge" | "invoice";
-  // Postiz sync is the default: the platform only recognizes subscriptions
-  // carrying the gitroom metadata contract. false = deliberately non-Postiz.
-  postizSync?: boolean;
 }
 
 const subscriptionCreate = defineAction<SubscriptionCreateParams>({
@@ -673,6 +721,11 @@ const subscriptionCreate = defineAction<SubscriptionCreateParams>({
     }
     const trialDays = posInt(o!.trialDays) ?? undefined;
     if (trialDays != null && trialDays > 730) return { ok: false, error: "trialDays must be ≤ 730" };
+    const cancelAtUnix = posInt(o!.cancelAtUnix) ?? undefined;
+    const cancelIfNoPaymentMethod = o!.cancelIfNoPaymentMethod === true ? true : undefined;
+    if (cancelIfNoPaymentMethod && !trialDays) {
+      return { ok: false, error: "cancelIfNoPaymentMethod only applies to a trial; set trialDays too" };
+    }
     return {
       ok: true,
       params: {
@@ -681,8 +734,9 @@ const subscriptionCreate = defineAction<SubscriptionCreateParams>({
         quantity: posInt(o!.quantity) ?? undefined,
         promoCode: str(o!.promoCode, 100) ?? undefined,
         trialDays,
+        cancelAtUnix,
+        cancelIfNoPaymentMethod,
         collection,
-        postizSync: o!.postizSync === false ? false : true,
       },
     };
   },
@@ -690,9 +744,11 @@ const subscriptionCreate = defineAction<SubscriptionCreateParams>({
     `Create a subscription for ${p.customerId} on ${p.priceId}` +
     (p.quantity != null ? ` ×${p.quantity}` : "") +
     (p.trialDays ? `, ${p.trialDays}-day trial` : "") +
+    (p.cancelIfNoPaymentMethod ? " (cancels at trial end if no card is on file)" : "") +
+    (p.cancelAtUnix ? `, cancels on ${cancelDate(p.cancelAtUnix)}` : "") +
     (p.promoCode ? `, promo ${p.promoCode}` : "") +
     (p.collection === "invoice" ? " (email invoice)" : " (charge the default payment method now)") +
-    (p.postizSync === false ? ", NO Postiz sync" : ", Postiz sync (tier from the price)"),
+    ", Postiz sync (tier from the price)",
   revalidate: async (ctx, p) => {
     const cus = requireCustomer(ctx);
     if (!cus) return "No linked Stripe customer.";
@@ -702,8 +758,13 @@ const subscriptionCreate = defineAction<SubscriptionCreateParams>({
     const price = await ctx.stripe.getPrice(p.priceId).catch(() => null);
     if (!price || !price.recurring) return "Price does not exist or is not recurring.";
     if (!price.active) return "Price is archived.";
-    if (p.postizSync !== false && !derivePostizPlan(price)) {
-      return "Price is not a canonical Postiz price ($29/$278, $39/$374, $49/$470, $99/$950 USD): pick a canonical price, use a promo for discounts, or set No sync.";
+    if (!derivePostizPlan(price)) {
+      return "Price is not a canonical Postiz price ($29/$278, $39/$374, $49/$470, $99/$950 USD): pick a canonical price, or use a promo for discounts.";
+    }
+    if (p.cancelAtUnix != null) {
+      const nowSec = Math.floor(Date.now() / 1000);
+      if (p.cancelAtUnix <= nowSec) return "The cancellation date must be in the future.";
+      if (p.cancelAtUnix > nowSec + MAX_CANCEL_HORIZON_SECONDS) return "The cancellation date must be within two years.";
     }
     const allowlist = ctx.settingsStore.allowedPriceIds();
     if (allowlist.length > 0 && !allowlist.includes(p.priceId)) return "Price is not on the plan allowlist (/config → Billing).";
@@ -730,15 +791,10 @@ const subscriptionCreate = defineAction<SubscriptionCreateParams>({
       if (!active) return { ok: false, error: "Promo code not found or inactive." };
       promotionCodeId = active.id;
     }
-    let metadata: Record<string, string> | undefined;
-    let syncText = "no Postiz sync";
-    if (p.postizSync !== false) {
-      const price = await ctx.stripe.getPrice(p.priceId);
-      const plan = derivePostizPlan(price);
-      if (!plan) return { ok: false, error: "Price is not a canonical Postiz price; cannot attach sync metadata." };
-      metadata = buildPostizMetadata(plan, postizUniqueId(ctx.idemScope));
-      syncText = `Postiz sync ${plan.tier}/${plan.period}`;
-    }
+    const price = await ctx.stripe.getPrice(p.priceId);
+    const plan = derivePostizPlan(price);
+    if (!plan) return { ok: false, error: "Price is not a canonical Postiz price; cannot attach sync metadata." };
+    const metadata = buildPostizMetadata(plan, postizUniqueId(ctx.idemScope));
     const sub = await ctx.stripe.createSubscription(
       {
         customerId: p.customerId,
@@ -746,12 +802,15 @@ const subscriptionCreate = defineAction<SubscriptionCreateParams>({
         quantity: p.quantity,
         promotionCodeId,
         trialDays: p.trialDays,
+        cancelAtUnix: p.cancelAtUnix,
+        cancelIfNoPaymentMethod: p.cancelIfNoPaymentMethod,
         collection: p.collection,
         metadata,
       },
       `panel-subcreate-${p.customerId}-${p.priceId}-${ctx.idemScope}`
     );
-    return { ok: true, text: `Subscription ${sub.id} created (${sub.status}, ${syncText}).` };
+    const ends = p.cancelAtUnix ? `, cancels ${cancelDate(p.cancelAtUnix)}` : "";
+    return { ok: true, text: `Subscription ${sub.id} created (${sub.status}, Postiz sync ${plan.tier}/${plan.period}${ends}).` };
   },
 });
 

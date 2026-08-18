@@ -96,6 +96,16 @@ export class DashboardActionGateway {
         }
         const subscriptionId = validId("subscription", params.subscriptionId);
         if (!subscriptionId) return { ok: false, error: "subscriptionId (sub_…) required." };
+        // The dated-cancel modal asks for a horizon in days ("cancel it after a
+        // week"); the registry only speaks absolute timestamps. Same idiom as
+        // the major→minor amount conversions above. A typed unix value wins, so
+        // the modal's optional override beats the day count.
+        if (key === "subscription.cancel" && params.when === "at" && params.cancelAtUnix == null) {
+          const days = typeof params.cancelInDays === "number" && isFinite(params.cancelInDays) ? params.cancelInDays : null;
+          if (days == null || days <= 0) return { ok: false, error: "Give a positive number of days (or an explicit unix timestamp)." };
+          params.cancelAtUnix = Math.floor(Date.now() / 1000) + Math.round(days * 86_400);
+        }
+        delete params.cancelInDays;
         const sub = await this.stripe.getSubscription(subscriptionId);
         const customerId = idOf(sub.customer);
         if (!customerId) return { ok: false, error: "This subscription has no customer attached." };

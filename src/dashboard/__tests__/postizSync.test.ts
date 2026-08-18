@@ -156,11 +156,10 @@ function createCtx(overrides: Record<string, unknown> = {}): {
   return { ctx, created };
 }
 
-test("subscription.create: sync is the default, attaches the full 4-key metadata; No sync attaches none", async () => {
+test("subscription.create: every create syncs — the full 4-key metadata is attached and there is no opt-out param", async () => {
   const def = actionByKey("subscription.create")!;
   const parsed = def.parseParams({ customerId: "cus_a", priceId: "price_prom", collection: "invoice" });
   assert.ok(parsed.ok);
-  assert.equal((parsed as { params: { postizSync: boolean } }).params.postizSync, true);
   const { ctx, created } = createCtx();
   assert.equal(await def.revalidate(ctx, (parsed as { params: unknown }).params), null);
   const res = await def.execute(ctx, (parsed as { params: unknown }).params);
@@ -173,15 +172,22 @@ test("subscription.create: sync is the default, attaches the full 4-key metadata
     uniqueId: postizUniqueId("scope-xyz"),
   });
 
+  // A hostile client asking for no sync is ignored, not obeyed.
   const off = def.parseParams({ customerId: "cus_a", priceId: "price_prom", collection: "invoice", postizSync: false });
   assert.ok(off.ok);
+  assert.equal((off as { params: Record<string, unknown> }).params.postizSync, undefined);
   const offRun = createCtx();
   const offRes = await def.execute(offRun.ctx, (off as { params: unknown }).params);
   assert.ok(offRes.ok);
-  assert.equal(offRun.created[0].metadata, undefined);
+  assert.deepEqual(offRun.created[0].metadata, {
+    service: "gitroom",
+    billing: "PRO",
+    period: "MONTHLY",
+    uniqueId: postizUniqueId("scope-xyz"),
+  });
 });
 
-test("subscription.create: non-canonical price is refused when syncing, allowed with No sync", async () => {
+test("subscription.create: a non-canonical price is refused outright — no opt-out can rescue it", async () => {
   const def = actionByKey("subscription.create")!;
   const parsed = def.parseParams({ customerId: "cus_a", priceId: "price_custom", collection: "invoice" });
   assert.ok(parsed.ok);
@@ -189,7 +195,35 @@ test("subscription.create: non-canonical price is refused when syncing, allowed 
   (ctx.stripe as unknown as Record<string, unknown>).getPrice = async () => PRICE_CUSTOM;
   assert.match((await def.revalidate(ctx, (parsed as { params: unknown }).params)) ?? "", /not a canonical Postiz price/);
   const off = def.parseParams({ customerId: "cus_a", priceId: "price_custom", collection: "invoice", postizSync: false });
-  assert.equal(await def.revalidate(ctx, (off as { ok: true; params: unknown }).params), null);
+  assert.match((await def.revalidate(ctx, (off as { ok: true; params: unknown }).params)) ?? "", /not a canonical Postiz price/);
+});
+
+test("subscription.create: a creation-time cancel date and trial end-behaviour reach Stripe (and are sanity-checked)", async () => {
+  const def = actionByKey("subscription.create")!;
+  const nowSec = Math.floor(Date.now() / 1000);
+  const parsed = def.parseParams({
+    customerId: "cus_a",
+    priceId: "price_prom",
+    collection: "invoice",
+    trialDays: 7,
+    cancelAtUnix: nowSec + 7 * 86400,
+    cancelIfNoPaymentMethod: true,
+  });
+  assert.ok(parsed.ok);
+  const { ctx, created } = createCtx();
+  assert.equal(await def.revalidate(ctx, (parsed as { params: unknown }).params), null);
+  assert.ok((await def.execute(ctx, (parsed as { params: unknown }).params)).ok);
+  assert.equal(created[0].cancelAtUnix, nowSec + 7 * 86400);
+  assert.equal(created[0].cancelIfNoPaymentMethod, true);
+  // End-behaviour without a trial is meaningless, and a past date is refused.
+  const noTrial = def.parseParams({ customerId: "cus_a", priceId: "price_prom", collection: "invoice", cancelIfNoPaymentMethod: true });
+  assert.equal(noTrial.ok, false);
+  const past = def.parseParams({ customerId: "cus_a", priceId: "price_prom", collection: "invoice", cancelAtUnix: nowSec - 60 });
+  assert.ok(past.ok);
+  assert.match((await def.revalidate(ctx, (past as { params: unknown }).params)) ?? "", /must be in the future/);
+  const tooFar = def.parseParams({ customerId: "cus_a", priceId: "price_prom", collection: "invoice", cancelAtUnix: nowSec + 900 * 86400 });
+  assert.ok(tooFar.ok);
+  assert.match((await def.revalidate(ctx, (tooFar as { params: unknown }).params)) ?? "", /within two years/);
 });
 
 // ---- registry: subscription.change_plan ----
@@ -419,7 +453,7 @@ function findCreateButton(blocks: Block[]): { params?: Record<string, unknown>; 
   return null;
 }
 
-test("composer: happy sync path is silent (postizSync baked true, no notice); caveats and No sync do surface", async () => {
+test("composer: happy sync path is silent (no notice); real caveats do surface", async () => {
   const section = makeSubscriptionsSection();
   const page = await section.buildPage(sectionCtx(), {
     page: "subscriptions.new",
@@ -434,7 +468,8 @@ test("composer: happy sync path is silent (postizSync baked true, no notice); ca
   assert.deepEqual(postizBadges, []);
   assert.ok(noticeTexts(page!.blocks).some((t) => t.includes("Postiz sync PRO/MONTHLY")));
   const btn = findCreateButton(page!.blocks)!;
-  assert.equal(btn.params!.postizSync, true);
+  // Sync is no longer a flag the page can turn off, so nothing is baked for it.
+  assert.equal(btn.params!.postizSync, undefined);
   assert.ok(btn.summary!.includes("You reviewed"));
 
   // Real caveats still surface (qty multiplication warning).
@@ -444,16 +479,45 @@ test("composer: happy sync path is silent (postizSync baked true, no notice); ca
   });
   assert.ok(noticeTexts(qty!.blocks).some((t) => t.includes("don't multiply")));
 
+  // The sync opt-out is gone: the filter no longer exists and asking for it in
+  // the URL changes nothing.
+  const table = page!.blocks.find((b) => b.type === "table" && (b as { key?: string }).key === "prices") as {
+    filters: Array<{ key: string }>;
+  };
+  assert.ok(!table.filters.some((f) => f.key === "postiz"));
   const off = await section.buildPage(sectionCtx(), {
     page: "subscriptions.new",
     filters: { customer: "cus_a", price: "price_prom", postiz: "off" },
   });
   const offBtn = findCreateButton(off!.blocks)!;
-  assert.equal(offBtn.params!.postizSync, false);
-  assert.ok(noticeTexts(off!.blocks).some((t) => t.includes("NOT sync")));
+  assert.equal(offBtn.params!.postizSync, undefined);
+  assert.ok(!noticeTexts(off!.blocks).some((t) => t.includes("NOT sync")));
 });
 
-test("composer: non-canonical price + sync → NOT SYNCABLE, confirm withheld (but allowed with No sync)", async () => {
+test("composer: a cancel-after horizon and trial end-behaviour bake into the create params", async () => {
+  const section = makeSubscriptionsSection();
+  const page = await section.buildPage(sectionCtx(), {
+    page: "subscriptions.new",
+    filters: { customer: "cus_a", price: "price_prom", trial: "7", cancel: "7", trialend: "cancel" },
+  });
+  const btn = findCreateButton(page!.blocks)!;
+  const nowSec = Math.floor(Date.now() / 1000);
+  const at = btn.params!.cancelAtUnix as number;
+  assert.ok(Math.abs(at - (nowSec + 7 * 86400)) <= 5, `cancelAtUnix ${at} should be ~7 days out`);
+  assert.equal(btn.params!.cancelIfNoPaymentMethod, true);
+  // Cancelling on/before trial end means it never bills — say so out loud.
+  assert.ok(noticeTexts(page!.blocks).some((t) => t.includes("never bills")));
+  // No trial → the end-behaviour param is dropped (Stripe would reject it) and
+  // the page says why rather than swallowing the setting.
+  const noTrial = await section.buildPage(sectionCtx(), {
+    page: "subscriptions.new",
+    filters: { customer: "cus_a", price: "price_prom", trialend: "cancel" },
+  });
+  assert.equal(findCreateButton(noTrial!.blocks)!.params!.cancelIfNoPaymentMethod, undefined);
+  assert.ok(noticeTexts(noTrial!.blocks).some((t) => t.includes("only applies to a trial")));
+});
+
+test("composer: a non-canonical price is NOT SYNCABLE and the confirm is withheld, opt-out or not", async () => {
   const section = makeSubscriptionsSection();
   const blocked = await section.buildPage(sectionCtx(), {
     page: "subscriptions.new",
@@ -465,7 +529,7 @@ test("composer: non-canonical price + sync → NOT SYNCABLE, confirm withheld (b
     page: "subscriptions.new",
     filters: { customer: "cus_a", price: "price_custom", postiz: "off" },
   });
-  assert.ok(findCreateButton(optOut!.blocks));
+  assert.equal(findCreateButton(optOut!.blocks), null);
 });
 
 test("detail: unsynced sub shows warn badge, repair button, sync rail card and warning-augmented cancel summaries", async () => {
@@ -531,6 +595,9 @@ test("subStatusFlags: an already-canceled period-end sub collapses to one past-t
   assert.deepEqual(subStatusFlags(pending).map((b) => b.text), ["Active", "Cancels at period end"]);
   // Plain canceled sub stays plain.
   assert.deepEqual(subStatusFlags(fakeSub({ status: "canceled" })).map((b) => b.text), ["Canceled"]);
+  // A dated cancel names its date, and does not linger once the sub is gone.
+  assert.deepEqual(subStatusFlags(fakeSub({ cancel_at: 1_767_225_600 })).map((b) => b.text), ["Active", "Cancels 2026-01-01"]);
+  assert.deepEqual(subStatusFlags(fakeSub({ status: "canceled", cancel_at: 1_767_225_600 })).map((b) => b.text), ["Canceled"]);
 });
 
 test("list: Create subscription carries a customer-scoped list's customer into the composer", async () => {

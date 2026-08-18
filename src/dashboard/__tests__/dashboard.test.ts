@@ -1443,6 +1443,105 @@ test("subscription detail: stat strip, pricing footer → change-plan page, canc
   assert.equal(page!.rail!.length, 2);
 });
 
+test("subscription detail: dated cancel offers days + unix, warns about no proration, and the undo only appears when armed", async () => {
+  const section = makeSubscriptionsSection();
+  const page = await section.buildPage(subsCtx(), { page: "subscriptions.detail", params: { id: "sub_1" } });
+  const header = page!.blocks[0] as HeaderBlock;
+  const dated = header.actions!.find((a) => a.label === "Cancel on a date")!;
+  assert.deepEqual(dated.params, { subscriptionId: "sub_1", when: "at" });
+  assert.deepEqual(dated.inputs!.map((i) => i.key), ["cancelInDays", "cancelAtUnix"]);
+  assert.equal(dated.dangerous, true);
+  assert.ok(!dated.stepUp, "a future-dated cancel is T1, unlike cancel-now");
+  assert.match(dated.summary!, /does NOT prorate/);
+  // Nothing scheduled on the plain fixture → no undo button.
+  assert.ok(!header.actions!.some((a) => a.label === "Don't cancel"));
+
+  // With a cancel armed, the undo shows up and the badge names the date.
+  const armedCtx = subsCtx();
+  (armedCtx.stripe as unknown as Record<string, unknown>).getSubscription = async () => ({
+    ...(await (subsCtx().stripe as unknown as { getSubscription: () => Promise<Record<string, unknown>> }).getSubscription()),
+    cancel_at: 1_767_225_600,
+  });
+  const armed = await section.buildPage(armedCtx, { page: "subscriptions.detail", params: { id: "sub_1" } });
+  const armedHeader = armed!.blocks[0] as HeaderBlock;
+  const undo = armedHeader.actions!.find((a) => a.label === "Don't cancel")!;
+  assert.deepEqual(undo.params, { subscriptionId: "sub_1", when: "never" });
+  // The registry marks the whole key dangerous, so the client must ask for
+  // CONFIRM too or the server rejects the submission.
+  assert.equal(undo.dangerous, true);
+  assert.ok(armedHeader.badges!.some((b) => b.text === "Cancels 2026-01-01"));
+  assert.match(armedHeader.actions!.find((a) => a.label === "Cancel on a date")!.summary!, /Replaces the cancellation/);
+});
+
+test("gateway: the dated-cancel modal's day count becomes an absolute timestamp; an explicit unix wins", async () => {
+  const { gateway } = gatewayFixture();
+  const nowSec = Math.floor(Date.now() / 1000);
+  const week = await gateway.resolve("subscription.cancel", { subscriptionId: "sub_1", when: "at", cancelInDays: 7 });
+  assert.ok(week.ok);
+  const at = (week as unknown as { params: { cancelAtUnix: number } }).params.cancelAtUnix;
+  assert.ok(Math.abs(at - (nowSec + 7 * 86_400)) <= 5, `expected ~7 days out, got ${at}`);
+  assert.equal((week as unknown as { params: { cancelInDays?: number } }).params.cancelInDays, undefined);
+  // Typed timestamp overrides the day count instead of being recomputed.
+  const exact = await gateway.resolve("subscription.cancel", {
+    subscriptionId: "sub_1",
+    when: "at",
+    cancelInDays: 7,
+    cancelAtUnix: nowSec + 999,
+  });
+  assert.equal((exact as unknown as { params: { cancelAtUnix: number } }).params.cancelAtUnix, nowSec + 999);
+  // Neither → refused before any Stripe write.
+  assert.equal((await gateway.resolve("subscription.cancel", { subscriptionId: "sub_1", when: "at" })).ok, false);
+  assert.equal(
+    (await gateway.resolve("subscription.cancel", { subscriptionId: "sub_1", when: "at", cancelInDays: -3 })).ok,
+    false
+  );
+  // Other cancel shapes are untouched by the conversion.
+  const now = await gateway.resolve("subscription.cancel", { subscriptionId: "sub_1", when: "now" });
+  assert.deepEqual((now as unknown as { params: unknown }).params, { subscriptionId: "sub_1", when: "now" });
+});
+
+test("subscription.cancel: dated + undo shapes validate against live Stripe state", async () => {
+  const def = actionByKey("subscription.cancel")!;
+  const nowSec = Math.floor(Date.now() / 1000);
+  const calls: Array<[string, unknown]> = [];
+  const subState: Record<string, unknown> = { id: "sub_1", customer: "cus_a", status: "active", cancel_at: null, cancel_at_period_end: false, schedule: null };
+  const ctx = {
+    stripe: {
+      getSubscription: async () => subState,
+      setSubscriptionCancelAt: async (id: string, at: number) => calls.push(["at", [id, at]]),
+      clearScheduledCancel: async (id: string) => calls.push(["clear", id]),
+    },
+    stripeCustomerId: "cus_a",
+    idemScope: "scope-1",
+  } as unknown as ActionExecCtx;
+
+  const at = def.parseParams({ subscriptionId: "sub_1", when: "at", cancelAtUnix: nowSec + 7 * 86_400 });
+  assert.ok(at.ok);
+  assert.equal(await def.revalidate(ctx, (at as { params: unknown }).params), null);
+  assert.ok((await def.execute(ctx, (at as { params: unknown }).params)).ok);
+  assert.deepEqual(calls[0], ["at", ["sub_1", nowSec + 7 * 86_400]]);
+
+  // when=at without a timestamp never parses.
+  assert.equal(def.parseParams({ subscriptionId: "sub_1", when: "at" }).ok, false);
+  // Past / too-far dates and schedule-driven subs are refused.
+  const past = def.parseParams({ subscriptionId: "sub_1", when: "at", cancelAtUnix: nowSec - 60 });
+  assert.match((await def.revalidate(ctx, (past as { ok: true; params: unknown }).params)) ?? "", /must be in the future/);
+  const far = def.parseParams({ subscriptionId: "sub_1", when: "at", cancelAtUnix: nowSec + 900 * 86_400 });
+  assert.match((await def.revalidate(ctx, (far as { ok: true; params: unknown }).params)) ?? "", /within two years/);
+  subState.schedule = "sub_sched_1";
+  assert.match((await def.revalidate(ctx, (at as { params: unknown }).params)) ?? "", /driven by a schedule/);
+  subState.schedule = null;
+
+  // Undo: refused when nothing is armed, clears both flags when it is.
+  const never = def.parseParams({ subscriptionId: "sub_1", when: "never" });
+  assert.ok(never.ok);
+  assert.match((await def.revalidate(ctx, (never as { params: unknown }).params)) ?? "", /Nothing is scheduled/);
+  subState.cancel_at = nowSec + 86_400;
+  assert.equal(await def.revalidate(ctx, (never as { params: unknown }).params), null);
+  assert.ok((await def.execute(ctx, (never as { params: unknown }).params)).ok);
+  assert.deepEqual(calls[1], ["clear", "sub_1"]);
+});
+
 test("change plan: confirm button exists ONLY after a successful proration preview", async () => {
   const section = makeSubscriptionsSection();
   const hasChangeButton = (page: { blocks: Block[] }): boolean =>
@@ -3056,7 +3155,7 @@ test("create-subscription composer: confirm exists ONLY after a successful first
   const btn = confirm.actions[0];
   assert.equal(btn.dangerous, true);
   assert.equal(btn.stepUp, true);
-  assert.deepEqual(btn.params, { customerId: "cus_a", priceId: "price_new", quantity: 2, trialDays: 14, collection: "charge", postizSync: true });
+  assert.deepEqual(btn.params, { customerId: "cus_a", priceId: "price_new", quantity: 2, trialDays: 14, collection: "charge" });
   // Invoice collection → no step-up flag.
   const invoiceMode = await section.buildPage(subsCtx(), {
     page: "subscriptions.new",
