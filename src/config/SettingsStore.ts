@@ -3,7 +3,7 @@ import { Prisma, PrismaClient, BotSettings, StatusTag } from "../generated/prism
 import type { SentryRuntimeConfig } from "../util/logger";
 import type { InfluxRuntimeConfig } from "../metrics/InfluxWriter";
 import { decryptSecret, encryptSecret, isVaultKvSentinel, VAULT_KV_SENTINEL } from "../util/crypto";
-import { envBool, envPin, envStr } from "./env";
+import { ENV_PINS, envBool, envPin, envStr } from "./env";
 import type { VaultIntegration, VaultRuntimeConfig, VaultService } from "../vault/VaultService";
 import type { SlaTargetEntry } from "../sla/types";
 import { parseOfficeHours, type OfficeHoursSchedule } from "../sla/businessTime";
@@ -78,7 +78,7 @@ const DEFAULT_TAGS: TagInput[] = [
   { emoji: "📁", label: "Closed", closesThread: true, reminderEnabled: false },
 ];
 
-// The eight global secrets and their Vault KV home (one KV entry per
+// The nine global secrets and their Vault KV home (one KV entry per
 // integration; field names live inside the entry). Shared by the read
 // resolver, the write router, the panel state helper and the migrator.
 export type GlobalSecretColumn =
@@ -89,7 +89,8 @@ export type GlobalSecretColumn =
   | "sentryReadToken"
   | "sentryWebhookSecret"
   | "influxToken"
-  | "yubicoApiSecret";
+  | "yubicoApiSecret"
+  | "postizApiKey";
 
 export const GLOBAL_SECRETS: Record<GlobalSecretColumn, { integration: VaultIntegration; field: string }> = {
   intercomAccessToken: { integration: "intercom", field: "accessToken" },
@@ -100,6 +101,7 @@ export const GLOBAL_SECRETS: Record<GlobalSecretColumn, { integration: VaultInte
   sentryWebhookSecret: { integration: "sentry", field: "webhookSecret" },
   influxToken: { integration: "influx", field: "token" },
   yubicoApiSecret: { integration: "yubico", field: "apiSecret" },
+  postizApiKey: { integration: "postiz", field: "apiKey" },
 };
 
 // Panel-facing storage state of a global secret column.
@@ -1506,6 +1508,47 @@ export class SettingsStore {
           : {}),
         ...(sentryWebhookSecret !== undefined
           ? { sentryWebhookSecret: await this.routeSecretWrite("sentryWebhookSecret", sentryWebhookSecret) }
+          : {}),
+      },
+    });
+  }
+
+  // ---- Postiz platform lookup (superadmin user search) ----
+
+  postizLookupEnabled(): boolean {
+    return this.settings.postizLookupEnabled;
+  }
+
+  // Backend base URL the /public/v1 routes hang off, no trailing slash.
+  postizBaseUrl(): string | null {
+    return this.settings.postizBaseUrl?.trim().replace(/\/+$/, "") || null;
+  }
+
+  // Org API key for the platform's public API. The calling org must contain a
+  // superadmin user (SuperAdminGuard) and hold a subscription, or every lookup
+  // comes back 401/403. POSTIZ_ADMIN_TOKEN in the environment WINS over the
+  // stored column — the deploy already carries the key, and a second copy in
+  // the database would only drift.
+  postizApiKey(): string | null {
+    return envStr(ENV_PINS.postizApiKey) ?? this.resolveSecret(this.settings.postizApiKey, "postizApiKey");
+  }
+
+  postizConfigured(): boolean {
+    return Boolean(this.postizApiKey() && this.postizBaseUrl());
+  }
+
+  async updatePostiz(data: {
+    postizLookupEnabled?: boolean;
+    postizBaseUrl?: string | null;
+    postizApiKey?: string | null;
+  }): Promise<void> {
+    const { postizApiKey, ...rest } = data;
+    this.settings = await this.prisma.botSettings.update({
+      where: { id: "global" },
+      data: {
+        ...rest,
+        ...(postizApiKey !== undefined
+          ? { postizApiKey: await this.routeSecretWrite("postizApiKey", postizApiKey) }
           : {}),
       },
     });

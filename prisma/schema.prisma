@@ -166,6 +166,13 @@ model BotSettings {
   sentryFeedbackLastSyncAt   DateTime? // last completed sync tick — /config status line
   sentryWebhookSecret        String?   // Sentry internal-integration client secret — encrypted (crypto.ts/Vault)
   sentryFeedbackTicketTypeId String?   // convert imports into customer tickets of this type; null = plain conversations
+  // Postiz platform lookup (GET /public/v1/users?name= — superadmin search).
+  // The key's org must contain a superadmin user AND hold a subscription, or
+  // every call 401s. POSTIZ_ADMIN_TOKEN in the environment overrides the
+  // column (see config/env.ts); the column is encrypted (crypto.ts/Vault).
+  postizLookupEnabled Boolean @default(false)
+  postizBaseUrl       String? // backend origin the /public/v1 routes hang off, no trailing slash
+  postizApiKey        String?
   // Forwarded-email conversion (lite-seat teammate forwards a customer email to
   // support@ → recreate the conversation for the original sender; edited via
   // /intercom → Automation). Replicates Intercom's "Detect customers in
@@ -569,6 +576,14 @@ model Ticket {
   // Stamped (last message + 30m) whenever someone writes in an already-closed ticket.
   recloseAt           DateTime?
   question            String?
+  // Resolved Postiz account for this ticket's customer, stamped best-effort at
+  // creation from the platform's superadmin search. All null = never resolved
+  // (lookup off, no match, or the call failed) — never treated as "no account".
+  postizUserId        String?
+  postizOrgId         String?
+  postizTier          String? // STANDARD | TEAM | PRO | ULTIMATE, as the platform reports it
+  postizRole          String? // USER | ADMIN | SUPERADMIN within postizOrgId
+  postizLinkedAt      DateTime?
   // Verbatim final AI answer, persisted so a filed GitHub issue is just question +
   // answer (not a brittle re-scan of the last few thread messages).
   aiAnswer            String?

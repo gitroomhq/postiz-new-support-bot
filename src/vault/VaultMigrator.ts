@@ -17,6 +17,7 @@ export const COLUMN_LABELS: Record<GlobalSecretColumn, string> = {
   sentryWebhookSecret: "Sentry webhook secret",
   influxToken: "InfluxDB token",
   yubicoApiSecret: "Yubico API secret",
+  postizApiKey: "Postiz API key",
 };
 
 export interface MigrateItemResult {

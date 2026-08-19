@@ -47,6 +47,7 @@ const EXPECTED_COLUMNS: Record<string, string[]> = {
     "sentryReadEnabled", "sentryReadToken", "sentryOrgSlug", "sentryProjectSlug", "sentryReadRegion",
     "sentryFeedbackTeamId", "sentryFeedbackWatermarkAt", "sentryFeedbackLastSyncAt", "sentryWebhookSecret",
     "sentryFeedbackTicketTypeId",
+    "postizLookupEnabled", "postizBaseUrl", "postizApiKey",
     "forwardConvertEnabled", "forwardConvertTagName", "forwardConvertCloseNote", "forwardConvertExtraEmails",
     "aiModel", "aiModelLight",
     "aiEffortAsk", "aiEffortCause", "aiMaxBudgetUsdAsk", "aiMaxBudgetUsdCause", "aiPostizPrefetchEnabled",
@@ -87,6 +88,7 @@ const EXPECTED_COLUMNS: Record<string, string[]> = {
     "escalationTierId", "lastStatusChangeAt", "lastReminderAt", "reminderCount", "remindersPaused", "closed", "closedAt",
     "recloseAt", "question", "aiAnswer", "firstResponseAt", "csatScore", "csatComment", "csatPromptedAt", "csatRatedAt",
     "createdAt", "intercomExempt", "intercomExemptLiftedAt",
+    "postizUserId", "postizOrgId", "postizTier", "postizRole", "postizLinkedAt",
   ],
   ticket_notes: ["id", "ticketThreadId", "authorId", "authorName", "text", "createdAt"],
   ticket_tag_changes: [

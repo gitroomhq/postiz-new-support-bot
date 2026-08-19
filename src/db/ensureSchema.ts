@@ -302,6 +302,11 @@ const STATEMENTS: string[] = [
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "sentryOrgSlug" TEXT`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "sentryProjectSlug" TEXT`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "sentryReadRegion" TEXT NOT NULL DEFAULT 'us'`,
+  // Postiz platform lookup (superadmin user search). POSTIZ_ADMIN_TOKEN
+  // overrides the key column at runtime; the column stays the rotation path.
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "postizLookupEnabled" BOOLEAN NOT NULL DEFAULT false`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "postizBaseUrl" TEXT`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "postizApiKey" TEXT`,
   // AI models + knowledge-base auto-refresh (paired with /config → AI & Knowledge).
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "aiModel" TEXT NOT NULL DEFAULT 'sonnet'`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "aiModelLight" TEXT NOT NULL DEFAULT 'haiku'`,
@@ -633,6 +638,12 @@ const STATEMENTS: string[] = [
   // IS NULL guard keeps flipped tickets (customer typed → mirrored) from
   // being re-exempted on every boot.
   `ALTER TABLE "tickets" ADD COLUMN IF NOT EXISTS "intercomExemptLiftedAt" TIMESTAMP(3)`,
+  // Resolved Postiz account, stamped best-effort at ticket creation.
+  `ALTER TABLE "tickets" ADD COLUMN IF NOT EXISTS "postizUserId" TEXT`,
+  `ALTER TABLE "tickets" ADD COLUMN IF NOT EXISTS "postizOrgId" TEXT`,
+  `ALTER TABLE "tickets" ADD COLUMN IF NOT EXISTS "postizTier" TEXT`,
+  `ALTER TABLE "tickets" ADD COLUMN IF NOT EXISTS "postizRole" TEXT`,
+  `ALTER TABLE "tickets" ADD COLUMN IF NOT EXISTS "postizLinkedAt" TIMESTAMP(3)`,
   `UPDATE "tickets" SET "intercomExempt" = true
     WHERE "categoryId" = 'billing' AND "question" = 'Refund request' AND "intercomExempt" = false
       AND "intercomExemptLiftedAt" IS NULL`,

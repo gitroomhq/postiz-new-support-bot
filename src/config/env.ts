@@ -1,6 +1,7 @@
 import { log } from "../util/logger";
 
-// Environment overrides for the Infrastructure settings (Vault + Temporal).
+// Environment overrides for the Infrastructure settings (Vault + Temporal), plus
+// the Postiz admin key.
 //
 // Every other BotSettings value is /config-only: the deploy has no editable
 // .env, so a new setting must be reachable from Discord. Vault and Temporal are
@@ -10,6 +11,12 @@ import { log } from "../util/logger";
 // the very panel that depends on them. So these accept an env var, and when one
 // is set it WINS over the stored value: a deploy can pin its infrastructure
 // regardless of what the database happens to hold.
+//
+// postizApiKey joins them for a different reason: the deploy already supplies
+// the platform admin key as POSTIZ_ADMIN_TOKEN, so honouring that variable
+// avoids a second copy of the same credential drifting in the database. It is
+// the only pinned SECRET, so the value is never rendered — panels show only
+// that the pin is in force, exactly as they do for a Vault-held secret.
 //
 // The panels never pretend the pin isn't there (see envPin): they show which
 // variable is in force and keep accepting edits, which still write BotSettings
@@ -34,6 +41,7 @@ export const ENV_PINS = {
   temporalDeploymentName: "TEMPORAL_DEPLOYMENT_NAME",
   temporalTlsEnabled: "TEMPORAL_TLS_ENABLED",
   temporalTlsServerName: "TEMPORAL_TLS_SERVER_NAME",
+  postizApiKey: "POSTIZ_ADMIN_TOKEN",
 } as const;
 
 export type EnvPinnedField = keyof typeof ENV_PINS;
