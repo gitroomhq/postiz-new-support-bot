@@ -192,6 +192,12 @@ export class TicketStore {
       statusTagId?: string;
       closed?: boolean;
       customerIds?: string[];
+      // A Postiz identity matches a ticket two ways: through a Discord account
+      // linked to that Postiz user, or through the identity stamped on the
+      // ticket itself at creation. These are OR-ed together, then AND-ed with
+      // every other filter, so combining them with a Discord/Stripe filter
+      // still narrows rather than widens.
+      postizMatch?: { discordIds: string[]; userIds: string[]; orgIds: string[] };
       text?: string;
       createdAfter?: Date;
       createdBefore?: Date;
@@ -205,12 +211,23 @@ export class TicketStore {
       closed?: boolean;
       customerId?: { in: string[] };
       OR?: object[];
+      AND?: object[];
       createdAt?: { gte?: Date; lt?: Date };
     } = {};
     if (filters.categoryId) where.categoryId = filters.categoryId;
     if (filters.statusTagId) where.statusTagId = filters.statusTagId;
     if (filters.closed !== undefined) where.closed = filters.closed;
     if (filters.customerIds) where.customerId = { in: filters.customerIds };
+    if (filters.postizMatch) {
+      const m = filters.postizMatch;
+      const alternatives: object[] = [];
+      if (m.discordIds.length) alternatives.push({ customerId: { in: m.discordIds } });
+      if (m.userIds.length) alternatives.push({ postizUserId: { in: m.userIds } });
+      if (m.orgIds.length) alternatives.push({ postizOrgId: { in: m.orgIds } });
+      // Nothing to match on at all: force an empty result rather than dropping
+      // the filter and returning every ticket.
+      where.AND = [alternatives.length ? { OR: alternatives } : { threadId: { in: [] } }];
+    }
     if (filters.text) {
       where.OR = [
         { question: { contains: filters.text, mode: "insensitive" } },

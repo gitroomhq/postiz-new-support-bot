@@ -114,6 +114,7 @@ type TicketSearchFilters = {
   statusTagId?: string;
   closed?: boolean;
   customerIds?: string[];
+  postizMatch?: { discordIds: string[]; userIds: string[]; orgIds: string[] };
   text?: string;
   createdAfter?: Date;
   createdBefore?: Date;
@@ -934,7 +935,6 @@ export class DiscordBot {
     // customerId allow-list by intersecting each provided filter's set of Discord ids.
     const idConstraints: string[][] = [];
     if (user) idConstraints.push([user.id]);
-    if (postizId) idConstraints.push(await this.sessionStore.findDiscordIdsByPostizId(postizId));
     if (stripeId) idConstraints.push(await this.sessionStore.findDiscordIdsByStripeId(stripeId));
 
     let customerIds: string[] | undefined;
@@ -942,11 +942,36 @@ export class DiscordBot {
       customerIds = [...new Set(idConstraints.reduce((acc, ids) => acc.filter((id) => ids.includes(id))))];
     }
 
+    // postiz_id accepts a Postiz user id, an organization id, or an email
+    // address. The Discord-link path only knows people who linked their
+    // account, so the identity stamped on the ticket is searched alongside it,
+    // and an email is resolved through the platform first.
+    let postizMatch: TicketSearchFilters["postizMatch"];
+    if (postizId) {
+      const term = postizId.trim();
+      const userIds = new Set<string>();
+      const orgIds = new Set<string>();
+      // A bare id is usable as either without a lookup.
+      userIds.add(term);
+      orgIds.add(term);
+      const account = await this.postizIdentity?.resolve(term).catch(() => null);
+      if (account) {
+        userIds.add(account.userId);
+        orgIds.add(account.orgId);
+      }
+      postizMatch = {
+        discordIds: await this.sessionStore.findDiscordIdsByPostizId(account?.userId ?? term),
+        userIds: [...userIds],
+        orgIds: [...orgIds],
+      };
+    }
+
     const filters: TicketSearchFilters = {
       categoryId: type ?? undefined,
       statusTagId: statusTagId ?? undefined,
       closed: state === "open" ? false : state === "closed" ? true : undefined,
       customerIds,
+      postizMatch,
       text: text?.trim() || undefined,
       createdAfter,
       createdBefore,
@@ -971,7 +996,7 @@ export class DiscordBot {
     // An identity filter that resolved to nobody → no possible matches.
     if (filters.customerIds && filters.customerIds.length === 0) {
       return {
-        embed: makeEmbed("No users match that Discord user / Postiz ID / Stripe ID.", COLORS.warn),
+        embed: makeEmbed("No users match that Discord user / Stripe ID.", COLORS.warn),
         components: [],
       };
     }
@@ -994,7 +1019,10 @@ export class DiscordBot {
       const category = t.categoryId ? categoryLabels.get(t.categoryId) ?? t.categoryId : "N/A";
       const who = t.customerId ? `<@${t.customerId}>` : t.customerDisplayName ?? "unknown user";
       const session = t.customerId ? sessionByDiscordId.get(t.customerId) : undefined;
-      const postiz = session?.postizUserId ? ` · Postiz \`${session.postizUserId}\`` : "";
+      // The identity stamped on the ticket wins: it is resolved from the
+      // platform, whereas the session only knows self-linked accounts.
+      const postizId2 = t.postizUserId ?? session?.postizUserId;
+      const postiz = postizId2 ? ` · Postiz \`${postizId2}\`${t.postizTier ? ` (${t.postizTier})` : ""}` : "";
       const stripe = session?.stripeCustomerId ? ` · Stripe \`${session.stripeCustomerId}\`` : "";
       const created = `<t:${Math.floor(t.createdAt.getTime() / 1000)}:R>`;
       const closedMark = t.closed ? " · 🔒 closed" : "";
@@ -5738,7 +5766,7 @@ export class DiscordBot {
           {
             type: 3, // STRING
             name: "postiz_id",
-            description: "Postiz user ID",
+            description: "Postiz user ID, organization ID, or email address",
             required: false,
           },
           {
