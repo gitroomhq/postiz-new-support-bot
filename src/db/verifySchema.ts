@@ -126,6 +126,7 @@ const EXPECTED_COLUMNS: Record<string, string[]> = {
     "intercomContactId", "intercomConversationId", "intercomTicketId", "pageUrl", "feedbackAt", "importedAt",
     "postizUserId", "postizOrgId", "stripeCustomerId", "retriedAt",
   ],
+  postiz_org_links: ["id", "orgId", "stripeCustomerId", "firstSeenAt", "lastSeenAt", "observations"],
   forwarded_email_converts: [
     "id", "originalConversationId", "newConversationId", "forwarderAdminId", "forwarderEmail", "customerEmail",
     "customerName", "intercomContactId", "contactRole", "trigger", "actorLabel", "attachmentsCount",

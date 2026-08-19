@@ -11,6 +11,7 @@ import {
 } from "./feedbackFormat";
 import type { SentryFeedbackClient, SentryFeedbackIssue } from "./SentryFeedbackClient";
 import type { SentryFeedbackStore } from "./SentryFeedbackStore";
+import type { PostizOrgLinkStore } from "../postiz/PostizOrgLinkStore";
 
 const syncLog = log.child("sentry:feedback");
 
@@ -37,8 +38,22 @@ export class SentryFeedbackImporter {
     private sentry: SentryFeedbackClient,
     private intercom: IntercomClient,
     private store: SentryFeedbackStore,
-    private settingsStore: SettingsStore
+    private settingsStore: SettingsStore,
+    // Optional: every event read here may carry the organization and Stripe
+    // customer together, which is the only place that pairing is observable.
+    // Recording it is free, so it happens wherever an event is already loaded.
+    private orgLinks?: PostizOrgLinkStore
   ) {}
+
+  // Never allowed to disturb an import: the mapping is a side benefit.
+  private async harvestLink(identity: { orgId: string | null; stripeCustomerId: string | null }): Promise<void> {
+    if (!this.orgLinks) return;
+    await this.orgLinks.recordIdentity(identity).catch((e) => {
+      syncLog.warn("postiz org link record failed", {
+        "error.message": e instanceof Error ? e.message : String(e),
+      });
+    });
+  }
 
   // force = the /config "Sync Now" button: bypasses the enabled toggle (a
   // deliberate one-shot test) but never the configuration/watermark gate.
@@ -117,6 +132,7 @@ export class SentryFeedbackImporter {
           continue;
         }
         const context = await this.sentry.getFeedbackContext(issue.id);
+        await this.harvestLink(context.identity);
         const email = context.contactEmail;
         if (!email) {
           await this.store.insertSkipped({
@@ -327,6 +343,7 @@ export class SentryFeedbackImporter {
     for (const row of candidates) {
       try {
         const context = await this.sentry.getFeedbackContext(row.sentryIssueId);
+        await this.harvestLink(context.identity);
         const email = context.contactEmail;
         if (!email) {
           await this.store.markRetried(row.sentryIssueId, now);

@@ -1039,6 +1039,28 @@ model SentryFeedbackImport {
   @@map("sentry_feedback_imports")
 }
 
+// Organization to Stripe customer mapping, harvested from Sentry events.
+//
+// The platform creates its Stripe customer with an email and name and NO
+// metadata, so nothing on the Stripe object points back at the organization,
+// and the platform's own search endpoint does not expose paymentId. A backend
+// Sentry event is the one place both ids appear together, so every event the
+// bot reads that carries the pair is recorded here. Ids only: no email, no
+// name, nothing that is not already in both systems.
+model PostizOrgLink {
+  id               String   @id @default(cuid())
+  orgId            String   @unique
+  stripeCustomerId String
+  // Bumped on every re-observation, so a stale mapping is visible as one that
+  // stopped being seen rather than silently trusted forever.
+  firstSeenAt      DateTime @default(now())
+  lastSeenAt       DateTime @default(now())
+  observations     Int      @default(1)
+
+  @@index([stripeCustomerId])
+  @@map("postiz_org_links")
+}
+
 // Forwarded-email conversion ledger: one row per converted conversation.
 // originalConversationId = the misattributed teammate-authored conversation
 // (unique = idempotency across webhook retries); newConversationId = the

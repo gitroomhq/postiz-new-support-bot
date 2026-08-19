@@ -865,6 +865,18 @@ const STATEMENTS: string[] = [
   `ALTER TABLE "sentry_feedback_imports" ADD COLUMN IF NOT EXISTS "postizOrgId" TEXT`,
   `ALTER TABLE "sentry_feedback_imports" ADD COLUMN IF NOT EXISTS "stripeCustomerId" TEXT`,
   `ALTER TABLE "sentry_feedback_imports" ADD COLUMN IF NOT EXISTS "retriedAt" TIMESTAMP(3)`,
+  // Organization ↔ Stripe customer mapping harvested from Sentry events.
+  `CREATE TABLE IF NOT EXISTS "postiz_org_links" (
+    "id" TEXT NOT NULL,
+    "orgId" TEXT NOT NULL,
+    "stripeCustomerId" TEXT NOT NULL,
+    "firstSeenAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "lastSeenAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "observations" INTEGER NOT NULL DEFAULT 1,
+    CONSTRAINT "postiz_org_links_pkey" PRIMARY KEY ("id")
+  )`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS "postiz_org_links_orgId_key" ON "postiz_org_links"("orgId")`,
+  `CREATE INDEX IF NOT EXISTS "postiz_org_links_stripeCustomerId_idx" ON "postiz_org_links"("stripeCustomerId")`,
   `CREATE INDEX IF NOT EXISTS "sentry_feedback_imports_status_retriedAt_idx" ON "sentry_feedback_imports"("status", "retriedAt")`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "sentryFeedbackTeamId" TEXT`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "sentryFeedbackWatermarkAt" TIMESTAMP(3)`,

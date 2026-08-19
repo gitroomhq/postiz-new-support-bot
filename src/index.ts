@@ -53,6 +53,7 @@ import { SlaFactsLoader } from "./sla/facts";
 import { SlaService } from "./sla/SlaService";
 import { PostizClient } from "./postiz/PostizClient";
 import { PostizIdentityService } from "./postiz/PostizIdentityService";
+import { PostizOrgLinkStore } from "./postiz/PostizOrgLinkStore";
 import { SentryFeedbackClient } from "./sentry/SentryFeedbackClient";
 import { SentryFeedbackStore } from "./sentry/SentryFeedbackStore";
 import { SentryFeedbackImporter } from "./sentry/SentryFeedbackImporter";
@@ -440,6 +441,7 @@ async function main() {
   // the constructor.
   const postizClient = new PostizClient(settingsStore);
   const postizIdentity = new PostizIdentityService(postizClient, settingsStore, sessionStore);
+  const postizOrgLinks = new PostizOrgLinkStore(prisma);
 
   const bot = new DiscordBot(
     config,
@@ -651,7 +653,8 @@ async function main() {
     sentryFeedbackClient,
     intercomClient,
     sentryFeedbackStore,
-    settingsStore
+    settingsStore,
+    postizOrgLinks
   );
 
   // ---- Temporal worker (all background work lives in workflows) ----
