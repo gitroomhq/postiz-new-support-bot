@@ -21,6 +21,9 @@ export interface ToggleField {
   value: boolean;
   help?: string;
   disabled?: boolean;
+  // Provenance/state marker drawn next to the label (e.g. an env-pinned
+  // Infrastructure setting). Rendered by the same badge() helper as StaticField.
+  badge?: Badge;
 }
 export interface TextField {
   type: "text";
@@ -35,6 +38,7 @@ export interface TextField {
   pattern?: string;
   secret?: boolean;
   secretState?: SecretState;
+  badge?: Badge;
 }
 export interface NumberField {
   type: "number";

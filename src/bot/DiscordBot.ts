@@ -100,6 +100,7 @@ import {
 } from "../util/instrument";
 import { reconfigureInflux, pingInflux, influxActive } from "../metrics/InfluxWriter";
 import { VaultService, VAULT_INTEGRATIONS, type VaultTestReport } from "../vault/VaultService";
+import { envPin, type EnvPinnedField } from "../config/env";
 import type { TemporalOpsBinding, TemporalProducers } from "../temporal/producers";
 import { describeSaResult } from "../temporal/searchAttributes";
 import { buildIdIsDegenerate } from "../temporal/buildId";
@@ -2559,12 +2560,21 @@ export class DiscordBot {
           cfg.tlsServerName ? ` · SNI \`${cfg.tlsServerName}\`` : ""
         }`
       );
+      // TEMPORAL_* env vars override the stored connection values; name them
+      // so a value that ignores the Connection modal is never a mystery.
+      const pinnedConn = (["temporalAddress", "temporalNamespace", "temporalTaskQueue", "temporalDeploymentName", "temporalTlsServerName"] as const)
+        .map((f) => envPin(f))
+        .filter((n): n is string => n != null);
+      if (pinnedConn.length) lines.push(`> _pinned by the environment: ${pinnedConn.map((n) => `\`${n}\``).join(", ")}_`);
       const cert = svc.certInfo();
+      const certSource = svc.tlsSource();
       lines.push(
         `**Client cert:** ${
           cert
-            ? `SHA-256 \`${cert.fingerprint256.replace(/:/g, "").slice(0, 16).toLowerCase()}…\` · expires ${rel(cert.notAfter)}${cert.daysLeft < 30 ? " ⚠️" : ""}`
-            : "_not entered (Certificates below, stored in Vault KV)_"
+            ? `SHA-256 \`${cert.fingerprint256.replace(/:/g, "").slice(0, 16).toLowerCase()}…\` · expires ${rel(cert.notAfter)}${cert.daysLeft < 30 ? " ⚠️" : ""}${
+                certSource === "env-files" ? " · from `TEMPORAL_TLS_*_FILE` (Vault KV empty)" : ""
+              }`
+            : "_not entered (Certificates below, stored in Vault KV; `TEMPORAL_TLS_CERT_FILE`/`KEY_FILE` is the offline fallback)_"
         }`
       );
       const buf = svc.bufferStats();
@@ -2576,7 +2586,9 @@ export class DiscordBot {
         `**Worker:** ${ops.workerManager.running() ? "✅ polling" : "⏹️ stopped"} · build \`${v.buildId}\` (deployment \`${v.deploymentName}\`)${
           promoted === true ? " · current" : promoted === false ? " · ⚠️ NOT promoted to current" : ""
         }${buildIdIsDegenerate(v.buildId) ? " · ⚠️ degenerate build id (package version: every deploy looks identical; rebuild with the stamped buildInfo.json in dist)" : ""}`,
-        `**Background work:** ${s.temporalEnabled() ? "running (worker active)" : "⏸️ paused: signals park server-side until resumed"}`
+        `**Background work:** ${s.temporalEnabled() ? "running (worker active)" : "⏸️ paused: signals park server-side until resumed"}${
+          envPin("temporalEnabled") ? ` _(pinned by \`${envPin("temporalEnabled")}\`)_` : ""
+        }`
       );
 
       // Live readouts, best-effort with a short budget — a down server must
@@ -2597,7 +2609,9 @@ export class DiscordBot {
     const row1 = new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder()
         .setCustomId("config_temporal_toggle")
-        .setLabel(s.temporalEnabled() ? "Background work: running" : "Background work: paused")
+        .setLabel(
+          `${s.temporalEnabled() ? "Background work: running" : "Background work: paused"}${envPin("temporalEnabled") ? " (env)" : ""}`
+        )
         .setStyle(s.temporalEnabled() ? ButtonStyle.Success : ButtonStyle.Danger),
       new ButtonBuilder().setCustomId("config_temporal_conn").setLabel("Connection").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("config_temporal_certs").setLabel("Certificates").setStyle(ButtonStyle.Primary),
@@ -2647,9 +2661,31 @@ export class DiscordBot {
       }
       await interaction.deferUpdate();
       await s.updateTemporal({ temporalEnabled: enabling });
+      // TEMPORAL_ENABLED overrides the stored flag, so the worker follows the
+      // EFFECTIVE value: a stored flip must not drain a worker the env pins on.
+      const pinnedBy = envPin("temporalEnabled");
+      const effective = s.temporalEnabled();
       try {
-        await ops.setEnabled(enabling);
-        this.auditConfig(interaction, `Temporal background work → ${enabling ? "running" : "paused (worker drained)"}`);
+        await ops.setEnabled(effective);
+        this.auditConfig(
+          interaction,
+          `Temporal background work → ${enabling ? "running" : "paused (worker drained)"}${
+            pinnedBy ? ` (inert: pinned ${effective ? "running" : "paused"} by ${pinnedBy})` : ""
+          }`
+        );
+        if (pinnedBy) {
+          await interaction.followUp({
+            embeds: [
+              makeEmbed(
+                `\`${pinnedBy}\` is set in the environment and overrides this toggle: background work stays **${
+                  effective ? "running" : "paused"
+                }**. The new value is stored and takes effect once that variable is removed.`,
+                COLORS.warn
+              ),
+            ],
+            flags: 64,
+          });
+        }
       } catch (e) {
         await s.updateTemporal({ temporalEnabled: !enabling });
         await interaction.followUp({
@@ -2897,6 +2933,14 @@ export class DiscordBot {
               ? `**unreachable** ⚠️${service.downSince() ? ` since <t:${Math.floor(service.downSince()!.getTime() / 1000)}:R>` : ""}. Serving cached secrets, retrying every 30s`
               : "**enabled but incomplete** ⚠️. Set address + token";
 
+    // A set VAULT_*/TEMPORAL_* env var OVERRIDES the stored value, so every
+    // pinned line says so: the modals below still accept edits, they just sit
+    // dormant in BotSettings until the variable is removed.
+    const pin = (field: EnvPinnedField) => {
+      const name = envPin(field);
+      return name ? ` _(pinned by \`${name}\`)_` : "";
+    };
+
     const tokenLine = s.vaultTokenUnreadable()
       ? "⚠️ stored token can't be decrypted (key source rotated): re-enter it"
       : mask(s.vaultToken());
@@ -2922,8 +2966,10 @@ export class DiscordBot {
       .setDescription(
         [
           `**Connection:** ${stateLine}`,
-          `**Address:** ${s.vaultAddr() ? `\`${s.vaultAddr()}\`` : "_not set_"} · **Token:** ${tokenLine}`,
-          `**Paths:** KV \`${s.vaultKvMount()}/${s.vaultKvBasePath()}\` · Transit \`${s.vaultTransitMount()}\` key \`${s.vaultTransitKey()}\``,
+          `**Address:** ${s.vaultAddr() ? `\`${s.vaultAddr()}\`` : "_not set_"}${pin("vaultAddr")} · **Token:** ${tokenLine}${pin("vaultToken")}`,
+          `**Paths:** KV \`${s.vaultKvMount()}/${s.vaultKvBasePath()}\` · Transit \`${s.vaultTransitMount()}\` key \`${s.vaultTransitKey()}\`${
+            pin("vaultKvMount") || pin("vaultKvBasePath") || pin("vaultTransitMount") || pin("vaultTransitKey") ? " _(env-pinned)_" : ""
+          }`,
           `**Probe:** ${service?.lastProbeAt() ? `<t:${Math.floor(service.lastProbeAt()!.getTime() / 1000)}:R>` : "_none yet_"} · **KV cache:** ${
             cacheAge != null ? `warm (${Math.max(0, Math.round(cacheAge / 60_000))}m old)` : "cold"
           }`,
@@ -2945,7 +2991,7 @@ export class DiscordBot {
       new ButtonBuilder().setCustomId("config_vault_paths").setLabel("Paths").setStyle(ButtonStyle.Primary),
       new ButtonBuilder()
         .setCustomId("config_vault_toggle")
-        .setLabel(`Vault: ${s.vaultEnabled() ? "on" : "off"}`)
+        .setLabel(`Vault: ${s.vaultEnabled() ? "on" : "off"}${envPin("vaultEnabled") ? " (env)" : ""}`)
         .setStyle(s.vaultEnabled() ? ButtonStyle.Success : ButtonStyle.Secondary),
       new ButtonBuilder()
         .setCustomId("config_vault_test")
@@ -3107,10 +3153,25 @@ export class DiscordBot {
 
     if (id === "config_vault_toggle") {
       const turningOff = s.vaultEnabled();
-      await s.updateVault({ vaultEnabled: !s.vaultEnabled() });
+      await s.updateVault({ vaultEnabled: !turningOff });
       await service.reconfigure();
-      this.auditConfig(interaction, `Vault connection → ${s.vaultEnabled() ? "on" : "off"}`);
+      const pinnedBy = envPin("vaultEnabled");
+      this.auditConfig(
+        interaction,
+        `Vault connection → ${turningOff ? "off" : "on"}${pinnedBy ? ` (inert: pinned ${s.vaultEnabled() ? "on" : "off"} by ${pinnedBy})` : ""}`
+      );
       await interaction.update(await this.buildVaultPanel());
+      if (pinnedBy) {
+        await interaction.followUp({
+          embeds: [
+            makeEmbed(
+              `\`${pinnedBy}\` is set in the environment and overrides this toggle: Vault stays **${s.vaultEnabled() ? "on" : "off"}**. The new value is stored and takes effect once that variable is removed.`,
+              COLORS.warn
+            ),
+          ],
+          flags: 64,
+        });
+      }
       if (turningOff && s.vaultMigratedAt()) {
         await interaction.followUp({
           embeds: [
@@ -3211,6 +3272,17 @@ export class DiscordBot {
     }
   }
 
+  // A save into a field an env var pins is stored but dormant (config/env.ts):
+  // the reply says which variables are in force instead of implying the new
+  // value took effect.
+  private envPinFootnote(fields: readonly EnvPinnedField[]): string {
+    const names = fields.map((f) => envPin(f)).filter((n): n is string => n != null);
+    if (!names.length) return "";
+    return `\n⚠️ Stored, but ${names.map((n) => `\`${n}\``).join(", ")} in the environment override${names.length === 1 ? "s" : ""} ${
+      names.length === 1 ? "this value" : "these values"
+    }. The saved value applies once the variable${names.length === 1 ? " is" : "s are"} removed.`;
+  }
+
   // config_vault_conn_modal / config_vault_paths_modal submits (delegated from
   // handleConfigModal; admin already re-checked there).
   private async handleVaultConfigModal(interaction: ModalSubmitInteraction): Promise<void> {
@@ -3220,7 +3292,7 @@ export class DiscordBot {
     }
     const s = this.settingsStore;
 
-    const replyWithState = async (prefix: string) => {
+    const replyWithState = async (prefix: string, pinned: readonly EnvPinnedField[] = []) => {
       const state = this.vault!.service.state();
       const note =
         state === "up"
@@ -3230,7 +3302,11 @@ export class DiscordBot {
             : state === "down"
               ? `${prefix}, but Vault is **unreachable**. The probe loop retries every 30s.`
               : `${prefix}. Turn the Vault toggle on to activate the connection.`;
-      await interaction.reply({ embeds: [makeEmbed(note, state === "up" ? COLORS.success : COLORS.warn)], flags: 64 });
+      const footnote = this.envPinFootnote(pinned);
+      await interaction.reply({
+        embeds: [makeEmbed(note + footnote, footnote || state !== "up" ? COLORS.warn : COLORS.success)],
+        flags: 64,
+      });
     };
 
     if (interaction.customId === "config_vault_conn_modal") {
@@ -3253,7 +3329,7 @@ export class DiscordBot {
       await reconfigureInflux(s.influxConfig());
       // Deliberately no token value in the audit line.
       this.auditConfig(interaction, `Vault connection updated (addr ${addr || "N/A"}${token ? ", token set" : ""})`);
-      await replyWithState("Vault connection saved");
+      await replyWithState("Vault connection saved", token ? ["vaultAddr", "vaultToken"] : ["vaultAddr"]);
       return;
     }
 
@@ -3274,7 +3350,7 @@ export class DiscordBot {
         interaction,
         `Vault paths updated (kv ${s.vaultKvMount()}/${s.vaultKvBasePath()}, transit ${s.vaultTransitMount()}/${s.vaultTransitKey()})`
       );
-      await replyWithState("Vault paths saved");
+      await replyWithState("Vault paths saved", ["vaultKvMount", "vaultKvBasePath", "vaultTransitMount", "vaultTransitKey"]);
       return;
     }
   }
@@ -4758,6 +4834,13 @@ export class DiscordBot {
               this.settingsStore.temporalEnabled() && this.temporalOps?.workerManager.running()
                 ? "⚠️ The running worker keeps its old connection. Toggle Temporal off/on to apply the change."
                 : "",
+              this.envPinFootnote([
+                "temporalAddress",
+                "temporalNamespace",
+                "temporalTaskQueue",
+                "temporalDeploymentName",
+                "temporalTlsServerName",
+              ]).trim(),
             ]
               .filter(Boolean)
               .join("\n"),

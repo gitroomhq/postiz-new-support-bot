@@ -6,7 +6,7 @@ import type { AuditLogger } from "../bot/AuditLogger";
 import type { VaultService } from "../vault/VaultService";
 import { log } from "../util/logger";
 import { RetryBuffer, type BufferedOp } from "./RetryBuffer";
-import { loadTemporalTls, parseCertInfo, type TemporalCertInfo, type TemporalTlsMaterial } from "./certs";
+import { loadTemporalTls, parseCertInfo, temporalTlsSource, type TemporalCertInfo, type TemporalTlsMaterial, type TemporalTlsSource } from "./certs";
 import { describeSaResult, ensureSearchAttributes, type SaEnsureResult } from "./searchAttributes";
 
 const temporalLog = log.child("temporal");
@@ -138,8 +138,8 @@ export class TemporalService {
     if (!this.settings.temporalNamespace()) return "Namespace not set (Connection in /config → Temporal).";
     if (!this.tlsMaterial()) {
       return this.vault.state() === "up"
-        ? "mTLS client cert/key not found in Vault (enter them via Certificates)."
-        : "mTLS client cert/key unavailable (Vault KV cache is cold or certs were never entered).";
+        ? "mTLS client cert/key not found in Vault (enter them via Certificates, or point TEMPORAL_TLS_CERT_FILE/KEY_FILE at PEM files)."
+        : "mTLS client cert/key unavailable (Vault KV cache is cold or certs were never entered; TEMPORAL_TLS_CERT_FILE/KEY_FILE is the offline fallback).";
     }
     return null;
   }
@@ -209,6 +209,12 @@ export class TemporalService {
 
   tlsMaterial(): TemporalTlsMaterial | null {
     return loadTemporalTls(this.vault);
+  }
+
+  // "vault" | "env-files" | null — panels name the source so a cert that came
+  // off disk is never mistaken for one stored in Vault.
+  tlsSource(): TemporalTlsSource | null {
+    return temporalTlsSource(this.vault);
   }
 
   // ---- lifecycle ----

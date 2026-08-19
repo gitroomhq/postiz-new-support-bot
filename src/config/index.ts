@@ -25,9 +25,11 @@ export interface BotConfig {
     port: number;
     callbackUrl: string;
   };
-  // Temporal connection values are NOT here: they live in BotSettings
-  // (/config → Temporal → Connection); SettingsStore reads the TEMPORAL_* env
-  // vars directly as first-boot fallbacks, like the INTERCOM_* getters.
+  // Vault and Temporal are NOT here: they live in BotSettings (/config →
+  // Vault / Temporal), and SettingsStore reads the VAULT_*/TEMPORAL_* env vars
+  // directly as OVERRIDES of the stored values — the bootstrap exception
+  // explained in ./env.ts, not the first-boot-fallback pattern used for
+  // INTERCOM_*.
 }
 
 export function loadConfig(): BotConfig {

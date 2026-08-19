@@ -493,7 +493,10 @@ async function main() {
   const guildSnapshot = new GuildSnapshotProvider(() => bot.client);
   // Temporal worker-pause is defined after bot.start(); hold it late-bound so the
   // infra hub's toggle can reach it at request time.
-  const temporalControl: { setEnabled: ((on: boolean) => Promise<void>) | null } = { setEnabled: null };
+  const temporalControl: {
+    setEnabled: ((on: boolean) => Promise<void>) | null;
+    tlsSource: (() => "vault" | "env-files" | null) | null;
+  } = { setEnabled: null, tlsSource: null };
   // Dashboard credential reset is defined after the dashboard stack below —
   // held late-bound so the Dashboard hub's action can reach it at request time.
   const dashboardOps: { resetCredentials: ((userId: string) => Promise<number>) | null } = { resetCredentials: null };
@@ -526,6 +529,7 @@ async function main() {
       vaultMigrate: async () => fmtReport(await vaultMigrator.migrate()),
       vaultReverse: async () => fmtReport(await vaultMigrator.reverse()),
       setTemporalEnabled: async (on) => { if (temporalControl.setEnabled) await temporalControl.setEnabled(on); },
+      temporalTlsSource: () => temporalControl.tlsSource?.() ?? null,
     }),
     makeAuditBillingHub({
       applyWebhook: async (on) => { if (on) await stripeWebhookHandler.ensureEndpoint(true); else await stripeWebhookHandler.disableEndpoint(); },
@@ -676,6 +680,7 @@ async function main() {
     }
   };
   temporalControl.setEnabled = setWorkerActive;
+  temporalControl.tlsSource = () => temporalService.tlsSource();
 
   bot.bindTemporal({
     producers: temporalProducers,

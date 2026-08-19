@@ -281,6 +281,9 @@ ${panelThemeCss()}
       wrap.appendChild(labelFor(id, f.label));
       wrap.appendChild(el("p", "help", "Rule builder loads here (see SLA hub)."));
     }
+    // "static" already drew its badge inline next to the value; everywhere else
+    // it hangs under the control (env-pinned Infrastructure settings use this).
+    if (f.badge && f.type !== "static") wrap.appendChild(badge(f.badge));
     if (f.help) wrap.appendChild(el("div", "help", f.help));
     var errSlot = el("div", "ferr"); errSlot.id = "err_" + f.key; errSlot.hidden = true; wrap.appendChild(errSlot);
     return wrap;

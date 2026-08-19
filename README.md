@@ -21,7 +21,7 @@ Prisma + PostgreSQL (`prisma/schema.prisma`). The deploy environment can't run t
 
 ## Runtime configuration
 
-Almost everything is configured live through the admin-only **`/config`** panel and stored in a single `BotSettings` row — the deploy has **no editable `.env`**, so new settings must be `/config`-configurable rather than new env vars.
+Almost everything is configured live through the admin-only **`/config`** panel and stored in a single `BotSettings` row — the deploy has **no editable `.env`**, so new settings must be `/config`-configurable rather than new env vars. The one exception is the infrastructure layer underneath `/config` itself (Vault + Temporal), where a set env var *overrides* the stored value; see below.
 
 ### Environment variables
 
@@ -29,7 +29,13 @@ Almost everything is configured live through the admin-only **`/config`** panel 
 
 **Optional** (feature-gating, or first-boot seeds that `/config` then owns): `DISCORD_THREADS_CHANNEL_ID`, `DISCORD_SUPPORT_ROLE_ID`, `POSTIZ_FRONTEND_URL`, `POSTIZ_API_URL`, `POSTIZ_CLIENT_ID`, `POSTIZ_CLIENT_SECRET`, `POSTIZ_CALLBACK_URL`, `GH_BOT_TOKEN`, `GH_BOT_REPO`, `STRIPE_DISCOUNT_COUPON_ID`, `SERVER_PORT` (default 3000), `SENTRY_DSN`, `INTERCOM_*`, `SCHEMA_DRIFT_STRICT`.
 
-**Temporal**: the connection (address `host:port`, namespace, task queue, deployment name, TLS server-name/SNI override for dialing by IP) is edited live via **`/config → Temporal → Connection`** and stored in `BotSettings` — no env access needed. The `TEMPORAL_*` env vars exist only as optional first-boot fallbacks (like `INTERCOM_*`). The worker build id comes from `dist/temporal/buildInfo.json`, stamped by `pnpm build` with the git SHA — or, on a `.git`-less build machine, a content hash of `dist/` so every deploy still gets a unique id (`GIT_SHA` env remains a CI fallback; the panel flags a degenerate `x.y.z` id).
+**Infrastructure overrides (`VAULT_*` / `TEMPORAL_*`)**: these are the only env vars that **win over `/config`**. Vault holds the Temporal mTLS certs, Temporal runs the background work, and `/config` is only reachable once the bot is up — so a deploy needs a way to pin the bootstrap layer regardless of what the database holds. Setting one pins the value; leaving it blank hands the setting back to Discord. Both panels label every pinned field and keep accepting edits, which are stored in `BotSettings` and take effect as soon as the variable is removed.
+
+- **Vault** (`/config → Vault`): `VAULT_ENABLED`, `VAULT_ADDR`, `VAULT_TOKEN`, `VAULT_KV_MOUNT`, `VAULT_KV_BASE_PATH`, `VAULT_TRANSIT_MOUNT`, `VAULT_TRANSIT_KEY`.
+- **Temporal** (`/config → Temporal → Connection`): `TEMPORAL_ENABLED` (worker pause switch), `TEMPORAL_ADDRESS`, `TEMPORAL_NAMESPACE`, `TEMPORAL_TASK_QUEUE`, `TEMPORAL_DEPLOYMENT_NAME`, `TEMPORAL_TLS_SERVER_NAME`. Booleans accept `1/true/yes/on` and `0/false/no/off`; anything else is ignored with a warning.
+- **Temporal mTLS certs are the exception to the exception**: Vault KV (`<kvBasePath>/temporal`, written by `/config → Temporal → Certificates`) stays authoritative, and `TEMPORAL_TLS_CERT_FILE` / `TEMPORAL_TLS_KEY_FILE` / `TEMPORAL_TLS_CA_FILE` are read *only* when KV holds no `temporal` entry, so a deploy that already keeps its certs in Vault never falls back to stale files on disk. Cert and key are required together; the CA is optional. The panel names whichever source is live.
+
+The worker build id comes from `dist/temporal/buildInfo.json`, stamped by `pnpm build` with the git SHA — or, on a `.git`-less build machine, a content hash of `dist/` so every deploy still gets a unique id (`GIT_SHA` env remains a CI fallback; the panel flags a degenerate `x.y.z` id).
 
 ### Temporal server prerequisites
 

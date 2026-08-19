@@ -1,10 +1,20 @@
 import { X509Certificate, createPrivateKey } from "node:crypto";
+import { readFileSync, statSync } from "node:fs";
+import { temporalTlsFilePaths, TEMPORAL_TLS_FILE_VARS } from "../config/env";
+import { log } from "../util/logger";
 import type { VaultService } from "../vault/VaultService";
 
-// mTLS material for the Temporal connection. Vault-only by design (no local
-// encrypted fallback, unlike the token-shaped GLOBAL_SECRETS): the material is
-// only needed while Temporal is enabled, and a cold Vault cache simply leaves
-// the connection "down" until the probe loop warms it.
+// mTLS material for the Temporal connection. Vault KV is authoritative (no
+// local encrypted fallback, unlike the token-shaped GLOBAL_SECRETS): the
+// material is only needed while Temporal is enabled, and a cold Vault cache
+// simply leaves the connection "down" until the probe loop warms it.
+//
+// The TEMPORAL_TLS_*_FILE env vars are the one bootstrap escape hatch, and
+// unlike the other TEMPORAL_* vars they do NOT override: they are read only
+// when KV holds no temporal entry at all, so a deploy that has already put its
+// certs in Vault never silently switches to stale files on disk.
+
+const certLog = log.child("temporal");
 
 export interface TemporalTlsMaterial {
   clientCertPem: string;
@@ -20,14 +30,70 @@ export interface TemporalCertInfo {
   daysLeft: number;
 }
 
-// Reads from the in-memory KV cache (sync); null = not entered yet or cache
-// cold. Field names match what the Certificates modal writes.
+/** Where the material in use came from; null = none available. */
+export type TemporalTlsSource = "vault" | "env-files";
+
+// Reads from the in-memory KV cache (sync), falling back to the PEM files named
+// by TEMPORAL_TLS_CERT_FILE/KEY_FILE/CA_FILE. Null = not entered yet, cache
+// cold, and no readable files. Field names match what the Certificates modal
+// writes.
 export function loadTemporalTls(vault: VaultService): TemporalTlsMaterial | null {
   const cert = vault.getCachedKvField("temporal", "clientCertPem");
   const key = vault.getCachedKvField("temporal", "clientKeyPem");
-  if (!cert || !key) return null;
+  if (!cert || !key) return loadTemporalTlsFromFiles();
   return { clientCertPem: cert, clientKeyPem: key, caPem: vault.getCachedKvField("temporal", "caPem") };
 }
+
+/** Which source the panels should name for the material currently in use. */
+export function temporalTlsSource(vault: VaultService): TemporalTlsSource | null {
+  if (vault.getCachedKvField("temporal", "clientCertPem") && vault.getCachedKvField("temporal", "clientKeyPem")) return "vault";
+  return loadTemporalTlsFromFiles() ? "env-files" : null;
+}
+
+// Re-read only when a file's size/mtime moved, so a rotation on disk reaches
+// the next reconnect without re-reading PEMs on every panel render.
+type FileCacheEntry = { stamp: string; contents: string };
+const fileCache = new Map<string, FileCacheEntry>();
+const fileErrorsLogged = new Set<string>();
+
+function readPemFile(path: string): string | null {
+  try {
+    const st = statSync(path);
+    const stamp = `${st.size}:${st.mtimeMs}`;
+    const cached = fileCache.get(path);
+    if (cached?.stamp === stamp) return cached.contents;
+    const contents = readFileSync(path, "utf8");
+    fileCache.set(path, { stamp, contents });
+    fileErrorsLogged.delete(path);
+    return contents;
+  } catch (e) {
+    // Once per path until it reads again: this sits on the probe loop.
+    if (!fileErrorsLogged.has(path)) {
+      fileErrorsLogged.add(path);
+      certLog.warn("temporal TLS file unreadable", {
+        "temporal.tls_file": path,
+        "error.message": e instanceof Error ? e.message : String(e),
+      });
+    }
+    fileCache.delete(path);
+    return null;
+  }
+}
+
+function loadTemporalTlsFromFiles(): TemporalTlsMaterial | null {
+  const paths = temporalTlsFilePaths();
+  if (!paths) return null;
+  const clientCertPem = readPemFile(paths.cert);
+  const clientKeyPem = readPemFile(paths.key);
+  if (!clientCertPem || !clientKeyPem) return null;
+  // A named-but-unreadable CA is a misconfiguration; failing closed here would
+  // take the whole connection down, so it degrades to "no CA override" and the
+  // readPemFile warning above carries the diagnosis.
+  return { clientCertPem, clientKeyPem, caPem: paths.ca ? readPemFile(paths.ca) : null };
+}
+
+/** The env var names behind the file fallback, for panel copy. */
+export const TLS_FILE_VARS = TEMPORAL_TLS_FILE_VARS;
 
 // Parses the leaf cert for the panel readout. Returns null on garbage instead
 // of throwing — the panel renders "unreadable" and the modal validation path

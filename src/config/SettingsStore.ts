@@ -3,6 +3,7 @@ import { Prisma, PrismaClient, BotSettings, StatusTag } from "../generated/prism
 import type { SentryRuntimeConfig } from "../util/logger";
 import type { InfluxRuntimeConfig } from "../metrics/InfluxWriter";
 import { decryptSecret, encryptSecret, isVaultKvSentinel, VAULT_KV_SENTINEL } from "../util/crypto";
+import { envBool, envPin, envStr } from "./env";
 import type { VaultIntegration, VaultRuntimeConfig, VaultService } from "../vault/VaultService";
 import type { SlaTargetEntry } from "../sla/types";
 import { parseOfficeHours, type OfficeHoursSchedule } from "../sla/businessTime";
@@ -1218,39 +1219,47 @@ export class SettingsStore {
   // credential and is always encrypted with the LOCAL key (crypto.ts) — Vault
   // can't wrap its own token.
 
+  // The VAULT_* env vars OVERRIDE the stored values (config/env.ts explains
+  // why this layer inverts the usual /config-wins rule); the panels flag every
+  // pinned field rather than letting an edit look effective.
   vaultEnabled(): boolean {
-    return this.settings.vaultEnabled;
+    return envBool("VAULT_ENABLED") ?? this.settings.vaultEnabled;
   }
 
   vaultAddr(): string | null {
-    return this.settings.vaultAddr?.trim() || null;
+    return envStr("VAULT_ADDR") ?? (this.settings.vaultAddr?.trim() || null);
   }
 
   vaultToken(): string | null {
+    const pinned = envStr("VAULT_TOKEN");
+    if (pinned) return pinned;
     const raw = this.settings.vaultToken;
     return raw != null ? decryptSecret(raw) : null;
   }
 
   // Local ciphertext present but no longer decryptable (rotated key source) —
-  // the panel asks for re-entry.
+  // the panel asks for re-entry. An env-pinned token means there IS a working
+  // token, so the re-entry nag stays off.
   vaultTokenUnreadable(): boolean {
+    if (envPin("vaultToken")) return false;
     return this.settings.vaultToken != null && this.vaultToken() == null;
   }
 
   vaultKvMount(): string {
-    return this.settings.vaultKvMount?.trim() || "kv";
+    return envStr("VAULT_KV_MOUNT") ?? (this.settings.vaultKvMount?.trim() || "kv");
   }
 
   vaultKvBasePath(): string {
-    return this.settings.vaultKvBasePath?.trim().replace(/^\/+|\/+$/g, "") || "support-bot";
+    const raw = envStr("VAULT_KV_BASE_PATH") ?? this.settings.vaultKvBasePath?.trim() ?? "";
+    return raw.replace(/^\/+|\/+$/g, "") || "support-bot";
   }
 
   vaultTransitMount(): string {
-    return this.settings.vaultTransitMount?.trim() || "transit";
+    return envStr("VAULT_TRANSIT_MOUNT") ?? (this.settings.vaultTransitMount?.trim() || "transit");
   }
 
   vaultTransitKey(): string {
-    return this.settings.vaultTransitKey?.trim() || "support-bot";
+    return envStr("VAULT_TRANSIT_KEY") ?? (this.settings.vaultTransitKey?.trim() || "support-bot");
   }
 
   // Storage cutover stamp: null = secrets live in Postgres columns; set = the
@@ -1322,34 +1331,37 @@ export class SettingsStore {
 
   // Worker pause switch: ON = the worker polls and owns all background work;
   // OFF = the worker is drained and background work pauses (signals park
-  // server-side; no legacy fallback exists).
+  // server-side; no legacy fallback exists). TEMPORAL_ENABLED pins it so a
+  // fresh deploy can boot with the worker already polling.
   temporalEnabled(): boolean {
-    return this.settings.temporalEnabled;
+    return envBool("TEMPORAL_ENABLED") ?? this.settings.temporalEnabled;
   }
 
-  // Connection values live in BotSettings (the deploy has no .env access);
-  // the TEMPORAL_* env vars are first-boot fallbacks only, same pattern as
-  // the INTERCOM_* getters above.
+  // Connection values live in BotSettings and are edited via /config, but a set
+  // TEMPORAL_* env var OVERRIDES the stored value — same rule as the VAULT_*
+  // getters above, and unlike the INTERCOM_* fallbacks, which /config still
+  // wins over. The mTLS material is the one exception (Vault KV stays
+  // authoritative; see certs.ts).
   temporalAddress(): string | null {
-    return this.settings.temporalAddress?.trim() || (process.env.TEMPORAL_ADDRESS ?? "").trim() || null;
+    return envStr("TEMPORAL_ADDRESS") ?? (this.settings.temporalAddress?.trim() || null);
   }
 
   temporalNamespace(): string | null {
-    return this.settings.temporalNamespace?.trim() || (process.env.TEMPORAL_NAMESPACE ?? "").trim() || null;
+    return envStr("TEMPORAL_NAMESPACE") ?? (this.settings.temporalNamespace?.trim() || null);
   }
 
   temporalTaskQueue(): string {
-    return this.settings.temporalTaskQueue?.trim() || (process.env.TEMPORAL_TASK_QUEUE ?? "").trim() || "support-bot";
+    return envStr("TEMPORAL_TASK_QUEUE") ?? (this.settings.temporalTaskQueue?.trim() || "support-bot");
   }
 
   temporalDeploymentName(): string {
-    return this.settings.temporalDeploymentName?.trim() || (process.env.TEMPORAL_DEPLOYMENT_NAME ?? "").trim() || "support-bot";
+    return envStr("TEMPORAL_DEPLOYMENT_NAME") ?? (this.settings.temporalDeploymentName?.trim() || "support-bot");
   }
 
   // TLS SNI / server-name override for dialing by IP while the server cert
   // carries a hostname. Null = let gRPC derive it from the address.
   temporalTlsServerName(): string | null {
-    return this.settings.temporalTlsServerName?.trim() || (process.env.TEMPORAL_TLS_SERVER_NAME ?? "").trim() || null;
+    return envStr("TEMPORAL_TLS_SERVER_NAME") ?? (this.settings.temporalTlsServerName?.trim() || null);
   }
 
   // Stamp of the one-time legacy-state import into workflows (open tickets,

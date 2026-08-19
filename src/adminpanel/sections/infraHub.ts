@@ -1,4 +1,5 @@
-import { ActionResult, Section, SaveResult } from "../renderer/contract";
+import { ActionResult, Badge, Section, SaveResult, StaticField } from "../renderer/contract";
+import { envPin, envPinNote, type EnvPinnedField } from "../../config/env";
 import { AdminHubContext, ActionRequest, HubModule, SaveRequest, asString } from "./types";
 
 // Infrastructure hub (config group): Vault secret storage + Temporal worker.
@@ -9,7 +10,32 @@ export interface InfraHubDeps {
   vaultMigrate: () => Promise<string>; // local → Vault (returns a report summary)
   vaultReverse: () => Promise<string>; // Vault → local
   setTemporalEnabled: (on: boolean) => Promise<void>; // worker pause switch
+  // Where the live mTLS material came from; omitted when the Temporal stack
+  // isn't wired into this process.
+  temporalTlsSource?: () => "vault" | "env-files" | null;
 }
+
+// Vault/Temporal settings can be pinned by an env var, which OVERRIDES the
+// stored value (see config/env.ts). The field stays editable — the save lands
+// in BotSettings and waits there — so the badge is what keeps the panel honest
+// about which value is actually in force.
+const pinBadge = (field: EnvPinnedField): Badge | undefined => {
+  const name = envPin(field);
+  return name ? { kind: "warn", text: `env: ${name}` } : undefined;
+};
+
+// Certs stay Vault-authoritative; the TEMPORAL_TLS_*_FILE paths only stand in
+// while KV holds no temporal entry, so the readout names whichever is live.
+const certsField = (source: "vault" | "env-files" | null): StaticField => ({
+  type: "static",
+  key: "temporalCerts",
+  label: "mTLS certs",
+  value:
+    source === "env-files"
+      ? "Loaded from the TEMPORAL_TLS_CERT_FILE / KEY_FILE / CA_FILE paths. Entering certs in Vault takes over."
+      : "Managed in Vault KV (PEM cert/key/CA).",
+  badge: source === "env-files" ? { kind: "warn", text: "env files" } : { kind: "info", text: "vault-only" },
+});
 
 export function makeInfraHub(deps: InfraHubDeps): HubModule {
   return {
@@ -23,13 +49,51 @@ export function makeInfraHub(deps: InfraHubDeps): HubModule {
         key: "vault",
         title: "Vault (secret storage)",
         fields: [
-          { type: "toggle", key: "vaultEnabled", label: "Enabled", value: s.vaultEnabled() },
-          { type: "text", key: "vaultAddr", label: "Address", value: s.vaultAddr() ?? "", placeholder: "https://vault.example.com:8200" },
-          { type: "text", key: "vaultToken", label: "Token", value: "", secret: true, secretState: s.vaultToken() ? "local" : "none", help: "Write-only. Blank = keep." },
-          { type: "text", key: "vaultKvMount", label: "KV mount", value: s.vaultKvMount() },
-          { type: "text", key: "vaultKvBasePath", label: "KV base path", value: s.vaultKvBasePath() },
-          { type: "text", key: "vaultTransitMount", label: "Transit mount", value: s.vaultTransitMount() },
-          { type: "text", key: "vaultTransitKey", label: "Transit key", value: s.vaultTransitKey() },
+          { type: "toggle", key: "vaultEnabled", label: "Enabled", value: s.vaultEnabled(), badge: pinBadge("vaultEnabled"), help: envPinNote("vaultEnabled") },
+          {
+            type: "text",
+            key: "vaultAddr",
+            label: "Address",
+            value: s.vaultAddr() ?? "",
+            placeholder: "https://vault.example.com:8200",
+            badge: pinBadge("vaultAddr"),
+            help: envPinNote("vaultAddr"),
+          },
+          {
+            type: "text",
+            key: "vaultToken",
+            label: "Token",
+            value: "",
+            secret: true,
+            secretState: s.vaultToken() ? "local" : "none",
+            badge: pinBadge("vaultToken"),
+            help: envPinNote("vaultToken") ?? "Write-only. Blank = keep.",
+          },
+          { type: "text", key: "vaultKvMount", label: "KV mount", value: s.vaultKvMount(), badge: pinBadge("vaultKvMount"), help: envPinNote("vaultKvMount") },
+          {
+            type: "text",
+            key: "vaultKvBasePath",
+            label: "KV base path",
+            value: s.vaultKvBasePath(),
+            badge: pinBadge("vaultKvBasePath"),
+            help: envPinNote("vaultKvBasePath"),
+          },
+          {
+            type: "text",
+            key: "vaultTransitMount",
+            label: "Transit mount",
+            value: s.vaultTransitMount(),
+            badge: pinBadge("vaultTransitMount"),
+            help: envPinNote("vaultTransitMount"),
+          },
+          {
+            type: "text",
+            key: "vaultTransitKey",
+            label: "Transit key",
+            value: s.vaultTransitKey(),
+            badge: pinBadge("vaultTransitKey"),
+            help: envPinNote("vaultTransitKey"),
+          },
         ],
         actions: [
           { key: "vault_reload", label: "Reload Vault client", style: "secondary" },
@@ -41,13 +105,49 @@ export function makeInfraHub(deps: InfraHubDeps): HubModule {
         key: "temporal",
         title: "Temporal (background worker)",
         fields: [
-          { type: "toggle", key: "temporalEnabled", label: "Worker enabled", value: s.temporalEnabled(), help: "Off drains the worker; background work pauses." },
-          { type: "text", key: "temporalAddress", label: "Address", value: s.temporalAddress() ?? "" },
-          { type: "text", key: "temporalNamespace", label: "Namespace", value: s.temporalNamespace() ?? "" },
-          { type: "text", key: "temporalTaskQueue", label: "Task queue", value: s.temporalTaskQueue() },
-          { type: "text", key: "temporalDeploymentName", label: "Deployment name", value: s.temporalDeploymentName() },
-          { type: "text", key: "temporalTlsServerName", label: "TLS server name (SNI)", value: s.temporalTlsServerName() ?? "", placeholder: "optional" },
-          { type: "static", key: "temporalCerts", label: "mTLS certs", value: "Managed in Vault KV (PEM cert/key/CA).", badge: { kind: "info", text: "vault-only" } },
+          {
+            type: "toggle",
+            key: "temporalEnabled",
+            label: "Worker enabled",
+            value: s.temporalEnabled(),
+            badge: pinBadge("temporalEnabled"),
+            help: envPinNote("temporalEnabled") ?? "Off drains the worker; background work pauses.",
+          },
+          { type: "text", key: "temporalAddress", label: "Address", value: s.temporalAddress() ?? "", badge: pinBadge("temporalAddress"), help: envPinNote("temporalAddress") },
+          {
+            type: "text",
+            key: "temporalNamespace",
+            label: "Namespace",
+            value: s.temporalNamespace() ?? "",
+            badge: pinBadge("temporalNamespace"),
+            help: envPinNote("temporalNamespace"),
+          },
+          {
+            type: "text",
+            key: "temporalTaskQueue",
+            label: "Task queue",
+            value: s.temporalTaskQueue(),
+            badge: pinBadge("temporalTaskQueue"),
+            help: envPinNote("temporalTaskQueue"),
+          },
+          {
+            type: "text",
+            key: "temporalDeploymentName",
+            label: "Deployment name",
+            value: s.temporalDeploymentName(),
+            badge: pinBadge("temporalDeploymentName"),
+            help: envPinNote("temporalDeploymentName"),
+          },
+          {
+            type: "text",
+            key: "temporalTlsServerName",
+            label: "TLS server name (SNI)",
+            value: s.temporalTlsServerName() ?? "",
+            placeholder: "optional",
+            badge: pinBadge("temporalTlsServerName"),
+            help: envPinNote("temporalTlsServerName"),
+          },
+          certsField(deps.temporalTlsSource?.() ?? null),
         ],
       };
       return [vault, temporal];
@@ -82,8 +182,13 @@ export function makeInfraHub(deps: InfraHubDeps): HubModule {
         case "temporalEnabled": {
           const on = v === true;
           await s.updateTemporal({ temporalEnabled: on });
-          await deps.setTemporalEnabled(on);
-          await ctx.audit(`temporal worker → ${on ? "enabled" : "paused"}`);
+          // The worker follows the EFFECTIVE value: with TEMPORAL_ENABLED
+          // pinned, the stored flip must not drain a worker the env says runs.
+          const effective = s.temporalEnabled();
+          await deps.setTemporalEnabled(effective);
+          await ctx.audit(
+            `temporal worker → ${on ? "enabled" : "paused"}${effective !== on ? ` (inert: pinned to ${effective ? "enabled" : "paused"} by TEMPORAL_ENABLED)` : ""}`
+          );
           return { ok: true };
         }
         case "temporalAddress":
