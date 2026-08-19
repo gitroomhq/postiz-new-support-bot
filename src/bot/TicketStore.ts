@@ -148,6 +148,21 @@ export class TicketStore {
     });
   }
 
+  // Best-effort identity stamp from the platform lookup. Scoped to the columns
+  // the resolver owns so it can never disturb ticket state.
+  async setPostizIdentity(
+    threadId: string,
+    stamp: {
+      postizUserId: string;
+      postizOrgId: string;
+      postizTier: string | null;
+      postizRole: string | null;
+      postizLinkedAt: Date;
+    }
+  ): Promise<void> {
+    await this.prisma.ticket.update({ where: { threadId }, data: stamp });
+  }
+
   async close(threadId: string): Promise<void> {
     // Closing is a status transition, so it also ends a /reminders off pause.
     await this.prisma.ticket.update({

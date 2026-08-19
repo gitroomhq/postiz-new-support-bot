@@ -42,6 +42,8 @@ import {
 } from "../intercom/conversationAttributeWrite";
 import { SettingsStore, isUnicodeEmoji, ReminderTarget, type GlobalSecretColumn, type SecretState } from "../config/SettingsStore";
 import type { SentryFeedbackStore } from "../sentry/SentryFeedbackStore";
+import type { PostizClient } from "../postiz/PostizClient";
+import type { PostizIdentityService } from "../postiz/PostizIdentityService";
 import { EscalationTier, StatusTag } from "../generated/prisma/client";
 import { EscalationTierStore } from "../config/EscalationTierStore";
 import { SessionStore } from "../auth/SessionStore";
@@ -161,6 +163,8 @@ export class DiscordBot {
   private slaService: {
     onTicketTrigger(threadId: string, reason: "created" | "customer_reply"): Promise<void>;
   } | null = null;
+  private postizIdentity: PostizIdentityService | null = null;
+  private postizClient: PostizClient | null = null;
   // Sentry feedback import ledger — bound late from index.ts; the /config
   // panel reads its counters.
   private sentryFeedback: SentryFeedbackStore | null = null;
@@ -241,6 +245,34 @@ export class DiscordBot {
 
   setSentryFeedbackStore(store: SentryFeedbackStore): void {
     this.sentryFeedback = store;
+  }
+
+  setPostizIdentity(service: PostizIdentityService, client: PostizClient): void {
+    this.postizIdentity = service;
+    this.postizClient = client;
+  }
+
+  // Resolves the ticket's Discord customer to a Postiz account and stamps it.
+  // Silent by design: enrichment is an enhancement, and a support ticket that
+  // opened correctly must not sprout an error because the platform was busy.
+  private async enrichTicketIdentity(threadId: string, discordUserId: string): Promise<void> {
+    const identity = this.postizIdentity;
+    if (!identity) return;
+    await identity.enrichTicket(this.ticketStore, threadId, discordUserId, (customerId) =>
+      this.stripeCustomerEmail(customerId)
+    );
+  }
+
+  // Email on a linked Stripe customer, used as the second rung of the identity
+  // ladder when the Discord user never linked their Postiz account.
+  private async stripeCustomerEmail(customerId: string): Promise<string | null> {
+    try {
+      // getCustomer already returns null for a deleted customer.
+      const customer = await this.disputes?.stripeClient.getCustomer(customerId);
+      return customer?.email ?? null;
+    } catch {
+      return null;
+    }
   }
 
   // Late-bound from index.ts: the admin web-panel graph needs bot.client (created
@@ -1248,6 +1280,12 @@ export class DiscordBot {
           "ticket.customer_id": customerId,
           "ticket.has_question": !!question,
         });
+        // Identity enrichment is deliberately not awaited into the creation
+        // path: the platform lookup is a table scan on the far side, and a slow
+        // or unreachable platform must never hold up opening a ticket. The
+        // columns stay null until it lands, which is how every ticket already
+        // reads today.
+        void this.enrichTicketIdentity(thread.id, customerId);
         metricCount("tickets.created", 1, { category: category.id });
         void this.audit.log({
           title: "🎫 Ticket opened",

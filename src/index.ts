@@ -51,6 +51,8 @@ import { IntercomPanel } from "./intercom/panel/IntercomPanel";
 import { SlaRuleStore } from "./sla/SlaRuleStore";
 import { SlaFactsLoader } from "./sla/facts";
 import { SlaService } from "./sla/SlaService";
+import { PostizClient } from "./postiz/PostizClient";
+import { PostizIdentityService } from "./postiz/PostizIdentityService";
 import { SentryFeedbackClient } from "./sentry/SentryFeedbackClient";
 import { SentryFeedbackStore } from "./sentry/SentryFeedbackStore";
 import { SentryFeedbackImporter } from "./sentry/SentryFeedbackImporter";
@@ -433,6 +435,12 @@ async function main() {
     panelSessions
   );
 
+  // Postiz platform lookup: turns a support contact into a known account.
+  // Late-bound onto the bot (setSlaService idiom) rather than threaded through
+  // the constructor.
+  const postizClient = new PostizClient(settingsStore);
+  const postizIdentity = new PostizIdentityService(postizClient, settingsStore, sessionStore);
+
   const bot = new DiscordBot(
     config,
     settingsStore,
@@ -459,6 +467,7 @@ async function main() {
   );
   // The client exists as soon as the constructor ran; nothing fires before login.
   bot.setSlaService(slaService);
+  bot.setPostizIdentity(postizIdentity, postizClient);
   bot.setSentryFeedbackStore(sentryFeedbackStore);
   auditLogger.bindClient(bot.client);
   billingActionService.bindClient(bot.client);
