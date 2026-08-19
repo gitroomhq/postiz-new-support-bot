@@ -16,6 +16,7 @@ import type { LightAiRunner } from "../../LightAiRunner";
 import type { IntercomClient } from "../../../intercom/IntercomClient";
 import type { ApprovalStore } from "../ApprovalStore";
 import type { BillingActionService } from "../actions/BillingActionService";
+import type { PostizIdentityService } from "../../../postiz/PostizIdentityService";
 
 // Shared dependency bundle handed to every hub (and the target resolver).
 export interface HubContext {
@@ -47,4 +48,7 @@ export interface HubContext {
   // Intercom canvas/panel billing-action approvals (ApprovalsHub).
   approvalStore: ApprovalStore;
   billingActions: BillingActionService;
+  // Platform account lookup. Optional: the panel works without it, just
+  // without the non-Discord resolution path.
+  postizIdentity?: PostizIdentityService;
 }

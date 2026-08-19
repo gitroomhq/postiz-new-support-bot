@@ -308,7 +308,7 @@ export class TargetResolver {
     }
     if (!target && !fingerprint) {
       await interaction.reply({
-        embeds: [makeEmbed("Enter a Stripe customer ID, an email, or a Postiz user ID.", COLORS.danger)],
+        embeds: [makeEmbed("Enter a Stripe customer ID, an email, or a Postiz user or organization ID.", COLORS.danger)],
         flags: 64,
       });
       return;
@@ -351,6 +351,22 @@ export class TargetResolver {
       const rows = await this.ctx.sessionStore.listByDiscordIds(discordIds);
       const stripeIds = [...new Set(rows.map((r) => r.stripeCustomerId).filter((v): v is string => !!v))];
       if (stripeIds.length === 0) {
+        // The bot DB only knows people who linked their Discord account. Ask
+        // the platform directly before giving up: it resolves a Postiz user id
+        // or organization id to an account, and that account's email is what
+        // finds the Stripe customer (the platform does not expose the customer
+        // id itself).
+        const viaPlatform = await this.resolveViaPlatform(target);
+        if (viaPlatform.length === 1) {
+          const token = this.ctx.sessions.newSession(interaction, { customerId: viaPlatform[0].id, originHub: origin });
+          await this.runTargetAction(interaction, token, action);
+          return;
+        }
+        if (viaPlatform.length > 1) {
+          const token = this.ctx.sessions.newSession(interaction, { pendingAction: action, originHub: origin });
+          await interaction.editReply(this.buildCustomerPickPanel(viaPlatform, token, hubBack(action, origin)));
+          return;
+        }
         await interaction.editReply(
           this.buildTargetPanel(action, `No linked Stripe customer found for Postiz user \`${target}\`.`, origin)
         );
@@ -373,6 +389,17 @@ export class TargetResolver {
         components: [selectRow(select), backRow(hubBack(action, origin))],
       });
     });
+  }
+
+  // Postiz id or org id → platform account → its email → Stripe customer.
+  // Returns [] when the lookup is off, unconfigured, ambiguous or unknown; the
+  // caller then reports the original "no linked customer" outcome.
+  private async resolveViaPlatform(target: string): Promise<Stripe.Customer[]> {
+    const identity = this.ctx.postizIdentity;
+    if (!identity) return [];
+    const account = await identity.resolve(target);
+    if (!account?.email) return [];
+    return this.ctx.stripe.findCustomersByEmail(account.email);
   }
 
   buildTargetPanel(action: TargetAction | "link", error?: string, origin?: string): Panel {
@@ -413,9 +440,9 @@ export class TargetResolver {
       .setTitle(TARGET_TITLES[action].slice(0, 45));
     modal.addComponents(
       new ActionRowBuilder<TextInputBuilder>().addComponents(
-        textInput("target", "Stripe cus_ ID, email, or Postiz user ID", {
+        textInput("target", "Stripe cus_ ID, email, or Postiz user/org ID", {
           required: action !== "fraud",
-          placeholder: "cus_… / mail@example.com / postiz id",
+          placeholder: "cus_… / mail@example.com / postiz user or org id",
         })
       )
     );

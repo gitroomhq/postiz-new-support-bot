@@ -468,6 +468,7 @@ async function main() {
   // The client exists as soon as the constructor ran; nothing fires before login.
   bot.setSlaService(slaService);
   bot.setPostizIdentity(postizIdentity, postizClient);
+  billingAdmin.setPostizIdentity(postizIdentity);
   bot.setSentryFeedbackStore(sentryFeedbackStore);
   auditLogger.bindClient(bot.client);
   billingActionService.bindClient(bot.client);

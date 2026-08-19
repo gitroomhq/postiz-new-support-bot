@@ -26,6 +26,7 @@ import { PriceBook } from "./billing/PriceBook";
 import { AdminAudit } from "./billing/AdminAudit";
 import { TargetResolver } from "./billing/TargetResolver";
 import type { HubContext } from "./billing/hubs/HubContext";
+import type { PostizIdentityService } from "../postiz/PostizIdentityService";
 import { CardsHub } from "./billing/hubs/CardsHub";
 import { CustomersHub } from "./billing/hubs/CustomersHub";
 import { ChargesHub } from "./billing/hubs/ChargesHub";
@@ -96,6 +97,7 @@ class RouteTable<I> {
 export class BillingAdmin {
   private sessions = new SessionManager();
   private priceBook: PriceBook;
+  private ctx!: HubContext;
   private audit: AdminAudit;
   private targets: TargetResolver;
   private cards: CardsHub;
@@ -144,6 +146,10 @@ export class BillingAdmin {
       approvalStore: extras.approvalStore,
       billingActions: extras.billingActions,
     };
+
+    // Held so the platform lookup can be attached later: it is constructed
+    // after this panel, and every hub shares this one object by reference.
+    this.ctx = ctx;
 
     this.targets = new TargetResolver(ctx);
     this.cards = new CardsHub(ctx);
@@ -334,6 +340,13 @@ export class BillingAdmin {
       return;
     }
     await this.replyUnknownComponent(interaction);
+  }
+
+  // Late-bound: the platform lookup is constructed after this panel. Every hub
+  // and the target resolver share the one context object, so assigning here
+  // reaches all of them at once.
+  setPostizIdentity(service: PostizIdentityService): void {
+    this.ctx.postizIdentity = service;
   }
 
   // ---- root dispatch ----
