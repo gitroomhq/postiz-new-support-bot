@@ -651,6 +651,7 @@ async function main() {
   const slaSweeper = new SlaSweeper(intercomClient, intercomStore, settingsStore, slaService);
   // Sentry feedback → Intercom import body (sentryFeedbackWorkflow's tick).
   const sentryFeedbackClient = new SentryFeedbackClient(settingsStore);
+  bot.setSentryFeedbackClient(sentryFeedbackClient);
   const sentryFeedbackImporter = new SentryFeedbackImporter(
     sentryFeedbackClient,
     intercomClient,

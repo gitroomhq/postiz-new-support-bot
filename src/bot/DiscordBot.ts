@@ -43,7 +43,9 @@ import {
 import { SettingsStore, isUnicodeEmoji, ReminderTarget, type GlobalSecretColumn, type SecretState } from "../config/SettingsStore";
 import type { SentryFeedbackStore } from "../sentry/SentryFeedbackStore";
 import type { PostizClient } from "../postiz/PostizClient";
+import type { PostizAccount } from "../postiz/PostizClient";
 import type { PostizIdentityService } from "../postiz/PostizIdentityService";
+import { IDENTITY_TAGS, type SentryFeedbackClient } from "../sentry/SentryFeedbackClient";
 import { EscalationTier, StatusTag } from "../generated/prisma/client";
 import { EscalationTierStore } from "../config/EscalationTierStore";
 import { SessionStore } from "../auth/SessionStore";
@@ -166,6 +168,7 @@ export class DiscordBot {
   } | null = null;
   private postizIdentity: PostizIdentityService | null = null;
   private postizClient: PostizClient | null = null;
+  private sentryFeedbackClient: SentryFeedbackClient | null = null;
   // Sentry feedback import ledger — bound late from index.ts; the /config
   // panel reads its counters.
   private sentryFeedback: SentryFeedbackStore | null = null;
@@ -251,6 +254,11 @@ export class DiscordBot {
   setPostizIdentity(service: PostizIdentityService, client: PostizClient): void {
     this.postizIdentity = service;
     this.postizClient = client;
+  }
+
+  // Read-only Sentry access for the per-account error list.
+  setSentryFeedbackClient(client: SentryFeedbackClient): void {
+    this.sentryFeedbackClient = client;
   }
 
   // Resolves the ticket's Discord customer to a Postiz account and stamps it.
@@ -751,6 +759,162 @@ export class DiscordBot {
       await this.intercomAdmin?.handleCommand(interaction);
     } else if (interaction.commandName === "debug-attribute") {
       await this.handleDebugAttributeCommand(interaction);
+    } else if (interaction.commandName === "postiz") {
+      await this.handlePostizCommand(interaction);
+    }
+  }
+
+  // ---- /postiz: account lookup + that account's recent Sentry errors ----
+  //
+  // Admin-only: a lookup exposes a customer's email, organization and plan,
+  // and the error list exposes what they hit in the product. Assume the
+  // invoker is hostile, so registration alone is not the gate.
+  private async handlePostizCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+    if (!this.isAdmin(interaction)) {
+      await interaction.reply({
+        embeds: [makeEmbed("Administrator permission is required for /postiz.", COLORS.danger)],
+        flags: 64,
+      });
+      return;
+    }
+    const identity = this.postizIdentity;
+    if (!identity) {
+      await interaction.reply({
+        embeds: [makeEmbed("The Postiz lookup is not available on this instance.", COLORS.warn)],
+        flags: 64,
+      });
+      return;
+    }
+
+    await interaction.deferReply({ flags: 64 });
+    const query = (interaction.options.getString("query", true) ?? "").trim();
+
+    let result;
+    try {
+      result = await identity.search(query);
+    } catch (e) {
+      // A refused query is operator input, so it is reported verbatim rather
+      // than logged as a failure.
+      await interaction.editReply({
+        embeds: [makeEmbed(e instanceof Error ? e.message : String(e), COLORS.warn)],
+      });
+      return;
+    }
+    if (!result) {
+      await interaction.editReply({
+        embeds: [makeEmbed("The Postiz lookup is off or not configured. Set it up in /config → Integrations.", COLORS.warn)],
+      });
+      return;
+    }
+    if (result.accounts.length === 0) {
+      await interaction.editReply({ embeds: [makeEmbed(`No Postiz account matches \`${query}\`.`, COLORS.neutral)] });
+      return;
+    }
+
+    if (interaction.options.getSubcommand() === "errors") {
+      await this.replyPostizErrors(interaction, result.accounts[0], result.accounts.length);
+      return;
+    }
+    await this.replyPostizLookup(interaction, result, query);
+  }
+
+  private async replyPostizLookup(
+    interaction: ChatInputCommandInteraction,
+    result: { accounts: PostizAccount[]; capped: boolean; matched: number },
+    query: string
+  ): Promise<void> {
+    // The platform's endpoint has no limit of its own, so the client caps the
+    // list; say so rather than presenting a truncated list as complete.
+    const shown = result.accounts.slice(0, 10);
+    const lines = shown.map((a) => {
+      const org = a.orgName ? `${a.orgName} (\`${a.orgId}\`)` : `\`${a.orgId}\``;
+      return [
+        `**${a.email ?? a.name ?? a.userId}**`,
+        `user \`${a.userId}\` · ${a.role ?? "role unknown"}`,
+        `org ${org} · plan ${a.tier ?? "none"}`,
+      ].join("\n");
+    });
+    const more =
+      result.matched > shown.length
+        ? `\n\nShowing ${shown.length} of ${result.matched}${result.capped ? "+" : ""} matches. Narrow the search to see the rest.`
+        : "";
+    await interaction.editReply({
+      embeds: [makeEmbed(`**Postiz accounts matching \`${query}\`**\n\n${lines.join("\n\n")}${more}`, COLORS.brand)],
+    });
+  }
+
+  private async replyPostizErrors(
+    interaction: ChatInputCommandInteraction,
+    account: PostizAccount,
+    matchCount: number
+  ): Promise<void> {
+    if (matchCount > 1) {
+      await interaction.editReply({
+        embeds: [
+          makeEmbed(
+            `That search matches ${matchCount} accounts. Narrow it to one before asking for errors.`,
+            COLORS.warn
+          ),
+        ],
+      });
+      return;
+    }
+    const sentry = this.sentryFeedbackClient;
+    if (!sentry || !this.settingsStore.sentryOrgSlug() || !this.settingsStore.sentryReadToken()) {
+      await interaction.editReply({
+        embeds: [makeEmbed("Sentry reads are not configured, so errors cannot be listed.", COLORS.warn)],
+      });
+      return;
+    }
+
+    const days = Math.min(Math.max(interaction.options.getInteger("days") ?? 7, 1), 30);
+    const until = new Date();
+    const since = new Date(until.getTime() - days * 24 * 60 * 60 * 1000);
+
+    try {
+      // The organization tag catches everyone in the org, which is usually
+      // what a support question is really about; the user tag narrows it when
+      // only that person is affected.
+      const issues = await sentry.searchIssuesByIdentity({
+        key: IDENTITY_TAGS.orgId,
+        value: account.orgId,
+        sinceIso: since.toISOString(),
+        untilIso: until.toISOString(),
+        limit: 10,
+      });
+      if (issues.length === 0) {
+        await interaction.editReply({
+          embeds: [
+            makeEmbed(
+              `No Sentry issues for organization \`${account.orgId}\` in the last ${days} day(s).`,
+              COLORS.neutral
+            ),
+          ],
+        });
+        return;
+      }
+      const lines = issues.slice(0, 10).map((i) => {
+        const title = (i.title ?? "untitled").slice(0, 120);
+        const when = `<t:${Math.floor(new Date(i.firstSeen).getTime() / 1000)}:R>`;
+        const link = i.permalink ? `[${i.shortId ?? "open"}](${i.permalink})` : (i.shortId ?? "");
+        return `• ${title}\n  ${link} · first seen ${when}`;
+      });
+      await interaction.editReply({
+        embeds: [
+          makeEmbed(
+            `**Recent Sentry issues · ${account.email ?? account.userId}**\norg \`${account.orgId}\` · last ${days} day(s)\n\n${lines.join("\n")}`,
+            COLORS.brand
+          ),
+        ],
+      });
+    } catch (e) {
+      log.child("postiz").warn("postiz errors lookup failed", {
+        "postiz.org_id": account.orgId,
+        "error.message": e instanceof Error ? e.message : String(e),
+      });
+      await interaction.editReply({
+        embeds: [makeEmbed("Sentry did not answer. Try again in a moment.", COLORS.danger)],
+      });
     }
   }
 
@@ -5792,6 +5956,44 @@ export class DiscordBot {
             name: "opened_before",
             description: "Only tickets opened on/before this date (YYYY-MM-DD)",
             required: false,
+          },
+        ],
+      },
+      {
+        name: "postiz",
+        description: "Look up a Postiz account, or its recent errors (admin only)",
+        options: [
+          {
+            type: 1, // SUB_COMMAND
+            name: "lookup",
+            description: "Find a Postiz account by user ID, organization ID, email or name",
+            options: [
+              {
+                type: 3, // STRING
+                name: "query",
+                description: "User ID, organization ID, email address or name",
+                required: true,
+              },
+            ],
+          },
+          {
+            type: 1, // SUB_COMMAND
+            name: "errors",
+            description: "Recent Sentry errors for a Postiz account",
+            options: [
+              {
+                type: 3, // STRING
+                name: "query",
+                description: "User ID, organization ID, email address or name",
+                required: true,
+              },
+              {
+                type: 4, // INTEGER
+                name: "days",
+                description: "How far back to look (default 7, max 30)",
+                required: false,
+              },
+            ],
           },
         ],
       },
