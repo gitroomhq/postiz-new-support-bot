@@ -12,6 +12,7 @@ import {
   postizSyncStatus,
   postizUniqueId,
 } from "../postizPlan";
+import type { PostizDriftService } from "../../../postiz/PostizDriftService";
 
 // Single source of truth for every canvas/panel billing action: the panel UI,
 // the canvas card, the /config levels panel and the approval executor all
@@ -52,6 +53,10 @@ export interface ActionExecCtx {
   // Idempotency scope: the approval id (queued path) or a per-request nonce
   // (direct path) — folded into Stripe idempotency keys.
   idemScope: string;
+  // Platform-side plan comparison. Absent when the Postiz lookup is not
+  // configured, which makes the platform resync action refuse rather than
+  // guess.
+  postizDrift?: PostizDriftService;
 }
 
 export type ActionParse<P> = { ok: true; params: P } | { ok: false; error: string };
@@ -868,6 +873,74 @@ const subscriptionRepairSync = defineAction<SubscriptionRepairSyncParams>({
   },
 });
 
+interface SubscriptionResyncPlatformParams {
+  subscriptionId: string;
+}
+
+// Forces the platform to re-read a subscription whose Stripe metadata is
+// already correct but whose tier never landed on the organization.
+//
+// Distinct from subscription.repair_sync, which REFUSES once the metadata
+// agrees with the price — from Stripe's side alone that case looks perfectly
+// healthy. Only the platform's own record of the organization's tier reveals
+// the disagreement, so this action is gated on a live drift check rather than
+// on anything visible in Stripe.
+//
+// The re-stamp writes a changing marker alongside the canonical contract:
+// Stripe emits customer.subscription.updated only when something actually
+// changed, so an identical write would be a silent no-op.
+const subscriptionResyncPlatform = defineAction<SubscriptionResyncPlatformParams>({
+  key: "subscription.resync_platform",
+  label: "Force platform re-sync (plan drift)",
+  group: "Subscriptions",
+  defaultLevel: "none",
+  dangerous: true,
+  parseParams: (raw) => {
+    const o = obj(raw);
+    const subscriptionId = o ? idWithPrefix(o.subscriptionId, "sub_") : null;
+    if (!subscriptionId) return { ok: false, error: "subscriptionId (sub_…) required" };
+    return { ok: true, params: { subscriptionId } };
+  },
+  summarize: (p) => `Force the platform to re-read ${p.subscriptionId} (fixes a tier that never applied)`,
+  revalidate: async (ctx, p) => {
+    const cus = requireCustomer(ctx);
+    if (!cus) return "No linked Stripe customer.";
+    if (!ctx.postizDrift) return "The Postiz platform lookup is not configured, so drift cannot be confirmed.";
+    const sub = await ctx.stripe.getSubscription(p.subscriptionId);
+    if (customerIdOf(sub) !== cus) return "Subscription does not belong to this customer.";
+    const customer = await ctx.stripe.getCustomer(cus);
+    if (!customer) return "Stripe customer is not readable.";
+
+    // Re-confirmed immediately before executing: this writes to live billing
+    // on the strength of an identity match, so a stale verdict is not enough.
+    const report = await ctx.postizDrift.check(sub, customer);
+    if (report.verdict === "in_sync") return "Platform and Stripe already agree; nothing to re-sync.";
+    if (report.verdict === "stripe_unsynced") {
+      return "The Stripe metadata itself is wrong. Use Repair Postiz sync metadata instead.";
+    }
+    if (report.verdict === "unknown") return `Drift could not be confirmed: ${report.detail}`;
+    return null;
+  },
+  execute: async (ctx, p) => {
+    const sub = await ctx.stripe.getSubscription(p.subscriptionId);
+    const price = sub.items.data[0]?.price;
+    const plan = price ? derivePostizPlan(price) : null;
+    if (!plan) return { ok: false, error: "Price is not a canonical Postiz price; tier cannot be derived." };
+    // The existing uniqueId is preserved: the platform stores it as the
+    // subscription identifier, so a new one would orphan its record.
+    const uniqueId = sub.metadata?.uniqueId || postizUniqueId(ctx.idemScope);
+    await ctx.stripe.updateSubscriptionMetadata(
+      p.subscriptionId,
+      { ...buildPostizMetadata(plan, uniqueId), resyncedAt: String(Math.floor(Date.now() / 1000)) },
+      `panel-subresync-${p.subscriptionId}-${ctx.idemScope}`
+    );
+    return {
+      ok: true,
+      text: `Re-stamped ${p.subscriptionId} as ${plan.tier} ${plan.period}. The platform re-syncs the organization on the update event; re-check the drift badge in a moment.`,
+    };
+  },
+});
+
 interface SubscriptionItemsParams {
   subscriptionId: string;
   op: "add" | "remove";
@@ -1653,6 +1726,7 @@ export const BILLING_ACTIONS: BillingActionDef[] = [
   subscriptionTerms,
   subscriptionCreate,
   subscriptionRepairSync,
+  subscriptionResyncPlatform,
   subscriptionItems,
   subscriptionSchedule,
   invoiceCollect,

@@ -4,6 +4,7 @@ import { StripeClient } from "../../StripeClient";
 import { SessionStore } from "../../../auth/SessionStore";
 import { SettingsStore } from "../../../config/SettingsStore";
 import { AuditLogger } from "../../AuditLogger";
+import type { PostizDriftService } from "../../../postiz/PostizDriftService";
 import { TicketStore } from "../../TicketStore";
 import { IntercomStore } from "../../../intercom/IntercomStore";
 import type { IntercomEventExecutor } from "../../../intercom/IntercomEventExecutor";
@@ -58,6 +59,8 @@ export class BillingActionService {
   // conversation:action shape (SessionManager.runExclusive analogue).
   private inFlight = new Set<string>();
 
+  private postizDrift?: PostizDriftService;
+
   constructor(
     private approvalStore: ApprovalStore,
     private settingsStore: SettingsStore,
@@ -73,6 +76,13 @@ export class BillingActionService {
 
   bindClient(client: Client): void {
     this.client = client;
+  }
+
+  // Late-bound like bindClient: the drift service depends on the platform
+  // lookup, which is constructed after this service. Absent until then, which
+  // makes the platform resync action refuse rather than guess.
+  bindPostizDrift(drift: PostizDriftService): void {
+    this.postizDrift = drift;
   }
 
   // Resolves how THIS actor may run THIS action right now.
@@ -314,6 +324,7 @@ export class BillingActionService {
       discordCustomerId,
       actor,
       idemScope,
+      postizDrift: this.postizDrift,
     };
   }
 
@@ -330,6 +341,7 @@ export class BillingActionService {
       discordCustomerId: binding.discordCustomerId,
       actor,
       idemScope,
+      postizDrift: this.postizDrift,
     };
   }
 

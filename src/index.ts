@@ -54,6 +54,7 @@ import { SlaService } from "./sla/SlaService";
 import { PostizClient } from "./postiz/PostizClient";
 import { PostizIdentityService } from "./postiz/PostizIdentityService";
 import { PostizOrgLinkStore } from "./postiz/PostizOrgLinkStore";
+import { PostizDriftService } from "./postiz/PostizDriftService";
 import { SentryFeedbackClient } from "./sentry/SentryFeedbackClient";
 import { SentryFeedbackStore } from "./sentry/SentryFeedbackStore";
 import { SentryFeedbackImporter } from "./sentry/SentryFeedbackImporter";
@@ -471,6 +472,7 @@ async function main() {
   bot.setSlaService(slaService);
   bot.setPostizIdentity(postizIdentity, postizClient);
   billingAdmin.setPostizIdentity(postizIdentity);
+  billingActionService.bindPostizDrift(new PostizDriftService(postizIdentity, postizOrgLinks));
   bot.setSentryFeedbackStore(sentryFeedbackStore);
   auditLogger.bindClient(bot.client);
   billingActionService.bindClient(bot.client);
