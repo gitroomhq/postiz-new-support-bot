@@ -47,6 +47,7 @@ const context = (email: string | null, message = "hello"): SentryFeedbackContext
   contactEmail: email,
   name: "Someone",
   message,
+  identity: { userId: null, email, orgId: null, stripeCustomerId: null },
   url: "https://app.example.com/page",
 });
 

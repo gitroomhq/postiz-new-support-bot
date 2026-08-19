@@ -29,6 +29,57 @@ export interface SentryFeedbackContext {
   name: string | null;
   message: string | null;
   url: string | null;
+  // Acting identity carried by the platform on every authenticated request.
+  identity: SentryIdentity;
+}
+
+// The platform attaches the acting identity to its events, but the SHAPE
+// differs by release: older builds call Sentry.setUser (so id/email arrive in
+// the event's `user` block) while newer ones carry the same values as indexed
+// tags because the user context is display-only and not searchable. Both are in
+// flight, so every read tries tags first and falls back to the user block.
+export interface SentryIdentity {
+  userId: string | null;
+  email: string | null;
+  orgId: string | null;
+  stripeCustomerId: string | null;
+}
+
+// Tag keys the platform sets. `organization` duplicates `organization.id` on
+// newer builds; only the explicit one is read.
+export const IDENTITY_TAGS = {
+  userId: "user.id",
+  email: "user.email",
+  orgId: "organization.id",
+  stripeCustomerId: "stripe.customer_id",
+} as const;
+
+export type IdentityTagKey = (typeof IDENTITY_TAGS)[keyof typeof IDENTITY_TAGS];
+
+// Sentry returns event tags as [{key, value}]; be tolerant of a plain object
+// too, since the shape varies across endpoints.
+type RawTags = Array<{ key?: string; value?: string }> | Record<string, string> | undefined;
+
+export function readTag(tags: RawTags, key: string): string | null {
+  if (!tags) return null;
+  if (Array.isArray(tags)) {
+    const hit = tags.find((t) => t?.key === key);
+    return hit?.value?.trim() || null;
+  }
+  return tags[key]?.trim() || null;
+}
+
+export function extractIdentity(
+  tags: RawTags,
+  user?: { id?: string | number; email?: string } | null
+): SentryIdentity {
+  return {
+    userId: readTag(tags, IDENTITY_TAGS.userId) ?? (user?.id != null ? String(user.id) : null),
+    email: readTag(tags, IDENTITY_TAGS.email) ?? (user?.email?.trim() || null),
+    orgId: readTag(tags, IDENTITY_TAGS.orgId),
+    // Only ever set by the backend, and only for a real `cus_` customer.
+    stripeCustomerId: readTag(tags, IDENTITY_TAGS.stripeCustomerId),
+  };
 }
 
 // Read-only client for Sentry's org API — User Feedback widget submissions
@@ -110,19 +161,88 @@ export class SentryFeedbackClient {
 
   // The feedback content (submitter email/name/message/page URL) lives in the
   // latest event's contexts.feedback.
+  //
+  // The widget's own email field is hidden on the platform side, which means
+  // contact_email is only populated when the SDK had a scope user to fill it
+  // from. On builds that carry the identity as tags instead there is no scope
+  // user, so contact_email arrives EMPTY and the identity tags are the only way
+  // to know who submitted. Hence the three-way resolution below: without it a
+  // whole release's feedback imports as anonymous and is dropped.
   async getFeedbackContext(issueId: string): Promise<SentryFeedbackContext> {
     const { data } = await this.request<{
       contexts?: { feedback?: { contact_email?: string; name?: string; message?: string; url?: string } };
+      tags?: RawTags;
+      user?: { id?: string | number; email?: string } | null;
     }>(
       `/api/0/organizations/${encodeURIComponent(this.orgSlug())}/issues/${encodeURIComponent(issueId)}/events/latest/`,
       "feedback event"
     );
     const fb = data.contexts?.feedback ?? {};
+    const identity = extractIdentity(data.tags, data.user);
     return {
-      contactEmail: fb.contact_email?.trim() || null,
+      contactEmail: fb.contact_email?.trim() || identity.email,
       name: fb.name?.trim() || null,
       message: fb.message ?? null,
       url: fb.url?.trim() || null,
+      identity,
     };
+  }
+
+  // Issues carrying a given identity, newest first. Used to show a ticket's
+  // customer their own recent errors. The `tags[...]` form matches the tag
+  // shape; the bare `user.id:` / `user.email:` form is Sentry's own syntax for
+  // the user context, so both are issued for the identity keys that can arrive
+  // either way.
+  async searchIssuesByIdentity(input: {
+    key: IdentityTagKey;
+    value: string;
+    sinceIso: string;
+    untilIso: string;
+    limit?: number;
+  }): Promise<SentryFeedbackIssue[]> {
+    const quoted = `"${input.value.replace(/"/g, '\\"')}"`;
+    const clauses = [`tags[${input.key}]:${quoted}`];
+    if (input.key === IDENTITY_TAGS.userId || input.key === IDENTITY_TAGS.email) {
+      clauses.push(`${input.key}:${quoted}`);
+    }
+
+    const seen = new Set<string>();
+    const out: SentryFeedbackIssue[] = [];
+    for (const clause of clauses) {
+      const params = new URLSearchParams({
+        // Feedback submissions are imported separately; this is for errors.
+        query: `!issue.category:feedback ${clause}`,
+        start: input.sinceIso,
+        end: input.untilIso,
+        utc: "true",
+        sort: "date",
+        limit: String(input.limit ?? 25),
+      });
+      const { data } = await this.request<
+        Array<{
+          id?: string | number;
+          shortId?: string;
+          title?: string;
+          firstSeen?: string;
+          permalink?: string;
+          project?: { slug?: string };
+        }>
+      >(`/api/0/organizations/${encodeURIComponent(this.orgSlug())}/issues/?${params.toString()}`, "identity issue search");
+      for (const i of Array.isArray(data) ? data : []) {
+        if (i.id == null || typeof i.firstSeen !== "string") continue;
+        const id = String(i.id);
+        if (seen.has(id)) continue;
+        seen.add(id);
+        out.push({
+          id,
+          shortId: i.shortId ?? null,
+          title: i.title ?? null,
+          firstSeen: i.firstSeen,
+          permalink: i.permalink ?? null,
+          projectSlug: i.project?.slug ?? null,
+        });
+      }
+    }
+    return out;
   }
 }
