@@ -1884,6 +1884,13 @@ export class DiscordBot {
                 ? `${sentryActive() ? "on" : "configured ⚠️ restart pending"} · traces ${s.sentryTracesSampleRate()} · logs ${s.sentryLogsEnabled() ? "on" : "off"}`
                 : "off"
             }`,
+            `Postiz lookup: ${
+              s.postizLookupEnabled()
+                ? s.postizConfigured()
+                  ? "on"
+                  : "enabled ⚠️ incomplete config"
+                : "off"
+            }`,
           ].join("\n"),
           inline: false,
         },

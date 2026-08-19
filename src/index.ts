@@ -521,6 +521,13 @@ async function main() {
     makeWorkflowHub({ tiers: tierStore }),
     makeIntegrationsHub({
       listIntercomAdmins,
+      testPostiz: async () => {
+        // The three gates fail with indistinguishable-looking errors, so the
+        // probe names which one rejected us.
+        const r = await postizClient.selfTest();
+        postizClient.clearCache();
+        return r.detail;
+      },
       reconfigureSentry: async () => {
         const r = await reconfigureSentry(settingsStore.sentryConfig());
         switch (r.status) {

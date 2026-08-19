@@ -1,14 +1,27 @@
-import { Opt, Section } from "../renderer/contract";
+import { Badge, Opt, Section } from "../renderer/contract";
 import { ActionResult, SaveResult } from "../renderer/contract";
+import { envPin, envPinNote } from "../../config/env";
 import { AdminHubContext, ActionRequest, HubModule, SaveRequest, asBoundedFloat, asString, oneOf } from "./types";
 
 // Integrations hub (config group): the Intercom CONNECTION (bridge/SLA/automation
-// live in the /intercom hubs) + Sentry. Mirrors /config → Integrations.
+// live in the /intercom hubs) + Sentry + the Postiz platform lookup. Mirrors
+// /config → Integrations.
 
 export interface IntegrationsHubDeps {
   listIntercomAdmins: () => Promise<Array<{ id: string; name: string }>>;
   reconfigureSentry: () => Promise<string>;
+  // Probes the platform search endpoint and reports which of its gates
+  // (key valid / org has a superadmin / org has a subscription) let us through.
+  testPostiz: () => Promise<string>;
 }
+
+// POSTIZ_ADMIN_TOKEN overrides the stored key (see config/env.ts). The field
+// stays editable so the value is ready the moment the variable is removed; the
+// badge is what keeps the panel honest about which one is actually in force.
+const postizKeyBadge = (): Badge | undefined => {
+  const name = envPin("postizApiKey");
+  return name ? { kind: "warn", text: `env: ${name}` } : undefined;
+};
 
 const REGIONS = ["us", "eu", "au"] as const;
 
@@ -79,7 +92,40 @@ export function makeIntegrationsHub(deps: IntegrationsHubDeps): HubModule {
         ],
         actions: [{ key: "sentry_test", label: "Reload & test Sentry", style: "secondary" }],
       };
-      return [intercom, sentry];
+      const postiz: Section = {
+        key: "postiz",
+        title: "Postiz platform lookup",
+        description:
+          "Resolves a support contact to a Postiz account (user, organization and plan). The API key's organization must contain a superadmin user and hold a subscription.",
+        fields: [
+          {
+            type: "toggle",
+            key: "postizLookupEnabled",
+            label: "Enabled",
+            value: s.postizLookupEnabled(),
+            help: "Off means no lookups run and tickets keep null identity columns.",
+          },
+          {
+            type: "text",
+            key: "postizBaseUrl",
+            label: "Backend base URL",
+            value: s.postizBaseUrl() ?? "",
+            help: "Origin the /public/v1 routes hang off, for example https://api.postiz.com. Point at the backend, not the frontend.",
+          },
+          {
+            type: "text",
+            key: "postizApiKey",
+            label: "API key",
+            value: "",
+            secret: true,
+            secretState: s.secretState("postizApiKey"),
+            badge: postizKeyBadge(),
+            help: envPinNote("postizApiKey") ?? "Write-only. Blank = keep; type 'none' to clear.",
+          },
+        ],
+        actions: [{ key: "postiz_test", label: "Test connection", style: "secondary" }],
+      };
+      return [intercom, sentry, postiz];
     },
 
     async save(ctx: AdminHubContext, req: SaveRequest): Promise<SaveResult> {
@@ -133,6 +179,29 @@ export function makeIntegrationsHub(deps: IntegrationsHubDeps): HubModule {
           await s.updateSentry({ [req.field]: v === true });
           await ctx.audit(`set ${req.field} → ${v === true}`);
           return { ok: true };
+        case "postizLookupEnabled":
+          await s.updatePostiz({ postizLookupEnabled: v === true });
+          await ctx.audit(`set postiz lookup → ${v === true ? "on" : "off"}`);
+          return { ok: true };
+        case "postizBaseUrl": {
+          const raw = asString(v);
+          const url = raw === "none" ? null : raw || null;
+          if (url && !/^https?:\/\//i.test(url)) {
+            return { ok: false, fieldErrors: { postizBaseUrl: "Enter a full http(s) URL." } };
+          }
+          await s.updatePostiz({ postizBaseUrl: url });
+          // The URL is not a secret, but the key it is used with is, so the
+          // audit line records the change without echoing either.
+          await ctx.audit(`set postiz base url → ${url ?? "none"}`);
+          return { ok: true };
+        }
+        case "postizApiKey": {
+          const val = asString(v);
+          if (!val) return { ok: true }; // blank = keep
+          await s.updatePostiz({ postizApiKey: val === "none" ? null : val });
+          await ctx.audit(val === "none" ? "cleared postiz api key" : "updated postiz api key");
+          return { ok: true };
+        }
         default:
           return { ok: false, error: "Unknown field." };
       }
@@ -142,6 +211,9 @@ export function makeIntegrationsHub(deps: IntegrationsHubDeps): HubModule {
       if (req.key === "sentry_test") {
         const msg = await deps.reconfigureSentry();
         return { ok: true, text: msg };
+      }
+      if (req.key === "postiz_test") {
+        return { ok: true, text: await deps.testPostiz() };
       }
       return { ok: false, error: "Unknown action." };
     },
