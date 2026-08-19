@@ -200,3 +200,56 @@ test("trace records reasons for the preview UI", () => {
   assert.equal(res.trace[0].conditions[0].pass, true);
   assert.ok(res.trace[0].conditions[0].reason.length > 0);
 });
+
+// ---- postiz.* -------------------------------------------------------------
+// The account is resolved once at ticket creation and stored on the ticket row,
+// so these dimensions cost nothing to evaluate and behave like stripe.*:
+// `linked` is always answerable, everything else is false without data.
+
+const matches = (cond: SlaCondition, facts: SlaFacts): boolean =>
+  evaluateRules([rule([cond], { position: 1 })], facts).winner != null;
+
+test("postiz.linked answers both ways once an account was resolved", () => {
+  const linked: SlaFacts = { ...bridgedFacts, postiz: { linked: true, tier: "PRO", role: "ADMIN" } };
+  assert.equal(matches({ dim: "postiz.linked", op: "eq", value: true }, linked), true);
+
+  const unlinked: SlaFacts = { ...bridgedFacts, postiz: { linked: false } };
+  assert.equal(matches({ dim: "postiz.linked", op: "eq", value: false }, unlinked), true);
+  assert.equal(matches({ dim: "postiz.linked", op: "eq", value: true }, unlinked), false);
+});
+
+test("postiz dimensions are all false for a subject carrying no postiz facts", () => {
+  assert.equal(matches({ dim: "postiz.linked", op: "eq", value: true }, bridgedFacts), false);
+  assert.equal(matches({ dim: "postiz.tier", op: "eq", value: "PRO" }, bridgedFacts), false);
+});
+
+test("postiz.tier compares case-insensitively and supports a regex", () => {
+  const facts: SlaFacts = { ...bridgedFacts, postiz: { linked: true, tier: "PRO" } };
+  assert.equal(matches({ dim: "postiz.tier", op: "eq", value: "pro" }, facts), true);
+  assert.equal(matches({ dim: "postiz.tier", op: "neq", value: "TEAM" }, facts), true);
+  assert.equal(matches({ dim: "postiz.tier", op: "matches", value: "^(pro|ultimate)$" }, facts), true);
+  assert.equal(matches({ dim: "postiz.tier", op: "matches", value: "^team$" }, facts), false);
+});
+
+test("postiz.role compares case-insensitively", () => {
+  const facts: SlaFacts = { ...bridgedFacts, postiz: { linked: true, role: "SUPERADMIN" } };
+  assert.equal(matches({ dim: "postiz.role", op: "eq", value: "superadmin" }, facts), true);
+  assert.equal(matches({ dim: "postiz.role", op: "eq", value: "USER" }, facts), false);
+});
+
+test("an unavailable lookup fails every postiz dimension except linked", () => {
+  // A native conversation has no ticket row to carry a resolved account, so
+  // the identity is unknown. `linked=false` must stay answerable so authors
+  // can gate on it, exactly as they do for stripe.
+  const facts: SlaFacts = { ...nativeFacts, postiz: { linked: false, unavailable: true, tier: "PRO" } };
+  assert.equal(matches({ dim: "postiz.linked", op: "eq", value: false }, facts), true);
+  assert.equal(matches({ dim: "postiz.tier", op: "eq", value: "PRO" }, facts), false);
+});
+
+test("a free organization has no tier, which is not an unavailable lookup", () => {
+  const facts: SlaFacts = { ...bridgedFacts, postiz: { linked: true, tier: null, role: "USER" } };
+  assert.equal(matches({ dim: "postiz.linked", op: "eq", value: true }, facts), true);
+  assert.equal(matches({ dim: "postiz.tier", op: "eq", value: "PRO" }, facts), false);
+  // The role is still known, so it evaluates normally.
+  assert.equal(matches({ dim: "postiz.role", op: "eq", value: "USER" }, facts), true);
+});

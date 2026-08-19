@@ -40,6 +40,7 @@ export type SlaTriggerReason = "created" | "status" | "customer_reply" | "refund
 const ALL_DIMS: SlaDim[] = [
   "category", "status", "open", "exempt", "mirrored",
   "stripe.linked", "stripe.paying", "stripe.dispute", "stripe.refund_review", "stripe.plan", "stripe.spend",
+  "postiz.linked", "postiz.tier", "postiz.role",
   "intercom.team", "intercom.kind", "intercom.ticket_type", "intercom.tag", "intercom.assignee",
   "intercom.attribute", "keyword",
 ];

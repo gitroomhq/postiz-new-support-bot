@@ -71,6 +71,21 @@ export const FIELD_DESCRIPTORS: FieldDescriptor[] = [
     ops: [...EQ_NEQ, { op: "matches", label: "matches regex" }],
     hint: "price id, nickname or lookup key; ~ accepts a case-insensitive regex",
   },
+  { key: "postiz.linked", label: "Postiz account linked", kind: "boolean", ops: [{ op: "eq", label: "is" }] },
+  {
+    key: "postiz.tier",
+    label: "Postiz plan tier",
+    kind: "text",
+    ops: [...EQ_NEQ, { op: "matches", label: "matches regex" }],
+    hint: "STANDARD, TEAM, PRO or ULTIMATE as the platform reports it; ~ accepts a case-insensitive regex",
+  },
+  {
+    key: "postiz.role",
+    label: "Role in the Postiz organization",
+    kind: "text",
+    ops: [...EQ_NEQ],
+    hint: "USER, ADMIN or SUPERADMIN",
+  },
   {
     key: "stripe.spend",
     label: "Lifetime spend (major units)",
@@ -175,6 +190,12 @@ export function conditionFor(key: string, op: string, value: string): SlaConditi
       return { dim: key, op: "eq", value: value === "true" } as SlaCondition;
     case "stripe.plan":
       return { dim: "stripe.plan", op: op as "eq" | "neq" | "matches", value };
+    case "postiz.linked":
+      return { dim: "postiz.linked", op: "eq", value: value === "true" };
+    case "postiz.tier":
+      return { dim: "postiz.tier", op: op as "eq" | "neq" | "matches", value };
+    case "postiz.role":
+      return { dim: "postiz.role", op: op as "eq" | "neq", value };
     case "stripe.spend": {
       const n = Number(value);
       if (!Number.isFinite(n)) throw new Error(`stripe.spend needs a number, got "${value}"`);

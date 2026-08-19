@@ -35,6 +35,12 @@ const zCondition = z.discriminatedUnion("dim", [
   z.object({ dim: z.literal("stripe.refund_review"), op: z.literal("eq"), value: z.boolean() }),
   z.object({ dim: z.literal("stripe.plan"), op: z.enum(["eq", "neq", "matches"]), value: z.string().min(1) }),
   z.object({ dim: z.literal("stripe.spend"), op: z.enum(["gt", "gte", "lt", "lte"]), value: z.number().finite() }),
+  // Postiz platform account (bridged tickets whose customer resolved). Same
+  // shape as the stripe.* block: `linked` is always computable, everything
+  // else is false when the account is unknown or the lookup was unavailable.
+  z.object({ dim: z.literal("postiz.linked"), op: z.literal("eq"), value: z.boolean() }),
+  z.object({ dim: z.literal("postiz.tier"), op: z.enum(["eq", "neq", "matches"]), value: z.string().min(1) }),
+  z.object({ dim: z.literal("postiz.role"), op: eqNeq, value: z.string().min(1) }),
   // Intercom-side (bridged + native).
   z.object({ dim: z.literal("intercom.team"), op: eqNeq, value: z.string().min(1) }),
   z.object({ dim: z.literal("intercom.kind"), op: z.literal("eq"), value: z.enum(["conversation", "ticket"]) }),
@@ -86,6 +92,18 @@ export const slaConditionsSchema = z.array(slaConditionSchema).min(1);
 
 // ---- facts ----------------------------------------------------------------
 
+export interface SlaPostizFacts {
+  linked: boolean;
+  // Set only when a lookup ran; `unavailable` marks a disabled, refused or
+  // failed lookup — every postiz.* condition except `linked` then evaluates
+  // false, mirroring the stripe.* convention.
+  unavailable?: boolean;
+  tier?: string | null;
+  role?: string | null;
+  orgId?: string | null;
+  userId?: string | null;
+}
+
 export interface SlaStripeFacts {
   linked: boolean;
   // Set only when a Stripe fetch ran; `unavailable` marks a timed-out/errored
@@ -117,6 +135,7 @@ export interface SlaFacts {
   exempt?: boolean;
   mirrored?: boolean;
   stripe?: SlaStripeFacts;
+  postiz?: SlaPostizFacts;
   intercom?: SlaIntercomFacts;
   text?: string; // Ticket.question (bridged) | conversation source body, HTML-stripped (native)
 }

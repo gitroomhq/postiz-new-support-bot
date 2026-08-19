@@ -116,6 +116,21 @@ export class SlaFactsLoader {
         : { linked: false };
     }
 
+    // Postiz facts are free: the account was resolved once at ticket creation
+    // and lives on the ticket row, so no rule can turn evaluation into a
+    // platform call. A never-resolved ticket is simply not linked.
+    if ([...referenced].some((d) => d.startsWith("postiz."))) {
+      facts.postiz = ticket.postizUserId
+        ? {
+            linked: true,
+            userId: ticket.postizUserId,
+            orgId: ticket.postizOrgId,
+            tier: ticket.postizTier,
+            role: ticket.postizRole,
+          }
+        : { linked: false };
+    }
+
     if ([...referenced].some((d) => d.startsWith("intercom."))) {
       const intercom: SlaFacts["intercom"] = {
         kind: link?.ticketId ? "ticket" : "conversation",
@@ -175,6 +190,10 @@ export class SlaFactsLoader {
         attributes: conv.customAttributes,
       },
       text: conv.sourceBody ? stripHtml(conv.sourceBody) : undefined,
+      // A native conversation has no ticket row to carry a resolved account,
+      // so the identity is unknown rather than absent. Same treatment stripe.*
+      // gets here: `linked` is false and everything else evaluates false.
+      postiz: { linked: false, unavailable: true },
     };
     return { facts, open: conv.open, customAttributes: conv.customAttributes, slaApplied: conv.slaApplied };
   }

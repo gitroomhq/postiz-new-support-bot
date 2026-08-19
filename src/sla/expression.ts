@@ -109,7 +109,17 @@ function boolValue(raw: { text: string; quoted: boolean }): boolean | null {
   return null;
 }
 
-function boolSpec(dim: "open" | "exempt" | "mirrored" | "stripe.linked" | "stripe.paying" | "stripe.dispute" | "stripe.refund_review"): KeySpec {
+function boolSpec(
+  dim:
+    | "open"
+    | "exempt"
+    | "mirrored"
+    | "stripe.linked"
+    | "stripe.paying"
+    | "stripe.dispute"
+    | "stripe.refund_review"
+    | "postiz.linked"
+): KeySpec {
   return {
     ops: { "=": "eq" },
     opHint: `${dim} only supports "=" with true/false (negate via =false)`,
@@ -176,6 +186,27 @@ const KEY_SPECS: Record<string, KeySpec> = {
   "stripe.paying": boolSpec("stripe.paying"),
   "stripe.dispute": boolSpec("stripe.dispute"),
   "stripe.refund_review": boolSpec("stripe.refund_review"),
+  "postiz.linked": boolSpec("postiz.linked"),
+  "postiz.tier": {
+    ops: { "=": "eq", "!=": "neq", "~": "matches" },
+    opHint: "postiz.tier supports =, != (exact) and ~ (regex)",
+    build: (op, raw) => {
+      if (op === "matches") {
+        const err = regexError(raw.text);
+        if (err) return { message: err };
+      }
+      if (!raw.text) return { message: "postiz.tier needs a value", hint: 'postiz.tier="PRO"' };
+      return { dim: "postiz.tier", op: op as "eq" | "neq" | "matches", value: raw.text };
+    },
+  },
+  "postiz.role": {
+    ops: { "=": "eq", "!=": "neq" },
+    opHint: "postiz.role supports = and !=",
+    build: (op, raw) => {
+      if (!raw.text) return { message: "postiz.role needs a value", hint: 'postiz.role="ADMIN"' };
+      return { dim: "postiz.role", op: op as "eq" | "neq", value: raw.text };
+    },
+  },
   "stripe.plan": {
     ops: { "=": "eq", "!=": "neq", "~": "matches" },
     opHint: 'stripe.plan supports =, != (exact) and ~ (regex)',
@@ -440,6 +471,7 @@ export function serializeCondition(cond: SlaCondition, ctx: ParseContext): strin
     case "stripe.paying":
     case "stripe.dispute":
     case "stripe.refund_review":
+    case "postiz.linked":
       return `${cond.dim}=${cond.value}`;
     case "intercom.attribute": {
       const name = `attr:"${cond.name.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;

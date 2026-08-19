@@ -83,6 +83,28 @@ function evaluateCondition(cond: SlaCondition, facts: SlaFacts): { pass: boolean
         cond.op === "gt" ? spend > cond.value : cond.op === "gte" ? spend >= cond.value : cond.op === "lt" ? spend < cond.value : spend <= cond.value;
       return ok ? pass(`spend=${spend}`) : fail(`spend=${spend}`);
     }
+    case "postiz.linked": {
+      const linked = facts.postiz?.linked;
+      if (linked == null) return fail("no Postiz data for this subject");
+      return linked === cond.value ? pass(`postiz.linked=${linked}`) : fail(`postiz.linked=${linked}`);
+    }
+    case "postiz.tier": {
+      // Unavailable means the lookup could not run, which is not the same as
+      // "the account is on no tier" — both fail, but only linked stays usable.
+      const tier = facts.postiz && !facts.postiz.unavailable ? facts.postiz.tier : undefined;
+      if (tier == null) return fail("no Postiz plan data");
+      if (cond.op === "matches") {
+        return safeRegexTest(cond.value, tier) ? pass(`tier=${tier}`) : fail(`tier=${tier}`);
+      }
+      const eq = ci(tier) === ci(cond.value);
+      return (cond.op === "eq") === eq ? pass(`tier=${tier}`) : fail(`tier=${tier}`);
+    }
+    case "postiz.role": {
+      const role = facts.postiz && !facts.postiz.unavailable ? facts.postiz.role : undefined;
+      if (role == null) return fail("no Postiz role data");
+      const eq = ci(role) === ci(cond.value);
+      return (cond.op === "eq") === eq ? pass(`role=${role}`) : fail(`role=${role}`);
+    }
     case "intercom.team": {
       const ic = facts.intercom;
       const id = ic?.teamId ?? null;
