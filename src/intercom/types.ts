@@ -35,6 +35,17 @@ export interface EnsurePayload {
   customerId: string | null;
   customerDisplayName: string | null;
   postizUserId?: string | null; // primary external_id source
+  // Account resolved from the platform and stamped on the ticket. DISPLAY ONLY
+  // and deliberately separate from postizUserId above: that field decides the
+  // contact's external_id, so feeding a newly-resolved id into it would move
+  // an existing customer into a different id namespace and create a duplicate
+  // contact. This one only ever renders.
+  postizResolved?: {
+    userId: string;
+    orgId: string | null;
+    tier: string | null;
+    role: string | null;
+  } | null;
   stripeCustomerId?: string | null;
   categoryId: string | null; // ticket-type map key ("howto" | "bugs" | "billing")
   categoryLabel?: string | null;

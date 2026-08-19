@@ -623,6 +623,15 @@ export class IntercomSyncService {
     const session = await this.sessionStore.getSession(ticket.customerId).catch(() => null);
     payload.postizUserId = session?.postizUserId ?? null;
     payload.stripeCustomerId = session?.stripeCustomerId ?? null;
+    // Display only — see the note on EnsurePayload.postizResolved.
+    payload.postizResolved = ticket.postizUserId
+      ? {
+          userId: ticket.postizUserId,
+          orgId: ticket.postizOrgId,
+          tier: ticket.postizTier,
+          role: ticket.postizRole,
+        }
+      : null;
     if (this.customerInfoResolver) {
       const info = await this.customerInfoResolver(ticket.customerId).catch(() => null);
       if (info) {

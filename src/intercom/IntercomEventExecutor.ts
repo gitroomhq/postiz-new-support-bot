@@ -259,6 +259,17 @@ export class IntercomEventExecutor {
         payload.customerDisplayName ? `Customer: ${escapeHtmlText(payload.customerDisplayName)}` : null,
         payload.categoryLabel ? `Category: ${escapeHtmlText(payload.categoryLabel)}` : null,
         payload.postizUserId ? `Postiz user: ${escapeHtmlText(payload.postizUserId)}` : null,
+        // The resolved account is shown whenever it adds something the linked
+        // session did not already say.
+        payload.postizResolved && payload.postizResolved.userId !== payload.postizUserId
+          ? `Postiz user (resolved): ${escapeHtmlText(payload.postizResolved.userId)}`
+          : null,
+        payload.postizResolved?.orgId
+          ? `Organization: ${escapeHtmlText(payload.postizResolved.orgId)}${
+              payload.postizResolved.role ? ` (${escapeHtmlText(payload.postizResolved.role)})` : ""
+            }`
+          : null,
+        payload.postizResolved?.tier ? `Postiz plan: ${escapeHtmlText(payload.postizResolved.tier)}` : null,
         payload.stripeCustomerId ? `Stripe customer: ${escapeHtmlText(payload.stripeCustomerId)}` : null,
       ].filter(Boolean);
       await this.postAdminNote(threadId, link.conversationId, `<p>${contextLines.join("<br>")}</p>`, undefined, true).catch(
