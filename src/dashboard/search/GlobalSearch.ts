@@ -5,6 +5,7 @@ import { DisputeStore } from "../../bot/billing/DisputeStore";
 import { BlockStore } from "../../bot/billing/BlockStore";
 import { BillingQolStore } from "../../bot/billing/BillingQolStore";
 import { ObjectRef } from "../renderer/contract";
+import type { PostizIdentityService } from "../../postiz/PostizIdentityService";
 
 // Global search behind the ⌘K palette. Pipeline: id fast-path (no network) →
 // local DB hits (notes/bookmarks/blocklist/dispute mirror/Discord links) →
@@ -52,8 +53,45 @@ export class GlobalSearch {
       dispute: DisputeStore;
       block: BlockStore;
       qol: BillingQolStore;
-    }
+    },
+    // Optional: search works without it, just without the platform group.
+    private postiz?: PostizIdentityService
   ) {}
+
+  // Postiz accounts matching the term. The platform is the only place a name
+  // or organization id resolves to a person, and its account email is what
+  // finds the Stripe customer to open — the platform does not expose the
+  // customer id itself, so a hit without a matching customer is shown as
+  // context rather than as a dead link.
+  private async postizGroup(term: string): Promise<SearchGroup | null> {
+    if (!this.postiz) return null;
+    let result;
+    try {
+      result = await this.postiz.search(term);
+    } catch {
+      // Too short or too broad for the platform's unindexed search. The rest
+      // of the palette still answers.
+      return null;
+    }
+    if (!result || result.accounts.length === 0) return null;
+
+    const hits: SearchHit[] = [];
+    for (const account of result.accounts.slice(0, GROUP_LIMIT)) {
+      const customers = account.email ? await this.stripe.findCustomersByEmail(account.email).catch(() => []) : [];
+      const sub = [account.orgName ?? account.orgId, account.tier ?? "no plan", account.role]
+        .filter(Boolean)
+        .join(" · ");
+      hits.push({
+        title: account.email ?? account.name ?? account.userId,
+        sub,
+        id: account.userId,
+        ref: customers.length === 1
+          ? { page: "customers.detail", params: { id: customers[0].id } }
+          : { page: "customers", params: { q: account.email ?? "" } },
+      });
+    }
+    return hits.length ? { label: "Postiz accounts", hits } : null;
+  }
 
   async run(rawTerm: string): Promise<SearchResponse> {
     const term = rawTerm.trim().slice(0, 80);
@@ -69,9 +107,14 @@ export class GlobalSearch {
       };
     }
 
-    // 2) local hits (cheap, always run) + 3) Stripe fan-out (classified).
-    const [local, stripeGroups] = await Promise.all([this.localHits(term), this.stripeFanOut(term)]);
-    const groups = [...stripeGroups, ...local].filter((g) => g.hits.length > 0);
+    // 2) local hits (cheap, always run) + 3) Stripe fan-out (classified) +
+    //    4) the platform account lookup (its own failure never sinks the rest).
+    const [local, stripeGroups, postizGroup] = await Promise.all([
+      this.localHits(term),
+      this.stripeFanOut(term),
+      this.postizGroup(term).catch(() => null),
+    ]);
+    const groups = [...stripeGroups, ...(postizGroup ? [postizGroup] : []), ...local].filter((g) => g.hits.length > 0);
     return {
       groups,
       notice: "Stripe search can lag by ~1 minute. Showing the top matches per group.",

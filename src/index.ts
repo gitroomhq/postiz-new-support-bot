@@ -623,7 +623,7 @@ async function main() {
     settings: settingsStore,
     stores: dashboardStores,
     billing: { actions: billingActionService, gateway: dashboardGateway },
-    search: new GlobalSearch(stripeClient, dashboardStores),
+    search: new GlobalSearch(stripeClient, dashboardStores, postizIdentity),
     metrics: dashboardMetrics,
   });
   const dashboardDiscord = new DashboardDiscord(settingsStore, dashboardTokens, dashboardAuth);
