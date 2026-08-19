@@ -23,6 +23,9 @@ export class SentryFeedbackStore {
     intercomConversationId: string;
     pageUrl: string | null;
     feedbackAt: Date;
+    postizUserId?: string | null;
+    postizOrgId?: string | null;
+    stripeCustomerId?: string | null;
   }): Promise<void> {
     await this.prisma.sentryFeedbackImport.create({ data: { ...data, status: "imported" } });
   }
@@ -34,8 +37,54 @@ export class SentryFeedbackStore {
     contactName: string | null;
     pageUrl: string | null;
     feedbackAt: Date;
+    postizUserId?: string | null;
+    postizOrgId?: string | null;
+    stripeCustomerId?: string | null;
   }): Promise<void> {
     await this.prisma.sentryFeedbackImport.create({ data: { ...data, status: "skipped_no_email" } });
+  }
+
+  // Replay candidates: submissions dropped as anonymous that have never been
+  // re-examined. Once the event reader understands the identity tags, most of
+  // these have an email after all. Oldest first so the backlog drains in
+  // submission order.
+  listSkippedForRetry(limit: number): Promise<SentryFeedbackImport[]> {
+    return this.prisma.sentryFeedbackImport.findMany({
+      where: { status: "skipped_no_email", retriedAt: null },
+      orderBy: { feedbackAt: "asc" },
+      take: limit,
+    });
+  }
+
+  countSkippedForRetry(): Promise<number> {
+    return this.prisma.sentryFeedbackImport.count({ where: { status: "skipped_no_email", retriedAt: null } });
+  }
+
+  // One-shot marker: a row that still has no identity stays skipped instead of
+  // being re-read on every tick for the rest of time.
+  async markRetried(sentryIssueId: string, at: Date): Promise<void> {
+    await this.prisma.sentryFeedbackImport.update({ where: { sentryIssueId }, data: { retriedAt: at } });
+  }
+
+  // A skipped row that turned out to have an identity after all: it becomes a
+  // normal imported row in place, keeping its original id and feedbackAt.
+  async promoteToImported(
+    sentryIssueId: string,
+    data: {
+      contactEmail: string;
+      contactName: string | null;
+      intercomContactId: string;
+      intercomConversationId: string;
+      postizUserId?: string | null;
+      postizOrgId?: string | null;
+      stripeCustomerId?: string | null;
+      retriedAt: Date;
+    }
+  ): Promise<void> {
+    await this.prisma.sentryFeedbackImport.update({
+      where: { sentryIssueId },
+      data: { ...data, status: "imported" },
+    });
   }
 
   // Stamps the customer-ticket conversion onto the ledger row (powers the

@@ -48,6 +48,8 @@ export class SentryFeedbackImporter {
       imported: 0,
       skippedNoEmail: 0,
       deduped: 0,
+      replayed: 0,
+      replayExhausted: 0,
       errors: 0,
       capped: false,
       skipped: true,
@@ -124,29 +126,18 @@ export class SentryFeedbackImporter {
             contactName: context.name,
             pageUrl: context.url,
             feedbackAt,
+            // Kept even without an email: an org or Stripe id still identifies
+            // the account, and a later replay starts from these.
+            postizUserId: context.identity.userId,
+            postizOrgId: context.identity.orgId,
+            stripeCustomerId: context.identity.stripeCustomerId,
           });
           result.skippedNoEmail++;
           outcomes.push({ feedbackAt, terminal: true });
           continue;
         }
 
-        // Contact: prefer an existing user-role match (real customer record);
-        // a lead-only match is reused as-is (fromType "lead"); else create.
-        const matches = await this.intercom.searchContactsByEmail(email);
-        let match = matches.find((m) => m.role === "user") ?? matches.find((m) => m.role === "lead") ?? null;
-        if (!match) {
-          await paceWrite();
-          try {
-            match = { id: (await this.intercom.createEmailContact({ email, name: context.name })).id, role: "user" };
-          } catch (e) {
-            // 409 = create raced an existing/archived record — one re-search;
-            // still nothing → item failure (retried next tick).
-            if (!(e instanceof IntercomHttpError && e.status === 409)) throw e;
-            const retry = await this.intercom.searchContactsByEmail(email);
-            match = retry.find((m) => m.role === "user") ?? retry[0] ?? null;
-            if (!match) throw e;
-          }
-        }
+        const match = await this.ensureContact(email, context.name, paceWrite);
         const fromType = match.role === "lead" ? "lead" : "user";
 
         await paceWrite();
@@ -170,6 +161,9 @@ export class SentryFeedbackImporter {
           intercomConversationId: conversationId,
           pageUrl: context.url,
           feedbackAt,
+          postizUserId: context.identity.userId,
+          postizOrgId: context.identity.orgId,
+          stripeCustomerId: context.identity.stripeCustomerId,
         });
         result.imported++;
         outcomes.push({ feedbackAt, terminal: true });
@@ -235,6 +229,7 @@ export class SentryFeedbackImporter {
               pageUrl: context.url,
               shortId: issue.shortId,
               permalink: issue.permalink,
+              identity: context.identity,
             }),
           });
         } catch (e) {
@@ -263,6 +258,10 @@ export class SentryFeedbackImporter {
       }
     }
 
+    // Replay shares the tick's import budget so a large backlog cannot flood
+    // Intercom in one pass; whatever is left over drains on later ticks.
+    await this.replaySkipped(result, MAX_IMPORTS_PER_TICK - result.imported, adminId, paceWrite, now);
+
     const newMark = advanceWatermark(outcomes, watermark);
     await this.settingsStore.recordSentryFeedbackSync({
       lastSyncAt: now,
@@ -273,11 +272,119 @@ export class SentryFeedbackImporter {
       "feedback.imported": result.imported,
       "feedback.skipped_no_email": result.skippedNoEmail,
       "feedback.deduped": result.deduped,
+      "feedback.replayed": result.replayed,
+      "feedback.replay_exhausted": result.replayExhausted,
       "feedback.errors": result.errors,
       "feedback.capped": result.capped,
       "feedback.forced": force,
     });
     return result;
+  }
+
+  // Intercom contact for a submitter email: prefer an existing user-role match
+  // (a real customer record), reuse a lead-only match as-is, else create.
+  private async ensureContact(
+    email: string,
+    name: string | null,
+    paceWrite: () => Promise<void>
+  ): Promise<{ id: string; role: string | null }> {
+    const matches = await this.intercom.searchContactsByEmail(email);
+    const found = matches.find((m) => m.role === "user") ?? matches.find((m) => m.role === "lead") ?? null;
+    if (found) return found;
+
+    await paceWrite();
+    try {
+      return { id: (await this.intercom.createEmailContact({ email, name })).id, role: "user" };
+    } catch (e) {
+      // 409 = create raced an existing/archived record — one re-search; still
+      // nothing → item failure (retried next tick).
+      if (!(e instanceof IntercomHttpError && e.status === 409)) throw e;
+      const retry = await this.intercom.searchContactsByEmail(email);
+      const raced = retry.find((m) => m.role === "user") ?? retry[0] ?? null;
+      if (!raced) throw e;
+      return raced;
+    }
+  }
+
+  // Re-examines submissions previously dropped as anonymous. The platform hides
+  // the widget's email field and relies on the SDK filling it from the scope
+  // user, so on builds that carry identity as tags instead the field arrives
+  // empty and every submission looked anonymous. Those events did carry the
+  // submitter, just somewhere the old reader did not look.
+  //
+  // One-shot by design: a row that still resolves to nothing is stamped and
+  // left skipped, so the candidate set drains instead of being re-read forever.
+  private async replaySkipped(
+    result: SentryFeedbackTickResult,
+    budget: number,
+    adminId: string,
+    paceWrite: () => Promise<void>,
+    now: Date
+  ): Promise<void> {
+    if (budget <= 0) return;
+
+    const candidates = await this.store.listSkippedForRetry(budget);
+    for (const row of candidates) {
+      try {
+        const context = await this.sentry.getFeedbackContext(row.sentryIssueId);
+        const email = context.contactEmail;
+        if (!email) {
+          await this.store.markRetried(row.sentryIssueId, now);
+          result.replayExhausted++;
+          continue;
+        }
+
+        const match = await this.ensureContact(email, context.name ?? row.contactName, paceWrite);
+        await paceWrite();
+        const conversationId = await this.intercom.createConversation(
+          match.id,
+          buildConversationBody(context.message ?? ""),
+          row.feedbackAt.toISOString(),
+          match.role === "lead" ? "lead" : "user"
+        );
+        // Same commit ordering as a fresh import: the ledger row is updated
+        // directly after the only non-idempotent call.
+        await this.store.promoteToImported(row.sentryIssueId, {
+          contactEmail: email,
+          contactName: context.name ?? row.contactName,
+          intercomContactId: match.id,
+          intercomConversationId: conversationId,
+          postizUserId: context.identity.userId,
+          postizOrgId: context.identity.orgId,
+          stripeCustomerId: context.identity.stripeCustomerId,
+          retriedAt: now,
+        });
+        result.replayed++;
+
+        // Best-effort note, matching a fresh import. The permalink is not on
+        // the ledger row, so the note carries the short id alone.
+        try {
+          await paceWrite();
+          await this.intercom.replyAsAdmin(conversationId, {
+            adminId,
+            note: true,
+            body: buildMetadataNote({
+              pageUrl: row.pageUrl,
+              shortId: row.sentryShortId,
+              permalink: null,
+              identity: context.identity,
+            }),
+          });
+        } catch (e) {
+          syncLog.warn("sentry feedback replay: metadata note failed", {
+            "intercom.conversation_id": conversationId,
+            "error.message": e instanceof Error ? e.message : String(e),
+          });
+        }
+      } catch (e) {
+        // Left unstamped so a transient failure is retried on a later tick.
+        result.errors++;
+        syncLog.warn("sentry feedback replay: item failed", {
+          "sentry.issue_id": row.sentryIssueId,
+          "error.message": e instanceof Error ? e.message : String(e),
+        });
+      }
+    }
   }
 
   // The bridge's attachTicket ladder minus the standalone rung: convert with

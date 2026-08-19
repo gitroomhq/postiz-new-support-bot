@@ -860,6 +860,12 @@ const STATEMENTS: string[] = [
   `CREATE UNIQUE INDEX IF NOT EXISTS "sentry_feedback_imports_sentryIssueId_key" ON "sentry_feedback_imports"("sentryIssueId")`,
   `CREATE UNIQUE INDEX IF NOT EXISTS "sentry_feedback_imports_intercomConversationId_key" ON "sentry_feedback_imports"("intercomConversationId")`,
   `CREATE INDEX IF NOT EXISTS "sentry_feedback_imports_importedAt_idx" ON "sentry_feedback_imports"("importedAt")`,
+  // Identity captured off the Sentry event, plus the one-shot replay marker.
+  `ALTER TABLE "sentry_feedback_imports" ADD COLUMN IF NOT EXISTS "postizUserId" TEXT`,
+  `ALTER TABLE "sentry_feedback_imports" ADD COLUMN IF NOT EXISTS "postizOrgId" TEXT`,
+  `ALTER TABLE "sentry_feedback_imports" ADD COLUMN IF NOT EXISTS "stripeCustomerId" TEXT`,
+  `ALTER TABLE "sentry_feedback_imports" ADD COLUMN IF NOT EXISTS "retriedAt" TIMESTAMP(3)`,
+  `CREATE INDEX IF NOT EXISTS "sentry_feedback_imports_status_retriedAt_idx" ON "sentry_feedback_imports"("status", "retriedAt")`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "sentryFeedbackTeamId" TEXT`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "sentryFeedbackWatermarkAt" TIMESTAMP(3)`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "sentryFeedbackLastSyncAt" TIMESTAMP(3)`,

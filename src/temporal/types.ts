@@ -353,6 +353,10 @@ export interface SentryFeedbackTickResult {
   imported: number;
   skippedNoEmail: number;
   deduped: number;
+  // Previously-anonymous submissions re-examined this tick: `replayed` were
+  // imported after all, `replayExhausted` had no identity and stay skipped.
+  replayed: number;
+  replayExhausted: number;
   errors: number;
   capped: boolean; // per-tick import cap hit — remainder picked up next tick
   skipped: boolean; // disabled / not configured / no watermark / Intercom unconfigured

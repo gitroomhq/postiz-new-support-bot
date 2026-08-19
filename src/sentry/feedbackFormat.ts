@@ -31,6 +31,13 @@ export interface FeedbackNoteInput {
   pageUrl: string | null;
   shortId: string | null;
   permalink: string | null;
+  // Acting identity off the Sentry event. Absent on anonymous submissions and
+  // on older ledger rows, so every field is optional.
+  identity?: {
+    userId: string | null;
+    orgId: string | null;
+    stripeCustomerId: string | null;
+  } | null;
 }
 
 // Agent-facing internal note: Sentry provenance + page context. Customers
@@ -44,6 +51,14 @@ export function buildMetadataNote(input: FeedbackNoteInput): string {
   if (input.pageUrl) {
     lines.push(`<p>Page: <a href="${escapeHtmlText(input.pageUrl)}">${escapeHtmlText(input.pageUrl)}</a></p>`);
   }
+  // Account identity the platform stamped on the event. The submitter email is
+  // already the conversation's contact, so only the ids that Intercom does not
+  // otherwise show are repeated here.
+  const ids: string[] = [];
+  if (input.identity?.userId) ids.push(`Postiz user: ${escapeHtmlText(input.identity.userId)}`);
+  if (input.identity?.orgId) ids.push(`Organization: ${escapeHtmlText(input.identity.orgId)}`);
+  if (input.identity?.stripeCustomerId) ids.push(`Stripe: ${escapeHtmlText(input.identity.stripeCustomerId)}`);
+  if (ids.length > 0) lines.push(`<p>${ids.join("<br>")}</p>`);
   if (input.permalink) {
     lines.push(`<p><a href="${escapeHtmlText(input.permalink)}">Open in Sentry</a></p>`);
   }

@@ -32,6 +32,7 @@ interface HarnessOpts {
   failNthConversation?: number; // the Nth createConversation call throws
   convertFails?: "permanent" | "permanent-with-existing" | "transient";
   noteFails?: boolean;
+  replayRows?: unknown[];
 }
 
 const issue = (id: string, iso: string, project = "postiz-web"): SentryFeedbackIssue => ({
@@ -139,6 +140,18 @@ function makeHarness(opts: HarnessOpts = {}): Harness {
     },
     async setTicketId(sentryIssueId: string, ticketId: string) {
       ops.push(`store.ticket:${sentryIssueId}:${ticketId}`);
+    },
+    // Replay of previously-skipped rows is exercised in replay.test.ts; these
+    // keep the main walk's assertions about call ORDER unpolluted.
+    async listSkippedForRetry() {
+      return opts.replayRows ?? [];
+    },
+    async markRetried(sentryIssueId: string) {
+      ops.push(`store.retried:${sentryIssueId}`);
+    },
+    async promoteToImported(sentryIssueId: string) {
+      ops.push(`store.promoted:${sentryIssueId}`);
+      ledger.set(sentryIssueId, { status: "imported" });
     },
   } as unknown as SentryFeedbackStore;
 

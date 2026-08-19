@@ -1021,6 +1021,17 @@ model SentryFeedbackImport {
   intercomConversationId String?  @unique // Postgres unique ignores NULLs, so skipped rows coexist
   intercomTicketId       String? // set when the conversation was converted to a customer ticket
   pageUrl                String?
+  // Acting identity carried on the Sentry event (tags, or the user context on
+  // older platform builds). Captured even for skipped rows: it is what lets a
+  // previously anonymous submission be replayed once the reader understands
+  // the newer event shape.
+  postizUserId           String?
+  postizOrgId            String?
+  stripeCustomerId       String?
+  // Stamped when a skipped row has been re-examined. Retry is one-shot: a row
+  // that still resolves to nothing stays skipped rather than being re-read on
+  // every tick forever.
+  retriedAt              DateTime?
   feedbackAt             DateTime // Sentry issue firstSeen — watermark math + audit
   importedAt             DateTime @default(now())
 
