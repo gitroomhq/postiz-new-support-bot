@@ -147,6 +147,21 @@ export function makeInfraHub(deps: InfraHubDeps): HubModule {
             badge: pinBadge("temporalTlsServerName"),
             help: envPinNote("temporalTlsServerName"),
           },
+          {
+            // Read-only here on purpose: the switch lives on the Discord panel
+            // (and TEMPORAL_TLS_ENABLED), but an unencrypted hop still has to
+            // be visible wherever the connection is shown.
+            type: "static",
+            key: "temporalTlsEnabled",
+            label: "Transport",
+            value: s.temporalTlsEnabled() ? "mTLS (client cert below)" : "plaintext — TLS off",
+            badge: s.temporalTlsEnabled()
+              ? { kind: "ok", text: "encrypted" }
+              : { kind: "warn", text: "plaintext" },
+            help:
+              envPinNote("temporalTlsEnabled") ??
+              "Toggle in Discord: /config → Temporal → TLS. Off dials plaintext gRPC, for a frontend on a private network.",
+          },
           certsField(deps.temporalTlsSource?.() ?? null),
         ],
       };

@@ -25,6 +25,7 @@ const VARS = [
   "TEMPORAL_NAMESPACE",
   "TEMPORAL_TASK_QUEUE",
   "TEMPORAL_DEPLOYMENT_NAME",
+  "TEMPORAL_TLS_ENABLED",
   "TEMPORAL_TLS_SERVER_NAME",
   "TEMPORAL_TLS_CERT_FILE",
   "TEMPORAL_TLS_KEY_FILE",
@@ -50,6 +51,7 @@ const STORED = {
   temporalNamespace: "db-namespace",
   temporalTaskQueue: "db-queue",
   temporalDeploymentName: "db-deployment",
+  temporalTlsEnabled: false,
   temporalTlsServerName: "db-sni",
 };
 
@@ -141,6 +143,9 @@ test("Temporal getters: env overrides the stored connection and the worker switc
   assert.equal(stored.temporalEnabled(), false);
   assert.equal(stored.temporalAddress(), "db-host:7233");
   assert.equal(stored.temporalTaskQueue(), "db-queue");
+  // Plaintext is the stored default: a private-network frontend is the norm
+  // for this deploy, and TLS is the thing you opt into.
+  assert.equal(stored.temporalTlsEnabled(), false);
 
   process.env.TEMPORAL_ENABLED = "yes";
   process.env.TEMPORAL_ADDRESS = "env-host:7233";
@@ -148,6 +153,7 @@ test("Temporal getters: env overrides the stored connection and the worker switc
   process.env.TEMPORAL_TASK_QUEUE = "env-queue";
   process.env.TEMPORAL_DEPLOYMENT_NAME = "env-deployment";
   process.env.TEMPORAL_TLS_SERVER_NAME = "env-sni";
+  process.env.TEMPORAL_TLS_ENABLED = "on";
   const pinned = storeWith();
   assert.equal(pinned.temporalEnabled(), true);
   assert.equal(pinned.temporalAddress(), "env-host:7233");
@@ -155,6 +161,7 @@ test("Temporal getters: env overrides the stored connection and the worker switc
   assert.equal(pinned.temporalTaskQueue(), "env-queue");
   assert.equal(pinned.temporalDeploymentName(), "env-deployment");
   assert.equal(pinned.temporalTlsServerName(), "env-sni");
+  assert.equal(pinned.temporalTlsEnabled(), true);
 
   // A stored value still applies to whatever the env leaves unpinned.
   delete process.env.TEMPORAL_TASK_QUEUE;

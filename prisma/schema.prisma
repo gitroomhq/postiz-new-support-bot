@@ -289,8 +289,15 @@ model BotSettings {
   temporalNamespace      String?
   temporalTaskQueue      String    @default("support-bot")
   temporalDeploymentName String    @default("support-bot")
+  // Transport security for the frontend connection. OFF = plaintext gRPC,
+  // which is what a private-network deploy (Railway internal DNS, a service
+  // mesh) wants: the frontend there listens without TLS, and dialing it with
+  // TLS fails the handshake outright. ON = mTLS with the Vault-held client
+  // cert. Certs stay stored either way; they are simply unused while off.
+  temporalTlsEnabled     Boolean   @default(false)
   // TLS SNI / server-name override — needed when dialing by IP while the
-  // server cert carries a hostname. Null = derive from the address.
+  // server cert carries a hostname. Null = derive from the address. Ignored
+  // while temporalTlsEnabled is off.
   temporalTlsServerName  String?
   temporalImportDoneAt DateTime?
   // Intercom teammates who count as billing admins for canvas/panel actions

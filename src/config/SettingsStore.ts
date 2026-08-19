@@ -1358,8 +1358,18 @@ export class SettingsStore {
     return envStr("TEMPORAL_DEPLOYMENT_NAME") ?? (this.settings.temporalDeploymentName?.trim() || "support-bot");
   }
 
+  // Transport security for the frontend connection. OFF (the default) dials
+  // plaintext gRPC — a private-network frontend (Railway internal DNS, a
+  // service mesh) listens without TLS, and speaking TLS at it dies in the
+  // handshake with a rustls InvalidContentType. ON requires the Vault-held
+  // mTLS material; the certs stay stored while off, just unused.
+  temporalTlsEnabled(): boolean {
+    return envBool("TEMPORAL_TLS_ENABLED") ?? this.settings.temporalTlsEnabled;
+  }
+
   // TLS SNI / server-name override for dialing by IP while the server cert
-  // carries a hostname. Null = let gRPC derive it from the address.
+  // carries a hostname. Null = let gRPC derive it from the address. Inert
+  // while temporalTlsEnabled is off.
   temporalTlsServerName(): string | null {
     return envStr("TEMPORAL_TLS_SERVER_NAME") ?? (this.settings.temporalTlsServerName?.trim() || null);
   }
@@ -1376,6 +1386,7 @@ export class SettingsStore {
     temporalNamespace?: string | null;
     temporalTaskQueue?: string;
     temporalDeploymentName?: string;
+    temporalTlsEnabled?: boolean;
     temporalTlsServerName?: string | null;
     temporalImportDoneAt?: Date | null;
   }): Promise<void> {

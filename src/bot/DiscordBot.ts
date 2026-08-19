@@ -2557,24 +2557,31 @@ export class DiscordBot {
           state === "up" ? "✅ up" : state === "down" ? `❌ down${svc.downSince() ? ` since ${rel(svc.downSince()!)}` : ""}` : `⚪ not configured${configError ? `: ${configError}` : ""}`
         }`,
         `**Address / namespace:** \`${cfg.address || "N/A"}\` · \`${cfg.namespace || "N/A"}\` · queue \`${cfg.taskQueue}\`${
-          cfg.tlsServerName ? ` · SNI \`${cfg.tlsServerName}\`` : ""
-        }`
+          cfg.tlsEnabled && cfg.tlsServerName ? ` · SNI \`${cfg.tlsServerName}\`` : ""
+        }`,
+        // Plaintext is a legitimate setup (private-network frontend), but it
+        // is never left implicit: an unencrypted hop stays visible here.
+        `**Transport:** ${cfg.tlsEnabled ? "🔒 mTLS" : "⚠️ plaintext (TLS off; only safe on a private network)"}`
       );
       // TEMPORAL_* env vars override the stored connection values; name them
       // so a value that ignores the Connection modal is never a mystery.
-      const pinnedConn = (["temporalAddress", "temporalNamespace", "temporalTaskQueue", "temporalDeploymentName", "temporalTlsServerName"] as const)
+      const pinnedConn = (["temporalAddress", "temporalNamespace", "temporalTaskQueue", "temporalDeploymentName", "temporalTlsEnabled", "temporalTlsServerName"] as const)
         .map((f) => envPin(f))
         .filter((n): n is string => n != null);
       if (pinnedConn.length) lines.push(`> _pinned by the environment: ${pinnedConn.map((n) => `\`${n}\``).join(", ")}_`);
       const cert = svc.certInfo();
       const certSource = svc.tlsSource();
+      // Certs stay stored while TLS is off, so the row stays — flagged unused
+      // rather than hidden, which keeps re-enabling a one-button move.
       lines.push(
         `**Client cert:** ${
           cert
             ? `SHA-256 \`${cert.fingerprint256.replace(/:/g, "").slice(0, 16).toLowerCase()}…\` · expires ${rel(cert.notAfter)}${cert.daysLeft < 30 ? " ⚠️" : ""}${
                 certSource === "env-files" ? " · from `TEMPORAL_TLS_*_FILE` (Vault KV empty)" : ""
-              }`
-            : "_not entered (Certificates below, stored in Vault KV; `TEMPORAL_TLS_CERT_FILE`/`KEY_FILE` is the offline fallback)_"
+              }${cfg.tlsEnabled ? "" : " · _unused while TLS is off_"}`
+            : cfg.tlsEnabled
+              ? "_not entered (Certificates below, stored in Vault KV; `TEMPORAL_TLS_CERT_FILE`/`KEY_FILE` is the offline fallback)_"
+              : "_none stored — not needed while TLS is off_"
         }`
       );
       const buf = svc.bufferStats();
@@ -2619,6 +2626,10 @@ export class DiscordBot {
       new ButtonBuilder().setCustomId("config_infra").setLabel("Back").setStyle(ButtonStyle.Secondary)
     );
     const row2 = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId("config_temporal_tls")
+        .setLabel(`${s.temporalTlsEnabled() ? "TLS: on (mTLS)" : "TLS: off (plaintext)"}${envPin("temporalTlsEnabled") ? " (env)" : ""}`)
+        .setStyle(s.temporalTlsEnabled() ? ButtonStyle.Success : ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId("config_temporal_sa").setLabel("Ensure Search Attributes").setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId("config_temporal_pause").setLabel("Pause Schedules").setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId("config_temporal_unpause").setLabel("Unpause Schedules").setStyle(ButtonStyle.Secondary)
@@ -2651,7 +2662,7 @@ export class DiscordBot {
         await interaction.reply({
           embeds: [
             makeEmbed(
-              `Can't enable Temporal: ${ops.service.configError() ?? "not configured"}.\nSet address + namespace via **Connection** and enter the mTLS certs via **Certificates**.`,
+              `Can't enable Temporal: ${ops.service.configError() ?? "not configured"}.\nSet address + namespace via **Connection**${s.temporalTlsEnabled() ? " and enter the mTLS certs via **Certificates**" : ""}.`,
               COLORS.danger
             ),
           ],
@@ -2702,6 +2713,61 @@ export class DiscordBot {
       return;
     }
 
+    if (id === "config_temporal_tls") {
+      const enabling = !s.temporalTlsEnabled();
+      // Turning TLS ON without material would drop the connection to "not
+      // configured" the moment it is saved, so refuse up front.
+      if (enabling && !ops.service.tlsMaterial()) {
+        await interaction.reply({
+          embeds: [
+            makeEmbed(
+              "Can't enable TLS: no mTLS client cert/key available. Enter them via **Certificates** (stored in Vault KV) first.",
+              COLORS.danger
+            ),
+          ],
+          flags: 64,
+        });
+        return;
+      }
+      await interaction.deferUpdate();
+      await s.updateTemporal({ temporalTlsEnabled: enabling });
+      await ops.service.reconfigure();
+      const pinnedBy = envPin("temporalTlsEnabled");
+      const effective = s.temporalTlsEnabled();
+      this.auditConfig(
+        interaction,
+        `Temporal transport → ${enabling ? "mTLS" : "plaintext (TLS off)"}${
+          pinnedBy ? ` (inert: pinned ${effective ? "mTLS" : "plaintext"} by ${pinnedBy})` : ""
+        }`
+      );
+      await interaction.editReply(await this.buildTemporalPanel());
+      await interaction.followUp({
+        embeds: [
+          makeEmbed(
+            [
+              pinnedBy
+                ? `\`${pinnedBy}\` is set in the environment and overrides this toggle: the connection stays **${
+                    effective ? "mTLS" : "plaintext"
+                  }**. The new value is stored and takes effect once that variable is removed.`
+                : `Transport is now **${enabling ? "mTLS" : "plaintext"}**.${
+                    enabling ? "" : " Only do this when the frontend is reachable over a private network."
+                  }`,
+              // Same caveat as the Connection modal: NativeConnection is built
+              // once at worker start and does not hot-swap.
+              this.settingsStore.temporalEnabled() && ops.workerManager.running()
+                ? "⚠️ The running worker keeps its old connection. Toggle **Background work** off/on to apply this."
+                : "",
+            ]
+              .filter(Boolean)
+              .join("\n"),
+            pinnedBy ? COLORS.warn : enabling ? COLORS.success : COLORS.warn
+          ),
+        ],
+        flags: 64,
+      });
+      return;
+    }
+
     if (id === "config_temporal_test") {
       await interaction.deferReply({ flags: 64 });
       const r = await ops.service.testConnection();
@@ -2732,7 +2798,7 @@ export class DiscordBot {
         new ActionRowBuilder<TextInputBuilder>().addComponents(
           new TextInputBuilder()
             .setCustomId("address")
-            .setLabel("Address (host:port of the mTLS frontend)")
+            .setLabel("Address (host:port of the frontend)")
             .setStyle(TextInputStyle.Short)
             .setRequired(false)
             .setValue(cfg.address)

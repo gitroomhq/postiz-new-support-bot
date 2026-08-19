@@ -61,7 +61,7 @@ const EXPECTED_COLUMNS: Record<string, string[]> = {
     "vaultEnabled", "vaultAddr", "vaultToken", "vaultKvMount", "vaultKvBasePath",
     "vaultTransitMount", "vaultTransitKey", "vaultMigratedAt",
     "temporalEnabled", "temporalAddress", "temporalNamespace", "temporalTaskQueue",
-    "temporalDeploymentName", "temporalTlsServerName", "temporalImportDoneAt",
+    "temporalDeploymentName", "temporalTlsEnabled", "temporalTlsServerName", "temporalImportDoneAt",
     "disputeAutoCancelSub", "disputeAutoBlock", "disputeAutoAttachReceipt", "disputeReminderDays",
     "disputeRatioWarnPct", "disputeRatioCriticalPct", "disputeRatioLastLevel",
     "disputeUrgentHours", "disputeUrgentRoleId", "disputeBackfillDoneAt",

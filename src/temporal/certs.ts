@@ -1,4 +1,5 @@
 import { X509Certificate, createPrivateKey } from "node:crypto";
+import type { TLSConfig } from "@temporalio/client";
 import { readFileSync, statSync } from "node:fs";
 import { temporalTlsFilePaths, TEMPORAL_TLS_FILE_VARS } from "../config/env";
 import { log } from "../util/logger";
@@ -32,6 +33,28 @@ export interface TemporalCertInfo {
 
 /** Where the material in use came from; null = none available. */
 export type TemporalTlsSource = "vault" | "env-files";
+
+// Builds the `tls` option shared by the client Connection and the worker's
+// NativeConnection (both take the same TLSConfig). `undefined` is the SDK's
+// plaintext mode — what a private-network frontend that terminates no TLS
+// needs; handing it a TLSConfig instead dies in the handshake with a rustls
+// InvalidContentType, because the ClientHello is answered in cleartext.
+// Callers pass null material when TLS is off; the certs stay stored.
+export function temporalTlsOptions(
+  cfg: { tlsServerName: string | null },
+  material: TemporalTlsMaterial | null
+): TLSConfig | undefined {
+  if (!material) return undefined;
+  return {
+    clientCertPair: {
+      crt: Buffer.from(material.clientCertPem),
+      key: Buffer.from(material.clientKeyPem),
+    },
+    ...(material.caPem ? { serverRootCACertificate: Buffer.from(material.caPem) } : {}),
+    // SNI/cert-hostname override — needed when dialing by IP.
+    ...(cfg.tlsServerName ? { serverNameOverride: cfg.tlsServerName } : {}),
+  };
+}
 
 // Reads from the in-memory KV cache (sync), falling back to the PEM files named
 // by TEMPORAL_TLS_CERT_FILE/KEY_FILE/CA_FILE. Null = not entered yet, cache

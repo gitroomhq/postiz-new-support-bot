@@ -6,7 +6,7 @@ import type { AuditLogger } from "../bot/AuditLogger";
 import type { VaultService } from "../vault/VaultService";
 import { log } from "../util/logger";
 import { RetryBuffer, type BufferedOp } from "./RetryBuffer";
-import { loadTemporalTls, parseCertInfo, temporalTlsSource, type TemporalCertInfo, type TemporalTlsMaterial, type TemporalTlsSource } from "./certs";
+import { loadTemporalTls, parseCertInfo, temporalTlsOptions, temporalTlsSource, type TemporalCertInfo, type TemporalTlsMaterial, type TemporalTlsSource } from "./certs";
 import { describeSaResult, ensureSearchAttributes, type SaEnsureResult } from "./searchAttributes";
 
 const temporalLog = log.child("temporal");
@@ -27,7 +27,11 @@ export interface TemporalEnvConfig {
   namespace: string;
   taskQueue: string;
   deploymentName: string;
+  // false = plaintext gRPC (private-network frontend); true = mTLS with the
+  // Vault-held client cert.
+  tlsEnabled: boolean;
   // TLS SNI / server-name override (dialing by IP with a hostname cert).
+  // Ignored while tlsEnabled is false.
   tlsServerName: string | null;
 }
 
@@ -127,6 +131,7 @@ export class TemporalService {
       namespace: this.settings.temporalNamespace() ?? "",
       taskQueue: this.settings.temporalTaskQueue(),
       deploymentName: this.settings.temporalDeploymentName(),
+      tlsEnabled: this.settings.temporalTlsEnabled(),
       tlsServerName: this.settings.temporalTlsServerName(),
     };
   }
@@ -136,7 +141,10 @@ export class TemporalService {
   configError(): string | null {
     if (!this.settings.temporalAddress()) return "Address not set (Connection in /config → Temporal).";
     if (!this.settings.temporalNamespace()) return "Namespace not set (Connection in /config → Temporal).";
-    if (!this.tlsMaterial()) {
+    // Certs are only a prerequisite when the connection is encrypted — a
+    // plaintext frontend needs none, and demanding them would strand the
+    // panel in "not configured".
+    if (this.settings.temporalTlsEnabled() && !this.tlsMaterial()) {
       return this.vault.state() === "up"
         ? "mTLS client cert/key not found in Vault (enter them via Certificates, or point TEMPORAL_TLS_CERT_FILE/KEY_FILE at PEM files)."
         : "mTLS client cert/key unavailable (Vault KV cache is cold or certs were never entered; TEMPORAL_TLS_CERT_FILE/KEY_FILE is the offline fallback).";
@@ -313,19 +321,12 @@ export class TemporalService {
     if (!this.configured()) throw new Error(this.configError() ?? "temporal not configured");
     if (!this.connecting) {
       this.connecting = (async () => {
-        const tls = this.tlsMaterial()!;
         const cfg = this.envConfig();
         const conn = await Connection.connect({
           address: cfg.address,
-          tls: {
-            clientCertPair: {
-              crt: Buffer.from(tls.clientCertPem),
-              key: Buffer.from(tls.clientKeyPem),
-            },
-            ...(tls.caPem ? { serverRootCACertificate: Buffer.from(tls.caPem) } : {}),
-            // SNI/cert-hostname override — needed when dialing by IP.
-            ...(cfg.tlsServerName ? { serverNameOverride: cfg.tlsServerName } : {}),
-          },
+          // A falsy tls option is the SDK's plaintext mode; the mTLS block is
+          // built only when TLS is on (see temporalTlsOptions).
+          tls: temporalTlsOptions(cfg, cfg.tlsEnabled ? this.tlsMaterial() : null),
           connectTimeout: CONNECT_TIMEOUT,
         });
         this.conn = conn;

@@ -32,13 +32,14 @@ export const ENV_PINS = {
   temporalNamespace: "TEMPORAL_NAMESPACE",
   temporalTaskQueue: "TEMPORAL_TASK_QUEUE",
   temporalDeploymentName: "TEMPORAL_DEPLOYMENT_NAME",
+  temporalTlsEnabled: "TEMPORAL_TLS_ENABLED",
   temporalTlsServerName: "TEMPORAL_TLS_SERVER_NAME",
 } as const;
 
 export type EnvPinnedField = keyof typeof ENV_PINS;
 
-// The two boolean-valued pins; everything else in ENV_PINS is a string.
-const BOOLEAN_PINS = new Set<EnvPinnedField>(["vaultEnabled", "temporalEnabled"]);
+// The boolean-valued pins; everything else in ENV_PINS is a string.
+const BOOLEAN_PINS = new Set<EnvPinnedField>(["vaultEnabled", "temporalEnabled", "temporalTlsEnabled"]);
 
 const TRUE_VALUES = new Set(["1", "true", "yes", "on", "enabled"]);
 const FALSE_VALUES = new Set(["0", "false", "no", "off", "disabled"]);

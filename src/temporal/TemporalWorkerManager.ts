@@ -4,6 +4,7 @@ import * as os from "node:os";
 import { NativeConnection, Runtime, Worker, DefaultLogger, type LogEntry } from "@temporalio/worker";
 import { log } from "../util/logger";
 import type { TemporalService } from "./TemporalService";
+import { temporalTlsOptions } from "./certs";
 import { makeTemporalRuntimeLogger, sentryActivityInterceptor, sentrySinks } from "./sentry";
 
 const workerLog = log.child("temporal:worker");
@@ -57,8 +58,10 @@ export class TemporalWorkerManager {
   async start(activities: Record<string, unknown>): Promise<void> {
     if (this.worker) return;
     const cfg = this.temporal.envConfig();
-    const tls = this.temporal.tlsMaterial();
-    if (!tls) throw new Error(this.temporal.configError() ?? "temporal mTLS material unavailable");
+    // Certs are required only for an encrypted connection; a plaintext
+    // frontend (cfg.tlsEnabled === false) needs none.
+    const tls = cfg.tlsEnabled ? this.temporal.tlsMaterial() : null;
+    if (cfg.tlsEnabled && !tls) throw new Error(this.temporal.configError() ?? "temporal mTLS material unavailable");
     this.stopping = false;
     this.promotedVal = null;
 
@@ -75,15 +78,8 @@ export class TemporalWorkerManager {
 
     this.nativeConn = await NativeConnection.connect({
       address: cfg.address,
-      tls: {
-        clientCertPair: {
-          crt: Buffer.from(tls.clientCertPem),
-          key: Buffer.from(tls.clientKeyPem),
-        },
-        ...(tls.caPem ? { serverRootCACertificate: Buffer.from(tls.caPem) } : {}),
-        // SNI/cert-hostname override — needed when dialing by IP.
-        ...(cfg.tlsServerName ? { serverNameOverride: cfg.tlsServerName } : {}),
-      },
+      // undefined = plaintext; the Rust core dials http:// instead of https://.
+      tls: temporalTlsOptions(cfg, tls),
     });
 
     const codeOpt = workflowCodeOption();

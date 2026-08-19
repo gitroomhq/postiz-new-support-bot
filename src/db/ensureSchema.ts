@@ -489,6 +489,7 @@ const STATEMENTS: string[] = [
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "temporalNamespace" TEXT`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "temporalTaskQueue" TEXT NOT NULL DEFAULT 'support-bot'`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "temporalDeploymentName" TEXT NOT NULL DEFAULT 'support-bot'`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "temporalTlsEnabled" BOOLEAN NOT NULL DEFAULT false`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "temporalTlsServerName" TEXT`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "temporalImportDoneAt" TIMESTAMP(3)`,
   // Dispute management: local dispute mirror (webhook-fed + looper-reconciled),
