@@ -425,6 +425,13 @@ async function main() {
   // Human amounts in the refund-flip context note (zero-decimal aware).
   intercomSync.setAmountFormatter((amountMinor, currency) => stripeClient.formatAmount(amountMinor, currency));
 
+  // Postiz platform lookup: turns a support contact into a known account.
+  // Constructed here because the Intercom canvas app renders it; the bot and
+  // billing panel pick it up by late-binding further down.
+  const postizClient = new PostizClient(settingsStore);
+  const postizIdentity = new PostizIdentityService(postizClient, settingsStore, sessionStore);
+  const postizOrgLinks = new PostizOrgLinkStore(prisma);
+
   const intercomInboxApp = new IntercomInboxApp(
     settingsStore,
     intercomStore,
@@ -434,15 +441,9 @@ async function main() {
     categoryLabelResolver,
     billingActionService,
     panelTokens,
-    panelSessions
+    panelSessions,
+    postizIdentity
   );
-
-  // Postiz platform lookup: turns a support contact into a known account.
-  // Late-bound onto the bot (setSlaService idiom) rather than threaded through
-  // the constructor.
-  const postizClient = new PostizClient(settingsStore);
-  const postizIdentity = new PostizIdentityService(postizClient, settingsStore, sessionStore);
-  const postizOrgLinks = new PostizOrgLinkStore(prisma);
 
   const bot = new DiscordBot(
     config,

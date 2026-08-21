@@ -42,6 +42,21 @@ export const CONV_ATTR_ORIGIN = "Origin";
 //    intercomDeliveryWorkflow owns the retry loop.
 // Every step is idempotent / crash-resumable (link ladder, reserve→call→confirm
 // pending posts, lastSynced* dampers) — a retry resumes whatever is missing.
+// Postiz account fields mirrored onto the Intercom CONTACT, so they render in
+// Intercom's own sidebar next to the Discord and Stripe ids rather than only
+// inside the canvas app. Values come from the identity stamped on the ticket;
+// an unresolved account contributes nothing (Intercom merges attributes, so
+// omitting a key leaves any previous value intact rather than blanking it).
+export function postizContactAttributes(payload: EnsurePayload): Record<string, string> {
+  const resolved = payload.postizResolved;
+  if (!resolved) return {};
+  return {
+    postiz_user_id: resolved.userId,
+    ...(resolved.orgId ? { postiz_org_id: resolved.orgId } : {}),
+    ...(resolved.tier ? { postiz_plan: resolved.tier } : {}),
+  };
+}
+
 export class IntercomEventExecutor {
   private contactAttrsEnsured = false;
   private discordTagId: string | null = null;
@@ -427,6 +442,9 @@ export class IntercomEventExecutor {
     const customAttributes: Record<string, unknown> = {
       ...(payload.customerId ? { discord_user_id: payload.customerId } : {}),
       ...(payload.stripeCustomerId ? { stripe_customer_id: payload.stripeCustomerId } : {}),
+      // Surfaced in Intercom's own contact sidebar alongside the ids above, so
+      // an agent sees the account without opening the canvas app.
+      ...postizContactAttributes(payload),
     };
 
     // Create under the first candidate that isn't locked. A blocked id 409s with
@@ -514,13 +532,27 @@ export class IntercomEventExecutor {
 
   // Pushes name/avatar onto an existing contact, skipping when this process
   // already pushed the identical identity (re-ensures are routine).
+  // Pushes Discord identity drift (name/avatar) plus the resolved Postiz
+  // account onto the contact. The account is included in the dedup stamp so a
+  // ticket that resolves AFTER the contact was created still gets the update;
+  // keying on name/avatar alone would pin the attributes to whatever was known
+  // at creation time.
   private async refreshContactIdentity(contactId: string, payload: EnsurePayload): Promise<void> {
-    if (!payload.customerDisplayName && !payload.customerAvatarUrl) return;
-    const stamp = `${payload.customerDisplayName ?? ""}|${payload.customerAvatarUrl ?? ""}`;
+    const attrs = postizContactAttributes(payload);
+    const hasAttrs = Object.keys(attrs).length > 0;
+    if (!payload.customerDisplayName && !payload.customerAvatarUrl && !hasAttrs) return;
+    const stamp = [
+      payload.customerDisplayName ?? "",
+      payload.customerAvatarUrl ?? "",
+      attrs.postiz_user_id ?? "",
+      attrs.postiz_org_id ?? "",
+      attrs.postiz_plan ?? "",
+    ].join("|");
     if (this.contactIdentityPushed.get(contactId) === stamp) return;
     await this.client.updateContact(contactId, {
       name: payload.customerDisplayName,
       avatarUrl: payload.customerAvatarUrl ?? null,
+      customAttributes: attrs,
     });
     if (this.contactIdentityPushed.size > 2000) this.contactIdentityPushed.clear();
     this.contactIdentityPushed.set(contactId, stamp);
@@ -534,6 +566,9 @@ export class IntercomEventExecutor {
     for (const [name, description] of [
       ["discord_user_id", "Discord user id of the support-bot customer"],
       ["stripe_customer_id", "Stripe customer id from the support bot"],
+      ["postiz_user_id", "Postiz platform user id resolved by the support bot"],
+      ["postiz_org_id", "Postiz organization id resolved by the support bot"],
+      ["postiz_plan", "Postiz plan tier at the time the support bot last resolved the account"],
     ] as const) {
       await this.client.createContactAttribute(name, description).catch(() => {});
     }

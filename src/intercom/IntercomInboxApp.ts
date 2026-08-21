@@ -10,6 +10,7 @@ import type { BillingActionService } from "../bot/billing/actions/BillingActionS
 import type { ActionActor } from "../bot/billing/actions/ActionRegistry";
 import type { PanelTokens } from "./panel/PanelTokens";
 import type { PanelSessions } from "./panel/PanelSessions";
+import type { PostizIdentityService } from "../postiz/PostizIdentityService";
 
 // Canvas Kit inbox app: renders a live context card in the Intercom inbox
 // sidebar. Everything is fetched at render time (plan, charges, ticket state)
@@ -58,7 +59,10 @@ export class IntercomInboxApp {
     private categoryLabelResolver: (id: string | null) => string | null,
     private billingActions: BillingActionService,
     private panelTokens: PanelTokens,
-    private panelSessions: PanelSessions
+    private panelSessions: PanelSessions,
+    // Optional: the card degrades to the identity stamped on the ticket when
+    // the platform lookup is off or unconfigured.
+    private postizIdentity?: PostizIdentityService
   ) {}
 
   bindClient(client: Client): void {
@@ -223,9 +227,7 @@ export class IntercomInboxApp {
       components.push(text("💳 No linked Stripe customer."));
     }
 
-    if (session?.postizUserId) {
-      components.push(dataRow("Postiz user", session.postizUserId));
-    }
+    components.push(...(await this.postizSection(ticket, session?.postizUserId ?? null)));
 
     components.push(...(await this.chargeReviewSection(link.ticketThreadId)));
     components.push(...(await this.approvalsSection(String(conversationId))));
@@ -332,6 +334,57 @@ export class IntercomInboxApp {
       );
     }
     if (pending.length > 3) components.push(text(`…more in the Stripe panel.`));
+    return components;
+  }
+
+  // The Postiz account behind this conversation: who they are on the platform,
+  // which organization, and what plan the platform actually has them on.
+  //
+  // The stamped id is authoritative for WHICH account this is (resolved once at
+  // ticket creation); the live lookup is what supplies the email, names and the
+  // CURRENT tier, in keeping with this card's "fetched at render time" rule. A
+  // lookup that is off, slow or failing degrades to the stamped columns rather
+  // than dropping the section.
+  private async postizSection(
+    ticket: { postizUserId: string | null; postizOrgId: string | null; postizTier: string | null; postizRole: string | null } | null,
+    sessionPostizUserId: string | null
+  ): Promise<CanvasComponent[]> {
+    const stampedId = ticket?.postizUserId ?? null;
+    const lookupTerm = stampedId ?? sessionPostizUserId;
+    if (!lookupTerm) return [text("👤 No Postiz account linked.")];
+
+    const components: CanvasComponent[] = [header("👤 Postiz account")];
+    const account = this.postizIdentity
+      ? await timeBox(this.postizIdentity.resolve(lookupTerm), FETCH_TIMEOUT_MS).catch((e) => {
+          this.log.warn("postiz lookup failed", { error: e instanceof Error ? e.message : String(e) });
+          return null;
+        })
+      : null;
+
+    if (account) {
+      components.push(
+        dataRow("User ID", account.userId),
+        ...(account.email ? [dataRow("Email", account.email)] : []),
+        ...(account.name ? [dataRow("Name", account.name)] : []),
+        dataRow("Organization", account.orgName ? `${account.orgName} (${account.orgId})` : account.orgId),
+        ...(account.role ? [dataRow("Role", account.role)] : []),
+        dataRow("Plan", account.tier ?? "none")
+      );
+      // The tier the platform reports now versus the one recorded when this
+      // ticket was opened: a mismatch is exactly the drift the billing panel
+      // can repair, so it is worth an agent seeing it here.
+      if (ticket?.postizTier && account.tier && ticket.postizTier !== account.tier) {
+        components.push(dataRow("Plan at ticket open", ticket.postizTier));
+      }
+      return components;
+    }
+
+    // Degraded: everything known without the platform.
+    components.push(dataRow("User ID", lookupTerm));
+    if (ticket?.postizOrgId) components.push(dataRow("Organization", ticket.postizOrgId));
+    if (ticket?.postizRole) components.push(dataRow("Role", ticket.postizRole));
+    if (ticket?.postizTier) components.push(dataRow("Plan (at ticket open)", ticket.postizTier));
+    components.push(dataRow("Live lookup", this.postizIdentity ? "unavailable" : "not configured"));
     return components;
   }
 

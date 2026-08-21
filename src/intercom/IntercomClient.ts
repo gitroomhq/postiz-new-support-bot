@@ -285,10 +285,17 @@ export class IntercomClient {
 
   // Refreshes display identity on an existing contact (Discord names drift;
   // avatar was never set at create time). Never adds an email.
-  async updateContact(contactId: string, input: { name?: string | null; avatarUrl?: string | null }): Promise<void> {
+  async updateContact(
+    contactId: string,
+    input: { name?: string | null; avatarUrl?: string | null; customAttributes?: Record<string, unknown> }
+  ): Promise<void> {
     const body: Record<string, unknown> = {};
     if (input.name) body.name = input.name;
     if (input.avatarUrl) body.avatar = input.avatarUrl;
+    // Attributes are merged by Intercom, so only the changed keys are sent.
+    if (input.customAttributes && Object.keys(input.customAttributes).length > 0) {
+      body.custom_attributes = input.customAttributes;
+    }
     if (Object.keys(body).length === 0) return;
     await this.json(`/contacts/${encodeURIComponent(contactId)}`, "PUT", body, "contact update");
   }
