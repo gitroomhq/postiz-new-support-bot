@@ -112,6 +112,44 @@ export class StripeClient {
     };
   }
 
+  // Billing shape of a subscription, for the self-service guardrails: whether
+  // it is actually being paid for right now, and how long a period one charge
+  // buys. Both are invisible on the charge itself, which is why the
+  // self-service flow could not previously tell an annual payment from a
+  // monthly one, or a trial from a paying customer.
+  async getSubscriptionBillingContext(
+    subscriptionId: string
+  ): Promise<{
+    status: string;
+    customerId: string | null;
+    interval: string | null;
+    intervalCount: number;
+    monthsPerPeriod: number | null;
+  } | null> {
+    const sub = await this.stripe.subscriptions.retrieve(subscriptionId);
+    const price = sub.items.data[0]?.price;
+    const recurring = price?.recurring ?? null;
+    const interval = recurring?.interval ?? null;
+    const intervalCount = recurring?.interval_count ?? 1;
+    // Normalised to months so callers compare one number instead of
+    // re-deriving the day/week/month/year ladder.
+    const monthsPerPeriod =
+      interval === "year"
+        ? 12 * intervalCount
+        : interval === "month"
+          ? intervalCount
+          : interval === "week" || interval === "day"
+            ? 0 // shorter than a month; never a multi-month prepayment
+            : null;
+    return {
+      status: sub.status,
+      customerId: typeof sub.customer === "string" ? sub.customer : (sub.customer?.id ?? null),
+      interval,
+      intervalCount,
+      monthsPerPeriod,
+    };
+  }
+
   async applyDiscountCoupon(subscriptionId: string, couponId: string, idempotencyKey?: string): Promise<void> {
     await this.stripe.subscriptions.update(
       subscriptionId,

@@ -214,29 +214,49 @@ export class BillingCategory extends BaseCategory {
         day: "numeric",
       });
 
+      // The retention offer is only shown to customers it actually applies to
+      // (see checkDiscountEligibility). Everyone else goes straight to the
+      // refund path, where the guardrails decide self-service versus a human.
+      const discountBlocked = await this.checkDiscountEligibility(invoice.subscriptionId);
+
       const invoiceEmbed = new EmbedBuilder()
         .setTitle("Subscription Charge Found")
         .setDescription(
           `We found your most recent subscription charge:\n\n` +
           `**Amount:** ${amount}\n` +
           `**Date:** ${date}\n\n` +
-          `Before processing a refund and cancelling your subscription, we'd like to offer you **50% off your next month** instead. Would you like that?`
+          (discountBlocked
+            ? `Would you like to proceed with a refund and cancel your subscription?`
+            : `Before processing a refund and cancelling your subscription, we'd like to offer you **50% off your next month** instead. Would you like that?`)
         )
         .setColor(0x5865f2);
 
-      const acceptButton = new ButtonBuilder()
-        .setCustomId(`bill_disc_ok:${interaction.user.id}:${invoice.subscriptionId}:${invoice.chargeId}`)
-        .setLabel("Yes, 50% off next month")
-        .setEmoji("✅")
-        .setStyle(ButtonStyle.Success);
-
       const declineButton = new ButtonBuilder()
         .setCustomId(`bill_disc_no:${interaction.user.id}:${invoice.chargeId}:${invoice.subscriptionId}`)
-        .setLabel("No thanks, refund & cancel")
+        .setLabel(discountBlocked ? "Refund & cancel" : "No thanks, refund & cancel")
         .setEmoji("💰")
         .setStyle(ButtonStyle.Danger);
 
-      const row = new ActionRowBuilder<ButtonBuilder>().addComponents(acceptButton, declineButton);
+      const buttons = discountBlocked
+        ? [declineButton]
+        : [
+            new ButtonBuilder()
+              .setCustomId(`bill_disc_ok:${interaction.user.id}:${invoice.subscriptionId}:${invoice.chargeId}`)
+              .setLabel("Yes, 50% off next month")
+              .setEmoji("✅")
+              .setStyle(ButtonStyle.Success),
+            declineButton,
+          ];
+      if (discountBlocked) {
+        billingLog.info("billing.discount.not_offered", {
+          "stripe.charge_id": invoice.chargeId,
+          "stripe.subscription_id": invoice.subscriptionId,
+          "discount.reason": discountBlocked,
+          "discord.user_id": interaction.user.id,
+        });
+      }
+
+      const row = new ActionRowBuilder<ButtonBuilder>().addComponents(...buttons);
 
       await thread.send({ embeds: [invoiceEmbed], components: [row] });
     } catch (error) {
@@ -253,6 +273,51 @@ export class BillingCategory extends BaseCategory {
     const chargeId = parts[3];
 
     await interaction.deferReply();
+
+    // Re-checked here, not just when the button was rendered: the ids ride in
+    // the component custom_id, and the subscription can have changed state
+    // between the offer and the click. Everything below runs BEFORE the claim,
+    // because a claim consumes the charge and a refusal after it would strand
+    // the customer with neither discount nor refund.
+    const invokerCustomerId = (await this.sessionStore.getSession(interaction.user.id))?.stripeCustomerId ?? null;
+    let subCustomerId: string | null = null;
+    try {
+      subCustomerId = (await this.stripeClient.getSubscriptionBillingContext(subscriptionId))?.customerId ?? null;
+    } catch {
+      subCustomerId = null;
+    }
+    // Ownership gate, same standard as the refund path: the subscription must
+    // belong to the invoker's own linked Stripe customer.
+    if (!invokerCustomerId || !subCustomerId || subCustomerId !== invokerCustomerId) {
+      billingLog.warn("billing.discount.ownership_mismatch", {
+        "stripe.subscription_id": subscriptionId,
+        "discord.user_id": interaction.user.id,
+      });
+      await this.disableButtons(interaction);
+      await interaction.editReply({
+        embeds: [makeEmbed("This subscription can't be matched to your account. A support agent will take a look.", COLORS.warn)],
+      });
+      return;
+    }
+
+    const ineligible = await this.checkDiscountEligibility(subscriptionId);
+    if (ineligible) {
+      billingLog.warn("billing.discount.refused", {
+        "stripe.subscription_id": subscriptionId,
+        "discount.reason": ineligible,
+        "discord.user_id": interaction.user.id,
+      });
+      await this.disableButtons(interaction);
+      await interaction.editReply({
+        embeds: [
+          makeEmbed(
+            "This offer isn't available on your current subscription. A support agent will take a look at your request.",
+            COLORS.warn
+          ),
+        ],
+      });
+      return;
+    }
 
     // Claim the charge BEFORE calling Stripe — the unique index on the billing-action row
     // is the lock, so a second confirm (even from a parallel refund thread) loses here.
@@ -384,7 +449,7 @@ export class BillingCategory extends BaseCategory {
     const amountText = this.stripeClient.formatAmount(charge.amount, charge.currency);
 
     // Guardrails: on breach, no Stripe call and no lock row — a human takes over.
-    const breach = await this.checkRefundGuardrails(interaction, charge, chargeId);
+    const breach = await this.checkRefundGuardrails(interaction, charge, chargeId, subscriptionId);
     if (breach) {
       billingLog.warn("billing.refund.blocked", {
         "stripe.charge_id": chargeId,
@@ -459,11 +524,42 @@ export class BillingCategory extends BaseCategory {
     }
   }
 
+  // Is the retention discount legitimate for this subscription?
+  //
+  // The offer is "50% off your next month", which only makes sense for a
+  // customer who is actually paying monthly right now. A TRIALING subscriber
+  // has not paid anything yet, so handing them 50% off discounts a bill they
+  // have never been charged; and on an annual plan "next month" is not a
+  // billing period at all, so the coupon would silently take half off a whole
+  // year. Neither is verifiable from the charge, so both need the
+  // subscription.
+  //
+  // Returns null when the discount is allowed, or a reason when it is not.
+  private async checkDiscountEligibility(subscriptionId: string): Promise<string | null> {
+    if (!subscriptionId) return "no subscription resolved for this charge";
+    try {
+      const billing = await this.stripeClient.getSubscriptionBillingContext(subscriptionId);
+      if (!billing) return "subscription could not be read";
+      // Only a live paying subscription. Trialing has never been billed;
+      // past_due/unpaid/incomplete/canceled are not states to discount into.
+      if (billing.status !== "active") return `subscription is ${billing.status}, not an active paid subscription`;
+      if (billing.monthsPerPeriod == null) return "billing period could not be determined";
+      if (billing.monthsPerPeriod > 1) return "subscription is not billed monthly";
+      return null;
+    } catch (error) {
+      billingLog.error("discount eligibility lookup failed", error, {
+        "stripe.subscription_id": subscriptionId,
+      });
+      return "subscription could not be read";
+    }
+  }
+
   // First tripped guardrail as a human-readable reason, or null when all pass.
   private async checkRefundGuardrails(
     interaction: ButtonInteraction,
     charge: { amount: number; currency: string; created: Date; customerId: string | null },
-    chargeId: string
+    chargeId: string,
+    subscriptionId: string
   ): Promise<string | null> {
     // Blocklisted customers never self-serve money movement — straight to
     // manual review. Both identities are checked: the invoker's linked Stripe
@@ -476,6 +572,40 @@ export class BillingCategory extends BaseCategory {
     }
     if (blockHit) {
       return `Customer is on the billing block list (${blockHit.kind}): ${blockHit.reason}`;
+    }
+
+    // Multi-month prepayments never self-serve.
+    //
+    // One annual charge buys a whole year, so refunding it in full hands back
+    // far more than any monthly plan and is exactly the decision a human
+    // should make. Nothing on the charge says how long a period it paid for,
+    // so this has to come off the subscription's price. The amount cap below
+    // is not a substitute: it is optional (blank = no cap), scoped to a single
+    // currency, and a cap set high enough for a large monthly plan lets an
+    // annual charge straight through.
+    //
+    // Unverifiable cases go to review, matching every other guardrail here.
+    if (!subscriptionId) {
+      return "The billing period for this charge could not be verified.";
+    }
+    try {
+      const billing = await this.stripeClient.getSubscriptionBillingContext(subscriptionId);
+      if (!billing || billing.monthsPerPeriod == null) {
+        return "The billing period for this subscription could not be verified.";
+      }
+      if (billing.monthsPerPeriod > 1) {
+        const period =
+          billing.interval === "year" && billing.intervalCount === 1
+            ? "annual"
+            : `${billing.monthsPerPeriod}-month`;
+        return `Charge covers an ${period} billing period; self-service refunds are limited to monthly subscriptions.`;
+      }
+    } catch (error) {
+      billingLog.error("subscription billing context lookup failed", error, {
+        "stripe.charge_id": chargeId,
+        "stripe.subscription_id": subscriptionId,
+      });
+      return "The billing period for this subscription could not be verified.";
     }
 
     const maxAmount = this.settingsStore.refundMaxAmount();
