@@ -1,12 +1,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { IntercomInboxApp } from "../IntercomInboxApp";
+import { IntercomInboxApp, collapse } from "../IntercomInboxApp";
 import type { PostizIdentityService } from "../../postiz/PostizIdentityService";
 
-// The canvas card is the agent-facing view inside the Intercom inbox. Its rule
-// is "fetched at render time, nothing stale", so the live lookup supplies the
-// email and current plan while the ticket's stamped id decides WHICH account.
-// A lookup that is off, slow or failing must degrade, never blank the section.
+// The canvas card is the agent-facing view inside the Intercom inbox. The case
+// that matters most is the one it used to refuse outright: a conversation this
+// bot did not create (email, website, Sentry feedback), where the contact's
+// email is the only identifier available.
 
 type Row = { type: string; text?: string };
 
@@ -22,19 +22,19 @@ const account = (over: Record<string, unknown> = {}) => ({
   ...over,
 });
 
-const ticket = (over: Record<string, unknown> = {}) =>
-  ({ postizUserId: "usr_1", postizOrgId: "org_1", postizTier: "PRO", postizRole: "ADMIN", ...over }) as never;
+const stamped = (over: Record<string, unknown> = {}) =>
+  ({ postizOrgId: "org_1", postizTier: "PRO", postizRole: "ADMIN", ...over }) as never;
 
-function appWith(identity: PostizIdentityService | undefined) {
+function render(identity: PostizIdentityService | undefined) {
   const app = new IntercomInboxApp(
     {} as never, {} as never, {} as never, {} as never, {} as never,
-    () => null, {} as never, {} as never, {} as never,
+    () => null, {} as never, {} as never, {} as never, {} as never,
     identity
   );
-  return async (t: unknown, sessionId: string | null = null): Promise<string[]> => {
+  return async (input: unknown): Promise<string[]> => {
     const rows = (await (app as unknown as {
-      postizSection(t: unknown, s: string | null): Promise<Row[]>;
-    }).postizSection(t, sessionId)) as Row[];
+      postizSection(i: unknown): Promise<Row[]>;
+    }).postizSection(input)) as Row[];
     return rows.map((r) => r.text ?? r.type);
   };
 }
@@ -48,64 +48,124 @@ const identityReturning = (value: unknown, calls?: string[]) =>
     },
   }) as unknown as PostizIdentityService;
 
-test("a resolved account shows the id, email, name, organization, role and plan", async () => {
-  const render = appWith(identityReturning(account()));
-  const rows = await render(ticket());
+test("an emailed-in customer with no Discord ticket is identified from their contact email", async () => {
+  // This is the whole point: before the platform search existed, this
+  // conversation was anonymous to us.
+  const calls: string[] = [];
+  const rows = await render(identityReturning(account(), calls))({
+    stampedUserId: null,
+    email: "jamie@example.com",
+    stamped: null,
+  });
+  assert.deepEqual(calls, ["jamie@example.com"]);
   assert.ok(rows.some((r) => r.includes("User ID:") && r.includes("usr_1")));
-  assert.ok(rows.some((r) => r.includes("Email:") && r.includes("jamie@example.com")));
-  assert.ok(rows.some((r) => r.includes("Name:") && r.includes("Jamie")));
-  assert.ok(rows.some((r) => r.includes("Organization:") && r.includes("Acme") && r.includes("org_1")));
-  assert.ok(rows.some((r) => r.includes("Role:") && r.includes("ADMIN")));
-  assert.ok(rows.some((r) => r.includes("Plan:") && r.includes("PRO")));
+  assert.ok(rows.some((r) => r.includes("Organization:") && r.includes("Acme")));
+  assert.ok(rows.some((r) => r.includes("Plan:") && r.includes("PRO") && r.includes("ADMIN")));
 });
 
-test("the stamped id is what gets looked up, not the self-linked session id", async () => {
+test("a bridged ticket prefers its stamped id over the contact email", async () => {
   const calls: string[] = [];
-  const render = appWith(identityReturning(account(), calls));
-  await render(ticket({ postizUserId: "usr_stamped" }), "usr_session");
+  await render(identityReturning(account(), calls))({
+    stampedUserId: "usr_stamped",
+    email: "someone-else@example.com",
+    stamped: stamped(),
+  });
   assert.deepEqual(calls, ["usr_stamped"]);
 });
 
-test("falls back to the session id when the ticket was never resolved", async () => {
-  const calls: string[] = [];
-  const render = appWith(identityReturning(account(), calls));
-  await render(ticket({ postizUserId: null }), "usr_session");
-  assert.deepEqual(calls, ["usr_session"]);
-});
-
 test("a plan that changed since the ticket opened is called out", async () => {
-  // This is exactly the drift the billing panel can repair, so an agent
-  // reading the conversation should see both numbers.
-  const render = appWith(identityReturning(account({ tier: "ULTIMATE" })));
-  const rows = await render(ticket({ postizTier: "PRO" }));
+  const rows = await render(identityReturning(account({ tier: "ULTIMATE" })))({
+    stampedUserId: "usr_1",
+    email: null,
+    stamped: stamped({ postizTier: "PRO" }),
+  });
   assert.ok(rows.some((r) => r.includes("Plan:") && r.includes("ULTIMATE")));
   assert.ok(rows.some((r) => r.includes("Plan at ticket open:") && r.includes("PRO")));
 });
 
 test("an unchanged plan does not repeat itself", async () => {
-  const render = appWith(identityReturning(account({ tier: "PRO" })));
-  const rows = await render(ticket({ postizTier: "PRO" }));
+  const rows = await render(identityReturning(account({ tier: "PRO" })))({
+    stampedUserId: "usr_1",
+    email: null,
+    stamped: stamped({ postizTier: "PRO" }),
+  });
   assert.ok(!rows.some((r) => r.includes("Plan at ticket open")));
 });
 
 test("a failing lookup degrades to the stamped identity instead of vanishing", async () => {
-  const render = appWith(identityReturning(new Error("platform down")));
-  const rows = await render(ticket());
+  const rows = await render(identityReturning(new Error("platform down")))({
+    stampedUserId: "usr_1",
+    email: null,
+    stamped: stamped(),
+  });
   assert.ok(rows.some((r) => r.includes("User ID:") && r.includes("usr_1")));
   assert.ok(rows.some((r) => r.includes("Organization:") && r.includes("org_1")));
-  assert.ok(rows.some((r) => r.includes("Plan (at ticket open):") && r.includes("PRO")));
   assert.ok(rows.some((r) => r.includes("Live lookup:") && r.includes("unavailable")));
 });
 
-test("with no lookup configured the section still shows what the ticket knows", async () => {
-  const render = appWith(undefined);
-  const rows = await render(ticket());
-  assert.ok(rows.some((r) => r.includes("User ID:") && r.includes("usr_1")));
+test("a failing lookup on an email-only conversation still shows the email", async () => {
+  const rows = await render(identityReturning(new Error("down")))({
+    stampedUserId: null,
+    email: "jamie@example.com",
+    stamped: null,
+  });
+  assert.ok(rows.some((r) => r.includes("Email:") && r.includes("jamie@example.com")));
+  assert.ok(rows.some((r) => r.includes("Live lookup:")));
+});
+
+test("with no lookup configured the section says so rather than looking empty", async () => {
+  const rows = await render(undefined)({ stampedUserId: "usr_1", email: null, stamped: stamped() });
   assert.ok(rows.some((r) => r.includes("Live lookup:") && r.includes("not configured")));
 });
 
-test("a customer with no Postiz identity anywhere gets one honest line", async () => {
-  const render = appWith(identityReturning(account()));
-  const rows = await render(ticket({ postizUserId: null }), null);
-  assert.deepEqual(rows, ["👤 No Postiz account linked."]);
+test("a conversation with neither an account nor an email says it is unidentified", async () => {
+  const rows = await render(identityReturning(account()))({ stampedUserId: null, email: null, stamped: null });
+  assert.ok(rows.some((r) => r.includes("Not identified")));
+});
+
+// ---- row collapsing (the duplicate ULTIMATE/failed-charge rows) ----
+
+test("collapse: identical rows fold into one with a count", () => {
+  const rows = collapse(
+    [
+      { label: "$1.00", value: "failed · 2026-08-20" },
+      { label: "$1.00", value: "failed · 2026-08-20" },
+      { label: "$1.00", value: "failed · 2026-08-20" },
+    ],
+    3
+  );
+  assert.deepEqual(rows, [{ label: "$1.00", value: "failed · 2026-08-20 (×3)" }]);
+});
+
+test("collapse: distinct rows are kept separate and uncounted", () => {
+  const rows = collapse(
+    [
+      { label: "ULTIMATE MONTHLY", value: "canceled" },
+      { label: "STANDARD MONTHLY", value: "canceled" },
+    ],
+    3
+  );
+  assert.deepEqual(rows, [
+    { label: "ULTIMATE MONTHLY", value: "canceled" },
+    { label: "STANDARD MONTHLY", value: "canceled" },
+  ]);
+});
+
+test("collapse: overflow past the limit is reported, never silently dropped", () => {
+  const rows = collapse(
+    [
+      { label: "a", value: "1" },
+      { label: "b", value: "2" },
+      { label: "c", value: "3" },
+      { label: "d", value: "4" },
+      { label: "e", value: "5" },
+    ],
+    3
+  );
+  assert.equal(rows.length, 4);
+  assert.deepEqual(rows[3], { label: "…", value: "2 more not shown" });
+});
+
+test("collapse: an empty list stays empty", () => {
+  assert.deepEqual(collapse([], 3), []);
 });

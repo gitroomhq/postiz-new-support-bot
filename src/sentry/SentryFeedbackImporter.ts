@@ -45,6 +45,47 @@ export class SentryFeedbackImporter {
     private orgLinks?: PostizOrgLinkStore
   ) {}
 
+  private contactAttrsEnsured = false;
+
+  // Mirrors the account onto the Intercom CONTACT so it renders in Intercom's
+  // own sidebar. Feedback submitters arrive with no Discord ticket behind them,
+  // so the bridge's contact-attribute path never runs for them and this is the
+  // only place they get identified natively.
+  //
+  // The definitions must exist before a value can be written; "already exists"
+  // after the first run is the normal case, so every step is best-effort.
+  private async stampContactIdentity(
+    contactId: string,
+    identity: { userId: string | null; orgId: string | null }
+  ): Promise<void> {
+    if (!identity.userId && !identity.orgId) return;
+    // Guarded as a whole, not per call: this decorates an import that has
+    // already succeeded, so nothing in here may turn a delivered conversation
+    // into a failed item.
+    try {
+      if (!this.contactAttrsEnsured) {
+        this.contactAttrsEnsured = true;
+        await this.intercom
+          .createContactAttribute("postiz_user_id", "Postiz platform user id resolved by the support bot")
+          .catch(() => {});
+        await this.intercom
+          .createContactAttribute("postiz_org_id", "Postiz organization id resolved by the support bot")
+          .catch(() => {});
+      }
+      await this.intercom.updateContact(contactId, {
+        customAttributes: {
+          ...(identity.userId ? { postiz_user_id: identity.userId } : {}),
+          ...(identity.orgId ? { postiz_org_id: identity.orgId } : {}),
+        },
+      });
+    } catch (e) {
+      syncLog.warn("sentry feedback import: contact identity stamp failed", {
+        "intercom.contact_id": contactId,
+        "error.message": e instanceof Error ? e.message : String(e),
+      });
+    }
+  }
+
   // Never allowed to disturb an import: the mapping is a side benefit.
   private async harvestLink(identity: { orgId: string | null; stripeCustomerId: string | null }): Promise<void> {
     if (!this.orgLinks) return;
@@ -154,6 +195,7 @@ export class SentryFeedbackImporter {
         }
 
         const match = await this.ensureContact(email, context.name, paceWrite);
+        await this.stampContactIdentity(match.id, context.identity);
         const fromType = match.role === "lead" ? "lead" : "user";
 
         await paceWrite();
@@ -352,6 +394,7 @@ export class SentryFeedbackImporter {
         }
 
         const match = await this.ensureContact(email, context.name ?? row.contactName, paceWrite);
+        await this.stampContactIdentity(match.id, context.identity);
         await paceWrite();
         const conversationId = await this.intercom.createConversation(
           match.id,

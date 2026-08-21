@@ -283,6 +283,38 @@ export class IntercomClient {
     }
   }
 
+  // Primary contact behind a conversation, for the conversations this bot did
+  // NOT create: email, website Messenger, Sentry feedback imports. The Discord
+  // bridge knows its customer from its own link table; everything else only
+  // has whoever Intercom attached, so the email here is the one identifier
+  // available to resolve them against the platform.
+  async getConversationContact(
+    conversationId: string
+  ): Promise<{ contactId: string | null; email: string | null; name: string | null } | null> {
+    try {
+      const data = await this.json<{
+        contacts?: { contacts?: Array<{ id?: string | number; email?: string | null; name?: string | null }> };
+        source?: { author?: { type?: string; id?: string | number; email?: string | null; name?: string | null } };
+      }>(`/conversations/${encodeURIComponent(conversationId)}`, "GET", undefined, "conversation contact");
+
+      // contacts[] is the attached customer and is authoritative. The source
+      // author is the fallback, but only when it IS the customer: on a
+      // teammate-authored conversation the author is the admin, not them.
+      const attached = data.contacts?.contacts?.[0];
+      const author = data.source?.author;
+      const authorIsCustomer = author?.type === "user" || author?.type === "lead" || author?.type === "contact";
+
+      const contactId = attached?.id != null ? String(attached.id) : authorIsCustomer && author?.id != null ? String(author.id) : null;
+      const email = attached?.email?.trim() || (authorIsCustomer ? author?.email?.trim() : null) || null;
+      const name = attached?.name?.trim() || (authorIsCustomer ? author?.name?.trim() : null) || null;
+      if (!contactId && !email) return null;
+      return { contactId, email, name };
+    } catch (e) {
+      if (e instanceof IntercomHttpError && e.status === 404) return null;
+      throw e;
+    }
+  }
+
   // Refreshes display identity on an existing contact (Discord names drift;
   // avatar was never set at create time). Never adds an email.
   async updateContact(

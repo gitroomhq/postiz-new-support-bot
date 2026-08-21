@@ -442,6 +442,7 @@ async function main() {
     billingActionService,
     panelTokens,
     panelSessions,
+    intercomClient,
     postizIdentity
   );
 

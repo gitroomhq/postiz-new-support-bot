@@ -43,6 +43,7 @@ const withIdentity = (email: string | null, over: Partial<SentryFeedbackContext>
 
 function harness(opts: HarnessOpts = {}) {
   const ops: string[] = [];
+  let breakStamp = false;
   const promoted: Array<{ id: string; email: string; orgId: string | null }> = [];
   const retried: string[] = [];
 
@@ -72,6 +73,13 @@ function harness(opts: HarnessOpts = {}) {
       ops.push(`intercom.note:${conversationId}`);
       // The note is what carries the recovered ids to the agent.
       if (input.body.includes("org_1")) ops.push("note.has_org");
+    },
+    async createContactAttribute() {},
+    async updateContact(contactId: string, input: { customAttributes?: Record<string, unknown> }) {
+      if (breakStamp) throw new Error("attribute rejected");
+      // The contact attributes are what make a feedback submitter identifiable
+      // in Intercom's own sidebar; they have no Discord ticket behind them.
+      ops.push(`intercom.contact_attrs:${contactId}:${Object.keys(input.customAttributes ?? {}).sort().join(",")}`);
     },
     async findOrCreateTag() {
       return { id: "tag_1" };
@@ -117,6 +125,9 @@ function harness(opts: HarnessOpts = {}) {
     ops,
     promoted,
     retried,
+    breakContactStamp: () => {
+      breakStamp = true;
+    },
   };
 }
 
@@ -169,6 +180,19 @@ test("replay: shares the tick import budget so a backlog cannot flood Intercom a
 
   assert.equal(res.replayed, 25);
   assert.equal(h.promoted.length, 25, "the remainder drains on later ticks");
+});
+
+test("replay: the contact identity stamp is decoration and cannot fail an import", async () => {
+  // The stamp runs after the conversation exists. An Intercom that rejects the
+  // attribute write (or a client missing the method entirely) must leave the
+  // import standing rather than re-queueing a delivered conversation.
+  const h = harness({ rows: [skipped("400")], contexts: { "400": withIdentity("x@example.com") } });
+  h.breakContactStamp();
+  const res = await h.importer.tick(false);
+
+  assert.equal(res.replayed, 1);
+  assert.equal(res.errors, 0);
+  assert.equal(h.promoted.length, 1);
 });
 
 test("replay: mixed batch splits into recovered and exhausted without cross-contamination", async () => {

@@ -11,6 +11,7 @@ import type { ActionActor } from "../bot/billing/actions/ActionRegistry";
 import type { PanelTokens } from "./panel/PanelTokens";
 import type { PanelSessions } from "./panel/PanelSessions";
 import type { PostizIdentityService } from "../postiz/PostizIdentityService";
+import type { IntercomClient } from "./IntercomClient";
 
 // Canvas Kit inbox app: renders a live context card in the Intercom inbox
 // sidebar. Everything is fetched at render time (plan, charges, ticket state)
@@ -60,6 +61,9 @@ export class IntercomInboxApp {
     private billingActions: BillingActionService,
     private panelTokens: PanelTokens,
     private panelSessions: PanelSessions,
+    // Reads the contact behind a conversation this bot did not create (email,
+    // website, Sentry feedback) — those have no Discord link to read from.
+    private intercomClient?: IntercomClient,
     // Optional: the card degrades to the identity stamped on the ticket when
     // the platform lookup is off or unconfigured.
     private postizIdentity?: PostizIdentityService
@@ -195,46 +199,67 @@ export class IntercomInboxApp {
     const conversationId = request?.conversation?.id ?? request?.context?.conversation_id;
     if (conversationId == null) return canvas([text("No conversation context.")]);
 
+    // A conversation is EITHER Discord-bridged (this bot opened it and knows
+    // the customer from its own link table) or native: email, website
+    // Messenger, or a Sentry feedback import. Native conversations used to get
+    // "not bridged" and nothing else, which is precisely backwards — they are
+    // the ones where nobody knows who the person is. Their Intercom contact
+    // email is the identifier that resolves them against the platform.
     const link = await this.store.getLinkByConversationId(String(conversationId)).catch(() => null);
-    if (!link) return canvas([text("Not a Discord-bridged conversation.")]);
-
-    const ticket = await this.ticketStore.getByThreadId(link.ticketThreadId).catch(() => null);
+    const ticket = link ? await this.ticketStore.getByThreadId(link.ticketThreadId).catch(() => null) : null;
     const session = ticket?.customerId
       ? await this.sessionStore.getSession(ticket.customerId).catch(() => null)
       : null;
 
+    const nativeContact = link
+      ? null
+      : await this.nativeContact(String(conversationId));
+
     const components: CanvasComponent[] = [];
     if (notice) components.push(text(notice), divider());
-    components.push(header("🎫 Discord ticket"));
 
-    if (ticket) {
-      const statusLabel = ticket.statusTag ? `${ticket.statusTag.emoji} ${ticket.statusTag.label}` : "N/A";
-      components.push(
-        dataRow("Customer", ticket.customerDisplayName ?? ticket.customerId ?? "unknown"),
-        dataRow("Category", this.categoryLabelResolver(ticket.categoryId) ?? "N/A"),
-        dataRow("Status", statusLabel),
-        ...(ticket.csatScore != null ? [dataRow("CSAT", `${ticket.csatScore}/5`)] : [])
-      );
-    } else {
-      components.push(text("Discord ticket record not found."));
-    }
+    // Identity first: who this is comes before what they pay.
+    components.push(
+      ...(await this.postizSection({
+        stampedUserId: ticket?.postizUserId ?? session?.postizUserId ?? null,
+        email: nativeContact?.email ?? null,
+        stamped: ticket,
+      }))
+    );
+
+    // Stripe customer: from the Discord link, or resolved from the contact
+    // email for a native conversation.
+    const stripeCustomerId =
+      session?.stripeCustomerId ?? (nativeContact?.email ? await this.customerIdForEmail(nativeContact.email) : null);
 
     components.push(divider());
-
-    if (session?.stripeCustomerId) {
-      components.push(...(await this.billingSection(session.stripeCustomerId)));
+    if (stripeCustomerId) {
+      components.push(...(await this.billingSection(stripeCustomerId)));
     } else {
       components.push(text("💳 No linked Stripe customer."));
     }
 
-    components.push(...(await this.postizSection(ticket, session?.postizUserId ?? null)));
+    // Discord context last, and only when there is any: an email conversation
+    // has no ticket, category or thread to show.
+    if (ticket) {
+      const who = ticket.customerDisplayName ?? ticket.customerId ?? "unknown";
+      const category = this.categoryLabelResolver(ticket.categoryId);
+      components.push(
+        divider(),
+        header("🎫 Discord ticket"),
+        dataRow("Customer", category ? `${who} · ${category}` : who),
+        ...(ticket.csatScore != null ? [dataRow("CSAT", `${ticket.csatScore}/5`)] : [])
+      );
+    } else if (!link) {
+      components.push(divider(), text(`🎫 ${nativeContact?.sourceLabel ?? "Native Intercom conversation"} · no Discord ticket.`));
+    }
 
-    components.push(...(await this.chargeReviewSection(link.ticketThreadId)));
+    if (link) components.push(...(await this.chargeReviewSection(link.ticketThreadId)));
     components.push(...(await this.approvalsSection(String(conversationId))));
 
     components.push(divider());
 
-    const threadUrl = await this.threadUrl(link.ticketThreadId);
+    const threadUrl = link ? await this.threadUrl(link.ticketThreadId) : null;
     if (threadUrl) {
       components.push({
         type: "button",
@@ -337,25 +362,56 @@ export class IntercomInboxApp {
     return components;
   }
 
-  // The Postiz account behind this conversation: who they are on the platform,
-  // which organization, and what plan the platform actually has them on.
+  // Contact behind a conversation this bot did not create. Time-boxed like
+  // every other fetch on this card.
+  private async nativeContact(
+    conversationId: string
+  ): Promise<{ email: string | null; name: string | null; contactId: string | null; sourceLabel: string } | null> {
+    if (!this.intercomClient) return null;
+    const contact = await timeBox(this.intercomClient.getConversationContact(conversationId), FETCH_TIMEOUT_MS).catch(
+      (e) => {
+        this.log.warn("conversation contact fetch failed", { error: e instanceof Error ? e.message : String(e) });
+        return null;
+      }
+    );
+    if (!contact) return null;
+    return { ...contact, sourceLabel: "Intercom conversation" };
+  }
+
+  // Email to Stripe customer, for native conversations that have no Discord
+  // link to read the customer from. Ambiguity is refused rather than guessed:
+  // showing the wrong person's billing is worse than showing none.
+  private async customerIdForEmail(email: string): Promise<string | null> {
+    const found = await timeBox(this.stripe.findCustomersByEmail(email), FETCH_TIMEOUT_MS).catch((e) => {
+      this.log.warn("stripe email lookup failed", { error: e instanceof Error ? e.message : String(e) });
+      return [] as Array<{ id: string }>;
+    });
+    return found.length === 1 ? found[0].id : null;
+  }
+
+  // Who this conversation is with, on the Postiz platform.
   //
-  // The stamped id is authoritative for WHICH account this is (resolved once at
-  // ticket creation); the live lookup is what supplies the email, names and the
-  // CURRENT tier, in keeping with this card's "fetched at render time" rule. A
-  // lookup that is off, slow or failing degrades to the stamped columns rather
-  // than dropping the section.
-  private async postizSection(
-    ticket: { postizUserId: string | null; postizOrgId: string | null; postizTier: string | null; postizRole: string | null } | null,
-    sessionPostizUserId: string | null
-  ): Promise<CanvasComponent[]> {
-    const stampedId = ticket?.postizUserId ?? null;
-    const lookupTerm = stampedId ?? sessionPostizUserId;
-    if (!lookupTerm) return [text("👤 No Postiz account linked.")];
+  // Two ways in: a Discord-bridged ticket carries the account id stamped at
+  // creation, while a native conversation (email, website, Sentry feedback)
+  // only has its Intercom contact email. The email path is the whole point of
+  // this section: before the platform exposed a search, an emailed-in customer
+  // was simply anonymous to us.
+  //
+  // The stamped id decides WHICH account; the live lookup supplies email,
+  // names and the CURRENT tier, keeping this card's "fetched at render time"
+  // rule. A lookup that is off, slow or failing degrades to whatever the
+  // ticket already recorded rather than dropping the section.
+  private async postizSection(input: {
+    stampedUserId: string | null;
+    email: string | null;
+    stamped: { postizOrgId: string | null; postizTier: string | null; postizRole: string | null } | null;
+  }): Promise<CanvasComponent[]> {
+    const term = input.stampedUserId ?? input.email;
+    if (!term) return [header("👤 Postiz account"), text("Not identified: no linked account and no contact email.")];
 
     const components: CanvasComponent[] = [header("👤 Postiz account")];
     const account = this.postizIdentity
-      ? await timeBox(this.postizIdentity.resolve(lookupTerm), FETCH_TIMEOUT_MS).catch((e) => {
+      ? await timeBox(this.postizIdentity.resolve(term), FETCH_TIMEOUT_MS).catch((e) => {
           this.log.warn("postiz lookup failed", { error: e instanceof Error ? e.message : String(e) });
           return null;
         })
@@ -365,25 +421,27 @@ export class IntercomInboxApp {
       components.push(
         dataRow("User ID", account.userId),
         ...(account.email ? [dataRow("Email", account.email)] : []),
-        ...(account.name ? [dataRow("Name", account.name)] : []),
         dataRow("Organization", account.orgName ? `${account.orgName} (${account.orgId})` : account.orgId),
-        ...(account.role ? [dataRow("Role", account.role)] : []),
-        dataRow("Plan", account.tier ?? "none")
+        dataRow("Plan", `${account.tier ?? "none"}${account.role ? ` · ${account.role}` : ""}`)
       );
-      // The tier the platform reports now versus the one recorded when this
-      // ticket was opened: a mismatch is exactly the drift the billing panel
-      // can repair, so it is worth an agent seeing it here.
-      if (ticket?.postizTier && account.tier && ticket.postizTier !== account.tier) {
-        components.push(dataRow("Plan at ticket open", ticket.postizTier));
+      // The tier the platform reports NOW versus the one recorded when the
+      // ticket opened: that gap is the drift the billing panel can repair.
+      if (input.stamped?.postizTier && account.tier && input.stamped.postizTier !== account.tier) {
+        components.push(dataRow("Plan at ticket open", input.stamped.postizTier));
       }
       return components;
     }
 
     // Degraded: everything known without the platform.
-    components.push(dataRow("User ID", lookupTerm));
-    if (ticket?.postizOrgId) components.push(dataRow("Organization", ticket.postizOrgId));
-    if (ticket?.postizRole) components.push(dataRow("Role", ticket.postizRole));
-    if (ticket?.postizTier) components.push(dataRow("Plan (at ticket open)", ticket.postizTier));
+    if (input.stampedUserId) {
+      components.push(dataRow("User ID", input.stampedUserId));
+      if (input.stamped?.postizOrgId) components.push(dataRow("Organization", input.stamped.postizOrgId));
+      if (input.stamped?.postizTier) {
+        components.push(dataRow("Plan (at ticket open)", `${input.stamped.postizTier}${input.stamped.postizRole ? ` · ${input.stamped.postizRole}` : ""}`));
+      }
+    } else if (input.email) {
+      components.push(dataRow("Email", input.email));
+    }
     components.push(dataRow("Live lookup", this.postizIdentity ? "unavailable" : "not configured"));
     return components;
   }
@@ -420,22 +478,31 @@ export class IntercomInboxApp {
           }
         }
       }
-      for (const sub of subs.slice(0, 3)) {
-        const item = sub.items.data[0];
-        const price = item?.price;
-        const label = price?.nickname ?? (typeof price?.product === "string" ? price.product : price?.id) ?? "plan";
-        const periodEnd = item?.current_period_end
-          ? new Date(item.current_period_end * 1000).toISOString().slice(0, 10)
-          : null;
-        const flags = [
-          sub.status,
-          periodEnd ? `period ends ${periodEnd}` : null,
-          sub.pause_collection ? "⏸ paused" : null,
-          sub.cancel_at_period_end ? "cancels at period end" : null,
-        ]
-          .filter(Boolean)
-          .join(" · ");
-        components.push(dataRow(label, flags));
+      // Identical rows are common (a customer can hold several copies of the
+      // same plan, and a retried payment repeats verbatim). Rendering each one
+      // buries the card in duplicates, so they collapse to one row with a
+      // count.
+      for (const row of collapse(
+        subs.map((sub) => {
+          const item = sub.items.data[0];
+          const price = item?.price;
+          const label = price?.nickname ?? (typeof price?.product === "string" ? price.product : price?.id) ?? "plan";
+          const periodEnd = item?.current_period_end
+            ? new Date(item.current_period_end * 1000).toISOString().slice(0, 10)
+            : null;
+          const flags = [
+            sub.status,
+            periodEnd ? `ends ${periodEnd}` : null,
+            sub.pause_collection ? "⏸ paused" : null,
+            sub.cancel_at_period_end ? "cancels at period end" : null,
+          ]
+            .filter(Boolean)
+            .join(" · ");
+          return { label, value: flags };
+        }),
+        3
+      )) {
+        components.push(dataRow(row.label, row.value));
       }
       if (mrrCurrency) {
         components.push(dataRow("MRR", this.stripe.formatAmount(Math.round(mrrMinor), mrrCurrency)));
@@ -450,14 +517,17 @@ export class IntercomInboxApp {
     if (recent === null) {
       components.push(dataRow("Recent charges", "unavailable"));
     } else if (recent.charges.length > 0) {
-      for (const charge of recent.charges) {
-        const state = charge.refunded ? "refunded" : (charge.amount_refunded ?? 0) > 0 ? "partial refund" : charge.status;
-        components.push(
-          dataRow(
-            this.stripe.formatAmount(charge.amount, charge.currency),
-            `${state} · ${new Date(charge.created * 1000).toISOString().slice(0, 10)}`
-          )
-        );
+      for (const row of collapse(
+        recent.charges.map((charge) => {
+          const state = charge.refunded ? "refunded" : (charge.amount_refunded ?? 0) > 0 ? "partial refund" : charge.status;
+          return {
+            label: this.stripe.formatAmount(charge.amount, charge.currency),
+            value: `${state} · ${new Date(charge.created * 1000).toISOString().slice(0, 10)}`,
+          };
+        }),
+        3
+      )) {
+        components.push(dataRow(row.label, row.value));
       }
     }
 
@@ -493,6 +563,30 @@ function dataRow(label: string, value: string): CanvasComponent {
 
 function divider(): CanvasComponent {
   return { type: "divider" };
+}
+
+// Folds identical label/value pairs into one row carrying a count, keeps the
+// first `limit` distinct rows, and says how many were left off. Three retries
+// of the same failed charge should read as one line, not three.
+export function collapse(
+  rows: Array<{ label: string; value: string }>,
+  limit: number
+): Array<{ label: string; value: string }> {
+  const seen = new Map<string, { label: string; value: string; count: number }>();
+  for (const row of rows) {
+    const key = `${row.label}\u0000${row.value}`;
+    const hit = seen.get(key);
+    if (hit) hit.count++;
+    else seen.set(key, { ...row, count: 1 });
+  }
+  const distinct = [...seen.values()];
+  const shown = distinct.slice(0, limit).map((r) => ({
+    label: r.label,
+    value: r.count > 1 ? `${r.value} (×${r.count})` : r.value,
+  }));
+  const hidden = distinct.length - shown.length;
+  if (hidden > 0) shown.push({ label: "…", value: `${hidden} more not shown` });
+  return shown;
 }
 
 function timeBox<T>(promise: Promise<T>, ms: number): Promise<T> {
