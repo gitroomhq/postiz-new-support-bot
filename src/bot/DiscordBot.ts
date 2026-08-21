@@ -2219,6 +2219,13 @@ export class DiscordBot {
                 ? `on${s.sentryFeedbackLastSyncAt() ? ` · last sync <t:${Math.floor(s.sentryFeedbackLastSyncAt()!.getTime() / 1000)}:R>` : ""}`
                 : "configured · off"
           }`,
+          `**Postiz lookup:** ${
+            !s.postizConfigured()
+              ? "off: not configured"
+              : s.postizLookupEnabled()
+                ? "on"
+                : "configured · off"
+          }`,
           "",
           "The Intercom button below holds connection settings only. Bridge behavior, SLA rules, automation and maintenance are managed via **/intercom**.",
         ].join("\n")
@@ -2227,6 +2234,7 @@ export class DiscordBot {
       new ButtonBuilder().setCustomId("config_intercom").setLabel("Intercom").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("config_sentry").setLabel("Sentry").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("config_sentryfeedback").setLabel("Sentry Feedback").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("config_postiz").setLabel("Postiz Lookup").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("config_back_main").setLabel("Back").setStyle(ButtonStyle.Secondary)
     );
     return { embeds: [embed], components: [buttons] };
@@ -2706,6 +2714,62 @@ export class DiscordBot {
       new ButtonBuilder().setCustomId("config_integrations").setLabel("Back").setStyle(ButtonStyle.Secondary)
     );
     return { embeds: [embed], components: [row1, row2] };
+  }
+
+  // /config → Integrations → Postiz Lookup: resolves a support contact to a
+  // Postiz account (user, organization, plan tier). Read-only against the
+  // platform; the key is write-only here and never echoed back.
+  private buildPostizLookupPanel() {
+    const s = this.settingsStore;
+    const stateLabel: Record<SecretState, string> = {
+      none: "_not set_",
+      local: "stored (local encryption)",
+      "local-unreadable": "⚠️ stored but unreadable: re-enter",
+      vault: "stored (Vault)",
+      "vault-unreachable": "stored (Vault) ⚠️ unreachable right now",
+    };
+    // POSTIZ_ADMIN_TOKEN overrides the stored key. The panel keeps accepting
+    // edits (they land in BotSettings and wait), so it has to say which value
+    // is actually in force.
+    const pin = envPin("postizApiKey");
+    const keyLine = pin
+      ? `pinned by \`${pin}\` _(stored value: ${stateLabel[s.secretState("postizApiKey")]})_`
+      : stateLabel[s.secretState("postizApiKey")];
+
+    const statusLine = !s.postizBaseUrl()
+      ? "**not configured**: set the backend base URL below"
+      : !s.postizApiKey()
+        ? "**not configured**: set the API key below"
+        : s.postizLookupEnabled()
+          ? "**on**: tickets resolve their Postiz account at creation"
+          : "**off**: nothing looks anything up (existing stamps are kept)";
+
+    const embed = new EmbedBuilder()
+      .setTitle("Postiz Platform Lookup")
+      .setColor(0x5865f2)
+      .setDescription(
+        [
+          `**Status:** ${statusLine}`,
+          "",
+          `**Base URL:** ${s.postizBaseUrl() ? `\`${s.postizBaseUrl()}\`` : "_not set_"}`,
+          `**API key:** ${keyLine}`,
+          "",
+          "Resolves a support contact to a Postiz user, organization and plan. Feeds the identity stamped on new tickets, the `postiz.*` SLA conditions, `/postiz`, `/search-tickets postiz_id`, and the Postiz ID path in **/billing**.",
+          "The key is an **organization API key** from the platform, sent as-is. Its organization must contain a superadmin user and hold an active subscription, or every call is rejected. Use Test Connection below: it names which of those checks failed.",
+          "Point the base URL at the **backend** (where `/public/v1` lives), not the frontend.",
+        ].join("\n")
+      );
+
+    const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId("config_postiz_toggle")
+        .setLabel(`Enabled: ${s.postizLookupEnabled() ? "on" : "off"}`)
+        .setStyle(s.postizLookupEnabled() ? ButtonStyle.Success : ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("config_postiz_creds").setLabel("Base URL & Key").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("config_postiz_test").setLabel("Test Connection").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("config_integrations").setLabel("Back").setStyle(ButtonStyle.Secondary)
+    );
+    return { embeds: [embed], components: [row] };
   }
 
   // /config → Analytics: InfluxDB export + AI ticket scoring. Async because it
@@ -4216,6 +4280,62 @@ export class DiscordBot {
       return;
     }
 
+    if (id === "config_postiz") {
+      await interaction.update(this.buildPostizLookupPanel());
+      return;
+    }
+
+    if (id === "config_postiz_toggle") {
+      const enabling = !this.settingsStore.postizLookupEnabled();
+      await this.settingsStore.updatePostiz({ postizLookupEnabled: enabling });
+      this.auditConfig(interaction, `Postiz lookup → ${enabling ? "on" : "off"}`);
+      await interaction.update(this.buildPostizLookupPanel());
+      return;
+    }
+
+    if (id === "config_postiz_creds") {
+      const modal = new ModalBuilder().setCustomId("config_postiz_creds_modal").setTitle("Postiz Lookup");
+      modal.addComponents(
+        new ActionRowBuilder<TextInputBuilder>().addComponents(
+          new TextInputBuilder()
+            .setCustomId("base_url")
+            .setLabel("Backend base URL")
+            .setPlaceholder("https://api.postiz.com")
+            .setStyle(TextInputStyle.Short)
+            // Not a secret, so it is safe to pre-fill and edit in place.
+            .setValue(this.settingsStore.postizBaseUrl() ?? "")
+            .setRequired(false)
+        ),
+        new ActionRowBuilder<TextInputBuilder>().addComponents(
+          new TextInputBuilder()
+            .setCustomId("api_key")
+            .setLabel("Org API key (blank = keep, off = clear)")
+            .setStyle(TextInputStyle.Short)
+            .setRequired(false)
+        )
+      );
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (id === "config_postiz_test") {
+      await interaction.deferReply({ flags: 64 });
+      const client = this.postizClient;
+      if (!client) {
+        await interaction.editReply({
+          embeds: [makeEmbed("The Postiz lookup is not available on this instance.", COLORS.warn)],
+        });
+        return;
+      }
+      // A stale cached answer would make a just-fixed key look broken.
+      client.clearCache();
+      const result = await client.selfTest();
+      await interaction.editReply({
+        embeds: [makeEmbed(result.detail, result.ok ? COLORS.success : COLORS.danger)],
+      });
+      return;
+    }
+
     if (id === "config_sentryfeedback_toggle") {
       const enabling = !this.settingsStore.sentryReadEnabled();
       // First enable stamps the no-backfill floor; disable/re-enable keeps it
@@ -5005,6 +5125,51 @@ export class DiscordBot {
             this.settingsStore.sentryWebhookSecret()
               ? "Sentry feedback credentials saved. Point the internal integration's webhook at `POST <public-url>/sentry/webhook`."
               : "Sentry feedback credentials saved. No webhook secret set; the webhook endpoint rejects everything and the 15-min poll carries imports alone.",
+            COLORS.success
+          ),
+        ],
+        flags: 64,
+      });
+      return;
+    }
+
+    if (interaction.customId === "config_postiz_creds_modal") {
+      const baseUrlInput = interaction.fields.getTextInputValue("base_url").trim();
+      const keyInput = interaction.fields.getTextInputValue("api_key").trim();
+      const clears = (v: string) => /^(off|none|disable|-)$/i.test(v);
+
+      if (baseUrlInput && !clears(baseUrlInput) && !/^https?:\/\//i.test(baseUrlInput)) {
+        await interaction.reply({
+          embeds: [makeEmbed("Base URL must start with `http://` or `https://`.", COLORS.warn)],
+          flags: 64,
+        });
+        return;
+      }
+
+      const update: { postizBaseUrl?: string | null; postizApiKey?: string | null } = {};
+      // The base URL is pre-filled, so blank means "clear it", unlike the
+      // write-only key below where blank means "keep".
+      update.postizBaseUrl = !baseUrlInput || clears(baseUrlInput) ? null : baseUrlInput;
+      if (keyInput) update.postizApiKey = clears(keyInput) ? null : keyInput;
+      await this.settingsStore.updatePostiz(update);
+      this.postizClient?.clearCache();
+
+      // Deliberately no key value in the audit line.
+      this.auditConfig(
+        interaction,
+        `Postiz lookup updated (base URL ${update.postizBaseUrl ?? "cleared"}, API key ${
+          keyInput ? (clears(keyInput) ? "cleared" : "set") : "unchanged"
+        })`
+      );
+
+      const pin = envPin("postizApiKey");
+      const note = pin
+        ? ` \`${pin}\` is set in the environment and overrides the stored key until it is removed.`
+        : "";
+      await interaction.reply({
+        embeds: [
+          makeEmbed(
+            `Postiz lookup settings saved.${note} Use Test Connection to check the key before enabling.`,
             COLORS.success
           ),
         ],
