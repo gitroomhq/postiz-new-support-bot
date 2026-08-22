@@ -4385,9 +4385,9 @@ export class DiscordBot {
         const startedAt = Date.now();
         try {
           const result = await service.backfillHistory({
-            // A pure re-emit still needs a scope; "ledger" skips the concession
-            // endpoints so nothing is swept twice just to republish points.
-            scope: reemit ? "ledger" : scope,
+            // A pure re-emit sweeps NOTHING: it only republishes rows that are
+            // already stored, so touching Stripe at all would be waste.
+            scope: reemit ? "none" : scope,
             reemitAll: reemit,
           });
           const secs = Math.round((Date.now() - startedAt) / 1000);

@@ -793,7 +793,6 @@ export class StripeClient {
     startingAfter?: string;
     createdGte?: number;
     createdLt?: number;
-    expandDiscounts?: boolean;
   }): Promise<{ subscriptions: Stripe.Subscription[]; hasMore: boolean }> {
     const created = {
       ...(opts.createdGte ? { gte: opts.createdGte } : {}),
@@ -806,9 +805,6 @@ export class StripeClient {
       limit: opts.limit ?? 25,
       ...(opts.startingAfter ? { starting_after: opts.startingAfter } : {}),
       ...(Object.keys(created).length ? { created } : {}),
-      // discounts arrive as bare ids otherwise, and there is no
-      // discounts.retrieve endpoint to resolve them with.
-      ...(opts.expandDiscounts ? { expand: ["data.discounts"] } : {}),
     });
     return { subscriptions: res.data, hasMore: res.has_more };
   }
@@ -879,6 +875,15 @@ export class StripeClient {
       expand: ["data.discounts.source.coupon"],
     });
     return res.data;
+  }
+
+  // A subscription with its discounts expanded. Discount objects are NOT
+  // retrievable on their own (there is no discounts.retrieve), so this is the
+  // only way to turn the bare ids a list returns into something priceable.
+  async getSubscriptionWithDiscounts(subscriptionId: string): Promise<Stripe.Subscription | null> {
+    return this.stripe.subscriptions
+      .retrieve(subscriptionId, { expand: ["discounts", "discounts.source.coupon"] })
+      .catch(() => null);
   }
 
   async getSubscription(subscriptionId: string): Promise<Stripe.Subscription> {

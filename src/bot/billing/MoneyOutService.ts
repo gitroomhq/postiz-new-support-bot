@@ -45,7 +45,7 @@ const BACKFILL_FLUSH_EVERY = 500;
 // credit notes and write-offs can be added to an account whose ledger is
 // already imported, and re-walking every balance transaction to get them would
 // be pure waste.
-export type MoneyOutBackfillScope = "all" | "ledger" | "concessions";
+export type MoneyOutBackfillScope = "all" | "ledger" | "concessions" | "none";
 
 export interface MoneyOutBackfillResult {
   scanned: number;
@@ -167,7 +167,7 @@ export class MoneyOutService {
     // (each row carries its real timestamp), so there is no second full-table
     // walk in the normal case.
     const swept =
-      scope === "concessions"
+      scope === "concessions" || scope === "none"
         ? { scanned: 0, created: 0, truncated: false }
         : await this.sweep({
             maxPages: MAX_PAGES_BACKFILL,
@@ -179,7 +179,7 @@ export class MoneyOutService {
     // Concessions come from their own endpoints — the ledger sweep above has
     // no trail for them at all.
     const concessions =
-      scope === "ledger"
+      scope === "ledger" || scope === "none"
         ? { creditNotes: 0, writeOffs: 0, discounts: 0, discountsHistoricalUnavailable: false }
         : await this.backfillConcessions(onProgress);
 
@@ -277,29 +277,51 @@ export class MoneyOutService {
     // Stripe exposes no way to list discounts that have already ended, so this
     // captures what is currently attached and nothing older. Reported honestly
     // rather than left to look like a complete history.
-    try {
-      let startingAfter: string | undefined;
-      for (let page = 0; page < MAX_PAGES_BACKFILL; page++) {
-        onProgress?.();
-        const res = await this.stripe.listAllSubscriptions({
-          status: "active",
-          limit: 100,
-          expandDiscounts: true,
-          ...(startingAfter ? { startingAfter } : {}),
-        });
-        for (const sub of res.subscriptions) {
-          const booked = await this.recordDiscountsOn(sub.discounts, {
-            customerId: idOf(sub.customer as string | { id: string } | null),
-            subscriptionId: sub.id,
-            createdFallback: sub.created,
+    //
+    // Deliberately does NOT expand discounts on the list call: if Stripe
+    // rejects that expand path the whole page throws, the catch swallows it,
+    // and the backfill reports "0 coupons" for an account full of them. Instead
+    // the cheap list finds WHICH subscriptions carry a discount, then each of
+    // those is re-read expanded — one extra call per discounted subscription,
+    // and a failure can only ever lose that one.
+    let sawDiscounts = 0;
+    for (const status of ["active", "trialing"] as const) {
+      try {
+        let startingAfter: string | undefined;
+        for (let page = 0; page < MAX_PAGES_BACKFILL; page++) {
+          onProgress?.();
+          const res = await this.stripe.listAllSubscriptions({
+            status,
+            limit: 100,
+            ...(startingAfter ? { startingAfter } : {}),
           });
-          if (booked) discounts++;
+          for (const sub of res.subscriptions) {
+            if ((sub.discounts?.length ?? 0) === 0) continue;
+            sawDiscounts++;
+            // Bare ids are the norm here; re-read expanded so they can be priced.
+            const needsExpand = sub.discounts.some((d) => typeof d === "string");
+            const full = needsExpand ? await this.stripe.getSubscriptionWithDiscounts(sub.id) : sub;
+            const booked = await this.recordDiscountsOn(full?.discounts ?? sub.discounts, {
+              customerId: idOf(sub.customer as string | { id: string } | null),
+              subscriptionId: sub.id,
+              createdFallback: sub.created,
+            });
+            if (booked) discounts++;
+          }
+          if (!res.hasMore || res.subscriptions.length === 0) break;
+          startingAfter = res.subscriptions[res.subscriptions.length - 1].id;
         }
-        if (!res.hasMore || res.subscriptions.length === 0) break;
-        startingAfter = res.subscriptions[res.subscriptions.length - 1].id;
+      } catch (error) {
+        moneyLog.warn("money-out discount backfill failed", { "money_out.status": status, "error.message": String(error) });
       }
-    } catch (error) {
-      moneyLog.warn("money-out discount backfill failed", { "error.message": String(error) });
+    }
+    // Loud when the two disagree: subscriptions carrying a coupon that we could
+    // not book is the exact shape of the bug that made this report zero.
+    if (sawDiscounts !== discounts) {
+      moneyLog.warn("money-out: some subscription coupons could not be booked", {
+        "money_out.subs_with_discounts": sawDiscounts,
+        "money_out.booked": discounts,
+      });
     }
 
     // Customer-level coupons: applied to the customer rather than one
