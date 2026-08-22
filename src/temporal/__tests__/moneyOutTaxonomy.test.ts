@@ -4,6 +4,8 @@ import type Stripe from "stripe";
 import {
   ALL_CATEGORIES,
   BUCKET_OF,
+  countsAsLoss,
+  LOSS_BUCKETS,
   categoryOfBalanceTransaction,
   classifyBalanceConcession,
   classifyBalanceTransaction,
@@ -50,6 +52,18 @@ test("every category maps to exactly one bucket and the bucket map is total", ()
   );
 });
 
+test("ordinary processing fees are the ONLY thing that is not a loss", () => {
+  const notLoss = ALL_CATEGORIES.filter((c) => !countsAsLoss(c));
+  assert.deepEqual(notLoss, ["stripe_fee"], "processing fees are a cost of doing business, everything else is a loss");
+  assert.equal(BUCKET_OF.stripe_fee, "OPERATING");
+  // The loss buckets must never include OPERATING, or a total would quietly
+  // start growing with healthy revenue.
+  assert.ok(!LOSS_BUCKETS.includes("OPERATING"));
+  for (const c of ALL_CATEGORIES) {
+    assert.equal(countsAsLoss(c), LOSS_BUCKETS.includes(BUCKET_OF[c]), c);
+  }
+});
+
 test("refund: Stripe's negative amount becomes positive money-out", () => {
   const rows = classifyBalanceTransaction(bt({ type: "refund", amount: -2500 }), "sweep");
   assert.equal(rows.length, 1);
@@ -88,6 +102,7 @@ test("dispute splits into the withdrawal AND a separate dispute-fee row", () => 
   assert.equal(movement.id, "txn_d");
 
   assert.equal(fee.category, "dispute_fee");
+  assert.ok(countsAsLoss(fee.category), "a chargeback penalty IS a loss");
   assert.equal(fee.bucket, "FEES");
   assert.equal(fee.amountMinor, 1500);
   // Suffixed so the fee row can never overwrite the movement row it accompanies.
@@ -107,6 +122,17 @@ test("dispute reversal is negative and its fee is still a dispute fee (won dispu
   assert.equal(rows[0].amountMinor, -2500);
 });
 
+test("a fee riding on a REFUND is a loss, not operating cost", () => {
+  // The processing fee Stripe keeps on money we handed back buys nothing.
+  const rows = classifyBalanceTransaction(bt({ id: "txn_rf", type: "refund", amount: -2500, fee: 90 }), "sweep");
+  assert.equal(rows.length, 2);
+  assert.equal(rows[1].category, "refund_fee");
+  assert.equal(rows[1].bucket, "FEES");
+  assert.equal(rows[1].amountMinor, 90);
+  assert.equal(rows[1].id, "txn_rf:fee");
+  assert.ok(countsAsLoss(rows[1].category));
+});
+
 test("a pure stripe_fee transaction emits ONE row, not a fee row on top of itself", () => {
   const rows = classifyBalanceTransaction(bt({ type: "stripe_fee", amount: -1000, fee: 1000 }), "sweep");
   assert.equal(rows.length, 1);
@@ -114,12 +140,13 @@ test("a pure stripe_fee transaction emits ONE row, not a fee row on top of itsel
   assert.equal(rows[0].amountMinor, 1000);
 });
 
-test("every flavour of Stripe fee lands in the FEES bucket", () => {
+test("every flavour of Stripe fee lands in OPERATING and is excluded from losses", () => {
   for (const type of ["stripe_fee", "stripe_fx_fee", "tax_fee", "stripe_balance_payment_debit"]) {
     const rows = classifyBalanceTransaction(bt({ type, amount: -750 }), "sweep");
     assert.equal(rows.length, 1, `${type} should emit one row`);
     assert.equal(rows[0].category, "stripe_fee", type);
-    assert.equal(rows[0].bucket, "FEES", type);
+    assert.equal(rows[0].bucket, "OPERATING", type);
+    assert.equal(countsAsLoss(rows[0].category), false, type);
     assert.equal(rows[0].amountMinor, 750, type);
   }
   // A reversal nets against the debit rather than getting its own category.

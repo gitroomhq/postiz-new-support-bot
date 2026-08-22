@@ -24,6 +24,9 @@ export interface MoneyOutPageFilters {
   currency?: string | null;
   from?: Date | null;
   to?: Date | null;
+  // Categories to leave out entirely — the ledger table hides ordinary
+  // processing fees unless they are explicitly asked for.
+  excludeCategories?: MoneyOutCategory[] | null;
 }
 
 // Local half of the money-out ledger. Rows are upserted by id, which is the
@@ -180,7 +183,11 @@ export class MoneyOutStore {
   ): Promise<{ rows: StripeMoneyOut[]; total: number }> {
     const where = {
       ...(filters.bucket ? { bucket: filters.bucket } : {}),
-      ...(filters.category ? { category: filters.category } : {}),
+      ...(filters.category
+        ? { category: filters.category }
+        : filters.excludeCategories?.length
+          ? { category: { notIn: filters.excludeCategories } }
+          : {}),
       ...(filters.currency ? { currency: filters.currency } : {}),
       ...(filters.from || filters.to
         ? {

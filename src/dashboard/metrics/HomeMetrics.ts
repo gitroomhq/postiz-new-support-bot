@@ -3,6 +3,7 @@ import { StripeClient } from "../../bot/StripeClient";
 import { SettingsStore } from "../../config/SettingsStore";
 import { DisputeStore } from "../../bot/billing/DisputeStore";
 import { MoneyOutStore } from "../../bot/billing/MoneyOutStore";
+import { countsAsLoss } from "../../bot/billing/moneyOutTaxonomy";
 import { SeriesResponse } from "../renderer/contract";
 
 // Home chart series + expensive counters, behind a 10-minute in-memory cache
@@ -313,6 +314,9 @@ export class HomeMetrics {
     }
     for (const r of rows) {
       if (r.currency !== currency) continue;
+      // Ordinary processing fees are the cost of taking money, not money lost —
+      // charting them would make the line track revenue instead of losses.
+      if (!countsAsLoss(r.category)) continue;
       byDay.set(r.day, (byDay.get(r.day) ?? 0) + r.amountMinor);
     }
     return {
@@ -332,7 +336,7 @@ export class HomeMetrics {
     const currency = dominantCurrency(totals.map((t) => t.currency)) ?? "usd";
     const factor = StripeClient.isZeroDecimal(currency) ? 1 : 100;
     const points = totals
-      .filter((t) => t.currency === currency && t.amountMinor !== 0)
+      .filter((t) => t.currency === currency && countsAsLoss(t.category) && t.amountMinor !== 0)
       .sort((a, b) => b.amountMinor - a.amountMinor)
       .map((t) => ({ label: t.category.replace(/_/g, " "), v: t.amountMinor / factor }));
     return {

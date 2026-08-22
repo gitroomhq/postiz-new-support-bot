@@ -332,17 +332,25 @@ export class StripeWebhookHandler {
 
     let baseMinor = 0;
     let currency = coupon.currency ?? "usd";
-    try {
-      if (coupon.percent_off != null && customerId && discount.subscription) {
-        const subId = typeof discount.subscription === "string" ? discount.subscription : discount.subscription;
-        const preview = await this.stripe.previewUpcomingInvoice(customerId, subId);
-        if (preview) {
-          baseMinor = preview.subtotal ?? 0;
-          currency = preview.currency;
-        }
+    // A flat amount_off prices itself; only a percentage needs a base.
+    if (coupon.percent_off != null) {
+      const subscriptionId = typeof discount.subscription === "string" ? discount.subscription : null;
+      const priced = await this.moneyOut.priceDiscountBase(customerId, subscriptionId).catch((e) => {
+        hookLog.warn("money-out discount base lookup failed", { "error.message": String(e) });
+        return null;
+      });
+      if (!priced) {
+        // Better a loud gap than a silent zero: a discount booked at 0 would
+        // read as "this concession cost nothing", which is worse than absent.
+        hookLog.warn("money-out discount not priced", {
+          "stripe.discount_id": discount.id,
+          "stripe.customer_id": customerId ?? "",
+          "money_out.reason": "no subscription line items or upcoming invoice to price the percentage against",
+        });
+        return;
       }
-    } catch (e) {
-      hookLog.warn("money-out discount base lookup failed", { "error.message": String(e) });
+      baseMinor = priced.baseMinor;
+      currency = priced.currency;
     }
 
     await this.moneyOut
@@ -353,7 +361,9 @@ export class StripeWebhookHandler {
         baseMinor,
         percentOff: coupon.percent_off,
         amountOffMinor: coupon.amount_off,
-        reason: coupon.name ?? coupon.id,
+        // Duration matters for reading the number later: this books ONE billing
+        // cycle, so a repeating/forever coupon is worth more than recorded.
+        reason: `${coupon.name ?? coupon.id}${coupon.duration ? ` (${coupon.duration})` : ""}`,
         occurredAt: new Date((discount.start ?? Math.floor(Date.now() / 1000)) * 1000),
         source: "webhook",
       })

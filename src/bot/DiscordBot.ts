@@ -76,7 +76,7 @@ import { DashboardDiscord } from "../dashboard/DashboardDiscord";
 import { RADAR_LISTS, type BlockService } from "./billing/BlockService";
 import { backfillDisputeHistory } from "./billing/DisputeMonitor";
 import type { DisputeStore } from "./billing/DisputeStore";
-import type { MoneyOutService } from "./billing/MoneyOutService";
+import type { MoneyOutBackfillScope, MoneyOutService } from "./billing/MoneyOutService";
 import type { BlockKind } from "./billing/BlockStore";
 import { TICKET_ATTR_CSAT, TICKET_ATTR_CSAT_COMMENT, TICKET_ATTR_THREAD } from "../intercom/IntercomEventExecutor";
 import { IntercomMode, IntercomRegion } from "../config/SettingsStore";
@@ -2380,32 +2380,55 @@ export class DiscordBot {
           "",
           "Mirrors **every outflow** from the Stripe account into `/billing → Money out` and the Grafana **Money Out** dashboard:",
           "• **Cash reversed** — refunds (full and partial), dispute withdrawals, minus anything that came back",
-          "• **Stripe fees** — processing fees and the per-chargeback fee",
+          "• **Fees lost** — the per-chargeback fee, and fees Stripe keeps on money we handed back",
           "• **Concessions** — credit notes, discounts, write-offs, credit grants, balance credits",
+          "",
+          "Ordinary **processing fees are recorded but never counted**: that is what taking money costs, not money lost, and including it would make the total climb with healthy revenue. They are one click away behind the Processing cost filter.",
           "",
           "Source of truth is Stripe's own balance-transaction ledger, so this **includes refunds issued straight from the Stripe Dashboard**, which nothing else here can see. Webhooks make an outflow appear within seconds; the reconcile looper ticks every 30 min as the backstop and is the only way fees ever arrive.",
           "",
-          "_Backfill is idempotent: re-running it never double-counts, and it is also how you populate Grafana after enabling InfluxDB._",
+          "**Backfills are scoped** and idempotent, so re-running never double-counts. Refunds & fees come from balance transactions; concessions come from unrelated endpoints, so pick that one to add coupons to an already-imported ledger instead of re-sweeping everything. Coupons that have already **ended** cannot be imported: Stripe has no endpoint for them, so only live ones are captured.",
         ].join("\n")
       );
-    const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    const off = !s.moneyOutEnabled();
+    const row1 = new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder()
         .setCustomId("config_money_out_toggle")
         .setLabel(`Ledger: ${s.moneyOutEnabled() ? "on" : "off"}`)
         .setStyle(s.moneyOutEnabled() ? ButtonStyle.Success : ButtonStyle.Secondary),
       new ButtonBuilder()
-        .setCustomId("config_money_out_backfill")
-        .setLabel("Backfill History")
-        .setStyle(ButtonStyle.Primary)
-        .setDisabled(!s.moneyOutEnabled()),
-      new ButtonBuilder()
         .setCustomId("config_money_out_run_now")
         .setLabel("Reconcile Now")
         .setStyle(ButtonStyle.Secondary)
-        .setDisabled(!s.moneyOutEnabled()),
+        .setDisabled(off),
       new ButtonBuilder().setCustomId("config_billing").setLabel("Back").setStyle(ButtonStyle.Secondary)
     );
-    return { embeds: [embed], components: [row] };
+    // Scoped backfills: the two halves come from unrelated Stripe endpoints, so
+    // adding coupons to an already-imported ledger must not re-walk every
+    // balance transaction.
+    const row2 = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId("config_money_out_backfill:all")
+        .setLabel("Backfill Everything")
+        .setStyle(ButtonStyle.Primary)
+        .setDisabled(off),
+      new ButtonBuilder()
+        .setCustomId("config_money_out_backfill:ledger")
+        .setLabel("Backfill Refunds & Fees")
+        .setStyle(ButtonStyle.Secondary)
+        .setDisabled(off),
+      new ButtonBuilder()
+        .setCustomId("config_money_out_backfill:concessions")
+        .setLabel("Backfill Concessions")
+        .setStyle(ButtonStyle.Secondary)
+        .setDisabled(off),
+      new ButtonBuilder()
+        .setCustomId("config_money_out_reemit")
+        .setLabel("Re-emit to InfluxDB")
+        .setStyle(ButtonStyle.Secondary)
+        .setDisabled(off)
+    );
+    return { embeds: [embed], components: [row1, row2] };
   }
 
   private buildDisputesConfigPanel() {
@@ -4285,15 +4308,11 @@ export class DiscordBot {
       return;
     }
 
-    if (id === "config_money_out_backfill") {
-      // All-time balance-transaction sweep into the local ledger + historical
-      // Influx points at each row's real timestamp. Idempotent, so re-runs are
-      // allowed — notably to populate Grafana after enabling Influx.
-      //
-      // Runs DETACHED: an account with years of history pages for minutes,
-      // which would blow past Discord's interaction window and leave the panel
-      // stuck on "thinking…". The result lands in the billing audit channel
-      // instead, which is also where it stays readable afterwards.
+    if (id.startsWith("config_money_out_backfill:") || id === "config_money_out_reemit") {
+      // All-time history import, run DETACHED: an account with years of history
+      // pages for minutes, which would blow past Discord's interaction window
+      // and leave the panel stuck on "thinking…". The result lands in the
+      // billing audit channel instead, where it also stays readable afterwards.
       await interaction.deferReply({ flags: 64 });
       if (!this.moneyOutService) return;
       if (this.moneyOutBackfillRunning) {
@@ -4302,11 +4321,22 @@ export class DiscordBot {
         });
         return;
       }
+      const reemit = id === "config_money_out_reemit";
+      const raw = reemit ? "" : id.slice("config_money_out_backfill:".length);
+      const scope: MoneyOutBackfillScope = raw === "ledger" || raw === "concessions" ? raw : "all";
+      const what = reemit
+        ? "Re-emitting every stored row to InfluxDB"
+        : scope === "ledger"
+          ? "Sweeping every balance transaction (refunds, disputes, fees)"
+          : scope === "concessions"
+            ? "Sweeping credit notes, write-offs and live coupons"
+            : "Sweeping balance transactions AND concessions";
+
       this.moneyOutBackfillRunning = true;
       await interaction.editReply({
         embeds: [
           makeEmbed(
-            "⏳ Backfill started. It sweeps every balance transaction Stripe has, so it can take a few minutes on an old account.\n\n" +
+            `⏳ ${what}. This can take a few minutes on an old account.\n\n` +
               "The result posts to the billing audit channel when it finishes; you can close this and keep working.",
             COLORS.brand
           ),
@@ -4316,21 +4346,35 @@ export class DiscordBot {
       void (async () => {
         const startedAt = Date.now();
         try {
-          const result = await service.backfillHistory();
+          const result = await service.backfillHistory({
+            // A pure re-emit still needs a scope; "ledger" skips the concession
+            // endpoints so nothing is swept twice just to republish points.
+            scope: reemit ? "ledger" : scope,
+            reemitAll: reemit,
+          });
           const secs = Math.round((Date.now() - startedAt) / 1000);
-          this.auditConfig(
-            interaction,
-            `Money-out history backfilled in ${secs}s → ${result.scanned} transaction(s) scanned, ${result.created} new row(s), ${result.points} Influx point(s)${
-              result.truncated ? " (sweep truncated)" : ""
-            }`
-          );
+          const parts: string[] = [];
+          if (scope !== "concessions" && !reemit) {
+            parts.push(`scanned **${result.scanned}** balance transaction(s), **${result.created}** new ledger row(s)`);
+          }
+          if (scope !== "ledger" && !reemit) {
+            parts.push(
+              `**${result.creditNotes}** credit note(s), **${result.writeOffs}** write-off(s), **${result.discounts}** subscription(s) with live coupons`
+            );
+          }
+          if (result.points) parts.push(`**${result.points}** point(s) re-emitted to InfluxDB`);
+          this.auditConfig(interaction, `Money-out backfill (${reemit ? "re-emit" : scope}) in ${secs}s → ${parts.join("; ") || "nothing found"}`);
           await this.postBillingAuditEmbed(
             makeEmbed(
-              `✅ **Money-out backfill complete** (${secs}s): scanned **${result.scanned}** balance transaction(s), recorded **${result.created}** new ledger row(s).` +
-                (result.points
-                  ? ` Wrote **${result.points}** historical point(s) to InfluxDB.`
-                  : " Influx exporter inactive: no analytics points written (re-run after enabling it).") +
-                (result.truncated ? "\n⚠️ Sweep hit the page cap. Run it again to continue." : ""),
+              `✅ **Money-out backfill complete** (${reemit ? "re-emit" : scope}, ${secs}s)\n` +
+                (parts.length ? parts.map((p) => `• ${p}`).join("\n") : "• nothing found") +
+                (result.discountsHistoricalUnavailable
+                  ? "\n\n⚠️ Only coupons **currently attached** to an active subscription could be imported. Stripe has no endpoint for discounts that already ended, so past coupons are not recoverable: from here on they are captured live by webhook."
+                  : "") +
+                (result.truncated ? "\n⚠️ The ledger sweep hit its page cap. Run it again to continue." : "") +
+                (!result.points && !reemit
+                  ? "\n\n_InfluxDB inactive or nothing new: use **Re-emit to InfluxDB** after enabling it to populate Grafana from the stored rows._"
+                  : ""),
               COLORS.success
             )
           );

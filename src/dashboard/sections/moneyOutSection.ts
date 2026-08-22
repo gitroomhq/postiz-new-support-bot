@@ -6,6 +6,9 @@ import type { StripeMoneyOut } from "../../bot/billing/MoneyOutStore";
 import {
   ALL_CATEGORIES,
   BUCKET_OF,
+  countsAsLoss,
+  LOSS_BUCKETS,
+  OPERATING_CATEGORIES,
   type MoneyOutBucket,
   type MoneyOutCategory,
 } from "../../bot/billing/moneyOutTaxonomy";
@@ -30,14 +33,16 @@ const WINDOWS = [
 
 const BUCKET_LABELS: Record<MoneyOutBucket, string> = {
   CASH: "Cash reversed",
-  FEES: "Stripe fees",
+  FEES: "Fees lost",
   CONCESSION: "Concessions",
+  OPERATING: "Processing cost",
 };
 
 const BUCKET_SUBS: Record<MoneyOutBucket, string> = {
   CASH: "Refunds and disputes",
-  FEES: "Processing and chargeback fees",
+  FEES: "Chargeback and refund fees",
   CONCESSION: "Credits, discounts, write-offs",
+  OPERATING: "Not a loss, excluded from totals",
 };
 
 const CATEGORY_LABELS: Record<MoneyOutCategory, string> = {
@@ -46,7 +51,8 @@ const CATEGORY_LABELS: Record<MoneyOutCategory, string> = {
   dispute: "Disputes",
   dispute_reversal: "Disputes reversed",
   dispute_fee: "Dispute fees",
-  stripe_fee: "Stripe fees",
+  refund_fee: "Fees lost to refunds",
+  stripe_fee: "Stripe processing fees",
   credit_note: "Credit notes",
   discount: "Discounts",
   write_off: "Write-offs",
@@ -71,7 +77,7 @@ export function makeMoneyOutSection(): DashboardSectionModule {
 
 async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: string | null): Promise<SectionPage> {
   const window = WINDOWS.find((w) => w.value === filters.window) ?? WINDOWS[1];
-  const bucket = (["CASH", "FEES", "CONCESSION"] as const).find((b) => b === filters.bucket) ?? null;
+  const bucket = (["CASH", "FEES", "CONCESSION", "OPERATING"] as const).find((b) => b === filters.bucket) ?? null;
   const category = ALL_CATEGORIES.find((c) => c === filters.category) ?? null;
   const skip = Math.max(0, Number.parseInt(cursor ?? "0", 10) || 0);
 
@@ -80,7 +86,19 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
 
   const [totals, page, topCustomers] = await Promise.all([
     ctx.stores.moneyOut.windowTotals(from, to),
-    ctx.stores.moneyOut.page({ bucket, category, from, to }, skip, PAGE_SIZE),
+    ctx.stores.moneyOut.page(
+      {
+        bucket,
+        category,
+        from,
+        to,
+        // Hidden unless asked for by name or by picking the Processing cost
+        // card: ordinary fees are high-volume noise next to actual losses.
+        ...(category || bucket === "OPERATING" ? {} : { excludeCategories: OPERATING_CATEGORIES.slice() }),
+      },
+      skip,
+      PAGE_SIZE
+    ),
     ctx.stores.moneyOut.topCustomers(from, to, 5),
   ]);
 
@@ -119,27 +137,40 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
   const inCurrency = totals.filter((t) => t.currency === currency);
   const otherCurrencies = [...new Set(totals.filter((t) => t.currency !== currency).map((t) => t.currency))];
 
-  const byBucket = new Map<MoneyOutBucket, number>([
-    ["CASH", 0],
-    ["FEES", 0],
-    ["CONCESSION", 0],
-  ]);
-  for (const t of inCurrency) byBucket.set(t.bucket, (byBucket.get(t.bucket) ?? 0) + t.amountMinor);
+  // Ordinary Stripe processing fees are the cost of TAKING money, not money
+  // lost — including them would make "money out" rise with healthy revenue and
+  // drown the numbers that matter. They are still recorded and still reachable
+  // through the Processing cost filter; they just never enter a total.
+  const byBucket = new Map<MoneyOutBucket, number>(LOSS_BUCKETS.map((b) => [b, 0]));
+  let operatingMinor = 0;
+  for (const t of inCurrency) {
+    if (!countsAsLoss(t.category)) {
+      operatingMinor += t.amountMinor;
+      continue;
+    }
+    byBucket.set(t.bucket, (byBucket.get(t.bucket) ?? 0) + t.amountMinor);
+  }
   const grandTotal = [...byBucket.values()].reduce((a, b) => a + b, 0);
 
   blocks.push({
     type: "stats",
     items: [
       {
-        label: "Total out",
+        label: "Total lost",
         value: ctx.stripe.formatAmount(grandTotal, currency),
-        sub: `${window.label} · net of reversals`,
+        sub: `${window.label} · net of reversals, excludes processing fees`,
       },
-      ...[...byBucket.entries()].map(([b, minor]) => ({
+      ...LOSS_BUCKETS.map((b) => ({
         label: BUCKET_LABELS[b],
-        value: ctx.stripe.formatAmount(minor, currency),
+        value: ctx.stripe.formatAmount(byBucket.get(b) ?? 0, currency),
         sub: BUCKET_SUBS[b],
       })),
+      {
+        label: BUCKET_LABELS.OPERATING,
+        value: ctx.stripe.formatAmount(operatingMinor, currency),
+        sub: BUCKET_SUBS.OPERATING,
+        badge: { kind: "neutral", text: "Not counted" } as Badge,
+      },
     ],
   });
 
@@ -165,7 +196,7 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
   // Category breakdown as a table rather than a legend: the numbers matter more
   // than the shape, and every row is a filter into the ledger below.
   const categoryRows = inCurrency
-    .filter((t) => t.amountMinor !== 0)
+    .filter((t) => countsAsLoss(t.category) && t.amountMinor !== 0)
     .sort((a, b) => b.amountMinor - a.amountMinor)
     .map((t) => ({
       id: t.category,
@@ -226,12 +257,23 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
     counts: {
       key: "bucket",
       items: [
-        { value: "", label: "All", count: totals.reduce((n, t) => n + t.count, 0) },
-        ...(["CASH", "FEES", "CONCESSION"] as MoneyOutBucket[]).map((b) => ({
+        // "All" means all LOSSES — processing fees have their own card so they
+        // are one click away without ever padding the default view.
+        {
+          value: "",
+          label: "All losses",
+          count: totals.filter((t) => countsAsLoss(t.category)).reduce((n, t) => n + t.count, 0),
+        },
+        ...LOSS_BUCKETS.map((b) => ({
           value: b,
           label: BUCKET_LABELS[b],
-          count: totals.filter((t) => t.bucket === b).reduce((n, t) => n + t.count, 0),
+          count: totals.filter((t) => countsAsLoss(t.category) && t.bucket === b).reduce((n, t) => n + t.count, 0),
         })),
+        {
+          value: "OPERATING",
+          label: BUCKET_LABELS.OPERATING,
+          count: totals.filter((t) => !countsAsLoss(t.category)).reduce((n, t) => n + t.count, 0),
+        },
       ],
     },
     filters: [
@@ -251,9 +293,11 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
     nextCursor: skip + PAGE_SIZE < page.total ? String(skip + PAGE_SIZE) : null,
     empty: "No outflow recorded for this filter.",
     footer: `${page.total} item${page.total === 1 ? "" : "s"}`,
-    notice: lastSweep
-      ? `Reconciled with Stripe's balance transactions ${describeAge(lastSweep)}. Refunds issued in the Stripe Dashboard appear here too.`
-      : "Never reconciled with Stripe yet — only events seen live are listed.",
+    notice:
+      (lastSweep
+        ? `Reconciled with Stripe's balance transactions ${describeAge(lastSweep)}. Refunds issued in the Stripe Dashboard appear here too. `
+        : "Never reconciled with Stripe yet — only events seen live are listed. ") +
+      "Ordinary processing fees are recorded but hidden and never counted as a loss; open the Processing cost card to see them.",
     exportable: true,
   });
 

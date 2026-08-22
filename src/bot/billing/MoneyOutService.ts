@@ -40,11 +40,26 @@ const MAX_CUSTOMER_LOOKUPS_PER_PAGE = 20;
 // the client drops points once its 5000-line buffer fills.
 const BACKFILL_FLUSH_EVERY = 500;
 
+// Which half of the history to import. "concessions" exists because coupons,
+// credit notes and write-offs can be added to an account whose ledger is
+// already imported, and re-walking every balance transaction to get them would
+// be pure waste.
+export type MoneyOutBackfillScope = "all" | "ledger" | "concessions";
+
 export interface MoneyOutBackfillResult {
   scanned: number;
   created: number;
   points: number;
   truncated: boolean;
+  // Concessions have no balance transaction, so they are swept from their own
+  // endpoints rather than the ledger.
+  creditNotes: number;
+  writeOffs: number;
+  discounts: number;
+  // Discounts that ended before the backfill ran cannot be recovered: Stripe
+  // has no list endpoint for historical discounts, only the live ones still
+  // attached to a subscription or customer.
+  discountsHistoricalUnavailable: boolean;
 }
 
 // The money-out ledger engine.
@@ -114,26 +129,47 @@ export class MoneyOutService {
     return swept.created;
   }
 
-  // All-time history import. Idempotent: the same primary keys upsert, and the
-  // Influx re-emission uses each row's real occurredAt, so identical points
-  // (same measurement + tags + timestamp) overwrite rather than double-count.
-  async backfillHistory(onProgress?: () => void): Promise<MoneyOutBackfillResult> {
-    // No per-charge customer lookups and no live points: an all-time sweep
-    // would otherwise spend thousands of Stripe reads on a display column, and
-    // the points are re-emitted from the mirror below at their real timestamps.
-    const swept = await this.sweep({
-      maxPages: MAX_PAGES_BACKFILL,
-      source: "backfill",
-      emitPoints: false,
-      resolveCustomers: false,
-      onProgress,
-    });
+  // All-time history import, in selectable scopes.
+  //
+  // The two halves have nothing in common: the LEDGER comes from balance
+  // transactions, CONCESSIONS from credit-note / invoice / subscription
+  // endpoints. Adding coupons to an account whose ledger is already imported
+  // should not re-walk every balance transaction Stripe has, so each half runs
+  // on its own.
+  //
+  // Idempotent throughout: rows key on their Stripe id, and points carry each
+  // row's real occurredAt, so identical points overwrite rather than double-count.
+  async backfillHistory(
+    opts: { scope?: MoneyOutBackfillScope; reemitAll?: boolean; onProgress?: () => void } = {}
+  ): Promise<MoneyOutBackfillResult> {
+    const scope = opts.scope ?? "all";
+    const onProgress = opts.onProgress;
+    // No per-charge customer lookups: an all-time sweep would otherwise spend
+    // thousands of Stripe reads on a display column. Points ARE emitted inline
+    // (each row carries its real timestamp), so there is no second full-table
+    // walk in the normal case.
+    const swept =
+      scope === "concessions"
+        ? { scanned: 0, created: 0, truncated: false }
+        : await this.sweep({
+            maxPages: MAX_PAGES_BACKFILL,
+            source: "backfill",
+            resolveCustomers: false,
+            onProgress,
+          });
 
-    // Re-emit the WHOLE mirror at historical timestamps, not just what this
-    // sweep created — a re-run after enabling Influx must be able to populate
-    // the series from rows an earlier run already stored.
+    // Concessions come from their own endpoints — the ledger sweep above has
+    // no trail for them at all.
+    const concessions =
+      scope === "ledger"
+        ? { creditNotes: 0, writeOffs: 0, discounts: 0, discountsHistoricalUnavailable: false }
+        : await this.backfillConcessions(onProgress);
+
+    // Opt-in only: re-emit the WHOLE mirror at historical timestamps. Needed
+    // exactly once, when Influx is enabled AFTER rows were already imported —
+    // every other run emits its new rows inline as it writes them.
     let points = 0;
-    if (influxActive()) {
+    if (opts.reemitAll && influxActive()) {
       let sinceFlush = 0;
       for await (const batch of this.store.iterateAll()) {
         onProgress?.();
@@ -161,7 +197,123 @@ export class MoneyOutService {
     }
 
     await this.settings.updateMoneyOut({ moneyOutBackfillDoneAt: new Date() }).catch(() => undefined);
-    return { scanned: swept.scanned, created: swept.created, points, truncated: swept.truncated };
+    return {
+      scanned: swept.scanned,
+      created: swept.created,
+      points,
+      truncated: swept.truncated,
+      ...concessions,
+    };
+  }
+
+  // Concessions leave NO balance transaction, so the ledger sweep above cannot
+  // see a single one of them — which is why the concession bucket reads zero
+  // until this runs. Each source is swept from its own endpoint instead.
+  private async backfillConcessions(onProgress?: () => void): Promise<{
+    creditNotes: number;
+    writeOffs: number;
+    discounts: number;
+    discountsHistoricalUnavailable: boolean;
+  }> {
+    let creditNotes = 0;
+    let writeOffs = 0;
+    let discounts = 0;
+
+    // ---- credit notes ----
+    try {
+      let startingAfter: string | undefined;
+      for (let page = 0; page < MAX_PAGES_BACKFILL; page++) {
+        onProgress?.();
+        const res = await this.stripe.listAllCreditNotes({ limit: 100, ...(startingAfter ? { startingAfter } : {}) });
+        for (const note of res.notes) {
+          await this.recordCreditNote(note, "backfill");
+          creditNotes++;
+        }
+        if (!res.hasMore || res.notes.length === 0) break;
+        startingAfter = res.notes[res.notes.length - 1].id;
+      }
+    } catch (error) {
+      moneyLog.warn("money-out credit note backfill failed", { "error.message": String(error) });
+    }
+
+    // ---- write-offs (void + uncollectible invoices) ----
+    for (const status of ["void", "uncollectible"] as const) {
+      try {
+        let startingAfter: string | undefined;
+        for (let page = 0; page < MAX_PAGES_BACKFILL; page++) {
+          onProgress?.();
+          const res = await this.stripe.listInvoicesByStatus(null, status, 100, startingAfter);
+          for (const invoice of res.data) {
+            await this.recordWriteOff(invoice, "backfill");
+            writeOffs++;
+          }
+          if (!res.has_more || res.data.length === 0) break;
+          startingAfter = res.data[res.data.length - 1].id;
+        }
+      } catch (error) {
+        moneyLog.warn("money-out write-off backfill failed", { "money_out.status": status, "error.message": String(error) });
+      }
+    }
+
+    // ---- discounts, live ones only ----
+    // Stripe exposes no way to list discounts that have already ended, so this
+    // captures what is currently attached and nothing older. Reported honestly
+    // rather than left to look like a complete history.
+    try {
+      let startingAfter: string | undefined;
+      for (let page = 0; page < MAX_PAGES_BACKFILL; page++) {
+        onProgress?.();
+        const res = await this.stripe.listAllSubscriptions({
+          status: "active",
+          limit: 100,
+          expandDiscounts: true,
+          ...(startingAfter ? { startingAfter } : {}),
+        });
+        for (const sub of res.subscriptions) {
+          if (await this.recordSubscriptionDiscounts(sub)) discounts++;
+        }
+        if (!res.hasMore || res.subscriptions.length === 0) break;
+        startingAfter = res.subscriptions[res.subscriptions.length - 1].id;
+      }
+    } catch (error) {
+      moneyLog.warn("money-out discount backfill failed", { "error.message": String(error) });
+    }
+
+    return { creditNotes, writeOffs, discounts, discountsHistoricalUnavailable: true };
+  }
+
+  // Books every discount currently attached to one subscription. Returns true
+  // when at least one was recorded, so the caller can count subscriptions
+  // rather than raw coupon objects.
+  private async recordSubscriptionDiscounts(sub: Stripe.Subscription): Promise<boolean> {
+    const customerId = idOf(sub.customer as string | { id: string } | null);
+    let any = false;
+    for (const raw of sub.discounts ?? []) {
+      if (typeof raw === "string") continue; // unexpanded — nothing to price
+      const coupon = raw.source?.coupon;
+      if (!coupon || typeof coupon === "string") continue;
+      let baseMinor = 0;
+      let currency = coupon.currency ?? "usd";
+      if (coupon.percent_off != null) {
+        const priced = await this.priceDiscountBase(customerId, sub.id).catch(() => null);
+        if (!priced) continue;
+        baseMinor = priced.baseMinor;
+        currency = priced.currency;
+      }
+      await this.recordDiscount({
+        discountId: raw.id,
+        customerId,
+        currency,
+        baseMinor,
+        percentOff: coupon.percent_off,
+        amountOffMinor: coupon.amount_off,
+        reason: `${coupon.name ?? coupon.id}${coupon.duration ? ` (${coupon.duration})` : ""}`,
+        occurredAt: new Date((raw.start ?? sub.created) * 1000),
+        source: "backfill",
+      });
+      any = true;
+    }
+    return any;
   }
 
   // The shared pager behind reconcile / syncForObject / backfillHistory.
@@ -276,6 +428,66 @@ export class MoneyOutService {
 
   async recordWriteOff(invoice: Stripe.Invoice, source: MoneyOutSource): Promise<void> {
     await this.record(classifyWriteOff(invoice, source));
+  }
+
+  // What a discount is worth per billing cycle.
+  //
+  // This is the number that made concessions read as zero: classifyDiscount
+  // refuses to book a percentage coupon it cannot price, and the only base we
+  // used to try was an upcoming-invoice preview — which returns nothing for a
+  // customer-level discount, or for any subscription without a next invoice.
+  // Now the subscription's own line items answer it directly, with the preview
+  // as the fallback rather than the only route.
+  async priceDiscountBase(
+    customerId: string | null,
+    subscriptionId: string | null
+  ): Promise<{ baseMinor: number; currency: string } | null> {
+    if (subscriptionId) {
+      const fromItems = await this.subscriptionRecurringTotal(subscriptionId);
+      if (fromItems) return fromItems;
+      if (customerId) {
+        const preview = await this.stripe.previewUpcomingInvoice(customerId, subscriptionId).catch(() => null);
+        // subtotal is pre-discount, which is exactly the base a percentage
+        // applies to (total would already have the discount taken off).
+        if (preview && preview.subtotal > 0) return { baseMinor: preview.subtotal, currency: preview.currency };
+      }
+      return null;
+    }
+    // Customer-level discount: it applies to whatever they are subscribed to,
+    // so the base is the sum of their active subscriptions.
+    if (!customerId) return null;
+    const subs = await this.stripe.listSubscriptions(customerId).catch(() => []);
+    let baseMinor = 0;
+    let currency: string | null = null;
+    for (const sub of subs) {
+      if (sub.status !== "active" && sub.status !== "trialing") continue;
+      const priced = await this.subscriptionRecurringTotal(sub);
+      if (!priced) continue;
+      baseMinor += priced.baseMinor;
+      currency = currency ?? priced.currency;
+    }
+    return baseMinor > 0 && currency ? { baseMinor, currency } : null;
+  }
+
+  // Sum of a subscription's line items at list price: quantity × unit amount.
+  // Deterministic and available even when there is no upcoming invoice.
+  private async subscriptionRecurringTotal(
+    subscriptionOrId: string | Stripe.Subscription
+  ): Promise<{ baseMinor: number; currency: string } | null> {
+    const sub =
+      typeof subscriptionOrId === "string"
+        ? await this.stripe.getSubscription(subscriptionOrId).catch(() => null)
+        : subscriptionOrId;
+    if (!sub) return null;
+    let baseMinor = 0;
+    let currency: string | null = null;
+    for (const item of sub.items?.data ?? []) {
+      const unit = item.price?.unit_amount;
+      if (unit == null) continue; // tiered/metered price — not knowable up front
+      baseMinor += unit * (item.quantity ?? 1);
+      currency = currency ?? item.price.currency;
+    }
+    return baseMinor > 0 && currency ? { baseMinor, currency } : null;
   }
 
   async recordDiscount(input: {

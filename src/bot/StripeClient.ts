@@ -684,6 +684,20 @@ export class StripeClient {
     return this.stripe.creditNotes.retrieve(creditNoteId);
   }
 
+  // Account-wide credit notes (the per-invoice listCreditNotes above cannot
+  // answer "what did we credit last year"). Used by the money-out concession
+  // backfill, which has no balance-transaction trail to walk.
+  async listAllCreditNotes(opts: { limit?: number; startingAfter?: string } = {}): Promise<{
+    notes: Stripe.CreditNote[];
+    hasMore: boolean;
+  }> {
+    const res = await this.stripe.creditNotes.list({
+      limit: opts.limit ?? 100,
+      ...(opts.startingAfter ? { starting_after: opts.startingAfter } : {}),
+    });
+    return { notes: res.data, hasMore: res.has_more };
+  }
+
   // ---- Radar reviews: the manual-review queue ----
 
   // reviews.list returns OPEN reviews only; the charge is expanded so the
@@ -767,6 +781,7 @@ export class StripeClient {
     startingAfter?: string;
     createdGte?: number;
     createdLt?: number;
+    expandDiscounts?: boolean;
   }): Promise<{ subscriptions: Stripe.Subscription[]; hasMore: boolean }> {
     const created = {
       ...(opts.createdGte ? { gte: opts.createdGte } : {}),
@@ -779,6 +794,9 @@ export class StripeClient {
       limit: opts.limit ?? 25,
       ...(opts.startingAfter ? { starting_after: opts.startingAfter } : {}),
       ...(Object.keys(created).length ? { created } : {}),
+      // discounts arrive as bare ids otherwise, and there is no
+      // discounts.retrieve endpoint to resolve them with.
+      ...(opts.expandDiscounts ? { expand: ["data.discounts"] } : {}),
     });
     return { subscriptions: res.data, hasMore: res.has_more };
   }

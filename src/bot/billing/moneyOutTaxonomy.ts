@@ -13,7 +13,7 @@ import type Stripe from "stripe";
 // is cash moving from the Stripe balance to the bank, not cash lost. They are
 // classified as "ignored" and never written.
 
-export type MoneyOutBucket = "CASH" | "FEES" | "CONCESSION";
+export type MoneyOutBucket = "CASH" | "FEES" | "CONCESSION" | "OPERATING";
 
 export type MoneyOutCategory =
   // CASH — money reversed to a cardholder
@@ -21,8 +21,12 @@ export type MoneyOutCategory =
   | "refund_failure"
   | "dispute"
   | "dispute_reversal"
-  // FEES — money Stripe keeps
+  // FEES — fees we LOSE: a penalty, or a fee Stripe keeps on money we gave back
   | "dispute_fee"
+  | "refund_fee"
+  // OPERATING — the cost of processing payments at all. Recorded, but NOT a
+  // loss: it is what taking money costs, and folding it into "money out" would
+  // make the number grow with healthy revenue.
   | "stripe_fee"
   // CONCESSION — revenue given away without cash moving
   | "credit_note"
@@ -39,7 +43,8 @@ export const BUCKET_OF: Record<MoneyOutCategory, MoneyOutBucket> = {
   dispute: "CASH",
   dispute_reversal: "CASH",
   dispute_fee: "FEES",
-  stripe_fee: "FEES",
+  refund_fee: "FEES",
+  stripe_fee: "OPERATING",
   credit_note: "CONCESSION",
   discount: "CONCESSION",
   write_off: "CONCESSION",
@@ -48,10 +53,27 @@ export const BUCKET_OF: Record<MoneyOutCategory, MoneyOutBucket> = {
 };
 
 export const CASH_CATEGORIES = ["refund", "refund_failure", "dispute", "dispute_reversal"] as const;
-export const FEE_CATEGORIES = ["dispute_fee", "stripe_fee"] as const;
+export const FEE_CATEGORIES = ["dispute_fee", "refund_fee"] as const;
+export const OPERATING_CATEGORIES = ["stripe_fee"] as const;
 export const CONCESSION_CATEGORIES = ["credit_note", "discount", "write_off", "credit_grant", "balance_credit"] as const;
 
-export const ALL_CATEGORIES: MoneyOutCategory[] = [...CASH_CATEGORIES, ...FEE_CATEGORIES, ...CONCESSION_CATEGORIES];
+export const ALL_CATEGORIES: MoneyOutCategory[] = [
+  ...CASH_CATEGORIES,
+  ...FEE_CATEGORIES,
+  ...OPERATING_CATEGORIES,
+  ...CONCESSION_CATEGORIES,
+];
+
+// The buckets that answer "what did we LOSE". Everything a money-out total
+// sums must come from these; OPERATING is deliberately absent.
+export const LOSS_BUCKETS: MoneyOutBucket[] = ["CASH", "FEES", "CONCESSION"];
+
+// Loss-vs-cost is decided by CATEGORY, never by the stored bucket string: a row
+// written before a taxonomy change keeps its old bucket, and a total must not
+// silently shift because of it.
+export function countsAsLoss(category: string): boolean {
+  return !(OPERATING_CATEGORIES as readonly string[]).includes(category);
+}
 
 // One row destined for the stripe_money_out table. `id` carries the whole
 // idempotency story: balance-transaction id for ledger rows, Stripe object id
@@ -157,8 +179,11 @@ export function classifyBalanceTransaction(
   // for anything else it is an ordinary processing fee. Suffixed id so it never
   // collides with the movement row it accompanies.
   if (fee > 0) {
+    // A fee riding on a movement transaction is a fee we LOST: the chargeback
+    // penalty, or the processing fee Stripe keeps on money we handed back.
+    // Standalone fee transactions (handled above) are ordinary operating cost.
     const feeCategory: MoneyOutCategory =
-      category === "dispute" || category === "dispute_reversal" ? "dispute_fee" : "stripe_fee";
+      category === "dispute" || category === "dispute_reversal" ? "dispute_fee" : "refund_fee";
     rows.push(
       row({
         id: `${bt.id}:fee`,

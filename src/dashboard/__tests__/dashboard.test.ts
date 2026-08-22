@@ -6513,6 +6513,8 @@ function moneyOutCtx(over: {
         { bucket: "CASH", category: "dispute_reversal", currency: "eur", amountMinor: -1_500, count: 1 },
         { bucket: "FEES", category: "dispute_fee", currency: "eur", amountMinor: 1_500, count: 1 },
         { bucket: "CONCESSION", category: "credit_note", currency: "eur", amountMinor: 2_000, count: 2 },
+        // Operating cost: must never reach a total, however large it gets.
+        { bucket: "OPERATING", category: "stripe_fee", currency: "eur", amountMinor: 99_000, count: 40 },
       ],
     page: async () => ({
       rows:
@@ -6546,17 +6548,25 @@ test("money out: bucket tiles net out reversals, categories link into the ledger
   const page = await makeMoneyOutSection().buildPage(moneyOutCtx(), { page: "money-out", filters: {} });
   const stats = page!.blocks.find((b) => b.type === "stats") as { items: Array<{ label: string; value: string }> };
 
-  // 12000 + 4500 - 1500 = 15000 cash, + 1500 fees + 2000 concessions = 18500.
-  assert.equal(stats.items[0].label, "Total out");
+  // 12000 + 4500 - 1500 = 15000 cash, + 1500 lost fees + 2000 concessions = 18500.
+  // The 99000 of processing fees is reported separately and NOT added in.
+  assert.equal(stats.items[0].label, "Total lost");
   assert.equal(stats.items[0].value, "185.00 EUR");
   assert.equal(stats.items.find((i) => i.label === "Cash reversed")!.value, "150.00 EUR");
-  assert.equal(stats.items.find((i) => i.label === "Stripe fees")!.value, "15.00 EUR");
+  assert.equal(stats.items.find((i) => i.label === "Fees lost")!.value, "15.00 EUR");
   assert.equal(stats.items.find((i) => i.label === "Concessions")!.value, "20.00 EUR");
+  const operating = stats.items.find((i) => i.label === "Processing cost")!;
+  assert.equal(operating.value, "990.00 EUR");
+  assert.equal((operating as { badge?: { text: string } }).badge?.text, "Not counted");
 
   const categories = page!.blocks.find(
     (b) => b.type === "table" && b.key === "money-out-categories"
   ) as { rows: Array<{ id: string; ref?: { page: string; filters?: Record<string, string> } }> };
   assert.equal(categories.rows[0].id, "refund", "largest first");
+  assert.ok(
+    !categories.rows.some((r) => r.id === "stripe_fee"),
+    "processing fees would otherwise dominate the breakdown at 990 EUR"
+  );
   assert.deepEqual(categories.rows[0].ref, { page: "money-out", filters: { category: "refund", window: "30d" } });
 
   const ledger = page!.blocks.find((b) => b.type === "table" && b.key === "money-out-ledger") as {
@@ -6567,6 +6577,31 @@ test("money out: bucket tiles net out reversals, categories link into the ledger
   assert.equal(ledger.rows[0].id, "txn_1");
   assert.equal(ledger.nextCursor, null, "one row fits on one page");
   assert.equal(ledger.counts.items.find((i) => i.value === "CASH")!.count, 6);
+  // "All" counts losses only; processing fees get their own card so they stay
+  // one click away without ever padding the default view.
+  assert.equal(ledger.counts.items.find((i) => i.value === "")!.count, 9); // 4+1+1 cash, 1 fee, 2 concession
+  assert.equal(ledger.counts.items.find((i) => i.value === "OPERATING")!.count, 40);
+});
+
+test("money out: the ledger table hides processing fees until they are asked for", async () => {
+  const seen: Array<Record<string, unknown>> = [];
+  const ctx = moneyOutCtx();
+  (ctx.stores.moneyOut as { page: unknown }).page = async (filters: Record<string, unknown>) => {
+    seen.push(filters);
+    return { rows: [], total: 0 };
+  };
+
+  await makeMoneyOutSection().buildPage(ctx, { page: "money-out", filters: {} });
+  assert.deepEqual(seen[0].excludeCategories, ["stripe_fee"], "hidden by default");
+
+  // Picking the Processing cost card shows them.
+  await makeMoneyOutSection().buildPage(ctx, { page: "money-out", filters: { bucket: "OPERATING" } });
+  assert.equal(seen[1].excludeCategories, undefined);
+
+  // So does naming the category outright.
+  await makeMoneyOutSection().buildPage(ctx, { page: "money-out", filters: { category: "stripe_fee" } });
+  assert.equal(seen[2].excludeCategories, undefined);
+  assert.equal(seen[2].category, "stripe_fee");
 });
 
 test("money out: paginates past 25 rows", async () => {

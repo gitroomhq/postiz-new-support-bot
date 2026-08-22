@@ -1,7 +1,7 @@
 {
   "uid": "psb-money-out",
   "title": "Money Out",
-  "description": "Everything that leaves the Stripe account: refunds, disputes and their fees, Stripe processing fees, and non-cash concessions. Sourced from Stripe's own balance-transaction ledger, so it includes outflows made outside this bot (the Stripe Dashboard included). Amounts are net of reversals and shown in major units. For staff-activity counts use the 'Billing: Support Events' dashboard instead: its events describe what the team did, and several of them describe the same money.",
+  "description": "What leaves the Stripe account: refunds, disputes and their penalty fees, and non-cash concessions. Sourced from Stripe's own balance-transaction ledger, so it includes outflows made outside this bot (the Stripe Dashboard included). ORDINARY PROCESSING FEES ARE EXCLUDED FROM EVERY TOTAL \u2014 they are the cost of taking money, not money lost, and live in their own row at the bottom. Amounts are net of reversals, in major units. For staff-activity counts use the 'Billing: Support Events' dashboard instead: its events describe what the team did, and several of them describe the same money.",
   "tags": [
     "postiz-support-bot",
     "billing"
@@ -42,12 +42,25 @@
   },
   "panels": [
     {
-      "id": 1,
-      "type": "stat",
-      "title": "Total money out",
+      "id": 100,
+      "type": "row",
+      "title": "Losses",
       "gridPos": {
         "x": 0,
         "y": 0,
+        "w": 24,
+        "h": 1
+      },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Total lost",
+      "gridPos": {
+        "x": 0,
+        "y": 1,
         "w": 5,
         "h": 4
       },
@@ -61,7 +74,7 @@
             "type": "influxdb",
             "uid": "${datasource}"
           },
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_minor\")\n  |> sum()\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))",
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_minor\")\n  |> filter(fn: (r) => r.category != \"stripe_fee\")\n  |> sum()\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))",
           "refId": "A"
         }
       ],
@@ -95,7 +108,7 @@
         },
         "overrides": []
       },
-      "description": "Every outflow in the window, net of reversals. Sum of money_out.amount_minor across all buckets."
+      "description": "Everything we LOST in the window, net of reversals: refunds, disputes, chargeback fees and concessions. Ordinary Stripe processing fees are deliberately excluded \u2014 that is the cost of taking money, not money lost, and folding it in would make this number climb with healthy revenue."
     },
     {
       "id": 2,
@@ -103,7 +116,7 @@
       "title": "Cash reversed",
       "gridPos": {
         "x": 5,
-        "y": 0,
+        "y": 1,
         "w": 5,
         "h": 4
       },
@@ -117,7 +130,7 @@
             "type": "influxdb",
             "uid": "${datasource}"
           },
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_minor\")\n  |> filter(fn: (r) => r.bucket == \"CASH\")\n  |> sum()\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))",
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_minor\")\n  |> filter(fn: (r) => r.category != \"stripe_fee\")\n  |> filter(fn: (r) => r.bucket == \"CASH\")\n  |> sum()\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))",
           "refId": "A"
         }
       ],
@@ -151,15 +164,15 @@
         },
         "overrides": []
       },
-      "description": "Refunds and disputes, minus refund failures and dispute reversals."
+      "description": "Refunds and dispute withdrawals, minus refund failures and dispute reversals."
     },
     {
       "id": 3,
       "type": "stat",
-      "title": "Stripe fees",
+      "title": "Fees lost",
       "gridPos": {
         "x": 10,
-        "y": 0,
+        "y": 1,
         "w": 5,
         "h": 4
       },
@@ -173,7 +186,7 @@
             "type": "influxdb",
             "uid": "${datasource}"
           },
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_minor\")\n  |> filter(fn: (r) => r.bucket == \"FEES\")\n  |> sum()\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))",
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_minor\")\n  |> filter(fn: (r) => r.category != \"stripe_fee\")\n  |> filter(fn: (r) => r.bucket == \"FEES\")\n  |> sum()\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))",
           "refId": "A"
         }
       ],
@@ -207,7 +220,7 @@
         },
         "overrides": []
       },
-      "description": "Processing fees plus chargeback fees. These exist only on balance transactions, so they arrive via the reconcile sweep, never a webhook."
+      "description": "Penalty fees only: the per-chargeback fee, plus fees Stripe keeps on money we handed back. Not ordinary processing fees."
     },
     {
       "id": 4,
@@ -215,7 +228,7 @@
       "title": "Concessions",
       "gridPos": {
         "x": 15,
-        "y": 0,
+        "y": 1,
         "w": 5,
         "h": 4
       },
@@ -229,7 +242,7 @@
             "type": "influxdb",
             "uid": "${datasource}"
           },
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_minor\")\n  |> filter(fn: (r) => r.bucket == \"CONCESSION\")\n  |> sum()\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))",
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_minor\")\n  |> filter(fn: (r) => r.category != \"stripe_fee\")\n  |> filter(fn: (r) => r.bucket == \"CONCESSION\")\n  |> sum()\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))",
           "refId": "A"
         }
       ],
@@ -263,15 +276,15 @@
         },
         "overrides": []
       },
-      "description": "Credit notes, discounts, write-offs, credit grants and balance credits: revenue given away without cash moving."
+      "description": "Credit notes, discounts, write-offs, credit grants and balance credits: revenue given away without cash moving. Discounts are booked at ONE billing cycle, so repeating coupons are worth more than shown."
     },
     {
       "id": 5,
       "type": "stat",
-      "title": "Outflow events",
+      "title": "Loss events",
       "gridPos": {
         "x": 20,
-        "y": 0,
+        "y": 1,
         "w": 4,
         "h": 4
       },
@@ -285,7 +298,7 @@
             "type": "influxdb",
             "uid": "${datasource}"
           },
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"count\")\n  |> sum()",
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"count\")\n  |> filter(fn: (r) => r.category != \"stripe_fee\")\n  |> sum()",
           "refId": "A"
         }
       ],
@@ -319,15 +332,15 @@
         },
         "overrides": []
       },
-      "description": "Number of ledger rows in the window."
+      "description": "Number of loss rows in the window (processing fees excluded)."
     },
     {
       "id": 10,
       "type": "timeseries",
-      "title": "Outflow per day by category",
+      "title": "Losses per day by category",
       "gridPos": {
         "x": 0,
-        "y": 4,
+        "y": 5,
         "w": 16,
         "h": 9
       },
@@ -341,7 +354,7 @@
             "type": "influxdb",
             "uid": "${datasource}"
           },
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_minor\")\n  |> keep(columns: [\"_time\", \"_value\", \"category\"])\n  |> group(columns: [\"category\"])\n  |> aggregateWindow(every: 1d, fn: sum, createEmpty: true)\n  |> fill(value: 0.0)\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))",
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_minor\")\n  |> filter(fn: (r) => r.category != \"stripe_fee\")\n  |> keep(columns: [\"_time\", \"_value\", \"category\"])\n  |> group(columns: [\"category\"])\n  |> aggregateWindow(every: 1d, fn: sum, createEmpty: true)\n  |> fill(value: 0.0)\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))",
           "refId": "A"
         }
       ],
@@ -383,7 +396,7 @@
         },
         "overrides": []
       },
-      "description": "Stacked daily outflow. A spike in one band tells you which kind of money left, not just that it did."
+      "description": "Stacked daily losses. A spike tells you which KIND of money left, not just that it did."
     },
     {
       "id": 11,
@@ -391,7 +404,7 @@
       "title": "Total by category",
       "gridPos": {
         "x": 16,
-        "y": 4,
+        "y": 5,
         "w": 8,
         "h": 9
       },
@@ -405,7 +418,7 @@
             "type": "influxdb",
             "uid": "${datasource}"
           },
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_minor\")\n  |> keep(columns: [\"_value\", \"category\"])\n  |> group(columns: [\"category\"])\n  |> sum()\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))\n  |> group()",
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_minor\")\n  |> filter(fn: (r) => r.category != \"stripe_fee\")\n  |> keep(columns: [\"_value\", \"category\"])\n  |> group(columns: [\"category\"])\n  |> sum()\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))\n  |> group()",
           "refId": "A"
         }
       ],
@@ -443,7 +456,20 @@
         },
         "overrides": []
       },
-      "description": "Where the money went in this window, largest first."
+      "description": "Where the losses went in this window, largest first."
+    },
+    {
+      "id": 101,
+      "type": "row",
+      "title": "Refunds & disputes",
+      "gridPos": {
+        "x": 0,
+        "y": 14,
+        "w": 24,
+        "h": 1
+      },
+      "collapsed": false,
+      "panels": []
     },
     {
       "id": 20,
@@ -451,7 +477,7 @@
       "title": "Refunded",
       "gridPos": {
         "x": 0,
-        "y": 13,
+        "y": 15,
         "w": 4,
         "h": 4
       },
@@ -465,7 +491,7 @@
             "type": "influxdb",
             "uid": "${datasource}"
           },
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_minor\")\n  |> filter(fn: (r) => r.category == \"refund\")\n  |> sum()\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))",
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_minor\")\n  |> filter(fn: (r) => r.category != \"stripe_fee\")\n  |> filter(fn: (r) => r.category == \"refund\")\n  |> sum()\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))",
           "refId": "A"
         }
       ],
@@ -507,7 +533,7 @@
       "title": "Refunds returned",
       "gridPos": {
         "x": 4,
-        "y": 13,
+        "y": 15,
         "w": 4,
         "h": 4
       },
@@ -521,7 +547,7 @@
             "type": "influxdb",
             "uid": "${datasource}"
           },
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_minor\")\n  |> filter(fn: (r) => r.category == \"refund_failure\")\n  |> sum()\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))",
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_minor\")\n  |> filter(fn: (r) => r.category != \"stripe_fee\")\n  |> filter(fn: (r) => r.category == \"refund_failure\")\n  |> sum()\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))",
           "refId": "A"
         }
       ],
@@ -560,10 +586,10 @@
     {
       "id": 22,
       "type": "stat",
-      "title": "Disputed",
+      "title": "Fees lost to refunds",
       "gridPos": {
         "x": 8,
-        "y": 13,
+        "y": 15,
         "w": 4,
         "h": 4
       },
@@ -577,7 +603,63 @@
             "type": "influxdb",
             "uid": "${datasource}"
           },
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_minor\")\n  |> filter(fn: (r) => r.category == \"dispute\")\n  |> sum()\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))",
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_minor\")\n  |> filter(fn: (r) => r.category != \"stripe_fee\")\n  |> filter(fn: (r) => r.category == \"refund_fee\")\n  |> sum()\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "decimals": 2,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "yellow",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "description": "Processing fees Stripe keeps on refunded money. Unlike an ordinary fee this buys nothing: the revenue went back."
+    },
+    {
+      "id": 23,
+      "type": "stat",
+      "title": "Disputed",
+      "gridPos": {
+        "x": 12,
+        "y": 15,
+        "w": 4,
+        "h": 4
+      },
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${datasource}"
+          },
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_minor\")\n  |> filter(fn: (r) => r.category != \"stripe_fee\")\n  |> filter(fn: (r) => r.category == \"dispute\")\n  |> sum()\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))",
           "refId": "A"
         }
       ],
@@ -614,12 +696,12 @@
       "description": "Funds withdrawn by card issuers for chargebacks."
     },
     {
-      "id": 23,
+      "id": 24,
       "type": "stat",
       "title": "Disputes reversed",
       "gridPos": {
-        "x": 12,
-        "y": 13,
+        "x": 16,
+        "y": 15,
         "w": 4,
         "h": 4
       },
@@ -633,7 +715,7 @@
             "type": "influxdb",
             "uid": "${datasource}"
           },
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_minor\")\n  |> filter(fn: (r) => r.category == \"dispute_reversal\")\n  |> sum()\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))",
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_minor\")\n  |> filter(fn: (r) => r.category != \"stripe_fee\")\n  |> filter(fn: (r) => r.category == \"dispute_reversal\")\n  |> sum()\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))",
           "refId": "A"
         }
       ],
@@ -670,68 +752,12 @@
       "description": "Chargebacks we won: funds reinstated to the balance."
     },
     {
-      "id": 24,
-      "type": "stat",
-      "title": "Dispute fees",
-      "gridPos": {
-        "x": 16,
-        "y": 13,
-        "w": 4,
-        "h": 4
-      },
-      "datasource": {
-        "type": "influxdb",
-        "uid": "${datasource}"
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${datasource}"
-          },
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_minor\")\n  |> filter(fn: (r) => r.category == \"dispute_fee\")\n  |> sum()\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))",
-          "refId": "A"
-        }
-      ],
-      "options": {
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "orientation": "auto",
-        "textMode": "auto",
-        "colorMode": "value",
-        "graphMode": "none",
-        "justifyMode": "auto"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "currencyUSD",
-          "decimals": 2,
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "red",
-                "value": null
-              }
-            ]
-          }
-        },
-        "overrides": []
-      },
-      "description": "The per-chargeback fee Stripe keeps whether the dispute is won or lost. Not refunded on a win."
-    },
-    {
       "id": 25,
       "type": "stat",
       "title": "True dispute cost",
       "gridPos": {
         "x": 20,
-        "y": 13,
+        "y": 15,
         "w": 4,
         "h": 4
       },
@@ -745,7 +771,7 @@
             "type": "influxdb",
             "uid": "${datasource}"
           },
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_minor\")\n  |> filter(fn: (r) => r.category == \"dispute\" or r.category == \"dispute_reversal\" or r.category == \"dispute_fee\")\n  |> sum()\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))",
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_minor\")\n  |> filter(fn: (r) => r.category != \"stripe_fee\")\n  |> filter(fn: (r) => r.category == \"dispute\" or r.category == \"dispute_reversal\" or r.category == \"dispute_fee\")\n  |> sum()\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))",
           "refId": "A"
         }
       ],
@@ -779,7 +805,7 @@
         },
         "overrides": []
       },
-      "description": "Withdrawals minus reinstatements PLUS the fees. This is what chargebacks actually cost, which the amount on a dispute object never shows."
+      "description": "Withdrawals minus reinstatements PLUS the chargeback fees. This is what disputes actually cost \u2014 the amount on a dispute object never shows the fee, and the fee is kept even when you WIN."
     },
     {
       "id": 30,
@@ -787,7 +813,7 @@
       "title": "Cash reversed per day: refunds vs disputes",
       "gridPos": {
         "x": 0,
-        "y": 17,
+        "y": 19,
         "w": 12,
         "h": 8
       },
@@ -850,7 +876,7 @@
       "title": "Concessions per day",
       "gridPos": {
         "x": 12,
-        "y": 17,
+        "y": 19,
         "w": 12,
         "h": 8
       },
@@ -906,15 +932,28 @@
         },
         "overrides": []
       },
-      "description": "Revenue given away rather than cash paid out. Easy to overlook because none of it shows up as a refund."
+      "description": "Revenue given away rather than cash paid out. Easy to overlook: none of it shows up as a refund."
+    },
+    {
+      "id": 102,
+      "type": "row",
+      "title": "Ledger health",
+      "gridPos": {
+        "x": 0,
+        "y": 27,
+        "w": 24,
+        "h": 1
+      },
+      "collapsed": false,
+      "panels": []
     },
     {
       "id": 40,
       "type": "barchart",
-      "title": "Outflow by how it reached us",
+      "title": "Losses by how they reached us",
       "gridPos": {
         "x": 0,
-        "y": 25,
+        "y": 28,
         "w": 8,
         "h": 7
       },
@@ -928,7 +967,7 @@
             "type": "influxdb",
             "uid": "${datasource}"
           },
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_minor\")\n  |> keep(columns: [\"_value\", \"source\"])\n  |> group(columns: [\"source\"])\n  |> sum()\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))\n  |> group()",
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_minor\")\n  |> filter(fn: (r) => r.category != \"stripe_fee\")\n  |> keep(columns: [\"_value\", \"source\"])\n  |> group(columns: [\"source\"])\n  |> sum()\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))\n  |> group()",
           "refId": "A"
         }
       ],
@@ -974,7 +1013,7 @@
       "title": "Ledger reconcile lag",
       "gridPos": {
         "x": 8,
-        "y": 25,
+        "y": 28,
         "w": 8,
         "h": 7
       },
@@ -1038,7 +1077,7 @@
       "title": "Reconcile errors",
       "gridPos": {
         "x": 16,
-        "y": 25,
+        "y": 28,
         "w": 8,
         "h": 7
       },
@@ -1095,6 +1134,140 @@
         "overrides": []
       },
       "description": "Anything above zero for a sustained period means the ledger is drifting from Stripe."
+    },
+    {
+      "id": 103,
+      "type": "row",
+      "title": "Processing cost (not a loss)",
+      "gridPos": {
+        "x": 0,
+        "y": 35,
+        "w": 24,
+        "h": 1
+      },
+      "collapsed": false,
+      "panels": [],
+      "description": "Ordinary Stripe fees, shown apart because they are the cost of taking money rather than money lost. Nothing here is included in any total above."
+    },
+    {
+      "id": 50,
+      "type": "stat",
+      "title": "Processing fees",
+      "gridPos": {
+        "x": 0,
+        "y": 36,
+        "w": 6,
+        "h": 5
+      },
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${datasource}"
+          },
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_minor\" and r.category == \"stripe_fee\")\n  |> sum()\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "decimals": 2,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "description": "Card processing, FX, tax on fees, and Stripe invoices paid from the balance."
+    },
+    {
+      "id": 51,
+      "type": "timeseries",
+      "title": "Processing fees per day",
+      "gridPos": {
+        "x": 6,
+        "y": 36,
+        "w": 18,
+        "h": 5
+      },
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${datasource}"
+          },
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_minor\" and r.category == \"stripe_fee\")\n  |> aggregateWindow(every: 1d, fn: sum, createEmpty: true)\n  |> fill(value: 0.0)\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "decimals": 2,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 15,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "showPoints": "never",
+            "barAlignment": 0
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "description": "Expected to track revenue: it rising is normally a good sign, which is exactly why it does not belong in a money-lost total."
     }
   ]
 }
