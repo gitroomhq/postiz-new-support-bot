@@ -2349,6 +2349,20 @@ export class DiscordBot {
     };
   }
 
+  // Guards against a second detached backfill starting while one is running:
+  // two concurrent all-time sweeps would just fight over the same rows.
+  private moneyOutBackfillRunning = false;
+
+  // Posts a standalone embed to the billing audit channel (falling back to the
+  // general audit channel), for results that outlive their interaction.
+  private async postBillingAuditEmbed(embed: EmbedBuilder): Promise<void> {
+    const channelId = this.settingsStore.billingAuditChannelId() ?? this.settingsStore.auditLogChannelId();
+    if (!channelId) return;
+    const channel = await this.client.channels.fetch(channelId).catch(() => null);
+    if (!channel?.isSendable()) return;
+    await channel.send({ embeds: [embed] }).catch(() => undefined);
+  }
+
   private buildMoneyOutConfigPanel() {
     const s = this.settingsStore;
     const sweepAt = s.moneyOutSweepAt();
@@ -4273,36 +4287,61 @@ export class DiscordBot {
 
     if (id === "config_money_out_backfill") {
       // All-time balance-transaction sweep into the local ledger + historical
-      // Influx points at each row's real timestamp. Idempotent (upsert by
-      // transaction id; identical points overwrite), so re-runs are allowed —
-      // notably to populate Grafana after enabling Influx.
+      // Influx points at each row's real timestamp. Idempotent, so re-runs are
+      // allowed — notably to populate Grafana after enabling Influx.
+      //
+      // Runs DETACHED: an account with years of history pages for minutes,
+      // which would blow past Discord's interaction window and leave the panel
+      // stuck on "thinking…". The result lands in the billing audit channel
+      // instead, which is also where it stays readable afterwards.
       await interaction.deferReply({ flags: 64 });
       if (!this.moneyOutService) return;
-      try {
-        const result = await this.moneyOutService.backfillHistory();
-        this.auditConfig(
-          interaction,
-          `Money-out history backfilled → ${result.scanned} transaction(s) scanned, ${result.created} new row(s), ${result.points} Influx point(s)${
-            result.truncated ? " (sweep truncated)" : ""
-          }`
-        );
+      if (this.moneyOutBackfillRunning) {
         await interaction.editReply({
-          embeds: [
+          embeds: [makeEmbed("A money-out backfill is already running. Its result will post to the billing audit channel.", COLORS.warn)],
+        });
+        return;
+      }
+      this.moneyOutBackfillRunning = true;
+      await interaction.editReply({
+        embeds: [
+          makeEmbed(
+            "⏳ Backfill started. It sweeps every balance transaction Stripe has, so it can take a few minutes on an old account.\n\n" +
+              "The result posts to the billing audit channel when it finishes; you can close this and keep working.",
+            COLORS.brand
+          ),
+        ],
+      });
+      const service = this.moneyOutService;
+      void (async () => {
+        const startedAt = Date.now();
+        try {
+          const result = await service.backfillHistory();
+          const secs = Math.round((Date.now() - startedAt) / 1000);
+          this.auditConfig(
+            interaction,
+            `Money-out history backfilled in ${secs}s → ${result.scanned} transaction(s) scanned, ${result.created} new row(s), ${result.points} Influx point(s)${
+              result.truncated ? " (sweep truncated)" : ""
+            }`
+          );
+          await this.postBillingAuditEmbed(
             makeEmbed(
-              `✅ Backfill complete: scanned **${result.scanned}** balance transaction(s), recorded **${result.created}** new ledger row(s).` +
+              `✅ **Money-out backfill complete** (${secs}s): scanned **${result.scanned}** balance transaction(s), recorded **${result.created}** new ledger row(s).` +
                 (result.points
                   ? ` Wrote **${result.points}** historical point(s) to InfluxDB.`
                   : " Influx exporter inactive: no analytics points written (re-run after enabling it).") +
-                (result.truncated ? "\n⚠️ Sweep hit the page cap. Run again to continue." : ""),
+                (result.truncated ? "\n⚠️ Sweep hit the page cap. Run it again to continue." : ""),
               COLORS.success
-            ),
-          ],
-        });
-      } catch (error) {
-        await interaction.editReply({
-          embeds: [makeEmbed(`Backfill failed: ${String(error).slice(0, 500)}`, COLORS.danger)],
-        });
-      }
+            )
+          );
+        } catch (error) {
+          await this.postBillingAuditEmbed(
+            makeEmbed(`❌ **Money-out backfill failed**: ${String(error).slice(0, 500)}`, COLORS.danger)
+          );
+        } finally {
+          this.moneyOutBackfillRunning = false;
+        }
+      })();
       return;
     }
 

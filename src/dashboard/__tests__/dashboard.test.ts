@@ -6626,3 +6626,34 @@ test("money out: a mixed-currency window reports one currency instead of adding 
   const notices = page!.blocks.filter((b) => b.type === "notice") as Array<{ text: string }>;
   assert.ok(notices.some((n) => /USD/.test(n.text)), "the excluded currency must be called out");
 });
+
+
+test("api view: a hyphenated page name routes instead of 400ing (money-out lives at /billing/money-out)", async () => {
+  const fake = fakeSettings();
+  const provider: DashboardAuthProvider = {
+    enter: async () => ({ kind: "page" }),
+    authenticate: async () => fakeAuthResult("active"),
+    publicEndpoint: async () => null,
+    sessionEndpoint: async () => null,
+  };
+  const hyphenSection: DashboardSectionModule = {
+    nav: [{ key: "money-out", label: "Money out", page: "money-out", group: "Operate" }],
+    ownsPage: (p) => p === "money-out",
+    buildPage: async () => ({ title: "Money out", crumbs: [{ label: "Money out" }], blocks: [] }),
+  };
+  const dashboard = new Dashboard(fake.store, provider, [hyphenSection], {
+    stripe: { isTestMode: () => true } as unknown as StripeClient,
+    settings: fake.store,
+    stores: {} as never,
+    billing: { actions: {} as never, gateway: {} as never },
+  });
+
+  const ok = await dashboard.api("view", "c", { page: "money-out" });
+  assert.equal(ok.status, 200, "a hyphenated page must not be rejected as a bad request");
+  assert.equal((ok.json as { title: string }).title, "Money out");
+
+  // The validator still rejects anything that is not a plain page name.
+  for (const bad of ["../etc", "Money-Out", "money out", "-money", "money/out"]) {
+    assert.equal((await dashboard.api("view", "c", { page: bad })).status, 400, bad);
+  }
+});

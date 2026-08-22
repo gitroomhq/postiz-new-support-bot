@@ -369,7 +369,10 @@ export class Dashboard implements MountedPanelRoute {
   // Hostile-client shaping of the view request.
   private viewRequest(request: Record<string, unknown>): ViewRequest | null {
     const page = typeof request.page === "string" ? request.page : "";
-    if (!/^[a-z][a-z0-9_.]{0,63}$/.test(page)) return null;
+    // Hyphens are allowed so a multi-word page keeps a readable URL
+    // (/billing/money-out). The page name only ever selects a module by
+    // ownsPage — it never reaches a filesystem, a query or a shell.
+    if (!/^[a-z][a-z0-9_.-]{0,63}$/.test(page)) return null;
     const params: Record<string, string> = {};
     const rawParams = this.obj(request.params);
     if (rawParams) {

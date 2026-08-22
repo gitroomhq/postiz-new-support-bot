@@ -32,6 +32,13 @@ const FIRST_SWEEP_LOOKBACK_S = 7 * DAY_S;
 const PAGE_SIZE = 100;
 const MAX_PAGES_PER_TICK = 40;
 const MAX_PAGES_BACKFILL = 2_000;
+// Per page, how many charge reads the sweep will spend resolving customer ids.
+// Attribution is a nice-to-have column; the totals never depend on it, so this
+// is capped rather than allowed to dominate a backfill's runtime.
+const MAX_CUSTOMER_LOOKUPS_PER_PAGE = 20;
+// Flush the Influx buffer every N points during the backfill's re-emission —
+// the client drops points once its 5000-line buffer fills.
+const BACKFILL_FLUSH_EVERY = 500;
 
 export interface MoneyOutBackfillResult {
   scanned: number;
@@ -111,13 +118,23 @@ export class MoneyOutService {
   // Influx re-emission uses each row's real occurredAt, so identical points
   // (same measurement + tags + timestamp) overwrite rather than double-count.
   async backfillHistory(onProgress?: () => void): Promise<MoneyOutBackfillResult> {
-    const swept = await this.sweep({ maxPages: MAX_PAGES_BACKFILL, source: "backfill", emitPoints: false, onProgress });
+    // No per-charge customer lookups and no live points: an all-time sweep
+    // would otherwise spend thousands of Stripe reads on a display column, and
+    // the points are re-emitted from the mirror below at their real timestamps.
+    const swept = await this.sweep({
+      maxPages: MAX_PAGES_BACKFILL,
+      source: "backfill",
+      emitPoints: false,
+      resolveCustomers: false,
+      onProgress,
+    });
 
     // Re-emit the WHOLE mirror at historical timestamps, not just what this
     // sweep created — a re-run after enabling Influx must be able to populate
     // the series from rows an earlier run already stored.
     let points = 0;
     if (influxActive()) {
+      let sinceFlush = 0;
       for await (const batch of this.store.iterateAll()) {
         onProgress?.();
         for (const row of batch) {
@@ -132,6 +149,12 @@ export class MoneyOutService {
             ts: row.occurredAt,
           });
           points++;
+          // The client silently DROPS points once its buffer fills, which on an
+          // all-time history would quietly lose most of it.
+          if (++sinceFlush >= BACKFILL_FLUSH_EVERY) {
+            sinceFlush = 0;
+            await flushInflux();
+          }
         }
       }
       await flushInflux();
@@ -149,6 +172,7 @@ export class MoneyOutService {
     source: MoneyOutSource;
     emitPoints?: boolean;
     onProgress?: () => void;
+    resolveCustomers?: boolean;
   }): Promise<{ scanned: number; created: number; truncated: boolean }> {
     const emitPoints = opts.emitPoints !== false;
     let startingAfter: string | undefined;
@@ -166,28 +190,43 @@ export class MoneyOutService {
       });
       pages++;
       opts.onProgress?.();
+
+      // Classify the whole page first, then write it in ONE batch. Doing this
+      // per row cost two queries each, which is what made an all-time backfill
+      // take minutes on a busy account.
+      const pageRows: MoneyOutRow[] = [];
       for (const bt of page.transactions) {
         scanned++;
         const rows = classifyBalanceTransaction(bt, opts.source);
         if (rows.length === 0) continue;
-        for (const row of await this.withCustomer(rows, bt)) {
-          const isNew = await this.store.upsert(row);
-          if (!isNew) continue;
-          created++;
-          if (emitPoints) {
-            exportMoneyOut({
-              bucket: row.bucket,
-              category: row.category,
-              currency: row.currency,
-              source: row.source,
-              amountMinor: row.amountMinor,
-              feeMinor: row.feeMinor,
-              netMinor: row.netMinor,
-              ts: row.occurredAt,
-            });
-          }
-        }
+        pageRows.push(...this.attachCustomerFromSource(rows, bt));
       }
+
+      const fresh = await this.store.insertNew(pageRows);
+      created += fresh.length;
+      if (emitPoints) {
+        for (const row of fresh) {
+          exportMoneyOut({
+            bucket: row.bucket,
+            category: row.category,
+            currency: row.currency,
+            source: row.source,
+            amountMinor: row.amountMinor,
+            feeMinor: row.feeMinor,
+            netMinor: row.netMinor,
+            ts: row.occurredAt,
+          });
+        }
+        // The Influx client drops points once its buffer fills (5000 lines), so
+        // a long sweep MUST flush as it goes or it silently loses history.
+        await flushInflux();
+      }
+
+      // Customer attribution for rows the expanded source couldn't answer.
+      // Deliberately AFTER the write and only for genuinely new rows: it costs
+      // a Stripe read per charge, and a missing customer id degrades one
+      // dashboard column rather than the totals.
+      if (opts.resolveCustomers !== false) await this.backfillCustomers(fresh);
       if (!page.hasMore || page.transactions.length === 0) {
         return { scanned, created, truncated: false };
       }
@@ -199,25 +238,32 @@ export class MoneyOutService {
     }
   }
 
-  // Resolve the customer behind the rows once per transaction (not once per
-  // row) and only when the expanded source didn't already carry it.
-  private async withCustomer(rows: MoneyOutRow[], bt: Stripe.BalanceTransaction): Promise<MoneyOutRow[]> {
-    if (rows.every((r) => r.customerId != null)) return rows;
-    const customerId = await this.resolveCustomer(bt);
+  // Free attribution: the expanded source often already names the customer.
+  // No network, so it runs for every row before the batch write.
+  private attachCustomerFromSource(rows: MoneyOutRow[], bt: Stripe.BalanceTransaction): MoneyOutRow[] {
+    const src = bt.source;
+    if (!src || typeof src === "string") return rows;
+    const customerId = idOf((src as { customer?: string | { id: string } | null }).customer ?? null);
     if (!customerId) return rows;
     return rows.map((r) => ({ ...r, customerId: r.customerId ?? customerId }));
   }
 
-  private async resolveCustomer(bt: Stripe.BalanceTransaction): Promise<string | null> {
-    const src = bt.source;
-    if (src && typeof src !== "string") {
-      const withCustomer = src as { customer?: string | { id: string } | null; charge?: string | { id: string } | null };
-      const direct = idOf(withCustomer.customer ?? null);
-      if (direct) return direct;
-      const chargeId = idOf(withCustomer.charge ?? null);
-      if (chargeId) return this.stripe.getChargeCustomerId(chargeId).catch(() => null);
+  // Paid attribution: one charge read per distinct charge, and only for rows
+  // that ended up without a customer. Bounded per page so a backfill over an
+  // account with thousands of refunds cannot turn into thousands of extra
+  // Stripe calls — the rest simply keep a null customer, which costs one
+  // dashboard column and nothing else.
+  private async backfillCustomers(rows: MoneyOutRow[]): Promise<void> {
+    const needing = rows.filter((r) => !r.customerId && r.chargeId);
+    if (needing.length === 0) return;
+    const chargeIds = [...new Set(needing.map((r) => r.chargeId!))].slice(0, MAX_CUSTOMER_LOOKUPS_PER_PAGE);
+    for (const chargeId of chargeIds) {
+      const customerId = await this.stripe.getChargeCustomerId(chargeId).catch(() => null);
+      if (!customerId) continue;
+      await this.store
+        .setCustomerForCharge(chargeId, customerId)
+        .catch(() => undefined);
     }
-    return null;
   }
 
   // ---- concession path (no balance transaction exists for these) ----

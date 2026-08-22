@@ -66,12 +66,58 @@ export class MoneyOutStore {
     return existing == null;
   }
 
-  async upsertMany(rows: MoneyOutRow[]): Promise<number> {
-    let created = 0;
-    for (const row of rows) {
-      if (await this.upsert(row)) created++;
-    }
-    return created;
+  // Bulk path for the ledger sweeps, which page 100 transactions at a time.
+  // Two queries per page instead of two per ROW: read back which ids already
+  // exist, then createMany the rest. Returns the rows that were actually new,
+  // so the caller knows exactly which ones to emit as Influx points.
+  //
+  // Existing rows are deliberately NOT rewritten: a balance transaction is
+  // immutable once Stripe has written it, so an update would spend a query to
+  // store the identical values. Concessions, which CAN change, keep using
+  // upsert() above.
+  async insertNew(rows: MoneyOutRow[]): Promise<MoneyOutRow[]> {
+    if (rows.length === 0) return [];
+    // Same id twice in one page (a fee row keyed off its movement row cannot
+    // collide, but a retry inside one sweep could) would make createMany throw.
+    const deduped = [...new Map(rows.map((r) => [r.id, r])).values()];
+    const existing = await this.prisma.stripeMoneyOut.findMany({
+      where: { id: { in: deduped.map((r) => r.id) } },
+      select: { id: true },
+    });
+    const known = new Set(existing.map((e) => e.id));
+    const fresh = deduped.filter((r) => !known.has(r.id));
+    if (fresh.length === 0) return [];
+    await this.prisma.stripeMoneyOut.createMany({
+      data: fresh.map((r) => ({
+        id: r.id,
+        kind: r.kind,
+        bucket: r.bucket,
+        category: r.category,
+        amountMinor: r.amountMinor,
+        feeMinor: r.feeMinor,
+        netMinor: r.netMinor,
+        currency: r.currency,
+        source: r.source,
+        reason: r.reason,
+        stripeObjectId: r.stripeObjectId,
+        chargeId: r.chargeId,
+        customerId: r.customerId,
+        occurredAt: r.occurredAt,
+      })),
+      // A concurrent sweep (webhook mini-sweep racing the looper) may have
+      // inserted the same id between the read and the write.
+      skipDuplicates: true,
+    });
+    return fresh;
+  }
+
+  // Late attribution: fill in the customer on rows a sweep wrote before it
+  // knew who they belonged to. Never overwrites an id that is already there.
+  async setCustomerForCharge(chargeId: string, customerId: string): Promise<void> {
+    await this.prisma.stripeMoneyOut.updateMany({
+      where: { chargeId, customerId: null },
+      data: { customerId },
+    });
   }
 
   async get(id: string): Promise<StripeMoneyOut | null> {
