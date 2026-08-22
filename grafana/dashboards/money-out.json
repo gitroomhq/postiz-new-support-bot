@@ -354,7 +354,7 @@
             "type": "influxdb",
             "uid": "${datasource}"
           },
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_minor\")\n  |> filter(fn: (r) => r.category != \"stripe_fee\")\n  |> keep(columns: [\"_time\", \"_value\", \"category\"])\n  |> group(columns: [\"category\"])\n  |> aggregateWindow(every: 1d, fn: sum, createEmpty: true)\n  |> fill(value: 0.0)\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))",
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_minor\")\n  |> filter(fn: (r) => r.category != \"stripe_fee\")\n  |> filter(fn: (r) => r.category != \"refund_failure\" and r.category != \"dispute_reversal\")\n  |> keep(columns: [\"_time\", \"_value\", \"category\"])\n  |> group(columns: [\"category\"])\n  |> aggregateWindow(every: 1d, fn: sum, createEmpty: true)\n  |> fill(value: 0.0)\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))",
           "refId": "A"
         }
       ],
@@ -396,7 +396,7 @@
         },
         "overrides": []
       },
-      "description": "Stacked daily losses. A spike tells you which KIND of money left, not just that it did."
+      "description": "Stacked daily losses. Reversals (refunds that failed, disputes we won) are EXCLUDED here so the bars stay readable \u2014 money coming back would stack downward and smear every bar. See 'Reversals per day' for those, and the tiles above for the net figures, which do subtract them."
     },
     {
       "id": 11,
@@ -810,7 +810,7 @@
     {
       "id": 30,
       "type": "timeseries",
-      "title": "Cash reversed per day: refunds vs disputes",
+      "title": "Cash out per day: refunds vs disputes",
       "gridPos": {
         "x": 0,
         "y": 19,
@@ -827,7 +827,7 @@
             "type": "influxdb",
             "uid": "${datasource}"
           },
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_minor\" and r.bucket == \"CASH\")\n  |> keep(columns: [\"_time\", \"_value\", \"category\"])\n  |> group(columns: [\"category\"])\n  |> aggregateWindow(every: 1d, fn: sum, createEmpty: true)\n  |> fill(value: 0.0)\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))",
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_minor\" and r.bucket == \"CASH\")\n  |> filter(fn: (r) => r.category != \"refund_failure\" and r.category != \"dispute_reversal\")\n  |> keep(columns: [\"_time\", \"_value\", \"category\"])\n  |> group(columns: [\"category\"])\n  |> aggregateWindow(every: 1d, fn: sum, createEmpty: true)\n  |> fill(value: 0.0)\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))",
           "refId": "A"
         }
       ],
@@ -868,7 +868,8 @@
           }
         },
         "overrides": []
-      }
+      },
+      "description": "Money leaving only. Reversals are charted separately below rather than stacked in as negatives."
     },
     {
       "id": 31,
@@ -932,7 +933,71 @@
         },
         "overrides": []
       },
-      "description": "Revenue given away rather than cash paid out. Easy to overlook: none of it shows up as a refund."
+      "description": "Revenue deliberately given away: credit notes, coupons, credit grants and balance credits. Voided and uncollectible invoices are NOT here \u2014 those are revenue that never arrived, not money given away, and they outweigh real concessions by so much that including them hid everything else."
+    },
+    {
+      "id": 32,
+      "type": "timeseries",
+      "title": "Reversals per day (money that came back)",
+      "gridPos": {
+        "x": 0,
+        "y": 27,
+        "w": 24,
+        "h": 6
+      },
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${datasource}"
+      },
+      "description": "Refunds that failed at the bank and disputes we won. Stored negative so every total nets out automatically; shown here as positive amounts because that is how you read them.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${datasource}"
+          },
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_minor\")\n  |> filter(fn: (r) => r.category == \"refund_failure\" or r.category == \"dispute_reversal\")\n  |> keep(columns: [\"_time\", \"_value\", \"category\"])\n  |> group(columns: [\"category\"])\n  |> aggregateWindow(every: 1d, fn: sum, createEmpty: true)\n  |> fill(value: 0.0)\n  |> map(fn: (r) => ({ r with _value: r._value / -100.0 }))",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "decimals": 2,
+          "custom": {
+            "drawStyle": "bars",
+            "lineWidth": 1,
+            "fillOpacity": 20,
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            },
+            "showPoints": "never",
+            "barAlignment": 0
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
     },
     {
       "id": 102,
@@ -940,7 +1005,7 @@
       "title": "Ledger health",
       "gridPos": {
         "x": 0,
-        "y": 27,
+        "y": 33,
         "w": 24,
         "h": 1
       },
@@ -953,7 +1018,7 @@
       "title": "Losses by how they reached us",
       "gridPos": {
         "x": 0,
-        "y": 28,
+        "y": 34,
         "w": 8,
         "h": 7
       },
@@ -1013,7 +1078,7 @@
       "title": "Ledger reconcile lag",
       "gridPos": {
         "x": 8,
-        "y": 28,
+        "y": 34,
         "w": 8,
         "h": 7
       },
@@ -1077,7 +1142,7 @@
       "title": "Reconcile errors",
       "gridPos": {
         "x": 16,
-        "y": 28,
+        "y": 34,
         "w": 8,
         "h": 7
       },
@@ -1138,16 +1203,16 @@
     {
       "id": 103,
       "type": "row",
-      "title": "Processing cost (not a loss)",
+      "title": "Context: not losses, never counted",
       "gridPos": {
         "x": 0,
-        "y": 35,
+        "y": 41,
         "w": 24,
         "h": 1
       },
       "collapsed": false,
       "panels": [],
-      "description": "Ordinary Stripe fees, shown apart because they are the cost of taking money rather than money lost. Nothing here is included in any total above."
+      "description": "Processing fees and never-collected invoices. Neither is money lost \u2014 a fee is what taking money costs, and a voided invoice is revenue that never arrived. Both dwarf real losses by volume, so neither is included in any total above."
     },
     {
       "id": 50,
@@ -1155,7 +1220,7 @@
       "title": "Processing fees",
       "gridPos": {
         "x": 0,
-        "y": 36,
+        "y": 42,
         "w": 6,
         "h": 5
       },
@@ -1206,12 +1271,75 @@
       "description": "Card processing, FX, tax on fees, and Stripe invoices paid from the balance."
     },
     {
+      "id": 60,
+      "type": "timeseries",
+      "title": "Never collected per day (voided / uncollectible invoices)",
+      "gridPos": {
+        "x": 0,
+        "y": 42,
+        "w": 24,
+        "h": 5
+      },
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${datasource}"
+      },
+      "description": "Invoices voided or written off: revenue that never arrived. NOT a loss and not in any total above \u2014 no money moves, and it is overwhelmingly failed payments and dunning rather than a decision anyone made. Tracked because the trend is worth watching on its own.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${datasource}"
+          },
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_minor\" and r.category == \"write_off\")\n  |> aggregateWindow(every: 1d, fn: sum, createEmpty: true)\n  |> fill(value: 0.0)\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": false
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "decimals": 2,
+          "custom": {
+            "drawStyle": "bars",
+            "lineWidth": 1,
+            "fillOpacity": 15,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "showPoints": "never"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
       "id": 51,
       "type": "timeseries",
       "title": "Processing fees per day",
       "gridPos": {
         "x": 6,
-        "y": 36,
+        "y": 42,
         "w": 18,
         "h": 5
       },

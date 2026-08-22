@@ -8,7 +8,7 @@ import {
   BUCKET_OF,
   countsAsLoss,
   LOSS_BUCKETS,
-  OPERATING_CATEGORIES,
+  CONTEXT_CATEGORIES,
   type MoneyOutBucket,
   type MoneyOutCategory,
 } from "../../bot/billing/moneyOutTaxonomy";
@@ -36,6 +36,7 @@ const BUCKET_LABELS: Record<MoneyOutBucket, string> = {
   FEES: "Fees lost",
   CONCESSION: "Concessions",
   OPERATING: "Processing cost",
+  UNCOLLECTED: "Never collected",
 };
 
 const BUCKET_SUBS: Record<MoneyOutBucket, string> = {
@@ -43,6 +44,7 @@ const BUCKET_SUBS: Record<MoneyOutBucket, string> = {
   FEES: "Chargeback and refund fees",
   CONCESSION: "Credits, discounts, write-offs",
   OPERATING: "Not a loss, excluded from totals",
+  UNCOLLECTED: "Failed payments, excluded from totals",
 };
 
 const CATEGORY_LABELS: Record<MoneyOutCategory, string> = {
@@ -77,7 +79,7 @@ export function makeMoneyOutSection(): DashboardSectionModule {
 
 async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: string | null): Promise<SectionPage> {
   const window = WINDOWS.find((w) => w.value === filters.window) ?? WINDOWS[1];
-  const bucket = (["CASH", "FEES", "CONCESSION", "OPERATING"] as const).find((b) => b === filters.bucket) ?? null;
+  const bucket = (["CASH", "FEES", "CONCESSION", "OPERATING", "UNCOLLECTED"] as const).find((b) => b === filters.bucket) ?? null;
   const category = ALL_CATEGORIES.find((c) => c === filters.category) ?? null;
   const skip = Math.max(0, Number.parseInt(cursor ?? "0", 10) || 0);
 
@@ -94,7 +96,9 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
         to,
         // Hidden unless asked for by name or by picking the Processing cost
         // card: ordinary fees are high-volume noise next to actual losses.
-        ...(category || bucket === "OPERATING" ? {} : { excludeCategories: OPERATING_CATEGORIES.slice() }),
+        ...(category || bucket === "OPERATING" || bucket === "UNCOLLECTED"
+          ? {}
+          : { excludeCategories: CONTEXT_CATEGORIES.slice() }),
       },
       skip,
       PAGE_SIZE
@@ -141,16 +145,18 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
   // lost — including them would make "money out" rise with healthy revenue and
   // drown the numbers that matter. They are still recorded and still reachable
   // through the Processing cost filter; they just never enter a total.
-  const byBucket = new Map<MoneyOutBucket, number>(LOSS_BUCKETS.map((b) => [b, 0]));
-  let operatingMinor = 0;
+  const byBucket = new Map<MoneyOutBucket, number>(
+    [...LOSS_BUCKETS, "OPERATING" as const, "UNCOLLECTED" as const].map((b) => [b, 0])
+  );
   for (const t of inCurrency) {
-    if (!countsAsLoss(t.category)) {
-      operatingMinor += t.amountMinor;
-      continue;
-    }
-    byBucket.set(t.bucket, (byBucket.get(t.bucket) ?? 0) + t.amountMinor);
+    // Bucket by CATEGORY, not by the stored bucket string, so rows written
+    // before a taxonomy change land where they belong today.
+    byBucket.set(BUCKET_OF[t.category] ?? t.bucket, (byBucket.get(BUCKET_OF[t.category] ?? t.bucket) ?? 0) + t.amountMinor);
   }
-  const grandTotal = [...byBucket.values()].reduce((a, b) => a + b, 0);
+  // LOSS buckets only. byBucket also holds the context buckets so their tiles
+  // can render, and summing every value would quietly put processing fees and
+  // uncollected invoices straight back into the headline number.
+  const grandTotal = LOSS_BUCKETS.reduce((sum, b) => sum + (byBucket.get(b) ?? 0), 0);
 
   blocks.push({
     type: "stats",
@@ -165,12 +171,12 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
         value: ctx.stripe.formatAmount(byBucket.get(b) ?? 0, currency),
         sub: BUCKET_SUBS[b],
       })),
-      {
-        label: BUCKET_LABELS.OPERATING,
-        value: ctx.stripe.formatAmount(operatingMinor, currency),
-        sub: BUCKET_SUBS.OPERATING,
+      ...(["OPERATING", "UNCOLLECTED"] as const).map((b) => ({
+        label: BUCKET_LABELS[b],
+        value: ctx.stripe.formatAmount(byBucket.get(b) ?? 0, currency),
+        sub: BUCKET_SUBS[b],
         badge: { kind: "neutral", text: "Not counted" } as Badge,
-      },
+      })),
     ],
   });
 
@@ -269,11 +275,11 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
           label: BUCKET_LABELS[b],
           count: totals.filter((t) => countsAsLoss(t.category) && t.bucket === b).reduce((n, t) => n + t.count, 0),
         })),
-        {
-          value: "OPERATING",
-          label: BUCKET_LABELS.OPERATING,
-          count: totals.filter((t) => !countsAsLoss(t.category)).reduce((n, t) => n + t.count, 0),
-        },
+        ...(["OPERATING", "UNCOLLECTED"] as const).map((b) => ({
+          value: b,
+          label: BUCKET_LABELS[b],
+          count: totals.filter((t) => BUCKET_OF[t.category] === b).reduce((n, t) => n + t.count, 0),
+        })),
       ],
     },
     filters: [
@@ -297,7 +303,7 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
       (lastSweep
         ? `Reconciled with Stripe's balance transactions ${describeAge(lastSweep)}. Refunds issued in the Stripe Dashboard appear here too. `
         : "Never reconciled with Stripe yet — only events seen live are listed. ") +
-      "Ordinary processing fees are recorded but hidden and never counted as a loss; open the Processing cost card to see them.",
+      "Processing fees and never-collected invoices are recorded but hidden and never counted: a fee is what taking money costs, and a voided invoice is revenue that never arrived rather than money given away. Open their cards to see them.",
     exportable: true,
   });
 

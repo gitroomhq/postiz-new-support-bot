@@ -4,6 +4,7 @@ import { SettingsStore } from "../../config/SettingsStore";
 import { MoneyOutStore } from "./MoneyOutStore";
 import {
   classifyBalanceConcession,
+  buildRefundFeeRow,
   classifyBalanceTransaction,
   classifyCreditNote,
   classifyDiscount,
@@ -80,6 +81,12 @@ export class MoneyOutService {
     private store: MoneyOutStore
   ) {}
 
+  // Pass-through so /config can read what the mirror holds without reaching
+  // past the service into the store.
+  coverage(): ReturnType<MoneyOutStore["coverage"]> {
+    return this.store.coverage();
+  }
+
   // ---- ledger path ----
 
   // The looper tick: walk forward from the cursor, upsert what is new, advance.
@@ -87,7 +94,12 @@ export class MoneyOutService {
   // can page for minutes, which would otherwise trip the heartbeat timeout.
   async reconcile(onProgress?: () => void): Promise<MoneyOutTickResult> {
     const result: MoneyOutTickResult = { scanned: 0, created: 0, errors: 0, truncated: false, skipped: true };
-    if (!this.settings.moneyOutEnabled()) return result;
+    if (!this.settings.moneyOutEnabled()) {
+      // Still emit the gauge: a silent measurement must mean "the tick is not
+      // running", never "the tick ran and chose to do nothing".
+      exportMoneyOutSweep({ scanned: 0, created: 0, errors: 0, lagSeconds: 0, skipped: true });
+      return result;
+    }
     result.skipped = false;
 
     const cursor = this.settings.moneyOutSweepAt();
@@ -116,7 +128,13 @@ export class MoneyOutService {
     }
 
     const lagSeconds = Math.max(0, Math.round((Date.now() - (this.settings.moneyOutSweepAt()?.getTime() ?? Date.now())) / 1000));
-    exportMoneyOutSweep({ scanned: result.scanned, created: result.created, errors: result.errors, lagSeconds });
+    exportMoneyOutSweep({
+      scanned: result.scanned,
+      created: result.created,
+      errors: result.errors,
+      lagSeconds,
+      skipped: false,
+    });
     return result;
   }
 
@@ -270,7 +288,12 @@ export class MoneyOutService {
           ...(startingAfter ? { startingAfter } : {}),
         });
         for (const sub of res.subscriptions) {
-          if (await this.recordSubscriptionDiscounts(sub)) discounts++;
+          const booked = await this.recordDiscountsOn(sub.discounts, {
+            customerId: idOf(sub.customer as string | { id: string } | null),
+            subscriptionId: sub.id,
+            createdFallback: sub.created,
+          });
+          if (booked) discounts++;
         }
         if (!res.hasMore || res.subscriptions.length === 0) break;
         startingAfter = res.subscriptions[res.subscriptions.length - 1].id;
@@ -279,41 +302,100 @@ export class MoneyOutService {
       moneyLog.warn("money-out discount backfill failed", { "error.message": String(error) });
     }
 
+    // Customer-level coupons: applied to the customer rather than one
+    // subscription, so the subscription walk above never sees them.
+    try {
+      let startingAfter: string | undefined;
+      for (let page = 0; page < MAX_PAGES_BACKFILL; page++) {
+        onProgress?.();
+        const res = await this.stripe.listCustomersPage({
+          limit: 100,
+          ...(startingAfter ? { startingAfter } : {}),
+        });
+        for (const customer of res.customers) {
+          const discount = (customer as { discount?: Stripe.Discount | null }).discount;
+          if (!discount) continue;
+          const booked = await this.recordDiscountsOn(discount, {
+            customerId: customer.id,
+            subscriptionId: null,
+            createdFallback: customer.created,
+          });
+          if (booked) discounts++;
+        }
+        if (!res.hasMore || res.customers.length === 0) break;
+        startingAfter = res.customers[res.customers.length - 1].id;
+      }
+    } catch (error) {
+      moneyLog.warn("money-out customer discount backfill failed", { "error.message": String(error) });
+    }
+
     return { creditNotes, writeOffs, discounts, discountsHistoricalUnavailable: true };
   }
 
-  // Books every discount currently attached to one subscription. Returns true
-  // when at least one was recorded, so the caller can count subscriptions
-  // rather than raw coupon objects.
-  private async recordSubscriptionDiscounts(sub: Stripe.Subscription): Promise<boolean> {
-    const customerId = idOf(sub.customer as string | { id: string } | null);
+  // Books every discount attached to a subscription or a customer. Returns true
+  // when at least one was recorded, so the caller counts subjects rather than
+  // raw coupon objects.
+  private async recordDiscountsOn(
+    discounts: Array<string | Stripe.Discount> | Stripe.Discount | null | undefined,
+    scope: { customerId: string | null; subscriptionId: string | null; createdFallback: number }
+  ): Promise<boolean> {
+    const list = Array.isArray(discounts) ? discounts : discounts ? [discounts] : [];
     let any = false;
-    for (const raw of sub.discounts ?? []) {
-      if (typeof raw === "string") continue; // unexpanded — nothing to price
-      const coupon = raw.source?.coupon;
-      if (!coupon || typeof coupon === "string") continue;
+    for (const raw of list) {
+      // An unexpanded DISCOUNT is a dead end: Stripe has no discounts.retrieve.
+      if (typeof raw === "string") continue;
+      // An unexpanded COUPON is not — and it is the common case, which is why
+      // skipping it made the coupon backfill report zero every time.
+      const coupon = await this.resolveCoupon(raw.source?.coupon ?? null);
+      if (!coupon) continue;
+
       let baseMinor = 0;
       let currency = coupon.currency ?? "usd";
       if (coupon.percent_off != null) {
-        const priced = await this.priceDiscountBase(customerId, sub.id).catch(() => null);
+        const priced = await this.priceDiscountBase(scope.customerId, scope.subscriptionId).catch(() => null);
         if (!priced) continue;
         baseMinor = priced.baseMinor;
         currency = priced.currency;
       }
       await this.recordDiscount({
         discountId: raw.id,
-        customerId,
+        customerId: scope.customerId,
         currency,
         baseMinor,
         percentOff: coupon.percent_off,
         amountOffMinor: coupon.amount_off,
         reason: `${coupon.name ?? coupon.id}${coupon.duration ? ` (${coupon.duration})` : ""}`,
-        occurredAt: new Date((raw.start ?? sub.created) * 1000),
+        occurredAt: new Date((raw.start ?? scope.createdFallback) * 1000),
         source: "backfill",
       });
       any = true;
     }
     return any;
+  }
+
+  // One charge read per distinct charge for the life of the sweep: several
+  // partial refunds of the same payment are the common case.
+  private chargeFeeCache = new Map<string, { amount: number; feeMinor: number; currency: string } | null>();
+
+  private async chargeWithFee(chargeId: string): Promise<{ amount: number; feeMinor: number; currency: string } | null> {
+    if (this.chargeFeeCache.has(chargeId)) return this.chargeFeeCache.get(chargeId) ?? null;
+    const fetched = await this.stripe.getChargeWithFee(chargeId).catch(() => null);
+    this.chargeFeeCache.set(chargeId, fetched);
+    return fetched;
+  }
+
+  // Coupons arrive as bare ids far more often than as objects, and the same
+  // handful of coupons repeat across every subscription, so this is cached for
+  // the life of the sweep.
+  private couponCache = new Map<string, Stripe.Coupon | null>();
+
+  private async resolveCoupon(coupon: string | Stripe.Coupon | null): Promise<Stripe.Coupon | null> {
+    if (!coupon) return null;
+    if (typeof coupon !== "string") return coupon;
+    if (this.couponCache.has(coupon)) return this.couponCache.get(coupon) ?? null;
+    const fetched = await this.stripe.getCoupon(coupon).catch(() => null);
+    this.couponCache.set(coupon, fetched);
+    return fetched;
   }
 
   // The shared pager behind reconcile / syncForObject / backfillHistory.
@@ -325,6 +407,7 @@ export class MoneyOutService {
     emitPoints?: boolean;
     onProgress?: () => void;
     resolveCustomers?: boolean;
+    resolveRefundFees?: boolean;
   }): Promise<{ scanned: number; created: number; truncated: boolean }> {
     const emitPoints = opts.emitPoints !== false;
     let startingAfter: string | undefined;
@@ -352,6 +435,21 @@ export class MoneyOutService {
         const rows = classifyBalanceTransaction(bt, opts.source);
         if (rows.length === 0) continue;
         pageRows.push(...this.attachCustomerFromSource(rows, bt));
+      }
+
+      // Fees lost to refunds. Stripe keeps the ORIGINAL charge's processing fee
+      // when you refund, and that fee lives only on the charge's balance
+      // transaction — the refund's own carries none, which is why this needs a
+      // lookup rather than a field. Not capped like customer attribution: this
+      // feeds a total, so quietly sampling it would understate real losses.
+      if (opts.resolveRefundFees !== false) {
+        for (const movement of pageRows.filter((r) => r.category === "refund" || r.category === "refund_failure")) {
+          if (!movement.chargeId) continue;
+          const charge = await this.chargeWithFee(movement.chargeId);
+          if (!charge) continue;
+          const feeRow = buildRefundFeeRow(movement, charge);
+          if (feeRow) pageRows.push(feeRow);
+        }
       }
 
       const fresh = await this.store.insertNew(pageRows);

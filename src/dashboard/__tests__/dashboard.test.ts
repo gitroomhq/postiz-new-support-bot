@@ -6513,8 +6513,10 @@ function moneyOutCtx(over: {
         { bucket: "CASH", category: "dispute_reversal", currency: "eur", amountMinor: -1_500, count: 1 },
         { bucket: "FEES", category: "dispute_fee", currency: "eur", amountMinor: 1_500, count: 1 },
         { bucket: "CONCESSION", category: "credit_note", currency: "eur", amountMinor: 2_000, count: 2 },
-        // Operating cost: must never reach a total, however large it gets.
+        // Context rows: must never reach a total, however large they get. The
+        // write-offs are the case that made the whole chart unreadable.
         { bucket: "OPERATING", category: "stripe_fee", currency: "eur", amountMinor: 99_000, count: 40 },
+        { bucket: "UNCOLLECTED", category: "write_off", currency: "eur", amountMinor: 300_000, count: 60 },
       ],
     page: async () => ({
       rows:
@@ -6558,14 +6560,17 @@ test("money out: bucket tiles net out reversals, categories link into the ledger
   const operating = stats.items.find((i) => i.label === "Processing cost")!;
   assert.equal(operating.value, "990.00 EUR");
   assert.equal((operating as { badge?: { text: string } }).badge?.text, "Not counted");
+  const uncollected = stats.items.find((i) => i.label === "Never collected")!;
+  assert.equal(uncollected.value, "3000.00 EUR");
+  assert.equal((uncollected as { badge?: { text: string } }).badge?.text, "Not counted");
 
   const categories = page!.blocks.find(
     (b) => b.type === "table" && b.key === "money-out-categories"
   ) as { rows: Array<{ id: string; ref?: { page: string; filters?: Record<string, string> } }> };
   assert.equal(categories.rows[0].id, "refund", "largest first");
   assert.ok(
-    !categories.rows.some((r) => r.id === "stripe_fee"),
-    "processing fees would otherwise dominate the breakdown at 990 EUR"
+    !categories.rows.some((r) => r.id === "stripe_fee" || r.id === "write_off"),
+    "fees and write-offs would otherwise dominate the breakdown at 990 and 3000 EUR"
   );
   assert.deepEqual(categories.rows[0].ref, { page: "money-out", filters: { category: "refund", window: "30d" } });
 
@@ -6581,6 +6586,7 @@ test("money out: bucket tiles net out reversals, categories link into the ledger
   // one click away without ever padding the default view.
   assert.equal(ledger.counts.items.find((i) => i.value === "")!.count, 9); // 4+1+1 cash, 1 fee, 2 concession
   assert.equal(ledger.counts.items.find((i) => i.value === "OPERATING")!.count, 40);
+  assert.equal(ledger.counts.items.find((i) => i.value === "UNCOLLECTED")!.count, 60);
 });
 
 test("money out: the ledger table hides processing fees until they are asked for", async () => {
@@ -6592,7 +6598,7 @@ test("money out: the ledger table hides processing fees until they are asked for
   };
 
   await makeMoneyOutSection().buildPage(ctx, { page: "money-out", filters: {} });
-  assert.deepEqual(seen[0].excludeCategories, ["stripe_fee"], "hidden by default");
+  assert.deepEqual(seen[0].excludeCategories, ["stripe_fee", "write_off"], "both context categories hidden by default");
 
   // Picking the Processing cost card shows them.
   await makeMoneyOutSection().buildPage(ctx, { page: "money-out", filters: { bucket: "OPERATING" } });

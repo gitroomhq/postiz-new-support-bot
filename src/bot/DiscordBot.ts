@@ -2363,10 +2363,16 @@ export class DiscordBot {
     await channel.send({ embeds: [embed] }).catch(() => undefined);
   }
 
-  private buildMoneyOutConfigPanel() {
+  private async buildMoneyOutConfigPanel() {
     const s = this.settingsStore;
     const sweepAt = s.moneyOutSweepAt();
     const backfillAt = s.moneyOutBackfillDoneAt();
+    // What the MIRROR holds, straight from Postgres. When a Grafana panel looks
+    // wrong this is the first thing to read: a coverage window that runs to
+    // today means the mirror is complete and the gap is in the Influx points
+    // (re-emit); one that stops early means the sweep stopped early (re-run).
+    const cov = await this.moneyOutService?.coverage().catch(() => null);
+    const day = (d: Date | null | undefined) => (d ? `<t:${Math.floor(d.getTime() / 1000)}:d>` : "—");
     const embed = new EmbedBuilder()
       .setTitle("💸 Money Out")
       .setColor(0x5865f2)
@@ -2374,6 +2380,11 @@ export class DiscordBot {
         [
           `**Ledger:** ${s.moneyOutEnabled() ? "on" : "off"}`,
           `**Last reconcile:** ${sweepAt ? `<t:${Math.floor(sweepAt.getTime() / 1000)}:R>` : "_never_"}`,
+          cov
+            ? `**Stored:** ${cov.rows} row(s), covering ${day(cov.oldest)} → ${day(cov.newest)}${
+                cov.byCategory.length ? `\n**Breakdown:** ${cov.byCategory.map((c) => `${c.category} ${c.count}`).join(" · ")}` : ""
+              }`
+            : "**Stored:** _unavailable_",
           `**History backfill:** ${
             backfillAt ? `last run <t:${Math.floor(backfillAt.getTime() / 1000)}:R>` : "_never run_: figures only cover the period since the ledger was switched on"
           }`,
@@ -4281,30 +4292,57 @@ export class DiscordBot {
     }
 
     if (id === "config_money_out") {
-      await interaction.update(this.buildMoneyOutConfigPanel());
+      await interaction.update(await this.buildMoneyOutConfigPanel());
       return;
     }
 
     if (id === "config_money_out_toggle") {
       await this.settingsStore.updateMoneyOut({ moneyOutEnabled: !this.settingsStore.moneyOutEnabled() });
       this.auditConfig(interaction, `Money-out ledger → ${this.settingsStore.moneyOutEnabled() ? "on" : "off"}`);
-      await interaction.update(this.buildMoneyOutConfigPanel());
+      await interaction.update(await this.buildMoneyOutConfigPanel());
       return;
     }
 
     if (id === "config_money_out_run_now") {
       await interaction.deferReply({ flags: 64 });
-      const result = await this.temporalProducers?.moneyOutRunNow();
-      await interaction.editReply({
-        embeds: [
-          makeEmbed(
-            result && result.ok
-              ? "✅ Reconcile signalled. The tick walks Stripe's balance transactions forward from the stored cursor."
-              : "⚠️ Could not signal the reconcile looper (Temporal unreachable?). The next scheduled tick still runs.",
-            result && result.ok ? COLORS.success : COLORS.warn
-          ),
-        ],
-      });
+      if (!this.moneyOutService) return;
+      // Signal the looper when Temporal is up; otherwise run the tick right
+      // here. Without the fallback this button silently does nothing on a
+      // Temporal-less deploy — and the reconcile is the ONLY way Stripe fees
+      // and dispute fees ever reach the ledger, so "nothing happened" would be
+      // indistinguishable from "there was nothing to find".
+      const signalled = await this.temporalProducers?.moneyOutRunNow().catch(() => null);
+      if (signalled?.ok) {
+        await interaction.editReply({
+          embeds: [
+            makeEmbed(
+              "✅ Reconcile signalled. The tick walks Stripe's balance transactions forward from the stored cursor.",
+              COLORS.success
+            ),
+          ],
+        });
+        return;
+      }
+      try {
+        const r = await this.moneyOutService.reconcile();
+        this.auditConfig(interaction, `Money-out reconcile (in-process) → ${r.scanned} scanned, ${r.created} new`);
+        await interaction.editReply({
+          embeds: [
+            makeEmbed(
+              r.skipped
+                ? "The money-out ledger is switched off, so there was nothing to reconcile."
+                : `✅ Reconciled in-process (the looper was unreachable): scanned **${r.scanned}** balance transaction(s), recorded **${r.created}** new row(s).` +
+                    (r.truncated ? "\n⚠️ Hit the page cap; run it again to continue." : "") +
+                    (r.errors ? `\n⚠️ ${r.errors} error(s) — check the logs.` : ""),
+              r.skipped ? COLORS.warn : COLORS.success
+            ),
+          ],
+        });
+      } catch (error) {
+        await interaction.editReply({
+          embeds: [makeEmbed(`Reconcile failed: ${String(error).slice(0, 500)}`, COLORS.danger)],
+        });
+      }
       return;
     }
 

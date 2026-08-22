@@ -127,6 +127,27 @@ export class MoneyOutStore {
     return this.prisma.stripeMoneyOut.findUnique({ where: { id } });
   }
 
+  // What the mirror actually holds. This is the disambiguation when a chart
+  // looks wrong: if coverage runs to today, the mirror is fine and the gap is
+  // in the Influx points; if coverage stops early, the SWEEP stopped early and
+  // no amount of re-emitting will fix it.
+  async coverage(): Promise<{ rows: number; oldest: Date | null; newest: Date | null; byCategory: Array<{ category: string; count: number }> }> {
+    const [rows, oldest, newest, grouped] = await Promise.all([
+      this.prisma.stripeMoneyOut.count(),
+      this.prisma.stripeMoneyOut.findFirst({ orderBy: { occurredAt: "asc" }, select: { occurredAt: true } }),
+      this.prisma.stripeMoneyOut.findFirst({ orderBy: { occurredAt: "desc" }, select: { occurredAt: true } }),
+      this.prisma.stripeMoneyOut.groupBy({ by: ["category"], _count: { _all: true } }),
+    ]);
+    return {
+      rows,
+      oldest: oldest?.occurredAt ?? null,
+      newest: newest?.occurredAt ?? null,
+      byCategory: grouped
+        .map((g) => ({ category: g.category, count: g._count._all }))
+        .sort((a, b) => b.count - a.count),
+    };
+  }
+
   async count(): Promise<number> {
     return this.prisma.stripeMoneyOut.count();
   }

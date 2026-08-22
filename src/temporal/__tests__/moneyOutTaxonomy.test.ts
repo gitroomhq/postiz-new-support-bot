@@ -52,13 +52,19 @@ test("every category maps to exactly one bucket and the bucket map is total", ()
   );
 });
 
-test("ordinary processing fees are the ONLY thing that is not a loss", () => {
+test("only processing fees and never-collected invoices sit outside the losses", () => {
   const notLoss = ALL_CATEGORIES.filter((c) => !countsAsLoss(c));
-  assert.deepEqual(notLoss, ["stripe_fee"], "processing fees are a cost of doing business, everything else is a loss");
+  assert.deepEqual(
+    notLoss.sort(),
+    ["stripe_fee", "write_off"].sort(),
+    "a fee is what taking money costs; a voided invoice is revenue that never arrived. Neither is money lost."
+  );
   assert.equal(BUCKET_OF.stripe_fee, "OPERATING");
+  assert.equal(BUCKET_OF.write_off, "UNCOLLECTED");
   // The loss buckets must never include OPERATING, or a total would quietly
   // start growing with healthy revenue.
   assert.ok(!LOSS_BUCKETS.includes("OPERATING"));
+  assert.ok(!LOSS_BUCKETS.includes("UNCOLLECTED"));
   for (const c of ALL_CATEGORIES) {
     assert.equal(countsAsLoss(c), LOSS_BUCKETS.includes(BUCKET_OF[c]), c);
   }

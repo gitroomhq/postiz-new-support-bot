@@ -13,7 +13,7 @@ import type Stripe from "stripe";
 // is cash moving from the Stripe balance to the bank, not cash lost. They are
 // classified as "ignored" and never written.
 
-export type MoneyOutBucket = "CASH" | "FEES" | "CONCESSION" | "OPERATING";
+export type MoneyOutBucket = "CASH" | "FEES" | "CONCESSION" | "OPERATING" | "UNCOLLECTED";
 
 export type MoneyOutCategory =
   // CASH — money reversed to a cardholder
@@ -28,12 +28,18 @@ export type MoneyOutCategory =
   // loss: it is what taking money costs, and folding it into "money out" would
   // make the number grow with healthy revenue.
   | "stripe_fee"
-  // CONCESSION — revenue given away without cash moving
+  // CONCESSION — revenue deliberately given away. No cash leaves the account,
+  // but we chose to forgo money we were owed.
   | "credit_note"
   | "discount"
-  | "write_off"
   | "credit_grant"
-  | "balance_credit";
+  | "balance_credit"
+  // UNCOLLECTED — invoices voided or written off. Recorded for context, NOT a
+  // loss: no money moves, and nothing was given away. It is revenue that never
+  // arrived, which is overwhelmingly failed payments and dunning rather than a
+  // decision anyone made. Mixed into a money-out total it dwarfs every real
+  // loss and makes the whole chart unreadable.
+  | "write_off";
 
 export type MoneyOutSource = "webhook" | "sweep" | "backfill" | "action";
 
@@ -47,32 +53,40 @@ export const BUCKET_OF: Record<MoneyOutCategory, MoneyOutBucket> = {
   stripe_fee: "OPERATING",
   credit_note: "CONCESSION",
   discount: "CONCESSION",
-  write_off: "CONCESSION",
   credit_grant: "CONCESSION",
   balance_credit: "CONCESSION",
+  write_off: "UNCOLLECTED",
 };
 
 export const CASH_CATEGORIES = ["refund", "refund_failure", "dispute", "dispute_reversal"] as const;
 export const FEE_CATEGORIES = ["dispute_fee", "refund_fee"] as const;
-export const OPERATING_CATEGORIES = ["stripe_fee"] as const;
-export const CONCESSION_CATEGORIES = ["credit_note", "discount", "write_off", "credit_grant", "balance_credit"] as const;
+export const CONCESSION_CATEGORIES = ["credit_note", "discount", "credit_grant", "balance_credit"] as const;
+// Recorded but never counted. Kept because both are genuinely useful to look
+// at — just not as losses.
+export const CONTEXT_CATEGORIES = ["stripe_fee", "write_off"] as const;
 
 export const ALL_CATEGORIES: MoneyOutCategory[] = [
   ...CASH_CATEGORIES,
   ...FEE_CATEGORIES,
-  ...OPERATING_CATEGORIES,
   ...CONCESSION_CATEGORIES,
+  ...CONTEXT_CATEGORIES,
 ];
 
-// The buckets that answer "what did we LOSE". Everything a money-out total
-// sums must come from these; OPERATING is deliberately absent.
+// The buckets that answer "what did we LOSE". Everything a money-out total sums
+// must come from these.
+//
+// OPERATING (processing fees) and UNCOLLECTED (voided invoices) are absent on
+// purpose, for the same underlying reason: neither is money we lost. A fee is
+// what taking money costs, and a voided invoice is money that never arrived —
+// no cash moves and nobody decided to give anything away. Both dwarf real
+// losses by volume, so including either buries the numbers that matter.
 export const LOSS_BUCKETS: MoneyOutBucket[] = ["CASH", "FEES", "CONCESSION"];
 
-// Loss-vs-cost is decided by CATEGORY, never by the stored bucket string: a row
-// written before a taxonomy change keeps its old bucket, and a total must not
-// silently shift because of it.
+// Loss-vs-context is decided by CATEGORY, never by the stored bucket string: a
+// row written before a taxonomy change keeps its old bucket, and a total must
+// not silently shift because of it.
 export function countsAsLoss(category: string): boolean {
-  return !(OPERATING_CATEGORIES as readonly string[]).includes(category);
+  return !(CONTEXT_CATEGORIES as readonly string[]).includes(category);
 }
 
 // One row destined for the stripe_money_out table. `id` carries the whole
@@ -204,6 +218,44 @@ export function classifyBalanceTransaction(
   }
 
   return rows;
+}
+
+// The processing fee lost because a charge was refunded.
+//
+// Stripe does not take a NEW fee on a refund — the refund's own balance
+// transaction has fee 0, which is why looking there found nothing. What it does
+// is keep the fee it already charged on the original payment, so that fee has
+// bought nothing: the revenue went back. The lost amount is the original fee
+// pro-rated by how much of the charge was refunded.
+//
+// Mirrors the sign of the movement it accompanies, so a failed refund (money
+// returned) also returns its share of the fee to the total.
+export function buildRefundFeeRow(
+  movement: MoneyOutRow,
+  charge: { amount: number; feeMinor: number; currency: string }
+): MoneyOutRow | null {
+  if (movement.category !== "refund" && movement.category !== "refund_failure") return null;
+  if (charge.feeMinor <= 0 || charge.amount <= 0) return null;
+  const share = Math.abs(movement.amountMinor) / charge.amount;
+  const lost = Math.round(charge.feeMinor * Math.min(1, share));
+  if (lost <= 0) return null;
+  return row({
+    // Distinct from the ":fee" suffix used for a fee carried ON the transaction
+    // — these are two different things and must never share a key.
+    id: `${movement.id}:refundfee`,
+    kind: "LEDGER",
+    category: "refund_fee",
+    amountMinor: movement.amountMinor < 0 ? -lost : lost,
+    feeMinor: 0,
+    netMinor: movement.amountMinor < 0 ? -lost : lost,
+    currency: charge.currency.toLowerCase(),
+    source: movement.source,
+    reason: "processing fee kept on refunded payment",
+    stripeObjectId: movement.stripeObjectId,
+    chargeId: movement.chargeId,
+    customerId: movement.customerId,
+    occurredAt: movement.occurredAt,
+  });
 }
 
 // null = not an outflow we track (charges, payouts, transfers, top-ups…).

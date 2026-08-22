@@ -680,6 +680,18 @@ export class StripeClient {
     return { transactions: res.data, hasMore: res.has_more };
   }
 
+  // A charge with its balance transaction expanded — the ONLY place the
+  // processing fee Stripe charged for it is visible. The money-out ledger needs
+  // it to work out what a refund cost in fees: Stripe takes no new fee on a
+  // refund, it simply never gives the original one back.
+  async getChargeWithFee(chargeId: string): Promise<{ amount: number; feeMinor: number; currency: string } | null> {
+    const charge = await this.stripe.charges.retrieve(chargeId, { expand: ["balance_transaction"] }).catch(() => null);
+    if (!charge) return null;
+    const bt = charge.balance_transaction;
+    if (!bt || typeof bt === "string") return null;
+    return { amount: charge.amount, feeMinor: bt.fee ?? 0, currency: bt.currency };
+  }
+
   async getCreditNote(creditNoteId: string): Promise<Stripe.CreditNote> {
     return this.stripe.creditNotes.retrieve(creditNoteId);
   }

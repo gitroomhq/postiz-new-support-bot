@@ -164,16 +164,28 @@ export function exportMoneyOut(p: {
 // Gauge from the money-out reconcile tick: how far behind the ledger mirror is
 // and whether the last sweep errored. Lag climbing is the alertable signal — it
 // means Stripe outflows are happening that the mirror has not seen.
+// Written on EVERY tick, including one that did nothing because the ledger is
+// switched off. That is deliberate: if this measurement is silent, the tick
+// itself is not running (looper down, Temporal off), which is a different
+// problem from "the ledger is disabled" and needs a different fix.
 export function exportMoneyOutSweep(p: {
   scanned: number;
   created: number;
   errors: number;
   lagSeconds: number;
+  skipped: boolean;
 }): void {
   writePoint(
     "money_out_sweep",
     {},
-    { scanned: p.scanned, created: p.created, errors: p.errors, lag_seconds: p.lagSeconds }
+    {
+      scanned: p.scanned,
+      created: p.created,
+      errors: p.errors,
+      lag_seconds: p.lagSeconds,
+      skipped: p.skipped ? 1 : 0,
+      alive: 1,
+    }
   );
 }
 
