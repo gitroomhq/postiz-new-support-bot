@@ -315,6 +315,46 @@ export class IntercomClient {
     }
   }
 
+  // EVERY contact attached to a conversation, not just the primary one.
+  // Intercom's native "detect customers in forwarded emails" attaches the real
+  // sender alongside the forwarder, so a forwarded thread legitimately has two
+  // — this is the read that makes the extra one visible.
+  async listConversationParticipants(
+    conversationId: string
+  ): Promise<Array<{ id: string; email: string | null }>> {
+    const data = await this.json<{
+      contacts?: { contacts?: Array<{ id?: string | number; email?: string | null }> };
+    }>(`/conversations/${encodeURIComponent(conversationId)}`, "GET", undefined, "conversation participants");
+    return (data.contacts?.contacts ?? [])
+      .filter((c) => c.id != null)
+      .map((c) => ({ id: String(c.id), email: c.email?.trim().toLowerCase() || null }));
+  }
+
+  // Detach one contact from a conversation. Intercom refuses to remove the last
+  // participant, and so does the caller — but the API is the backstop.
+  //
+  // Returns "unsupported" instead of throwing on 404/405: the endpoint's
+  // availability varies by API version, and a caller that retries every sweep
+  // on an endpoint this workspace does not have would loop forever.
+  async removeConversationParticipant(
+    conversationId: string,
+    contactId: string,
+    adminId: string
+  ): Promise<"removed" | "unsupported"> {
+    try {
+      await this.json(
+        `/conversations/${encodeURIComponent(conversationId)}/customers/${encodeURIComponent(contactId)}`,
+        "DELETE",
+        { admin_id: adminId },
+        "conversation participant remove"
+      );
+      return "removed";
+    } catch (e) {
+      if (e instanceof IntercomHttpError && (e.status === 404 || e.status === 405)) return "unsupported";
+      throw e;
+    }
+  }
+
   // Refreshes display identity on an existing contact (Discord names drift;
   // avatar was never set at create time). Never adds an email.
   async updateContact(
@@ -872,6 +912,7 @@ export class IntercomClient {
         team_assignee_id?: number | string | null;
         admin_assignee_id?: number | string | null;
         custom_attributes?: Record<string, unknown> | null;
+        contacts?: { contacts?: Array<{ id?: string | number }> } | null;
         statistics?: {
           first_admin_reply_at?: number | null;
           last_contact_reply_at?: number | null;
@@ -909,6 +950,10 @@ export class IntercomClient {
           teamAssigneeId: c.team_assignee_id != null ? String(c.team_assignee_id) : null,
           adminAssigneeId: c.admin_assignee_id != null ? String(c.admin_assignee_id) : null,
           customAttributes: c.custom_attributes ?? {},
+          // Ids only — the search projection carries no emails. Two or more is
+          // the cheap pre-filter that keeps the forwarder-detach check off the
+          // overwhelming majority of conversations.
+          participantIds: (c.contacts?.contacts ?? []).filter((p) => p.id != null).map((p) => String(p.id)),
         })),
       nextStartingAfter: data.pages?.next?.starting_after ?? null,
     };

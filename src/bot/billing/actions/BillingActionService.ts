@@ -5,6 +5,7 @@ import { SessionStore } from "../../../auth/SessionStore";
 import { SettingsStore } from "../../../config/SettingsStore";
 import { AuditLogger } from "../../AuditLogger";
 import type { PostizDriftService } from "../../../postiz/PostizDriftService";
+import type { MoneyOutService } from "../MoneyOutService";
 import { TicketStore } from "../../TicketStore";
 import { IntercomStore } from "../../../intercom/IntercomStore";
 import type { IntercomEventExecutor } from "../../../intercom/IntercomEventExecutor";
@@ -61,6 +62,11 @@ export class BillingActionService {
 
   private postizDrift?: PostizDriftService;
 
+  // Money-out ledger — late-bound like the drift service (it is constructed
+  // after this one). Absent means concessions simply go unrecorded; it never
+  // blocks the action.
+  private moneyOut?: MoneyOutService;
+
   constructor(
     private approvalStore: ApprovalStore,
     private settingsStore: SettingsStore,
@@ -83,6 +89,10 @@ export class BillingActionService {
   // makes the platform resync action refuse rather than guess.
   bindPostizDrift(drift: PostizDriftService): void {
     this.postizDrift = drift;
+  }
+
+  bindMoneyOut(service: MoneyOutService): void {
+    this.moneyOut = service;
   }
 
   // Resolves how THIS actor may run THIS action right now.
@@ -325,6 +335,7 @@ export class BillingActionService {
       actor,
       idemScope,
       postizDrift: this.postizDrift,
+      moneyOut: this.moneyOut,
     };
   }
 
@@ -342,6 +353,7 @@ export class BillingActionService {
       actor,
       idemScope,
       postizDrift: this.postizDrift,
+      moneyOut: this.moneyOut,
     };
   }
 

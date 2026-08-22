@@ -28,6 +28,8 @@ import { IntercomEventExecutor } from "./intercom/IntercomEventExecutor";
 import { IntercomWebhookHandler } from "./intercom/IntercomWebhookHandler";
 import { IntercomInboxApp } from "./intercom/IntercomInboxApp";
 import { ForwardConvertStore } from "./intercom/ForwardConvertStore";
+import { ForwarderRoster } from "./intercom/forwarderRoster";
+import { ForwarderDetacher } from "./intercom/ForwarderDetacher";
 import { ForwardedEmailConverter } from "./intercom/ForwardedEmailConverter";
 import { initSentry, shutdownSentry, captureFatal, log, reconfigureSentry } from "./util/logger";
 import { safe, setAiRecordContent } from "./util/instrument";
@@ -91,6 +93,7 @@ import { makeLinksSection } from "./dashboard/sections/linksSection";
 import { makeQuotesSection } from "./dashboard/sections/quotesSection";
 import { makeEventsSection } from "./dashboard/sections/eventsSection";
 import { makeWebhooksSection } from "./dashboard/sections/webhooksSection";
+import { makeMoneyOutSection } from "./dashboard/sections/moneyOutSection";
 import { makeReportsSection } from "./dashboard/sections/reportsSection";
 import { makeMetersSection } from "./dashboard/sections/metersSection";
 import { makePortalSection } from "./dashboard/sections/portalSection";
@@ -112,6 +115,8 @@ import { makeMaintenanceHub } from "./adminpanel/sections/maintenanceHub";
 import { makeSlaHub } from "./adminpanel/sections/slaHub";
 import { makeAssignmentHub } from "./adminpanel/sections/assignmentHub";
 import { CachedRatioEngine } from "./bot/billing/disputeRatio";
+import { MoneyOutStore } from "./bot/billing/MoneyOutStore";
+import { MoneyOutService } from "./bot/billing/MoneyOutService";
 import { DisputeMonitor } from "./bot/billing/DisputeMonitor";
 import { TemporalService } from "./temporal/TemporalService";
 import { TemporalWorkerManager } from "./temporal/TemporalWorkerManager";
@@ -266,7 +271,13 @@ async function main() {
   const blockService = new BlockService(settingsStore, stripeClient, blockStore);
   const ratioEngine = new CachedRatioEngine(stripeClient);
   const disputeMonitor = new DisputeMonitor(settingsStore, sessionStore, stripeClient, disputeStore, blockStore, ratioEngine);
+  // Money-out ledger: every outflow (refunds, disputes, fees, concessions)
+  // mirrored from Stripe's balance transactions, whatever surface caused it —
+  // the Stripe Dashboard included.
+  const moneyOutStore = new MoneyOutStore(prisma);
+  const moneyOutService = new MoneyOutService(settingsStore, stripeClient, moneyOutStore);
   const stripeWebhookHandler = new StripeWebhookHandler(settingsStore, sessionStore, stripeClient, disputeStore, blockService);
+  stripeWebhookHandler.setMoneyOutService(moneyOutService);
   // Intercom canvas/panel billing actions: approval queue + the shared
   // Discord-independent action brain (levels re-checked per request).
   const approvalStore = new ApprovalStore(prisma);
@@ -351,12 +362,19 @@ async function main() {
   // for the original sender): ledger + service. The ledger also exempts the
   // closed originals from native SLA evaluation when Intercom reopens them.
   const forwardConvertStore = new ForwardConvertStore(prisma);
+  // One roster shared by both halves of the forwarded-email feature, so they
+  // can never disagree about who counts as a forwarder (and share /admins).
+  const forwarderRoster = new ForwarderRoster(settingsStore, intercomClient);
   const forwardedEmailConverter = new ForwardedEmailConverter(
     settingsStore,
     intercomClient,
     forwardConvertStore,
-    auditLogger
+    auditLogger,
+    forwarderRoster
   );
+  // The other half: Intercom's NATIVE forward detection attaches the customer
+  // but leaves the forwarder attached too — this removes them.
+  const forwarderDetacher = new ForwarderDetacher(settingsStore, intercomClient, forwarderRoster, auditLogger);
   const slaService = new SlaService(
     prisma,
     settingsStore,
@@ -378,6 +396,7 @@ async function main() {
   intercomWebhookHandler.setSlaService(slaService);
   intercomWebhookHandler.setSentryFeedbackStore(sentryFeedbackStore);
   intercomWebhookHandler.setForwardedEmailConverter(forwardedEmailConverter);
+  intercomWebhookHandler.setForwarderDetacher(forwarderDetacher);
   sessionStore.setSlaHook((threadId) => slaService.onTicketTrigger(threadId, "refund_review"));
 
   // ---- Balanced assignment + bot-native SLA enforcement (Advanced tier:
@@ -468,13 +487,15 @@ async function main() {
     { service: vaultService, migrator: vaultMigrator },
     { blockService, stripeClient, disputeStore },
     intercomPanel,
-    intercomAdmin
+    intercomAdmin,
+    moneyOutService
   );
   // The client exists as soon as the constructor ran; nothing fires before login.
   bot.setSlaService(slaService);
   bot.setPostizIdentity(postizIdentity, postizClient);
   billingAdmin.setPostizIdentity(postizIdentity);
   billingActionService.bindPostizDrift(new PostizDriftService(postizIdentity, postizOrgLinks));
+  billingActionService.bindMoneyOut(moneyOutService);
   bot.setSentryFeedbackStore(sentryFeedbackStore);
   auditLogger.bindClient(bot.client);
   billingActionService.bindClient(bot.client);
@@ -595,8 +616,8 @@ async function main() {
   );
   dashboardOps.resetCredentials = (userId) => dashboardAuth.resetCredentials(userId);
   const dashboardGateway = new DashboardActionGateway(billingActionService, stripeClient, sessionStore);
-  const dashboardStores = { session: sessionStore, dispute: disputeStore, block: blockStore, qol: qolStore };
-  const dashboardMetrics = new HomeMetrics(stripeClient, settingsStore, disputeStore);
+  const dashboardStores = { session: sessionStore, dispute: disputeStore, block: blockStore, qol: qolStore, moneyOut: moneyOutStore };
+  const dashboardMetrics = new HomeMetrics(stripeClient, settingsStore, disputeStore, moneyOutStore);
   const fraudHuntService = new FraudHuntService(stripeClient, sessionStore);
   const dashboardSections = [
     makeHomeSection({ metrics: dashboardMetrics }),
@@ -616,6 +637,7 @@ async function main() {
     makeMetersSection(),
     makeEventsSection(),
     makeWebhooksSection(),
+    makeMoneyOutSection(),
     makeReportsSection(),
     makeBookmarksSection(),
     makeSecuritySection({ credentials: dashboardCredentials, sessions: dashboardDbSessions, audit: dashboardAudit }),
@@ -624,7 +646,7 @@ async function main() {
     stripe: stripeClient,
     settings: settingsStore,
     stores: dashboardStores,
-    billing: { actions: billingActionService, gateway: dashboardGateway },
+    billing: { actions: billingActionService, gateway: dashboardGateway, moneyOut: moneyOutService },
     search: new GlobalSearch(stripeClient, dashboardStores, postizIdentity),
     metrics: dashboardMetrics,
   });
@@ -650,7 +672,7 @@ async function main() {
   // Influx gauge snapshot body for the metricsSnapshotWorkflow's snapshotTick.
   const snapshotScheduler = new SnapshotScheduler(prisma, settingsStore);
   // SLA safety-sweep body (slaSweepWorkflow's slaSweepTick).
-  const slaSweeper = new SlaSweeper(intercomClient, intercomStore, settingsStore, slaService);
+  const slaSweeper = new SlaSweeper(intercomClient, intercomStore, settingsStore, slaService, forwarderDetacher);
   // Sentry feedback → Intercom import body (sentryFeedbackWorkflow's tick).
   const sentryFeedbackClient = new SentryFeedbackClient(settingsStore);
   bot.setSentryFeedbackClient(sentryFeedbackClient);
@@ -684,6 +706,7 @@ async function main() {
     stripeWebhookHandler,
     billingCategory,
     disputeMonitor,
+    moneyOutService,
     vaultMigrator,
     client: bot.client,
     producers: temporalProducers,

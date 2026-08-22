@@ -22,6 +22,7 @@ import {
   SIG_INTERCOM_CLEAR_OUTBOX,
   SIG_INTERCOM_ENQUEUE,
   SIG_KB_REFRESH_NOW,
+  SIG_MONEY_OUT_RUN_NOW,
   SIG_NOOP,
   SIG_REQUEST_STATUS_CHANGE,
   SIG_TICKET_CREATED,
@@ -281,6 +282,17 @@ export class TemporalProducers {
     });
   }
 
+  // /config "Sync Now" on the money-out panel + the Stripe webhook's
+  // accelerator when a targeted sync is not enough (fee-bearing events).
+  async moneyOutRunNow(): Promise<GatewayResult> {
+    return this.temporal.signalWithStart({
+      workflowType: "moneyOutWorkflow",
+      workflowId: SINGLETONS.moneyOut,
+      signalName: SIG_MONEY_OUT_RUN_NOW,
+      options: looperStartOptions(SINGLETONS.moneyOut),
+    });
+  }
+
   // ---- baseline: retire dead singletons/schedules, then ensure the live ones ----
 
   // Idempotent; runs before the worker starts (boot / toggle ON) and on
@@ -301,6 +313,7 @@ export class TemporalProducers {
       ["slaSweepWorkflow", SINGLETONS.slaSweep],
       ["slaEnforceWorkflow", SINGLETONS.slaEnforce],
       ["sentryFeedbackWorkflow", SINGLETONS.sentryFeedback],
+      ["moneyOutWorkflow", SINGLETONS.moneyOut],
     ];
     for (const [type, id] of singles) {
       if (client) {

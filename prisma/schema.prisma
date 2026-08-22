@@ -181,6 +181,10 @@ model BotSettings {
   forwardConvertTagName     String  @default("email") // tag applied to the recreated conversation
   forwardConvertCloseNote   String? // close-note override on the misattributed original ({email} supported); null = built-in default
   forwardConvertExtraEmails String  @default("") // comma-separated forwarder addresses treated like lite-seat teammates (personal mailboxes etc.)
+  // Intercom's NATIVE forward detection attaches the real customer but leaves
+  // the forwarder attached too; this detaches them afterwards. Separate from
+  // forwardConvertEnabled so the repair can be switched off on its own.
+  forwardDetachForwarder    Boolean @default(true)
   // AI models (edited via /config → AI & Knowledge). Free-text so new model ids
   // work without a code change. Light model runs the tool-less /ai summarize|draft.
   aiModel               String  @default("sonnet")
@@ -237,6 +241,14 @@ model BotSettings {
   disputeUrgentHours      Int     @default(48)
   disputeUrgentRoleId     String?
   disputeBackfillDoneAt   DateTime? // last all-time dispute history backfill run
+  // Money-out ledger: every outflow (refunds, disputes, fees, concessions)
+  // mirrored from Stripe's balance transactions + the concession webhooks.
+  // moneyOutSweepAt is the reconcile cursor (sweeps re-read from it minus an
+  // overlap); a null cursor means "never swept" and the first tick walks the
+  // default lookback rather than all of history.
+  moneyOutEnabled         Boolean   @default(false)
+  moneyOutSweepAt         DateTime?
+  moneyOutBackfillDoneAt  DateTime?
   radarListCardId         String?
   radarListEmailId        String?
   radarListCustomerId     String?
@@ -792,6 +804,46 @@ model StripeDispute {
   @@index([customerId])
   @@index([closedAt])
   @@map("stripe_disputes")
+}
+
+// Every outflow from the Stripe account, whatever its origin (our panels, the
+// Stripe Dashboard, Stripe itself). Two disjoint key spaces in one table:
+//
+//   kind=LEDGER      id = balance transaction id (txn_…). The balance-transaction
+//                    sweep is the ONLY writer, which is what makes webhook +
+//                    reconcile + backfill idempotent without any dedupe logic.
+//   kind=CONCESSION  id = the Stripe object id (cn_/di_/in_/…). These never
+//                    produce a balance transaction, so they can't collide.
+//
+// amountMinor is SIGNED: positive = money left, negative = money came back
+// (refund failures, dispute reversals). Reversals are kept as negative rows
+// rather than deleting the original, so any window sum is net and the history
+// stays auditable.
+model StripeMoneyOut {
+  id             String   @id
+  kind           String // LEDGER | CONCESSION
+  bucket         String // CASH | FEES | CONCESSION
+  category       String // refund | refund_failure | dispute | dispute_reversal | dispute_fee | stripe_fee | credit_note | discount | write_off | credit_grant | balance_credit
+  amountMinor    Int
+  feeMinor       Int      @default(0)
+  netMinor       Int
+  currency       String
+  source         String // webhook | sweep | backfill | action
+  reason         String?
+  stripeObjectId String? // re_ / dp_ / cn_ / di_ / in_ — the object behind the row
+  chargeId       String?
+  customerId     String?
+  occurredAt     DateTime
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@index([occurredAt])
+  @@index([bucket, occurredAt])
+  @@index([category, occurredAt])
+  @@index([customerId])
+  @@index([chargeId])
+  @@index([stripeObjectId])
+  @@map("stripe_money_out")
 }
 
 // Billing blocklist: one row per blocked identifier, mirrored into a Stripe

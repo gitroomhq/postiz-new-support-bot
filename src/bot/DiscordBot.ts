@@ -76,6 +76,7 @@ import { DashboardDiscord } from "../dashboard/DashboardDiscord";
 import { RADAR_LISTS, type BlockService } from "./billing/BlockService";
 import { backfillDisputeHistory } from "./billing/DisputeMonitor";
 import type { DisputeStore } from "./billing/DisputeStore";
+import type { MoneyOutService } from "./billing/MoneyOutService";
 import type { BlockKind } from "./billing/BlockStore";
 import { TICKET_ATTR_CSAT, TICKET_ATTR_CSAT_COMMENT, TICKET_ATTR_THREAD } from "../intercom/IntercomEventExecutor";
 import { IntercomMode, IntercomRegion } from "../config/SettingsStore";
@@ -209,7 +210,10 @@ export class DiscordBot {
     // Stripe panel (tokenized standalone page opened from the Intercom canvas).
     private intercomPanel?: IntercomPanel,
     // /intercom admin panel (bridge/SLA/automation/maintenance hubs).
-    private intercomAdmin?: IntercomAdmin
+    private intercomAdmin?: IntercomAdmin,
+    // Money-out ledger (drives /config → Billing → Money Out: the enable
+    // toggle and the one-time all-time balance-transaction backfill).
+    private moneyOutService?: MoneyOutService
   ) {
     this.client = new Client({
       // MessageContent is privileged (enable it in the Dev Portal too) — without it
@@ -2334,6 +2338,7 @@ export class DiscordBot {
       new ButtonBuilder().setCustomId("config_disputes").setLabel("Disputes").setStyle(ButtonStyle.Primary)
     );
     const buttons2 = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId("config_money_out").setLabel("Money Out").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("config_billing_clear_channel").setLabel("Clear Channel").setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId("config_reporting").setLabel("Back").setStyle(ButtonStyle.Secondary)
     );
@@ -2342,6 +2347,51 @@ export class DiscordBot {
       embeds: [embed],
       components: [new ActionRowBuilder<ChannelSelectMenuBuilder>().addComponents(channelSelect), buttons, buttons2],
     };
+  }
+
+  private buildMoneyOutConfigPanel() {
+    const s = this.settingsStore;
+    const sweepAt = s.moneyOutSweepAt();
+    const backfillAt = s.moneyOutBackfillDoneAt();
+    const embed = new EmbedBuilder()
+      .setTitle("💸 Money Out")
+      .setColor(0x5865f2)
+      .setDescription(
+        [
+          `**Ledger:** ${s.moneyOutEnabled() ? "on" : "off"}`,
+          `**Last reconcile:** ${sweepAt ? `<t:${Math.floor(sweepAt.getTime() / 1000)}:R>` : "_never_"}`,
+          `**History backfill:** ${
+            backfillAt ? `last run <t:${Math.floor(backfillAt.getTime() / 1000)}:R>` : "_never run_: figures only cover the period since the ledger was switched on"
+          }`,
+          "",
+          "Mirrors **every outflow** from the Stripe account into `/billing → Money out` and the Grafana **Money Out** dashboard:",
+          "• **Cash reversed** — refunds (full and partial), dispute withdrawals, minus anything that came back",
+          "• **Stripe fees** — processing fees and the per-chargeback fee",
+          "• **Concessions** — credit notes, discounts, write-offs, credit grants, balance credits",
+          "",
+          "Source of truth is Stripe's own balance-transaction ledger, so this **includes refunds issued straight from the Stripe Dashboard**, which nothing else here can see. Webhooks make an outflow appear within seconds; the reconcile looper ticks every 30 min as the backstop and is the only way fees ever arrive.",
+          "",
+          "_Backfill is idempotent: re-running it never double-counts, and it is also how you populate Grafana after enabling InfluxDB._",
+        ].join("\n")
+      );
+    const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId("config_money_out_toggle")
+        .setLabel(`Ledger: ${s.moneyOutEnabled() ? "on" : "off"}`)
+        .setStyle(s.moneyOutEnabled() ? ButtonStyle.Success : ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId("config_money_out_backfill")
+        .setLabel("Backfill History")
+        .setStyle(ButtonStyle.Primary)
+        .setDisabled(!s.moneyOutEnabled()),
+      new ButtonBuilder()
+        .setCustomId("config_money_out_run_now")
+        .setLabel("Reconcile Now")
+        .setStyle(ButtonStyle.Secondary)
+        .setDisabled(!s.moneyOutEnabled()),
+      new ButtonBuilder().setCustomId("config_billing").setLabel("Back").setStyle(ButtonStyle.Secondary)
+    );
+    return { embeds: [embed], components: [row] };
   }
 
   private buildDisputesConfigPanel() {
@@ -4190,6 +4240,69 @@ export class DiscordBot {
       await this.settingsStore.updateDisputes({ disputeUrgentRoleId: null });
       this.auditConfig(interaction, "Urgent dispute role cleared");
       await interaction.update(this.buildDisputesConfigPanel());
+      return;
+    }
+
+    if (id === "config_money_out") {
+      await interaction.update(this.buildMoneyOutConfigPanel());
+      return;
+    }
+
+    if (id === "config_money_out_toggle") {
+      await this.settingsStore.updateMoneyOut({ moneyOutEnabled: !this.settingsStore.moneyOutEnabled() });
+      this.auditConfig(interaction, `Money-out ledger → ${this.settingsStore.moneyOutEnabled() ? "on" : "off"}`);
+      await interaction.update(this.buildMoneyOutConfigPanel());
+      return;
+    }
+
+    if (id === "config_money_out_run_now") {
+      await interaction.deferReply({ flags: 64 });
+      const result = await this.temporalProducers?.moneyOutRunNow();
+      await interaction.editReply({
+        embeds: [
+          makeEmbed(
+            result && result.ok
+              ? "✅ Reconcile signalled. The tick walks Stripe's balance transactions forward from the stored cursor."
+              : "⚠️ Could not signal the reconcile looper (Temporal unreachable?). The next scheduled tick still runs.",
+            result && result.ok ? COLORS.success : COLORS.warn
+          ),
+        ],
+      });
+      return;
+    }
+
+    if (id === "config_money_out_backfill") {
+      // All-time balance-transaction sweep into the local ledger + historical
+      // Influx points at each row's real timestamp. Idempotent (upsert by
+      // transaction id; identical points overwrite), so re-runs are allowed —
+      // notably to populate Grafana after enabling Influx.
+      await interaction.deferReply({ flags: 64 });
+      if (!this.moneyOutService) return;
+      try {
+        const result = await this.moneyOutService.backfillHistory();
+        this.auditConfig(
+          interaction,
+          `Money-out history backfilled → ${result.scanned} transaction(s) scanned, ${result.created} new row(s), ${result.points} Influx point(s)${
+            result.truncated ? " (sweep truncated)" : ""
+          }`
+        );
+        await interaction.editReply({
+          embeds: [
+            makeEmbed(
+              `✅ Backfill complete: scanned **${result.scanned}** balance transaction(s), recorded **${result.created}** new ledger row(s).` +
+                (result.points
+                  ? ` Wrote **${result.points}** historical point(s) to InfluxDB.`
+                  : " Influx exporter inactive: no analytics points written (re-run after enabling it).") +
+                (result.truncated ? "\n⚠️ Sweep hit the page cap. Run again to continue." : ""),
+              COLORS.success
+            ),
+          ],
+        });
+      } catch (error) {
+        await interaction.editReply({
+          embeds: [makeEmbed(`Backfill failed: ${String(error).slice(0, 500)}`, COLORS.danger)],
+        });
+      }
       return;
     }
 

@@ -170,6 +170,7 @@ export interface IntercomSweepConversation {
   teamAssigneeId: string | null;
   adminAssigneeId: string | null;
   customAttributes: Record<string, unknown>;
+  participantIds: string[]; // attached contacts; >1 means a forwarded-email conversion may have left the forwarder behind
 }
 
 export interface IntercomSweepTicket {
@@ -242,6 +243,10 @@ export interface IntercomConversationItem {
   // converter's cheap pre-filter (authoritative data comes from a fresh GET).
   source?: { subject?: string | null; author?: IntercomWebhookAuthor };
   conversation_parts?: { conversation_parts?: IntercomWebhookPart[] };
+  // Attached contacts. Intercom's native forward detection adds the real
+  // customer here alongside the forwarder, so ≥2 is the free pre-filter that
+  // keeps the forwarder-detach check off ordinary single-customer threads.
+  contacts?: { contacts?: Array<{ id?: string | number }> } | null;
   admin_assignee_id?: number | string | null; // balanced assignment + assignee SLA dim
   team_assignee_id?: number | string | null; // scopes the balanced-assignment pool + per-team config
   snoozed_until?: number | null;

@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { ForwarderRoster } from "../forwarderRoster";
 import { ForwardedEmailConverter } from "../ForwardedEmailConverter";
 import { IntercomHttpError, type IntercomClient } from "../IntercomClient";
 import type { ForwardConvertStore } from "../ForwardConvertStore";
@@ -164,7 +165,8 @@ function makeHarness(opts: HarnessOpts = {}): Harness {
   } as unknown as IntercomClient;
 
   const audit = { log: async () => undefined } as unknown as AuditLogger;
-  return { converter: new ForwardedEmailConverter(settings, client, store, audit), ops, inserted };
+  const roster = new ForwarderRoster(settings, client);
+  return { converter: new ForwardedEmailConverter(settings, client, store, audit, roster), ops, inserted };
 }
 
 test("auto: happy path converts, commits create-then-insert, decorates and closes the original", async () => {

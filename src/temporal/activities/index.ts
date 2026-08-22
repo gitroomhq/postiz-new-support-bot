@@ -13,6 +13,7 @@ import type { StripeWebhookHandler } from "../../bot/StripeWebhookHandler";
 import { RECLOSE_DELAY_MS } from "../../bot/StatusService";
 import type { BillingCategory } from "../../categories/BillingCategory";
 import type { DisputeMonitor } from "../../bot/billing/DisputeMonitor";
+import type { MoneyOutService } from "../../bot/billing/MoneyOutService";
 import type { IntercomStore } from "../../intercom/IntercomStore";
 import { isIntercomExempt, type IntercomSyncService } from "../../intercom/IntercomSyncService";
 import type { IntercomEventExecutor } from "../../intercom/IntercomEventExecutor";
@@ -70,6 +71,7 @@ export interface ActivityDeps {
   stripeWebhookHandler: StripeWebhookHandler;
   billingCategory: BillingCategory;
   disputeMonitor: DisputeMonitor;
+  moneyOutService: MoneyOutService;
   vaultMigrator: VaultMigrator;
   client: Client;
   producers: TemporalProducers;
@@ -99,6 +101,7 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
     stripeWebhookHandler,
     billingCategory,
     disputeMonitor,
+    moneyOutService,
     vaultMigrator,
     client,
     producers,
@@ -755,6 +758,16 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
     async disputesTick(force) {
       heartbeat();
       return disputeMonitor.tick(force);
+    },
+
+    // Money-out ledger reconcile: walk Stripe's balance transactions forward
+    // from the cursor. Idempotent (upsert by transaction id), so a retry after
+    // a partial page costs nothing.
+    async moneyOutTick() {
+      heartbeat();
+      // Per-page heartbeat: a first sweep against a busy account pages for
+      // minutes, well past the heartbeatTimeout on this proxy.
+      return moneyOutService.reconcile(() => heartbeat());
     },
 
     async runVaultUpgradeJob() {

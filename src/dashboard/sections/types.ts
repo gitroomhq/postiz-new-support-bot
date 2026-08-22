@@ -4,6 +4,8 @@ import { SessionStore } from "../../auth/SessionStore";
 import { DisputeStore } from "../../bot/billing/DisputeStore";
 import { BlockStore } from "../../bot/billing/BlockStore";
 import { BillingQolStore } from "../../bot/billing/BillingQolStore";
+import { MoneyOutStore } from "../../bot/billing/MoneyOutStore";
+import type { MoneyOutService } from "../../bot/billing/MoneyOutService";
 import type { BillingActionService } from "../../bot/billing/actions/BillingActionService";
 import type { DashboardActionGateway } from "../DashboardActions";
 import { DashboardActor } from "../DashboardAuth";
@@ -22,6 +24,7 @@ export interface DashboardCtx {
     dispute: DisputeStore; // local dispute mirror
     block: BlockStore; // blocklist
     qol: BillingQolStore; // notes + bookmarks
+    moneyOut: MoneyOutStore; // every outflow (refunds, disputes, fees, concessions)
   };
   // Registry billing actions: the shared level/queue/execute/audit brain plus
   // the dashboard's target→customer binding gateway. Sections use `actions`
@@ -30,6 +33,10 @@ export interface DashboardCtx {
   billing: {
     actions: BillingActionService;
     gateway: DashboardActionGateway;
+    // Concessions made straight from a section (credit grants) leave no
+    // balance transaction, so the section has to book them itself. Optional
+    // like ActionExecCtx.moneyOut: a metrics gap must never fail the action.
+    moneyOut?: MoneyOutService;
   };
   audit(change: string): Promise<void>;
   // For destructive (reverseConfirm) actions: whether a valid Discord→web

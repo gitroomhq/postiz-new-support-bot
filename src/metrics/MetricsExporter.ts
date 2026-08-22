@@ -51,7 +51,14 @@ export function exportAiRun(run: AiRunExport): void {
 export type BillingEventKind =
   | "refund"
   | "discount"
+  | "credit_note"
+  | "write_off"
+  | "credit_grant"
+  | "balance_credit"
   | "charge_review_created"
+  // ATTRIBUTION ONLY — charge_review_approved fires for a refund that ALSO
+  // emits "refund" from the refund core. Never sum both: for money totals use
+  // the money_out measurement, which is deduplicated at the ledger.
   | "charge_review_approved"
   | "charge_review_denied"
   | "dispute"
@@ -65,21 +72,38 @@ export type BillingEventKind =
   | "block"
   | "unblock";
 
+// Which surface a staff member acted from. Bounded set, so it is safe as a tag.
+export type BillingEventSurface = "discord" | "panel" | "dashboard";
+
+// Staff-action attribution: WHO did WHAT from WHERE. This measurement answers
+// "what is our team doing"; it is deliberately NOT the money-total source (see
+// exportMoneyOut) because several of its events describe the same money.
 export function exportBillingEvent(p: {
   event: BillingEventKind;
   amountMinor?: number | null;
   currency?: string | null;
   chargeId?: string | null;
   threadId?: string | null;
+  surface?: BillingEventSurface;
+  // Refunds only: true when a specific amount was refunded rather than the
+  // full remainder. A field, not a tag — it is only meaningful for one event.
+  partial?: boolean;
+  reason?: string | null;
 }): void {
   writePoint(
     "billing_events",
-    { event: p.event, currency: (p.currency ?? "unknown").toLowerCase() },
+    {
+      event: p.event,
+      currency: (p.currency ?? "unknown").toLowerCase(),
+      ...(p.surface ? { surface: p.surface } : {}),
+    },
     {
       count: 1,
       amount_minor: p.amountMinor,
       charge_id: p.chargeId ?? undefined,
       thread_id: p.threadId ?? undefined,
+      partial: p.partial == null ? undefined : p.partial ? 1 : 0,
+      reason: p.reason ?? undefined,
     }
   );
 }
@@ -102,6 +126,54 @@ export function exportDisputeOutcome(p: {
     { outcome: p.outcome, reason: p.reason, currency: p.currency.toLowerCase() },
     { count: 1, amount_minor: p.amountMinor, submitted: p.submitted ? 1 : 0 },
     p.ts
+  );
+}
+
+// One point per money-out ledger row. This is the measurement to SUM when the
+// question is "how much money left the account" — billing_events answers the
+// different question of "what did our staff do", and its refund/
+// charge_review_approved events overlap by design.
+//
+// amount_minor is signed (positive = out, negative = returned), so a window sum
+// is already net of reversals. Live emissions stamp "now"; the sweep and the
+// all-time backfill pass the real occurrence time, so identical points (same
+// tags + timestamp) overwrite instead of double-counting on a re-run.
+export function exportMoneyOut(p: {
+  bucket: string; // CASH | FEES | CONCESSION
+  category: string;
+  currency: string;
+  source: string; // webhook | sweep | backfill | action
+  amountMinor: number;
+  feeMinor?: number;
+  netMinor?: number;
+  ts?: Date;
+}): void {
+  writePoint(
+    "money_out",
+    { bucket: p.bucket, category: p.category, currency: p.currency.toLowerCase(), source: p.source },
+    {
+      count: 1,
+      amount_minor: p.amountMinor,
+      fee_minor: p.feeMinor ?? 0,
+      net_minor: p.netMinor ?? p.amountMinor,
+    },
+    p.ts
+  );
+}
+
+// Gauge from the money-out reconcile tick: how far behind the ledger mirror is
+// and whether the last sweep errored. Lag climbing is the alertable signal — it
+// means Stripe outflows are happening that the mirror has not seen.
+export function exportMoneyOutSweep(p: {
+  scanned: number;
+  created: number;
+  errors: number;
+  lagSeconds: number;
+}): void {
+  writePoint(
+    "money_out_sweep",
+    {},
+    { scanned: p.scanned, created: p.created, errors: p.errors, lag_seconds: p.lagSeconds }
   );
 }
 

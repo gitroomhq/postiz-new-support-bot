@@ -912,6 +912,39 @@ const STATEMENTS: string[] = [
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "forwardConvertTagName" TEXT NOT NULL DEFAULT 'email'`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "forwardConvertCloseNote" TEXT`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "forwardConvertExtraEmails" TEXT NOT NULL DEFAULT ''`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "forwardDetachForwarder" BOOLEAN NOT NULL DEFAULT true`,
+  // Money-out ledger: one row per outflow, written by the balance-transaction
+  // sweep (kind=LEDGER, id = txn_…) or by the concession webhooks/actions
+  // (kind=CONCESSION, id = the Stripe object id). Disjoint key spaces, so a
+  // plain upsert-by-id is the whole idempotency story.
+  `CREATE TABLE IF NOT EXISTS "stripe_money_out" (
+    "id" TEXT NOT NULL,
+    "kind" TEXT NOT NULL,
+    "bucket" TEXT NOT NULL,
+    "category" TEXT NOT NULL,
+    "amountMinor" INTEGER NOT NULL,
+    "feeMinor" INTEGER NOT NULL DEFAULT 0,
+    "netMinor" INTEGER NOT NULL,
+    "currency" TEXT NOT NULL,
+    "source" TEXT NOT NULL,
+    "reason" TEXT,
+    "stripeObjectId" TEXT,
+    "chargeId" TEXT,
+    "customerId" TEXT,
+    "occurredAt" TIMESTAMP(3) NOT NULL,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updatedAt" TIMESTAMP(3) NOT NULL,
+    CONSTRAINT "stripe_money_out_pkey" PRIMARY KEY ("id")
+  )`,
+  `CREATE INDEX IF NOT EXISTS "stripe_money_out_occurredAt_idx" ON "stripe_money_out"("occurredAt")`,
+  `CREATE INDEX IF NOT EXISTS "stripe_money_out_bucket_occurredAt_idx" ON "stripe_money_out"("bucket", "occurredAt")`,
+  `CREATE INDEX IF NOT EXISTS "stripe_money_out_category_occurredAt_idx" ON "stripe_money_out"("category", "occurredAt")`,
+  `CREATE INDEX IF NOT EXISTS "stripe_money_out_customerId_idx" ON "stripe_money_out"("customerId")`,
+  `CREATE INDEX IF NOT EXISTS "stripe_money_out_chargeId_idx" ON "stripe_money_out"("chargeId")`,
+  `CREATE INDEX IF NOT EXISTS "stripe_money_out_stripeObjectId_idx" ON "stripe_money_out"("stripeObjectId")`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "moneyOutEnabled" BOOLEAN NOT NULL DEFAULT false`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "moneyOutSweepAt" TIMESTAMP(3)`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "moneyOutBackfillDoneAt" TIMESTAMP(3)`,
 ];
 
 export async function ensureSchema(prisma: PrismaClient): Promise<void> {

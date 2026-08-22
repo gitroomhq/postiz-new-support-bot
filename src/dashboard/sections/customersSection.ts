@@ -1,4 +1,5 @@
 import type Stripe from "stripe";
+import { exportBillingEvent } from "../../metrics/MetricsExporter";
 import { StripeClient } from "../../bot/StripeClient";
 import type { ActionActor } from "../../bot/billing/actions/BillingActionService";
 import { ActionButton, Badge, Block, Cell, TableBlock } from "../renderer/contract";
@@ -357,6 +358,20 @@ async function customerAction(
       await ctx.audit(
         `Credit grant ${grant.id} for ${customerId}: ${ctx.stripe.formatAmount(amountMinor, currency)} (${category}${expiresDays ? `, expires in ${expiresDays}d` : ""})`
       );
+      // Concession: billing credits never produce a balance transaction, so
+      // this is the only place the give-away can be booked.
+      await ctx.billing.moneyOut
+        ?.recordBalanceConcession({
+          id: grant.id,
+          category: "credit_grant",
+          customerId,
+          currency,
+          amountMinor,
+          reason: category,
+          source: "action",
+        })
+        .catch(() => undefined);
+      exportBillingEvent({ event: "credit_grant", amountMinor, currency, surface: "dashboard" });
       return { ok: true, text: `Granted ${ctx.stripe.formatAmount(amountMinor, currency)} in billing credits (${grant.id}).` };
     }
 

@@ -6,6 +6,7 @@ import {
   SIG_INTERCOM_CLEAR_OUTBOX,
   SIG_INTERCOM_ENQUEUE,
   SIG_KB_REFRESH_NOW,
+  SIG_MONEY_OUT_RUN_NOW,
   SIG_NOOP,
   SIG_REMINDERS_PAUSED,
   SIG_SLA_RUN_NOW,
@@ -44,6 +45,7 @@ export const disputesRunNowSignal = defineSignal(SIG_DISPUTES_RUN_NOW);
 export const slaRunNowSignal = defineSignal(SIG_SLA_RUN_NOW);
 export const slaEnforceRunNowSignal = defineSignal(SIG_SLA_ENFORCE_RUN_NOW);
 export const sentryFeedbackRunNowSignal = defineSignal(SIG_SENTRY_FEEDBACK_RUN_NOW);
+export const moneyOutRunNowSignal = defineSignal(SIG_MONEY_OUT_RUN_NOW);
 
 export const applyStatusUpdate = defineUpdate<ApplyStatusResult, [StatusChangeRequest]>(UPD_APPLY_STATUS);
 

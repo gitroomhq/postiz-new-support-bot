@@ -11,6 +11,7 @@ import type { CoreActivities } from "../types";
 import {
   disputesRunNowSignal,
   kbRefreshNowSignal,
+  moneyOutRunNowSignal,
   sentryFeedbackRunNowSignal,
   slaEnforceRunNowSignal,
   slaRunNowSignal,
@@ -179,5 +180,25 @@ export async function disputesLoopWorkflow(): Promise<void> {
     await disputesActs.disputesTick(force).catch(() => {});
     await canIfDue(() => continueWithMemo<typeof disputesLoopWorkflow>());
     await condition(() => runNow, 6 * 60 * 60_000);
+  }
+}
+
+// Money-out ledger reconcile: 30-minute tick that walks Stripe's balance
+// transactions forward from the stored cursor. This is the SAFETY NET, not the
+// primary path — the Stripe webhook calls syncForObject so a refund (including
+// one issued straight from the Stripe Dashboard) lands within seconds. What
+// this tick adds is everything a webhook cannot deliver: Stripe fees, the
+// chargeback fee, and any event lost while the endpoint was unreachable.
+// The enabled gate re-reads from BotSettings inside the activity.
+export async function moneyOutWorkflow(): Promise<void> {
+  let runNow = false;
+  setHandler(moneyOutRunNowSignal, () => {
+    runNow = true;
+  });
+  for (;;) {
+    runNow = false;
+    await disputesActs.moneyOutTick().catch(() => {});
+    await canIfDue(() => continueWithMemo<typeof moneyOutWorkflow>());
+    await condition(() => runNow, 30 * 60_000);
   }
 }

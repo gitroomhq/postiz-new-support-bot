@@ -31,6 +31,7 @@ export class AutomationHub {
     { kind: "button", id: "icadmin_auto_tag_texts:", match: "prefix", handler: (i) => this.handleTagTextsOpen(i) },
     { kind: "select", id: "icadmin_auto_tag_pick", match: "exact", handler: (i) => this.handleTagPick(i) },
     { kind: "button", id: "icadmin_auto_fwd_toggle", match: "exact", handler: (i) => this.handleFwdToggle(i) },
+    { kind: "button", id: "icadmin_auto_fwd_detach", match: "exact", handler: (i) => this.handleFwdDetachToggle(i) },
     { kind: "button", id: "icadmin_auto_fwd_opts", match: "exact", handler: (i) => this.handleFwdOptsOpen(i) },
     { kind: "button", id: "icadmin_auto_fwd_list", match: "exact", handler: (i) => this.handleFwdList(i) },
     { kind: "modal", id: "icadmin_auto_sweep_opts_m", match: "exact", handler: (i) => this.handleSweepOptsSubmit(i) },
@@ -63,6 +64,9 @@ export class AutomationHub {
         `**Status:** ${s.forwardConvertEnabled() ? "**on**" : "**off**"} · tag: ${s.forwardConvertTagName()}`,
         `**Close note:** ${s.forwardConvertCloseNote() ? "custom" : "default"} · **extra forwarders:** ${s.forwardConvertExtraEmails().length || "none"}`,
         "New conversations authored by a lite-seat teammate (or a listed extra address) with a Fwd: subject are recreated for the parsed original sender and closed (Intercom's own detection skips lite seats). A forward the parser misses stays attributed to the forwarder; re-forwarding with the standard Fwd: block retries it.",
+        "",
+        `**Detach forwarder:** ${s.forwardDetachForwarder() ? "**on**" : "**off**"}`,
+        "The other half: where Intercom's OWN forward detection ran, it attaches the real customer but leaves the forwarding address attached as well, so every reply also emails the person who forwarded it. This removes them, using the same forwarder list above. It never removes the last participant, and it posts an internal note saying what it detached. Runs on inbound webhooks plus the SLA sweep, since Intercom attaches the customer asynchronously.",
       ].join("\n")
     );
 
@@ -89,6 +93,11 @@ export class AutomationHub {
         "icadmin_auto_fwd_toggle",
         `Fwd Convert: ${s.forwardConvertEnabled() ? "on" : "off"}`,
         s.forwardConvertEnabled() ? ButtonStyle.Success : ButtonStyle.Secondary
+      ),
+      btn(
+        "icadmin_auto_fwd_detach",
+        `Detach Forwarder: ${s.forwardDetachForwarder() ? "on" : "off"}`,
+        s.forwardDetachForwarder() ? ButtonStyle.Success : ButtonStyle.Secondary
       ),
       btn("icadmin_auto_fwd_opts", "Tag & Note", ButtonStyle.Primary),
       btn("icadmin_auto_fwd_list", "List Forwarders", ButtonStyle.Secondary)
@@ -287,6 +296,13 @@ export class AutomationHub {
     const next = !this.ctx.settingsStore.forwardConvertEnabled();
     await this.ctx.settingsStore.updateForwardConvert({ forwardConvertEnabled: next });
     this.ctx.auditConfig(interaction, `Forwarded-email conversion → ${next ? "on" : "off"}`);
+    await this.renderPanel(interaction);
+  }
+
+  private async handleFwdDetachToggle(interaction: ButtonInteraction): Promise<void> {
+    const next = !this.ctx.settingsStore.forwardDetachForwarder();
+    await this.ctx.settingsStore.updateForwardConvert({ forwardDetachForwarder: next });
+    this.ctx.auditConfig(interaction, `Forwarder detaching → ${next ? "on" : "off"}`);
     await this.renderPanel(interaction);
   }
 

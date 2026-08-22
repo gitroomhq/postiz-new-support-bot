@@ -4,6 +4,7 @@ import { SettingsStore } from "../config/SettingsStore";
 import { SessionStore } from "../auth/SessionStore";
 import { StripeClient } from "./StripeClient";
 import { DisputeStore } from "./billing/DisputeStore";
+import type { MoneyOutService } from "./billing/MoneyOutService";
 import { BlockService } from "./billing/BlockService";
 import { attachReceiptEvidence } from "./billing/receiptEvidence";
 import { COLORS } from "../util/embeds";
@@ -32,6 +33,20 @@ const EVENTS: Stripe.WebhookEndpointCreateParams.EnabledEvent[] = [
   // on next boot, so the addition converges without dashboard access.
   "customer.subscription.updated",
   "customer.subscription.deleted",
+  // Money-out ledger. These are what make an outflow visible no matter WHERE it
+  // was made — a refund issued straight from the Stripe Dashboard reaches us
+  // only through these. The refund/charge events trigger a targeted sweep of
+  // the object's balance transactions (the ledger stays the single writer of
+  // cash rows); the rest are concessions, which have no balance transaction at
+  // all and are recorded directly.
+  "refund.created",
+  "refund.updated",
+  "refund.failed",
+  "charge.refunded",
+  "credit_note.created",
+  "invoice.voided",
+  "invoice.marked_uncollectible",
+  "customer.discount.created",
 ];
 
 // Programmatically registers a Stripe webhook endpoint (the full-access key can
@@ -61,6 +76,15 @@ export class StripeWebhookHandler {
 
   setSlaService(service: { onStripeCustomerTrigger(stripeCustomerId: string): Promise<void> }): void {
     this.slaService = service;
+  }
+
+  // Money-out ledger — bound late (it depends on the Prisma-backed store built
+  // after this handler). Absent until then, which simply means an outflow waits
+  // for the reconcile tick instead of landing in seconds.
+  private moneyOut: MoneyOutService | null = null;
+
+  setMoneyOutService(service: MoneyOutService): void {
+    this.moneyOut = service;
   }
 
   // Read per request — the secret lives in BotSettings and can rotate live.
@@ -179,9 +203,22 @@ export class StripeWebhookHandler {
       case "charge.dispute.updated":
       case "charge.dispute.closed":
       case "charge.dispute.funds_withdrawn":
-      case "charge.dispute.funds_reinstated":
-        await this.onDisputeUpdated(event.type, event.data.object as Stripe.Dispute, firstDelivery);
+      case "charge.dispute.funds_reinstated": {
+        const dispute = event.data.object as Stripe.Dispute;
+        await this.onDisputeUpdated(event.type, dispute, firstDelivery);
+        // Funds events are the moment dispute money (and the chargeback fee)
+        // actually moves — sweep so both land in the ledger. The fee exists
+        // ONLY on the balance transaction, which is why the webhook payload
+        // alone can never tell us what a dispute cost.
+        //
+        // Sweep by the DISPUTE id, not the charge: a balance transaction's
+        // `source` is the object that produced it (dp_…), so filtering by ch_…
+        // would return the original charge's transaction and nothing else.
+        if (event.type === "charge.dispute.funds_withdrawn" || event.type === "charge.dispute.funds_reinstated") {
+          await this.syncMoneyOut(dispute.id, event.type);
+        }
         return;
+      }
       case "customer.subscription.updated":
       case "customer.subscription.deleted": {
         // SLA-only: plan/subscription changes re-run the SLA rules for the
@@ -203,9 +240,126 @@ export class StripeWebhookHandler {
         // State-freshness only (actionable flips when the EFW gets disputed or
         // refunded) — nothing local mirrors EFWs, so this is just a metric.
         return;
+      case "refund.created":
+      case "refund.updated":
+      case "refund.failed": {
+        // Targeted sweep of THIS refund's balance transactions. Deliberately
+        // not a direct write: the ledger sweep stays the single writer of cash
+        // rows, which is what makes webhook / reconcile / backfill idempotent.
+        // Runs on retries too — upsert-by-id makes that free.
+        const refund = event.data.object as Stripe.Refund;
+        await this.syncMoneyOut(refund.id, event.type);
+        return;
+      }
+      case "charge.refunded": {
+        // Belt to refund.created's braces: a Stripe-Dashboard refund may reach
+        // us here first. Sweep each REFUND, not the charge — a balance
+        // transaction's `source` is the object that produced it (re_…), so
+        // filtering by ch_… returns the original charge's transaction and
+        // misses every refund on it.
+        const charge = event.data.object as Stripe.Charge;
+        for (const refund of charge.refunds?.data ?? []) {
+          await this.syncMoneyOut(refund.id, event.type);
+        }
+        return;
+      }
+      case "credit_note.created": {
+        if (!firstDelivery) return;
+        const note = event.data.object as Stripe.CreditNote;
+        await this.moneyOut?.recordCreditNote(note, "webhook").catch((e) => {
+          hookLog.warn("money-out credit note failed", { "error.message": String(e) });
+        });
+        exportBillingEvent({
+          event: "credit_note",
+          amountMinor: note.total,
+          currency: note.currency,
+        });
+        return;
+      }
+      case "invoice.voided":
+      case "invoice.marked_uncollectible": {
+        if (!firstDelivery) return;
+        const invoice = event.data.object as Stripe.Invoice;
+        await this.moneyOut?.recordWriteOff(invoice, "webhook").catch((e) => {
+          hookLog.warn("money-out write-off failed", { "error.message": String(e) });
+        });
+        exportBillingEvent({
+          event: "write_off",
+          amountMinor: invoice.amount_due - (invoice.amount_paid ?? 0),
+          currency: invoice.currency,
+          reason: event.type,
+        });
+        return;
+      }
+      case "customer.discount.created": {
+        if (!firstDelivery) return;
+        await this.onDiscountCreated(event.data.object as Stripe.Discount);
+        return;
+      }
       default:
         return;
     }
+  }
+
+  // Targeted money-out sweep. Best-effort by construction: a metrics gap must
+  // never fail webhook processing, because a thrown error here would make
+  // Stripe redeliver an event whose ALERTING half already ran.
+  private async syncMoneyOut(sourceId: string, eventType: string): Promise<void> {
+    if (!this.moneyOut) return;
+    try {
+      await this.moneyOut.syncForObject(sourceId);
+    } catch (e) {
+      hookLog.warn("money-out sync failed", {
+        "stripe.event_type": eventType,
+        "stripe.source_id": sourceId,
+        "error.message": e instanceof Error ? e.message : String(e),
+      });
+    }
+  }
+
+  // A discount's cost is only knowable against what it will be applied to, so
+  // resolve the base from the subscription it landed on (or the customer's
+  // upcoming invoice). No base = no row: an unquantified concession is worse
+  // than a missing one, because it would silently read as zero.
+  private async onDiscountCreated(discount: Stripe.Discount): Promise<void> {
+    if (!this.moneyOut) return;
+    const customerId = typeof discount.customer === "string" ? discount.customer : (discount.customer?.id ?? null);
+    // SDK v20 moved the coupon behind discount.source; it can still arrive
+    // unexpanded as a bare id, which carries no percent/amount to price.
+    const rawCoupon = discount.source?.coupon ?? null;
+    const coupon = rawCoupon && typeof rawCoupon !== "string" ? rawCoupon : null;
+    if (!coupon) return;
+
+    let baseMinor = 0;
+    let currency = coupon.currency ?? "usd";
+    try {
+      if (coupon.percent_off != null && customerId && discount.subscription) {
+        const subId = typeof discount.subscription === "string" ? discount.subscription : discount.subscription;
+        const preview = await this.stripe.previewUpcomingInvoice(customerId, subId);
+        if (preview) {
+          baseMinor = preview.subtotal ?? 0;
+          currency = preview.currency;
+        }
+      }
+    } catch (e) {
+      hookLog.warn("money-out discount base lookup failed", { "error.message": String(e) });
+    }
+
+    await this.moneyOut
+      .recordDiscount({
+        discountId: discount.id,
+        customerId,
+        currency,
+        baseMinor,
+        percentOff: coupon.percent_off,
+        amountOffMinor: coupon.amount_off,
+        reason: coupon.name ?? coupon.id,
+        occurredAt: new Date((discount.start ?? Math.floor(Date.now() / 1000)) * 1000),
+        source: "webhook",
+      })
+      .catch((e) => {
+        hookLog.warn("money-out discount record failed", { "error.message": String(e) });
+      });
   }
 
   private async onDisputeCreated(dispute: Stripe.Dispute, firstDelivery: boolean): Promise<void> {

@@ -657,6 +657,12 @@ export class StripeClient {
     payoutId?: string;
     createdGte?: number;
     createdLt?: number;
+    // Narrows to the transactions produced by one object (re_… / dp_… / ch_…) —
+    // the money-out webhook path uses this for its targeted mini-sweep.
+    sourceId?: string;
+    // Expands source (and, through it, the charge) so the money-out classifier
+    // can attribute a row without an extra round-trip per transaction.
+    expandSource?: boolean;
   }): Promise<{ transactions: Stripe.BalanceTransaction[]; hasMore: boolean }> {
     const created = {
       ...(opts.createdGte ? { gte: opts.createdGte } : {}),
@@ -667,9 +673,15 @@ export class StripeClient {
       ...(opts.startingAfter ? { starting_after: opts.startingAfter } : {}),
       ...(opts.type ? { type: opts.type } : {}),
       ...(opts.payoutId ? { payout: opts.payoutId } : {}),
+      ...(opts.sourceId ? { source: opts.sourceId } : {}),
+      ...(opts.expandSource ? { expand: ["data.source"] } : {}),
       ...(Object.keys(created).length ? { created } : {}),
     });
     return { transactions: res.data, hasMore: res.has_more };
+  }
+
+  async getCreditNote(creditNoteId: string): Promise<Stripe.CreditNote> {
+    return this.stripe.creditNotes.retrieve(creditNoteId);
   }
 
   // ---- Radar reviews: the manual-review queue ----

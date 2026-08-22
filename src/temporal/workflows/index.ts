@@ -19,5 +19,6 @@ export {
   metricsSnapshotWorkflow,
   cleanupLoopWorkflow,
   disputesLoopWorkflow,
+  moneyOutWorkflow,
 } from "./loopers.workflow";
 export { publishStatusReportWorkflow, stripeEventWorkflow, refundWorkflow, vaultUpgradeWorkflow } from "./ops.workflow";

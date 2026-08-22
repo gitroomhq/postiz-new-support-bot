@@ -1086,6 +1086,9 @@ export class ChargesHub {
         amountMinor: result.amount,
         currency: result.currency,
         chargeId: session.chargeId,
+        surface: "discord",
+        partial: session.refundAmountMinor != null,
+        ...(reason ? { reason } : {}),
       });
 
       await interaction.editReply({

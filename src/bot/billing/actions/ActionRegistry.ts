@@ -13,6 +13,8 @@ import {
   postizUniqueId,
 } from "../postizPlan";
 import type { PostizDriftService } from "../../../postiz/PostizDriftService";
+import type { MoneyOutService } from "../MoneyOutService";
+import { exportBillingEvent, type BillingEventSurface } from "../../../metrics/MetricsExporter";
 
 // Single source of truth for every canvas/panel billing action: the panel UI,
 // the canvas card, the /config levels panel and the approval executor all
@@ -57,6 +59,17 @@ export interface ActionExecCtx {
   // configured, which makes the platform resync action refuse rather than
   // guess.
   postizDrift?: PostizDriftService;
+  // Money-out ledger. Concessions (credit notes, coupons, balance credits,
+  // write-offs) leave no balance transaction behind, so the action that made
+  // them is the ONLY place they can be recorded. Optional: a metrics gap must
+  // never stop a billing action.
+  moneyOut?: MoneyOutService;
+}
+
+// Which surface an action ran from — the Intercom panel always carries a
+// conversation, the web dashboard never does.
+function surfaceOf(ctx: ActionExecCtx): BillingEventSurface {
+  return ctx.conversationId ? "panel" : "dashboard";
 }
 
 export type ActionParse<P> = { ok: true; params: P } | { ok: false; error: string };
@@ -267,6 +280,17 @@ const refundPartial = defineAction<RefundPartialParams>({
       p.amountMinor,
       `panel-refund-${p.chargeId}-${p.amountMinor}-${ctx.idemScope}`
     );
+    // Attribution only. The MONEY is booked by the money-out ledger, which
+    // picks this refund up from its balance transaction (webhook first,
+    // reconcile sweep as the backstop) — never sum billing_events for totals.
+    exportBillingEvent({
+      event: "refund",
+      amountMinor: refund.amount,
+      currency: refund.currency,
+      chargeId: p.chargeId,
+      surface: surfaceOf(ctx),
+      partial: true,
+    });
     return { ok: true, text: `Refunded ${fmt(ctx.stripe, refund.amount, refund.currency)} of ${p.chargeId} (${refund.refundId}).` };
   },
 });
@@ -293,6 +317,15 @@ const refundFraud = defineAction<RefundPartialParams>({
       `panel-fraudrefund-${p.chargeId}-${p.amountMinor}-${ctx.idemScope}`,
       "fraudulent"
     );
+    exportBillingEvent({
+      event: "refund",
+      amountMinor: refund.amount,
+      currency: refund.currency,
+      chargeId: p.chargeId,
+      surface: surfaceOf(ctx),
+      partial: true,
+      reason: "fraudulent",
+    });
     return { ok: true, text: `Refunded ${fmt(ctx.stripe, refund.amount, refund.currency)} of ${p.chargeId} as fraudulent (${refund.refundId}).` };
   },
 });
@@ -1275,11 +1308,27 @@ const invoiceVoid = defineAction<InvoiceVoidParams>({
   },
   execute: async (ctx, p) => {
     if (p.op === "void") {
-      await ctx.stripe.voidInvoice(p.invoiceId, `panel-invvoid-${p.invoiceId}-${ctx.idemScope}`);
+      const invoice = await ctx.stripe.voidInvoice(p.invoiceId, `panel-invvoid-${p.invoiceId}-${ctx.idemScope}`);
+      await ctx.moneyOut?.recordWriteOff(invoice, "action").catch(() => undefined);
+      exportBillingEvent({
+        event: "write_off",
+        amountMinor: invoice.amount_due - (invoice.amount_paid ?? 0),
+        currency: invoice.currency,
+        surface: surfaceOf(ctx),
+        reason: "void",
+      });
       return { ok: true, text: `Invoice ${p.invoiceId} voided.` };
     }
     if (p.op === "uncollectible") {
-      await ctx.stripe.markInvoiceUncollectible(p.invoiceId, `panel-invunc-${p.invoiceId}-${ctx.idemScope}`);
+      const invoice = await ctx.stripe.markInvoiceUncollectible(p.invoiceId, `panel-invunc-${p.invoiceId}-${ctx.idemScope}`);
+      await ctx.moneyOut?.recordWriteOff(invoice, "action").catch(() => undefined);
+      exportBillingEvent({
+        event: "write_off",
+        amountMinor: invoice.amount_due - (invoice.amount_paid ?? 0),
+        currency: invoice.currency,
+        surface: surfaceOf(ctx),
+        reason: "uncollectible",
+      });
       return { ok: true, text: `Invoice ${p.invoiceId} marked uncollectible.` };
     }
     await ctx.stripe.deleteDraftInvoice(p.invoiceId, `panel-invdel-${p.invoiceId}-${ctx.idemScope}`);
@@ -1392,6 +1441,18 @@ const invoiceCreditNote = defineAction<InvoiceCreditNoteParams>({
       { invoiceId: p.invoiceId, amountMinor: p.amountMinor, mode: p.mode, memo: p.memo },
       `panel-creditnote-${p.invoiceId}-${p.amountMinor}-${ctx.idemScope}`
     );
+    // Concession: no balance transaction exists for the credited portion, so
+    // this action is the only place it can be booked. A refund-mode note also
+    // produces a real refund — the classifier subtracts that half so cash and
+    // concession never double-count the same money.
+    await ctx.moneyOut?.recordCreditNote(note, "action").catch(() => undefined);
+    exportBillingEvent({
+      event: "credit_note",
+      amountMinor: note.total,
+      currency: note.currency,
+      surface: surfaceOf(ctx),
+      reason: p.mode,
+    });
     return { ok: true, text: `Credit note ${note.id} created on ${p.invoiceId} (${fmt(ctx.stripe, note.total, note.currency)}).` };
   },
 });
@@ -1479,6 +1540,15 @@ const customerCoupon = defineAction<CustomerCouponParams>({
       label = `promo ${p.promoCode}`;
     }
     await ctx.stripe.applyDiscountCoupon(p.subscriptionId!, couponId!, `panel-coupon-${p.subscriptionId}-${couponId}-${ctx.idemScope}`);
+    // Attribution only. The concession itself is booked from the
+    // customer.discount.created webhook, which is the first point that knows
+    // the discount id (needed as the ledger key) and can price the coupon
+    // against the upcoming invoice — neither is knowable here.
+    exportBillingEvent({
+      event: "discount",
+      surface: surfaceOf(ctx),
+      reason: label || couponId || null,
+    });
     return { ok: true, text: `Applied ${label || `coupon ${couponId}`} to ${p.subscriptionId}.` };
   },
 });
@@ -1522,6 +1592,27 @@ const customerBalance = defineAction<CustomerBalanceParams>({
       p.note ?? `Support adjustment via ${ctx.actor.kind} panel (${ctx.actor.name})`,
       `panel-balance-${p.deltaMinor}-${p.currency}-${ctx.idemScope}`
     );
+    // Only a CREDIT is money out (the customer owes us less). A debit is the
+    // opposite and is dropped by the classifier.
+    await ctx.moneyOut
+      ?.recordBalanceConcession({
+        id: txn.id,
+        category: "balance_credit",
+        customerId: ctx.stripeCustomerId,
+        currency: p.currency,
+        amountMinor: p.deltaMinor,
+        reason: p.note ?? null,
+        source: "action",
+      })
+      .catch(() => undefined);
+    if (p.deltaMinor < 0) {
+      exportBillingEvent({
+        event: "balance_credit",
+        amountMinor: Math.abs(p.deltaMinor),
+        currency: p.currency,
+        surface: surfaceOf(ctx),
+      });
+    }
     return { ok: true, text: `Balance adjusted by ${fmt(ctx.stripe, p.deltaMinor, p.currency)} (txn ${txn.id}).` };
   },
 });

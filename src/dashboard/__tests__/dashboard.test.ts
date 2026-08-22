@@ -11,6 +11,7 @@ import { chargeBadge, estimateMrr, formatPerCurrency, refForId, sentence } from 
 import { makeCustomersSection } from "../sections/customersSection";
 import { makePaymentsSection, buildGuardrailPanel } from "../sections/paymentsSection";
 import { makeHomeSection } from "../sections/homeSection";
+import { makeMoneyOutSection } from "../sections/moneyOutSection";
 import { makeBalancesSection } from "../sections/balancesSection";
 import { makeSubscriptionsSection } from "../sections/subscriptionsSection";
 import { makeInvoicesSection } from "../sections/invoicesSection";
@@ -1804,7 +1805,7 @@ test("HomeMetrics: daily bucketing, truncation notes, TTL cache + singleflight, 
   } as unknown as StripeClient;
   const settings = { disputeRatioWarnPct: () => 0.75, disputeRatioCriticalPct: () => 1.5 } as unknown as SettingsStoreType;
   const disputes = { countCreatedBetween: async () => 1 } as never;
-  const metrics = new HomeMetrics(stripe, settings, disputes);
+  const metrics = new HomeMetrics(stripe, settings, disputes, {} as never);
 
   const gross = await metrics.series("gross_volume", "7d");
   assert.equal(gross!.unit, "currency");
@@ -6486,4 +6487,142 @@ test("search sweep resilience: a refused charges.search renders an empty table +
   // Stripe's exact refusal reaches the operator (deploys have no log access).
   assert.match(table.notice!, /expand\[0\] cannot be data\.refunds on search/);
   assert.match(table.empty!, /refused this sweep/);
+});
+
+
+// ---- money out ----
+
+function moneyOutCtx(over: {
+  totals?: Array<{ bucket: string; category: string; currency: string; amountMinor: number; count: number }>;
+  rows?: unknown[];
+  total?: number;
+  enabled?: boolean;
+  backfilled?: boolean;
+} = {}): DashboardCtx {
+  const ctx = homeCtx();
+  (ctx as { settings: unknown }).settings = {
+    moneyOutEnabled: () => over.enabled !== false,
+    moneyOutSweepAt: () => new Date(Date.now() - 10 * 60_000),
+    moneyOutBackfillDoneAt: () => (over.backfilled === false ? null : new Date(Date.now() - 86_400_000)),
+  };
+  (ctx.stores as { moneyOut?: unknown }).moneyOut = {
+    windowTotals: async () =>
+      over.totals ?? [
+        { bucket: "CASH", category: "refund", currency: "eur", amountMinor: 12_000, count: 4 },
+        { bucket: "CASH", category: "dispute", currency: "eur", amountMinor: 4_500, count: 1 },
+        { bucket: "CASH", category: "dispute_reversal", currency: "eur", amountMinor: -1_500, count: 1 },
+        { bucket: "FEES", category: "dispute_fee", currency: "eur", amountMinor: 1_500, count: 1 },
+        { bucket: "CONCESSION", category: "credit_note", currency: "eur", amountMinor: 2_000, count: 2 },
+      ],
+    page: async () => ({
+      rows:
+        over.rows ??
+        [
+          {
+            id: "txn_1",
+            kind: "LEDGER",
+            bucket: "CASH",
+            category: "refund",
+            amountMinor: 2_900,
+            feeMinor: 0,
+            netMinor: 2_900,
+            currency: "eur",
+            source: "webhook",
+            reason: null,
+            stripeObjectId: "re_1",
+            chargeId: "ch_1",
+            customerId: "cus_1",
+            occurredAt: new Date("2026-08-01T10:00:00Z"),
+          },
+        ],
+      total: over.total ?? 1,
+    }),
+    topCustomers: async () => [{ customerId: "cus_1", amountMinor: 2_900, count: 1 }],
+  };
+  return ctx;
+}
+
+test("money out: bucket tiles net out reversals, categories link into the ledger, rows carry origin", async () => {
+  const page = await makeMoneyOutSection().buildPage(moneyOutCtx(), { page: "money-out", filters: {} });
+  const stats = page!.blocks.find((b) => b.type === "stats") as { items: Array<{ label: string; value: string }> };
+
+  // 12000 + 4500 - 1500 = 15000 cash, + 1500 fees + 2000 concessions = 18500.
+  assert.equal(stats.items[0].label, "Total out");
+  assert.equal(stats.items[0].value, "185.00 EUR");
+  assert.equal(stats.items.find((i) => i.label === "Cash reversed")!.value, "150.00 EUR");
+  assert.equal(stats.items.find((i) => i.label === "Stripe fees")!.value, "15.00 EUR");
+  assert.equal(stats.items.find((i) => i.label === "Concessions")!.value, "20.00 EUR");
+
+  const categories = page!.blocks.find(
+    (b) => b.type === "table" && b.key === "money-out-categories"
+  ) as { rows: Array<{ id: string; ref?: { page: string; filters?: Record<string, string> } }> };
+  assert.equal(categories.rows[0].id, "refund", "largest first");
+  assert.deepEqual(categories.rows[0].ref, { page: "money-out", filters: { category: "refund", window: "30d" } });
+
+  const ledger = page!.blocks.find((b) => b.type === "table" && b.key === "money-out-ledger") as {
+    rows: Array<{ id: string; cells: Array<{ v?: string; text?: string }> }>;
+    nextCursor: string | null;
+    counts: { items: Array<{ value: string; count: number | string }> };
+  };
+  assert.equal(ledger.rows[0].id, "txn_1");
+  assert.equal(ledger.nextCursor, null, "one row fits on one page");
+  assert.equal(ledger.counts.items.find((i) => i.value === "CASH")!.count, 6);
+});
+
+test("money out: paginates past 25 rows", async () => {
+  const rows = Array.from({ length: 25 }, (_v, i) => ({
+    id: `txn_${i}`,
+    kind: "LEDGER",
+    bucket: "CASH",
+    category: "refund",
+    amountMinor: 100,
+    feeMinor: 0,
+    netMinor: 100,
+    currency: "eur",
+    source: "sweep",
+    reason: null,
+    stripeObjectId: null,
+    chargeId: null,
+    customerId: null,
+    occurredAt: new Date(),
+  }));
+  const page = await makeMoneyOutSection().buildPage(moneyOutCtx({ rows, total: 60 }), {
+    page: "money-out",
+    filters: {},
+  });
+  const ledger = page!.blocks.find((b) => b.type === "table" && b.key === "money-out-ledger") as {
+    nextCursor: string | null;
+    footer?: string;
+  };
+  assert.equal(ledger.nextCursor, "25");
+  assert.equal(ledger.footer, "60 items");
+});
+
+test("money out: warns when the ledger is off, and when history was never backfilled", async () => {
+  const off = await makeMoneyOutSection().buildPage(moneyOutCtx({ enabled: false }), { page: "money-out", filters: {} });
+  const offNotice = off!.blocks.find((b) => b.type === "notice") as { text: string };
+  assert.match(offNotice.text, /switched off/);
+
+  const noHistory = await makeMoneyOutSection().buildPage(moneyOutCtx({ backfilled: false }), {
+    page: "money-out",
+    filters: {},
+  });
+  const historyNotice = noHistory!.blocks.find((b) => b.type === "notice") as { text: string };
+  assert.match(historyNotice.text, /never been backfilled/);
+});
+
+test("money out: a mixed-currency window reports one currency instead of adding them together", async () => {
+  const page = await makeMoneyOutSection().buildPage(
+    moneyOutCtx({
+      totals: [
+        { bucket: "CASH", category: "refund", currency: "eur", amountMinor: 10_000, count: 3 },
+        { bucket: "CASH", category: "refund", currency: "usd", amountMinor: 90_000, count: 1 },
+      ],
+    }),
+    { page: "money-out", filters: {} }
+  );
+  const stats = page!.blocks.find((b) => b.type === "stats") as { items: Array<{ value: string }> };
+  assert.equal(stats.items[0].value, "100.00 EUR", "USD must not be summed into the EUR total");
+  const notices = page!.blocks.filter((b) => b.type === "notice") as Array<{ text: string }>;
+  assert.ok(notices.some((n) => /USD/.test(n.text)), "the excluded currency must be called out");
 });

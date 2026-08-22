@@ -5,13 +5,11 @@ import type { ForwardConvertStore } from "./ForwardConvertStore";
 import { IntercomHttpError, type IntercomClient } from "./IntercomClient";
 import { archivedContactId, escapeHtmlText } from "./IntercomEventExecutor";
 import { buildForwardConversationBody, parseForwardedEmail } from "./forwardedEmailParse";
+import { ForwarderRoster } from "./forwarderRoster";
 import type { IntercomAdmin } from "./types";
 
 const cvLog = log.child("intercom:fwdconvert");
 
-// Teammate roster cache for the lite-seat forwarder check — the webhook gate
-// runs per inbound email and must not hammer /admins.
-const ADMINS_TTL_MS = 5 * 60 * 1000;
 // Intercom reply cap for attachment_urls.
 const ATTACHMENT_CHUNK = 10;
 
@@ -26,13 +24,14 @@ type PayloadSource = { subject?: string | null; author?: { type?: string; email?
 // parser misses stays attributed to the forwarder, exactly like before this
 // feature.
 export class ForwardedEmailConverter {
-  private adminsCache: { at: number; admins: IntercomAdmin[] } | null = null;
-
   constructor(
     private settingsStore: SettingsStore,
     private client: IntercomClient,
     private store: ForwardConvertStore,
-    private audit: AuditLogger
+    private audit: AuditLogger,
+    // Shared with ForwarderDetacher so both halves of the feature agree on who
+    // a forwarder is (and share one /admins cache).
+    private roster: ForwarderRoster
   ) {}
 
   // Auto gate for the inbound webhook. Returns "converted" when the handler
@@ -294,37 +293,15 @@ export class ForwardedEmailConverter {
     });
   }
 
-  private async admins(): Promise<IntercomAdmin[]> {
-    const now = Date.now();
-    if (this.adminsCache && now - this.adminsCache.at < ADMINS_TTL_MS) return this.adminsCache.admins;
-    const admins = await this.client.listAdmins();
-    this.adminsCache = { at: now, admins };
-    return admins;
+  private admins(): Promise<IntercomAdmin[]> {
+    return this.roster.admins();
   }
 
-  private async isLiteSeatEmail(email: string): Promise<boolean> {
-    const admins = await this.admins();
-    return admins.some((a) => !a.hasInboxSeat && a.email?.toLowerCase() === email);
+  private isForwarderEmail(email: string): Promise<boolean> {
+    return this.roster.isForwarderEmail(email);
   }
 
-  private async isAnyAdminEmail(email: string): Promise<boolean> {
-    const admins = await this.admins();
-    return admins.some((a) => a.email?.toLowerCase() === email);
-  }
-
-  // Forwarder set = lite-seat teammates (dynamic) ∪ the configured extra
-  // addresses (personal mailboxes etc.). Listed entries check first — no
-  // roster fetch needed when they match.
-  private async isForwarderEmail(email: string): Promise<boolean> {
-    if (this.settingsStore.forwardConvertExtraEmails().includes(email)) return true;
-    return this.isLiteSeatEmail(email);
-  }
-
-  // Addresses that must never become the conversion TARGET: teammates and the
-  // listed forwarders themselves (a "customer" conversation for either would
-  // be wrong in every direction).
-  private async isProtectedTargetEmail(email: string): Promise<boolean> {
-    if (this.settingsStore.forwardConvertExtraEmails().includes(email)) return true;
-    return this.isAnyAdminEmail(email);
+  private isProtectedTargetEmail(email: string): Promise<boolean> {
+    return this.roster.isProtectedTargetEmail(email);
   }
 }

@@ -49,6 +49,7 @@ const EXPECTED_COLUMNS: Record<string, string[]> = {
     "sentryFeedbackTicketTypeId",
     "postizLookupEnabled", "postizBaseUrl", "postizApiKey",
     "forwardConvertEnabled", "forwardConvertTagName", "forwardConvertCloseNote", "forwardConvertExtraEmails",
+    "forwardDetachForwarder",
     "aiModel", "aiModelLight",
     "aiEffortAsk", "aiEffortCause", "aiMaxBudgetUsdAsk", "aiMaxBudgetUsdCause", "aiPostizPrefetchEnabled",
     "aiPreviousRunsEnabled",
@@ -66,6 +67,7 @@ const EXPECTED_COLUMNS: Record<string, string[]> = {
     "disputeAutoCancelSub", "disputeAutoBlock", "disputeAutoAttachReceipt", "disputeReminderDays",
     "disputeRatioWarnPct", "disputeRatioCriticalPct", "disputeRatioLastLevel",
     "disputeUrgentHours", "disputeUrgentRoleId", "disputeBackfillDoneAt",
+    "moneyOutEnabled", "moneyOutSweepAt", "moneyOutBackfillDoneAt",
     "radarListCardId", "radarListEmailId", "radarListCustomerId", "radarListIpId",
     "inactivityEnabled", "inactivityAgentWaitDays", "inactivityCustomerWaitDays", "inactivityNagsBeforeClose",
     "inactivityNagText", "inactivityAgentNoteText", "refundMaxChargeAgeDays",
@@ -113,6 +115,10 @@ const EXPECTED_COLUMNS: Record<string, string[]> = {
     "id", "chargeId", "paymentIntentId", "customerId", "amount", "currency", "reason", "status",
     "evidenceDueBy", "evidenceDraft", "evidenceFinal", "evidenceSubmittedAt", "lastReminderAt",
     "lastUrgentReminderAt", "disputeCreatedAt", "closedAt", "createdAt", "updatedAt",
+  ],
+  stripe_money_out: [
+    "id", "kind", "bucket", "category", "amountMinor", "feeMinor", "netMinor", "currency", "source",
+    "reason", "stripeObjectId", "chargeId", "customerId", "occurredAt", "createdAt", "updatedAt",
   ],
   blocked_entities: [
     "id", "kind", "value", "reason", "source", "actorId", "actorName", "customerId", "disputeId",

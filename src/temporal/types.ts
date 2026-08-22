@@ -28,6 +28,7 @@ export const SINGLETONS = {
   slaSweep: "sla-sweep",
   slaEnforce: "sla-enforce",
   sentryFeedback: "sentry-feedback-sync",
+  moneyOut: "money-out-sync",
 } as const;
 
 export const VAULT_UPGRADE_WORKFLOW_ID = "vault-upgrade";
@@ -69,6 +70,7 @@ export const LOOPER_GENERATIONS: Record<string, number> = {
   [SINGLETONS.slaSweep]: 1,
   [SINGLETONS.slaEnforce]: 1,
   [SINGLETONS.sentryFeedback]: 1,
+  [SINGLETONS.moneyOut]: 1,
 };
 
 // ---- Custom search attributes ----
@@ -111,6 +113,7 @@ export const SIG_DISPUTES_RUN_NOW = "disputesRunNow";
 export const SIG_SLA_RUN_NOW = "slaRunNow";
 export const SIG_SLA_ENFORCE_RUN_NOW = "slaEnforceRunNow";
 export const SIG_SENTRY_FEEDBACK_RUN_NOW = "sentryFeedbackRunNow";
+export const SIG_MONEY_OUT_RUN_NOW = "moneyOutRunNow";
 export const UPD_APPLY_STATUS = "applyStatus";
 export const QRY_TICKET_STATE = "getState";
 
@@ -348,6 +351,16 @@ export interface DisputesTickResult {
   ratioLevel: "ok" | "warn" | "critical" | "skipped";
 }
 
+export interface MoneyOutTickResult {
+  scanned: number;
+  created: number;
+  errors: number;
+  // The sweep hit its page cap and has NOT seen everything up to now — the
+  // cursor deliberately does not advance on a truncated pass.
+  truncated: boolean;
+  skipped: boolean; // the money-out ledger is disabled in /config
+}
+
 export interface SentryFeedbackTickResult {
   listed: number;
   imported: number;
@@ -368,6 +381,10 @@ export interface SlaSweepResult {
   unchanged: number;
   errors: number;
   skipped: boolean; // SLA disabled or Intercom unconfigured
+  // Forwarders detached from natively-converted forwarded emails, which this
+  // sweep also heals (Intercom attaches the customer asynchronously, so the
+  // webhook triggers can fire before there is anything to detach).
+  forwardersDetached: number;
 }
 
 // Bot-native SLA enforcement + assignment stray sweep + customer-idle
@@ -420,6 +437,7 @@ export interface CoreActivities {
   slaSweepTick(force: boolean): Promise<SlaSweepResult>;
   slaEnforceTick(force: boolean): Promise<SlaEnforceResult>;
   sentryFeedbackTick(force: boolean): Promise<SentryFeedbackTickResult>;
+  moneyOutTick(): Promise<MoneyOutTickResult>;
   snapshotTick(): Promise<void>;
   cleanupTick(): Promise<void>;
   // Tombstone stubs (agent-rip): in-flight runs at deploy time still proxy

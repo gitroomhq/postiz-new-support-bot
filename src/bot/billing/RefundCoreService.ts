@@ -109,6 +109,8 @@ export class RefundCoreService {
       currency: refund.currency,
       chargeId,
       threadId,
+      surface: "discord",
+      partial: false, // this core always refunds the full remaining amount
     });
 
     return { outcome: "ok", ...refund, cancelFailed, cancelledSubscriptionId };

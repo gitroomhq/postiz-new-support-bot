@@ -2,6 +2,7 @@ import type Stripe from "stripe";
 import { StripeClient } from "../../bot/StripeClient";
 import { SettingsStore } from "../../config/SettingsStore";
 import { DisputeStore } from "../../bot/billing/DisputeStore";
+import { MoneyOutStore } from "../../bot/billing/MoneyOutStore";
 import { SeriesResponse } from "../renderer/contract";
 
 // Home chart series + expensive counters, behind a 10-minute in-memory cache
@@ -40,7 +41,8 @@ export class HomeMetrics {
   constructor(
     private stripe: StripeClient,
     private settings: SettingsStore,
-    private disputes: DisputeStore
+    private disputes: DisputeStore,
+    private moneyOut: MoneyOutStore
   ) {}
 
   // ONE shared enumeration of active subscriptions feeds BOTH the Home stat
@@ -85,7 +87,13 @@ export class HomeMetrics {
   // Series entry point (the `series` endpoint). null = unknown key/window.
   async series(key: string, window: string): Promise<SeriesResponse | null> {
     if (!WINDOW_DAYS[window]) return null;
-    if (!["gross_volume", "new_customers", "mrr_by_plan", "failed_payments", "dispute_ratio"].includes(key)) return null;
+    if (
+      !["gross_volume", "new_customers", "mrr_by_plan", "failed_payments", "dispute_ratio", "money_out_daily", "money_out_by_category"].includes(
+        key
+      )
+    ) {
+      return null;
+    }
     const id = `${key}:${window}`;
     const hit = this.cache.get(id);
     const now = Date.now();
@@ -120,6 +128,10 @@ export class HomeMetrics {
         return this.failedPayments(window);
       case "dispute_ratio":
         return this.disputeRatio();
+      case "money_out_daily":
+        return this.moneyOutDaily(window);
+      case "money_out_by_category":
+        return this.moneyOutByCategory(window);
       default:
         return null;
     }
@@ -282,6 +294,58 @@ export class HomeMetrics {
   // ---- helpers ----
 
   // Cursor sweep with a hard page cap; reports truncation instead of hiding it.
+  // ---- money out: read straight from the local ledger mirror ----
+  //
+  // No Stripe calls and no cache: the mirror is already the reconciled answer,
+  // so a page load costs one indexed Postgres query instead of a paged sweep.
+
+  private async moneyOutDaily(window: string): Promise<SeriesResponse> {
+    const days = WINDOW_DAYS[window];
+    const { from, to } = windowRange(days);
+    const rows = await this.moneyOut.dailySeries(from, to);
+    const currency = dominantCurrency(rows.map((r) => r.currency)) ?? "usd";
+    const factor = StripeClient.isZeroDecimal(currency) ? 1 : 100;
+
+    // One bucket per day so gaps render as zero rather than closing up.
+    const byDay = new Map<string, number>();
+    for (let i = 0; i < days; i++) {
+      byDay.set(new Date(from.getTime() + i * DAY_MS).toISOString().slice(0, 10), 0);
+    }
+    for (const r of rows) {
+      if (r.currency !== currency) continue;
+      byDay.set(r.day, (byDay.get(r.day) ?? 0) + r.amountMinor);
+    }
+    return {
+      key: "money_out_daily",
+      unit: "currency",
+      currency,
+      points: [...byDay.entries()].map(([day, minor]) => ({ label: day.slice(5), v: minor / factor })),
+      ...(rows.some((r) => r.currency !== currency)
+        ? { note: `Other currencies are excluded; showing ${currency.toUpperCase()} only.` }
+        : {}),
+    };
+  }
+
+  private async moneyOutByCategory(window: string): Promise<SeriesResponse> {
+    const { from, to } = windowRange(WINDOW_DAYS[window]);
+    const totals = await this.moneyOut.windowTotals(from, to);
+    const currency = dominantCurrency(totals.map((t) => t.currency)) ?? "usd";
+    const factor = StripeClient.isZeroDecimal(currency) ? 1 : 100;
+    const points = totals
+      .filter((t) => t.currency === currency && t.amountMinor !== 0)
+      .sort((a, b) => b.amountMinor - a.amountMinor)
+      .map((t) => ({ label: t.category.replace(/_/g, " "), v: t.amountMinor / factor }));
+    return {
+      key: "money_out_by_category",
+      unit: "currency",
+      currency,
+      points,
+      ...(totals.some((t) => t.currency !== currency)
+        ? { note: `Other currencies are excluded; showing ${currency.toUpperCase()} only.` }
+        : {}),
+    };
+  }
+
   private async sweep<T extends { id: string }>(
     fetchPage: (startingAfter?: string) => Promise<{ items: T[]; hasMore: boolean }>,
     maxPages = 10
@@ -356,4 +420,30 @@ export class HomeMetrics {
   private minorFactor(currency: string): number {
     return StripeClient.isZeroDecimal(currency) ? 1 : 100;
   }
+}
+
+// The window a series covers, snapped to whole UTC days so a chart's buckets
+// line up with the day boundaries the ledger rows are grouped by.
+function windowRange(days: number): { from: Date; to: Date } {
+  const to = new Date();
+  const from = new Date(to.getTime() - (days - 1) * DAY_MS);
+  from.setUTCHours(0, 0, 0, 0);
+  return { from, to };
+}
+
+// This account is effectively single-currency, but the ledger records whatever
+// Stripe reports. Charting a mix would silently add cents to yen, so pick the
+// most common one and say so in the note rather than summing across them.
+function dominantCurrency(currencies: string[]): string | null {
+  const counts = new Map<string, number>();
+  for (const c of currencies) counts.set(c, (counts.get(c) ?? 0) + 1);
+  let best: string | null = null;
+  let bestN = 0;
+  for (const [c, n] of counts) {
+    if (n > bestN) {
+      best = c;
+      bestN = n;
+    }
+  }
+  return best;
 }

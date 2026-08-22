@@ -205,6 +205,18 @@ export class IntercomWebhookHandler {
     this.forwardedEmailConverter = converter;
   }
 
+  // Cleanup for Intercom's NATIVE forward detection — bound late like the
+  // converter. Best-effort: it never throws, so it can never make a delivery
+  // retry.
+  private forwarderDetacher: {
+    needsCheck(participantIds: string[]): boolean;
+    maybeDetach(conversationId: string): Promise<unknown>;
+  } | null = null;
+
+  setForwarderDetacher(detacher: NonNullable<IntercomWebhookHandler["forwarderDetacher"]>): void {
+    this.forwarderDetacher = detacher;
+  }
+
   // SLA enforcement engine — bound late; owns the unsnooze re-anchor for the
   // next-reply clock.
   private slaEnforcer: { reanchorAfterUnsnooze(conversationId: string): Promise<void> } | null = null;
@@ -336,6 +348,18 @@ export class IntercomWebhookHandler {
       const outcome = await this.forwardedEmailConverter.maybeConvertOnCreate(conversationId, item?.source);
       if (outcome === "converted") return;
     }
+    // Intercom's NATIVE forward detection attaches the real customer but leaves
+    // the forwarder attached too. It does that ASYNCHRONOUSLY, so creation is
+    // often too early — hence the replied topics as well, and the SLA sweep as
+    // the convergence backstop. Both topics are already subscribed, so this
+    // needs no new Developer Hub subscription (which is manual-only, and an
+    // unsubscribed topic silently disables the feature).
+    //
+    // Strictly OPPORTUNISTIC: it acts only when the delivered payload already
+    // shows two or more participants, so the hot path never pays for an extra
+    // conversation GET. A payload that omits contacts simply waits for the
+    // sweep, which has the same pre-filter for free.
+    if (!link) await this.maybeDetachForwarder(conversationId, item);
     // The conversation's team scopes its balanced-assignment pool + config
     // (Intercom's own routing rules set team_assignee_id; bridged tickets carry
     // the bot's routing team).
@@ -367,6 +391,17 @@ export class IntercomWebhookHandler {
     if (link) return; // bridged — Discord-side SLA hooks own it
     if (!this.slaService) return;
     await this.slaService.applyForNative(conversationId, topic);
+  }
+
+  // Opportunistic forwarder cleanup. Never throws and never adds a request:
+  // the participant count comes from the delivered payload, and anything the
+  // payload cannot answer is left to the SLA sweep's backstop.
+  private async maybeDetachForwarder(conversationId: string, item?: IntercomConversationItem): Promise<void> {
+    const detacher = this.forwarderDetacher;
+    if (!detacher) return;
+    const participantIds = (item?.contacts?.contacts ?? []).filter((c) => c.id != null).map((c) => String(c.id));
+    if (!detacher.needsCheck(participantIds)) return;
+    await detacher.maybeDetach(conversationId).catch(() => undefined);
   }
 
   // Assignee changed (bot or human). Bridged: refresh the lastAssigneeId
@@ -532,7 +567,14 @@ export class IntercomWebhookHandler {
     if (mode === "none" || !item || item.id == null) return;
 
     const link = await this.store.getLinkByConversationId(String(item.id));
-    if (!link) return; // Intercom-native conversation — not ours
+    if (!link) {
+      // Intercom-native conversation — not ours to mirror. It IS, however, the
+      // point where a teammate's first reply proves Intercom's native forward
+      // detection has finished attaching the customer, so this is the most
+      // reliable moment to detach the forwarder.
+      await this.maybeDetachForwarder(String(item.id), item);
+      return;
+    }
 
     const parts = item.conversation_parts?.conversation_parts ?? [];
     await this.relayReplyParts("c", "conversation.admin.replied", String(item.id), link, parts, attempt);

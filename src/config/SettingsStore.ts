@@ -1123,6 +1123,30 @@ export class SettingsStore {
     return this.settings.disputeBackfillDoneAt;
   }
 
+  // ---- Money-out ledger (/config → Billing → Money out) ----
+
+  moneyOutEnabled(): boolean {
+    return this.settings.moneyOutEnabled;
+  }
+
+  // Reconcile cursor. Null = never swept: the first tick walks the default
+  // lookback instead of all of history (that is what the backfill button is for).
+  moneyOutSweepAt(): Date | null {
+    return this.settings.moneyOutSweepAt;
+  }
+
+  moneyOutBackfillDoneAt(): Date | null {
+    return this.settings.moneyOutBackfillDoneAt;
+  }
+
+  async updateMoneyOut(data: {
+    moneyOutEnabled?: boolean;
+    moneyOutSweepAt?: Date | null;
+    moneyOutBackfillDoneAt?: Date | null;
+  }): Promise<void> {
+    this.settings = await this.prisma.botSettings.update({ where: { id: "global" }, data });
+  }
+
   // Provisioned Radar value-list ids (not secrets — plain rsl_… ids).
   radarListId(kind: "card_fingerprint" | "email" | "customer_id" | "ip_address"): string | null {
     switch (kind) {
@@ -1591,11 +1615,20 @@ export class SettingsStore {
     return [...new Set(raw.split(",").map((s) => s.trim().toLowerCase()).filter(Boolean))];
   }
 
+  // Detach the forwarder from a thread Intercom's NATIVE forward detection
+  // converted: it attaches the real customer but leaves the forwarding address
+  // attached too. Separate toggle from forwardConvertEnabled so the repair can
+  // be switched off without disabling our own bot-native conversion.
+  forwardDetachForwarder(): boolean {
+    return this.settings.forwardDetachForwarder;
+  }
+
   async updateForwardConvert(data: {
     forwardConvertEnabled?: boolean;
     forwardConvertTagName?: string;
     forwardConvertCloseNote?: string | null;
     forwardConvertExtraEmails?: string;
+    forwardDetachForwarder?: boolean;
   }): Promise<void> {
     this.settings = await this.prisma.botSettings.update({ where: { id: "global" }, data });
   }

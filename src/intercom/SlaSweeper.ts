@@ -3,6 +3,7 @@ import type { IntercomClient } from "./IntercomClient";
 import type { IntercomStore } from "./IntercomStore";
 import type { SlaSweepResult } from "../temporal/types";
 import type { SlaService } from "../sla/SlaService";
+import type { ForwarderDetacher } from "./ForwarderDetacher";
 import { log } from "../util/logger";
 
 const sweepLog = log.child("sla:sweep");
@@ -28,7 +29,11 @@ export class SlaSweeper {
     private client: IntercomClient,
     private store: IntercomStore,
     private settingsStore: SettingsStore,
-    private slaService: SlaService
+    private slaService: SlaService,
+    // Convergence backstop for the forwarded-email cleanup: Intercom attaches
+    // the customer asynchronously, so the webhook triggers can run before there
+    // is a forwarder to remove. Optional so existing constructions keep working.
+    private forwarderDetacher?: ForwarderDetacher
   ) {}
 
   // force = the /intercom "Run Now" button / rules-changed signal. Unlike the
@@ -36,7 +41,7 @@ export class SlaSweeper {
   // attribute write is externally visible, so the toggle always gates; force
   // only annotates the reason for tracing.
   async sweep(force: boolean): Promise<SlaSweepResult> {
-    const result: SlaSweepResult = { scanned: 0, written: 0, unchanged: 0, errors: 0, skipped: true };
+    const result: SlaSweepResult = { scanned: 0, written: 0, unchanged: 0, errors: 0, skipped: true, forwardersDetached: 0 };
     if (!this.settingsStore.intercomConfigured() || !this.settingsStore.slaEnabled()) return result;
     result.skipped = false;
 
@@ -47,6 +52,14 @@ export class SlaSweeper {
       const page = await this.client.searchOpenConversations(cursor);
       for (const conv of page.items) {
         result.scanned++;
+        // Forwarder cleanup rides along on a sweep that already lists every
+        // open conversation. The participant-count pre-filter comes from the
+        // search projection, so the extra reads only happen for the rare
+        // multi-participant thread — never for the ordinary single-customer one.
+        if (this.forwarderDetacher?.needsCheck(conv.participantIds)) {
+          const outcome = await this.forwarderDetacher.maybeDetach(conv.id);
+          if (outcome === "detached") result.forwardersDetached++;
+        }
         try {
           const link = await this.store.getLinkByConversationId(conv.id).catch(() => null);
           const applied = link
@@ -87,6 +100,7 @@ export class SlaSweeper {
       "sla.sweep_unchanged": result.unchanged,
       "sla.sweep_errors": result.errors,
       "sla.sweep_forced": force,
+      "sla.sweep_forwarders_detached": result.forwardersDetached,
     });
     return result;
   }
