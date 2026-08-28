@@ -82,6 +82,8 @@ test("search: sends the raw key with no Bearer prefix and maps the row shape", a
     // A "Bearer " prefix makes the platform treat it as an unknown key.
     assert.equal(h.calls[0].auth, "key-123");
     assert.match(h.calls[0].url, /\/public\/v1\/users\?name=/);
+    // The `row` fixture is a minimal (older-platform) response, so every
+    // extended field maps to null rather than a fabricated default.
     assert.deepEqual(res.accounts, [
       {
         membershipId: "uo_1",
@@ -92,6 +94,16 @@ test("search: sends the raw key with no Bearer prefix and maps the row shape", a
         orgId: "org_1",
         orgName: "Org 1",
         tier: "PRO",
+        membershipDisabled: null,
+        orgPaymentId: null,
+        orgDeletedAt: null,
+        userDeletedAt: null,
+        userActivated: null,
+        userProvider: null,
+        subIdentifier: null,
+        subPeriod: null,
+        subIsLifetime: null,
+        subCancelAt: null,
       },
     ]);
     assert.equal(res.capped, false);
@@ -132,16 +144,71 @@ test("search: drops rows missing a user or organization, and tolerates a null su
   }
 });
 
-test("search: caches by normalized term so repeat lookups do not re-scan", async () => {
+test("search: caches per exact term, because id matching is case-sensitive", async () => {
   const h = harness({ rows: [row(1)] });
   try {
-    await h.client.searchUsers("User1@Example.com");
-    await h.client.searchUsers("user1@example.com");
-    assert.equal(h.calls.length, 1, "case-insensitive match is the same lookup");
+    await h.client.searchUsers("aB3xK9mQ2p");
+    await h.client.searchUsers("aB3xK9mQ2p");
+    assert.equal(h.calls.length, 1, "an identical term is served from cache");
+
+    // Case is deliberately NOT folded. The endpoint matches ids — Stripe
+    // customer id, subscription identifier, channel id, post id — with
+    // `equals`, so two terms differing only in case are genuinely two
+    // different lookups and must not share a cache entry.
+    await h.client.searchUsers("ab3xk9mq2p");
+    assert.equal(h.calls.length, 2, "a differently-cased id is its own lookup");
 
     h.client.clearCache();
-    await h.client.searchUsers("user1@example.com");
-    assert.equal(h.calls.length, 2);
+    await h.client.searchUsers("aB3xK9mQ2p");
+    assert.equal(h.calls.length, 3);
+  } finally {
+    h.restore();
+  }
+});
+
+test("search: sends the customer id verbatim, so an exact-match branch can hit", async () => {
+  const h = harness({ rows: [] });
+  try {
+    await h.client.searchUsers("cus_UGGLxT7aZyXyCG");
+    assert.equal(new URL(h.calls[0].url).searchParams.get("name"), "cus_UGGLxT7aZyXyCG");
+  } finally {
+    h.restore();
+  }
+});
+
+test("search: maps the platform's extended fields, and leaves absent ones unknown", async () => {
+  const h = harness({
+    rows: [
+      row(1, {
+        disabled: false,
+        organization: {
+          id: "org_1",
+          name: "Acme",
+          paymentId: "cus_abc",
+          deletedAt: null,
+          subscription: { subscriptionTier: "PRO", identifier: "aB3xK9mQ2p", isLifetime: true, period: "YEARLY", cancelAt: null },
+        },
+        user: { id: "usr_1", name: "Jane", email: "jane@acme.com", activated: true, providerName: "GOOGLE", deletedAt: null },
+      }),
+      // An older deployment that predates the wider `select`.
+      row(2),
+    ],
+  });
+  try {
+    const { accounts } = await h.client.searchUsers("acme");
+    assert.equal(accounts[0].orgPaymentId, "cus_abc");
+    assert.equal(accounts[0].subIdentifier, "aB3xK9mQ2p");
+    assert.equal(accounts[0].subIsLifetime, true);
+    assert.equal(accounts[0].subPeriod, "YEARLY");
+    assert.equal(accounts[0].userProvider, "GOOGLE");
+    assert.equal(accounts[0].userActivated, true);
+    assert.equal(accounts[0].membershipDisabled, false);
+
+    // Absent must stay null ("the platform did not say"), never false.
+    assert.equal(accounts[1].orgPaymentId, null);
+    assert.equal(accounts[1].subIsLifetime, null);
+    assert.equal(accounts[1].userActivated, null);
+    assert.equal(accounts[1].membershipDisabled, null);
   } finally {
     h.restore();
   }

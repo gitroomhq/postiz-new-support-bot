@@ -5,6 +5,8 @@ import type { ActionActor } from "../../bot/billing/actions/BillingActionService
 import { ActionButton, Badge, Block, Cell, TableBlock } from "../renderer/contract";
 import { DashboardCtx, DashboardSectionModule, SectionPage, str, validCursor, validId } from "./types";
 import { bookmarkButton, isBookmarkedSafe, toggleBookmarkAction } from "./bookmarks";
+import { isGitroomSub, readPostizMeta } from "../../bot/billing/postizPlan";
+import type { PostizIdentityService, PostizOrgLookup, PostizOrgSummary } from "../../postiz/PostizIdentityService";
 import {
   amount,
   avatarCell,
@@ -123,7 +125,14 @@ function registryButton(ctx: DashboardCtx, button: ActionButton): ActionButton {
   return { ...button, mode: mode === "queue" ? "queue" : "direct" };
 }
 
-export function makeCustomersSection(): DashboardSectionModule {
+// `deps` is optional so the section keeps working (Postiz rows simply absent)
+// wherever it is constructed without the platform client, which is also what
+// keeps the existing Customer-360 tests honest.
+export interface CustomersDeps {
+  postiz?: PostizIdentityService | null;
+}
+
+export function makeCustomersSection(deps: CustomersDeps = {}): DashboardSectionModule {
   return {
     nav: [{ key: "customers", label: "Customers", page: "customers" }],
 
@@ -154,7 +163,7 @@ export function makeCustomersSection(): DashboardSectionModule {
       const id = validId("customer", req.params?.id);
       if (!id) return notFound("That customer id is not valid.");
       if (req.page === "customers.portal") return portalLinkPage(ctx, id);
-      return detail(ctx, id);
+      return detail(ctx, id, deps);
     },
 
     async action(ctx: DashboardCtx, req) {
@@ -555,7 +564,72 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
   return { title: "Customers", crumbs: [{ label: "Customers" }], blocks: [header, table] };
 }
 
-async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
+// The rail is 280px: two organizations is as much as reads cleanly, and a
+// Stripe customer mapping to more than one org is already an anomaly.
+const MAX_RAIL_ORGS = 2;
+
+// Platform dates arrive as ISO strings; the rail only has room for the day.
+function shortDay(iso: string | null | undefined): string | null {
+  if (!iso) return null;
+  const at = new Date(iso);
+  return Number.isNaN(at.getTime()) ? null : at.toISOString().slice(0, 10);
+}
+
+// Postiz-created subscriptions carry service:"gitroom" metadata. The live one
+// speaks for the customer's current plan, so it sorts ahead of a dead one.
+const LIVE_SUB_STATUSES = new Set(["active", "trialing", "past_due"]);
+
+function gitroomSubs(subs: Stripe.Subscription[]): Stripe.Subscription[] {
+  return subs
+    .filter((sub) => isGitroomSub(sub))
+    .sort(
+      (a, b) =>
+        Number(LIVE_SUB_STATUSES.has(b.status)) - Number(LIVE_SUB_STATUSES.has(a.status)) ||
+        (b.created ?? 0) - (a.created ?? 0)
+    );
+}
+
+// The Postiz lookup needs a uniqueId off the customer's subscriptions, so it
+// chains behind that read instead of becoming another independent entry in the
+// fan-out below. It is not a Stripe call and must not count against the
+// twelve-parallel-Stripe-reads ceiling documented there.
+async function loadSubsAndPostiz(
+  ctx: DashboardCtx,
+  customerId: string,
+  deps: CustomersDeps
+): Promise<{ subs: Stripe.Subscription[]; postiz: PostizOrgLookup }> {
+  const subs = await ctx.stripe.listSubscriptions(customerId).catch(() => [] as Stripe.Subscription[]);
+  const off: PostizOrgLookup = { state: "off", orgs: [], via: null };
+  if (!deps.postiz) return { subs, postiz: off };
+
+  const uniqueIds: string[] = [];
+  for (const sub of gitroomSubs(subs)) {
+    const uid = readPostizMeta(sub.metadata).uniqueId;
+    if (uid && !uniqueIds.includes(uid)) uniqueIds.push(uid);
+  }
+
+  const postiz = await deps
+    .postiz.resolveOrgsForCustomer(customerId, uniqueIds)
+    // resolveOrgsForCustomer already swallows its own failures; this is the
+    // belt for a client that is broken outright.
+    .catch(() => ({ state: "error", orgs: [], via: null }) as PostizOrgLookup);
+  return { subs, postiz };
+}
+
+// One query for the linked Discord sessions instead of one per id.
+async function loadDiscordLinks(
+  ctx: DashboardCtx,
+  customerId: string
+): Promise<{ discordIds: string[]; postizUserId: string | null }> {
+  const discordIds = await ctx.stores.session.findDiscordIdsByStripeId(customerId).catch(() => [] as string[]);
+  const capped = discordIds.slice(0, 5);
+  if (!capped.length) return { discordIds, postizUserId: null };
+  const sessions = await ctx.stores.session.listByDiscordIds(capped).catch(() => []);
+  const linked = sessions.find((row) => row.postizUserId)?.postizUserId ?? null;
+  return { discordIds, postizUserId: linked };
+}
+
+async function detail(ctx: DashboardCtx, id: string, deps: CustomersDeps = {}): Promise<SectionPage> {
   const customer = await ctx.stripe.getCustomer(id).catch(() => null);
   if (!customer) {
     return notFound("This customer does not exist (or was deleted).");
@@ -564,15 +638,15 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
   // Note: 12 parallel STRIPE reads is the ceiling here — consolidate
   // before adding more (every new one is .catch-guarded and independent; the
   // bookmark flag is a local DB read, not a Stripe call).
-  const [subs, invoices, methods, chargesPage, disputes, blocks, discordIds, notes, creditGrants, taxIds, balanceTxns, cashBalance, bookmarked] =
+  const [subsAndPostiz, invoices, methods, chargesPage, disputes, blocks, discordLinks, notes, creditGrants, taxIds, balanceTxns, cashBalance, bookmarked] =
     await Promise.all([
-      ctx.stripe.listSubscriptions(id).catch(() => [] as Stripe.Subscription[]),
+      loadSubsAndPostiz(ctx, id, deps),
       ctx.stripe.listInvoices(id, 10).catch(() => ({ invoices: [] as Stripe.Invoice[], hasMore: false })),
       ctx.stripe.listAllPaymentMethods(id).catch(() => [] as Stripe.PaymentMethod[]),
       ctx.stripe.listCharges(id, 100).catch(() => ({ charges: [] as Stripe.Charge[], hasMore: false })),
       ctx.stores.dispute.listByCustomer(id, 10).catch(() => []),
       ctx.stores.block.listForCustomer(id, customer.email).catch(() => []),
-      ctx.stores.session.findDiscordIdsByStripeId(id).catch(() => [] as string[]),
+      loadDiscordLinks(ctx, id),
       ctx.stores.qol.listNotes("customer", id, 0, 5).catch(() => ({ rows: [], total: 0 })),
       ctx.stripe.listCreditGrants(id).catch(() => [] as Stripe.Billing.CreditGrant[]),
       ctx.stripe.listTaxIds(id).catch(() => [] as Stripe.TaxId[]),
@@ -583,6 +657,9 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
       ctx.stripe.getCashBalance(id).catch(() => null),
       isBookmarkedSafe(ctx, "customer", id),
     ]);
+
+  const { subs, postiz } = subsAndPostiz;
+  const { discordIds } = discordLinks;
 
   const main: Block[] = [];
   const rail: Block[] = [];
@@ -882,11 +959,86 @@ async function detail(ctx: DashboardCtx, id: string): Promise<SectionPage> {
   const linkRows: Array<{ label: string; cell: Cell }> = [];
   for (const discordId of discordIds.slice(0, 5)) {
     linkRows.push({ label: "Discord user", cell: idCell(discordId, { copy: true }) });
-    const session = await ctx.stores.session.getSession(discordId).catch(() => null);
-    if (session?.postizUserId) {
-      linkRows.push({ label: "Postiz user", cell: idCell(session.postizUserId, { copy: true }) });
+  }
+
+  // Free half of the Postiz picture: whatever the subscription's own metadata
+  // already says. Rendered before the platform rows so the card still carries
+  // the plan when the platform is slow or switched off.
+  const gitroom = gitroomSubs(subs)[0] ?? null;
+  const meta = gitroom ? readPostizMeta(gitroom.metadata) : null;
+  // The platform writes userId on its own checkout subs; our own creates do not
+  // (buildPostizMetadata is deliberately four keys), hence the fallback order.
+  const metaUserId = str(gitroom?.metadata?.userId).trim() || null;
+  const postizUserId = discordLinks.postizUserId ?? metaUserId;
+  if (postizUserId) linkRows.push({ label: "Postiz user", cell: idCell(postizUserId, { copy: true }) });
+
+  const primaryOrg: PostizOrgSummary | null = postiz.orgs[0] ?? null;
+  if (meta?.billing || meta?.period) {
+    const planNotes: string[] = [];
+    if (primaryOrg?.tier && meta?.billing && primaryOrg.tier !== meta.billing) {
+      planNotes.push(`platform says ${primaryOrg.tier}`);
+    }
+    if (primaryOrg?.subIsLifetime) planNotes.push("lifetime deal");
+    const cancels = shortDay(primaryOrg?.subCancelAt);
+    if (cancels) planNotes.push(`cancels ${cancels}`);
+    linkRows.push({
+      label: "Postiz plan",
+      cell: text([meta?.billing, meta?.period].filter(Boolean).join(" · "), planNotes.join(" · ") || undefined),
+    });
+  }
+  if (meta?.uniqueId) {
+    linkRows.push({ label: "Postiz uniqueId", cell: idCell(meta.uniqueId, { copy: true }) });
+    // The platform stores that uniqueId as Subscription.identifier. A
+    // disagreement means Stripe and the platform are describing different
+    // subscriptions, which is worth saying out loud rather than hiding.
+    if (primaryOrg?.subIdentifier && primaryOrg.subIdentifier !== meta.uniqueId) {
+      linkRows.push({
+        label: "Platform identifier",
+        cell: text(primaryOrg.subIdentifier, "does not match the Stripe metadata"),
+      });
     }
   }
+
+  for (const org of postiz.orgs.slice(0, MAX_RAIL_ORGS)) {
+    const notes = [`${org.memberCount}${org.countIsFloor ? "+" : ""} member${org.memberCount === 1 ? "" : "s"}`];
+    if (org.orgDeleted) notes.push("deleted");
+    if (org.customerMatches === false) notes.push("points at a different Stripe customer");
+    else if (postiz.via === "uniqueId" && org.customerMatches !== true) notes.push("matched on subscription id");
+    linkRows.push({ label: "Postiz org", cell: text(org.orgName || org.orgId, notes.join(" · ")) });
+    linkRows.push({ label: "Postiz org ID", cell: idCell(org.orgId, { copy: true }) });
+    if (org.ownerEmail) {
+      const ownerNotes = [
+        org.ownerRole,
+        org.ownerProvider,
+        org.ownerActivated === false ? "not activated" : null,
+        org.ownerIsLive ? null : "inactive account",
+      ].filter(Boolean) as string[];
+      linkRows.push({ label: "Postiz owner", cell: text(org.ownerEmail, ownerNotes.join(" · ") || undefined) });
+    }
+    if (org.ownerMembershipId) {
+      linkRows.push({ label: "Impersonate id", cell: idCell(org.ownerMembershipId, { copy: true }) });
+    }
+  }
+  if (postiz.orgs.length > MAX_RAIL_ORGS) {
+    linkRows.push({
+      label: "More organizations",
+      cell: text(`+${postiz.orgs.length - MAX_RAIL_ORGS} not shown`),
+    });
+  }
+
+  // Say "no account" only about a customer that actually looks like a Postiz
+  // one. A plain Stripe customer that was never a Postiz org gets no Postiz row
+  // at all, rather than a "not found" implying we expected one.
+  if (!postiz.orgs.length && postiz.state !== "off" && gitroom) {
+    const miss =
+      postiz.state === "timeout"
+        ? "lookup timed out"
+        : postiz.state === "error"
+          ? "platform unreachable"
+          : "no account found";
+    linkRows.push({ label: "Postiz org", cell: text(miss) });
+  }
+
   rail.push({
     type: "kv",
     title: "Linked accounts",

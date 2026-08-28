@@ -168,6 +168,13 @@ export function dashboardCss(): string {
     .tablewrap { overflow-x:visible; }
     .tablewrap thead th { position:sticky; top:56px; background:var(--bg); z-index:2;
       box-shadow:0 1px 0 var(--border); }
+    /* ...except on a detail page, where the trade inverts: the table sits in a
+       narrow grid track beside the 280px rail, so overflow-x:visible lets a wide
+       table (long ch_/sub_ id columns) paint straight over the rail, which is
+       later in the DOM and therefore wins. Detail tables are short, so pinned
+       headers buy nothing here — take the h-scroll back instead. */
+    .detailmain .tablewrap { overflow-x:auto; }
+    .detailmain .tablewrap thead th { position:static; box-shadow:none; }
   }
   td .sub { display:block; color:var(--faint); font-size:12px; }
   td.money { font-variant-numeric:tabular-nums; font-weight:500; white-space:nowrap; }

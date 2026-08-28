@@ -623,7 +623,7 @@ async function main() {
     makeHomeSection({ metrics: dashboardMetrics }),
     makeBalancesSection(),
     makePaymentsSection(),
-    makeCustomersSection(),
+    makeCustomersSection({ postiz: postizIdentity }),
     makeSubscriptionsSection(),
     makeInvoicesSection(),
     makeDisputesSection({ ratio: ratioEngine, evidence: disputeEvidenceService }),

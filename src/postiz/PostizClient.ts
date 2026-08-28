@@ -32,6 +32,11 @@ export class PostizQueryError extends Error {}
 
 // One user's membership of one organization. The platform returns a
 // userOrganization row, so a user in two orgs comes back twice.
+//
+// Everything below `tier` was added to the platform's `select` later. An older
+// deployment simply omits those keys, so each one is optional-and-null rather
+// than assumed present: absent must read as "unknown", never as "false" or
+// "deleted".
 export interface PostizAccount {
   // The userOrganization id. Doubles as the platform's `impersonate` value,
   // which is why it is kept rather than flattened away.
@@ -43,6 +48,22 @@ export interface PostizAccount {
   orgId: string;
   orgName: string | null;
   tier: string | null;
+  // This membership is switched off, but the row still comes back.
+  membershipDisabled: boolean | null;
+  // The org's Stripe customer id, echoed back. Lets a caller VERIFY that a hit
+  // really belongs to the customer it searched for instead of trusting the
+  // server's OR clause.
+  orgPaymentId: string | null;
+  orgDeletedAt: string | null;
+  userDeletedAt: string | null;
+  userActivated: boolean | null;
+  // Login provider ("LOCAL", "GOOGLE", …) — support context for "I can't sign in".
+  userProvider: string | null;
+  // Platform-side subscription facts, for cross-checking against Stripe.
+  subIdentifier: string | null;
+  subPeriod: string | null;
+  subIsLifetime: boolean | null;
+  subCancelAt: string | null;
 }
 
 export interface PostizSearchResult {
@@ -56,8 +77,35 @@ export interface PostizSearchResult {
 interface RawUserOrganization {
   id?: string;
   role?: string;
-  organization?: { id?: string; name?: string; subscription?: { subscriptionTier?: string } | null };
-  user?: { id?: string; name?: string; email?: string };
+  disabled?: boolean;
+  organization?: {
+    id?: string;
+    name?: string;
+    paymentId?: string | null;
+    deletedAt?: string | null;
+    subscription?: {
+      subscriptionTier?: string;
+      identifier?: string | null;
+      isLifetime?: boolean;
+      period?: string | null;
+      cancelAt?: string | null;
+    } | null;
+  };
+  user?: {
+    id?: string;
+    name?: string;
+    email?: string;
+    activated?: boolean;
+    providerName?: string | null;
+    deletedAt?: string | null;
+  };
+}
+
+// An older platform omits the newer `select` keys entirely. `undefined` has to
+// survive as null ("the deployment does not tell us") rather than becoming
+// false, which would read as a positive statement the server never made.
+function nullableBool(v: boolean | undefined): boolean | null {
+  return typeof v === "boolean" ? v : null;
 }
 
 // Read-only client for the Postiz platform's superadmin search
@@ -93,10 +141,15 @@ export class PostizClient {
     this.cache.clear();
   }
 
-  // Normalised cache key: the endpoint's email/name matching is
-  // case-insensitive, so "Foo@x.com" and "foo@x.com" are the same lookup.
+  // Cache key. Case is PRESERVED on purpose: the endpoint's name/email branches
+  // match case-insensitively, but its id branches (Stripe customer id,
+  // subscription identifier, channel id, post id) match with `equals`, which is
+  // case-sensitive. Folding case would let two different ids — a base62
+  // uniqueId differing only in capitalisation, say — collide on one entry and
+  // hand back the wrong organisation. The only cost of keeping case is a
+  // duplicate entry for a differently-typed email, which is never a wrong answer.
   private static normalize(query: string): string {
-    return query.trim().toLowerCase();
+    return query.trim();
   }
 
   async searchUsers(query: string): Promise<PostizSearchResult> {
@@ -119,16 +172,31 @@ export class PostizClient {
     const rows = Array.isArray(raw) ? raw : [];
     const accounts = rows
       .filter((r) => r.user?.id && r.organization?.id)
-      .map((r) => ({
-        membershipId: String(r.id ?? ""),
-        role: r.role ?? null,
-        userId: String(r.user!.id),
-        name: r.user!.name?.trim() || null,
-        email: r.user!.email?.trim() || null,
-        orgId: String(r.organization!.id),
-        orgName: r.organization!.name?.trim() || null,
-        tier: r.organization!.subscription?.subscriptionTier ?? null,
-      }));
+      .map((r) => {
+        const org = r.organization!;
+        const user = r.user!;
+        const sub = org.subscription ?? null;
+        return {
+          membershipId: String(r.id ?? ""),
+          role: r.role ?? null,
+          userId: String(user.id),
+          name: user.name?.trim() || null,
+          email: user.email?.trim() || null,
+          orgId: String(org.id),
+          orgName: org.name?.trim() || null,
+          tier: sub?.subscriptionTier ?? null,
+          membershipDisabled: nullableBool(r.disabled),
+          orgPaymentId: org.paymentId?.trim() || null,
+          orgDeletedAt: org.deletedAt ?? null,
+          userDeletedAt: user.deletedAt ?? null,
+          userActivated: nullableBool(user.activated),
+          userProvider: user.providerName?.trim() || null,
+          subIdentifier: sub?.identifier?.trim() || null,
+          subPeriod: sub?.period?.trim() || null,
+          subIsLifetime: nullableBool(sub?.isLifetime),
+          subCancelAt: sub?.cancelAt ?? null,
+        };
+      });
 
     const result: PostizSearchResult = {
       accounts: accounts.slice(0, MAX_RESULTS),

@@ -416,7 +416,11 @@ function fakeCustomerCtx(): DashboardCtx {
     }),
   } as unknown as DashboardCtx["stripe"];
   const stores = {
-    session: { findDiscordIdsByStripeId: async () => ["111222333"], getSession: async () => ({ postizUserId: "pz_9" }) },
+    session: {
+      findDiscordIdsByStripeId: async () => ["111222333"],
+      getSession: async () => ({ postizUserId: "pz_9" }),
+      listByDiscordIds: async () => [{ discordUserId: "111222333", postizUserId: "pz_9" }],
+    },
     dispute: { listByCustomer: async () => [] },
     block: { listForCustomer: async () => [] },
     qol: { listNotes: async () => ({ rows: [], total: 0 }) },

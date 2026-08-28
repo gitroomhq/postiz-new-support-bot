@@ -201,3 +201,163 @@ test("enrichTicket: an unresolved customer leaves the ticket untouched", async (
     h.restore();
   }
 });
+
+// --- resolveOrgsForCustomer: Stripe customer -> Postiz organization ---------
+
+const CUS = "cus_UGGLxT7aZyXyCG";
+
+// A membership row for one org, with the platform's extended select filled in.
+const orgRow = (
+  n: number,
+  over: { role?: string; paymentId?: string | null; disabled?: boolean; userDeletedAt?: string | null; email?: string } = {}
+) => ({
+  id: `uo_${n}`,
+  role: over.role ?? "USER",
+  disabled: over.disabled ?? false,
+  organization: {
+    id: "org_1",
+    name: "Acme Social",
+    paymentId: over.paymentId === undefined ? CUS : over.paymentId,
+    deletedAt: null,
+    subscription: { subscriptionTier: "PRO", identifier: "aB3xK9mQ2p", isLifetime: false, period: "MONTHLY", cancelAt: null },
+  },
+  user: {
+    id: `usr_${n}`,
+    name: `User ${n}`,
+    email: over.email ?? `user${n}@acme.com`,
+    activated: true,
+    providerName: "LOCAL",
+    deletedAt: over.userDeletedAt ?? null,
+  },
+});
+
+test("resolveOrgsForCustomer: groups memberships into one org and picks the superadmin", async () => {
+  const h = harness({
+    rowsByTerm: {
+      [CUS]: [
+        orgRow(1, { role: "USER" }),
+        orgRow(2, { role: "SUPERADMIN", email: "boss@acme.com" }),
+        orgRow(3, { role: "ADMIN" }),
+      ],
+    },
+  });
+  try {
+    const out = await h.service.resolveOrgsForCustomer(CUS);
+    assert.equal(out.state, "found");
+    assert.equal(out.via, "customer");
+    assert.equal(out.orgs.length, 1, "three memberships are one organization");
+    const [org] = out.orgs;
+    assert.equal(org.orgId, "org_1");
+    assert.equal(org.memberCount, 3);
+    assert.equal(org.ownerEmail, "boss@acme.com");
+    assert.equal(org.ownerRole, "SUPERADMIN");
+    assert.equal(org.ownerMembershipId, "uo_2");
+    // The echoed paymentId proves the hit really is this Stripe customer.
+    assert.equal(org.customerMatches, true);
+  } finally {
+    h.restore();
+  }
+});
+
+test("resolveOrgsForCustomer: a deleted or disabled member never becomes the owner", async () => {
+  const h = harness({
+    rowsByTerm: {
+      [CUS]: [
+        orgRow(1, { role: "SUPERADMIN", email: "gone@acme.com", userDeletedAt: "2026-01-01T00:00:00.000Z" }),
+        orgRow(2, { role: "SUPERADMIN", email: "off@acme.com", disabled: true }),
+        orgRow(3, { role: "USER", email: "live@acme.com" }),
+      ],
+    },
+  });
+  try {
+    const [org] = (await h.service.resolveOrgsForCustomer(CUS)).orgs;
+    assert.equal(org.ownerEmail, "live@acme.com", "a live USER outranks a deleted SUPERADMIN");
+    assert.equal(org.ownerIsLive, true);
+  } finally {
+    h.restore();
+  }
+});
+
+test("resolveOrgsForCustomer: falls back to the subscription uniqueId, and only then", async () => {
+  const h = harness({ rowsByTerm: { aB3xK9mQ2p: [orgRow(1, { paymentId: null })] } });
+  try {
+    const out = await h.service.resolveOrgsForCustomer(CUS, ["aB3xK9mQ2p"]);
+    assert.deepEqual(h.searched, [CUS, "aB3xK9mQ2p"], "the customer id is tried first");
+    assert.equal(out.via, "uniqueId");
+    assert.equal(out.orgs[0].orgId, "org_1");
+    // The platform did not echo a paymentId, so no claim is made either way.
+    assert.equal(out.orgs[0].customerMatches, null);
+  } finally {
+    h.restore();
+  }
+});
+
+test("resolveOrgsForCustomer: a hit on the customer id skips the fallback entirely", async () => {
+  const h = harness({ rowsByTerm: { [CUS]: [orgRow(1)] } });
+  try {
+    await h.service.resolveOrgsForCustomer(CUS, ["aB3xK9mQ2p"]);
+    assert.deepEqual(h.searched, [CUS], "no second call once the customer id answered");
+  } finally {
+    h.restore();
+  }
+});
+
+test("resolveOrgsForCustomer: never makes more than two platform calls", async () => {
+  const h = harness({ rowsByTerm: {} });
+  try {
+    await h.service.resolveOrgsForCustomer(CUS, ["uid0000001", "uid0000002", "uid0000003"]);
+    assert.equal(h.searched.length, 2, "a customer with many subs must not fan out");
+  } finally {
+    h.restore();
+  }
+});
+
+test("resolveOrgsForCustomer: an org pointing elsewhere is reported, not hidden", async () => {
+  const h = harness({ rowsByTerm: { aB3xK9mQ2p: [orgRow(1, { paymentId: "cus_somethingelse" })] } });
+  try {
+    const out = await h.service.resolveOrgsForCustomer(CUS, ["aB3xK9mQ2p"]);
+    assert.equal(out.orgs[0].customerMatches, false);
+    assert.equal(out.orgs[0].paymentId, "cus_somethingelse");
+  } finally {
+    h.restore();
+  }
+});
+
+test("resolveOrgsForCustomer: a miss, an outage and a disabled lookup are three states", async () => {
+  const miss = harness({ rowsByTerm: {} });
+  try {
+    assert.equal((await miss.service.resolveOrgsForCustomer(CUS)).state, "none");
+  } finally {
+    miss.restore();
+  }
+
+  const broken = harness({ clientThrows: true });
+  try {
+    const out = await broken.service.resolveOrgsForCustomer(CUS);
+    assert.equal(out.state, "error", "an outage must not read as 'no account'");
+    assert.deepEqual(out.orgs, []);
+  } finally {
+    broken.restore();
+  }
+
+  const off = harness({ enabled: false });
+  try {
+    const out = await off.service.resolveOrgsForCustomer(CUS);
+    assert.equal(out.state, "off");
+    assert.equal(off.searched.length, 0, "a disabled lookup makes no request at all");
+  } finally {
+    off.restore();
+  }
+});
+
+test("resolveOrgsForCustomer: a term too short to send is skipped, not counted as an outage", async () => {
+  const h = harness({ rowsByTerm: {} });
+  try {
+    // "ab" is below MIN_QUERY_LENGTH, so the client refuses it pre-flight.
+    const out = await h.service.resolveOrgsForCustomer(CUS, ["ab"]);
+    assert.equal(out.state, "none", "rejected input is not an error state");
+    assert.deepEqual(h.searched, [CUS], "the short term never went out");
+  } finally {
+    h.restore();
+  }
+});
