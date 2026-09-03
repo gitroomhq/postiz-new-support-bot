@@ -1070,7 +1070,7 @@ test("charge detail: an open dispute surfaces a banner + Dispute rail card + sin
 
 // ---- global search ----
 
-function searchFixture(overrides: { customersThrow?: boolean } = {}) {
+function searchFixture(overrides: { customersThrow?: boolean; postizTerms?: string[] } = {}) {
   const stripe = {
     formatAmount: (a: number, c: string) => `${(a / 100).toFixed(2)} ${c.toUpperCase()}`,
     searchCustomersByTerm: async () => {
@@ -1080,6 +1080,7 @@ function searchFixture(overrides: { customersThrow?: boolean } = {}) {
     searchChargesByTerm: async () => [
       { id: "ch_1", amount: 2900, currency: "eur", billing_details: { email: "ada@x.com" } },
     ],
+    findCustomersByEmail: async () => [{ id: "cus_1", email: "ada@x.com" }],
     searchInvoicesByNumber: async () => [{ id: "in_1", number: "INV-0001", total: 2900, currency: "eur", status: "paid" }],
     searchChargesByCardLast4: async (_l4: string, _brand?: string, _limit?: number, _page?: string, status?: string) => ({
       charges:
@@ -1108,7 +1109,19 @@ function searchFixture(overrides: { customersThrow?: boolean } = {}) {
     block: { listPage: async () => ({ rows: [], total: 0 }) },
     qol: { searchNotes: async () => [], listBookmarks: async () => ({ rows: [], total: 0 }) },
   } as unknown as ConstructorParameters<typeof GlobalSearch>[1];
-  return new GlobalSearch(stripe, stores);
+  // Records every term that reaches the platform, and answers each one with a
+  // hit — so a group that is missing is one the palette declined to ask for.
+  const postiz = {
+    search: async (term: string) => {
+      overrides.postizTerms?.push(term);
+      return {
+        accounts: [{ userId: "usr_1", orgId: "org_1", orgName: "Org", tier: "PRO", role: "ADMIN", email: "ada@x.com", name: "Ada" }],
+        capped: false,
+        matched: 1,
+      };
+    },
+  } as unknown as ConstructorParameters<typeof GlobalSearch>[2];
+  return new GlobalSearch(stripe, stores, postiz);
 }
 
 test("global search: id fast-path, last4/amount classification, discord link, failure tolerance", async () => {
@@ -1141,6 +1154,26 @@ test("global search: id fast-path, last4/amount classification, discord link, fa
   const degraded = await searchFixture({ customersThrow: true }).run("ada");
   const degradedLabels = degraded.groups.map((g) => g.label);
   assert.ok(!degradedLabels.includes("Customers") && degradedLabels.includes("Payments"));
+});
+
+test("global search: the platform is only asked about terms that could be an account", async () => {
+  // The platform matches `contains` over ids, so digits alone would drag
+  // unrelated accounts in beside a card or an amount.
+  for (const numeric of ["4242", "29.00", "123456789012345678"]) {
+    const terms: string[] = [];
+    const res = await searchFixture({ postizTerms: terms }).run(numeric);
+    assert.deepEqual(terms, [], `${numeric} must not reach the platform`);
+    assert.ok(!res.groups.some((g) => g.label === "Postiz accounts"), `${numeric} must not list accounts`);
+  }
+  // Names, emails and id-shaped tokens still resolve to a person.
+  for (const term of ["ada", "ada@x.com", "clx7k2n0001ab9df"]) {
+    const terms: string[] = [];
+    const res = await searchFixture({ postizTerms: terms }).run(term);
+    assert.deepEqual(terms, [term]);
+    const group = res.groups.find((g) => g.label === "Postiz accounts")!;
+    assert.equal(group.hits[0].id, "usr_1");
+    assert.deepEqual(group.hits[0].ref, { page: "customers.detail", params: { id: "cus_1" } });
+  }
 });
 
 // ---- Home v1 + Balances rendering ----

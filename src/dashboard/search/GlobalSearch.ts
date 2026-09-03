@@ -63,8 +63,12 @@ export class GlobalSearch {
   // finds the Stripe customer to open — the platform does not expose the
   // customer id itself, so a hit without a matching customer is shown as
   // context rather than as a dead link.
+  //
+  // Only runs for a term that could BE an account identifier: see
+  // looksLikePostizTerm.
   private async postizGroup(term: string): Promise<SearchGroup | null> {
     if (!this.postiz) return null;
+    if (!looksLikePostizTerm(term)) return null;
     let result;
     try {
       result = await this.postiz.search(term);
@@ -295,6 +299,22 @@ export class GlobalSearch {
       new Promise<null>((resolve) => setTimeout(() => resolve(null), STRIPE_TIMEBOX_MS).unref?.()),
     ]);
   }
+}
+
+// The platform's search is an unanchored `contains` over user id / name /
+// email / org id, so any run of digits matches whichever account ids happen to
+// contain them. A card's last4, an amount and a Discord id would each list
+// unrelated accounts next to the payment they belong to, which reads as
+// "this is the payer" and is wrong. So the platform is asked only about a term
+// that could itself be an account identifier: an email (or a fragment of one),
+// an id-shaped token, or something with a word in it. A term made of digits
+// alone is never one of those.
+export function looksLikePostizTerm(term: string): boolean {
+  if (term.includes("@")) return true; // email, or the start of one
+  // cuid/uuid-shaped user or organization id — mixed case and digits, but a
+  // letter must be present so a Discord id or an order number never qualifies.
+  if (/^[A-Za-z0-9_-]{10,}$/.test(term) && /[A-Za-z]/.test(term)) return true;
+  return /[A-Za-z]{3,}/.test(term); // a name worth disambiguating
 }
 
 function chargeHit(stripe: StripeClient, c: Stripe.Charge): SearchHit {
