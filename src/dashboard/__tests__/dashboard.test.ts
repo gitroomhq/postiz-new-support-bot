@@ -909,6 +909,9 @@ function paymentsCtx(): DashboardCtx {
       hasMore: false,
     }),
     listRecentEarlyFraudWarnings: async () => [{ charge: "ch_2" }],
+    // Basil's charge → invoice link: the invoice names its payments, not the
+    // other way round. Overridden per test where the filter is exercised.
+    invoicePaymentRefs: async () => new Set<string>(),
     getChargeDetailed: async () =>
       charge({ id: "ch_1", amount_refunded: 400, balance_transaction: { fee: 119 } as never }),
     listRefunds: async () => ({
@@ -6370,16 +6373,26 @@ test("payments filters: fingerprint/email flip the rows into a whole-account sea
   stripe.listAllCharges = async () => ({
     charges: [
       { ...hit, id: "ch_d1", status: "failed", outcome: { reason: "insufficient_funds" }, failure_code: "card_declined" },
-      { ...hit, id: "ch_d2", invoice: "in_77" },
+      { ...hit, id: "ch_d2", invoice: "in_77" }, // pre-Basil shape
+      { ...hit, id: "ch_d3", payment_intent: "pi_77" }, // Basil: no invoice on the charge
+      { ...hit, id: "ch_d4", payment_intent: "pi_other" },
     ],
     hasMore: false,
   });
   const declined = await section.buildPage(ctx, { page: "payments", filters: { declineReason: "insufficient" } });
   const declinedTable = declined!.blocks.find((b) => b.type === "table") as TableBlock;
   assert.deepEqual(declinedTable.rows.map((r) => r.id), ["ch_d1"]);
+  // Basil removed charge.invoice, so the slice matches on the invoice's own
+  // payment refs; the legacy field still matches for pre-Basil accounts.
+  const refCalls: string[] = [];
+  stripe.invoicePaymentRefs = async (id: string) => {
+    refCalls.push(id);
+    return new Set(["pi_77"]);
+  };
   const byInvoice = await section.buildPage(ctx, { page: "payments", filters: { invoice: "in_77" } });
   const invoiceTable = byInvoice!.blocks.find((b) => b.type === "table") as TableBlock;
-  assert.deepEqual(invoiceTable.rows.map((r) => r.id), ["ch_d2"]);
+  assert.deepEqual(invoiceTable.rows.map((r) => r.id), ["ch_d2", "ch_d3"]);
+  assert.deepEqual(refCalls, ["in_77"]);
 });
 
 test("PM fingerprint: the 360 payment-methods table exposes the fingerprint and links into the reverse-card hunt", async () => {

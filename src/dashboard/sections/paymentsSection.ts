@@ -642,6 +642,11 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
     };
   }
 
+  // Basil removed `charge.invoice`, so the invoice slice compares against the
+  // invoice's own payment refs (charge id, or the charge's PaymentIntent).
+  // Resolved once, only when the filter is set.
+  const invoiceRefs = invoiceFilter ? await ctx.stripe.invoicePaymentRefs(invoiceFilter) : null;
+
   const filtered = charges.filter((c) => {
     // Per-customer listings (and the email-sweep merge, which is built from
     // them) can't take a server-side date param — cut here.
@@ -674,9 +679,13 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
     if (fingerprint && c.payment_method_details?.card?.fingerprint !== fingerprint) return false;
     if (declineFilter && !`${c.outcome?.reason ?? ""} ${c.failure_code ?? ""}`.toLowerCase().includes(declineFilter)) return false;
     if (invoiceFilter) {
+      // Legacy field first (pre-Basil accounts), then the invoice's payment refs.
       const inv = (c as { invoice?: string | { id: string } | null }).invoice;
       const invId = typeof inv === "string" ? inv : inv?.id ?? null;
-      if (invId !== invoiceFilter) return false;
+      if (invId !== invoiceFilter) {
+        const piId = typeof c.payment_intent === "string" ? c.payment_intent : c.payment_intent?.id ?? null;
+        if (!invoiceRefs?.has(c.id) && !(piId && invoiceRefs?.has(piId))) return false;
+      }
     }
     return true;
   });

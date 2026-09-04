@@ -20,28 +20,6 @@ import type { HubContext } from "./HubContext";
 
 const logger = new Logger("billing-admin:charges");
 
-// Basil (SDK v20) dropped `invoice` from the Stripe.Charge type, but the field
-// is still returned on the wire for subscription charges — narrow, don't cast.
-interface ChargeWithInvoiceRef extends Stripe.Charge {
-  invoice?: string | { id: string } | null;
-}
-
-function chargeInvoiceId(charge: Stripe.Charge): string | null {
-  const ref = (charge as ChargeWithInvoiceRef).invoice;
-  return typeof ref === "string" ? ref : ref?.id ?? null;
-}
-
-// Same Basil situation on PaymentIntent: `invoice` is gone from the type but
-// still present on the wire for invoice-backed intents.
-interface PaymentIntentWithInvoiceRef extends Stripe.PaymentIntent {
-  invoice?: string | { id: string } | null;
-}
-
-function piInvoiceId(pi: Stripe.PaymentIntent): string | null {
-  const ref = (pi as PaymentIntentWithInvoiceRef).invoice;
-  return typeof ref === "string" ? ref : ref?.id ?? null;
-}
-
 // Statuses in which Stripe allows paymentIntents.cancel.
 const PI_CANCELABLE = new Set<Stripe.PaymentIntent.Status>([
   "requires_payment_method",
@@ -214,7 +192,7 @@ export async function showRefundConfirm(
   const amountMinor = session.refundAmountMinor ?? null;
 
   let subscriptionId: string | null = null;
-  const invoiceId = chargeInvoiceId(charge);
+  const invoiceId = await ctx.stripe.resolveChargeInvoiceId(charge);
   if (invoiceId) {
     try {
       const invoice = await ctx.stripe.getInvoice(invoiceId);
@@ -816,7 +794,7 @@ export class ChargesHub {
     ]);
     const fmt = (v: number) => this.ctx.stripe.formatAmount(v, charge.currency);
     const remaining = charge.amount - charge.amount_refunded;
-    const invoiceId = chargeInvoiceId(charge);
+    const invoiceId = await this.ctx.stripe.resolveChargeInvoiceId(charge);
 
     const card = charge.payment_method_details?.card;
     const pmText = card
@@ -920,7 +898,7 @@ export class ChargesHub {
       pmText = `\`${pmRef}\``;
     }
 
-    const invoiceId = piInvoiceId(pi);
+    const invoiceId = await this.ctx.stripe.resolvePaymentIntentInvoiceId(pi);
     const cancelable = PI_CANCELABLE.has(pi.status);
 
     const embed = new EmbedBuilder()

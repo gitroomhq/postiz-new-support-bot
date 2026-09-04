@@ -13,9 +13,16 @@ export interface SubscriptionInvoice {
   created: Date;
 }
 
-// Basil (SDK v20) dropped `invoice` from the Stripe.Charge type, but the field is
-// still returned on the wire for subscription charges — narrow instead of `as any`.
+// Basil (2025-03-31, the API version SDK v20 pins) REMOVED `invoice` from both
+// Charge and PaymentIntent — it is gone from the wire, not just from the type.
+// The field is still narrowed here (instead of `as any`) so accounts pinned to
+// a pre-Basil version keep resolving without an extra round-trip, but the
+// Basil path is resolveChargeInvoiceId below.
 interface ChargeWithInvoice extends Stripe.Charge {
+  invoice?: string | { id: string } | null;
+}
+
+interface PaymentIntentWithInvoice extends Stripe.PaymentIntent {
   invoice?: string | { id: string } | null;
 }
 
@@ -83,12 +90,10 @@ export class StripeClient {
 
     // Try to find the subscription from the invoice
     let subscriptionId = "";
-    const chargeInvoice = succeededCharge.invoice;
-    if (chargeInvoice) {
-      const invoiceId = typeof chargeInvoice === "string" ? chargeInvoice : chargeInvoice.id;
-
+    const chargeInvoiceId = await this.resolveChargeInvoiceId(succeededCharge);
+    if (chargeInvoiceId) {
       try {
-        const invoice = await this.stripe.invoices.retrieve(invoiceId);
+        const invoice = await this.stripe.invoices.retrieve(chargeInvoiceId);
         const subDetails = invoice.parent?.subscription_details;
         if (subDetails?.subscription) {
           subscriptionId = typeof subDetails.subscription === "string"
@@ -101,15 +106,60 @@ export class StripeClient {
     }
 
     return {
-      invoiceId: typeof chargeInvoice === "string"
-        ? chargeInvoice
-        : chargeInvoice?.id || succeededCharge.id,
+      invoiceId: chargeInvoiceId || succeededCharge.id,
       chargeId: succeededCharge.id,
       amountPaid: succeededCharge.amount,
       currency: succeededCharge.currency,
       subscriptionId,
       created: new Date(succeededCharge.created * 1000),
     };
+  }
+
+  // The invoice a charge paid, or null.
+  //
+  // Basil removed `invoice` from Charge (and from PaymentIntent), so reading
+  // that field alone resolves nothing on a current account: an invoice can now
+  // be settled by several payments, and the mapping lives on the InvoicePayment
+  // object, which is listed by the charge's PaymentIntent. Losing it here is
+  // not cosmetic — the self-service refund flow derives the subscription (and
+  // with it the billing-period guardrail) from this invoice, so an unresolved
+  // charge fails safe and sends EVERY refund request to manual review.
+  //
+  // The legacy field is still read first, and costs nothing when absent, so
+  // accounts pinned to a pre-Basil API version skip the extra call.
+  async resolveChargeInvoiceId(charge: ChargeWithInvoice): Promise<string | null> {
+    const legacy = typeof charge.invoice === "string" ? charge.invoice : (charge.invoice?.id ?? null);
+    if (legacy) return legacy;
+
+    const paymentIntentId =
+      typeof charge.payment_intent === "string" ? charge.payment_intent : (charge.payment_intent?.id ?? null);
+    // `payment[type]` only accepts payment_intent/payment_record, so a charge
+    // with no PaymentIntent (pre-2019 invoices) has no filter to list by.
+    if (!paymentIntentId) return null;
+    return this.invoiceIdForPaymentIntent(paymentIntentId);
+  }
+
+  // Basil removed `invoice` from PaymentIntent as well — same lookup, same
+  // legacy-field-first contract as resolveChargeInvoiceId above.
+  async resolvePaymentIntentInvoiceId(paymentIntent: PaymentIntentWithInvoice): Promise<string | null> {
+    const legacy =
+      typeof paymentIntent.invoice === "string" ? paymentIntent.invoice : (paymentIntent.invoice?.id ?? null);
+    if (legacy) return legacy;
+    return this.invoiceIdForPaymentIntent(paymentIntent.id);
+  }
+
+  private async invoiceIdForPaymentIntent(paymentIntentId: string): Promise<string | null> {
+    try {
+      const payments = await this.stripe.invoicePayments.list({
+        payment: { type: "payment_intent", payment_intent: paymentIntentId },
+        limit: 1,
+      });
+      const invoice = payments.data[0]?.invoice;
+      return typeof invoice === "string" ? invoice : (invoice?.id ?? null);
+    } catch {
+      // Same contract as the legacy path: unresolved, not an error.
+      return null;
+    }
   }
 
   // Billing shape of a subscription, for the self-service guardrails: whether
@@ -1216,7 +1266,7 @@ export class StripeClient {
   async downloadChargeReceiptPdf(chargeId: string, maxBytes: number): Promise<Buffer | null> {
     const charge = (await this.stripe.charges.retrieve(chargeId)) as ChargeWithInvoice;
     const urls: string[] = [];
-    const invoiceId = typeof charge.invoice === "string" ? charge.invoice : (charge.invoice?.id ?? null);
+    const invoiceId = await this.resolveChargeInvoiceId(charge);
     if (invoiceId) {
       const invoice = await this.stripe.invoices.retrieve(invoiceId).catch(() => null);
       if (invoice?.invoice_pdf) urls.push(invoice.invoice_pdf);
@@ -2010,6 +2060,30 @@ export class StripeClient {
     // payments is expandable-only on Basil invoices — without it the invoice
     // carries no charge/payment-intent reference at all.
     return this.stripe.invoices.retrieve(invoiceId, { expand: ["payments"] });
+  }
+
+  // Charge and PaymentIntent ids that settled an invoice — the reverse of
+  // resolveChargeInvoiceId, for slicing a fetched charge list by invoice.
+  // Basil's `invoice.payments` is the only remaining link in that direction.
+  // Only the expanded first page is read: an invoice settled by more payments
+  // than that is a partial-payment edge case, not the subscription charges
+  // this filter is used on. Unresolvable invoice = empty set = matches nothing.
+  async invoicePaymentRefs(invoiceId: string): Promise<Set<string>> {
+    const refs = new Set<string>();
+    try {
+      const invoice = await this.getInvoice(invoiceId);
+      for (const entry of invoice.payments?.data ?? []) {
+        const pay = entry.payment;
+        if (pay?.type === "charge" && pay.charge) {
+          refs.add(typeof pay.charge === "string" ? pay.charge : pay.charge.id);
+        } else if (pay?.type === "payment_intent" && pay.payment_intent) {
+          refs.add(typeof pay.payment_intent === "string" ? pay.payment_intent : pay.payment_intent.id);
+        }
+      }
+    } catch {
+      // Deleted/unreadable invoice: no refs, same as no match.
+    }
+    return refs;
   }
 
   // customerId null = ACCOUNT-WIDE listing (dashboard Invoices page).
