@@ -3,7 +3,14 @@ import type { SearchAttributePair } from "@temporalio/common";
 import type { SettingsStore } from "../config/SettingsStore";
 import { log } from "../util/logger";
 import type { GatewayResult, TemporalService } from "./TemporalService";
-import { looperStartOptions, reconcileLooperGeneration, retireByQuery, retireWorkflowId } from "./looperGeneration";
+import {
+  describeLooper,
+  type LooperHealth,
+  looperStartOptions,
+  reconcileLooperGeneration,
+  retireByQuery,
+  retireWorkflowId,
+} from "./looperGeneration";
 import {
   inboxWorkflowId,
   LOOPER_GENERATIONS,
@@ -293,6 +300,31 @@ export class TemporalProducers {
     });
   }
 
+  // Looper state for the /config panels: a feature whose looper is wedged or
+  // gone looks configured and idle from the app's side, so the panel has to be
+  // able to say which. Null = Temporal unreachable (a different fault, and one
+  // the panel already reports elsewhere).
+  async looperHealth(workflowId: string): Promise<LooperHealth | null> {
+    const client = await this.temporal.client();
+    if (!client) return null;
+    return describeLooper(client, workflowId).catch(() => null);
+  }
+
+  // Every singleton's health in one pass, for the Temporal panel. This bug
+  // class hid for weeks because nothing anywhere reported a PER-LOOPER state:
+  // the connection was up, the worker was polling, and one dead loop was
+  // indistinguishable from a quiet one.
+  async looperHealthAll(): Promise<Array<{ workflowId: string; health: LooperHealth }> | null> {
+    const client = await this.temporal.client();
+    if (!client) return null;
+    const ids = Object.values(SINGLETONS);
+    const healths = await Promise.all(ids.map((id) => describeLooper(client, id).catch(() => null)));
+    return ids.flatMap((workflowId, i) => {
+      const health = healths[i];
+      return health ? [{ workflowId, health }] : [];
+    });
+  }
+
   // ---- baseline: retire dead singletons/schedules, then ensure the live ones ----
 
   // Idempotent; runs before the worker starts (boot / toggle ON) and on
@@ -319,11 +351,21 @@ export class TemporalProducers {
       if (client) {
         try {
           const r = await reconcileLooperGeneration(client, id, LOOPER_GENERATIONS[id] ?? 1);
-          if (r.action === "terminated") {
+          if (r.action === "terminated" && r.cause === "generation") {
             prodLog.info("looper generation changed: restarting singleton", {
               "temporal.workflow_id": id,
               "looper.gen_from": r.runningGen ?? 0,
               "looper.gen_to": r.wantedGen,
+            });
+          }
+          // warn, not info: a wedge means this looper has been doing nothing
+          // since some earlier deploy, so it belongs in Sentry rather than
+          // only in the boot log.
+          if (r.action === "terminated" && r.cause === "wedged") {
+            prodLog.warn("looper was wedged on a failing workflow task: restarted", {
+              "temporal.workflow_id": id,
+              "temporal.task_attempt": r.health.taskAttempt,
+              "looper.wedged_since": r.health.taskScheduledAt?.toISOString() ?? "unknown",
             });
           }
         } catch (e) {

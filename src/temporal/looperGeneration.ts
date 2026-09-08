@@ -1,4 +1,4 @@
-import type { Client } from "@temporalio/client";
+import type { Client, WorkflowExecutionDescription } from "@temporalio/client";
 import { WorkflowNotFoundError } from "@temporalio/common";
 import { LOOPER_GEN_MEMO_KEY, LOOPER_GENERATIONS } from "./types";
 
@@ -11,8 +11,77 @@ import { LOOPER_GEN_MEMO_KEY, LOOPER_GENERATIONS } from "./types";
 
 export interface LooperReconcileResult {
   action: "kept" | "terminated" | "absent";
+  // Why a run was terminated: a generation change, or a workflow task that has
+  // been failing long enough that the run will never make progress again.
+  cause: "generation" | "wedged" | null;
   runningGen: number | null;
   wantedGen: number;
+  health: LooperHealth;
+}
+
+// A looper whose workflow task keeps failing stays RUNNING forever: it never
+// schedules its activity again and signals pile up unread, so every symptom
+// the app could report (a stale sync stamp, a silent Sync Now) points at the
+// feature rather than at the loop that stopped driving it. The classic cause
+// is a replay that turned nondeterministic under a new bundle, which is what
+// the generation bump exists for — but that only helps when someone KNOWS to
+// bump it. This is the safety net for when nobody does: loopers hold no state
+// between iterations, so terminating a wedged run and letting the
+// signal-with-start below re-create it is always safe.
+//
+// A healthy looper is asleep on its timer with NO pending workflow task, and a
+// task that is merely slow is retried within seconds, so "still retrying the
+// same task minutes later" is not something a working loop does.
+const WEDGE_MIN_ATTEMPTS = 5;
+const WEDGE_MIN_AGE_MS = 5 * 60_000;
+
+export interface LooperHealth {
+  // RUNNING / COMPLETED / TERMINATED / … , or "absent" when there is no run.
+  status: string;
+  // Pending workflow-task attempt (0 = none pending, which is the healthy
+  // steady state for a looper sitting on its interval timer).
+  taskAttempt: number;
+  taskScheduledAt: Date | null;
+  wedged: boolean;
+}
+
+export const ABSENT_LOOPER: LooperHealth = {
+  status: "absent",
+  taskAttempt: 0,
+  taskScheduledAt: null,
+  wedged: false,
+};
+
+// Health straight off a DescribeWorkflowExecution response. Exported for the
+// reconcile below, which already holds one (describing twice would double the
+// boot's RPCs for no new information).
+export function looperHealthOf(desc: WorkflowExecutionDescription): LooperHealth {
+  const status = desc.status.name;
+  const pending = desc.raw?.pendingWorkflowTask;
+  const attempt = Number(pending?.attempt ?? 0);
+  const scheduledSeconds = pending?.scheduledTime?.seconds;
+  const taskScheduledAt = scheduledSeconds != null ? new Date(Number(scheduledSeconds) * 1000) : null;
+  return {
+    status,
+    taskAttempt: Number.isFinite(attempt) ? attempt : 0,
+    taskScheduledAt,
+    wedged:
+      status === "RUNNING" &&
+      attempt >= WEDGE_MIN_ATTEMPTS &&
+      taskScheduledAt != null &&
+      Date.now() - taskScheduledAt.getTime() >= WEDGE_MIN_AGE_MS,
+  };
+}
+
+// Current state of a singleton. Feeds the /config health line, so an absent or
+// unreachable run is a value, never a throw.
+export async function describeLooper(client: Client, workflowId: string): Promise<LooperHealth> {
+  try {
+    return looperHealthOf(await client.workflow.getHandle(workflowId).describe());
+  } catch (e) {
+    if (e instanceof WorkflowNotFoundError) return ABSENT_LOOPER;
+    throw e;
+  }
 }
 
 // wantedGen is a parameter (not a LOOPER_GENERATIONS lookup) so tests can
@@ -25,17 +94,26 @@ export async function reconcileLooperGeneration(
   const handle = client.workflow.getHandle(workflowId);
   try {
     const desc = await handle.describe();
-    if (desc.status.name !== "RUNNING") return { action: "absent", runningGen: null, wantedGen };
+    const health = looperHealthOf(desc);
+    if (desc.status.name !== "RUNNING") return { action: "absent", cause: null, runningGen: null, wantedGen, health };
     const raw = desc.memo?.[LOOPER_GEN_MEMO_KEY];
     // Pre-mechanism runs carry no memo — treat as generation 0 (restart once).
     const runningGen = typeof raw === "number" && Number.isFinite(raw) ? raw : 0;
     // !== rather than <: a HIGHER running generation (rollback deploy) is just
     // as history-incompatible with this bundle; restart in both directions.
-    if (runningGen === wantedGen) return { action: "kept", runningGen, wantedGen };
-    await handle.terminate(`looper generation ${runningGen} -> ${wantedGen}`);
-    return { action: "terminated", runningGen, wantedGen };
+    if (runningGen !== wantedGen) {
+      await handle.terminate(`looper generation ${runningGen} -> ${wantedGen}`);
+      return { action: "terminated", cause: "generation", runningGen, wantedGen, health };
+    }
+    if (health.wedged) {
+      await handle.terminate(`looper wedged: workflow task attempt ${health.taskAttempt}`);
+      return { action: "terminated", cause: "wedged", runningGen, wantedGen, health };
+    }
+    return { action: "kept", cause: null, runningGen, wantedGen, health };
   } catch (e) {
-    if (e instanceof WorkflowNotFoundError) return { action: "absent", runningGen: null, wantedGen };
+    if (e instanceof WorkflowNotFoundError) {
+      return { action: "absent", cause: null, runningGen: null, wantedGen, health: ABSENT_LOOPER };
+    }
     throw e;
   }
 }

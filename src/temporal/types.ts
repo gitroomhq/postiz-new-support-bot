@@ -69,7 +69,11 @@ export const LOOPER_GENERATIONS: Record<string, number> = {
   [SINGLETONS.disputesLoop]: 1,
   [SINGLETONS.slaSweep]: 1,
   [SINGLETONS.slaEnforce]: 1,
-  [SINGLETONS.sentryFeedback]: 1,
+  // 2: the run started before 2026-09-08 sat RUNNING with a failing workflow
+  // task, so the feedback import stopped dead while every panel still read
+  // "on". The bump is the deterministic restart; describeLooper's wedge check
+  // is the net for the next one.
+  [SINGLETONS.sentryFeedback]: 2,
   [SINGLETONS.moneyOut]: 1,
 };
 

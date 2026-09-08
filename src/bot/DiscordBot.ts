@@ -108,6 +108,7 @@ import { VaultService, VAULT_INTEGRATIONS, type VaultTestReport } from "../vault
 import { envPin, type EnvPinnedField } from "../config/env";
 import type { TemporalOpsBinding, TemporalProducers } from "../temporal/producers";
 import { describeSaResult } from "../temporal/searchAttributes";
+import { SINGLETONS } from "../temporal/types";
 import { buildIdIsDegenerate } from "../temporal/buildId";
 import { validateCertPair } from "../temporal/certs";
 import { VaultMigrator, COLUMN_LABELS, type MigrateItemResult, type MigrateReport } from "../vault/VaultMigrator";
@@ -2761,11 +2762,23 @@ export class DiscordBot {
     // Backticked into the embed, so a backtick in the upstream message would
     // break out of the span.
     const lastError = s.sentryFeedbackLastError()?.replace(/`/g, "'") ?? null;
-    const [counts, awaitingReplay, lastImport] = await Promise.all([
+    const [counts, awaitingReplay, lastImport, looper] = await Promise.all([
       this.sentryFeedback?.statusCounts().catch(() => null) ?? null,
       this.sentryFeedback?.countSkippedForRetry().catch(() => null) ?? null,
       this.sentryFeedback?.lastImportedAt().catch(() => null) ?? null,
+      this.temporalOps?.producers.looperHealth(SINGLETONS.sentryFeedback) ?? null,
     ]);
+    // The import runs in a Temporal looper, so "configured and enabled" says
+    // nothing about whether anything is actually driving it. A wedged or
+    // missing run is the one fault the settings alone cannot show.
+    const looperLine =
+      looper == null
+        ? "_unknown (Temporal unreachable)_"
+        : looper.wedged
+          ? `⚠️ wedged on a failing workflow task (attempt ${looper.taskAttempt}): restarted on the next boot`
+          : looper.status === "RUNNING"
+            ? "running"
+            : `⚠️ ${looper.status.toLowerCase()} (no run is driving the poll)`;
     const teamId = s.sentryFeedbackTeamId();
     const teamName = teamId ? await this.intercomClient.getTeamNameCached(teamId).catch(() => null) : null;
     const projects = s.sentryFeedbackProjectSlugs();
@@ -2782,8 +2795,8 @@ export class DiscordBot {
         : !watermark
           ? "**never enabled**: toggling on stamps the import floor (older feedback never imports)"
           : s.sentryReadEnabled()
-            ? lastError
-              ? "⚠️ **degraded**: the last attempt reported a problem (see below)"
+            ? lastError || looper?.wedged || (looper != null && looper.status !== "RUNNING")
+              ? "⚠️ **degraded**: the poll is not completing (see Looper and Last attempt below)"
               : "**on**: webhook accelerator + 15-min poll"
             : "**off** (Sync Now still runs a one-shot test)";
 
@@ -2799,15 +2812,13 @@ export class DiscordBot {
           `**Read token:** ${stateLabel[s.secretState("sentryReadToken")]} · **Webhook secret:** ${stateLabel[s.secretState("sentryWebhookSecret")]}`,
           `**Ticket type:** ${ticketTypeLabel} · **Team routing:** ${teamId ? (teamName ?? `id ${teamId}`) : "_unassigned_"}`,
           `**Import floor:** ${watermark ? `<t:${Math.floor(watermark.getTime() / 1000)}:f>` : "_not stamped_"} · **Last sync:** ${lastSync ? `<t:${Math.floor(lastSync.getTime() / 1000)}:R>` : "_never_"}`,
-          // The pair below is the whole point: a completed tick moves both
+          // The line below is the whole point: a completed tick moves both
           // stamps, so a fresh attempt next to a stale sync (plus the reason)
-          // is a tick that has been failing, which used to look identical to a
-          // quiet inbox.
-          ...(lastError
-            ? [
-                `⚠️ **Last attempt:** ${lastAttempt ? `<t:${Math.floor(lastAttempt.getTime() / 1000)}:R>` : "_unknown_"} · \`${lastError}\``,
-              ]
-            : []),
+          // is a tick that has been failing. It is unconditional because the
+          // most important value it can hold is "never": that is a tick that
+          // is not running AT ALL, which used to look exactly like a quiet
+          // inbox.
+          `${lastError ? "⚠️ " : ""}**Last attempt:** ${lastAttempt ? `<t:${Math.floor(lastAttempt.getTime() / 1000)}:R>` : "**never**"} · ${lastError ? `\`${lastError}\`` : "completed"} · **Looper:** ${looperLine}`,
           `**Imported:** ${counts?.imported ?? 0} · **Skipped (no email):** ${counts?.skippedNoEmail ?? 0} · **Awaiting replay:** ${awaitingReplay ?? 0}`,
           `**Last import:** ${lastImport ? `<t:${Math.floor(lastImport.getTime() / 1000)}:R>` : "_never_"}`,
           `**Webhook URL:** ${base ? `\`${base}/sentry/webhook\`` : "⚠️ _no public URL: set one via Billing → Stripe Webhooks_"}`,
@@ -2848,6 +2859,12 @@ export class DiscordBot {
         return error ? `reported: ${error}` : "completed";
       }
     }
+    // Nothing stamped in 12s. A tick that is merely slow is normal, but a
+    // looper that is wedged or gone NEVER stamps, and that is the case worth
+    // naming: the signal was accepted by Temporal and then read by nobody.
+    const looper = await (this.temporalOps?.producers.looperHealth(SINGLETONS.sentryFeedback) ?? Promise.resolve(null));
+    if (looper?.wedged) return `not picked up: the looper is wedged (task attempt ${looper.taskAttempt})`;
+    if (looper != null && looper.status !== "RUNNING") return `not picked up: the looper is ${looper.status.toLowerCase()}`;
     return "signalled, still running (reopen the panel for the outcome)";
   }
 
@@ -3043,6 +3060,25 @@ export class DiscordBot {
         ]);
         if (report?.visibilityOk) lines.push(`**Running workflows:** ${report.runningWorkflows}`);
         if (report?.currentVersion) lines.push(`**Deployment current version:** \`${report.currentVersion}\``);
+        // Per-looper state. Healthy loopers collapse to a count; anything not
+        // running is named, because a singleton that is wedged or gone means
+        // its whole feature has silently stopped.
+        const loopers = await Promise.race([
+          ops.producers.looperHealthAll(),
+          new Promise<null>((r) => setTimeout(() => r(null), 3000)),
+        ]);
+        if (loopers) {
+          const faulted = loopers.filter((l) => l.health.wedged || l.health.status !== "RUNNING");
+          lines.push(
+            `**Loopers:** ${loopers.length - faulted.length}/${loopers.length} running${
+              faulted.length
+                ? ` · ⚠️ ${faulted
+                    .map((l) => `\`${l.workflowId}\` ${l.health.wedged ? `wedged (task attempt ${l.health.taskAttempt})` : l.health.status.toLowerCase()}`)
+                    .join(", ")}, restarted on the next boot`
+                : ""
+            }`
+          );
+        }
       } catch {
         // panel stays useful without live counts
       }
