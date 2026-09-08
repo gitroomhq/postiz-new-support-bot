@@ -373,6 +373,9 @@ export interface SentryFeedbackTickResult {
   errors: number;
   capped: boolean; // per-tick import cap hit — remainder picked up next tick
   skipped: boolean; // disabled / not configured / no watermark / Intercom unconfigured
+  // Why a skipped tick was skipped, null when it ran (or when the feature is
+  // simply switched off, which the panel already states).
+  reason: string | null
 }
 
 export interface SlaSweepResult {

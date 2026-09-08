@@ -293,6 +293,14 @@ function sanitizeUrl(url: string): string {
   return redactSecretString(redactSensitiveParams(url));
 }
 
+// Backstop scrub for a string that is about to leave the process by a route
+// other than a log line — a Discord panel field, a stored error reason. Same
+// two passes the log/Sentry scrubbers use; still not a licence to put a secret
+// in one.
+export function redactSecrets(s: string): string {
+  return redactSecretString(redactSensitiveParams(s));
+}
+
 // Sentry beforeSend/beforeSendTransaction scrubber. Typed loosely against the
 // SDK's event shape so it can mutate URL/message/headers/exception in place.
 interface MutableSentryEvent {

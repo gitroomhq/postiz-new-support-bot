@@ -13,7 +13,7 @@ interface Harness {
   importer: SentryFeedbackImporter;
   ops: string[];
   ledger: Map<string, { status: string }>;
-  recorded: Array<{ lastSyncAt: Date; watermarkAt?: Date }>;
+  recorded: Array<{ attemptAt: Date; lastSyncAt?: Date; watermarkAt?: Date; error: string | null }>;
 }
 
 interface HarnessOpts {
@@ -32,6 +32,8 @@ interface HarnessOpts {
   failNthConversation?: number; // the Nth createConversation call throws
   convertFails?: "permanent" | "permanent-with-existing" | "transient";
   noteFails?: boolean;
+  listFails?: boolean;
+  replayQueryFails?: boolean;
   replayRows?: unknown[];
 }
 
@@ -55,11 +57,12 @@ const context = (email: string | null, message = "hello"): SentryFeedbackContext
 function makeHarness(opts: HarnessOpts = {}): Harness {
   const ops: string[] = [];
   const ledger = new Map<string, { status: string }>((opts.existingLedgerIds ?? []).map((id) => [id, { status: "imported" }]));
-  const recorded: Array<{ lastSyncAt: Date; watermarkAt?: Date }> = [];
+  const recorded: Array<{ attemptAt: Date; lastSyncAt?: Date; watermarkAt?: Date; error: string | null }> = [];
 
   const sentry = {
     async listFeedbackIssues() {
       ops.push("sentry.list");
+      if (opts.listFails) throw new Error("sentry list boom");
       return { items: opts.issues ?? [], nextCursor: null };
     },
     async getFeedbackContext(issueId: string) {
@@ -144,6 +147,7 @@ function makeHarness(opts: HarnessOpts = {}): Harness {
     // Replay of previously-skipped rows is exercised in replay.test.ts; these
     // keep the main walk's assertions about call ORDER unpolluted.
     async listSkippedForRetry() {
+      if (opts.replayQueryFails) throw new Error("replay query boom");
       return opts.replayRows ?? [];
     },
     async markRetried(sentryIssueId: string) {
@@ -165,7 +169,12 @@ function makeHarness(opts: HarnessOpts = {}): Harness {
     sentryFeedbackProjectSlugs: () => opts.projectSlugs ?? [],
     sentryFeedbackTeamId: () => opts.teamId ?? null,
     sentryFeedbackTicketTypeId: () => opts.ticketTypeId ?? null,
-    recordSentryFeedbackSync: async (data: { lastSyncAt: Date; watermarkAt?: Date }) => {
+    recordSentryFeedbackSync: async (data: {
+      attemptAt: Date;
+      lastSyncAt?: Date;
+      watermarkAt?: Date;
+      error: string | null;
+    }) => {
       recorded.push(data);
     },
   } as unknown as SettingsStore;
@@ -181,6 +190,76 @@ test("unconfigured or disabled ticks skip without touching Sentry or Intercom", 
   const disabled = makeHarness({ enabled: false, issues: [issue("1", "2026-07-20T11:00:00Z")] });
   assert.equal((await disabled.importer.tick(false)).skipped, true);
   assert.deepEqual(disabled.ops, []);
+});
+
+test("a gated tick stamps the attempt with its reason; a switched-off one stamps nothing", async () => {
+  const gated = makeHarness({ configured: false });
+  const result = await gated.importer.tick(false);
+  assert.equal(result.reason, "Intercom is not configured");
+  assert.equal(gated.recorded.length, 1);
+  assert.equal(gated.recorded[0].error, "skipped: Intercom is not configured");
+  // The sync stamp must NOT move: a stale sync next to a fresh attempt is the
+  // signal that the feature is on and getting nowhere.
+  assert.equal(gated.recorded[0].lastSyncAt, undefined);
+
+  const disabled = makeHarness({ enabled: false });
+  assert.equal((await disabled.importer.tick(false)).reason, null);
+  assert.deepEqual(disabled.recorded, []);
+});
+
+test("a completed tick stamps both timestamps and clears the error", async () => {
+  const h = makeHarness({ issues: [], contexts: {} });
+  await h.importer.tick(false);
+  assert.equal(h.recorded.length, 1);
+  assert.equal(h.recorded[0].error, null);
+  assert.ok(h.recorded[0].lastSyncAt instanceof Date);
+  assert.ok(h.recorded[0].attemptAt instanceof Date);
+});
+
+test("a listing failure stamps the reason, leaves the sync stamp alone and rethrows", async () => {
+  const h = makeHarness({ listFails: true });
+  await assert.rejects(() => h.importer.tick(false), /sentry list boom/);
+  assert.equal(h.recorded.length, 1);
+  assert.equal(h.recorded[0].lastSyncAt, undefined);
+  assert.match(h.recorded[0].error ?? "", /sentry list boom/);
+});
+
+test("a listing failure still drains the replay queue", async () => {
+  const h = makeHarness({
+    listFails: true,
+    contexts: { r1: context("replayed@b.c") },
+    emailMatches: [{ id: "user-7", role: "user" }],
+    replayRows: [
+      {
+        sentryIssueId: "r1",
+        sentryShortId: "POSTIZ-r1",
+        contactName: null,
+        pageUrl: null,
+        feedbackAt: new Date("2026-07-20T11:00:00Z"),
+      },
+    ],
+  });
+  await assert.rejects(() => h.importer.tick(false));
+  // Sentry's issue listing and Intercom's contact/conversation API are
+  // different surfaces: one being down must not park the other's backlog.
+  assert.ok(h.ops.includes("store.promoted:r1"));
+});
+
+test("a failing replay drain does not discard the walk it ran after", async () => {
+  const h = makeHarness({
+    issues: [issue("1", "2026-07-20T11:00:00Z")],
+    contexts: { "1": context("a@b.c") },
+    emailMatches: [{ id: "user-7", role: "user" }],
+    replayQueryFails: true,
+  });
+  const result = await h.importer.tick(false);
+  assert.equal(result.imported, 1);
+  assert.equal(result.errors, 1);
+  // The import happened, so the watermark and sync stamp MUST advance —
+  // otherwise the same walk repeats every tick and never gets anywhere.
+  assert.equal(h.recorded[0].watermarkAt?.toISOString(), "2026-07-20T11:00:00.000Z");
+  assert.ok(h.recorded[0].lastSyncAt instanceof Date);
+  assert.match(h.recorded[0].error ?? "", /replay drain failed: .*replay query boom/);
 });
 
 test("force runs a disabled-but-configured tick (Sync Now semantics)", async () => {

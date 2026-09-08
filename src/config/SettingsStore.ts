@@ -236,6 +236,14 @@ export class SettingsStore {
     await this.refreshTags();
   }
 
+  // Re-read the settings row alone, skipping load()'s first-run seeding and
+  // tag work. For a panel that must show what another writer (a Temporal
+  // activity) just persisted rather than the copy held in memory.
+  async refreshSettings(): Promise<void> {
+    const settings = await this.prisma.botSettings.findUnique({ where: { id: "global" } });
+    if (settings) this.settings = settings;
+  }
+
   private async refreshTags(): Promise<void> {
     this.tagList = await this.prisma.statusTag.findMany({ orderBy: { sortOrder: "asc" } });
   }
@@ -1501,8 +1509,20 @@ export class SettingsStore {
     return this.settings.sentryFeedbackWatermarkAt;
   }
 
+  // Last COMPLETED tick. A tick that threw leaves this alone, which is why the
+  // attempt stamp and the error below exist: the pair is the difference
+  // between "nothing to import" and "failing every 15 minutes unnoticed".
   sentryFeedbackLastSyncAt(): Date | null {
     return this.settings.sentryFeedbackLastSyncAt;
+  }
+
+  sentryFeedbackLastAttemptAt(): Date | null {
+    return this.settings.sentryFeedbackLastAttemptAt;
+  }
+
+  // Why the last attempt did not complete; null once one completes again.
+  sentryFeedbackLastError(): string | null {
+    return this.settings.sentryFeedbackLastError;
   }
 
   sentryFeedbackConfigured(): boolean {
@@ -1579,11 +1599,22 @@ export class SettingsStore {
   }
 
   // Tick stamp: lastSyncAt always; the watermark only when the walk advanced it.
-  async recordSentryFeedbackSync(data: { lastSyncAt: Date; watermarkAt?: Date }): Promise<void> {
+  // One writer for every tick outcome. `attemptAt` is always stamped;
+  // `lastSyncAt` only on a run that reached the end (so a stale sync stamp
+  // next to a fresh attempt stamp reads as "it is trying and failing"), and
+  // `error` carries the reason, null clearing it on the next healthy tick.
+  async recordSentryFeedbackSync(data: {
+    attemptAt: Date;
+    lastSyncAt?: Date;
+    watermarkAt?: Date;
+    error: string | null;
+  }): Promise<void> {
     this.settings = await this.prisma.botSettings.update({
       where: { id: "global" },
       data: {
-        sentryFeedbackLastSyncAt: data.lastSyncAt,
+        sentryFeedbackLastAttemptAt: data.attemptAt,
+        sentryFeedbackLastError: data.error,
+        ...(data.lastSyncAt ? { sentryFeedbackLastSyncAt: data.lastSyncAt } : {}),
         ...(data.watermarkAt ? { sentryFeedbackWatermarkAt: data.watermarkAt } : {}),
       },
     });

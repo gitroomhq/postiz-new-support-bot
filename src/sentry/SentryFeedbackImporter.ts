@@ -1,7 +1,7 @@
 import type { SettingsStore } from "../config/SettingsStore";
 import { IntercomHttpError, type IntercomClient } from "../intercom/IntercomClient";
 import type { SentryFeedbackTickResult } from "../temporal/types";
-import { log } from "../util/logger";
+import { log, redactSecrets } from "../util/logger";
 import {
   advanceWatermark,
   buildConversationBody,
@@ -27,6 +27,16 @@ const MAX_IMPORTS_PER_TICK = 25;
 // Politeness pacing between Intercom writes (shared sweep idiom).
 const WRITE_SPACING_MS = 400;
 const FEEDBACK_TAG = "sentry-feedback";
+// The stored failure reason is rendered in a Discord embed, so it is trimmed
+// to one line and capped. Redacted as defense in depth: an upstream error body
+// is echoed into the message and nobody controls what it contains.
+const MAX_STORED_ERROR_CHARS = 300;
+
+function describeTickError(e: unknown): string {
+  const raw = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
+  const clean = redactSecrets(raw).replace(/\s+/g, " ").trim() || "unknown error";
+  return clean.length > MAX_STORED_ERROR_CHARS ? `${clean.slice(0, MAX_STORED_ERROR_CHARS - 1)}…` : clean;
+}
 
 // Sentry User Feedback widget → Intercom: each feedback issue becomes ONE
 // contact-initiated conversation (the submitter's email is the contact), so
@@ -98,7 +108,35 @@ export class SentryFeedbackImporter {
 
   // force = the /config "Sync Now" button: bypasses the enabled toggle (a
   // deliberate one-shot test) but never the configuration/watermark gate.
+  //
+  // Wrapper around run(): a tick that throws must still leave a trace. The
+  // looper swallows activity failures (`.catch(() => {})`) and Temporal only
+  // keeps them in its own history, so before this the sole symptom of a tick
+  // failing every 15 minutes was a "Last sync" stamp that quietly stopped
+  // moving. The reason is stamped here and the error is rethrown unchanged so
+  // the activity still fails loudly for Sentry/Temporal.
   async tick(force: boolean): Promise<SentryFeedbackTickResult> {
+    const attemptAt = new Date();
+    try {
+      return await this.run(force, attemptAt);
+    } catch (e) {
+      await this.recordAttempt(attemptAt, describeTickError(e));
+      throw e;
+    }
+  }
+
+  // Stamps an attempt that did NOT complete (gated skip or failure): the sync
+  // stamp is deliberately left where it was, so the panel can show a fresh
+  // attempt next to a stale sync. Never allowed to mask the original failure.
+  private async recordAttempt(attemptAt: Date, error: string): Promise<void> {
+    await this.settingsStore.recordSentryFeedbackSync({ attemptAt, error }).catch((e) => {
+      syncLog.warn("sentry feedback: recording the tick attempt failed", {
+        "error.message": e instanceof Error ? e.message : String(e),
+      });
+    });
+  }
+
+  private async run(force: boolean, attemptAt: Date): Promise<SentryFeedbackTickResult> {
     const result: SentryFeedbackTickResult = {
       listed: 0,
       imported: 0,
@@ -109,12 +147,29 @@ export class SentryFeedbackImporter {
       errors: 0,
       capped: false,
       skipped: true,
+      reason: null,
     };
-    if (!this.settingsStore.intercomConfigured()) return result;
-    if (!this.settingsStore.sentryFeedbackConfigured()) return result;
+    // Switched off is a state, not a fault: it needs no stamp (the panel says
+    // "off" on its own) and must not write to BotSettings every 15 minutes.
     if (!this.settingsStore.sentryReadEnabled() && !force) return result;
     // Note/tag/assignment author — same resolution as the inactivity sweeper.
     const adminId = this.settingsStore.intercomAdminId() ?? this.settingsStore.intercomAuthorAdminId();
+    // Every gate below IS a fault while the toggle is on: the operator expects
+    // imports and gets none, so each one records which piece is missing.
+    const gate = !this.settingsStore.intercomConfigured()
+      ? "Intercom is not configured"
+      : !this.settingsStore.sentryFeedbackConfigured()
+        ? "Sentry read token, org slug or import floor missing"
+        : !adminId
+          ? "no Intercom admin id configured"
+          : null;
+    if (gate) {
+      result.reason = gate;
+      await this.recordAttempt(attemptAt, `skipped: ${gate}`);
+      return result;
+    }
+    // Unreachable (the ladder above returns on a missing admin id); it keeps
+    // the type narrowing in step with the gate.
     if (!adminId) return result;
     result.skipped = false;
 
@@ -124,17 +179,32 @@ export class SentryFeedbackImporter {
     const floor = new Date(watermark.getTime() - WATERMARK_OVERLAP_MS);
 
     // ---- list (newest-first pages; planFeedbackWalk re-sorts ascending) ----
+    // A Sentry-side failure is held rather than thrown: the replay drain below
+    // talks to a different API surface and must still run (and still record
+    // its progress) while Sentry is refusing the listing. It is rethrown at
+    // the end so the tick still counts as failed.
     const items: SentryFeedbackIssue[] = [];
+    let listError: unknown = null;
     let cursor: string | undefined;
     for (let page = 0; page < MAX_PAGES; page++) {
-      const res = await this.sentry.listFeedbackIssues({
-        startIso: floor.toISOString(),
-        endIso: now.toISOString(),
-        cursor,
-      });
-      items.push(...res.items);
-      if (!res.nextCursor) break;
-      cursor = res.nextCursor;
+      try {
+        const res = await this.sentry.listFeedbackIssues({
+          startIso: floor.toISOString(),
+          endIso: now.toISOString(),
+          cursor,
+        });
+        items.push(...res.items);
+        if (!res.nextCursor) break;
+        cursor = res.nextCursor;
+      } catch (e) {
+        listError = e;
+        result.errors++;
+        syncLog.warn("sentry feedback: listing failed, replay drain still runs", {
+          "feedback.page": page,
+          "error.message": e instanceof Error ? e.message : String(e),
+        });
+        break;
+      }
     }
     result.listed = items.length;
 
@@ -318,12 +388,36 @@ export class SentryFeedbackImporter {
 
     // Replay shares the tick's import budget so a large backlog cannot flood
     // Intercom in one pass; whatever is left over drains on later ticks.
-    await this.replaySkipped(result, MAX_IMPORTS_PER_TICK - result.imported, adminId, paceWrite, now);
+    //
+    // Isolated from the walk above on purpose. The drain is a best-effort
+    // background job, but it used to run INSIDE the tick's only success path,
+    // so anything it threw (its candidate query included) discarded a walk
+    // that had already imported and left the watermark where it was: the tick
+    // then redid the same work every 15 minutes forever, importing nothing.
+    let replayError: string | null = null;
+    try {
+      await this.replaySkipped(result, MAX_IMPORTS_PER_TICK - result.imported, adminId, paceWrite, now);
+    } catch (e) {
+      result.errors++;
+      replayError = `replay drain failed: ${describeTickError(e)}`;
+      syncLog.warn("sentry feedback: replay drain failed, the import walk still counts", {
+        "error.message": e instanceof Error ? e.message : String(e),
+      });
+    }
+
+    // A partial listing must not push the watermark past feedback it never
+    // saw, so a failed listing records nothing but the attempt (the outer
+    // catch does that) and leaves both stamps where they were.
+    if (listError) throw listError;
 
     const newMark = advanceWatermark(outcomes, watermark);
     await this.settingsStore.recordSentryFeedbackSync({
+      attemptAt,
       lastSyncAt: now,
       watermarkAt: newMark.getTime() > watermark.getTime() ? newMark : undefined,
+      // The walk completed, so the sync stamp moves; a failed drain still
+      // leaves its reason on the panel rather than passing as healthy.
+      error: replayError,
     });
     syncLog.info("sentry.feedback_sync", {
       "feedback.listed": result.listed,

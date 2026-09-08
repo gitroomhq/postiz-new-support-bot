@@ -2757,7 +2757,15 @@ export class DiscordBot {
     const base = s.resolvedPublicBaseUrl();
     const watermark = s.sentryFeedbackWatermarkAt();
     const lastSync = s.sentryFeedbackLastSyncAt();
-    const counts = (await this.sentryFeedback?.statusCounts().catch(() => null)) ?? null;
+    const lastAttempt = s.sentryFeedbackLastAttemptAt();
+    // Backticked into the embed, so a backtick in the upstream message would
+    // break out of the span.
+    const lastError = s.sentryFeedbackLastError()?.replace(/`/g, "'") ?? null;
+    const [counts, awaitingReplay, lastImport] = await Promise.all([
+      this.sentryFeedback?.statusCounts().catch(() => null) ?? null,
+      this.sentryFeedback?.countSkippedForRetry().catch(() => null) ?? null,
+      this.sentryFeedback?.lastImportedAt().catch(() => null) ?? null,
+    ]);
     const teamId = s.sentryFeedbackTeamId();
     const teamName = teamId ? await this.intercomClient.getTeamNameCached(teamId).catch(() => null) : null;
     const projects = s.sentryFeedbackProjectSlugs();
@@ -2774,7 +2782,9 @@ export class DiscordBot {
         : !watermark
           ? "**never enabled**: toggling on stamps the import floor (older feedback never imports)"
           : s.sentryReadEnabled()
-            ? "**on**: webhook accelerator + 15-min poll"
+            ? lastError
+              ? "⚠️ **degraded**: the last attempt reported a problem (see below)"
+              : "**on**: webhook accelerator + 15-min poll"
             : "**off** (Sync Now still runs a one-shot test)";
 
     const embed = new EmbedBuilder()
@@ -2789,10 +2799,20 @@ export class DiscordBot {
           `**Read token:** ${stateLabel[s.secretState("sentryReadToken")]} · **Webhook secret:** ${stateLabel[s.secretState("sentryWebhookSecret")]}`,
           `**Ticket type:** ${ticketTypeLabel} · **Team routing:** ${teamId ? (teamName ?? `id ${teamId}`) : "_unassigned_"}`,
           `**Import floor:** ${watermark ? `<t:${Math.floor(watermark.getTime() / 1000)}:f>` : "_not stamped_"} · **Last sync:** ${lastSync ? `<t:${Math.floor(lastSync.getTime() / 1000)}:R>` : "_never_"}`,
-          `**Imported:** ${counts?.imported ?? 0} · **Skipped (no email):** ${counts?.skippedNoEmail ?? 0}`,
+          // The pair below is the whole point: a completed tick moves both
+          // stamps, so a fresh attempt next to a stale sync (plus the reason)
+          // is a tick that has been failing, which used to look identical to a
+          // quiet inbox.
+          ...(lastError
+            ? [
+                `⚠️ **Last attempt:** ${lastAttempt ? `<t:${Math.floor(lastAttempt.getTime() / 1000)}:R>` : "_unknown_"} · \`${lastError}\``,
+              ]
+            : []),
+          `**Imported:** ${counts?.imported ?? 0} · **Skipped (no email):** ${counts?.skippedNoEmail ?? 0} · **Awaiting replay:** ${awaitingReplay ?? 0}`,
+          `**Last import:** ${lastImport ? `<t:${Math.floor(lastImport.getTime() / 1000)}:R>` : "_never_"}`,
           `**Webhook URL:** ${base ? `\`${base}/sentry/webhook\`` : "⚠️ _no public URL: set one via Billing → Stripe Webhooks_"}`,
           "",
-          "Each User Feedback widget item becomes an Intercom conversation authored by the submitter (email contact): replies are emailed to them and their answers thread back. Anonymous feedback is skipped. Create a Sentry **internal integration** (token scopes `org:read project:read event:read`), point its webhook at the URL above and paste its client secret here; unsigned posts are rejected and the 15-min poll covers delivery.",
+          "Each User Feedback widget item becomes an Intercom conversation authored by the submitter (email contact): replies are emailed to them and their answers thread back. Feedback with no resolvable identity is parked and re-examined once (Awaiting replay). Create a Sentry **internal integration** (token scopes `org:read project:read event:read`), point its webhook at the URL above and paste its client secret here; unsigned posts are rejected and the 15-min poll covers delivery.",
           "Feedback conversations get agent-idle notes but are never nagged, auto-closed or SLA-clocked. Disabling keeps the import floor: a re-enable imports the gap.",
         ].join("\n")
       );
@@ -2812,6 +2832,23 @@ export class DiscordBot {
       new ButtonBuilder().setCustomId("config_integrations").setLabel("Back").setStyle(ButtonStyle.Secondary)
     );
     return { embeds: [embed], components: [row1, row2] };
+  }
+
+  // Waits for a Sentry feedback tick attempt newer than `since`, re-reading
+  // BotSettings because the worker writes it (same process today, but the
+  // panel must not depend on that). ~12s: the signal has to reach the looper
+  // and the tick itself talks to Sentry and Intercom. Returns the audit line.
+  private async awaitSentryFeedbackAttempt(since: number): Promise<string> {
+    for (let i = 0; i < 24; i++) {
+      await new Promise((r) => setTimeout(r, 500));
+      await this.settingsStore.refreshSettings().catch(() => {});
+      const at = this.settingsStore.sentryFeedbackLastAttemptAt()?.getTime() ?? 0;
+      if (at > since) {
+        const error = this.settingsStore.sentryFeedbackLastError();
+        return error ? `reported: ${error}` : "completed";
+      }
+    }
+    return "signalled, still running (reopen the panel for the outcome)";
   }
 
   // /config → Integrations → Postiz Lookup: resolves a support contact to a
@@ -4743,11 +4780,13 @@ export class DiscordBot {
 
     if (id === "config_sentryfeedback_sync_now") {
       await interaction.deferUpdate();
+      const before = this.settingsStore.sentryFeedbackLastAttemptAt()?.getTime() ?? 0;
       const result = await this.temporalOps?.producers.sentryFeedbackRunNow();
-      this.auditConfig(
-        interaction,
-        `Sentry feedback sync triggered → ${result?.ok ? "signalled" : "not routable (Temporal off?)"}`
-      );
+      // The tick runs in the worker, so re-rendering immediately would show
+      // the same stamps a silently failing sync has been showing all along.
+      // Wait for the attempt stamp to move, then render the outcome.
+      const outcome = result?.ok ? await this.awaitSentryFeedbackAttempt(before) : "not routable (Temporal off?)";
+      this.auditConfig(interaction, `Sentry feedback sync triggered → ${outcome}`);
       await interaction.editReply(await this.buildSentryFeedbackPanel());
       return;
     }

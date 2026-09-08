@@ -46,7 +46,7 @@ const EXPECTED_COLUMNS: Record<string, string[]> = {
     "sentryLogsEnabled", "sentryDebug", "sentrySendDefaultPii", "sentryAiRecordContent",
     "sentryReadEnabled", "sentryReadToken", "sentryOrgSlug", "sentryProjectSlug", "sentryReadRegion",
     "sentryFeedbackTeamId", "sentryFeedbackWatermarkAt", "sentryFeedbackLastSyncAt", "sentryWebhookSecret",
-    "sentryFeedbackTicketTypeId",
+    "sentryFeedbackTicketTypeId", "sentryFeedbackLastAttemptAt", "sentryFeedbackLastError",
     "postizLookupEnabled", "postizBaseUrl", "postizApiKey",
     "forwardConvertEnabled", "forwardConvertTagName", "forwardConvertCloseNote", "forwardConvertExtraEmails",
     "forwardDetachForwarder",

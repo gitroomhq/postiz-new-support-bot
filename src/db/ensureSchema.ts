@@ -945,6 +945,11 @@ const STATEMENTS: string[] = [
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "moneyOutEnabled" BOOLEAN NOT NULL DEFAULT false`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "moneyOutSweepAt" TIMESTAMP(3)`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "moneyOutBackfillDoneAt" TIMESTAMP(3)`,
+  // Sentry feedback tick health: every attempt is stamped and a failed one
+  // keeps its (redacted) reason, so a throwing tick shows up on the panel
+  // instead of silently freezing lastSyncAt.
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "sentryFeedbackLastAttemptAt" TIMESTAMP(3)`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "sentryFeedbackLastError" TEXT`,
 ];
 
 export async function ensureSchema(prisma: PrismaClient): Promise<void> {
