@@ -69,11 +69,11 @@ export const LOOPER_GENERATIONS: Record<string, number> = {
   [SINGLETONS.disputesLoop]: 1,
   [SINGLETONS.slaSweep]: 1,
   [SINGLETONS.slaEnforce]: 1,
-  // 2: the run started before 2026-09-08 sat RUNNING with a failing workflow
-  // task, so the feedback import stopped dead while every panel still read
-  // "on". The bump is the deterministic restart; describeLooper's wedge check
-  // is the net for the next one.
-  [SINGLETONS.sentryFeedback]: 2,
+  // 2: forced restart of a run suspected of being wedged (it was not: the
+  // activity was timing out). 3: the loop body gained the
+  // sentryFeedbackTickFailed stamp on the tick's failure path, which is a new
+  // activity call, so the gen-2 runs now in flight cannot replay this bundle.
+  [SINGLETONS.sentryFeedback]: 3,
   [SINGLETONS.moneyOut]: 1,
 };
 
@@ -444,6 +444,9 @@ export interface CoreActivities {
   slaSweepTick(force: boolean): Promise<SlaSweepResult>;
   slaEnforceTick(force: boolean): Promise<SlaEnforceResult>;
   sentryFeedbackTick(force: boolean): Promise<SentryFeedbackTickResult>;
+  // Failure stamp for a tick killed server-side (timeout), which by definition
+  // cannot report its own death.
+  sentryFeedbackTickFailed(reason: string): Promise<void>;
   moneyOutTick(): Promise<MoneyOutTickResult>;
   snapshotTick(): Promise<void>;
   cleanupTick(): Promise<void>;

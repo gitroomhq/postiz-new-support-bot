@@ -245,6 +245,56 @@ test("a listing failure still drains the replay queue", async () => {
   assert.ok(h.ops.includes("store.promoted:r1"));
 });
 
+test("the walk heartbeats per page and per item, not on a timer", async () => {
+  // The activity is killed server-side when heartbeats stop, and a background
+  // interval demonstrably did not deliver them: every beat has to come from
+  // inside the work.
+  const h = makeHarness({
+    issues: [issue("1", "2026-07-20T11:00:00Z"), issue("2", "2026-07-20T12:00:00Z")],
+    contexts: { "1": context("a@b.c"), "2": context("d@e.f") },
+    emailMatches: [{ id: "user-7", role: "user" }],
+  });
+  let beats = 0;
+  const result = await h.importer.tick(false, { onProgress: () => beats++ });
+  assert.equal(result.imported, 2);
+  // One per list page and per item at the very least; the Intercom writes beat
+  // again through paceWrite.
+  assert.ok(beats >= 3, `expected per-page and per-item beats, got ${beats}`);
+});
+
+test("a tick that runs out of budget records what it finished instead of dying", async () => {
+  const h = makeHarness({
+    issues: [issue("1", "2026-07-20T11:00:00Z"), issue("2", "2026-07-20T12:00:00Z")],
+    contexts: { "1": context("a@b.c"), "2": context("d@e.f") },
+    emailMatches: [{ id: "user-7", role: "user" }],
+  });
+  // Zero budget: the listing runs (the deadline is checked before each page),
+  // then the walk stops before the first item.
+  const result = await h.importer.tick(false, { budgetMs: 0 });
+  assert.equal(result.capped, true);
+  assert.equal(result.imported, 0);
+  // The tick still COMPLETES: it stamps a sync rather than being killed with
+  // everything discarded, which is what turned a slow tick into a permanent one.
+  assert.equal(h.recorded.length, 1);
+  assert.ok(h.recorded[0].lastSyncAt instanceof Date);
+  assert.equal(h.recorded[0].error, null);
+});
+
+test("the budget stops the walk between items and keeps the finished ones", async () => {
+  const h = makeHarness({
+    issues: [issue("1", "2026-07-20T11:00:00Z"), issue("2", "2026-07-20T12:00:00Z")],
+    contexts: { "1": context("a@b.c"), "2": context("d@e.f") },
+    emailMatches: [{ id: "user-7", role: "user" }],
+  });
+  // Budget expires while the first item is being written.
+  const result = await h.importer.tick(false, { budgetMs: 300 });
+  assert.equal(result.imported, 1);
+  assert.equal(result.capped, true);
+  // The watermark advances past the item that finished, so the next tick
+  // resumes at the second one rather than redoing both.
+  assert.equal(h.recorded[0].watermarkAt?.toISOString(), "2026-07-20T11:00:00.000Z");
+});
+
 test("a failing replay drain does not discard the walk it ran after", async () => {
   const h = makeHarness({
     issues: [issue("1", "2026-07-20T11:00:00Z")],

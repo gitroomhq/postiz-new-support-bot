@@ -26,6 +26,14 @@ const MAX_PAGES = 10;
 const MAX_IMPORTS_PER_TICK = 25;
 // Politeness pacing between Intercom writes (shared sweep idiom).
 const WRITE_SPACING_MS = 400;
+// Wall-clock budget for one tick, comfortably inside the activity's 10-minute
+// start-to-close. A tick that runs out stops where it is and records what it
+// finished: the watermark only ever advances through completed items, so the
+// next tick resumes exactly where this one stopped. Without a budget a tick
+// that outgrows its timeouts is killed SERVER-SIDE, which discards the whole
+// run including the work it had already done, and every later tick repeats it
+// and dies the same way.
+const TICK_BUDGET_MS = 6 * 60_000;
 const FEEDBACK_TAG = "sentry-feedback";
 // The stored failure reason is rendered in a Discord embed, so it is trimmed
 // to one line and capped. Redacted as defense in depth: an upstream error body
@@ -115,10 +123,19 @@ export class SentryFeedbackImporter {
   // failing every 15 minutes was a "Last sync" stamp that quietly stopped
   // moving. The reason is stamped here and the error is rethrown unchanged so
   // the activity still fails loudly for Sentry/Temporal.
-  async tick(force: boolean): Promise<SentryFeedbackTickResult> {
+  //
+  // onProgress is the activity heartbeat, called from inside the work rather
+  // than on a background timer: Temporal wants proof of PROGRESS, and a tick
+  // that has stopped progressing has to be allowed to die.
+  async tick(
+    force: boolean,
+    opts: { onProgress?: () => void; budgetMs?: number } = {}
+  ): Promise<SentryFeedbackTickResult> {
+    const beat = opts.onProgress ?? (() => {});
+    const deadline = Date.now() + (opts.budgetMs ?? TICK_BUDGET_MS);
     const attemptAt = new Date();
     try {
-      return await this.run(force, attemptAt);
+      return await this.run(force, attemptAt, beat, () => Date.now() >= deadline);
     } catch (e) {
       await this.recordAttempt(attemptAt, describeTickError(e));
       throw e;
@@ -136,7 +153,12 @@ export class SentryFeedbackImporter {
     });
   }
 
-  private async run(force: boolean, attemptAt: Date): Promise<SentryFeedbackTickResult> {
+  private async run(
+    force: boolean,
+    attemptAt: Date,
+    beat: () => void,
+    outOfTime: () => boolean
+  ): Promise<SentryFeedbackTickResult> {
     const result: SentryFeedbackTickResult = {
       listed: 0,
       imported: 0,
@@ -187,6 +209,12 @@ export class SentryFeedbackImporter {
     let listError: unknown = null;
     let cursor: string | undefined;
     for (let page = 0; page < MAX_PAGES; page++) {
+      beat();
+      if (outOfTime()) {
+        result.capped = true;
+        syncLog.warn("sentry.feedback.budget_hit", { "feedback.phase": "list", "feedback.page": page });
+        break;
+      }
       try {
         const res = await this.sentry.listFeedbackIssues({
           startIso: floor.toISOString(),
@@ -228,6 +256,7 @@ export class SentryFeedbackImporter {
     const outcomes: Array<{ feedbackAt: Date; terminal: boolean }> = [];
     let lastWriteAt = 0;
     const paceWrite = async (): Promise<void> => {
+      beat();
       const wait = lastWriteAt + WRITE_SPACING_MS - Date.now();
       if (wait > 0) await new Promise((r) => setTimeout(r, wait));
       lastWriteAt = Date.now();
@@ -235,6 +264,15 @@ export class SentryFeedbackImporter {
     let tagId: string | null = null;
 
     for (const issue of todo) {
+      beat();
+      // Stopping here is not a loss: `outcomes` already holds everything
+      // finished, so the watermark advances past it and the remainder becomes
+      // the next tick's `todo`.
+      if (outOfTime()) {
+        result.capped = true;
+        syncLog.warn("sentry.feedback.budget_hit", { "feedback.phase": "import", "feedback.done": outcomes.length });
+        break;
+      }
       const feedbackAt = new Date(issue.firstSeen);
       try {
         if (await this.store.getByIssueId(issue.id)) {
@@ -243,6 +281,7 @@ export class SentryFeedbackImporter {
           continue;
         }
         const context = await this.sentry.getFeedbackContext(issue.id);
+        beat();
         await this.harvestLink(context.identity);
         const email = context.contactEmail;
         if (!email) {
@@ -396,7 +435,7 @@ export class SentryFeedbackImporter {
     // then redid the same work every 15 minutes forever, importing nothing.
     let replayError: string | null = null;
     try {
-      await this.replaySkipped(result, MAX_IMPORTS_PER_TICK - result.imported, adminId, paceWrite, now);
+      await this.replaySkipped(result, MAX_IMPORTS_PER_TICK - result.imported, adminId, paceWrite, now, outOfTime, beat);
     } catch (e) {
       result.errors++;
       replayError = `replay drain failed: ${describeTickError(e)}`;
@@ -471,14 +510,23 @@ export class SentryFeedbackImporter {
     budget: number,
     adminId: string,
     paceWrite: () => Promise<void>,
-    now: Date
+    now: Date,
+    outOfTime: () => boolean,
+    beat: () => void
   ): Promise<void> {
-    if (budget <= 0) return;
+    if (budget <= 0 || outOfTime()) return;
 
     const candidates = await this.store.listSkippedForRetry(budget);
     for (const row of candidates) {
+      // The drain is the lowest-priority work in the tick, so it is the first
+      // thing the budget takes back.
+      if (outOfTime()) {
+        result.capped = true;
+        return;
+      }
       try {
         const context = await this.sentry.getFeedbackContext(row.sentryIssueId);
+        beat();
         await this.harvestLink(context.identity);
         const email = context.contactEmail;
         if (!email) {

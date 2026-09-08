@@ -650,18 +650,22 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
     // enabled/configured/watermark gates itself.
     async sentryFeedbackTick(force) {
       heartbeat();
-      const keepalive = setInterval(() => {
-        try {
-          heartbeat();
-        } catch {
-          /* worker shutting down — the sweep finishes on its own */
-        }
-      }, 30_000);
-      try {
-        return await sentryFeedbackImporter.tick(force);
-      } finally {
-        clearInterval(keepalive);
-      }
+      // Per-page/per-item heartbeat, like moneyOutTick. A background
+      // setInterval used to do this and did NOT keep the activity alive: the
+      // server timed every tick out at the 2-minute heartbeatTimeout, attempt
+      // 1 of 1, for weeks. Heartbeating from inside the walk is both what the
+      // SDK expects and the only version that proves actual progress.
+      return sentryFeedbackImporter.tick(force, { onProgress: () => heartbeat() });
+    },
+
+    // Stamps a tick that died OUTSIDE its own code (a heartbeat or
+    // start-to-close timeout kills the activity server-side, so its catch
+    // block never runs and it cannot report anything). The looper calls this
+    // when the tick above rejects.
+    async sentryFeedbackTickFailed(reason) {
+      await settingsStore
+        .recordSentryFeedbackSync({ attemptAt: new Date(), error: reason.slice(0, 300) })
+        .catch(() => {});
     },
 
     // Bot-native SLA enforcement + assignment stray sweep (5-min looper).

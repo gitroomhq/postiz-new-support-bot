@@ -37,6 +37,16 @@ const light = proxyActivities<CoreActivities>({
   retry: { maximumAttempts: 2 },
 });
 
+// Activity failures arrive wrapped ("Activity task failed" around the real
+// cause), and a timeout carries no cause at all, so both layers are read.
+// Deterministic: every input comes from workflow history.
+function describeActivityFailure(e: unknown): string {
+  const err = e as { message?: string; cause?: { message?: string } } | null;
+  const outer = err?.message ?? String(e);
+  const inner = err?.cause?.message;
+  return inner ? `${outer}: ${inner}` : outer;
+}
+
 async function canIfDue(makeNext: () => Promise<never> | Promise<void>): Promise<void> {
   if (workflowInfo().continueAsNewSuggested || workflowInfo().historyLength > HISTORY_SOFT_LIMIT) {
     await condition(allHandlersFinished);
@@ -132,7 +142,13 @@ export async function sentryFeedbackWorkflow(): Promise<void> {
   for (;;) {
     const force = runNow;
     runNow = false;
-    await inactivityActs.sentryFeedbackTick(force).catch(() => {});
+    // A timeout kills the activity server-side, so the tick's own error
+    // stamping never runs and the failure would live ONLY in this workflow's
+    // history (which nothing in Discord can read). Hand the reason to a tiny
+    // activity so /config can show it.
+    await inactivityActs.sentryFeedbackTick(force).catch(async (e) => {
+      await light.sentryFeedbackTickFailed(describeActivityFailure(e)).catch(() => {});
+    });
     await canIfDue(() => continueWithMemo<typeof sentryFeedbackWorkflow>());
     await condition(() => runNow, 15 * 60_000);
   }
