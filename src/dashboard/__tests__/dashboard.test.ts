@@ -614,6 +614,24 @@ test("gateway: amountMajor converts via the charge currency; unlinked full refun
   assert.deepEqual((rewritten as { params: unknown }).params, { chargeId: "ch_1", amountMinor: 2500 });
 });
 
+test("registry: refund actions accept py_ charge ids, not just ch_", async () => {
+  // Non-card / legacy charges carry a py_ id, and every other surface already
+  // treats them as charges (payments detail page, ChargesHub, DisputesHub) —
+  // a py_ charge reaching the refund modal used to die in parseParams.
+  const full = actionByKey("charge.refund_full")!.parseParams({ chargeId: "py_1" });
+  assert.ok(full.ok);
+  for (const key of ["charge.refund_partial", "charge.refund_fraud"]) {
+    const parsed = actionByKey(key)!.parseParams({ chargeId: "py_1", amountMinor: 2900 });
+    assert.ok(parsed.ok, key);
+    assert.deepEqual(parsed.params, { chargeId: "py_1", amountMinor: 2900 });
+  }
+  // Wrong-shaped id and missing amount stay separate, legible failures.
+  const badId = actionByKey("charge.refund_partial")!.parseParams({ chargeId: "in_1", amountMinor: 100 });
+  assert.ok(!badId.ok && /chargeId/.test(badId.error));
+  const noAmount = actionByKey("charge.refund_partial")!.parseParams({ chargeId: "py_1" });
+  assert.ok(!noAmount.ok && /amountMinor/.test(noAmount.error));
+});
+
 test("gateway: charge_review binds the ticket thread from the PENDING review row", async () => {
   const { gateway } = gatewayFixture();
   const ok = await gateway.resolve("charge_review", { threadId: "12345678", decision: "approve" });

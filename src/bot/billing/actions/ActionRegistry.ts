@@ -109,6 +109,15 @@ function idWithPrefix(v: unknown, prefix: string): string | null {
   const s = str(v);
   return s && s.startsWith(prefix) ? s : null;
 }
+// Charge ids come in two shapes: card charges are ch_…, non-card / legacy
+// sources are py_… (Stripe's own dashboard shows both as charges). Every
+// other surface here already accepts both (payments section, ChargesHub,
+// DisputesHub), so the refund actions must too — a py_ charge is refundable
+// exactly like a ch_ one.
+function chargeId(v: unknown): string | null {
+  const s = str(v);
+  return s && (s.startsWith("ch_") || s.startsWith("py_")) ? s : null;
+}
 function customerIdOf(target: { customer?: string | Stripe.Customer | Stripe.DeletedCustomer | null }): string | null {
   const c = target.customer;
   if (!c) return null;
@@ -212,8 +221,8 @@ const refundFull = defineAction<RefundFullParams>({
   dangerous: true,
   parseParams: (raw) => {
     const o = obj(raw);
-    const chargeId = o ? idWithPrefix(o.chargeId, "ch_") : null;
-    return chargeId ? { ok: true, params: { chargeId } } : { ok: false, error: "chargeId (ch_…) required" };
+    const id = o ? chargeId(o.chargeId) : null;
+    return id ? { ok: true, params: { chargeId: id } } : { ok: false, error: "chargeId (ch_…/py_…) required" };
   },
   summarize: (p) => `Fully refund ${p.chargeId} and cancel the subscription`,
   revalidate: async (ctx, p) => {
@@ -267,10 +276,13 @@ const refundPartial = defineAction<RefundPartialParams>({
   dangerous: true,
   parseParams: (raw) => {
     const o = obj(raw);
-    const chargeId = o ? idWithPrefix(o.chargeId, "ch_") : null;
+    const id = o ? chargeId(o.chargeId) : null;
     const amountMinor = o ? posInt(o.amountMinor) : null;
-    if (!chargeId || !amountMinor) return { ok: false, error: "chargeId (ch_…) and positive amountMinor required" };
-    return { ok: true, params: { chargeId, amountMinor } };
+    // Split, not conflated: a wrong-shaped id and a missing amount are very
+    // different operator mistakes, and one message for both hides which fired.
+    if (!id) return { ok: false, error: "chargeId (ch_…/py_…) required" };
+    if (!amountMinor) return { ok: false, error: "A positive amountMinor is required" };
+    return { ok: true, params: { chargeId: id, amountMinor } };
   },
   summarize: (p) => `Partially refund ${p.chargeId} by ${p.amountMinor} minor units`,
   revalidate: revalidatePartialRefund,
@@ -303,10 +315,13 @@ const refundFraud = defineAction<RefundPartialParams>({
   dangerous: true,
   parseParams: (raw) => {
     const o = obj(raw);
-    const chargeId = o ? idWithPrefix(o.chargeId, "ch_") : null;
+    const id = o ? chargeId(o.chargeId) : null;
     const amountMinor = o ? posInt(o.amountMinor) : null;
-    if (!chargeId || !amountMinor) return { ok: false, error: "chargeId (ch_…) and positive amountMinor required" };
-    return { ok: true, params: { chargeId, amountMinor } };
+    // Split, not conflated: a wrong-shaped id and a missing amount are very
+    // different operator mistakes, and one message for both hides which fired.
+    if (!id) return { ok: false, error: "chargeId (ch_…/py_…) required" };
+    if (!amountMinor) return { ok: false, error: "A positive amountMinor is required" };
+    return { ok: true, params: { chargeId: id, amountMinor } };
   },
   summarize: (p) => `Refund ${p.amountMinor} minor units of ${p.chargeId} as FRAUDULENT (feeds Radar)`,
   revalidate: revalidatePartialRefund,
