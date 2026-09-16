@@ -942,6 +942,68 @@ const STATEMENTS: string[] = [
   `CREATE INDEX IF NOT EXISTS "stripe_money_out_customerId_idx" ON "stripe_money_out"("customerId")`,
   `CREATE INDEX IF NOT EXISTS "stripe_money_out_chargeId_idx" ON "stripe_money_out"("chargeId")`,
   `CREATE INDEX IF NOT EXISTS "stripe_money_out_stripeObjectId_idx" ON "stripe_money_out"("stripeObjectId")`,
+  // Descriptive segments on the dispute mirror: which plan, which card, which
+  // country, how long they had been a customer. Same rule as the ledger — ALTER
+  // rather than CREATE, because production has the table already.
+  `ALTER TABLE "stripe_disputes" ADD COLUMN IF NOT EXISTS "planTier" TEXT`,
+  `ALTER TABLE "stripe_disputes" ADD COLUMN IF NOT EXISTS "planPeriod" TEXT`,
+  `ALTER TABLE "stripe_disputes" ADD COLUMN IF NOT EXISTS "cardBrand" TEXT`,
+  `ALTER TABLE "stripe_disputes" ADD COLUMN IF NOT EXISTS "cardFunding" TEXT`,
+  `ALTER TABLE "stripe_disputes" ADD COLUMN IF NOT EXISTS "cardCountry" TEXT`,
+  `ALTER TABLE "stripe_disputes" ADD COLUMN IF NOT EXISTS "networkReason" TEXT`,
+  `ALTER TABLE "stripe_disputes" ADD COLUMN IF NOT EXISTS "tenure" TEXT`,
+  // Descriptive segments on the outflow ledger (plan, card, region, reason,
+  // charge age, customer tenure). Added rather than baked into the CREATE
+  // TABLE above so an instance that already has the table picks them up:
+  // production runs no migrations, this file IS the migration.
+  `ALTER TABLE "stripe_money_out" ADD COLUMN IF NOT EXISTS "planTier" TEXT`,
+  `ALTER TABLE "stripe_money_out" ADD COLUMN IF NOT EXISTS "planPeriod" TEXT`,
+  `ALTER TABLE "stripe_money_out" ADD COLUMN IF NOT EXISTS "cardBrand" TEXT`,
+  `ALTER TABLE "stripe_money_out" ADD COLUMN IF NOT EXISTS "cardFunding" TEXT`,
+  `ALTER TABLE "stripe_money_out" ADD COLUMN IF NOT EXISTS "cardCountry" TEXT`,
+  `ALTER TABLE "stripe_money_out" ADD COLUMN IF NOT EXISTS "refundReason" TEXT`,
+  `ALTER TABLE "stripe_money_out" ADD COLUMN IF NOT EXISTS "refundKind" TEXT`,
+  `ALTER TABLE "stripe_money_out" ADD COLUMN IF NOT EXISTS "chargeAge" TEXT`,
+  `ALTER TABLE "stripe_money_out" ADD COLUMN IF NOT EXISTS "tenure" TEXT`,
+  `ALTER TABLE "stripe_money_out" ADD COLUMN IF NOT EXISTS "networkReason" TEXT`,
+  `ALTER TABLE "stripe_money_out" ADD COLUMN IF NOT EXISTS "surface" TEXT`,
+  `CREATE INDEX IF NOT EXISTS "stripe_money_out_planTier_occurredAt_idx" ON "stripe_money_out"("planTier", "occurredAt")`,
+  `CREATE INDEX IF NOT EXISTS "stripe_money_out_cardCountry_occurredAt_idx" ON "stripe_money_out"("cardCountry", "occurredAt")`,
+  // Subscription lifecycle mirror — the churn half of the money analytics.
+  // Keyed on the Stripe event id so the 30-day replay is idempotent.
+  `CREATE TABLE IF NOT EXISTS "stripe_subscription_events" (
+    "id" TEXT NOT NULL,
+    "subscriptionId" TEXT NOT NULL,
+    "customerId" TEXT,
+    "event" TEXT NOT NULL,
+    "planTier" TEXT NOT NULL,
+    "planPeriod" TEXT NOT NULL,
+    "fromTier" TEXT,
+    "fromPeriod" TEXT,
+    "currency" TEXT NOT NULL,
+    "mrrMinor" INTEGER NOT NULL DEFAULT 0,
+    "mrrDeltaMinor" INTEGER NOT NULL DEFAULT 0,
+    "mrrAtRiskMinor" INTEGER NOT NULL DEFAULT 0,
+    "churnType" TEXT,
+    "cancelReason" TEXT,
+    "cancelFeedback" TEXT,
+    "comment" TEXT,
+    "cardCountry" TEXT,
+    "source" TEXT NOT NULL,
+    "occurredAt" TIMESTAMP(3) NOT NULL,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT "stripe_subscription_events_pkey" PRIMARY KEY ("id")
+  )`,
+  `CREATE INDEX IF NOT EXISTS "stripe_subscription_events_occurredAt_idx" ON "stripe_subscription_events"("occurredAt")`,
+  `CREATE INDEX IF NOT EXISTS "stripe_subscription_events_event_occurredAt_idx" ON "stripe_subscription_events"("event", "occurredAt")`,
+  `CREATE INDEX IF NOT EXISTS "stripe_subscription_events_subscriptionId_idx" ON "stripe_subscription_events"("subscriptionId")`,
+  `CREATE INDEX IF NOT EXISTS "stripe_subscription_events_customerId_idx" ON "stripe_subscription_events"("customerId")`,
+  `CREATE INDEX IF NOT EXISTS "stripe_subscription_events_planTier_occurredAt_idx" ON "stripe_subscription_events"("planTier", "occurredAt")`,
+  // Segment enrichment costs Stripe reads, so it is switchable independently of
+  // the ledger itself; and the churn replay records how far it last got.
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "moneyOutEnrichEnabled" BOOLEAN NOT NULL DEFAULT true`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "subscriptionEventsEnabled" BOOLEAN NOT NULL DEFAULT true`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "subscriptionReplayDoneAt" TIMESTAMP(3)`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "moneyOutEnabled" BOOLEAN NOT NULL DEFAULT false`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "moneyOutSweepAt" TIMESTAMP(3)`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "moneyOutBackfillDoneAt" TIMESTAMP(3)`,

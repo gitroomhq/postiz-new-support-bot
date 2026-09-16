@@ -1,5 +1,35 @@
 import { PrismaClient, StripeMoneyOut } from "../../generated/prisma/client";
 import type { MoneyOutBucket, MoneyOutCategory, MoneyOutRow } from "./moneyOutTaxonomy";
+import type { MoneySegments } from "./segments";
+
+// The segment axes flattened into their own columns. Kept as columns rather
+// than a JSON blob so Postgres can group by them directly — the Discord and
+// dashboard panels answer "refunds by plan" from here, without Influx.
+function segmentColumns(segments: MoneySegments | null | undefined) {
+  const s = segments ?? {};
+  return {
+    planTier: s.planTier ?? null,
+    planPeriod: s.planPeriod ?? null,
+    cardBrand: s.cardBrand ?? null,
+    cardFunding: s.cardFunding ?? null,
+    cardCountry: s.cardCountry ?? null,
+    refundReason: s.refundReason ?? null,
+    refundKind: s.refundKind ?? null,
+    chargeAge: s.chargeAge ?? null,
+    tenure: s.tenure ?? null,
+    networkReason: s.networkReason ?? null,
+    surface: s.surface ?? null,
+  };
+}
+
+// Columns a later, better-informed pass may fill in but must never blank out —
+// the same rule the customer id already follows. A sweep that ran out of its
+// lookup budget writes nulls, and the webhook path that enriches properly comes
+// along afterwards; letting the empty write win would undo the good one.
+function definedSegmentColumns(segments: MoneySegments | null | undefined) {
+  const cols = segmentColumns(segments);
+  return Object.fromEntries(Object.entries(cols).filter(([, v]) => v != null));
+}
 
 export type { StripeMoneyOut };
 
@@ -57,13 +87,14 @@ export class MoneyOutStore {
     };
     await this.prisma.stripeMoneyOut.upsert({
       where: { id: row.id },
-      create: { id: row.id, ...data },
+      create: { id: row.id, ...data, ...segmentColumns(row.segments) },
       // A later pass may know things the first one didn't (the customer id the
       // webhook path resolves), but must never blank out what is already there.
       update: {
         ...data,
         customerId: row.customerId ?? undefined,
         chargeId: row.chargeId ?? undefined,
+        ...definedSegmentColumns(row.segments),
       },
     });
     return existing == null;
@@ -106,6 +137,7 @@ export class MoneyOutStore {
         chargeId: r.chargeId,
         customerId: r.customerId,
         occurredAt: r.occurredAt,
+        ...segmentColumns(r.segments),
       })),
       // A concurrent sweep (webhook mini-sweep racing the looper) may have
       // inserted the same id between the read and the write.

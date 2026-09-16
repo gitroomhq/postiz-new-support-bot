@@ -254,6 +254,12 @@ model BotSettings {
   moneyOutEnabled         Boolean   @default(false)
   moneyOutSweepAt         DateTime?
   moneyOutBackfillDoneAt  DateTime?
+  // Segment enrichment (plan / card / region / tenure) costs extra Stripe reads
+  // per outflow, so it is switchable without switching off the ledger itself.
+  moneyOutEnrichEnabled   Boolean   @default(true)
+  // Subscription lifecycle tracking: the churn half of the money analytics.
+  subscriptionEventsEnabled Boolean @default(true)
+  subscriptionReplayDoneAt  DateTime?
   radarListCardId         String?
   radarListEmailId        String?
   radarListCustomerId     String?
@@ -800,6 +806,18 @@ model StripeDispute {
   lastUrgentReminderAt DateTime? // urgent-tier damper (≤1 urgent ping / 24h / dispute)
   disputeCreatedAt    DateTime
   closedAt            DateTime?
+  // ---- descriptive segments: who disputed us, without identifying them ----
+  // Bounded enums and an ISO country code only. Never a name, an email or a
+  // card number. src/bot/billing/segments.ts owns what may be written here.
+  // Nullable because resolving them costs Stripe reads against a bounded
+  // budget: null means "never looked", which charts as "unknown".
+  planTier            String? // STANDARD | TEAM | PRO | ULTIMATE | custom | unknown
+  planPeriod          String? // MONTHLY | YEARLY | custom | unknown
+  cardBrand           String? // visa | mastercard | amex | … | unknown
+  cardFunding         String? // credit | debit | prepaid | unknown
+  cardCountry         String? // ISO-3166 alpha-2 of the ISSUING card
+  networkReason       String? // the card network's own reason code (10.4, 4853, …)
+  tenure              String? // first_day | under_30d | 1_3mo | 3mo_plus
   createdAt           DateTime  @default(now())
   updatedAt           DateTime  @updatedAt
 
@@ -839,6 +857,26 @@ model StripeMoneyOut {
   chargeId       String?
   customerId     String?
   occurredAt     DateTime
+  // ---- descriptive segments ----
+  // What this outflow was ABOUT, as bounded enums only. Never PII: no names, no
+  // emails, no addresses, no card numbers. src/bot/billing/segments.ts is the
+  // single place that decides what may be written here.
+  //
+  // All nullable, because they are best-effort: resolving them costs Stripe
+  // reads, the sweep works to a bounded budget, and the all-time backfill does
+  // not resolve them at all. Null means "never looked", which charts as
+  // "unknown" rather than pretending to a value.
+  planTier       String? // STANDARD | TEAM | PRO | ULTIMATE | custom | unknown
+  planPeriod     String? // MONTHLY | YEARLY | custom | unknown
+  cardBrand      String? // visa | mastercard | amex | … | unknown
+  cardFunding    String? // credit | debit | prepaid | unknown
+  cardCountry    String? // ISO-3166 alpha-2 of the ISSUING card, not a person's address
+  refundReason   String? // duplicate | fraudulent | requested_by_customer | none
+  refundKind     String? // full | partial
+  chargeAge      String? // same_day | 1_7d | 8_30d | 31_90d | 90d_plus
+  tenure         String? // first_day | under_30d | 1_3mo | 3mo_plus
+  networkReason  String? // card-network reason code on a dispute (10.4, 4853, …)
+  surface        String? // discord | panel | dashboard | stripe
   createdAt      DateTime @default(now())
   updatedAt      DateTime @updatedAt
 
@@ -848,7 +886,58 @@ model StripeMoneyOut {
   @@index([customerId])
   @@index([chargeId])
   @@index([stripeObjectId])
+  @@index([planTier, occurredAt])
+  @@index([cardCountry, occurredAt])
   @@map("stripe_money_out")
+}
+
+// Subscription lifecycle movements: signups, plan changes, cancellations.
+//
+// Deliberately NOT part of stripe_money_out. A cancellation moves no money on
+// the day it happens — it removes FUTURE revenue — so folding it into the
+// outflow ledger would count a refund-and-cancel as two separate losses.
+//
+// Keyed on the Stripe EVENT id, which makes the 30-day replay idempotent: a
+// re-run writes the same rows and emits points at the same timestamps, so
+// Influx overwrites rather than double-counts.
+//
+// mrrDeltaMinor is signed and normalised to a month (a yearly plan counts a
+// twelfth per month) so a window sum is net revenue movement. mrrAtRiskMinor is
+// the separate "scheduled to leave, has not left yet" number and must never be
+// added to the delta.
+//
+// NO PII, with one guarded exception: `comment` is the customer's own
+// cancellation note, which is why it is scrubbed of emails, URLs, phone
+// numbers and Stripe ids before it is stored, and truncated. It is never
+// exported as a metric tag.
+model StripeSubscriptionEvent {
+  id              String   @id // Stripe event id (evt_…), or a synthetic id for locally derived rows
+  subscriptionId  String
+  customerId      String?
+  event           String // created | trial_started | trial_converted | upgraded | downgraded | cancel_scheduled | cancel_reverted | canceled | paused | resumed | payment_failing | payment_recovered
+  planTier        String
+  planPeriod      String
+  fromTier        String?
+  fromPeriod      String?
+  currency        String
+  mrrMinor        Int      @default(0)
+  mrrDeltaMinor   Int      @default(0)
+  mrrAtRiskMinor  Int      @default(0)
+  churnType       String? // voluntary | involuntary | unknown
+  cancelReason    String? // Stripe enum: cancellation_requested | payment_disputed | payment_failed
+  cancelFeedback  String? // Stripe enum: too_expensive | missing_features | switched_service | …
+  comment         String? // scrubbed + truncated customer free text
+  cardCountry     String?
+  source          String // webhook | replay
+  occurredAt      DateTime
+  createdAt       DateTime @default(now())
+
+  @@index([occurredAt])
+  @@index([event, occurredAt])
+  @@index([subscriptionId])
+  @@index([customerId])
+  @@index([planTier, occurredAt])
+  @@map("stripe_subscription_events")
 }
 
 // Billing blocklist: one row per blocked identifier, mirrored into a Stripe

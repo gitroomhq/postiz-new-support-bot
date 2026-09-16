@@ -5,6 +5,7 @@ import { SessionStore } from "../auth/SessionStore";
 import { StripeClient } from "./StripeClient";
 import { DisputeStore } from "./billing/DisputeStore";
 import type { MoneyOutService } from "./billing/MoneyOutService";
+import type { SubscriptionEventService } from "./billing/SubscriptionEventService";
 import { BlockService } from "./billing/BlockService";
 import { attachReceiptEvidence } from "./billing/receiptEvidence";
 import { COLORS } from "../util/embeds";
@@ -31,6 +32,10 @@ const EVENTS: Stripe.WebhookEndpointCreateParams.EnabledEvent[] = [
   // SLA manager triggers only (no alerts): plan changes re-run the SLA rules
   // for the customer's open tickets. ensureEndpoint reconciles enabled_events
   // on next boot, so the addition converges without dashboard access.
+  // Also the churn analytics feed: created is needed alongside these two,
+  // because the signup half of revenue movement is invisible without it (and a
+  // churn count with no installed base to compare it to is unreadable).
+  "customer.subscription.created",
   "customer.subscription.updated",
   "customer.subscription.deleted",
   // Money-out ledger. These are what make an outflow visible no matter WHERE it
@@ -85,6 +90,15 @@ export class StripeWebhookHandler {
 
   setMoneyOutService(service: MoneyOutService): void {
     this.moneyOut = service;
+  }
+
+  // Subscription lifecycle analytics — bound late for the same reason as the
+  // money-out ledger. Absent until then means a churn movement is simply not
+  // recorded; the 30-day replay can pick it up afterwards.
+  private subscriptionEvents: SubscriptionEventService | null = null;
+
+  setSubscriptionEventService(service: SubscriptionEventService): void {
+    this.subscriptionEvents = service;
   }
 
   // Read per request — the secret lives in BotSettings and can rotate live.
@@ -219,13 +233,26 @@ export class StripeWebhookHandler {
         }
         return;
       }
+      case "customer.subscription.created":
       case "customer.subscription.updated":
       case "customer.subscription.deleted": {
-        // SLA-only: plan/subscription changes re-run the SLA rules for the
-        // customer's open tickets. No alert, no mirror.
+        // Two unrelated consumers, neither of which alerts:
+        //  - the SLA manager re-runs its rules for the customer's open tickets
+        //    when their plan changes;
+        //  - the churn analytics record the revenue movement.
         const sub = event.data.object as Stripe.Subscription;
         const cus = typeof sub.customer === "string" ? sub.customer : sub.customer?.id;
-        if (cus) void this.slaService?.onStripeCustomerTrigger(cus);
+        if (cus && event.type !== "customer.subscription.created") {
+          void this.slaService?.onStripeCustomerTrigger(cus);
+        }
+        // Redeliveries are safe without the firstDelivery gate: rows key on the
+        // event id, so a second delivery writes nothing and emits nothing.
+        await this.subscriptionEvents?.recordEvent(event).catch((e) => {
+          hookLog.warn("subscription event record failed", {
+            "stripe.event_type": event.type,
+            "error.message": String(e),
+          });
+        });
         return;
       }
       case "radar.early_fraud_warning.created":

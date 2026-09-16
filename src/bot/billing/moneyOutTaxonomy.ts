@@ -1,4 +1,5 @@
 import type Stripe from "stripe";
+import type { MoneySegments } from "./segments";
 
 // The money-out taxonomy: one place that decides what counts as an outflow and
 // which bucket it lands in. Pure functions only — no Stripe calls, no Prisma —
@@ -107,6 +108,15 @@ export interface MoneyOutRow {
   chargeId: string | null;
   customerId: string | null;
   occurredAt: Date;
+  // Descriptive axes (plan, card, country, refund reason, charge age, customer
+  // tenure). Optional everywhere: the classifiers below are pure and cannot
+  // reach Stripe, so they never populate it — MoneyOutService enriches the rows
+  // afterwards, within a bounded lookup budget. A row that was never enriched
+  // keeps null here and charts as "unknown", which is the honest answer.
+  //
+  // NEVER any PII: every value is a bounded enum or an ISO country code. See
+  // segments.ts, which is the single place that decides what may live here.
+  segments?: MoneySegments | null;
 }
 
 function row(input: Omit<MoneyOutRow, "bucket" | "netMinor"> & { netMinor?: number }): MoneyOutRow {

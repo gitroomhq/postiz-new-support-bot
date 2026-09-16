@@ -117,6 +117,9 @@ import { makeAssignmentHub } from "./adminpanel/sections/assignmentHub";
 import { CachedRatioEngine } from "./bot/billing/disputeRatio";
 import { MoneyOutStore } from "./bot/billing/MoneyOutStore";
 import { MoneyOutService } from "./bot/billing/MoneyOutService";
+import { StripeSegmentResolver } from "./bot/billing/StripeSegmentResolver";
+import { SubscriptionEventStore } from "./bot/billing/SubscriptionEventStore";
+import { SubscriptionEventService } from "./bot/billing/SubscriptionEventService";
 import { DisputeMonitor } from "./bot/billing/DisputeMonitor";
 import { TemporalService } from "./temporal/TemporalService";
 import { TemporalWorkerManager } from "./temporal/TemporalWorkerManager";
@@ -255,9 +258,16 @@ async function main() {
   const kbScheduler = new KnowledgeBaseScheduler(settingsStore, process.cwd());
   const githubClient = new GitHubClient(config);
   const stripeClient = new StripeClient(config, settingsStore);
+  // Descriptive segments for the money analytics: which plan, which card, which
+  // country, how long the customer had been paying. ONE instance shared by
+  // everything that needs it, because its whole cost model is the cache — the
+  // webhook path and the reconcile sweep touch the same charge within seconds
+  // and must not each pay for it. Never carries PII: see segments.ts.
+  const segmentResolver = new StripeSegmentResolver(stripeClient);
   // Dispute console: local dispute mirror, blocklist (+ Radar bridge), team
   // notes/bookmarks, the shared ratio cache and the looper tick body.
   const disputeStore = new DisputeStore(prisma);
+  disputeStore.bindSegments(segmentResolver);
   // Shared dispute-evidence core: /billing → Disputes AND the web dashboard's
   // workbench run this one implementation (catalog, staging, submit claims).
   const disputeEvidenceService = new DisputeEvidenceService(stripeClient, disputeStore, sessionStore, {
@@ -275,9 +285,15 @@ async function main() {
   // mirrored from Stripe's balance transactions, whatever surface caused it —
   // the Stripe Dashboard included.
   const moneyOutStore = new MoneyOutStore(prisma);
-  const moneyOutService = new MoneyOutService(settingsStore, stripeClient, moneyOutStore);
+  const moneyOutService = new MoneyOutService(settingsStore, stripeClient, moneyOutStore, segmentResolver);
+  // Churn analytics: subscription lifecycle movements as counts and signed MRR.
+  // Separate from the money-out ledger on purpose — a cancellation moves no
+  // money on the day it happens, it removes future revenue.
+  const subscriptionEventStore = new SubscriptionEventStore(prisma);
+  const subscriptionEventService = new SubscriptionEventService(settingsStore, stripeClient, subscriptionEventStore);
   const stripeWebhookHandler = new StripeWebhookHandler(settingsStore, sessionStore, stripeClient, disputeStore, blockService);
   stripeWebhookHandler.setMoneyOutService(moneyOutService);
+  stripeWebhookHandler.setSubscriptionEventService(subscriptionEventService);
   // Intercom canvas/panel billing actions: approval queue + the shared
   // Discord-independent action brain (levels re-checked per request).
   const approvalStore = new ApprovalStore(prisma);
@@ -485,10 +501,11 @@ async function main() {
     stripeWebhookHandler,
     intercomInboxApp,
     { service: vaultService, migrator: vaultMigrator },
-    { blockService, stripeClient, disputeStore },
+    { blockService, stripeClient, disputeStore, segments: segmentResolver },
     intercomPanel,
     intercomAdmin,
-    moneyOutService
+    moneyOutService,
+    subscriptionEventService
   );
   // The client exists as soon as the constructor ran; nothing fires before login.
   bot.setSlaService(slaService);
@@ -670,7 +687,9 @@ async function main() {
   // ---- Activity tick-providers (bodies driven by the Temporal loopers) ----
 
   // Influx gauge snapshot body for the metricsSnapshotWorkflow's snapshotTick.
-  const snapshotScheduler = new SnapshotScheduler(prisma, settingsStore);
+  // The churn service is passed in so the hour-dampered plan-mix gauge rides
+  // the 5-minute snapshot tick rather than needing a looper of its own.
+  const snapshotScheduler = new SnapshotScheduler(prisma, settingsStore, subscriptionEventService);
   // SLA safety-sweep body (slaSweepWorkflow's slaSweepTick).
   const slaSweeper = new SlaSweeper(intercomClient, intercomStore, settingsStore, slaService, forwarderDetacher);
   // Sentry feedback → Intercom import body (sentryFeedbackWorkflow's tick).

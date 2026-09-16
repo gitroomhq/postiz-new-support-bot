@@ -1,6 +1,8 @@
 import type Stripe from "stripe";
 import { Prisma, PrismaClient, StripeDispute } from "../../generated/prisma/client";
 import { exportDisputeOutcome } from "../../metrics/MetricsExporter";
+import type { StripeSegmentResolver } from "./StripeSegmentResolver";
+import type { MoneySegments } from "./segments";
 
 // Statuses with staff work left to do — everything the overview lists.
 export const OPEN_DISPUTE_STATUSES = [
@@ -12,6 +14,35 @@ export const OPEN_DISPUTE_STATUSES = [
 
 // A response can still be submitted only in these two.
 export const RESPONDABLE_DISPUTE_STATUSES = ["needs_response", "warning_needs_response"] as const;
+
+// Stripe reads one live dispute upsert may spend on its descriptive segments:
+// the charge, its invoice, the subscription behind it, and the customer's age.
+// The resolver caches across calls, so a burst of webhooks for one dispute
+// spends this once, not once per delivery.
+const LIVE_SEGMENT_BUDGET = 4;
+
+// The stored segment columns, back in the shape the exporter wants. Exported so
+// the history backfill can re-emit outcome points with their axes intact
+// without re-reading anything from Stripe.
+export function segmentsOfDispute(row: {
+  planTier: string | null;
+  planPeriod: string | null;
+  cardBrand: string | null;
+  cardFunding: string | null;
+  cardCountry: string | null;
+  networkReason: string | null;
+  tenure: string | null;
+}): MoneySegments {
+  return {
+    planTier: row.planTier,
+    planPeriod: row.planPeriod,
+    cardBrand: row.cardBrand,
+    cardFunding: row.cardFunding,
+    cardCountry: row.cardCountry,
+    networkReason: row.networkReason,
+    tenure: row.tenure,
+  };
+}
 
 // Terminal states never regress: a late-delivered charge.dispute.updated must
 // not flip a closed dispute back to under_review (webhooks are unordered).
@@ -102,7 +133,16 @@ export const DAY_MS = 24 * 60 * 60 * 1000;
 // status, so the open-disputes overview and the reminder looper read from
 // here; webhooks and the looper reconciliation keep it fresh.
 export class DisputeStore {
+  // Optional, bound after construction (same idiom as the Discord client
+  // bindings elsewhere): the store is built before the Stripe client exists.
+  // Unbound, every dispute simply keeps null segments and charts as "unknown".
+  private segments: StripeSegmentResolver | null = null;
+
   constructor(private prisma: PrismaClient) {}
+
+  bindSegments(resolver: StripeSegmentResolver): void {
+    this.segments = resolver;
+  }
 
   // Idempotent upsert from a live Stripe dispute (webhook or reconciliation).
   // due_by can be null or 0 (bank allows no response) — both map to null.
@@ -111,7 +151,16 @@ export class DisputeStore {
   async upsertFromStripe(
     d: Stripe.Dispute,
     customerId: string | null,
-    opts?: { closedAtHint?: Date }
+    opts?: {
+      closedAtHint?: Date;
+      // Stripe reads this upsert may spend resolving the descriptive segments.
+      // undefined = the live default (a handful, mostly served from cache);
+      // null = do not touch the budget, because the CALLER opened one for a
+      // whole batch (the history backfill does exactly that, so one bounded
+      // budget covers every dispute instead of each one getting a fresh
+      // allowance and the sweep costing reads without limit).
+      enrichBudget?: number | null;
+    }
   ): Promise<StripeDispute> {
     const chargeId = typeof d.charge === "string" ? d.charge : (d.charge?.id ?? "");
     const paymentIntentId =
@@ -122,6 +171,8 @@ export class DisputeStore {
 
     const existing = await this.prisma.stripeDispute.findUnique({ where: { id: d.id } });
     if (existing && TERMINAL_STATUSES.has(existing.status) && !terminal) return existing; // stale event
+
+    const segments = await this.resolveSegments(d, existing, opts?.enrichBudget);
 
     const finalSnapshot = submitted ? snapshotTextEvidence(d) : null;
     const shared = {
@@ -140,6 +191,15 @@ export class DisputeStore {
       // but an empty read must not wipe a previous snapshot).
       evidenceFinal: finalSnapshot ?? (existing?.evidenceFinal as Prisma.InputJsonValue | undefined) ?? undefined,
       closedAt: terminal ? (existing?.closedAt ?? opts?.closedAtHint ?? new Date()) : null,
+      // Never blank out an axis a previous pass resolved: a lookup that ran out
+      // of budget returns undefined here and leaves the stored value alone.
+      planTier: segments?.planTier ?? undefined,
+      planPeriod: segments?.planPeriod ?? undefined,
+      cardBrand: segments?.cardBrand ?? undefined,
+      cardFunding: segments?.cardFunding ?? undefined,
+      cardCountry: segments?.cardCountry ?? undefined,
+      networkReason: segments?.networkReason ?? undefined,
+      tenure: segments?.tenure ?? undefined,
     };
     const row = await this.prisma.stripeDispute.upsert({
       where: { id: d.id },
@@ -157,10 +217,31 @@ export class DisputeStore {
         amountMinor: row.amount,
         currency: row.currency,
         submitted: row.evidenceSubmittedAt != null,
+        segments: segmentsOfDispute(row),
         ts: row.closedAt ?? undefined,
       });
     }
     return row;
+  }
+
+  // Who disputed us, described without identifying them. Skipped entirely when
+  // no resolver is bound, and skipped for a dispute whose axes are already
+  // known: they describe the charge behind it, which cannot change.
+  private async resolveSegments(
+    d: Stripe.Dispute,
+    existing: StripeDispute | null,
+    budget: number | null | undefined
+  ): Promise<MoneySegments | null> {
+    const resolver = this.segments;
+    if (!resolver) return null;
+    if (existing?.planTier && existing.cardBrand) return null;
+    if (budget !== null) resolver.startBatch(budget ?? LIVE_SEGMENT_BUDGET);
+    try {
+      return await resolver.forDispute(d, new Date(d.created * 1000));
+    } catch {
+      // A chart axis never fails a dispute mirror write.
+      return null;
+    }
   }
 
   async get(id: string): Promise<StripeDispute | null> {
@@ -328,11 +409,46 @@ export class DisputeStore {
 
   // Backfill export work-list: every terminal dispute in the mirror.
   async listTerminalForExport(): Promise<
-    Array<Pick<StripeDispute, "id" | "status" | "reason" | "amount" | "currency" | "closedAt" | "evidenceSubmittedAt">>
+    Array<
+      Pick<
+        StripeDispute,
+        | "id"
+        | "status"
+        | "reason"
+        | "amount"
+        | "currency"
+        | "closedAt"
+        | "evidenceSubmittedAt"
+        // The descriptive axes, so a re-emit carries them without re-reading
+        // Stripe. That is the whole point of mirroring them.
+        | "planTier"
+        | "planPeriod"
+        | "cardBrand"
+        | "cardFunding"
+        | "cardCountry"
+        | "networkReason"
+        | "tenure"
+      >
+    >
   > {
     return this.prisma.stripeDispute.findMany({
       where: { status: { in: [...TERMINAL_STATUSES] } },
-      select: { id: true, status: true, reason: true, amount: true, currency: true, closedAt: true, evidenceSubmittedAt: true },
+      select: {
+        id: true,
+        status: true,
+        reason: true,
+        amount: true,
+        currency: true,
+        closedAt: true,
+        evidenceSubmittedAt: true,
+        planTier: true,
+        planPeriod: true,
+        cardBrand: true,
+        cardFunding: true,
+        cardCountry: true,
+        networkReason: true,
+        tenure: true,
+      },
       orderBy: { closedAt: "asc" },
     });
   }

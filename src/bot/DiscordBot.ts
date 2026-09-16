@@ -77,6 +77,8 @@ import { RADAR_LISTS, type BlockService } from "./billing/BlockService";
 import { backfillDisputeHistory } from "./billing/DisputeMonitor";
 import type { DisputeStore } from "./billing/DisputeStore";
 import type { MoneyOutBackfillScope, MoneyOutService } from "./billing/MoneyOutService";
+import type { SubscriptionEventService } from "./billing/SubscriptionEventService";
+import type { StripeSegmentResolver } from "./billing/StripeSegmentResolver";
 import type { BlockKind } from "./billing/BlockStore";
 import { TICKET_ATTR_CSAT, TICKET_ATTR_CSAT_COMMENT, TICKET_ATTR_THREAD } from "../intercom/IntercomEventExecutor";
 import { IntercomMode, IntercomRegion } from "../config/SettingsStore";
@@ -207,6 +209,9 @@ export class DiscordBot {
       blockService: BlockService;
       stripeClient: StripeClient;
       disputeStore: DisputeStore;
+      // Shared with the money-out ledger, so the history backfill's segment
+      // lookups hit a warm cache instead of re-reading charges it already saw.
+      segments?: StripeSegmentResolver;
     },
     // Stripe panel (tokenized standalone page opened from the Intercom canvas).
     private intercomPanel?: IntercomPanel,
@@ -214,7 +219,10 @@ export class DiscordBot {
     private intercomAdmin?: IntercomAdmin,
     // Money-out ledger (drives /config → Billing → Money Out: the enable
     // toggle and the one-time all-time balance-transaction backfill).
-    private moneyOutService?: MoneyOutService
+    private moneyOutService?: MoneyOutService,
+    // Churn analytics (drives /config → Billing → Churn: the enable toggle,
+    // the 30-day Stripe event replay and the plan-mix snapshot).
+    private subscriptionEventService?: SubscriptionEventService
   ) {
     this.client = new Client({
       // MessageContent is privileged (enable it in the Dev Portal too) — without it
@@ -2340,6 +2348,7 @@ export class DiscordBot {
     );
     const buttons2 = new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder().setCustomId("config_money_out").setLabel("Money Out").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("config_churn").setLabel("Churn").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("config_billing_clear_channel").setLabel("Clear Channel").setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId("config_reporting").setLabel("Back").setStyle(ButtonStyle.Secondary)
     );
@@ -2353,6 +2362,9 @@ export class DiscordBot {
   // Guards against a second detached backfill starting while one is running:
   // two concurrent all-time sweeps would just fight over the same rows.
   private moneyOutBackfillRunning = false;
+  // Same single-flight guard as the money-out backfill: two replays at once
+  // would fight over the same event pages for no gain.
+  private churnReplayRunning = false;
 
   // Posts a standalone embed to the billing audit channel (falling back to the
   // general audit channel), for results that outlive their interaction.
@@ -2395,6 +2407,8 @@ export class DiscordBot {
           "• **Fees lost** — the per-chargeback fee, and fees Stripe keeps on money we handed back",
           "• **Concessions** — credit notes, discounts, write-offs, credit grants, balance credits",
           "",
+          `**Segments:** ${s.moneyOutEnrichEnabled() ? "on" : "off"}. Tags each refund and dispute with the plan, the card brand and funding type, the issuing country, the refund reason, how old the charge was and how long the customer had been paying, so Grafana can answer **which** plans we refund and **who** disputes us. Bounded values only, never anything that identifies a person. Costs a few extra Stripe reads per outflow, capped per sweep page and cached; turn it off if Stripe rate limits ever bite. History imported by a backfill is deliberately **not** segmented, so older rows read \"unknown\".`,
+          "",
           "Ordinary **processing fees are recorded but never counted**: that is what taking money costs, not money lost, and including it would make the total climb with healthy revenue. They are one click away behind the Processing cost filter.",
           "",
           "Source of truth is Stripe's own balance-transaction ledger, so this **includes refunds issued straight from the Stripe Dashboard**, which nothing else here can see. Webhooks make an outflow appear within seconds; the reconcile looper ticks every 30 min as the backstop and is the only way fees ever arrive.",
@@ -2412,6 +2426,11 @@ export class DiscordBot {
         .setCustomId("config_money_out_run_now")
         .setLabel("Reconcile Now")
         .setStyle(ButtonStyle.Secondary)
+        .setDisabled(off),
+      new ButtonBuilder()
+        .setCustomId("config_money_out_enrich_toggle")
+        .setLabel(`Segments: ${s.moneyOutEnrichEnabled() ? "on" : "off"}`)
+        .setStyle(s.moneyOutEnrichEnabled() ? ButtonStyle.Success : ButtonStyle.Secondary)
         .setDisabled(off),
       new ButtonBuilder().setCustomId("config_billing").setLabel("Back").setStyle(ButtonStyle.Secondary)
     );
@@ -2441,6 +2460,67 @@ export class DiscordBot {
         .setDisabled(off)
     );
     return { embeds: [embed], components: [row1, row2] };
+  }
+
+  // /config → Billing → Churn. The churn half of the money analytics: which
+  // plans people leave, why, and what that costs in recurring revenue.
+  private async buildChurnConfigPanel() {
+    const s = this.settingsStore;
+    const replayAt = s.subscriptionReplayDoneAt();
+    const cov = await this.subscriptionEventService?.coverage().catch(() => null);
+    const day = (d: Date | null | undefined) => (d ? `<t:${Math.floor(d.getTime() / 1000)}:d>` : "—");
+    const on = s.subscriptionEventsEnabled();
+    const embed = new EmbedBuilder()
+      .setTitle("📉 Churn Analytics")
+      .setColor(0x5865f2)
+      .setDescription(
+        [
+          `**Tracking:** ${on ? "on" : "off"}`,
+          cov
+            ? `**Stored:** ${cov.rows} movement(s), covering ${day(cov.oldest)} → ${day(cov.newest)}${
+                cov.byEvent.length ? `\n**Breakdown:** ${cov.byEvent.map((e) => `${e.event} ${e.count}`).join(" · ")}` : ""
+              }`
+            : "**Stored:** _unavailable_",
+          `**30-day replay:** ${
+            replayAt
+              ? `last run <t:${Math.floor(replayAt.getTime() / 1000)}:R>`
+              : "_never run_: the churn dashboard only covers the period since tracking was switched on"
+          }`,
+          "",
+          "Records every subscription movement into the Grafana **Money: Segments** dashboard: signups, trials converting, upgrades, downgrades, cancellations scheduled and completed, pauses, and payments starting or stopping to fail.",
+          "",
+          "Each movement carries the **plan tier and billing period**, the **region** (issuing country of the card), and, for a cancellation, Stripe's own **reason and feedback** enums plus whether the churn was **voluntary** (someone decided to leave) or **involuntary** (the payment simply stopped working). Conflating those two makes a dunning problem look like a product problem, so they are never summed together.",
+          "",
+          "Revenue movement is recorded as **MRR normalised to a month**, so a yearly plan counts a twelfth per month and sits on the same axis as a monthly one. Revenue scheduled to leave but not yet gone is kept as a **separate** number, because adding it to the completed total would count the same cancellation twice.",
+          "",
+          "Cancellation **comments are customer-written free text**. They are scrubbed of emails, links, phone numbers and Stripe ids and truncated before they are stored, and they are never used as a metric label.",
+          "",
+          "**Replay is limited to 30 days** — that is Stripe's entire event retention, not a setting. It is idempotent, so re-running it never double-counts.",
+        ].join("\n")
+      );
+    const row1 = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId("config_churn_toggle")
+        .setLabel(`Tracking: ${on ? "on" : "off"}`)
+        .setStyle(on ? ButtonStyle.Success : ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId("config_churn_replay")
+        .setLabel("Replay 30 Days")
+        .setStyle(ButtonStyle.Primary)
+        .setDisabled(!on),
+      new ButtonBuilder()
+        .setCustomId("config_churn_planmix")
+        .setLabel("Snapshot Plan Mix")
+        .setStyle(ButtonStyle.Secondary)
+        .setDisabled(!on),
+      new ButtonBuilder()
+        .setCustomId("config_churn_reemit")
+        .setLabel("Re-emit to InfluxDB")
+        .setStyle(ButtonStyle.Secondary)
+        .setDisabled(!on),
+      new ButtonBuilder().setCustomId("config_billing").setLabel("Back").setStyle(ButtonStyle.Secondary)
+    );
+    return { embeds: [embed], components: [row1] };
   }
 
   private buildDisputesConfigPanel() {
@@ -4364,6 +4444,121 @@ export class DiscordBot {
       return;
     }
 
+    if (id === "config_churn") {
+      await interaction.update(await this.buildChurnConfigPanel());
+      return;
+    }
+
+    if (id === "config_churn_toggle") {
+      await this.settingsStore.updateSubscriptionEvents({
+        subscriptionEventsEnabled: !this.settingsStore.subscriptionEventsEnabled(),
+      });
+      this.auditConfig(
+        interaction,
+        `Churn analytics → ${this.settingsStore.subscriptionEventsEnabled() ? "on" : "off"}`
+      );
+      await interaction.update(await this.buildChurnConfigPanel());
+      return;
+    }
+
+    if (id === "config_churn_planmix") {
+      await interaction.deferReply({ flags: 64 });
+      if (!this.subscriptionEventService) return;
+      try {
+        const mix = await this.subscriptionEventService.snapshotPlanMix();
+        const lines = mix.plans
+          .sort((a, b) => b.subscriptions - a.subscriptions)
+          .map(
+            (p) =>
+              `• **${p.planTier}** ${p.planPeriod.toLowerCase()} — ${p.subscriptions} sub(s), ${(p.mrrMinor / 100).toFixed(2)}/mo`
+          );
+        this.auditConfig(interaction, `Plan-mix snapshot → ${mix.scanned} active subscription(s)`);
+        await interaction.editReply({
+          embeds: [
+            makeEmbed(
+              `✅ Snapshotted **${mix.scanned}** active subscription(s).` +
+                (mix.truncated ? "\n⚠️ Hit the page cap; the gauge is incomplete." : "") +
+                (lines.length ? `\n\n${lines.join("\n")}` : ""),
+              mix.truncated ? COLORS.warn : COLORS.success
+            ),
+          ],
+        });
+      } catch (error) {
+        await interaction.editReply({
+          embeds: [makeEmbed(`Plan-mix snapshot failed: ${String(error).slice(0, 500)}`, COLORS.danger)],
+        });
+      }
+      return;
+    }
+
+    if (id === "config_churn_replay" || id === "config_churn_reemit") {
+      // Detached, for the same reason as the money-out backfill: 30 days of
+      // subscription events on a busy account pages for longer than Discord's
+      // interaction window, and a stuck "thinking…" panel is worse than a
+      // result that lands in the audit channel.
+      await interaction.deferReply({ flags: 64 });
+      if (!this.subscriptionEventService) return;
+      if (this.churnReplayRunning) {
+        await interaction.editReply({
+          embeds: [
+            makeEmbed(
+              "A churn replay is already running. Its result will post to the billing audit channel.",
+              COLORS.warn
+            ),
+          ],
+        });
+        return;
+      }
+      const reemit = id === "config_churn_reemit";
+      this.churnReplayRunning = true;
+      await interaction.editReply({
+        embeds: [
+          makeEmbed(
+            reemit
+              ? "⏳ Re-emitting every stored movement to InfluxDB at its original timestamp.\n\nThe result posts to the billing audit channel when it finishes."
+              : "⏳ Replaying the last 30 days of Stripe subscription events. That window is Stripe's entire retention, so nothing older can be imported.\n\nThe result posts to the billing audit channel when it finishes; you can close this and keep working.",
+            COLORS.brand
+          ),
+        ],
+      });
+      const service = this.subscriptionEventService;
+      void (async () => {
+        const startedAt = Date.now();
+        try {
+          const summary = reemit
+            ? `re-emitted **${await service.reemitAll()}** stored movement(s) to InfluxDB`
+            : await (async () => {
+                const r = await service.replayHistory();
+                return (
+                  `scanned **${r.scanned}** Stripe event(s), recorded **${r.created}** new movement(s)` +
+                  (r.truncated ? " — hit the page cap, run it again to continue" : "")
+                );
+              })();
+          const secs = Math.round((Date.now() - startedAt) / 1000);
+          this.auditConfig(interaction, `Churn ${reemit ? "re-emit" : "replay"} in ${secs}s → ${summary}`);
+          await this.postBillingAuditEmbed(
+            makeEmbed(
+              `✅ **Churn ${reemit ? "re-emit" : "replay"} complete** (${secs}s)\n• ${summary}` +
+                (reemit
+                  ? ""
+                  : "\n\n_Stripe retains events for 30 days; anything older cannot be imported and the dashboard simply starts there._"),
+              COLORS.success
+            )
+          );
+        } catch (error) {
+          await this.postBillingAuditEmbed(
+            makeEmbed(
+              `❌ **Churn ${reemit ? "re-emit" : "replay"} failed**: ${String(error).slice(0, 500)}`,
+              COLORS.danger
+            )
+          );
+        } finally {
+          this.churnReplayRunning = false;
+        }
+      })();
+      return;
+    }
+
     if (id === "config_money_out") {
       await interaction.update(await this.buildMoneyOutConfigPanel());
       return;
@@ -4372,6 +4567,18 @@ export class DiscordBot {
     if (id === "config_money_out_toggle") {
       await this.settingsStore.updateMoneyOut({ moneyOutEnabled: !this.settingsStore.moneyOutEnabled() });
       this.auditConfig(interaction, `Money-out ledger → ${this.settingsStore.moneyOutEnabled() ? "on" : "off"}`);
+      await interaction.update(await this.buildMoneyOutConfigPanel());
+      return;
+    }
+
+    if (id === "config_money_out_enrich_toggle") {
+      await this.settingsStore.updateMoneyOut({
+        moneyOutEnrichEnabled: !this.settingsStore.moneyOutEnrichEnabled(),
+      });
+      this.auditConfig(
+        interaction,
+        `Money-out segments → ${this.settingsStore.moneyOutEnrichEnabled() ? "on" : "off"}`
+      );
       await interaction.update(await this.buildMoneyOutConfigPanel());
       return;
     }
@@ -4506,7 +4713,11 @@ export class DiscordBot {
       await interaction.deferReply({ flags: 64 });
       if (!this.disputes) return;
       try {
-        const result = await backfillDisputeHistory(this.disputes.stripeClient, this.disputes.disputeStore);
+        const result = await backfillDisputeHistory(
+          this.disputes.stripeClient,
+          this.disputes.disputeStore,
+          this.disputes.segments
+        );
         await this.settingsStore.updateDisputes({ disputeBackfillDoneAt: new Date() });
         this.auditConfig(
           interaction,

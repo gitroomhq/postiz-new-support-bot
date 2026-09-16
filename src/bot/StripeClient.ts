@@ -833,6 +833,25 @@ export class StripeClient {
     return { events: res.data, hasMore: res.has_more };
   }
 
+  // Events of specific types since a moment, for the churn replay. Stripe
+  // retains ~30 days, which is the hard ceiling on how far back that replay can
+  // reach — there is no paid tier or parameter that extends it, so anything
+  // older simply does not exist to import.
+  async listEventsByType(opts: {
+    types: string[];
+    createdGte?: number;
+    limit?: number;
+    startingAfter?: string;
+  }): Promise<{ events: Stripe.Event[]; hasMore: boolean }> {
+    const res = await this.stripe.events.list({
+      types: opts.types,
+      limit: opts.limit ?? 100,
+      ...(opts.createdGte ? { created: { gte: opts.createdGte } } : {}),
+      ...(opts.startingAfter ? { starting_after: opts.startingAfter } : {}),
+    });
+    return { events: res.data, hasMore: res.has_more };
+  }
+
   // Account-wide subscription browse (dashboard Subscriptions list). Status
   // "all" includes canceled; price narrows to one plan.
   async listAllSubscriptions(opts: {

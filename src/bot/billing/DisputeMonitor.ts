@@ -2,7 +2,8 @@ import { ActionRowBuilder, ButtonBuilder, ButtonStyle, Client, EmbedBuilder } fr
 import { SettingsStore } from "../../config/SettingsStore";
 import { SessionStore } from "../../auth/SessionStore";
 import { StripeClient } from "../StripeClient";
-import { DisputeStore, OPEN_DISPUTE_STATUSES } from "./DisputeStore";
+import { DisputeStore, OPEN_DISPUTE_STATUSES, segmentsOfDispute } from "./DisputeStore";
+import type { StripeSegmentResolver } from "./StripeSegmentResolver";
 import { BlockStore } from "./BlockStore";
 import { CachedRatioEngine, describeRatioWindow, ratioLevel, type RatioLevel } from "./disputeRatio";
 import { COLORS } from "../../util/embeds";
@@ -98,19 +99,36 @@ function guessClosedAt(d: Stripe.Dispute, now: Date): Date {
   return new Date(Math.min(guess, now.getTime()));
 }
 
+// Stripe reads the WHOLE history sweep may spend resolving descriptive
+// segments — one budget for the entire run, not one per dispute. Disputes are
+// low-volume enough that enriching history is worth paying for (unlike the
+// money-out ledger, where all-time history is thousands of rows), but it still
+// needs a ceiling: an account with a chargeback problem has a lot of them, and
+// each one costs up to four reads. Past the cap the rest keep null segments and
+// chart as "unknown".
+const BACKFILL_SEGMENT_BUDGET = 400;
+
 export async function backfillDisputeHistory(
   stripe: StripeClient,
-  disputeStore: DisputeStore
+  disputeStore: DisputeStore,
+  segments?: StripeSegmentResolver
 ): Promise<DisputeBackfillResult> {
   const now = new Date();
   const sweep = await stripe.listAllDisputes();
+  // One budget for the run. Letting each upsert open its own would mean the cap
+  // never caps: a thousand disputes would each get a fresh allowance.
+  segments?.startBatch(BACKFILL_SEGMENT_BUDGET);
   for (const dispute of sweep.disputes) {
     const chargeId = typeof dispute.charge === "string" ? dispute.charge : (dispute.charge?.id ?? null);
     const existing = await disputeStore.get(dispute.id);
     const customerId =
       existing?.customerId ??
       (chargeId ? await stripe.getChargeCustomerId(chargeId).catch(() => null) : null);
-    await disputeStore.upsertFromStripe(dispute, customerId, { closedAtHint: guessClosedAt(dispute, now) });
+    await disputeStore.upsertFromStripe(dispute, customerId, {
+      closedAtHint: guessClosedAt(dispute, now),
+      // null = this loop owns the budget opened above.
+      enrichBudget: segments ? null : undefined,
+    });
   }
 
   // Emit outcome points for the WHOLE terminal mirror at the stored closedAt.
@@ -125,6 +143,10 @@ export async function backfillDisputeHistory(
         amountMinor: row.amount,
         currency: row.currency,
         submitted: row.evidenceSubmittedAt != null,
+        // Whatever the mirror knows about who disputed us. Re-emitting from the
+        // mirror rather than from Stripe is what lets a wiped Influx bucket be
+        // rebuilt with its axes intact.
+        segments: segmentsOfDispute(row),
         ts: row.closedAt ?? undefined,
       });
       points++;

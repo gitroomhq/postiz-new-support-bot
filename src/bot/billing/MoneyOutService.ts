@@ -13,12 +13,54 @@ import {
   type MoneyOutRow,
   type MoneyOutSource,
 } from "./moneyOutTaxonomy";
+import { StripeSegmentResolver } from "./StripeSegmentResolver";
+import { UNKNOWN, chargeAgeBucket, normalizeRefundReason, type MoneySegments } from "./segments";
 import { exportMoneyOut, exportMoneyOutSweep } from "../../metrics/MetricsExporter";
 import { flushInflux, influxActive } from "../../metrics/InfluxWriter";
 import { log } from "../../util/logger";
 import type { MoneyOutTickResult } from "../../temporal/types";
 
 const moneyLog = log.child("money-out");
+
+// The expanded source of a refund balance transaction IS the Refund object, and
+// it carries the reason and the exact amount — neither of which survives into
+// the balance transaction itself.
+function refundFromSource(bt: Stripe.BalanceTransaction | undefined): Stripe.Refund | null {
+  const src = bt?.source;
+  if (!src || typeof src === "string") return null;
+  return (src as { object?: string }).object === "refund" ? (src as Stripe.Refund) : null;
+}
+
+// The segment columns of a stored mirror row, back in the shape the exporter
+// wants. Null columns stay null so they render as "unknown" rather than
+// inventing a value the row never had.
+function segmentsOf(row: {
+  planTier: string | null;
+  planPeriod: string | null;
+  cardBrand: string | null;
+  cardFunding: string | null;
+  cardCountry: string | null;
+  refundReason: string | null;
+  refundKind: string | null;
+  chargeAge: string | null;
+  tenure: string | null;
+  networkReason: string | null;
+  surface: string | null;
+}): MoneySegments {
+  return {
+    planTier: row.planTier,
+    planPeriod: row.planPeriod,
+    cardBrand: row.cardBrand,
+    cardFunding: row.cardFunding,
+    cardCountry: row.cardCountry,
+    refundReason: row.refundReason,
+    refundKind: row.refundKind,
+    chargeAge: row.chargeAge,
+    tenure: row.tenure,
+    networkReason: row.networkReason,
+    surface: row.surface,
+  };
+}
 
 const DAY_S = 24 * 60 * 60;
 // Re-read this far behind the cursor on every sweep. Balance transactions are
@@ -40,6 +82,26 @@ const MAX_CUSTOMER_LOOKUPS_PER_PAGE = 20;
 // Flush the Influx buffer every N points during the backfill's re-emission —
 // the client drops points once its 5000-line buffer fills.
 const BACKFILL_FLUSH_EVERY = 500;
+// Per page, how many Stripe reads the sweep will spend resolving descriptive
+// segments (plan, card, region, tenure). Same shape as the customer-attribution
+// cap above and for the same reason: a segment is a chart axis, never a total,
+// so running out degrades one axis to "unknown" instead of stalling the sweep.
+// The resolver's process-wide cache means a busy account spends far less than
+// this in practice — the same few subscriptions repeat endlessly.
+const MAX_SEGMENT_LOOKUPS_PER_PAGE = 30;
+
+// The categories a descriptive segment can actually describe. Ordinary
+// processing fees are excluded deliberately: they are the highest-volume rows
+// on the account by an order of magnitude, they belong to no plan and no card,
+// and enriching them would spend the whole budget on rows nobody slices.
+const SEGMENTABLE_CATEGORIES = new Set<MoneyOutCategory>([
+  "refund",
+  "refund_failure",
+  "refund_fee",
+  "dispute",
+  "dispute_reversal",
+  "dispute_fee",
+]);
 
 // Which half of the history to import. "concessions" exists because coupons,
 // credit notes and write-offs can be added to an account whose ledger is
@@ -75,11 +137,18 @@ export interface MoneyOutBackfillResult {
 // credits) have no balance transaction at all, so they are written directly and
 // keyed on their Stripe object id — a disjoint key space that cannot collide.
 export class MoneyOutService {
+  private segments: StripeSegmentResolver;
+
   constructor(
     private settings: SettingsStore,
     private stripe: StripeClient,
-    private store: MoneyOutStore
-  ) {}
+    private store: MoneyOutStore,
+    segments?: StripeSegmentResolver
+  ) {
+    // Injectable so the webhook handler and this service share one cache — the
+    // same charge is touched by both within seconds of each other.
+    this.segments = segments ?? new StripeSegmentResolver(stripe);
+  }
 
   // Pass-through so /config can read what the mirror holds without reaching
   // past the service into the store.
@@ -173,6 +242,11 @@ export class MoneyOutService {
             maxPages: MAX_PAGES_BACKFILL,
             source: "backfill",
             resolveCustomers: false,
+            // Segments cost up to three Stripe reads per row. Over all-time
+            // history that is thousands of calls for axes on rows nobody
+            // slices, so history charts as "unknown" by design — the forward
+            // sweep and the webhooks enrich everything from here on.
+            enrichSegments: false,
             onProgress,
           });
 
@@ -200,6 +274,11 @@ export class MoneyOutService {
             amountMinor: row.amountMinor,
             feeMinor: row.feeMinor,
             netMinor: row.netMinor,
+            // Whatever the mirror learned when the row was first written. This
+            // is the point of keeping segments in Postgres: an Influx bucket
+            // that was wiped or aged out can be rebuilt with its axes intact,
+            // without re-reading a single thing from Stripe.
+            segments: segmentsOf(row),
             ts: row.occurredAt,
           });
           points++;
@@ -430,6 +509,7 @@ export class MoneyOutService {
     onProgress?: () => void;
     resolveCustomers?: boolean;
     resolveRefundFees?: boolean;
+    enrichSegments?: boolean;
   }): Promise<{ scanned: number; created: number; truncated: boolean }> {
     const emitPoints = opts.emitPoints !== false;
     let startingAfter: string | undefined;
@@ -452,11 +532,18 @@ export class MoneyOutService {
       // per row cost two queries each, which is what made an all-time backfill
       // take minutes on a busy account.
       const pageRows: MoneyOutRow[] = [];
+      // Which balance transaction produced each row. The expanded source on it
+      // carries facts the row itself cannot hold — a refund's reason, its
+      // amount against the original charge — and the enrichment pass below
+      // needs them without paying for a second read.
+      const btByRowId = new Map<string, Stripe.BalanceTransaction>();
       for (const bt of page.transactions) {
         scanned++;
         const rows = classifyBalanceTransaction(bt, opts.source);
         if (rows.length === 0) continue;
-        pageRows.push(...this.attachCustomerFromSource(rows, bt));
+        const attached = this.attachCustomerFromSource(rows, bt);
+        for (const r of attached) btByRowId.set(r.id, bt);
+        pageRows.push(...attached);
       }
 
       // Fees lost to refunds. Stripe keeps the ORIGINAL charge's processing fee
@@ -470,9 +557,17 @@ export class MoneyOutService {
           const charge = await this.chargeWithFee(movement.chargeId);
           if (!charge) continue;
           const feeRow = buildRefundFeeRow(movement, charge);
-          if (feeRow) pageRows.push(feeRow);
+          if (feeRow) {
+            const bt = btByRowId.get(movement.id);
+            if (bt) btByRowId.set(feeRow.id, bt);
+            pageRows.push(feeRow);
+          }
         }
       }
+
+      // Descriptive segments, before the write so the mirror and the Influx
+      // points carry the same axes. Never fatal: see enrichSegments.
+      if (opts.enrichSegments !== false) await this.enrichSegments(pageRows, btByRowId);
 
       const fresh = await this.store.insertNew(pageRows);
       created += fresh.length;
@@ -486,6 +581,7 @@ export class MoneyOutService {
             amountMinor: row.amountMinor,
             feeMinor: row.feeMinor,
             netMinor: row.netMinor,
+            segments: row.segments,
             ts: row.occurredAt,
           });
         }
@@ -508,6 +604,71 @@ export class MoneyOutService {
       }
       startingAfter = page.transactions[page.transactions.length - 1].id;
     }
+  }
+
+  // Descriptive segments for the rows that can carry one.
+  //
+  // Best-effort by construction, three times over: it is skipped entirely when
+  // /config turns enrichment off, it stops when the page's lookup budget runs
+  // out, and every individual resolution catches its own failure. A row that
+  // comes back without segments is written with nulls and charts as "unknown",
+  // which is the honest answer to "which plan was this" when nobody looked.
+  //
+  // It runs BEFORE the write so the Postgres mirror and the Influx point carry
+  // identical axes — a mirror that disagreed with the chart would be worse than
+  // no mirror at all.
+  private async enrichSegments(
+    rows: MoneyOutRow[],
+    btByRowId: Map<string, Stripe.BalanceTransaction>
+  ): Promise<void> {
+    if (!this.settings.moneyOutEnrichEnabled()) return;
+    const targets = rows.filter((r) => SEGMENTABLE_CATEGORIES.has(r.category));
+    if (targets.length === 0) return;
+
+    this.segments.startBatch(MAX_SEGMENT_LOOKUPS_PER_PAGE);
+    for (const row of targets) {
+      try {
+        row.segments = await this.segmentsForRow(row, btByRowId.get(row.id));
+      } catch (error) {
+        // A chart axis is never worth failing a money movement over.
+        moneyLog.debug("segment enrichment failed", {
+          "money_out.row_id": row.id,
+          "error.message": String(error),
+        });
+      }
+    }
+  }
+
+  private async segmentsForRow(
+    row: MoneyOutRow,
+    bt: Stripe.BalanceTransaction | undefined
+  ): Promise<MoneySegments> {
+    const facts = await this.segments.factsForCharge(row.chargeId);
+    const base: MoneySegments = {
+      planTier: facts.planTier,
+      planPeriod: facts.planPeriod,
+      cardBrand: facts.cardBrand,
+      cardFunding: facts.cardFunding,
+      cardCountry: facts.cardCountry,
+      tenure: await this.segments.tenureFor(facts.customerId, row.occurredAt),
+    };
+
+    const isRefund = row.category === "refund" || row.category === "refund_failure" || row.category === "refund_fee";
+    if (!isRefund) return base;
+
+    const refund = refundFromSource(bt);
+    // The charge is already in the fee cache from the refund-fee pass above, so
+    // reading the original amount here is a map lookup, not a Stripe call. When
+    // it is absent (resolveRefundFees off) full-vs-partial stays unknown rather
+    // than spending a read on it.
+    const charge = row.chargeId ? this.chargeFeeCache.get(row.chargeId) : null;
+    const refundedMinor = refund?.amount ?? Math.abs(row.amountMinor);
+    return {
+      ...base,
+      refundReason: normalizeRefundReason(refund?.reason ?? null),
+      refundKind: charge ? (refundedMinor < charge.amount ? "partial" : "full") : UNKNOWN,
+      chargeAge: chargeAgeBucket(facts.chargeCreatedAt, row.occurredAt),
+    };
   }
 
   // Free attribution: the expanded source often already names the customer.

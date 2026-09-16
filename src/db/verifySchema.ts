@@ -56,6 +56,7 @@ const EXPECTED_COLUMNS: Record<string, string[]> = {
     "kbRefreshEnabled", "kbRefreshIntervalHours", "kbLastRefreshAt", "refundMaxPer24hPerUser", "stripeWebhookEnabled",
     "stripeWebhookEndpointId", "stripeWebhookSecret", "stripeSecretKey", "publicBaseUrl",
     "influxEnabled", "influxUrl", "influxOrg", "influxBucket", "influxToken",
+    "moneyOutEnrichEnabled", "subscriptionEventsEnabled", "subscriptionReplayDoneAt",
     "scoringEnabled", "scoringIntervalHours", "scoringModel", "scoringMaxTicketsPerBatch",
     "scoringMaxBudgetUsdPerDay", "scoringLastRunAt", "scoringBackfillPending",
     "scoringEscalationEnabled", "scoringEscalationModel", "scoringEscalationIntervalHours",
@@ -115,10 +116,18 @@ const EXPECTED_COLUMNS: Record<string, string[]> = {
     "id", "chargeId", "paymentIntentId", "customerId", "amount", "currency", "reason", "status",
     "evidenceDueBy", "evidenceDraft", "evidenceFinal", "evidenceSubmittedAt", "lastReminderAt",
     "lastUrgentReminderAt", "disputeCreatedAt", "closedAt", "createdAt", "updatedAt",
+    "planTier", "planPeriod", "cardBrand", "cardFunding", "cardCountry", "networkReason", "tenure",
   ],
   stripe_money_out: [
     "id", "kind", "bucket", "category", "amountMinor", "feeMinor", "netMinor", "currency", "source",
     "reason", "stripeObjectId", "chargeId", "customerId", "occurredAt", "createdAt", "updatedAt",
+    "planTier", "planPeriod", "cardBrand", "cardFunding", "cardCountry", "refundReason", "refundKind",
+    "chargeAge", "tenure", "networkReason", "surface",
+  ],
+  stripe_subscription_events: [
+    "id", "subscriptionId", "customerId", "event", "planTier", "planPeriod", "fromTier", "fromPeriod",
+    "currency", "mrrMinor", "mrrDeltaMinor", "mrrAtRiskMinor", "churnType", "cancelReason",
+    "cancelFeedback", "comment", "cardCountry", "source", "occurredAt", "createdAt",
   ],
   blocked_entities: [
     "id", "kind", "value", "reason", "source", "actorId", "actorName", "customerId", "disputeId",

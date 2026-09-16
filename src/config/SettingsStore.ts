@@ -1147,10 +1147,36 @@ export class SettingsStore {
     return this.settings.moneyOutBackfillDoneAt;
   }
 
+  // Segment enrichment: resolving a refund's plan / card / region costs up to
+  // three extra Stripe reads. On by default because the reads are bounded and
+  // cached, and switchable on its own so a rate-limit scare can turn off the
+  // enrichment without turning off the ledger that feeds every money total.
+  moneyOutEnrichEnabled(): boolean {
+    return this.settings.moneyOutEnrichEnabled;
+  }
+
   async updateMoneyOut(data: {
     moneyOutEnabled?: boolean;
     moneyOutSweepAt?: Date | null;
     moneyOutBackfillDoneAt?: Date | null;
+    moneyOutEnrichEnabled?: boolean;
+  }): Promise<void> {
+    this.settings = await this.prisma.botSettings.update({ where: { id: "global" }, data });
+  }
+
+  // ---- Subscription lifecycle / churn analytics ----
+
+  subscriptionEventsEnabled(): boolean {
+    return this.settings.subscriptionEventsEnabled;
+  }
+
+  subscriptionReplayDoneAt(): Date | null {
+    return this.settings.subscriptionReplayDoneAt;
+  }
+
+  async updateSubscriptionEvents(data: {
+    subscriptionEventsEnabled?: boolean;
+    subscriptionReplayDoneAt?: Date | null;
   }): Promise<void> {
     this.settings = await this.prisma.botSettings.update({ where: { id: "global" }, data });
   }

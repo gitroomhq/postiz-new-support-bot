@@ -1,4 +1,5 @@
 import { writePoint } from "./InfluxWriter";
+import { segmentTags, type MoneySegments } from "../bot/billing/segments";
 
 // Typed, fire-and-forget domain-event exporters over writePoint. Every helper
 // no-ops when the exporter is inactive and never throws — call sites stay
@@ -119,11 +120,20 @@ export function exportDisputeOutcome(p: {
   amountMinor: number;
   currency: string;
   submitted: boolean; // evidence was submitted before it closed
+  // Who disputed us, described without identifying anyone: card brand and
+  // funding type, issuing country, the plan they were on, the network's own
+  // reason code, and how long they had been a customer. See segments.ts.
+  segments?: MoneySegments | null;
   ts?: Date;
 }): void {
   writePoint(
     "dispute_outcomes",
-    { outcome: p.outcome, reason: p.reason, currency: p.currency.toLowerCase() },
+    {
+      outcome: p.outcome,
+      reason: p.reason,
+      currency: p.currency.toLowerCase(),
+      ...segmentTags(p.segments),
+    },
     { count: 1, amount_minor: p.amountMinor, submitted: p.submitted ? 1 : 0 },
     p.ts
   );
@@ -146,11 +156,23 @@ export function exportMoneyOut(p: {
   amountMinor: number;
   feeMinor?: number;
   netMinor?: number;
+  // Descriptive axes: which plan, which card, which country, why, how old the
+  // charge was, how long the customer had been paying. Always ALL of them —
+  // segmentTags fills what the caller did not know with "unknown", because a
+  // tag present on some points and missing on others splits a Grafana group-by
+  // into two disjoint answers to one question. Never any PII: see segments.ts.
+  segments?: MoneySegments | null;
   ts?: Date;
 }): void {
   writePoint(
     "money_out",
-    { bucket: p.bucket, category: p.category, currency: p.currency.toLowerCase(), source: p.source },
+    {
+      bucket: p.bucket,
+      category: p.category,
+      currency: p.currency.toLowerCase(),
+      source: p.source,
+      ...segmentTags(p.segments),
+    },
     {
       count: 1,
       amount_minor: p.amountMinor,
@@ -158,6 +180,98 @@ export function exportMoneyOut(p: {
       net_minor: p.netMinor ?? p.amountMinor,
     },
     p.ts
+  );
+}
+
+// One point per subscription lifecycle movement: a signup, a plan change, a
+// scheduled or completed cancellation, a trial converting, a payment starting
+// or stopping to fail.
+//
+// This is the churn measurement, and it is NOT a money_out measurement: a
+// cancellation moves no money on the day it happens, it removes future revenue.
+// Mixing the two would double-count a refund-and-cancel as two losses.
+//
+// mrr_delta_minor is SIGNED and normalised to a month (a yearly plan counts a
+// twelfth per month), so a window sum is net revenue movement: signups and
+// upgrades positive, downgrades and churn negative. mrr_at_risk_minor is the
+// separate "scheduled to leave but has not left yet" number, which must never
+// be added to the delta or a cancellation counts twice.
+export type SubscriptionEventKind =
+  | "created"
+  | "trial_started"
+  | "trial_converted"
+  | "upgraded"
+  | "downgraded"
+  | "cancel_scheduled"
+  | "cancel_reverted"
+  | "canceled"
+  | "paused"
+  | "resumed"
+  | "payment_failing"
+  | "payment_recovered";
+
+export function exportSubscriptionEvent(p: {
+  event: SubscriptionEventKind;
+  planTier: string;
+  planPeriod: string;
+  // Plan change only: where it moved from. "none" on everything else, so the
+  // tag key stays present on every point in the measurement.
+  fromTier?: string | null;
+  fromPeriod?: string | null;
+  currency: string;
+  // voluntary | involuntary | unknown — a dunning failure and a decision to
+  // leave are different problems and must never share a number.
+  churnType?: string | null;
+  // Stripe's own bounded enums. The customer's free-text comment is a FIELD
+  // below, never a tag.
+  cancelReason?: string | null;
+  cancelFeedback?: string | null;
+  cardCountry?: string | null;
+  mrrDeltaMinor?: number | null;
+  mrrAtRiskMinor?: number | null;
+  // Scrubbed and truncated by segments.scrubFreeText. Free text written by a
+  // customer, so it is stored only as a field and only after redaction.
+  comment?: string | null;
+  ts?: Date;
+}): void {
+  writePoint(
+    "subscription_events",
+    {
+      event: p.event,
+      plan_tier: p.planTier,
+      plan_period: p.planPeriod,
+      from_tier: p.fromTier || "none",
+      from_period: p.fromPeriod || "none",
+      currency: p.currency.toLowerCase(),
+      churn_type: p.churnType || "unknown",
+      cancel_reason: p.cancelReason || "none",
+      cancel_feedback: p.cancelFeedback || "none",
+      card_country: p.cardCountry || "unknown",
+    },
+    {
+      count: 1,
+      mrr_delta_minor: p.mrrDeltaMinor ?? 0,
+      mrr_at_risk_minor: p.mrrAtRiskMinor ?? 0,
+      has_comment: p.comment ? 1 : 0,
+      comment: p.comment ?? undefined,
+    },
+    p.ts
+  );
+}
+
+// Gauge of the installed base, one point per tier/period on every snapshot
+// tick. Churn counts are meaningless without it: ten cancellations out of
+// twenty customers and ten out of two thousand are not the same event.
+export function exportPlanMix(p: {
+  planTier: string;
+  planPeriod: string;
+  subscriptions: number;
+  mrrMinor: number;
+}): void {
+  writePoint(
+    "plan_mix",
+    { plan_tier: p.planTier, plan_period: p.planPeriod },
+    { subscriptions: p.subscriptions, mrr_minor: p.mrrMinor }
   );
 }
 
@@ -264,6 +378,11 @@ export function exportDisputeSnapshot(p: {
   plain30dPct?: number | null;
   vamp30dPct?: number | null;
   vampMonthPct?: number | null;
+  // Queue depth of the dispute auto-resolve engine: everything it still owes an
+  // outcome. Written only by the 5-minute snapshot tick, never by the dispute
+  // looper — one gauge, one writer, or the series sawtooths between two
+  // cadences and nobody can tell which reading is current.
+  autoResolvePending?: number | null;
 }): void {
   writePoint(
     "dispute_snapshot",
@@ -275,7 +394,87 @@ export function exportDisputeSnapshot(p: {
       plain_30d_pct: p.plain30dPct ?? undefined,
       vamp_30d_pct: p.vamp30dPct ?? undefined,
       vamp_month_pct: p.vampMonthPct ?? undefined,
+      auto_resolve_pending: p.autoResolvePending ?? undefined,
     }
+  );
+}
+
+// ---- dispute auto-resolve engine ----
+
+// One point per decision the auto-resolve engine makes: a refund it proposed,
+// executed, had vetoed by staff, or refused to make.
+//
+// `reason` is a union of TWO bounded vocabularies keyed by `stage`: a Stripe
+// dispute reason at the inquiry stage, and an early-fraud-warning fraud_type at
+// the EFW stage (an EFW has no dispute behind it yet, so it has no dispute
+// reason). Both are bounded, so cardinality is fine, but nothing reading this
+// measurement may assume the value is a dispute reason.
+//
+// `amountMinor` is in the CHARGE's own currency and is never converted. Any USD
+// conversion the engine does is a threshold comparison only: a converted figure
+// reaching Influx would let someone sum money that was never in one currency.
+export function exportDisputeAutoResolve(p: {
+  stage: "inquiry" | "efw";
+  outcome: "proposed" | "executed" | "vetoed" | "blocked" | "failed";
+  reason: string;
+  currency: string;
+  // Which guardrail refused the action. Defaulted here rather than at the call
+  // site, and ALWAYS emitted: a tag that is present on blocked points and
+  // absent on executed ones makes those two different series, and a group-by on
+  // guardrail would silently drop every executed point.
+  guardrail?: string | null;
+  amountMinor?: number | null;
+}): void {
+  writePoint(
+    "dispute_auto_resolve",
+    {
+      stage: p.stage,
+      outcome: p.outcome,
+      reason: p.reason || "unknown",
+      currency: p.currency.toLowerCase(),
+      guardrail: p.guardrail || "none",
+    },
+    { count: 1, amount_minor: p.amountMinor ?? undefined }
+  );
+}
+
+// One point per evidence pack assembled for a dispute response: how much of the
+// recommended evidence was actually filled, and how much of it came from a
+// template rather than from someone typing.
+export function exportDisputeEvidencePack(p: {
+  reason: string;
+  source: "template" | "manual" | "mixed";
+  fieldsFilled: number;
+  fieldsRecommended: number;
+  filesAttached: number;
+  autoSubmitted: boolean;
+}): void {
+  writePoint(
+    "dispute_evidence_pack",
+    { reason: p.reason || "unknown", source: p.source },
+    {
+      count: 1,
+      fields_filled: p.fieldsFilled,
+      fields_recommended: p.fieldsRecommended,
+      files_attached: p.filesAttached,
+      auto_submitted: p.autoSubmitted ? 1 : 0,
+    }
+  );
+}
+
+// Response timing for the deadline-risk view: how long we took to submit, and
+// how much runway was left when we did. A shrinking hoursBeforeDeadline is the
+// leading indicator of a missed response, which is an automatic loss.
+export function exportDisputeResponse(p: {
+  reason: string;
+  currency: string;
+  hoursToSubmit: number;
+  hoursBeforeDeadline: number;
+}): void {
+  writePoint(
+    "dispute_response",
+    { reason: p.reason || "unknown", currency: p.currency.toLowerCase() },
+    { count: 1, hours_to_submit: p.hoursToSubmit, hours_before_deadline: p.hoursBeforeDeadline }
   );
 }
 
