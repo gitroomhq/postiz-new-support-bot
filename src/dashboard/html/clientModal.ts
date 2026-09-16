@@ -104,6 +104,10 @@ D.openModal = function (a) {
     if (!inp.multiline) ctrl.type = inp.type === "number" ? "number" : "text";
     ctrl.id = "mi_" + inp.key; ctrl.autocomplete = "off";
     if (inp.placeholder) ctrl.placeholder = inp.placeholder;
+    // Prefill, so an edit dialog opens on the current text instead of empty.
+    if (inp.value != null) ctrl.value = inp.value;
+    if (inp.multiline) ctrl.rows = inp.rows || 8;
+    if (inp.maxLength) ctrl.maxLength = inp.maxLength;
     if (inp.type === "number") {
       if (inp.min !== undefined) ctrl.min = String(inp.min);
       if (inp.max !== undefined) ctrl.max = String(inp.max);

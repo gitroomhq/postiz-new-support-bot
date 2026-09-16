@@ -2216,11 +2216,29 @@ function autoResolveRow(over: Record<string, unknown> = {}) {
   };
 }
 
+const templateState: { saved: Array<{ reason: string; field: string; body: string }>; reset: string[] } = {
+  saved: [],
+  reset: [],
+};
+
+const fakeTemplateStore = {
+  overrides: async () => new Map(),
+  save: async (reason: string, field: string, body: string) => {
+    templateState.saved.push({ reason, field, body });
+    return {} as never;
+  },
+  reset: async (reason: string, field: string) => {
+    templateState.reset.push(`${reason}/${field}`);
+    return true;
+  },
+};
+
 function disputesDeps(fakes?: ReturnType<typeof evidenceFakes>) {
   return {
     ratio: fakeRatio,
     evidence: (fakes ?? evidenceFakes()).svc,
     autoResolveStore: fakeAutoResolveStore as never,
+    templateStore: fakeTemplateStore as never,
   };
 }
 
@@ -2237,10 +2255,14 @@ const fakeRatio = {
 test("disputes overview: tabs + level-tinted ratio strip + due-date board (respondable only, urgency badges)", async () => {
   const section = makeDisputesSection(disputesDeps());
   const page = await section.buildPage(disputesCtx(), { page: "disputes", filters: {} });
-  const tabs = page!.blocks[0] as { type: string; items: Array<{ label: string; badge?: string }> };
+  // The header carries the only entry point to the template editor.
+  const header = page!.blocks[0] as { type: string; actions?: Array<{ ref?: { page: string } }> };
+  assert.equal(header.type, "header");
+  assert.equal(header.actions?.[0].ref?.page, "disputes.templates");
+  const tabs = page!.blocks[1] as { type: string; items: Array<{ label: string; badge?: string }> };
   assert.equal(tabs.type, "tabs");
   assert.equal(tabs.items[0].badge, "3"); // 2 needs_response + 1 warning_needs_response
-  const strip = page!.blocks[1] as { items: Array<{ label: string; value: string; badge?: { text: string } }> };
+  const strip = page!.blocks[2] as { items: Array<{ label: string; value: string; badge?: { text: string } }> };
   const byLabel = Object.fromEntries(strip.items.map((i) => [i.label, i]));
   assert.equal(byLabel["This month"].value, "0.89%");
   assert.equal(byLabel["This month"].badge?.text, "warn"); // ≥0.75 warn threshold
@@ -6727,4 +6749,85 @@ test("auto-resolve veto: cancels without a typed confirmation, and reports a los
   const bad = await section.action!(ctx, { key: "section:disputes.autoresolve_veto", params: { id: "nope" } });
   assert.equal(bad.ok, false);
   assert.match(bad.error ?? "", /not valid/);
+});
+
+
+// ---- evidence template editor ----
+
+test("template editor: paginates at 10 fields, badges the source, and prefills the edit textarea", async () => {
+  const section = makeDisputesSection(disputesDeps());
+  assert.equal(section.ownsPage("disputes.templates"), true);
+  const page = await section.buildPage(disputesCtx(), { page: "disputes.templates", filters: {} });
+  const table = page!.blocks.find((b) => b.type === "table") as TableBlock;
+  // "general" is nine fields, so it fits on one page and correctly has no cursor.
+  assert.ok(table.rows.length <= 10, "a reviewer reads ten rows, not twenty-five");
+  assert.equal(table.nextCursor, null);
+
+  // A reason that adds its own fields goes over ten and must paginate.
+  const longer = await section.buildPage(disputesCtx(), {
+    page: "disputes.templates",
+    filters: { reason: "subscription_canceled" },
+  });
+  const longTable = longer!.blocks.find((b) => b.type === "table") as TableBlock;
+  assert.equal(longTable.rows.length, 10);
+  assert.ok(longTable.nextCursor, "the eleventh field is on page two");
+
+  // The edit action must open on the CURRENT text: retyping 3000 characters of
+  // policy wording is not an edit.
+  const edit = table.rows[0].actions!.find((a) => a.key === "section:disputes.template_save")!;
+  const body = edit.inputs![0] as { multiline?: boolean; value?: string };
+  assert.equal(body.multiline, true);
+  assert.ok((body.value ?? "").length > 50, "the shipped text is prefilled");
+});
+
+test("template editor: an unknown token is refused, because it would render literally at the bank", async () => {
+  const section = makeDisputesSection(disputesDeps());
+  const res = await section.action!(disputesCtx(), {
+    key: "section:disputes.template_save",
+    params: { reason: "general", field: "uncategorized_text", body: "The subscription for {{customer.emial}} renewed as disclosed." },
+  });
+  assert.equal(res.ok, false);
+  assert.match(res.fieldErrors?.body ?? "", /customer\.emial/);
+});
+
+test("template editor: an internal artifact is refused and an em-dash is scrubbed", async () => {
+  const section = makeDisputesSection(disputesDeps());
+  const leak = await section.action!(disputesCtx(), {
+    key: "section:disputes.template_save",
+    params: { reason: "general", field: "refund_policy_disclosure", body: "Our policy lives in ./postiz-docs/cloud/refunds.mdx and applies to all." },
+  });
+  assert.equal(leak.ok, false);
+  assert.match(leak.fieldErrors?.body ?? "", /bank analyst/);
+
+  templateState.saved = [];
+  const dash = await section.action!(disputesCtx(), {
+    key: "section:disputes.template_save",
+    params: {
+      reason: "general",
+      field: "refund_policy_disclosure",
+      body: "The refund policy\u2014published in our documentation\u2014applies to every customer identically.",
+    },
+  });
+  assert.equal(dash.ok, true);
+  assert.match(dash.text ?? "", /em-dashes/i);
+  assert.ok(!templateState.saved[0].body.includes("\u2014"), "the stored text carries no em-dash");
+});
+
+test("template editor: reset needs a typed confirmation, save does not", async () => {
+  const section = makeDisputesSection(disputesDeps());
+  const ctx = disputesCtx();
+  const noConfirm = await section.action!(ctx, {
+    key: "section:disputes.template_reset",
+    params: { reason: "general", field: "uncategorized_text" },
+  });
+  assert.equal(noConfirm.ok, false);
+
+  templateState.reset = [];
+  const done = await section.action!(ctx, {
+    key: "section:disputes.template_reset",
+    params: { reason: "general", field: "uncategorized_text" },
+    confirmWord: "CONFIRM",
+  });
+  assert.equal(done.ok, true);
+  assert.deepEqual(templateState.reset, ["general/uncategorized_text"]);
 });

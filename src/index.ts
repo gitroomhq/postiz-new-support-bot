@@ -701,6 +701,7 @@ async function main() {
       evidence: disputeEvidenceService,
       evidencePack: evidencePackBuilder,
       autoResolveStore,
+      templateStore: evidenceTemplateStore,
     }),
     makeCatalogSection(),
     makeLinksSection(),

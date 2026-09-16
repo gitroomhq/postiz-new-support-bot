@@ -48,7 +48,19 @@ export type Cell =
   | { t: "avatar"; icon: "customer" | "product" | "invoice" | "subscription"; v: string; sub?: string; ref?: ObjectRef };
 
 export type InputField =
-  | { type: "text"; key: string; label: string; placeholder?: string; multiline?: boolean; maxLength?: number }
+  // `value` prefills the control, which a textarea needs for an EDIT dialog:
+  // retyping three thousand characters of policy text is not an edit. `rows`
+  // sizes a multiline control.
+  | {
+      type: "text";
+      key: string;
+      label: string;
+      placeholder?: string;
+      multiline?: boolean;
+      maxLength?: number;
+      value?: string;
+      rows?: number;
+    }
   | { type: "number"; key: string; label: string; min?: number; max?: number; placeholder?: string }
   | { type: "select"; key: string; label: string; options: Opt[]; value?: string }
   | { type: "toggle"; key: string; label: string; value?: boolean };

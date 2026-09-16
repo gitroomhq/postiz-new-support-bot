@@ -14,6 +14,17 @@ import {
 } from "../../bot/billing/DisputeEvidenceService";
 import type { EvidencePackBuilder } from "../../bot/billing/evidence/EvidencePackBuilder";
 import type { AutoResolveStore } from "../../bot/billing/AutoResolveStore";
+import type { TemplateStore } from "../../bot/billing/evidence/TemplateStore";
+import { NO_INTERNAL_ARTIFACT, templateTokens, tokensIn } from "../../bot/billing/evidence/renderTemplate";
+import { TOKEN_NAMES } from "../../bot/billing/evidence/tokens";
+import {
+  PACK_FIELDS_BY_REASON,
+  PACK_REASONS,
+  TEMPLATE_LIBRARY,
+  TEMPLATE_VERSION,
+  templateFor,
+  type PackReason,
+} from "../../bot/billing/evidence/templates";
 import { exportBillingEvent } from "../../metrics/MetricsExporter";
 import type { ActionActor } from "../../bot/billing/actions/BillingActionService";
 import { ActionButton, Badge, Block, Cell, EvidenceBlock, TableBlock } from "../renderer/contract";
@@ -30,6 +41,9 @@ import { amount, badgeCell, idCell, isoDateCell, sentence, strong, text } from "
 // behind /billing → Disputes — so both surfaces stay in lockstep.
 
 const PAGE_SIZE = 25;
+// The template editor lists one row per evidence field, so it paginates at a
+// size a reviewer can actually read rather than the 25-row list default.
+const TEMPLATE_PAGE_SIZE = 10;
 const BOARD_WINDOW = 50;
 
 const DUE_URGENT_HOURS = 24;
@@ -43,6 +57,8 @@ interface DisputesDeps {
   evidencePack?: EvidencePackBuilder | null;
   // Auto-resolve queue, so the money-moving automation is visible and stoppable.
   autoResolveStore?: AutoResolveStore | null;
+  // Operator overrides for the shipped evidence corpus.
+  templateStore?: TemplateStore | null;
 }
 
 
@@ -51,11 +67,17 @@ export function makeDisputesSection(deps: DisputesDeps): DashboardSectionModule 
     nav: [{ key: "disputes", label: "Disputes", page: "disputes" }],
 
     ownsPage(page: string): boolean {
-      return page === "disputes" || page === "disputes.detail" || page === "disputes.review";
+      return (
+        page === "disputes" ||
+        page === "disputes.detail" ||
+        page === "disputes.review" ||
+        page === "disputes.templates"
+      );
     },
 
     async buildPage(ctx: DashboardCtx, req): Promise<SectionPage | null> {
       if (req.page === "disputes") return list(ctx, deps, req.filters ?? {}, req.cursor ?? null);
+      if (req.page === "disputes.templates") return templatesPage(ctx, deps, req.filters ?? {}, req.cursor ?? null);
       const id = validId("dispute", req.params?.id);
       if (!id) return notFound("That dispute id is not valid (dp_/du_…).");
       if (req.page === "disputes.review") return review(ctx, deps, id);
@@ -99,6 +121,56 @@ async function disputeAction(
   p: Record<string, unknown>,
   confirmWord: string | undefined
 ): Promise<{ ok: boolean; text?: string; error?: string; fieldErrors?: Record<string, string>; needsReverse?: boolean }> {
+  const confirmed = confirmWord === "CONFIRM";
+
+  // Template edits are keyed on (reason, field), not on a dispute, so they also
+  // run before the dispute-id guard.
+  if (key === "section:disputes.template_save" || key === "section:disputes.template_reset") {
+    const store = deps.templateStore;
+    if (!store) return { ok: false, error: "The template store is not configured." };
+    const reason = str(p.reason, 40);
+    const field = str(p.field, 64);
+    if (!(PACK_REASONS as readonly string[]).includes(reason)) return { ok: false, error: "Unknown dispute reason." };
+    if (!EVIDENCE_KEY_SET.has(field)) return { ok: false, error: "Unknown evidence field." };
+
+    if (key === "section:disputes.template_reset") {
+      if (!confirmed) return { ok: false, error: "Type CONFIRM to restore the shipped text." };
+      const removed = await store.reset(reason, field);
+      await ctx.audit(`Dispute template override reset: ${reason}/${field}`);
+      return { ok: true, text: removed ? "Override removed; the shipped text is back in use." : "There was no override." };
+    }
+
+    const body = str(p.body, 3600).trim();
+    if (body.length < 20) return { ok: false, fieldErrors: { body: "Too short to be evidence." } };
+    if (body.length > 3500) return { ok: false, fieldErrors: { body: "Longer than Stripe accepts for one field." } };
+    // An unknown token would render as a literal {{...}} at the bank, which is
+    // the single worst thing this editor could allow.
+    const unknown = tokensIn(body).filter((t) => !TOKEN_NAMES.includes(t));
+    if (unknown.length) {
+      return {
+        ok: false,
+        fieldErrors: { body: `Unknown token(s): ${unknown.map((t) => `{{${t}}}`).join(", ")}. Available: ${TOKEN_NAMES.join(", ")}` },
+      };
+    }
+    if (NO_INTERNAL_ARTIFACT.test(body)) {
+      return { ok: false, fieldErrors: { body: "That mentions an internal file or repository. The reader is a bank analyst." } };
+    }
+    const hadDash = body.includes("\u2014");
+    await store.save(reason, field, body.replace(/\u2014/g, ", "), ctx.actor.id, ctx.actor.name);
+    await ctx.audit(`Dispute template override saved: ${reason}/${field} (${body.length} chars)`);
+    // A shipped `requires` gate is not the operator's to remove, so a reworded
+    // field that drops its grounding token is flagged rather than silently
+    // allowed to assert something we cannot prove.
+    const shipped = templateFor(reason as PackReason, field);
+    const lostGate = (shipped?.requires ?? []).filter((t) => !tokensIn(body).includes(t));
+    return {
+      ok: true,
+      text:
+        `Saved.${hadDash ? " Em-dashes were replaced with commas." : ""}` +
+        (lostGate.length ? ` Note: the shipped version referenced ${lostGate.join(", ")}; the gate on that claim still applies.` : ""),
+    };
+  }
+
   // Handled BEFORE the dispute-id guard: an auto-resolve row is keyed on its
   // own id, and a fraud-warning row has no dispute at all.
   //
@@ -125,7 +197,6 @@ async function disputeAction(
 
   const disputeId = validId("dispute", p.disputeId);
   if (!disputeId) return { ok: false, error: "Bad dispute id." };
-  const confirmed = confirmWord === "CONFIRM";
 
   switch (key) {
     // T0 — autosave one field into the LOCAL draft (empty never wipes).
@@ -331,6 +402,14 @@ async function list(
     .reduce((sum, c) => sum + c.count, 0);
 
   const blocks: Block[] = [];
+  blocks.push({
+    type: "header",
+    title: "Disputes",
+    sub: "Evidence is written from templates and real account facts, with no model involved.",
+    actions: [
+      { key: "nav.templates", label: "Evidence templates", style: "secondary", ref: { page: "disputes.templates" } },
+    ],
+  });
   blocks.push({
     type: "tabs",
     key: "view",
@@ -612,6 +691,127 @@ async function autoResolveBlocks(
       "Refunding an inquiry-stage dispute closes it as prevented, so it never counts toward the dispute ratio. Cancelling stops the refund; it does not close the dispute.",
   };
   return [table];
+}
+
+// Evidence template editor.
+//
+// The shipped corpus is reviewed text in the repository; a row here overrides
+// exactly one (reason, field) pair so wording can be fixed without a deploy.
+// The per-field fallback means most fields show as inherited from "general",
+// which is what keeps the corpus small enough to maintain.
+async function templatesPage(
+  ctx: DashboardCtx,
+  deps: DisputesDeps,
+  filters: Record<string, string>,
+  cursor: string | null
+): Promise<SectionPage> {
+  const store = deps.templateStore;
+  if (!store) {
+    return {
+      title: "Evidence templates",
+      crumbs: [{ label: "Disputes", ref: { page: "disputes" } }, { label: "Templates" }],
+      blocks: [{ type: "notice", badge: { kind: "info", text: "Off" }, text: "The template store is not configured." }],
+    };
+  }
+
+  const reason = (PACK_REASONS as readonly string[]).includes(filters.reason ?? "")
+    ? (filters.reason as PackReason)
+    : "general";
+  const offset = /^\d{1,6}$/.test(cursor ?? "") ? Number(cursor) : 0;
+  const overrides = await store.overrides();
+
+  const fields = PACK_FIELDS_BY_REASON[reason];
+  const shown = fields.slice(offset, offset + TEMPLATE_PAGE_SIZE);
+
+  const blocks: Block[] = [
+    {
+      type: "tabs",
+      key: "reason",
+      value: reason === "general" ? undefined : reason,
+      items: PACK_REASONS.map((r) => ({ value: r === "general" ? "" : r, label: sentence(r.replace(/_/g, " ")) })),
+    },
+  ];
+
+  const table: TableBlock = {
+    type: "table",
+    key: "templates",
+    columns: [
+      { key: "field", label: "Evidence field" },
+      { key: "source", label: "Source" },
+      { key: "length", label: "Length" },
+      { key: "tokens", label: "Tokens used" },
+    ],
+    rows: shown.map((field) => {
+      const own = overrides.get(`${reason}:${field}`);
+      const general = overrides.get(`general:${field}`);
+      const template = templateFor(reason, field, overrides);
+      const body = (template?.blocks ?? []).map((b) => b.text).join("\n\n");
+      const tokens = template ? templateTokens(template) : [];
+      const source: Badge = own
+        ? { kind: "warn", text: "Override" }
+        : general
+          ? { kind: "warn", text: "Override (general)" }
+          : TEMPLATE_LIBRARY[reason]?.[field]
+            ? { kind: "ok", text: "Shipped" }
+            : { kind: "neutral", text: "Inherited" };
+      return {
+        id: field,
+        cells: [
+          strong(field),
+          { t: "badge", b: source } as Cell,
+          text(`${body.length} chars`),
+          text(tokens.slice(0, 4).join(", ") + (tokens.length > 4 ? ` +${tokens.length - 4}` : "")),
+        ] as Cell[],
+        actions: [
+          {
+            key: "section:disputes.template_save",
+            label: "Edit",
+            style: "secondary",
+            params: { reason, field },
+            inputs: [
+              {
+                type: "text",
+                key: "body",
+                label: "Template text (paragraphs separated by a blank line)",
+                multiline: true,
+                rows: 14,
+                maxLength: 3500,
+                value: body,
+              },
+            ],
+          },
+          ...(own
+            ? ([
+                {
+                  key: "section:disputes.template_reset",
+                  label: "Reset to shipped",
+                  style: "danger",
+                  dangerous: true,
+                  params: { reason, field },
+                },
+              ] as ActionButton[])
+            : []),
+        ] as ActionButton[],
+      };
+    }),
+    nextCursor: offset + TEMPLATE_PAGE_SIZE < fields.length ? String(offset + TEMPLATE_PAGE_SIZE) : null,
+    empty: "No templated fields for this reason.",
+    footer: `${shown.length} of ${fields.length} field${fields.length === 1 ? "" : "s"} · corpus ${TEMPLATE_VERSION}`,
+    notice:
+      "A field renders only when every token in it resolves. Anything unresolved drops that paragraph, or the whole field, rather than reaching a bank with a gap in it.",
+  };
+  blocks.push(table);
+  blocks.push({
+    type: "notice",
+    badge: { kind: "info", text: "Tokens" },
+    text: `Available tokens: ${TOKEN_NAMES.join(", ")}`,
+  });
+
+  return {
+    title: "Evidence templates",
+    crumbs: [{ label: "Disputes", ref: { page: "disputes" } }, { label: "Templates" }],
+    blocks,
+  };
 }
 
 // History & stats: outcome tiles + win-rate by reason + closed list.
