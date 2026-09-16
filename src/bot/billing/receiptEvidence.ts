@@ -16,7 +16,7 @@ export type ReceiptAttachResult =
 // evidence slot. Always submit:false — the bank sees nothing until Submit
 // Evidence. Never overwrites an already-filled slot, so a manual upload (or a
 // previous run) wins. Used by the dispute-created webhook auto-action and as
-// a backfill when staff run AI Draft; callers own claims/error policy.
+// a backfill when the evidence pack is rebuilt; callers own claims/error policy.
 export async function attachReceiptEvidence(stripe: StripeClient, dispute: Stripe.Dispute): Promise<ReceiptAttachResult> {
   if (!RESPONDABLE.has(dispute.status)) return { attached: false, reason: "not_respondable" };
   if (dispute.evidence?.receipt) return { attached: false, reason: "slot_filled" };

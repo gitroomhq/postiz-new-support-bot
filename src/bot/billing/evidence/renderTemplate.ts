@@ -56,7 +56,8 @@ export const NO_UNRESOLVED_TOKEN = /\{\{|\}\}/;
 // Mined from the old drafting prompt's rules, which stay correct without it:
 // the reader is a bank analyst, not a developer.
 export const NO_INTERNAL_ARTIFACT = /(\.\/|\bsrc\/|postiz-app|postiz-docs|\.mdx\b|\.ts\b|localhost|prisma|node_modules)/i;
-const EM_DASH = /—/g;
+// Written as an escape so the codebase itself stays free of literal em-dashes.
+const EM_DASH = /\u2014/g;
 
 export type DropReason = "unresolved_token" | "internal_artifact" | "too_short" | "no_blocks" | "missing_requires";
 
