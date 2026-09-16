@@ -217,7 +217,19 @@ export class SessionStore {
   async claimBillingAction(
     discordUserId: string,
     chargeId: string,
-    action: "refund" | "discount" | "admin_refund" | "dispute_submit" | "dispute_accept" | "dispute_autocancel" | "dispute_autoblock" | "dispute_receipt"
+    action:
+      | "refund"
+      | "discount"
+      | "admin_refund"
+      | "dispute_submit"
+      | "dispute_accept"
+      | "dispute_autocancel"
+      | "dispute_autoblock"
+      | "dispute_receipt"
+      // Auto-resolve claims the CHARGE, not the dispute or the fraud warning:
+      // an early fraud warning and a later inquiry dispute on the same charge
+      // must collide rather than refund it twice.
+      | "dispute_autoresolve"
   ): Promise<boolean> {
     try {
       await this.prisma.billingAction.create({

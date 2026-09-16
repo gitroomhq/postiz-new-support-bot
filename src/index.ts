@@ -118,6 +118,8 @@ import { CachedRatioEngine } from "./bot/billing/disputeRatio";
 import { MoneyOutStore } from "./bot/billing/MoneyOutStore";
 import { MoneyOutService } from "./bot/billing/MoneyOutService";
 import { StripeSegmentResolver } from "./bot/billing/StripeSegmentResolver";
+import { AutoResolveStore } from "./bot/billing/AutoResolveStore";
+import { AutoResolveService } from "./bot/billing/AutoResolveService";
 import { SubscriptionEventStore } from "./bot/billing/SubscriptionEventStore";
 import { SubscriptionEventService } from "./bot/billing/SubscriptionEventService";
 import { DisputeMonitor } from "./bot/billing/DisputeMonitor";
@@ -279,6 +281,11 @@ async function main() {
   const blockStore = new BlockStore(prisma);
   const qolStore = new BillingQolStore(prisma);
   const blockService = new BlockService(settingsStore, stripeClient, blockStore);
+  // Auto-resolve: refunding an inquiry-stage dispute closes it as prevented, so
+  // it never reaches the chargeback numerator. Ships off; when on, it only
+  // PROPOSES here and the disputes looper executes after a vetoable alert.
+  const autoResolveStore = new AutoResolveStore(prisma);
+  const autoResolveService = new AutoResolveService(settingsStore, stripeClient, autoResolveStore, disputeStore);
   const ratioEngine = new CachedRatioEngine(stripeClient);
   const disputeMonitor = new DisputeMonitor(settingsStore, sessionStore, stripeClient, disputeStore, blockStore, ratioEngine);
   // Money-out ledger: every outflow (refunds, disputes, fees, concessions)
@@ -294,6 +301,7 @@ async function main() {
   const stripeWebhookHandler = new StripeWebhookHandler(settingsStore, sessionStore, stripeClient, disputeStore, blockService);
   stripeWebhookHandler.setMoneyOutService(moneyOutService);
   stripeWebhookHandler.setSubscriptionEventService(subscriptionEventService);
+  stripeWebhookHandler.setAutoResolveService(autoResolveService);
   // Intercom canvas/panel billing actions: approval queue + the shared
   // Discord-independent action brain (levels re-checked per request).
   const approvalStore = new ApprovalStore(prisma);
@@ -689,7 +697,9 @@ async function main() {
   // Influx gauge snapshot body for the metricsSnapshotWorkflow's snapshotTick.
   // The churn service is passed in so the hour-dampered plan-mix gauge rides
   // the 5-minute snapshot tick rather than needing a looper of its own.
-  const snapshotScheduler = new SnapshotScheduler(prisma, settingsStore, subscriptionEventService);
+  const snapshotScheduler = new SnapshotScheduler(prisma, settingsStore, subscriptionEventService, () =>
+    autoResolveStore.countPending()
+  );
   // SLA safety-sweep body (slaSweepWorkflow's slaSweepTick).
   const slaSweeper = new SlaSweeper(intercomClient, intercomStore, settingsStore, slaService, forwarderDetacher);
   // Sentry feedback → Intercom import body (sentryFeedbackWorkflow's tick).

@@ -8,6 +8,7 @@ import type { MoneyOutService } from "./billing/MoneyOutService";
 import type { SubscriptionEventService } from "./billing/SubscriptionEventService";
 import { BlockService } from "./billing/BlockService";
 import { attachReceiptEvidence } from "./billing/receiptEvidence";
+import type { AutoResolveService } from "./billing/AutoResolveService";
 import { COLORS } from "../util/embeds";
 import { log } from "../util/logger";
 import { metricCount } from "../util/instrument";
@@ -81,6 +82,16 @@ export class StripeWebhookHandler {
 
   setSlaService(service: { onStripeCustomerTrigger(stripeCustomerId: string): Promise<void> }): void {
     this.slaService = service;
+  }
+
+  // Dispute auto-resolve — bound late like the other Prisma-backed services.
+  // Absent means the engine simply never proposes, which is also what the
+  // default-off setting does, so an unbound handler behaves identically to a
+  // switched-off one.
+  private autoResolve: AutoResolveService | null = null;
+
+  setAutoResolveService(service: AutoResolveService): void {
+    this.autoResolve = service;
   }
 
   // Money-out ledger — bound late (it depends on the Prisma-backed store built
@@ -419,6 +430,27 @@ export class StripeWebhookHandler {
     const notes: string[] = [];
     let autoActionError: unknown = null;
 
+    // Refund-to-prevent. Only records a proposal; the disputes looper executes
+    // it once the veto window expires, and only after a vetoable alert has
+    // actually reached a channel. A read failure here is reported in the alert
+    // and retried by the looper rather than failing the webhook: an unheralded
+    // dispute is worse than a late auto-resolve.
+    if (chargeId && this.autoResolve) {
+      const proposal = await this.autoResolve
+        .proposeFromDispute(dispute, chargeId, customerId)
+        .catch((e) => ({ kind: "unavailable" as const, error: String(e) }));
+      if (proposal.kind === "proposed") {
+        const fires = Math.floor(proposal.fireAt.getTime() / 1000);
+        notes.push(
+          `🤝 Auto-resolve proposed: refunding ${this.stripe.formatAmount(proposal.amountMinor, proposal.currency)} <t:${fires}:R> unless cancelled`
+        );
+      } else if (proposal.kind === "blocked") {
+        notes.push(`🛑 Auto-resolve declined: ${proposal.guardrail.replace(/_/g, " ")}`);
+      } else if (proposal.kind === "unavailable") {
+        notes.push("⚠️ Auto-resolve could not be evaluated. The disputes looper will retry");
+      }
+    }
+
     if (this.settings.disputeAutoCancelSub() && customerId) {
       const claimed = await this.sessionStore
         .claimBillingAction("system", `dispute-autocancel-${dispute.id}`, "dispute_autocancel")
@@ -627,6 +659,20 @@ export class StripeWebhookHandler {
     const chargeId = typeof efw.charge === "string" ? efw.charge : (efw.charge?.id ?? null);
     exportBillingEvent({ event: "fraud_warning", chargeId });
     const linked = chargeId ? await this.linkedCustomer(chargeId) : null;
+    // An actionable warning is a chargeback that has not been filed yet:
+    // refunding now stops it being filed at all, which keeps it off the ratio.
+    let autoResolveNote: string | null = null;
+    if (chargeId && this.autoResolve) {
+      const proposal = await this.autoResolve
+        .proposeFromEfw(efw, chargeId, null)
+        .catch((e) => ({ kind: "unavailable" as const, error: String(e) }));
+      if (proposal.kind === "proposed") {
+        const fires = Math.floor(proposal.fireAt.getTime() / 1000);
+        autoResolveNote = `refunding ${this.stripe.formatAmount(proposal.amountMinor, proposal.currency)} <t:${fires}:R> unless cancelled`;
+      } else if (proposal.kind === "blocked") {
+        autoResolveNote = `declined: ${proposal.guardrail.replace(/_/g, " ")}`;
+      }
+    }
     const embed = new EmbedBuilder()
       .setTitle("🚨 Stripe early fraud warning")
       .setColor(COLORS.danger)
@@ -634,7 +680,8 @@ export class StripeWebhookHandler {
         { name: "Fraud type", value: efw.fraud_type || "unknown", inline: true },
         { name: "Actionable", value: efw.actionable ? "yes (may lead to a dispute)" : "no", inline: true },
         ...(chargeId ? [{ name: "Charge", value: `\`${chargeId}\``, inline: true }] : []),
-        ...(linked ? [{ name: "Customer", value: linked, inline: false }] : [])
+        ...(linked ? [{ name: "Customer", value: linked, inline: false }] : []),
+        ...(autoResolveNote ? [{ name: "Auto-resolve", value: autoResolveNote, inline: false }] : [])
       )
       .setTimestamp();
     const components: ActionRowBuilder<ButtonBuilder>[] = [];

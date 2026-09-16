@@ -511,6 +511,20 @@ export class DisputeStore {
   // Normal reminder work-list: respondable, unsubmitted, due within the lead
   // window but NOT yet inside the urgent window (that tier pings separately),
   // not pinged in the last 24h. Past-due excluded — the response window is over.
+  // How many disputes this customer has raised since a cutoff, excluding the
+  // one being evaluated. The repeat-offender half of the auto-resolve guardrail:
+  // refunding somebody their second dispute in a quarter teaches them the route
+  // works, so those get escalated to a human instead.
+  async countForCustomerSince(customerId: string, since: Date, excludeDisputeId: string | null): Promise<number> {
+    return this.prisma.stripeDispute.count({
+      where: {
+        customerId,
+        disputeCreatedAt: { gte: since },
+        ...(excludeDisputeId ? { id: { not: excludeDisputeId } } : {}),
+      },
+    });
+  }
+
   async listNeedingReminder(withinDays: number, urgentHours: number, now: Date = new Date()): Promise<StripeDispute[]> {
     const urgentEdge = new Date(now.getTime() + urgentHours * 3600_000);
     const leadEdge = new Date(now.getTime() + withinDays * DAY_MS);
