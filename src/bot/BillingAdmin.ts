@@ -43,11 +43,9 @@ import type { DisputeStore } from "./billing/DisputeStore";
 import type { DisputeEvidenceService } from "./billing/DisputeEvidenceService";
 import type { BlockStore } from "./billing/BlockStore";
 import type { BlockService } from "./billing/BlockService";
+import type { EvidencePackBuilder } from "./billing/evidence/EvidencePackBuilder";
 import type { BillingQolStore } from "./billing/BillingQolStore";
 import type { CachedRatioEngine } from "./billing/disputeRatio";
-import type { ClaudeCodeRunner } from "./ClaudeCodeRunner";
-import type { LightAiRunner } from "./LightAiRunner";
-import type { IntercomClient } from "../intercom/IntercomClient";
 
 // Dispute-console + QoL dependencies handed through to the hubs.
 export interface BillingAdminExtras {
@@ -57,9 +55,7 @@ export interface BillingAdminExtras {
   blockService: BlockService;
   qolStore: BillingQolStore;
   ratio: CachedRatioEngine;
-  claudeRunner: ClaudeCodeRunner;
-  lightAiRunner: LightAiRunner;
-  intercom: IntercomClient;
+  evidencePack: EvidencePackBuilder;
   approvalStore: ApprovalStore;
   billingActions: BillingActionService;
 }
@@ -140,9 +136,7 @@ export class BillingAdmin {
       blockService: extras.blockService,
       qolStore: extras.qolStore,
       ratio: extras.ratio,
-      claudeRunner: extras.claudeRunner,
-      lightAi: extras.lightAiRunner,
-      intercom: extras.intercom,
+      evidencePack: extras.evidencePack,
       approvalStore: extras.approvalStore,
       billingActions: extras.billingActions,
     };

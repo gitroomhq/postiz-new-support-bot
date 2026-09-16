@@ -9,11 +9,9 @@ import type { DisputeStore } from "../DisputeStore";
 import type { DisputeEvidenceService } from "../DisputeEvidenceService";
 import type { BlockStore } from "../BlockStore";
 import type { BlockService } from "../BlockService";
+import type { EvidencePackBuilder } from "../evidence/EvidencePackBuilder";
 import type { BillingQolStore } from "../BillingQolStore";
 import type { CachedRatioEngine } from "../disputeRatio";
-import type { ClaudeCodeRunner } from "../../ClaudeCodeRunner";
-import type { LightAiRunner } from "../../LightAiRunner";
-import type { IntercomClient } from "../../../intercom/IntercomClient";
 import type { ApprovalStore } from "../ApprovalStore";
 import type { BillingActionService } from "../actions/BillingActionService";
 import type { PostizIdentityService } from "../../../postiz/PostizIdentityService";
@@ -36,15 +34,9 @@ export interface HubContext {
   blockService: BlockService;
   qolStore: BillingQolStore;
   ratio: CachedRatioEngine;
-  // Evidence drafting runs on the Claude Code CLI (Read/Glob/Grep over the
-  // cloned Postiz source + docs) so policy fields can cite real terms.
-  claudeRunner: ClaudeCodeRunner;
-  // Evidence REVIEW runs tool-less on the cheap model (aiModelLight) — the
-  // staged text plus the evidence files as vision/document blocks.
-  lightAi: LightAiRunner;
-  // Customer support history for the evidence draft (customer_communication
-  // material). Reads no-op gracefully when the bridge is off.
-  intercom: IntercomClient;
+  // Deterministic evidence packs: the template corpus interpolated with real
+  // Stripe, platform and support facts. No model is involved.
+  evidencePack: EvidencePackBuilder;
   // Intercom canvas/panel billing-action approvals (ApprovalsHub).
   approvalStore: ApprovalStore;
   billingActions: BillingActionService;

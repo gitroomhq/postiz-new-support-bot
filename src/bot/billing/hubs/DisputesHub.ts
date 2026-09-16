@@ -278,6 +278,10 @@ export class DisputesHub {
           await this.ctx.disputeEvidence.saveDraft(disputeId, evidence);
           // submit:false stages at Stripe without sending to the bank.
           await this.ctx.disputeEvidence.stageFields(disputeId, evidence, interaction.id);
+          // Stamped by the CALL SITE, never by the shared service: the
+          // templated pack stages through the same method and must not mark
+          // itself as human-touched, or it would veto its own auto-submit.
+          await this.ctx.disputeStore.markEvidenceTouched(disputeId, interaction.user.id, interaction.user.username);
           this.ctx.audit.log(interaction, {
             action: "Dispute evidence staged",
             targetCustomerId: session.customerId,
@@ -369,17 +373,17 @@ export class DisputesHub {
         });
       },
     },
-    // ---- AI draft (local-only: this path has no route to Stripe) ----
+    // ---- deterministic evidence pack (stages with submit:false) ----
     {
       kind: "button",
-      id: "billadmin_dp_ai:",
+      id: "billadmin_dp_pack:",
       match: "prefix",
       handler: async (interaction) => {
         const token = interaction.customId.split(":")[1];
         const session = await this.ctx.sessions.getOwnedSession(token, interaction);
         if (!session?.disputeId) return;
         await interaction.deferUpdate();
-        await this.ctx.sessions.runExclusive(token, interaction, () => this.runAiDraft(interaction, token));
+        await this.ctx.sessions.runExclusive(token, interaction, () => this.runRebuildPack(interaction, token));
       },
     },
     // ---- staged-evidence review (read-back of what the bank will get) ----
@@ -394,20 +398,6 @@ export class DisputesHub {
         await interaction.deferUpdate();
         const page = Math.max(0, Number.parseInt(pageStr, 10) || 0);
         await this.ctx.sessions.tryRender(interaction, () => this.renderReviewStaged(interaction, token, page));
-      },
-    },
-    // AI critique of the staged package (cheap model + the evidence files as
-    // vision/document input). Read-only: renders a verdict, changes nothing.
-    {
-      kind: "button",
-      id: "billadmin_dp_evai:",
-      match: "prefix",
-      handler: async (interaction) => {
-        const token = interaction.customId.split(":")[1];
-        const session = await this.ctx.sessions.getOwnedSession(token, interaction);
-        if (!session?.disputeId) return;
-        await interaction.deferUpdate();
-        await this.ctx.sessions.runExclusive(token, interaction, () => this.runAiEvidenceReview(interaction, token));
       },
     },
     {
@@ -1555,7 +1545,7 @@ export class DisputesHub {
       components: [
         buttonRow(
           btn(`billadmin_dp_ev_edit:${token}`, "Edit Evidence", ButtonStyle.Primary, !respondable),
-          btn(`billadmin_dp_ai:${token}`, "AI Draft", ButtonStyle.Primary, !respondable),
+          btn(`billadmin_dp_pack:${token}`, "Build Evidence", ButtonStyle.Primary, !respondable),
           btn(`billadmin_dp_proof:${token}`, "Attach Proof", ButtonStyle.Primary, !respondable),
           // Review works on any dispute with evidence at Stripe — including
           // closed ones (post-mortem of what was actually sent to the bank).
@@ -1651,7 +1641,7 @@ export class DisputesHub {
     components.push(
       buttonRow(
         btn(`billadmin_dp_evrev:${token}:0`, "Review Evidence", ButtonStyle.Primary, !(dispute.evidence_details?.has_evidence || false)),
-        btn(`billadmin_dp_ai:${token}`, "AI Draft", ButtonStyle.Primary, !respondable),
+        btn(`billadmin_dp_pack:${token}`, "Build Evidence", ButtonStyle.Primary, !respondable),
         btn(`billadmin_dp_proof:${token}`, "Attach Proof", ButtonStyle.Primary, !respondable),
         btn(`billadmin_dp_det:${token}`, "Back", ButtonStyle.Secondary)
       )
@@ -1739,7 +1729,6 @@ export class DisputesHub {
     // AI critique of exactly this package — works on closed disputes too
     // (post-mortem), as long as anything is staged to look at.
     components.push(
-      buttonRow(btn(`billadmin_dp_evai:${token}`, "AI Review", ButtonStyle.Primary, !(textFields.length || files.length)))
     );
     components.push(
       buttonRow(
@@ -1904,102 +1893,48 @@ export class DisputesHub {
     });
   }
 
-  // ---- AI evidence draft (saves a LOCAL draft only) ----
+  // ---- deterministic evidence pack ----
 
-  // The whole pipeline (context gathering, CLI run, validators, receipt
-  // backfill) lives in the shared service — this wrapper only audits + renders.
-  private async runAiDraft(interaction: ButtonInteraction, token: string): Promise<void> {
+  // Rebuilds the templated package from real Stripe, platform and support facts
+  // and stages it with submit:false. No model: the corpus and the token
+  // resolver do the writing, so the same dispute always produces the same text.
+  private async runRebuildPack(interaction: ButtonInteraction, token: string): Promise<void> {
     const session = this.ctx.sessions.get(token);
     if (!session?.disputeId) return;
-    const result = await this.ctx.disputeEvidence.aiDraft(session.disputeId, session.customerId ?? null);
-    const receiptNote = result.receiptStaged ? "🧾 The charge's receipt PDF was staged in the `receipt` evidence slot." : null;
+    const builder = this.ctx.evidencePack;
+    if (!builder) {
+      await this.renderDetail(interaction, token, "⚠️ The evidence pack builder is not configured.");
+      return;
+    }
+    const dispute = await this.ctx.stripe.getDispute(session.disputeId);
+    if (!RESPONDABLE.has(dispute.status)) {
+      await this.renderDetail(interaction, token, `⚠️ Status is ${dispute.status}; there is nothing left to answer.`);
+      return;
+    }
+    const chargeId = typeof dispute.charge === "string" ? dispute.charge : dispute.charge?.id;
+    if (!chargeId) {
+      await this.renderDetail(interaction, token, "⚠️ This dispute has no charge to build a package from.");
+      return;
+    }
+    const charge = await this.ctx.stripe.getCharge(chargeId);
+    // Staff waiting on a panel can afford the Intercom round trips the Stripe
+    // webhook cannot, so the manual rebuild always enriches.
+    const pack = await builder.build(dispute, charge, { enrich: true });
+    const staged = await builder.stage(dispute, pack, false);
     this.ctx.audit.log(interaction, {
-      action: "Dispute AI evidence draft",
-      targetCustomerId: result.customerId ?? undefined,
+      action: "Dispute evidence pack rebuilt",
+      targetCustomerId: session.customerId ?? undefined,
       objectId: session.disputeId,
-      outcome: `Draft saved locally (${result.fields} field(s)${result.rejected.length ? `, ${result.rejected.length} invalid value(s) dropped: ${result.rejected.join(", ")}` : ""}${
-        result.usedIntercomHistory ? ", with Intercom history" : ""
-      }${result.exemplars ? `, ${result.exemplars} won-dispute exemplar(s)` : ""}${
-        result.receiptStaged ? ", receipt staged" : ""
-      }). Draft text not sent to Stripe`,
-      severity: "info",
+      outcome: `${staged.staged.length} field(s) staged, completeness ${staged.pack.score}%`,
     });
-    await this.renderEvidenceEditor(
+    const omitted = staged.omitted.length ? ` · omitted ${staged.omitted.map((o) => o.field).join(", ")}` : "";
+    await this.renderDetail(
       interaction,
       token,
-      [
-        "🤖 AI draft saved **locally**. Open the sections below to review/adjust and **Save** to stage, then Submit. No draft text was sent to Stripe.",
-        result.rejected.length
-          ? `⚠️ Dropped ${result.rejected.length} field(s) whose value didn't fit the field's meaning (${result.rejected.join(", ")}). Fill them manually if needed.`
-          : null,
-        receiptNote,
-      ]
-        .filter(Boolean)
-        .join("\n")
+      `📄 Staged ${staged.staged.length} field(s), completeness ${staged.pack.score}%${omitted}. Review, then submit.`
     );
   }
 
-  // ---- AI evidence review (cheap model, read-only) ----
-
-  // Progress message + verdict rendering here; the critique pipeline (file
-  // downloads, prompt, light-model run) lives in the shared service.
-  private async runAiEvidenceReview(interaction: ButtonInteraction, token: string): Promise<void> {
-    const session = this.ctx.sessions.get(token);
-    if (!session?.disputeId) return;
-    const pkg = await this.ctx.disputeEvidence.stagedPackage(session.disputeId);
-    if (!pkg.textFields.length && !pkg.files.length) {
-      await this.renderReviewStaged(interaction, token, 0, "Nothing staged at Stripe yet: there is nothing to review.");
-      return;
-    }
-
-    await interaction.editReply({
-      embeds: [
-        makeEmbed(
-          `🤖 Reviewing the staged evidence for \`${pkg.dispute.id}\`${pkg.files.length ? `, downloading ${pkg.files.length} evidence file(s)…` : "…"}`,
-          COLORS.brand
-        ),
-      ],
-      components: [],
-    });
-
-    const result = await this.ctx.disputeEvidence.aiReview(session.disputeId, {
-      pkg,
-      telemetry: { userId: interaction.user.id, username: interaction.user.username },
-    });
-    if (result.kind === "nothing_staged") {
-      await this.renderReviewStaged(interaction, token, 0, "Nothing staged at Stripe yet: there is nothing to review.");
-      return;
-    }
-
-    this.ctx.audit.log(interaction, {
-      action: "Dispute AI evidence review",
-      targetCustomerId: result.customerId ?? undefined,
-      objectId: pkg.dispute.id,
-      outcome: `Reviewed ${result.stagedFieldCount} staged field(s) + ${result.filesAttached}/${result.filesTotal} file(s) on the light model · read-only`,
-      severity: "info",
-    });
-
-    const embed = new EmbedBuilder()
-      .setTitle(`🧐 AI evidence review: \`${pkg.dispute.id}\``)
-      .setColor(COLORS.brand)
-      .setDescription(result.review.slice(0, 4096) || "The model returned no review text. Try again.")
-      .setFooter({
-        text: `${result.model} · ${result.stagedFieldCount} field(s) · ${result.filesAttached}/${result.filesTotal} file(s) reviewed${
-          result.skipped.length ? ` · skipped: ${result.skipped.map((f) => `${f.slot} (${f.note})`).join(", ")}` : ""
-        } · advisory only`.slice(0, 2048),
-      });
-    await interaction.editReply({
-      embeds: [embed],
-      components: [
-        buttonRow(
-          btn(`billadmin_dp_evai:${token}`, "Run Again", ButtonStyle.Secondary),
-          btn(`billadmin_dp_evrev:${token}:0`, "Staged Evidence", ButtonStyle.Secondary),
-          btn(`billadmin_dp_ev_edit:${token}`, "Edit Evidence", ButtonStyle.Secondary, !RESPONDABLE.has(pkg.dispute.status)),
-          btn(`billadmin_dp_det:${token}`, "Back", ButtonStyle.Secondary)
-        ),
-      ],
-    });
-  }
 
   // ---- block flow helpers ----
 

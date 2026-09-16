@@ -255,8 +255,17 @@ async function main() {
     intercomClient
   );
   const oauthManager = new OAuthManager(config, sessionStore);
-  // ClaudeCodeRunner + LightAiRunner survive the agent-rip for the dispute
-  // console (evidence drafts + summaries in /billing → Disputes).
+  // ORPHANED. The dispute console was the last consumer of both runners, and it
+  // now writes evidence from the deterministic template corpus instead
+  // (src/bot/billing/evidence). They are constructed but nothing calls them,
+  // and they are kept only so the excision is one reviewable change of its own.
+  //
+  // That follow-up removes: ClaudeCodeRunner, LightAiRunner, AiRunStore and the
+  // ai_runs table, KnowledgeBaseScheduler with its kbTick activity and
+  // kbRefreshWorkflow, the kbRefresh* settings, the "AI (dispute evidence)"
+  // section of the admin panel, and the postinstall clone of search/postiz-app
+  // and search/postiz-docs. The docs clone is the design-time source for the
+  // template corpus's policy wording, so it should outlive the runners.
   const claudeRunner = new ClaudeCodeRunner(process.cwd(), aiRunStore, () => settingsStore.stripeSecretKey());
   const lightAiRunner = new LightAiRunner(aiRunStore);
   const kbScheduler = new KnowledgeBaseScheduler(settingsStore, process.cwd());
@@ -274,12 +283,7 @@ async function main() {
   disputeStore.bindSegments(segmentResolver);
   // Shared dispute-evidence core: /billing → Disputes AND the web dashboard's
   // workbench run this one implementation (catalog, staging, submit claims).
-  const disputeEvidenceService = new DisputeEvidenceService(stripeClient, disputeStore, sessionStore, {
-    claudeRunner,
-    lightAi: lightAiRunner,
-    intercom: intercomClient,
-    settingsStore,
-  });
+  const disputeEvidenceService = new DisputeEvidenceService(stripeClient, disputeStore, sessionStore);
   // Deterministic evidence packs: template corpus plus operator overrides,
   // interpolated with real Stripe, platform and support facts. No model.
   const evidenceTemplateStore = new TemplateStore(prisma);
@@ -354,9 +358,7 @@ async function main() {
     blockService,
     qolStore,
     ratio: ratioEngine,
-    claudeRunner,
-    lightAiRunner,
-    intercom: intercomClient,
+    evidencePack: evidencePackBuilder,
     approvalStore,
     billingActions: billingActionService,
   });
@@ -670,7 +672,7 @@ async function main() {
     makeCustomersSection({ postiz: postizIdentity }),
     makeSubscriptionsSection(),
     makeInvoicesSection(),
-    makeDisputesSection({ ratio: ratioEngine, evidence: disputeEvidenceService }),
+    makeDisputesSection({ ratio: ratioEngine, evidence: disputeEvidenceService, evidencePack: evidencePackBuilder }),
     makeCatalogSection(),
     makeLinksSection(),
     makeQuotesSection(),

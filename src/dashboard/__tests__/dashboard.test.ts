@@ -1978,47 +1978,12 @@ test("integration refs: change-plan rows self-select via filters; Customer-360 f
 
 // ---- disputes overview / workbench ----
 
-// Real service over fakes: the section tests exercise the SAME code path the
-// Discord hub runs (extraction parity is the point).
-// Faked AI runners + settings for the pipelines. draftJson feeds the
-// Claude CLI fake's final message; reviewText the light model's.
-function fakeAiDeps(opts: { draftJson?: string; reviewText?: string; lightRun?: () => Promise<string[]> } = {}) {
-  const seen = { draftPrompts: [] as string[], reviewAttachments: [] as number[] };
-  return {
-    seen,
-    deps: {
-      claudeRunner: {
-        run: async (prompt: string) => {
-          seen.draftPrompts.push(prompt);
-          return ["research narration…", opts.draftJson ?? "{}"];
-        },
-      },
-      lightAi: {
-        run: async (_prompt: string, _sys: undefined, runOpts: { attachments?: unknown[] }) => {
-          seen.reviewAttachments.push(runOpts.attachments?.length ?? 0);
-          if (opts.lightRun) return opts.lightRun();
-          return [opts.reviewText ?? "Solid package; stage the draft narrative too."];
-        },
-      },
-      intercom: {},
-      settingsStore: {
-        aiModel: () => "claude-fable-5",
-        aiModelLight: () => "claude-haiku-4-5",
-        aiEffortAsk: () => "medium",
-        aiMaxBudgetUsdAsk: () => 2,
-        disputeAutoAttachReceipt: () => false,
-        intercomMode: () => "none",
-      },
-    },
-  };
-}
 
 function evidenceFakes(
   opts: {
     dispute?: Record<string, unknown>;
     row?: Record<string, unknown> | null;
     claims?: boolean[];
-    ai?: ReturnType<typeof fakeAiDeps>["deps"];
     fileContents?: () => Promise<Record<string, unknown>>;
   } = {}
 ) {
@@ -2120,8 +2085,7 @@ function evidenceFakes(
   const svc = new DisputeEvidenceService(
     stripe as unknown as StripeClient,
     disputeStore as unknown as ConstructorParameters<typeof DisputeEvidenceService>[1],
-    sessionStore as unknown as SessionStore,
-    opts.ai as ConstructorParameters<typeof DisputeEvidenceService>[3]
+    sessionStore as unknown as SessionStore
   );
   return { svc, calls, dispute, stripe, disputeStore, sessionStore, rowState };
 }
@@ -2156,10 +2120,6 @@ function disputesCtx(fakes?: ReturnType<typeof evidenceFakes>): DashboardCtx {
     settings: {
       disputeRatioWarnPct: () => 0.75,
       disputeRatioCriticalPct: () => 1.5,
-      aiModel: () => "claude-fable-5",
-      aiModelLight: () => "claude-haiku-4-5",
-      aiEffortAsk: () => "medium",
-      aiMaxBudgetUsdAsk: () => 2,
     } as never,
     stores: {
       dispute: {
@@ -2196,6 +2156,7 @@ function disputesCtx(fakes?: ReturnType<typeof evidenceFakes>): DashboardCtx {
         statsByReason: async () => [{ reason: "fraudulent", won: 4, lost: 1, other: 0, winRatePct: 80 }],
         listClosed: async () => ({ rows: [disputeRow({ id: "dp_c", status: "won", closedAt: new Date() })], total: 7 }),
         get: async (id: string) => (fakes ? fakes.rowState.row : id === "dp_1" ? disputeRow({}) : null),
+        markEvidenceTouched: async () => {},
         ...(fakes
           ? {
               upsertFromStripe: fakes.disputeStore.upsertFromStripe,
@@ -2550,104 +2511,6 @@ test("disputes review page: staged read-back tables, per-file remove actions, un
   assert.equal(header.actions![0].key, "section:disputes.submit");
 });
 
-// ---- AI draft + review via the service seams ----
-
-test("AI draft: faked runner; validators drop misshapen values, Stripe-sourced fields override the model, draft merges locally", async () => {
-  const ai = fakeAiDeps({
-    draftJson: JSON.stringify({
-      product_description: "Postiz is a social scheduler…",
-      uncategorized_text: "Narrative for the bank.",
-      duplicate_charge_id: "the customer paid twice", // not a ch_ id → dropped
-      duplicate_charge_explanation: "grace@example.com", // bare email is no explanation → dropped
-      customer_email_address: "model-hallucinated@example.com", // overridden by Stripe
-    }),
-  });
-  // reason=duplicate → requested fields = duplicate + core groups (the two
-  // validator-guarded duplicate_* fields are in the requested set).
-  const f = evidenceFakes({ ai: ai.deps, dispute: { reason: "duplicate" } });
-  const result = await f.svc.aiDraft("dp_1", null);
-  assert.equal(result.kind, "ok");
-  assert.deepEqual(result.rejected.sort(), ["duplicate_charge_explanation", "duplicate_charge_id"]);
-  assert.equal(result.model, "claude-fable-5");
-  const merged = f.calls.merged[0];
-  // Deterministic email/service_date come from Stripe, not the model.
-  assert.equal(merged.customer_email_address, "grace@example.com");
-  assert.match(merged.service_date, /^\d{4}-\d{2}-\d{2}$/);
-  assert.equal(merged.product_description, "Postiz is a social scheduler…");
-  assert.equal(merged.uncategorized_text, "Narrative for the bank.");
-  assert.equal(merged.duplicate_charge_id, undefined);
-  assert.equal(merged.duplicate_charge_explanation, undefined);
-  // The prompt carried the dispute + charge grounding.
-  assert.match(ai.seen.draftPrompts[0], /dp_1/);
-});
-
-test("AI review: staged text + files go to the light model; skipped files reported; nothing_staged early-out", async () => {
-  const ai = fakeAiDeps({ reviewText: "Weak: no activity log. Stage the draft." });
-  const f = evidenceFakes({ ai: ai.deps });
-  const r = await f.svc.aiReview("dp_1");
-  assert.equal(r.kind, "ok");
-  if (r.kind === "ok") {
-    assert.equal(r.review, "Weak: no activity log. Stage the draft.");
-    assert.equal(r.stagedFieldCount, 1);
-    assert.equal(r.filesAttached, 1);
-    assert.equal(r.filesTotal, 1);
-    assert.equal(r.model, "claude-haiku-4-5");
-  }
-  assert.deepEqual(ai.seen.reviewAttachments, [1]);
-
-  const skippy = evidenceFakes({
-    ai: fakeAiDeps().deps,
-    fileContents: async () => ({ filename: "big.pdf", sizeBytes: 9_999_999, mimeType: "application/pdf", data: null, skipped: "too_large" }),
-  });
-  const r2 = await skippy.svc.aiReview("dp_1");
-  assert.equal(r2.kind, "ok");
-  if (r2.kind === "ok") {
-    assert.equal(r2.filesAttached, 0);
-    assert.deepEqual(r2.skipped, [{ slot: "uncategorized_file", note: "too_large" }]);
-  }
-
-  const empty = evidenceFakes({ ai: fakeAiDeps().deps, dispute: { evidence: {}, evidence_details: { has_evidence: false, submission_count: 0 } } });
-  assert.deepEqual(await empty.svc.aiReview("dp_1"), { kind: "nothing_staged" });
-});
-
-test("dashboard AI actions: per-dispute lock blocks concurrent runs; review verdict renders as kv+notice blocks", async () => {
-  let release: (() => void) | null = null;
-  const gate = new Promise<void>((resolve) => {
-    release = resolve;
-  });
-  const ai = fakeAiDeps({
-    lightRun: async () => {
-      await gate;
-      return ["Verdict: looks fine."];
-    },
-  });
-  const fakes = evidenceFakes({ ai: ai.deps });
-  const section = makeDisputesSection(disputesDeps(fakes));
-  const ctx = disputesCtx(fakes);
-
-  const first = section.action!(ctx, { key: "section:disputes.ai_review", params: { disputeId: "dp_1" } });
-  await new Promise((r) => setImmediate(r)); // let the first run take the lock
-  const second = await section.action!(ctx, { key: "section:disputes.ai_review", params: { disputeId: "dp_1" } });
-  assert.equal(second.ok, false);
-  assert.match(second.error ?? "", /already in progress/);
-  release!();
-  const done = await first;
-  assert.equal(done.ok, true);
-
-  // The verdict survives the reload: detail page renders the AI kv + notice.
-  const page = await section.buildPage(ctx, { page: "disputes.detail", params: { id: "dp_1" } });
-  const kv = page!.blocks.find((b) => b.type === "kv" && b.title === "AI evidence review") as KeyValueBlock;
-  assert.ok(kv);
-  assert.deepEqual(kv.rows.find((r) => r.label === "Model")!.cell, { t: "text", v: "claude-haiku-4-5" });
-  assert.ok(page!.blocks.some((b) => b.type === "notice" && (b as { text: string }).text === "Verdict: looks fine."));
-  // The AI tools row surfaces model + budget from settings.
-  const tools = page!.blocks.find((b) => b.type === "notice" && /AI draft researches/.test((b as { text: string }).text)) as {
-    actions: Array<{ key: string }>;
-    text: string;
-  };
-  assert.match(tools.text, /claude-fable-5.*\$2.*claude-haiku-4-5/);
-  assert.deepEqual(tools.actions.map((a) => a.key), ["section:disputes.ai_draft", "section:disputes.ai_review"]);
-});
 
 // ---- fraud hunts ----
 

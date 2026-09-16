@@ -1,13 +1,7 @@
 import type Stripe from "stripe";
 import type { StripeClient } from "../StripeClient";
 import type { SessionStore } from "../../auth/SessionStore";
-import type { SettingsStore } from "../../config/SettingsStore";
-import type { ClaudeCodeRunner } from "../ClaudeCodeRunner";
-import type { LightAiRunner, LightAiAttachment } from "../LightAiRunner";
-import type { IntercomClient } from "../../intercom/IntercomClient";
 import { Logger } from "../../util/logger";
-import { buildDisputeEvidencePrompt, buildDisputeEvidenceReviewPrompt } from "../aiPrompts";
-import { subPlanLabel } from "./ui";
 import { attachReceiptEvidence } from "./receiptEvidence";
 import { DisputeStore, RESPONDABLE_DISPUTE_STATUSES, TEXT_EVIDENCE_KEYS } from "./DisputeStore";
 import type { StripeDispute } from "../../generated/prisma/client";
@@ -136,22 +130,18 @@ export const EVIDENCE_FILE_KEYS = [
 export const PROOF_TYPES = new Set(["image/png", "image/jpeg", "application/pdf"]);
 export const PROOF_MAX_BYTES = 4 * 1024 * 1024;
 
-// Field keys the AI draft fills: the union of the reason's recommended groups.
-export function aiDraftFieldsFor(reason: string | null | undefined): string[] {
-  const groups = recommendedGroupKeys(reason);
-  return EVIDENCE_GROUPS.filter((g) => groups.includes(g.key)).flatMap((g) => g.fields.map((f) => f.key));
-}
-
-// Shape guards for the AI draft's structured fields — the model has spilled
-// narrative text into duplicate_charge_id and an email into the explanation
-// before; values that can't possibly be what the field means are dropped
-// instead of saved (a missing field beats a provably wrong one at the bank).
+// Shape guards for the structured evidence fields. These are no longer
+// anti-hallucination guards, because there is no model any more: they are the
+// safety net for an operator's template override and for anything typed into
+// an editor by hand. A value that cannot possibly be what its field means is
+// dropped rather than saved, because a missing field beats a provably wrong
+// one at the bank.
 const CHARGE_ID_RE = /^(ch|py)_[A-Za-z0-9]+$/;
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const DATEISH_RE = /\d{4}-\d{2}-\d{2}|\d{1,2}[./ ]\d{1,2}[./ ]\d{2,4}/;
 const IPV4_RE = /^((25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(25[0-5]|2[0-4]\d|1?\d?\d)$/;
 const IPV6ISH_RE = /^[0-9a-fA-F:]{3,45}$/;
-export const AI_DRAFT_VALIDATORS: Record<string, (v: string) => boolean> = {
+export const EVIDENCE_FIELD_VALIDATORS: Record<string, (v: string) => boolean> = {
   duplicate_charge_id: (v) => CHARGE_ID_RE.test(v),
   // A bare email/id is not an explanation of why two charges are distinct.
   duplicate_charge_explanation: (v) => !EMAIL_RE.test(v) && !CHARGE_ID_RE.test(v),
@@ -193,21 +183,11 @@ export type FileOpResult =
   | { kind: "not_respondable"; status: string }
   | { kind: "invalid"; error: string };
 
-// AI runner seams: injected here so both surfaces share the draft and
-// review pipelines once they move in; unused until then.
-export interface DisputeAiDeps {
-  claudeRunner: ClaudeCodeRunner;
-  lightAi: LightAiRunner;
-  intercom: IntercomClient;
-  settingsStore: SettingsStore;
-}
-
 export class DisputeEvidenceService {
   constructor(
     private stripe: StripeClient,
     private disputeStore: DisputeStore,
-    private sessionStore: SessionStore,
-    protected ai?: DisputeAiDeps
+    private sessionStore: SessionStore
   ) {}
 
   respondable(status: string): boolean {
@@ -220,15 +200,26 @@ export class DisputeEvidenceService {
 
   // Merge non-empty known-key values into the LOCAL draft. Empty values are
   // omitted — a blank input must never wipe text already drafted or staged.
-  async saveDraft(disputeId: string, patch: Record<string, string>): Promise<{ saved: number }> {
+  // Rejected keys come back so a caller can flag the field instead of silently
+  // discarding what somebody typed. The shape guards run here because this is
+  // the one door every manual edit comes through, and an id or a date that
+  // cannot be what its field means is worth more to a bank left empty.
+  async saveDraft(disputeId: string, patch: Record<string, string>): Promise<{ saved: number; rejected: string[] }> {
     const clean: Record<string, string> = {};
+    const rejected: string[] = [];
     for (const [key, value] of Object.entries(patch)) {
       if (typeof value !== "string") continue;
       const trimmed = value.trim();
-      if (trimmed && EVIDENCE_KEY_SET.has(key)) clean[key] = trimmed;
+      if (!trimmed || !EVIDENCE_KEY_SET.has(key)) continue;
+      const validator = EVIDENCE_FIELD_VALIDATORS[key];
+      if (validator && !validator(trimmed)) {
+        rejected.push(key);
+        continue;
+      }
+      clean[key] = trimmed;
     }
     if (Object.keys(clean).length > 0) await this.disputeStore.mergeEvidenceDraft(disputeId, clean);
-    return { saved: Object.keys(clean).length };
+    return { saved: Object.keys(clean).length, rejected };
   }
 
   // Stage text evidence at Stripe WITHOUT submitting (submit:false) — the bank
@@ -373,348 +364,4 @@ export class DisputeEvidenceService {
     await this.disputeStore.upsertFromStripe(result, customerIdHint);
     return { kind: "accepted", dispute: result };
   }
-
-  // ---- AI pipelines: shared by /billing → Disputes and the web workbench ----
-
-  private aiDeps(): DisputeAiDeps {
-    if (!this.ai) throw new Error("Dispute AI dependencies are not wired.");
-    return this.ai;
-  }
-
-  // AI evidence DRAFT: Claude Code CLI over the cloned Postiz source + docs
-  // (policy fields must cite real terms), grounded with the live charge/
-  // customer/subscription context, Intercom history and won-dispute exemplars.
-  // Saves a LOCAL draft only — nothing is sent to Stripe except the optional
-  // receipt auto-attach backfill. Deterministic fields (email, service date)
-  // come from Stripe, not the model, and shape validators drop provably-wrong
-  // values instead of saving them.
-  async aiDraft(disputeId: string, customerIdHint: string | null): Promise<AiDraftResult> {
-    const ai = this.aiDeps();
-    const dispute = await this.stripe.getDispute(disputeId);
-    const chargeId = typeof dispute.charge === "string" ? dispute.charge : (dispute.charge?.id ?? null);
-    const charge = chargeId ? await this.stripe.getCharge(chargeId).catch(() => null) : null;
-    const customerId = charge
-      ? typeof charge.customer === "string"
-        ? charge.customer
-        : (charge.customer?.id ?? null)
-      : customerIdHint;
-    const customer = customerId ? await this.stripe.getCustomer(customerId).catch(() => null) : null;
-    const subs = customerId ? await this.stripe.listSubscriptions(customerId).catch(() => []) : [];
-
-    // Real customer-communication material + few-shot exemplars from past
-    // wins; both are best-effort — the draft still runs when they're missing.
-    const [intercomHistory, wonExemplars] = await Promise.all([
-      this.collectIntercomHistory(customerId, customer?.email ?? null).catch((error) => {
-        logger.warn("intercom history lookup failed", { error: String(error) });
-        return null;
-      }),
-      this.disputeStore.wonEvidenceExemplars(dispute.reason || "unknown", 2).catch(() => []),
-    ]);
-
-    const iso = (unix: number) => new Date(unix * 1000).toISOString().slice(0, 10);
-
-    // Fields with exactly one correct value come from Stripe, not the model —
-    // they're removed from the requested set entirely so there is nothing to
-    // hallucinate (the screenshot bug: an email drafted into the duplicate
-    // explanation, narrative text into the charge-id field).
-    const deterministic: Record<string, string> = {};
-    if (customer?.email) deterministic.customer_email_address = customer.email;
-    if (charge) deterministic.service_date = iso(charge.created);
-
-    // reason=duplicate: the only truthful duplicate_charge_id is another REAL
-    // charge on this customer with the same amount — look it up and hand the
-    // candidates to the model (or the explicit "none exist" fact).
-    let duplicateCandidates: Array<{ id: string; amountText: string; created: string; description: string | null }> = [];
-    if (dispute.reason === "duplicate" && customerId && charge) {
-      const { charges } = await this.stripe.listCharges(customerId, 100).catch(() => ({ charges: [], hasMore: false }));
-      duplicateCandidates = charges
-        .filter((c) => c.id !== charge.id && c.status === "succeeded" && c.currency === charge.currency && c.amount === charge.amount)
-        .slice(0, 3)
-        .map((c) => ({
-          id: c.id,
-          amountText: this.stripe.formatAmount(c.amount, c.currency),
-          created: iso(c.created),
-          description: c.description ?? null,
-        }));
-    }
-
-    const fields = aiDraftFieldsFor(dispute.reason).filter((f) => !(f in deterministic));
-    const prompt = buildDisputeEvidencePrompt({
-      disputeId: dispute.id,
-      reason: dispute.reason || "unknown",
-      status: dispute.status,
-      amountText: this.stripe.formatAmount(dispute.amount, dispute.currency),
-      disputeCreated: iso(dispute.created),
-      evidenceDueBy: dispute.evidence_details?.due_by ? iso(dispute.evidence_details.due_by) : null,
-      charge: charge
-        ? {
-            id: charge.id,
-            created: iso(charge.created),
-            amountText: this.stripe.formatAmount(charge.amount, charge.currency),
-            description: charge.description ?? null,
-            cardBrand: charge.payment_method_details?.card?.brand ?? null,
-            cardLast4: charge.payment_method_details?.card?.last4 ?? null,
-          }
-        : null,
-      customer: customer
-        ? { id: customer.id, email: customer.email ?? null, name: customer.name ?? null, created: iso(customer.created) }
-        : null,
-      subscriptions: subs.slice(0, 5).map((sub) => ({
-        plan: subPlanLabel(this.stripe, sub),
-        status: sub.status,
-        started: iso(sub.created),
-      })),
-      fields,
-      intercomHistory,
-      wonExemplars,
-      duplicateCandidates,
-    });
-
-    // Claude Code CLI run with Read/Glob/Grep over the cloned Postiz source +
-    // docs (same knowledge base as /ai), bounded by the /config → AI ask
-    // levers. Filling policy fields requires actually finding the terms.
-    const effortRaw = ai.settingsStore.aiEffortAsk();
-    const effort = effortRaw === "low" || effortRaw === "high" || effortRaw === "max" ? effortRaw : "medium";
-    const messages = await ai.claudeRunner.run(prompt, undefined, {
-      promptPrefix: null,
-      model: ai.settingsStore.aiModel(),
-      effort,
-      maxBudgetUsd: ai.settingsStore.aiMaxBudgetUsdAsk(),
-      timeoutMs: 300_000,
-      telemetry: { agentName: "ai-dispute-evidence", kind: "staff_command" },
-    });
-
-    // The final message carries the JSON; earlier ones are research narration.
-    // Scan backwards for the first parseable object; fall back to the raw tail
-    // as the uncategorized narrative rather than losing the run.
-    let draft: Record<string, string> = {};
-    const rejected = new Set<string>();
-    for (let i = messages.length - 1; i >= 0 && Object.keys(draft).length === 0; i--) {
-      const cleaned = messages[i]
-        .trim()
-        .replace(/^```(?:json)?\s*/i, "")
-        .replace(/```\s*$/, "");
-      const start = cleaned.indexOf("{");
-      const end = cleaned.lastIndexOf("}");
-      if (start === -1 || end <= start) continue;
-      try {
-        const parsed = JSON.parse(cleaned.slice(start, end + 1)) as Record<string, unknown>;
-        for (const key of fields) {
-          const value = parsed[key];
-          if (typeof value !== "string" || !value.trim()) continue;
-          const trimmed = value.trim();
-          // Shape guard: a value that can't be what the field means (text in
-          // an id field, an email as an explanation) is dropped, not saved.
-          if (AI_DRAFT_VALIDATORS[key] && !AI_DRAFT_VALIDATORS[key](trimmed)) {
-            rejected.add(key);
-            continue;
-          }
-          draft[key] = trimmed.slice(0, 3800);
-        }
-      } catch {
-        // keep scanning earlier messages
-      }
-    }
-    if (Object.keys(draft).length === 0 && Object.keys(deterministic).length === 0) {
-      draft = { uncategorized_text: (messages[messages.length - 1] ?? "").trim().slice(0, 3800) };
-    }
-    // Stripe-sourced values overwrite whatever the model produced for them.
-    Object.assign(draft, deterministic);
-
-    // Backfill the receipt file slot while we're here (the webhook auto-attach
-    // only covers disputes created after the feature) — best-effort, the draft
-    // itself must land regardless.
-    let receiptStaged = false;
-    if (ai.settingsStore.disputeAutoAttachReceipt()) {
-      try {
-        const receipt = await attachReceiptEvidence(this.stripe, dispute);
-        receiptStaged = receipt.attached;
-      } catch (error) {
-        logger.warn("receipt auto-attach during AI draft failed", { error: String(error), "stripe.dispute_id": dispute.id });
-      }
-    }
-
-    await this.disputeStore.mergeEvidenceDraft(dispute.id, draft);
-    return {
-      kind: "ok",
-      fields: Object.keys(draft).length,
-      rejected: [...rejected],
-      usedIntercomHistory: !!intercomHistory,
-      exemplars: wonExemplars.length,
-      receiptStaged,
-      customerId,
-      model: ai.settingsStore.aiModel(),
-    };
-  }
-
-  // Support-history context for the AI draft: resolve the customer to Intercom
-  // contacts (bridge contacts carry the Discord id as external_id and no email,
-  // so both lookups run), pull their newest conversations and render bounded
-  // plaintext transcripts. Null on any shortfall — the draft works without it.
-  private async collectIntercomHistory(customerId: string | null, email: string | null): Promise<string | null> {
-    const ai = this.aiDeps();
-    if (ai.settingsStore.intercomMode() === "none") return null;
-    const contactIds = new Set<string>();
-    if (customerId) {
-      const discordIds = await this.sessionStore.findDiscordIdsByStripeId(customerId).catch(() => []);
-      for (const discordId of discordIds.slice(0, 3)) {
-        const contact = await ai.intercom.findContactByExternalId(discordId).catch(() => null);
-        if (contact) contactIds.add(contact.id);
-      }
-    }
-    if (email) {
-      for (const c of await ai.intercom.searchContactsByEmail(email).catch(() => [])) contactIds.add(c.id);
-    }
-    if (contactIds.size === 0) return null;
-
-    const conversations: Array<{ id: string; createdAt: Date | null }> = [];
-    for (const contactId of [...contactIds].slice(0, 3)) {
-      conversations.push(...(await ai.intercom.searchConversationsByContact(contactId, 3).catch(() => [])));
-    }
-    const newest = [...new Map(conversations.map((c) => [c.id, c])).values()]
-      .sort((a, b) => (b.createdAt?.getTime() ?? 0) - (a.createdAt?.getTime() ?? 0))
-      .slice(0, 3);
-
-    const blocks: string[] = [];
-    let budget = 5000; // keep the prompt bounded — transcripts can be huge
-    for (const convo of newest) {
-      const transcript = await ai.intercom.getConversationTranscript(convo.id).catch(() => []);
-      if (!transcript.length) continue;
-      const lines = transcript
-        .slice(0, 12)
-        .map(
-          (m) =>
-            `  - [${m.at ? m.at.toISOString().slice(0, 10) : "?"}] ${m.author}: ${m.text.replace(/\s+/g, " ").slice(0, 300)}`
-        );
-      const block = `- Conversation started ${convo.createdAt ? convo.createdAt.toISOString().slice(0, 10) : "?"}:\n${lines.join("\n")}`;
-      if (block.length > budget) break;
-      budget -= block.length;
-      blocks.push(block);
-    }
-    return blocks.length ? blocks.join("\n") : null;
-  }
-
-  // AI evidence REVIEW: critiques exactly what the bank would receive — the
-  // staged text plus the staged files, downloaded from Stripe and passed to
-  // the light model as vision/document blocks. Local draft fields that differ
-  // from staged ride along so the review can say "stage this". Read-only;
-  // works on closed disputes too (post-mortem). Callers may pass a pre-fetched
-  // package to skip the second dispute read (the hub shows a progress message
-  // from it first).
-  async aiReview(
-    disputeId: string,
-    opts: { pkg?: StagedPackage; telemetry?: { userId?: string; username?: string } } = {}
-  ): Promise<AiReviewResult> {
-    const ai = this.aiDeps();
-    const pkg = opts.pkg ?? (await this.stagedPackage(disputeId));
-    const dispute = pkg.dispute;
-    const stagedFields = pkg.textFields.map((f) => ({ key: f.key, text: f.value.slice(0, 3800) }));
-    if (!stagedFields.length && !pkg.files.length) return { kind: "nothing_staged" };
-
-    // Pull the staged files back from Stripe; a file that can't be fetched or
-    // fed to the model is reported to the reviewer instead of failing the run.
-    const attachments: LightAiAttachment[] = [];
-    const files: Array<{ slot: string; filename: string; attached: boolean; note: string | null }> = [];
-    for (const { slot, fileId } of pkg.files) {
-      try {
-        const res = await this.stripe.getEvidenceFileWithContents(fileId, PROOF_MAX_BYTES);
-        if (res.data && res.mimeType) {
-          attachments.push({ name: res.filename, mediaType: res.mimeType, data: res.data });
-          files.push({ slot, filename: res.filename, attached: true, note: null });
-        } else {
-          files.push({ slot, filename: res.filename, attached: false, note: res.skipped ?? "unavailable" });
-        }
-      } catch (error) {
-        logger.warn("evidence file download for AI review failed", { error: String(error), "stripe.file_id": fileId });
-        files.push({ slot, filename: fileId, attached: false, note: "download failed" });
-      }
-    }
-
-    const unstagedDraft = pkg.unstagedDraft.map((key) => ({ key, text: pkg.draft[key].trim().slice(0, 1500) }));
-
-    const chargeId = typeof dispute.charge === "string" ? dispute.charge : (dispute.charge?.id ?? null);
-    const charge = chargeId ? await this.stripe.getCharge(chargeId).catch(() => null) : null;
-    const customerId = charge
-      ? typeof charge.customer === "string"
-        ? charge.customer
-        : (charge.customer?.id ?? null)
-      : (pkg.row?.customerId ?? null);
-    const customer = customerId ? await this.stripe.getCustomer(customerId).catch(() => null) : null;
-
-    const iso = (unix: number) => new Date(unix * 1000).toISOString().slice(0, 10);
-    const prompt = buildDisputeEvidenceReviewPrompt({
-      disputeId: dispute.id,
-      reason: dispute.reason || "unknown",
-      status: dispute.status,
-      amountText: this.stripe.formatAmount(dispute.amount, dispute.currency),
-      disputeCreated: iso(dispute.created),
-      evidenceDueBy: dispute.evidence_details?.due_by ? iso(dispute.evidence_details.due_by) : null,
-      submissionCount: pkg.submissions,
-      charge: charge
-        ? {
-            id: charge.id,
-            created: iso(charge.created),
-            amountText: this.stripe.formatAmount(charge.amount, charge.currency),
-            description: charge.description ?? null,
-            cardBrand: charge.payment_method_details?.card?.brand ?? null,
-            cardLast4: charge.payment_method_details?.card?.last4 ?? null,
-          }
-        : null,
-      customer: customer
-        ? { id: customer.id, email: customer.email ?? null, name: customer.name ?? null, created: iso(customer.created) }
-        : null,
-      stagedFields,
-      files,
-      unstagedDraft,
-    });
-
-    const messages = await ai.lightAi.run(prompt, undefined, {
-      model: ai.settingsStore.aiModelLight(),
-      maxTokens: 1_500,
-      timeoutMs: 120_000,
-      telemetry: {
-        agentName: "ai-dispute-evidence-review",
-        kind: "staff_command",
-        ...(opts.telemetry?.userId ? { userId: opts.telemetry.userId } : {}),
-        ...(opts.telemetry?.username ? { username: opts.telemetry.username } : {}),
-      },
-      attachments,
-    });
-    const review = messages.join("\n\n").trim();
-
-    return {
-      kind: "ok",
-      review,
-      stagedFieldCount: stagedFields.length,
-      filesAttached: attachments.length,
-      filesTotal: files.length,
-      skipped: files.filter((f) => !f.attached).map((f) => ({ slot: f.slot, note: f.note ?? "unavailable" })),
-      customerId,
-      model: ai.settingsStore.aiModelLight(),
-    };
-  }
 }
-
-export type AiDraftResult = {
-  kind: "ok";
-  fields: number;
-  rejected: string[];
-  usedIntercomHistory: boolean;
-  exemplars: number;
-  receiptStaged: boolean;
-  customerId: string | null;
-  model: string;
-};
-
-export type AiReviewResult =
-  | { kind: "nothing_staged" }
-  | {
-      kind: "ok";
-      review: string;
-      stagedFieldCount: number;
-      filesAttached: number;
-      filesTotal: number;
-      skipped: Array<{ slot: string; note: string }>;
-      customerId: string | null;
-      model: string;
-    };

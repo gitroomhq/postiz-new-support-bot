@@ -12,6 +12,7 @@ import {
   recommendedGroupKeys,
   type StagedPackage,
 } from "../../bot/billing/DisputeEvidenceService";
+import type { EvidencePackBuilder } from "../../bot/billing/evidence/EvidencePackBuilder";
 import { exportBillingEvent } from "../../metrics/MetricsExporter";
 import type { ActionActor } from "../../bot/billing/actions/BillingActionService";
 import { ActionButton, Badge, Block, Cell, EvidenceBlock, TableBlock } from "../renderer/contract";
@@ -36,34 +37,11 @@ const DUE_WARN_HOURS = 72;
 interface DisputesDeps {
   ratio: CachedRatioEngine;
   evidence: DisputeEvidenceService;
+  // Deterministic evidence packs. Optional so the section still renders on an
+  // instance where the builder is not wired.
+  evidencePack?: EvidencePackBuilder | null;
 }
 
-// AI runs are long (CLI draft ≤5min, light review ≤2min) and cost money — one
-// in-flight run per dispute, section-wide (double-click / second tab guard).
-const aiLocks = new Set<string>();
-// Last AI review per dispute so the verdict survives the page reload the
-// action triggers. Memory-only, advisory content — small cap + TTL.
-const aiReviews = new Map<string, { review: string; model: string; coverage: string; at: number }>();
-const AI_REVIEW_TTL_MS = 30 * 60_000;
-const AI_REVIEW_CAP = 24;
-
-function rememberAiReview(disputeId: string, entry: { review: string; model: string; coverage: string }): void {
-  aiReviews.set(disputeId, { ...entry, at: Date.now() });
-  if (aiReviews.size > AI_REVIEW_CAP) {
-    const oldest = [...aiReviews.entries()].sort((a, b) => a[1].at - b[1].at)[0];
-    if (oldest) aiReviews.delete(oldest[0]);
-  }
-}
-
-function freshAiReview(disputeId: string): { review: string; model: string; coverage: string; at: number } | null {
-  const entry = aiReviews.get(disputeId);
-  if (!entry) return null;
-  if (Date.now() - entry.at > AI_REVIEW_TTL_MS) {
-    aiReviews.delete(disputeId);
-    return null;
-  }
-  return entry;
-}
 
 export function makeDisputesSection(deps: DisputesDeps): DashboardSectionModule {
   return {
@@ -128,8 +106,13 @@ async function disputeAction(
       const fieldKey = str(p.key, 64);
       const value = str(p.value, 4000);
       if (!EVIDENCE_KEY_SET.has(fieldKey)) return { ok: false, error: "Unknown evidence field." };
-      const { saved } = await deps.evidence.saveDraft(disputeId, { [fieldKey]: value });
+      const { saved, rejected } = await deps.evidence.saveDraft(disputeId, { [fieldKey]: value });
+      if (rejected.length) {
+        return { ok: false, error: `That value cannot be what ${rejected[0]} means, so it was not saved.` };
+      }
       if (!saved) return { ok: false, error: "Nothing to save: the field was empty." };
+      // A human has typed into this dispute, so auto-submit stands down.
+      await ctx.stores.dispute.markEvidenceTouched(disputeId, ctx.actor.id, ctx.actor.name);
       return { ok: true, text: "Draft saved." };
     }
 
@@ -241,59 +224,33 @@ async function disputeAction(
       return { ok: true, text: "Dispute accepted; closed as lost." };
     }
 
-    // T0 long-running — AI draft (Claude Code CLI over the cloned repos).
-    // Merges into the LOCAL draft only; deterministic fields + shape
-    // validators live in the service (shared with /billing).
-    case "section:disputes.ai_draft": {
+    // T0 — rebuild the templated evidence pack and re-stage it. Deterministic:
+    // template text interpolated with real Stripe, platform and support facts,
+    // with no model involved. Staging uses submit:false, so Submit stays a
+    // separate, human action.
+    case "section:disputes.rebuild_pack": {
       const live = await ctx.stripe.getDispute(disputeId);
       if (!deps.evidence.respondable(live.status)) {
-        return { ok: false, error: `Status is ${live.status}; there is nothing left to draft for.` };
+        return { ok: false, error: `Status is ${live.status}; there is nothing left to answer.` };
       }
-      if (aiLocks.has(disputeId)) return { ok: false, error: "An AI run is already in progress for this dispute; hang on." };
-      aiLocks.add(disputeId);
-      try {
-        const result = await deps.evidence.aiDraft(disputeId, await customerHint(ctx, disputeId));
-        await ctx.audit(
-          `Dispute AI evidence draft on ${disputeId}: ${result.fields} field(s) saved locally${
-            result.rejected.length ? `, ${result.rejected.length} invalid dropped (${result.rejected.join(", ")})` : ""
-          }${result.usedIntercomHistory ? ", with Intercom history" : ""}${result.receiptStaged ? ", receipt staged" : ""} (${result.model})`
-        );
-        return {
-          ok: true,
-          text: `AI draft saved locally: ${result.fields} field(s) on ${result.model}${
-            result.rejected.length ? ` (${result.rejected.length} invalid value(s) dropped: ${result.rejected.join(", ")})` : ""
-          }${result.receiptStaged ? " · receipt PDF staged" : ""}. Review the sections below, then stage.`,
-        };
-      } finally {
-        aiLocks.delete(disputeId);
-      }
-    }
-
-    // T0 long-running — AI review of the staged package (light model, vision
-    // over the staged files). Read-only; verdict renders on the page.
-    case "section:disputes.ai_review": {
-      if (aiLocks.has(disputeId)) return { ok: false, error: "An AI run is already in progress for this dispute; hang on." };
-      aiLocks.add(disputeId);
-      try {
-        const result = await deps.evidence.aiReview(disputeId, {
-          telemetry: { userId: ctx.actor.id, username: ctx.actor.name },
-        });
-        if (result.kind === "nothing_staged") {
-          return { ok: false, error: "Nothing staged at Stripe yet; there is nothing to review." };
-        }
-        const coverage = `${result.stagedFieldCount} field(s) · ${result.filesAttached}/${result.filesTotal} file(s) reviewed${
-          result.skipped.length ? ` · skipped: ${result.skipped.map((f) => `${f.slot} (${f.note})`).join(", ")}` : ""
-        }`;
-        rememberAiReview(disputeId, {
-          review: result.review || "The model returned no review text; try again.",
-          model: result.model,
-          coverage,
-        });
-        await ctx.audit(`Dispute AI evidence review on ${disputeId}: ${coverage} (${result.model}, read-only)`);
-        return { ok: true, text: "AI review complete; the verdict is rendered on the page." };
-      } finally {
-        aiLocks.delete(disputeId);
-      }
+      if (!deps.evidencePack) return { ok: false, error: "The evidence pack builder is not configured." };
+      const chargeId = typeof live.charge === "string" ? live.charge : live.charge?.id;
+      if (!chargeId) return { ok: false, error: "This dispute has no charge to build a package from." };
+      const charge = await ctx.stripe.getCharge(chargeId);
+      // The panel always enriches: a human waiting on a page can afford the
+      // Intercom round trips that the Stripe webhook cannot.
+      const pack = await deps.evidencePack.build(live, charge, { enrich: true });
+      const staged = await deps.evidencePack.stage(live, pack, false);
+      await ctx.audit(
+        `Dispute evidence pack rebuilt on ${disputeId}: ${staged.staged.length} field(s), score ${staged.pack.score}%`
+      );
+      const omitted = staged.omitted.length
+        ? ` Omitted ${staged.omitted.length}: ${staged.omitted.map((o: { field: string; why: string }) => `${o.field} (${o.why})`).join(", ")}.`
+        : "";
+      return {
+        ok: true,
+        text: `Staged ${staged.staged.length} field(s), completeness ${staged.pack.score}%.${omitted} Review the sections below, then submit.`,
+      };
     }
 
     // T0 — DM-on-status-change subscription (actor ids ARE Discord ids).
@@ -781,7 +738,6 @@ async function detail(ctx: DashboardCtx, deps: DisputesDeps, id: string): Promis
     ],
   });
 
-  main.push(...aiToolsBlocks(ctx, pkg));
   main.push(evidenceBlockFrom(pkg));
 
   const timeline: Array<{ label: string; iso: string; text?: string; kind?: Badge["kind"] }> = [];
@@ -911,47 +867,6 @@ function submitButton(ctx: DashboardCtx, pkg: StagedPackage, draftFields: number
   };
 }
 
-// AI tools row (draft + review buttons w/ model/cost from settings, as the
-// hub surfaces them) plus the last stored review verdict, if fresh. The
-// verdict must survive the page reload a successful action triggers — it
-// lives in the section-level store, advisory-only.
-function aiToolsBlocks(ctx: DashboardCtx, pkg: StagedPackage): Block[] {
-  const id = pkg.dispute.id;
-  const blocks: Block[] = [];
-  blocks.push({
-    type: "notice",
-    badge: { kind: "info", text: "AI" },
-    text: `AI draft researches the ⭐ recommended fields from real account data (${ctx.settings.aiModel()}, effort ${ctx.settings.aiEffortAsk()}, ≤$${ctx.settings.aiMaxBudgetUsdAsk()}) and saves a LOCAL draft only. AI review critiques the staged package on ${ctx.settings.aiModelLight()} with the staged files as vision input. Both are advisory; nothing is sent to the bank.`,
-    actions: [
-      {
-        key: "section:disputes.ai_draft",
-        label: "AI draft",
-        params: { disputeId: id },
-        ...(pkg.respondable ? {} : { disabledReason: "Dispute is no longer respondable: nothing to draft for." }),
-      },
-      {
-        key: "section:disputes.ai_review",
-        label: "AI review",
-        params: { disputeId: id },
-        ...(pkg.textFields.length || pkg.files.length ? {} : { disabledReason: "Nothing staged at Stripe to review yet." }),
-      },
-    ],
-  });
-  const stored = freshAiReview(id);
-  if (stored) {
-    blocks.push({
-      type: "kv",
-      title: "AI evidence review",
-      rows: [
-        { label: "Model", cell: text(stored.model) },
-        { label: "Coverage", cell: text(stored.coverage) },
-        { label: "Ran", cell: isoDateCell(new Date(stored.at)) },
-      ],
-    });
-    blocks.push({ type: "notice", badge: { kind: "info", text: "Advisory" }, text: stored.review });
-  }
-  return blocks;
-}
 
 // Build the interactive evidence widget from the staged package + catalog.
 function evidenceBlockFrom(pkg: StagedPackage): EvidenceBlock {
@@ -1126,7 +1041,6 @@ async function review(ctx: DashboardCtx, deps: DisputesDeps, id: string): Promis
 
   // AI critique of exactly this package (works on closed disputes too —
   // post-mortem of what was actually sent), plus the last verdict if fresh.
-  main.push(...aiToolsBlocks(ctx, pkg));
 
   return {
     title: "Staged evidence",
