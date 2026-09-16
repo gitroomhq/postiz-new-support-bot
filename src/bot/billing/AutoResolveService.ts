@@ -60,6 +60,11 @@ export class AutoResolveService {
   // Has this customer already cost us a dispute or an auto-resolve recently.
   // Counts BOTH sources: a second dispute from someone we already refunded, and
   // a second dispute from someone who disputed before the engine existed.
+  //
+  // Callers deliberately treat a lookup FAILURE as "yes, repeat": if we cannot
+  // tell whether this customer has burned us before, the safe answer is to not
+  // refund automatically. It costs a human one look; the other way round costs
+  // money to somebody already flagged.
   private async isRepeatOffender(customerId: string | null, excludeDisputeId: string | null): Promise<boolean> {
     if (!customerId) return false;
     const days = this.settings.disputeAutoResolveRepeatDays();
