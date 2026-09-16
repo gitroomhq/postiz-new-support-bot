@@ -696,7 +696,12 @@ async function main() {
     makeCustomersSection({ postiz: postizIdentity }),
     makeSubscriptionsSection(),
     makeInvoicesSection(),
-    makeDisputesSection({ ratio: ratioEngine, evidence: disputeEvidenceService, evidencePack: evidencePackBuilder }),
+    makeDisputesSection({
+      ratio: ratioEngine,
+      evidence: disputeEvidenceService,
+      evidencePack: evidencePackBuilder,
+      autoResolveStore,
+    }),
     makeCatalogSection(),
     makeLinksSection(),
     makeQuotesSection(),

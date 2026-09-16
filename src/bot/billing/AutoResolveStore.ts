@@ -226,6 +226,12 @@ export class AutoResolveStore {
     });
   }
 
+  // Row counts per state, for the queue tab's filter chips.
+  async countsByState(): Promise<Record<string, number>> {
+    const grouped = await this.prisma.disputeAutoResolve.groupBy({ by: ["state"], _count: { _all: true } });
+    return Object.fromEntries(grouped.map((g) => [g.state, g._count._all]));
+  }
+
   async list(skip: number, take: number, filter: AutoResolveFilter = {}): Promise<{ rows: DisputeAutoResolve[]; total: number }> {
     const where = {
       ...(filter.state ? { state: filter.state } : {}),

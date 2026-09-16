@@ -13,6 +13,7 @@ import {
   type StagedPackage,
 } from "../../bot/billing/DisputeEvidenceService";
 import type { EvidencePackBuilder } from "../../bot/billing/evidence/EvidencePackBuilder";
+import type { AutoResolveStore } from "../../bot/billing/AutoResolveStore";
 import { exportBillingEvent } from "../../metrics/MetricsExporter";
 import type { ActionActor } from "../../bot/billing/actions/BillingActionService";
 import { ActionButton, Badge, Block, Cell, EvidenceBlock, TableBlock } from "../renderer/contract";
@@ -40,6 +41,8 @@ interface DisputesDeps {
   // Deterministic evidence packs. Optional so the section still renders on an
   // instance where the builder is not wired.
   evidencePack?: EvidencePackBuilder | null;
+  // Auto-resolve queue, so the money-moving automation is visible and stoppable.
+  autoResolveStore?: AutoResolveStore | null;
 }
 
 
@@ -96,6 +99,30 @@ async function disputeAction(
   p: Record<string, unknown>,
   confirmWord: string | undefined
 ): Promise<{ ok: boolean; text?: string; error?: string; fieldErrors?: Record<string, string>; needsReverse?: boolean }> {
+  // Handled BEFORE the dispute-id guard: an auto-resolve row is keyed on its
+  // own id, and a fraud-warning row has no dispute at all.
+  //
+  // No typed confirmation on purpose: the ceremony exists to slow down actions
+  // that spend money, and this one stops a spend.
+  if (key === "section:disputes.autoresolve_veto") {
+    const store = deps.autoResolveStore;
+    if (!store) return { ok: false, error: "Auto-resolve is not configured." };
+    const rowId = str(p.id, 40);
+    if (!/^c[a-z0-9]{20,32}$/.test(rowId)) return { ok: false, error: "That auto-resolve id is not valid." };
+    const outcome = await store.veto(rowId, ctx.actor.id, ctx.actor.name);
+    if (outcome.kind === "vetoed") {
+      await ctx.audit(`Auto-resolve cancelled: ${rowId}`);
+      return { ok: true, text: "Cancelled. No refund will be made for this one." };
+    }
+    if (outcome.kind === "already_vetoed") {
+      return { ok: false, error: `Already cancelled${outcome.byName ? ` by ${outcome.byName}` : ""}.` };
+    }
+    if (outcome.kind === "too_late") {
+      return { ok: false, error: `Too late: this is already ${outcome.state.toLowerCase()} and the refund is in flight.` };
+    }
+    return { ok: false, error: "That auto-resolve no longer exists." };
+  }
+
   const disputeId = validId("dispute", p.disputeId);
   if (!disputeId) return { ok: false, error: "Bad dispute id." };
   const confirmed = confirmWord === "CONFIRM";
@@ -296,7 +323,8 @@ async function list(
   filters: Record<string, string>,
   cursor: string | null
 ): Promise<SectionPage> {
-  const view = filters.view === "all" || filters.view === "history" ? filters.view : "";
+  const view =
+    filters.view === "all" || filters.view === "history" || filters.view === "autoresolve" ? filters.view : "";
   const counts = await ctx.stores.dispute.countsByStatus().catch(() => []);
   const needingCount = counts
     .filter((c) => (RESPONDABLE_DISPUTE_STATUSES as readonly string[]).includes(c.status))
@@ -310,6 +338,7 @@ async function list(
     items: [
       { value: "", label: "Needs response", ...(needingCount ? { badge: String(needingCount) } : {}) },
       { value: "all", label: "All disputes" },
+      { value: "autoresolve", label: "Auto-resolve" },
       { value: "history", label: "History & stats" },
     ],
   });
@@ -318,6 +347,7 @@ async function list(
   blocks.push(await ratioStrip(ctx, deps.ratio));
 
   if (view === "history") blocks.push(...(await historyBlocks(ctx, cursor)));
+  else if (view === "autoresolve") blocks.push(...(await autoResolveBlocks(ctx, deps, filters, cursor)));
   else if (view === "all") blocks.push(...(await allBlocks(ctx, filters, cursor, counts)));
   else blocks.push(await boardBlock(ctx));
 
@@ -491,6 +521,95 @@ async function allBlocks(
       ? { footer: `${page.rows.length} of ${page.total} item${page.total === 1 ? "" : "s"}` }
       : {}),
     notice: "Local mirror kept fresh by the dispute monitor and Stripe webhooks.",
+  };
+  return [table];
+}
+
+// Auto-resolve queue: what the engine has proposed, refused and executed.
+//
+// This exists because the engine moves money without anybody pressing
+// anything, and an automation nobody can see is an automation nobody can
+// trust. Vetoing carries NO typed confirmation on purpose: the ceremony exists
+// to slow down actions that spend money, and this one stops one.
+async function autoResolveBlocks(
+  ctx: DashboardCtx,
+  deps: DisputesDeps,
+  filters: Record<string, string>,
+  cursor: string | null
+): Promise<Block[]> {
+  const store = deps.autoResolveStore;
+  if (!store) {
+    return [{ type: "notice", badge: { kind: "info", text: "Off" }, text: "Auto-resolve is not configured on this instance." }];
+  }
+  const state = /^[A-Z]{1,12}$/.test(filters.state ?? "") ? filters.state : "";
+  const offset = /^\d{1,6}$/.test(cursor ?? "") ? Number(cursor) : 0;
+  const [page, byState] = await Promise.all([
+    store.list(offset, PAGE_SIZE, { state: (state || undefined) as never }),
+    store.countsByState().catch(() => ({}) as Record<string, number>),
+  ]);
+  const total = Object.values(byState).reduce((sum, n) => sum + n, 0);
+
+  const table: TableBlock = {
+    type: "table",
+    key: "autoresolve",
+    columns: [
+      { key: "state", label: "State" },
+      { key: "stage", label: "Stage" },
+      { key: "amount", label: "Amount" },
+      { key: "reason", label: "Reason" },
+      { key: "fires", label: "Fires / fired" },
+      { key: "who", label: "Outcome" },
+      { key: "charge", label: "Charge" },
+    ],
+    counts: {
+      key: "state",
+      items: [
+        { value: "", label: "All", count: total },
+        { value: "PENDING", label: "Pending", count: byState.PENDING ?? 0 },
+        { value: "EXECUTED", label: "Executed", count: byState.EXECUTED ?? 0 },
+        { value: "BLOCKED", label: "Declined", count: byState.BLOCKED ?? 0 },
+        { value: "VETOED", label: "Cancelled", count: byState.VETOED ?? 0 },
+      ],
+    },
+    rows: page.rows.map((r) => {
+      const pending = r.state === "PENDING";
+      // An executed row whose side effects never landed is a real loose end:
+      // the money moved but the subscription may still be billing.
+      const stuck = r.state === "EXECUTED" && (!r.subsCancelledAt || !r.intercomNotedAt);
+      const badgeKind: Badge["kind"] =
+        r.state === "EXECUTED" ? (stuck ? "warn" : "ok") : pending ? "warn" : r.state === "FAILED" ? "error" : "neutral";
+      return {
+        id: r.id,
+        cells: [
+          badgeCell(badgeKind, r.state.toLowerCase()),
+          text(r.stage === "efw" ? "Fraud warning" : "Inquiry"),
+          amount(ctx.stripe, r.amountMinor, r.currency),
+          text(sentence(r.reason.replace(/_/g, " "))),
+          isoDateCell(r.executedAt ?? r.fireAt),
+          text(
+            r.state === "BLOCKED"
+              ? (r.guardrail ?? "blocked").replace(/_/g, " ")
+              : r.state === "VETOED"
+                ? `cancelled by ${r.vetoedByName ?? "an admin"}`
+                : stuck
+                  ? "refunded, follow-up incomplete"
+                  : (r.refundId ?? "")
+          ),
+          idCell(r.chargeId, { copy: true }),
+        ] as Cell[],
+        ...(pending
+          ? {
+              actions: [
+                { key: "section:disputes.autoresolve_veto", label: "Cancel", style: "danger", params: { id: r.id } },
+              ] as ActionButton[],
+            }
+          : {}),
+      };
+    }),
+    nextCursor: offset + PAGE_SIZE < page.total ? String(offset + PAGE_SIZE) : null,
+    empty: "Nothing proposed yet. Auto-resolve is off by default.",
+    notice:
+      "Refunding an inquiry-stage dispute closes it as prevented, so it never counts toward the dispute ratio. Cancelling stops the refund; it does not close the dispute.",
   };
   return [table];
 }

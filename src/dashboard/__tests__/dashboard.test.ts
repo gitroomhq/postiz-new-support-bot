@@ -2180,8 +2180,48 @@ function disputesCtx(fakes?: ReturnType<typeof evidenceFakes>): DashboardCtx {
 }
 
 // Deps bundle for makeDisputesSection with the real service over the fakes.
+// State of the fake auto-resolve store, so a test can assert what veto did.
+const autoResolveState: { rows: Array<Record<string, unknown>>; vetoed: string[]; outcome: Record<string, unknown> } = {
+  rows: [],
+  vetoed: [],
+  outcome: { kind: "vetoed" },
+};
+
+const fakeAutoResolveStore = {
+  list: async () => ({ rows: autoResolveState.rows, total: autoResolveState.rows.length }),
+  countsByState: async () => ({ PENDING: 1, EXECUTED: 2 }),
+  veto: async (id: string) => {
+    autoResolveState.vetoed.push(id);
+    return autoResolveState.outcome;
+  },
+};
+
+function autoResolveRow(over: Record<string, unknown> = {}) {
+  return {
+    id: "cjld2cjxh0000qzrmn831i7rn",
+    stage: "inquiry",
+    state: "PENDING",
+    guardrail: null,
+    amountMinor: 2900,
+    currency: "usd",
+    reason: "subscription_canceled",
+    fireAt: new Date("2026-09-16T12:00:00.000Z"),
+    executedAt: null,
+    refundId: null,
+    vetoedByName: null,
+    subsCancelledAt: null,
+    intercomNotedAt: null,
+    chargeId: "ch_1",
+    ...over,
+  };
+}
+
 function disputesDeps(fakes?: ReturnType<typeof evidenceFakes>) {
-  return { ratio: fakeRatio, evidence: (fakes ?? evidenceFakes()).svc };
+  return {
+    ratio: fakeRatio,
+    evidence: (fakes ?? evidenceFakes()).svc,
+    autoResolveStore: fakeAutoResolveStore as never,
+  };
 }
 
 const fakeRatio = {
@@ -6628,4 +6668,63 @@ test("api view: a hyphenated page name routes instead of 400ing (money-out lives
   for (const bad of ["../etc", "Money-Out", "money out", "-money", "money/out"]) {
     assert.equal((await dashboard.api("view", "c", { page: bad })).status, 400, bad);
   }
+});
+
+
+// ---- auto-resolve queue tab ----
+
+test("auto-resolve tab: a pending row offers Cancel, a settled one does not", async () => {
+  autoResolveState.rows = [
+    autoResolveRow(),
+    autoResolveRow({ id: "cjld2cjxh0001qzrmn831i7rn", state: "EXECUTED", refundId: "re_1", executedAt: new Date(), subsCancelledAt: new Date(), intercomNotedAt: new Date() }),
+    autoResolveRow({ id: "cjld2cjxh0002qzrmn831i7rn", state: "BLOCKED", guardrail: "repeat_offender" }),
+  ];
+  const section = makeDisputesSection(disputesDeps());
+  const page = await section.buildPage(disputesCtx(), { page: "disputes", filters: { view: "autoresolve" } });
+  const table = page!.blocks.find((b) => b.type === "table" && b.key === "autoresolve") as TableBlock;
+  assert.ok(table);
+  assert.equal(table.rows.length, 3);
+  assert.ok(table.rows[0].actions?.some((a) => a.key === "section:disputes.autoresolve_veto"), "pending is cancellable");
+  assert.ok(!table.rows[1].actions?.length, "an executed row cannot be cancelled");
+  assert.ok(!table.rows[2].actions?.length, "a blocked row cannot be cancelled");
+  // The guardrail is named, so a human knows why the engine stood down.
+  assert.ok(JSON.stringify(table.rows[2].cells).includes("repeat offender"));
+});
+
+test("auto-resolve tab: an executed row with unfinished side effects is flagged, not shown as clean", async () => {
+  autoResolveState.rows = [
+    autoResolveRow({ state: "EXECUTED", refundId: "re_1", executedAt: new Date(), subsCancelledAt: null, intercomNotedAt: new Date() }),
+  ];
+  const section = makeDisputesSection(disputesDeps());
+  const page = await section.buildPage(disputesCtx(), { page: "disputes", filters: { view: "autoresolve" } });
+  const table = page!.blocks.find((b) => b.type === "table" && b.key === "autoresolve") as TableBlock;
+  const cells = JSON.stringify(table.rows[0].cells);
+  assert.ok(cells.includes("follow-up incomplete"), "the money moved but the subscription may still bill");
+  assert.ok(cells.includes('"warn"'), "and it is badged as needing attention");
+});
+
+test("auto-resolve veto: cancels without a typed confirmation, and reports a lost race honestly", async () => {
+  const section = makeDisputesSection(disputesDeps());
+  const ctx = disputesCtx();
+  autoResolveState.vetoed = [];
+  autoResolveState.outcome = { kind: "vetoed" };
+  // No confirmWord passed: vetoing STOPS a spend, so the ceremony would be backwards.
+  const ok = await section.action!(ctx, {
+    key: "section:disputes.autoresolve_veto",
+    params: { id: "cjld2cjxh0000qzrmn831i7rn" },
+  });
+  assert.equal(ok.ok, true);
+  assert.deepEqual(autoResolveState.vetoed, ["cjld2cjxh0000qzrmn831i7rn"]);
+
+  autoResolveState.outcome = { kind: "too_late", state: "EXECUTING" };
+  const late = await section.action!(ctx, {
+    key: "section:disputes.autoresolve_veto",
+    params: { id: "cjld2cjxh0000qzrmn831i7rn" },
+  });
+  assert.equal(late.ok, false);
+  assert.match(late.error ?? "", /already executing.*in flight/i);
+
+  const bad = await section.action!(ctx, { key: "section:disputes.autoresolve_veto", params: { id: "nope" } });
+  assert.equal(bad.ok, false);
+  assert.match(bad.error ?? "", /not valid/);
 });
