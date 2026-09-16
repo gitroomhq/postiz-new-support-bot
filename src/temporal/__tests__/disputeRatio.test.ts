@@ -169,3 +169,31 @@ test("ratioLevel: month VAMP figure drives transitions; null → ok", () => {
   assert.equal(ratioLevel(mk(0.5), 0.5, 0.9), "warn");
   assert.equal(ratioLevel(mk(0.9), 0.5, 0.9), "critical");
 });
+
+// The auto-resolve engine's whole thesis, asserted where the ratio math lives:
+// preventing an inquiry keeps it out of the numerator, whereas conceding a
+// chargeback does not. If this ever fails, refunding stops lowering the ratio
+// and the feature is spending money for nothing.
+test("prevented disputes stay out of the chargeback numerator; accepted ones do not", () => {
+  const inquiry = dispute({ charge: "ch_prevented", status: "warning_needs_response" });
+  assert.equal(isChargebackStage(inquiry), false);
+
+  // After a refund-to-prevent, Stripe reports the same dispute as "prevented".
+  const prevented = dispute({ charge: "ch_prevented", status: "prevented" });
+  assert.equal(isChargebackStage(prevented), true, "prevented does not carry a warning_ prefix on its own");
+  // ...which is exactly why the card case_type is what the numerator trusts.
+  const preventedCard = dispute({ charge: "ch_prevented", status: "prevented", caseType: "inquiry" });
+  assert.equal(isChargebackStage(preventedCard), false);
+
+  const succeeded = 1000;
+  const withInquiry = buildWindowNumbers([preventedCard], [], succeeded);
+  assert.equal(withInquiry.chargebacks, 0);
+  assert.equal(withInquiry.inquiries, 1);
+  assert.equal(withInquiry.plainPct, 0);
+
+  // Accepting a chargeback closes it as "lost" and it still counts.
+  const lost = dispute({ charge: "ch_lost", status: "lost", caseType: "chargeback" });
+  const withLoss = buildWindowNumbers([lost], [], succeeded);
+  assert.equal(withLoss.chargebacks, 1);
+  assert.equal(withLoss.plainPct, 0.1);
+});
