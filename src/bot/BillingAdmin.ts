@@ -44,6 +44,7 @@ import type { DisputeEvidenceService } from "./billing/DisputeEvidenceService";
 import type { BlockStore } from "./billing/BlockStore";
 import type { BlockService } from "./billing/BlockService";
 import type { EvidencePackBuilder } from "./billing/evidence/EvidencePackBuilder";
+import type { AutoResolveStore } from "./billing/AutoResolveStore";
 import type { BillingQolStore } from "./billing/BillingQolStore";
 import type { CachedRatioEngine } from "./billing/disputeRatio";
 
@@ -56,6 +57,7 @@ export interface BillingAdminExtras {
   qolStore: BillingQolStore;
   ratio: CachedRatioEngine;
   evidencePack: EvidencePackBuilder;
+  autoResolveStore?: AutoResolveStore | null;
   approvalStore: ApprovalStore;
   billingActions: BillingActionService;
 }
@@ -137,6 +139,7 @@ export class BillingAdmin {
       qolStore: extras.qolStore,
       ratio: extras.ratio,
       evidencePack: extras.evidencePack,
+      autoResolveStore: extras.autoResolveStore ?? null,
       approvalStore: extras.approvalStore,
       billingActions: extras.billingActions,
     };

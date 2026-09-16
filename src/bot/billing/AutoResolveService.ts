@@ -1,5 +1,6 @@
 import type Stripe from "stripe";
 import type { SettingsStore } from "../../config/SettingsStore";
+import type { SessionStore } from "../../auth/SessionStore";
 import type { StripeClient } from "../StripeClient";
 import type { DisputeStore } from "./DisputeStore";
 import { AutoResolveStore } from "./AutoResolveStore";
@@ -10,9 +11,13 @@ import {
   type AutoResolveConfig,
   type AutoResolveDecision,
   type AutoResolveStage,
+  type Guardrail,
 } from "./autoResolvePolicy";
 import { exportDisputeAutoResolve } from "../../metrics/MetricsExporter";
 import { log } from "../../util/logger";
+import { EXECUTING_LEASE_MS } from "./AutoResolveStore";
+import { refundReasonFor, refundableRemainder } from "./autoResolvePolicy";
+import type { DisputeAutoResolve } from "../../generated/prisma/client";
 
 const autoLog = log.child("dispute-auto-resolve");
 
@@ -33,12 +38,50 @@ export type ProposeResult =
   | { kind: "duplicate" }
   | { kind: "unavailable"; error: string };
 
+// How the engine reaches Discord. Kept as a seam rather than a Client so the
+// drain is testable without discord.js, and so an unreachable channel is a
+// clearly handled `null` rather than a thrown error.
+export interface AutoResolveAlerts {
+  // Returns where the alert landed, or null when it could not be posted at all.
+  postProposal(row: DisputeAutoResolve): Promise<{ channelId: string; messageId: string } | null>;
+  postBlocked(row: DisputeAutoResolve): Promise<void>;
+  postExecuted(row: DisputeAutoResolve, refundText: string): Promise<void>;
+  postFailed(row: DisputeAutoResolve, error: string): Promise<void>;
+}
+
+// The two things that happen to a customer after a successful auto-refund.
+// Optional: an instance without them still refunds, it just does not follow up.
+export interface AutoResolveSideEffects {
+  cancelSubscriptions(customerId: string, idemKey: string): Promise<void>;
+  noteOnCustomer(customerId: string, body: string): Promise<void>;
+}
+
+export interface DrainResult {
+  executed: number;
+  blocked: number;
+  failed: number;
+  superseded: number;
+  alerted: number;
+}
+
+// A refund attempt is retried this many times across ticks before the row is
+// parked as FAILED for a human. Each attempt is a fresh live re-check, so a
+// transient Stripe error recovers and a permanent one stops bothering anyone.
+const MAX_ATTEMPTS = 5;
+
+// One tick never processes more than this. A liveness guard against the
+// activity timeout, not a spend cap: the rest drain on the next tick.
+const DRAIN_LIMIT = 20;
+
 export class AutoResolveService {
   constructor(
     private settings: SettingsStore,
     private stripe: StripeClient,
     private store: AutoResolveStore,
-    private disputeStore: DisputeStore
+    private disputeStore: DisputeStore,
+    private sessionStore?: SessionStore,
+    private alerts?: AutoResolveAlerts,
+    private sideEffects?: AutoResolveSideEffects
   ) {}
 
   config(): AutoResolveConfig {
@@ -194,4 +237,213 @@ export class AutoResolveService {
       rowId: row.id,
     };
   }
+
+  // Executes proposals whose veto window has expired. Called by the disputes
+  // looper every hour.
+  //
+  // The ordering here is the whole safety argument:
+  //   1. a row with no posted alert is never executed, it is alerted instead
+  //   2. PENDING -> EXECUTING is a compare-and-set, so a veto racing the drain
+  //      wins or loses cleanly and never half-wins
+  //   3. every guardrail is re-run against LIVE Stripe state, because the
+  //      window is hours old and the world moved
+  //   4. the claim is keyed on the CHARGE, so an EFW row and an inquiry row for
+  //      the same charge collide instead of refunding twice
+  //   5. EXECUTED and the refund id are persisted BEFORE any side effect, so a
+  //      crash in a side effect can never cause a second refund
+  async drain(now: Date = new Date()): Promise<DrainResult> {
+    const result: DrainResult = { executed: 0, blocked: 0, failed: 0, superseded: 0, alerted: 0 };
+    if (!this.settings.disputeAutoResolveEnabled()) return result;
+
+    const due = await this.store.claimDue(now, DRAIN_LIMIT);
+    for (const row of due) {
+      try {
+        await this.drainRow(row, now, result);
+      } catch (error) {
+        autoLog.error("auto-resolve drain row failed", error, { "auto_resolve.id": row.id });
+      }
+    }
+    return result;
+  }
+
+  private async drainRow(row: DisputeAutoResolve, now: Date, result: DrainResult): Promise<void> {
+    // Finish the side effects of an already-executed row and stop. The money
+    // moved on a previous tick; nothing here may touch Stripe again.
+    if (row.state === "EXECUTED") {
+      await this.runSideEffects(row);
+      return;
+    }
+
+    // No alert on a channel means nobody could have vetoed this. Post it and
+    // push the window out, so a misconfigured billing channel fails closed
+    // rather than refunding in silence.
+    if (!row.alertedAt) {
+      const posted = await this.alerts?.postProposal(row).catch(() => null);
+      if (!posted) {
+        autoLog.warn("auto-resolve alert could not be posted; refund deferred", { "auto_resolve.id": row.id });
+        return;
+      }
+      const fireAt = new Date(now.getTime() + this.settings.disputeAutoResolveVetoMinutes() * 60_000);
+      await this.store.recordAlert(row.id, posted.channelId, posted.messageId, fireAt);
+      result.alerted++;
+      return;
+    }
+
+    // Reclaim a row abandoned by a crashed process, or take a pending one.
+    const claimed =
+      row.state === "EXECUTING"
+        ? await this.store.casReclaim(row.id, now)
+        : await this.store.casExecuting(row.id);
+    // Lost the race to a veto or to another worker. Silence is correct here.
+    if (!claimed) return;
+
+    const live = await this.liveGuardrails(row);
+    if (live.kind === "superseded") {
+      // A human already refunded inside the window. The engine's goal is met,
+      // so nothing is emitted: a blocked point here would be a lie.
+      await this.store.markSuperseded(row.id);
+      result.superseded++;
+      return;
+    }
+    if (live.kind === "block") {
+      await this.store.markBlocked(row.id, live.guardrail);
+      exportDisputeAutoResolve({
+        stage: row.stage as AutoResolveStage,
+        outcome: "blocked",
+        reason: row.reason,
+        currency: row.currency,
+        guardrail: live.guardrail,
+      });
+      await this.alerts?.postBlocked({ ...row, guardrail: live.guardrail }).catch(() => {});
+      result.blocked++;
+      return;
+    }
+
+    // Keyed on the charge, not the row: two stages on one charge must collide.
+    const claimKey = `dispute-autoresolve-${row.chargeId}`;
+    const held = await this.sessionStore
+      ?.claimBillingAction("system", claimKey, "dispute_autoresolve")
+      .catch(() => false);
+    if (this.sessionStore && !held) {
+      await this.store.markBlocked(row.id, "already_claimed");
+      exportDisputeAutoResolve({
+        stage: row.stage as AutoResolveStage,
+        outcome: "blocked",
+        reason: row.reason,
+        currency: row.currency,
+        guardrail: "already_claimed",
+      });
+      result.blocked++;
+      return;
+    }
+
+    let refund: { refundId: string; amount: number; currency: string };
+    try {
+      refund = await this.stripe.refundChargeAmount(
+        row.chargeId,
+        live.amountMinor,
+        // Idempotency keyed on the charge for the same reason as the claim.
+        `dp-autoresolve-${row.chargeId}`,
+        // NEVER "fraudulent": that value also adds the card and email to
+        // Stripe's native block lists, and auto-resolve is not allowed to block.
+        refundReasonFor(row.stage as AutoResolveStage, row.disputeId ? row.reason : null)
+      );
+    } catch (error) {
+      await this.sessionStore?.releaseBillingAction(claimKey).catch(() => {});
+      const outcome = await this.store.markRetryable(row.id, String(error), MAX_ATTEMPTS);
+      if (outcome === "failed") {
+        exportDisputeAutoResolve({
+          stage: row.stage as AutoResolveStage,
+          outcome: "failed",
+          reason: row.reason,
+          currency: row.currency,
+        });
+        await this.alerts?.postFailed(row, String(error)).catch(() => {});
+        result.failed++;
+      }
+      autoLog.error("auto-resolve refund failed", error, { "auto_resolve.id": row.id, "auto_resolve.outcome": outcome });
+      return;
+    }
+
+    // Money moved. Persist FIRST: from here the claim is never released, on the
+    // same principle the refund core uses.
+    await this.store.markExecuted(row.id, refund.refundId);
+    exportDisputeAutoResolve({
+      stage: row.stage as AutoResolveStage,
+      outcome: "executed",
+      reason: row.reason,
+      currency: row.currency,
+      // The charge's own currency, never the USD comparison value.
+      amountMinor: refund.amount,
+    });
+    result.executed++;
+    autoLog.info("auto-resolve executed", {
+      "auto_resolve.id": row.id,
+      "stripe.refund_id": refund.refundId,
+      "stripe.charge_id": row.chargeId,
+    });
+
+    const executed = { ...row, state: "EXECUTED", refundId: refund.refundId };
+    await this.alerts
+      ?.postExecuted(executed, this.stripe.formatAmount(refund.amount, refund.currency))
+      .catch(() => {});
+    await this.runSideEffects(executed);
+  }
+
+  // Re-runs every guardrail against live Stripe state. The veto window is hours
+  // wide, and surviving that drift is exactly what it is for.
+  private async liveGuardrails(
+    row: DisputeAutoResolve
+  ): Promise<{ kind: "ok"; amountMinor: number } | { kind: "block"; guardrail: Guardrail } | { kind: "superseded" }> {
+    const charge = await this.stripe.getCharge(row.chargeId);
+
+    // Did a human do it for us while the window ran? Any refund created after
+    // the proposal is theirs, not ours.
+    const humanRefund = (charge.refunds?.data ?? []).some((r) => r.created * 1000 > row.createdAt.getTime());
+    if (charge.refunded && humanRefund) return { kind: "superseded" };
+
+    if (charge.refunded) return { kind: "block", guardrail: "already_refunded" };
+    const remainder = refundableRemainder(charge);
+    if (remainder <= 0) return { kind: "block", guardrail: "no_remainder" };
+
+    if (row.disputeId) {
+      const dispute = await this.stripe.getDispute(row.disputeId);
+      // The case moved on: it is a chargeback now, or already closed, and a
+      // refund can no longer prevent anything.
+      if (dispute.status !== "warning_needs_response") return { kind: "block", guardrail: "not_refundable" };
+      if (dispute.is_charge_refundable === false) return { kind: "block", guardrail: "not_refundable" };
+      // A partial refund does not close a dispute as prevented.
+      if (remainder < dispute.amount) return { kind: "block", guardrail: "no_remainder" };
+    }
+    return { kind: "ok", amountMinor: remainder };
+  }
+
+  // Each side effect is stamped separately, so the drain can re-attempt one
+  // without re-attempting the other and without ever re-refunding.
+  private async runSideEffects(row: DisputeAutoResolve): Promise<void> {
+    if (!row.customerId) return;
+    if (!row.subsCancelledAt) {
+      try {
+        await this.sideEffects?.cancelSubscriptions(row.customerId, `dp-autoresolve-${row.sourceId}`);
+        await this.store.stampSideEffect(row.id, "subs");
+      } catch (error) {
+        autoLog.warn("auto-resolve subscription cancel failed", {
+          "auto_resolve.id": row.id,
+          "error.message": String(error),
+        });
+      }
+    }
+    if (!row.intercomNotedAt) {
+      try {
+        await this.sideEffects?.noteOnCustomer(
+          row.customerId,
+          `Stripe ${row.stage === "efw" ? "fraud warning" : "dispute"} auto-resolved: the charge ${row.chargeId} was refunded in full to prevent a chargeback, and any active subscription was cancelled. Do not issue a further refund or concession for this charge.`
+        );
+        await this.store.stampSideEffect(row.id, "intercom");
+      } catch (error) {
+        autoLog.warn("auto-resolve intercom note failed", { "auto_resolve.id": row.id, "error.message": String(error) });
+      }
+    }
+  }
+
 }

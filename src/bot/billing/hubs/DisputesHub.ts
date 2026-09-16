@@ -53,6 +53,9 @@ const logger = new Logger("billing-admin:disputes");
 const DISPUTE_ID_RE = /^(dp|du)_[A-Za-z0-9]+$/;
 const CHARGE_ID_RE = /^(ch|py)_[A-Za-z0-9]+$/;
 const CUSTOMER_ID_RE = /^cus_[A-Za-z0-9]+$/;
+// Auto-resolve rows are cuids, and the veto button carries one from a SHARED
+// channel message, so it is validated before it reaches the database.
+const CUID_RE = /^c[a-z0-9]{20,32}$/;
 // Pragmatic IP validation: dotted-quad with octet range, or a colon-bearing
 // IPv6-ish token (Radar does its own strict validation on the item anyway).
 const IPV4_RE = /^((25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(25[0-5]|2[0-4]\d|1?\d?\d)$/;
@@ -1174,6 +1177,44 @@ export class DisputesHub {
           session.blockSel = [];
           await this.renderBlockPanel(interaction, token);
         });
+      },
+    },
+    {
+      kind: "button",
+      id: "billadmin_dpa_veto:",
+      match: "prefix",
+      handler: async (interaction) => {
+        const rowId = interaction.customId.split(":")[1];
+        if (!CUID_RE.test(rowId)) return;
+        // This button lives on a SHARED channel message, so the reply is always
+        // ephemeral and the alert itself is never edited: several admins may be
+        // looking at it, and only one of them pressed anything.
+        await interaction.deferReply({ flags: 64 });
+        const store = this.ctx.autoResolveStore;
+        if (!store) {
+          await interaction.editReply({ embeds: [makeEmbed("Auto-resolve is not configured on this instance.", COLORS.warn)] });
+          return;
+        }
+        const outcome = await store.veto(rowId, interaction.user.id, interaction.user.username);
+        // Three genuinely different answers. "Too late" matters most: the
+        // refund is already in flight and pretending otherwise would be a lie.
+        const text =
+          outcome.kind === "vetoed"
+            ? "✅ Auto-resolve cancelled. No refund will be made, and this dispute is yours to handle."
+            : outcome.kind === "already_vetoed"
+              ? `⚠️ Already cancelled${outcome.byName ? ` by ${outcome.byName}` : ""}.`
+              : outcome.kind === "too_late"
+                ? `⚠️ Too late: this auto-resolve is already **${outcome.state.toLowerCase()}** and the refund is in flight.`
+                : "⚠️ That auto-resolve no longer exists.";
+        if (outcome.kind === "vetoed") {
+          this.ctx.audit.log(interaction, {
+            action: "Auto-resolve cancelled",
+            objectId: rowId,
+            outcome: "Refund-to-prevent vetoed by an admin",
+            severity: "info",
+          });
+        }
+        await interaction.editReply({ embeds: [makeEmbed(text, outcome.kind === "vetoed" ? COLORS.success : COLORS.warn)] });
       },
     },
     {

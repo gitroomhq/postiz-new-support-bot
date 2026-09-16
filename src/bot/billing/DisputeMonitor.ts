@@ -2,13 +2,21 @@ import { ActionRowBuilder, ButtonBuilder, ButtonStyle, Client, EmbedBuilder } fr
 import { SettingsStore } from "../../config/SettingsStore";
 import { SessionStore } from "../../auth/SessionStore";
 import { StripeClient } from "../StripeClient";
-import { DisputeStore, OPEN_DISPUTE_STATUSES, segmentsOfDispute } from "./DisputeStore";
+import { DisputeStore, OPEN_DISPUTE_STATUSES, RESPONDABLE_DISPUTE_STATUSES, segmentsOfDispute } from "./DisputeStore";
+import type { EvidencePackBuilder } from "./evidence/EvidencePackBuilder";
+import type { DisputeEvidenceService } from "./DisputeEvidenceService";
 import type { StripeSegmentResolver } from "./StripeSegmentResolver";
 import { BlockStore } from "./BlockStore";
 import { CachedRatioEngine, describeRatioWindow, ratioLevel, type RatioLevel } from "./disputeRatio";
 import { COLORS } from "../../util/embeds";
 import { log } from "../../util/logger";
-import { exportBillingEvent, exportDisputeOutcome, exportDisputeSnapshot } from "../../metrics/MetricsExporter";
+import {
+  exportBillingEvent,
+  exportDisputeEvidencePack,
+  exportDisputeOutcome,
+  exportDisputeResponse,
+  exportDisputeSnapshot,
+} from "../../metrics/MetricsExporter";
 import { flushInflux, influxActive } from "../../metrics/InfluxWriter";
 import type { DisputesTickResult } from "../../temporal/types";
 import type Stripe from "stripe";
@@ -16,6 +24,16 @@ import type Stripe from "stripe";
 const monitorLog = log.child("dispute-monitor");
 
 const DAY_S = 24 * 60 * 60;
+
+// The looper ticks hourly; the 90-day Stripe reconcile and the ratio sweeps
+// keep their original cadence behind a persisted cursor. A code constant rather
+// than a setting: it is a cost decision, not an operator preference.
+const RECONCILE_INTERVAL_MS = 6 * 60 * 60_000;
+
+// Evidence packs enrich through Intercom, so a tick handles a bounded number.
+const AUTO_EVIDENCE_LIMIT = 10;
+
+const RESPONDABLE = new Set<string>(RESPONDABLE_DISPUTE_STATUSES);
 
 // Stripe → local table reconciliation: upserts every dispute created in the
 // last 90 days, then re-checks any locally-open dispute the sweep missed
@@ -169,32 +187,196 @@ export class DisputeMonitor {
     private stripe: StripeClient,
     private disputeStore: DisputeStore,
     private blockStore: BlockStore,
-    private ratio: CachedRatioEngine
+    private ratio: CachedRatioEngine,
+    // Optional so an instance without them still reconciles and reminds.
+    private autoResolve?: { drain(): Promise<{ executed: number; blocked: number; failed: number }> } | null,
+    private evidencePack?: EvidencePackBuilder | null,
+    private evidence?: DisputeEvidenceService | null
   ) {}
 
   bindClient(client: Client): void {
     this.client = client;
   }
 
+  // The looper ticks HOURLY so due auto-resolves fire close to their configured
+  // veto window and near-deadline evidence is noticed in time. The expensive
+  // Stripe work does not run hourly: the 90-day reconcile and the ratio sweeps
+  // stay on their original 6h cadence behind a persisted cursor, so this change
+  // buys timeliness without multiplying Stripe reads by six.
+  //
+  // Order matters. The auto-resolve drain runs FIRST and unconditionally: it is
+  // cheap and time-critical, and a slow reconcile must never push a due refund
+  // past the window a human was promised.
   async tick(force: boolean): Promise<DisputesTickResult> {
-    let reconciled = 0;
-    try {
-      reconciled = (await reconcileDisputes(this.stripe, this.disputeStore)).synced;
-    } catch (error) {
-      monitorLog.error("dispute reconciliation failed", error);
-    }
+    const autoResolve = await this.autoResolve?.drain().catch((error) => {
+      monitorLog.error("auto-resolve drain failed", error);
+      return null;
+    });
 
+    // Free to run every tick: the query carries its own 24h damper per dispute
+    // and touches no Stripe at all, so hourly simply notices a near-due dispute
+    // within an hour instead of within six.
     const reminders = await this.sendReminders().catch((error) => {
       monitorLog.error("dispute reminders failed", error);
       return 0;
     });
 
-    const level = await this.checkRatio(force).catch((error) => {
-      monitorLog.error("dispute ratio check failed", error);
-      return "skipped" as const;
+    const evidence = await this.runAutoEvidence().catch((error) => {
+      monitorLog.error("dispute auto-evidence failed", error);
+      return { packed: 0, autoSubmitted: 0, escalated: 0 };
     });
 
-    return { reconciled, reminders, ratioLevel: level };
+    const last = this.settings.disputeReconcileAt();
+    const heavyDue = force || !last || Date.now() - last.getTime() >= RECONCILE_INTERVAL_MS;
+
+    let reconciled = 0;
+    let level: DisputesTickResult["ratioLevel"] = "skipped";
+    if (heavyDue) {
+      try {
+        reconciled = (await reconcileDisputes(this.stripe, this.disputeStore)).synced;
+      } catch (error) {
+        monitorLog.error("dispute reconciliation failed", error);
+      }
+      level = await this.checkRatio(force).catch((error) => {
+        monitorLog.error("dispute ratio check failed", error);
+        return "skipped" as const;
+      });
+      await this.settings.recordDisputeReconcile().catch(() => {
+        // A failed stamp only means the heavy pass runs again next hour.
+      });
+    }
+
+    return {
+      reconciled,
+      reminders,
+      ratioLevel: level,
+      autoResolved: autoResolve?.executed ?? 0,
+      autoResolveBlocked: autoResolve?.blocked ?? 0,
+      autoResolveFailed: autoResolve?.failed ?? 0,
+      packed: evidence.packed,
+      autoSubmitted: evidence.autoSubmitted,
+      escalated: evidence.escalated,
+    };
+  }
+
+  // Builds (or rebuilds) the templated evidence pack for disputes approaching
+  // their deadline, then either submits it or escalates. Capped per tick: this
+  // is the expensive path, with Intercom enrichment on every dispute it touches.
+  private async runAutoEvidence(): Promise<{ packed: number; autoSubmitted: number; escalated: number }> {
+    const out = { packed: 0, autoSubmitted: 0, escalated: 0 };
+    const builder = this.evidencePack;
+    if (!builder || !this.settings.disputeAutoPackEnabled()) return out;
+
+    // Look a full day beyond the submit window so a pack is built and readable
+    // BEFORE the hour it might be submitted in.
+    const windowHours = this.settings.disputeAutoSubmitHours() + 24;
+    const rows = await this.disputeStore.listNeedingAutoEvidence(windowHours);
+    for (const row of rows.slice(0, AUTO_EVIDENCE_LIMIT)) {
+      try {
+        const dispute = await this.stripe.getDispute(row.id);
+        if (!RESPONDABLE.has(dispute.status)) continue;
+        const chargeId = typeof dispute.charge === "string" ? dispute.charge : dispute.charge?.id;
+        if (!chargeId) continue;
+        const charge = await this.stripe.getCharge(chargeId);
+        const pack = await builder.build(dispute, charge, { enrich: true });
+        const staged = await builder.stage(dispute, pack, false);
+        out.packed++;
+
+        const decision = await builder.autoSubmitDecision(dispute, row, staged.pack);
+        if (decision.kind === "submit") {
+          const result = await this.evidence!.submit(dispute.id, "system", row.customerId);
+          if (result.kind === "submitted") {
+            out.autoSubmitted++;
+            exportDisputeEvidencePack({
+              reason: dispute.reason,
+              source: row.evidenceTouchedAt ? "mixed" : "template",
+              fieldsFilled: staged.staged.length,
+              fieldsRecommended: staged.staged.length + staged.omitted.length,
+              filesAttached: 0,
+              autoSubmitted: true,
+            });
+            exportDisputeResponse({
+              reason: dispute.reason,
+              currency: dispute.currency,
+              hoursToSubmit: (Date.now() - dispute.created * 1000) / 3_600_000,
+              // NOT clamped: a negative value means it went past the deadline,
+              // which is precisely the signal worth seeing.
+              hoursBeforeDeadline: ((dispute.evidence_details?.due_by ?? 0) * 1000 - Date.now()) / 3_600_000,
+            });
+            await this.postAutoSubmitted(dispute, staged.pack.score);
+          }
+          continue;
+        }
+
+        // Refused. NOTHING is un-staged: the pack stays exactly where it is, so
+        // a human only has to press Submit.
+        if (this.shouldEscalate(decision.why, dispute)) {
+          await this.escalateEvidence(dispute, decision.why, decision.score, staged.omitted);
+          exportDisputeEvidencePack({
+            reason: dispute.reason,
+            source: row.evidenceTouchedAt ? "mixed" : "template",
+            fieldsFilled: staged.staged.length,
+            fieldsRecommended: staged.staged.length + staged.omitted.length,
+            filesAttached: 0,
+            autoSubmitted: false,
+          });
+          out.escalated++;
+        }
+      } catch (error) {
+        monitorLog.error("dispute auto-evidence row failed", error, { "stripe.dispute_id": row.id });
+      }
+    }
+    return out;
+  }
+
+  // Only a refusal that a human can still act on is worth a ping. "Not due yet"
+  // and "already submitted" are the system working, not a problem.
+  private shouldEscalate(why: string, dispute: Stripe.Dispute): boolean {
+    if (why === "not_due_yet" || why === "already_submitted" || why === "opted_out") return false;
+    const dueBy = dispute.evidence_details?.due_by;
+    if (!dueBy) return false;
+    return (dueBy * 1000 - Date.now()) / 3_600_000 <= this.settings.disputeAutoSubmitHours();
+  }
+
+  private async escalateEvidence(
+    dispute: Stripe.Dispute,
+    why: string,
+    score: number,
+    omitted: Array<{ field: string; why: string }>
+  ): Promise<void> {
+    const dueBy = dispute.evidence_details?.due_by ?? 0;
+    const hours = Math.max(0, Math.round((dueBy * 1000 - Date.now()) / 3_600_000));
+    const roleId = this.settings.disputeUrgentRoleId();
+    const embed = new EmbedBuilder()
+      .setTitle("⏳ Evidence needs a human before the deadline")
+      .setColor(COLORS.danger)
+      .setDescription(
+        `The evidence package for \`${dispute.id}\` is staged but was NOT auto-submitted: **${why.replace(/_/g, " ")}**. ` +
+          "Nothing was un-staged, so opening it and pressing Submit is all that is required."
+      )
+      .addFields(
+        { name: "Completeness", value: `${score}%`, inline: true },
+        { name: "Hours left", value: String(hours), inline: true },
+        { name: "Amount", value: this.stripe.formatAmount(dispute.amount, dispute.currency), inline: true },
+        ...(omitted.length
+          ? [{ name: "Missing", value: omitted.map((o) => `${o.field}: ${o.why}`).join("\n").slice(0, 1024), inline: false }]
+          : [])
+      )
+      .setTimestamp();
+    await this.postAlert(embed, [], roleId ? `<@&${roleId}>` : undefined);
+    // Share the urgent damper so the ordinary urgent ping does not double-fire
+    // in the same hour for the same dispute.
+    await this.disputeStore.recordUrgentReminder(dispute.id).catch(() => {});
+  }
+
+  private async postAutoSubmitted(dispute: Stripe.Dispute, score: number): Promise<void> {
+    const embed = new EmbedBuilder()
+      .setTitle("📤 Evidence auto-submitted")
+      .setColor(COLORS.success)
+      .setDescription(`The templated evidence package for \`${dispute.id}\` was submitted to the bank at ${score}% completeness.`)
+      .addFields({ name: "Amount", value: this.stripe.formatAmount(dispute.amount, dispute.currency), inline: true })
+      .setTimestamp();
+    await this.postAlert(embed);
   }
 
   // Respondable disputes with evidence due within N days: one channel ping per

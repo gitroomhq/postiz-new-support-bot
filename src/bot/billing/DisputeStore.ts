@@ -615,7 +615,7 @@ export class DisputeStore {
     await this.prisma.stripeDispute.updateMany({ where: { id }, data: { lastUrgentReminderAt: new Date() } });
   }
 
-  // Group modals and the AI draft save one field subset at a time — merge into
+  // Group modals and the evidence pack save one field subset at a time, so they merge into
   // the existing draft so saving "Policies" doesn't wipe the "Core" draft.
   async mergeEvidenceDraft(id: string, patch: Record<string, string>): Promise<void> {
     const row = await this.prisma.stripeDispute.findUnique({ where: { id }, select: { evidenceDraft: true } });

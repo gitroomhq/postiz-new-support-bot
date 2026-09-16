@@ -120,6 +120,7 @@ import { MoneyOutService } from "./bot/billing/MoneyOutService";
 import { StripeSegmentResolver } from "./bot/billing/StripeSegmentResolver";
 import { AutoResolveStore } from "./bot/billing/AutoResolveStore";
 import { AutoResolveService } from "./bot/billing/AutoResolveService";
+import { DiscordAutoResolveAlerts, StripeIntercomSideEffects } from "./bot/billing/AutoResolveAlerts";
 import { TemplateStore } from "./bot/billing/evidence/TemplateStore";
 import { EvidencePackBuilder } from "./bot/billing/evidence/EvidencePackBuilder";
 import { SubscriptionEventStore } from "./bot/billing/SubscriptionEventStore";
@@ -303,9 +304,30 @@ async function main() {
   // it never reaches the chargeback numerator. Ships off; when on, it only
   // PROPOSES here and the disputes looper executes after a vetoable alert.
   const autoResolveStore = new AutoResolveStore(prisma);
-  const autoResolveService = new AutoResolveService(settingsStore, stripeClient, autoResolveStore, disputeStore);
+  // The alert adapter is what makes the veto window real: the drain refuses to
+  // execute any row it has not successfully posted an alert for.
+  const autoResolveAlerts = new DiscordAutoResolveAlerts(settingsStore, stripeClient);
+  const autoResolveService = new AutoResolveService(
+    settingsStore,
+    stripeClient,
+    autoResolveStore,
+    disputeStore,
+    sessionStore,
+    autoResolveAlerts,
+    new StripeIntercomSideEffects(stripeClient, sessionStore, settingsStore, intercomClient)
+  );
   const ratioEngine = new CachedRatioEngine(stripeClient);
-  const disputeMonitor = new DisputeMonitor(settingsStore, sessionStore, stripeClient, disputeStore, blockStore, ratioEngine);
+  const disputeMonitor = new DisputeMonitor(
+    settingsStore,
+    sessionStore,
+    stripeClient,
+    disputeStore,
+    blockStore,
+    ratioEngine,
+    autoResolveService,
+    evidencePackBuilder,
+    disputeEvidenceService
+  );
   // Money-out ledger: every outflow (refunds, disputes, fees, concessions)
   // mirrored from Stripe's balance transactions, whatever surface caused it —
   // the Stripe Dashboard included.
@@ -359,6 +381,7 @@ async function main() {
     qolStore,
     ratio: ratioEngine,
     evidencePack: evidencePackBuilder,
+    autoResolveStore,
     approvalStore,
     billingActions: billingActionService,
   });
@@ -549,6 +572,7 @@ async function main() {
   intercomInboxApp.bindClient(bot.client);
   stripeWebhookHandler.bindClient(bot.client);
   disputeMonitor.bindClient(bot.client);
+  autoResolveAlerts.bindClient(bot.client);
   // Thread URLs need the guild id, only known once the client is ready —
   // resolved lazily per call.
   intercomSync.setThreadUrlBuilder((threadId) => {

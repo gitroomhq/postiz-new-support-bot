@@ -282,3 +282,154 @@ test("policy: the refund reason is never fraudulent, because that blocklists at 
     }
   }
 });
+
+// ---- the drain: where money actually moves ----
+
+import { AutoResolveService } from "../../bot/billing/AutoResolveService";
+
+type Row = Record<string, unknown>;
+
+const row = (over: Row = {}): Row => ({
+  id: "cjld2cjxh0000qzrmn831i7rn",
+  stage: "inquiry",
+  sourceId: "dp_1",
+  disputeId: "dp_1",
+  chargeId: "ch_1",
+  customerId: "cus_1",
+  amountMinor: 2000,
+  currency: "usd",
+  usdMinor: 2000,
+  reason: "subscription_canceled",
+  state: "PENDING",
+  guardrail: null,
+  fireAt: new Date("2026-09-16T10:00:00.000Z"),
+  alertedAt: new Date("2026-09-16T08:00:00.000Z"),
+  refundId: null,
+  subsCancelledAt: new Date(),
+  intercomNotedAt: new Date(),
+  attempts: 0,
+  createdAt: new Date("2026-09-16T08:00:00.000Z"),
+  ...over,
+});
+
+function drainHarness(opts: { rows: Row[]; charge?: Stripe.Charge; dispute?: Stripe.Dispute; casOk?: boolean }) {
+  const calls: string[] = [];
+  const store = {
+    claimDue: async () => opts.rows,
+    casExecuting: async () => {
+      calls.push("cas");
+      return opts.casOk !== false;
+    },
+    casReclaim: async () => opts.casOk !== false,
+    recordAlert: async () => {
+      calls.push("recordAlert");
+    },
+    markExecuted: async (_id: string, refundId: string) => {
+      calls.push(`executed:${refundId}`);
+    },
+    markBlocked: async (_id: string, g: string) => {
+      calls.push(`blocked:${g}`);
+    },
+    markSuperseded: async () => {
+      calls.push("superseded");
+    },
+    markRetryable: async () => "retry" as const,
+    stampSideEffect: async () => {},
+  };
+  const alerts = {
+    postProposal: async () => {
+      calls.push("postProposal");
+      return { channelId: "c", messageId: "m" };
+    },
+    postBlocked: async () => {
+      calls.push("postBlocked");
+    },
+    postExecuted: async () => {},
+    postFailed: async () => {},
+  };
+  const stripe = {
+    getCharge: async () => opts.charge ?? charge({}),
+    getDispute: async () => opts.dispute ?? dispute({}),
+    refundChargeAmount: async (chargeId: string, amountMinor: number, key: string, reason: string) => {
+      calls.push(`refund:${chargeId}:${amountMinor}:${key}:${reason}`);
+      return { refundId: "re_1", amount: amountMinor, currency: "usd", status: "succeeded" };
+    },
+    formatAmount: (a: number) => `$${(a / 100).toFixed(2)}`,
+  };
+  const svc = new AutoResolveService(
+    { disputeAutoResolveEnabled: () => true, disputeAutoResolveVetoMinutes: () => 120 } as never,
+    stripe as never,
+    store as never,
+    {} as never,
+    { claimBillingAction: async () => true, releaseBillingAction: async () => {} } as never,
+    alerts as never,
+    { cancelSubscriptions: async () => {}, noteOnCustomer: async () => {} } as never
+  );
+  return { svc, calls };
+}
+
+test("drain: a row with no posted alert is alerted, never refunded", async () => {
+  // The invariant that makes the veto window real: an unreachable billing
+  // channel must fail closed, not refund in silence.
+  const h = drainHarness({ rows: [row({ alertedAt: null })] });
+  const result = await h.svc.drain(new Date("2026-09-16T12:00:00.000Z"));
+  assert.deepEqual(h.calls, ["postProposal", "recordAlert"]);
+  assert.equal(result.executed, 0);
+  assert.equal(result.alerted, 1);
+  assert.ok(!h.calls.some((c) => c.startsWith("refund:")));
+});
+
+test("drain: losing the compare-and-set to a veto refunds nothing, silently", async () => {
+  const h = drainHarness({ rows: [row()], casOk: false });
+  const result = await h.svc.drain(new Date("2026-09-16T12:00:00.000Z"));
+  assert.deepEqual(h.calls, ["cas"]);
+  assert.equal(result.executed, 0);
+});
+
+test("drain: the refund is keyed on the CHARGE and never uses the fraudulent reason", async () => {
+  const h = drainHarness({ rows: [row()] });
+  await h.svc.drain(new Date("2026-09-16T12:00:00.000Z"));
+  const refund = h.calls.find((c) => c.startsWith("refund:"));
+  assert.ok(refund, "a refund should have been made");
+  // Keyed on the charge so an EFW row and an inquiry row for the same charge
+  // collide by design instead of refunding it twice.
+  assert.ok(refund.includes("dp-autoresolve-ch_1"), refund);
+  assert.ok(!refund.includes("fraudulent"), "fraudulent would also blocklist at Stripe");
+  assert.ok(refund.endsWith("requested_by_customer"), refund);
+});
+
+test("drain: live guardrails are re-run, and a human refund inside the window supersedes", async () => {
+  // Superseded emits nothing and blocks nothing: a human did the thing the
+  // engine wanted, so a blocked point here would be a lie.
+  const refundedByHuman = charge({ fullyRefunded: true, refunded: 2000 });
+  // Only `created` is read, and only to tell a human's refund from ours.
+  (refundedByHuman as unknown as { refunds: { data: Array<{ created: number }> } }).refunds = {
+    data: [{ created: Math.floor(new Date("2026-09-16T09:00:00.000Z").getTime() / 1000) }],
+  };
+  const h = drainHarness({ rows: [row()], charge: refundedByHuman });
+  const result = await h.svc.drain(new Date("2026-09-16T12:00:00.000Z"));
+  assert.equal(result.superseded, 1);
+  assert.equal(result.executed, 0);
+  assert.ok(h.calls.includes("superseded"));
+});
+
+test("drain: a dispute that became a chargeback during the window is blocked, not refunded", async () => {
+  const h = drainHarness({ rows: [row()], dispute: dispute({ status: "needs_response" }) });
+  const result = await h.svc.drain(new Date("2026-09-16T12:00:00.000Z"));
+  assert.equal(result.blocked, 1);
+  assert.equal(result.executed, 0);
+  assert.ok(h.calls.includes("blocked:not_refundable"));
+  assert.ok(h.calls.includes("postBlocked"), "a blocked case still reaches a human");
+});
+
+test("drain: the master toggle makes the drain a no-op", async () => {
+  const h = drainHarness({ rows: [row()] });
+  const off = new AutoResolveService(
+    { disputeAutoResolveEnabled: () => false } as never,
+    {} as never,
+    { claimDue: async () => [] } as never,
+    {} as never
+  );
+  assert.deepEqual(await off.drain(), { executed: 0, blocked: 0, failed: 0, superseded: 0, alerted: 0 });
+  assert.equal(h.calls.length, 0);
+});

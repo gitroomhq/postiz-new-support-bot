@@ -66,7 +66,7 @@ export const LOOPER_GENERATIONS: Record<string, number> = {
   [SINGLETONS.kbRefresh]: 1,
   [SINGLETONS.metricsSnapshot]: 1,
   [SINGLETONS.cleanupLoop]: 1,
-  [SINGLETONS.disputesLoop]: 1,
+  [SINGLETONS.disputesLoop]: 2,
   [SINGLETONS.slaSweep]: 1,
   [SINGLETONS.slaEnforce]: 1,
   // 2: forced restart of a run suspected of being wedged (it was not: the
@@ -353,6 +353,16 @@ export interface DisputesTickResult {
   reconciled: number;
   reminders: number;
   ratioLevel: "ok" | "warn" | "critical" | "skipped";
+  // Auto-resolve drain: refunds that actually fired, guardrail refusals, and
+  // rows parked after repeated Stripe failures.
+  autoResolved: number;
+  autoResolveBlocked: number;
+  autoResolveFailed: number;
+  // Deterministic evidence: packs built, packages auto-submitted, and packages
+  // that hit the deadline needing a human instead.
+  packed: number;
+  autoSubmitted: number;
+  escalated: number;
 }
 
 export interface MoneyOutTickResult {

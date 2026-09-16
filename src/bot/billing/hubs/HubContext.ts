@@ -10,6 +10,7 @@ import type { DisputeEvidenceService } from "../DisputeEvidenceService";
 import type { BlockStore } from "../BlockStore";
 import type { BlockService } from "../BlockService";
 import type { EvidencePackBuilder } from "../evidence/EvidencePackBuilder";
+import type { AutoResolveStore } from "../AutoResolveStore";
 import type { BillingQolStore } from "../BillingQolStore";
 import type { CachedRatioEngine } from "../disputeRatio";
 import type { ApprovalStore } from "../ApprovalStore";
@@ -37,6 +38,8 @@ export interface HubContext {
   // Deterministic evidence packs: the template corpus interpolated with real
   // Stripe, platform and support facts. No model is involved.
   evidencePack: EvidencePackBuilder;
+  // Auto-resolve proposals, for the veto button on the alert message.
+  autoResolveStore?: AutoResolveStore | null;
   // Intercom canvas/panel billing-action approvals (ApprovalsHub).
   approvalStore: ApprovalStore;
   billingActions: BillingActionService;

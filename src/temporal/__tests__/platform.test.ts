@@ -104,14 +104,18 @@ test("every looper singleton has an integer generation ≥ 1", () => {
   }
 });
 
-test("disputes-loop starts at generation 1", () => {
-  // Bump IN THE SAME COMMIT as any history-incompatible disputesLoopWorkflow change.
-  assert.equal(LOOPER_GENERATIONS[SINGLETONS.disputesLoop], 1);
+test("disputes-loop is at generation 2", () => {
+  // Bump IN THE SAME COMMIT as any history-incompatible disputesLoopWorkflow
+  // change. Generation 2 is the 6h -> 1h tick: a changed condition() timer
+  // duration cannot be replayed by a running gen-1 workflow, so leaving this at
+  // 1 would wedge the live singleton with nondeterminism task failures on the
+  // next deploy instead of restarting it cleanly.
+  assert.equal(LOOPER_GENERATIONS[SINGLETONS.disputesLoop], 2);
 });
 
 test("looperStartOptions stamps the code generation into the memo", () => {
   const opts = looperStartOptions(SINGLETONS.disputesLoop);
-  assert.deepEqual(opts, { memo: { [LOOPER_GEN_MEMO_KEY]: 1 } });
+  assert.deepEqual(opts, { memo: { [LOOPER_GEN_MEMO_KEY]: 2 } });
   assert.deepEqual(looperStartOptions("unknown-id"), { memo: { [LOOPER_GEN_MEMO_KEY]: 1 } });
 });
 

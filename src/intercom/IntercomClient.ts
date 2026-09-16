@@ -187,6 +187,21 @@ export class IntercomClient {
 
   // ---- Contacts ----
 
+  // A note on the CUSTOMER rather than on a conversation. The conversation-note
+  // path (onTicketNote) silently does nothing when the customer has no open
+  // ticket, which is the common case for somebody who disputed instead of
+  // writing to us, so an auto-resolve needs this one to leave a trace support
+  // will actually see.
+  async addContactNote(contactId: string, body: string, adminId: string): Promise<boolean> {
+    try {
+      await this.json(`/contacts/${encodeURIComponent(contactId)}/notes`, "POST", { body, admin_id: adminId }, "contact note");
+      return true;
+    } catch (e) {
+      if (e instanceof IntercomHttpError && e.status === 404) return false;
+      throw e;
+    }
+  }
+
   async findContactByExternalId(externalId: string): Promise<{ id: string } | null> {
     try {
       const data = await this.json<{ id?: string | number }>(

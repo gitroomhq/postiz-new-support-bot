@@ -181,10 +181,17 @@ const disputesActs = proxyActivities<CoreActivities>({
   retry: { maximumAttempts: 1 }, // the next tick retries naturally
 });
 
-// Dispute console: 6h tick (evidence-due reminders keep their own ≤1-ping/24h
-// damper per dispute, so the cadence only affects how fast NEW near-due
-// disputes are noticed) — reconcile the local mirror against Stripe, post
-// reminders, check the ratio thresholds. /config's "Run now" signals it.
+// Dispute console: HOURLY tick. The cadence is set by the two time-critical
+// jobs, not by the expensive ones: a due auto-resolve must fire close to the
+// veto window a human was promised, and an evidence package must be submitted
+// before its deadline rather than up to six hours after it.
+//
+// The expensive Stripe work did NOT become hourly. The 90-day reconcile and the
+// ratio sweeps stay on a 6h cadence behind a persisted cursor inside the tick
+// body (see DisputeMonitor.tick), so this buys timeliness without multiplying
+// Stripe reads by six. Evidence-due reminders keep their own damper of at most
+// one ping per dispute per 24h. /config's "Run now" signals it and bypasses the
+// cursor.
 export async function disputesLoopWorkflow(): Promise<void> {
   let runNow = false;
   setHandler(disputesRunNowSignal, () => {
@@ -195,7 +202,7 @@ export async function disputesLoopWorkflow(): Promise<void> {
     runNow = false;
     await disputesActs.disputesTick(force).catch(() => {});
     await canIfDue(() => continueWithMemo<typeof disputesLoopWorkflow>());
-    await condition(() => runNow, 6 * 60 * 60_000);
+    await condition(() => runNow, 60 * 60_000);
   }
 }
 
