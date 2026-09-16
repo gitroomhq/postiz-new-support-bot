@@ -314,3 +314,94 @@ test("tokens: a throwing resolver reads as unresolved, not as a crash", () => {
   assert.equal(Object.keys(resolved).length, TOKEN_NAMES.length);
   for (const name of TOKEN_NAMES) assert.ok(name in resolved);
 });
+
+// ---- completeness score and the auto-submit gate ----
+
+import { EvidencePackBuilder, scorePack } from "../billing/evidence/EvidencePackBuilder";
+
+const fullPackFields = (reason: PackReason): Record<string, string> =>
+  Object.fromEntries(PACK_FIELDS_BY_REASON[reason].map((f) => [f, "x".repeat(250)]));
+
+test("score: a complete pack is 100, an empty one is 0, the receipt bonus cannot exceed 100", () => {
+  assert.equal(scorePack("general", fullPackFields("general"), false), 100);
+  assert.equal(scorePack("general", {}, false), 0);
+  assert.equal(scorePack("general", fullPackFields("general"), true), 100, "the bonus is capped, not additive past 100");
+});
+
+test("score: the narrative fields dominate the cheap scalar ones", () => {
+  const scalars = { customer_email_address: "a@b.co", service_date: "1 May 2026", customer_name: "A B" };
+  const narrative = { product_description: "x".repeat(250), uncategorized_text: "x".repeat(250) };
+  assert.ok(
+    scorePack("general", narrative, false) > scorePack("general", scalars, false),
+    "two narrative fields must outweigh three scalar ones"
+  );
+});
+
+// Only `settings` is read by autoSubmitDecision, so the rest stay unconstructed.
+const builderWith = (over: Record<string, unknown> = {}) =>
+  new EvidencePackBuilder(
+    null as never,
+    {
+      disputeAutoSubmitEnabled: () => true,
+      disputeAutoSubmitHours: () => 24,
+      disputeAutoSubmitMinScore: () => 70,
+      disputeAutoSubmitMaxMinor: () => null,
+      disputeTemplateIntercomEnabled: () => true,
+      ...over,
+    } as never,
+    null as never,
+    null as never,
+    null as never,
+    null as never
+  );
+
+const NOW = new Date("2026-09-16T12:00:00.000Z");
+const dueIn = (hours: number) => Math.floor((NOW.getTime() + hours * 3_600_000) / 1000);
+const gateDispute = (over: Record<string, unknown> = {}) =>
+  ({
+    id: "dp_1",
+    status: "needs_response",
+    amount: 4900,
+    evidence_details: { due_by: dueIn(12), submission_count: 0 },
+    ...over,
+  }) as never;
+const gateRow = (over: Record<string, unknown> = {}) =>
+  ({ evidenceTouchedAt: null, evidenceAutoOptOut: false, evidenceSubmittedAt: null, ...over }) as never;
+const strongPack = { score: 90, fields: fullPackFields("general") };
+
+test("auto-submit: a strong, untouched, near-deadline pack is allowed through", async () => {
+  const d = await builderWith().autoSubmitDecision(gateDispute(), gateRow(), strongPack, NOW);
+  assert.deepEqual(d, { kind: "submit" });
+});
+
+test("auto-submit: every gate refuses for its own reason", async () => {
+  const cases: Array<[string, Promise<{ kind: string }>]> = [
+    ["disabled", builderWith({ disputeAutoSubmitEnabled: () => false }).autoSubmitDecision(gateDispute(), gateRow(), strongPack, NOW)],
+    ["not_respondable", builderWith().autoSubmitDecision(gateDispute({ status: "under_review" }), gateRow(), strongPack, NOW)],
+    ["already_submitted", builderWith().autoSubmitDecision(gateDispute(), gateRow({ evidenceSubmittedAt: NOW }), strongPack, NOW)],
+    ["opted_out", builderWith().autoSubmitDecision(gateDispute(), gateRow({ evidenceAutoOptOut: true }), strongPack, NOW)],
+    ["human_touched", builderWith().autoSubmitDecision(gateDispute(), gateRow({ evidenceTouchedAt: NOW }), strongPack, NOW)],
+    ["no_deadline", builderWith().autoSubmitDecision(gateDispute({ evidence_details: { due_by: null, submission_count: 0 } }), gateRow(), strongPack, NOW)],
+    ["past_deadline", builderWith().autoSubmitDecision(gateDispute({ evidence_details: { due_by: dueIn(-1), submission_count: 0 } }), gateRow(), strongPack, NOW)],
+    ["not_due_yet", builderWith().autoSubmitDecision(gateDispute({ evidence_details: { due_by: dueIn(100), submission_count: 0 } }), gateRow(), strongPack, NOW)],
+    ["over_amount", builderWith({ disputeAutoSubmitMaxMinor: () => 1000 }).autoSubmitDecision(gateDispute(), gateRow(), strongPack, NOW)],
+    ["low_score", builderWith().autoSubmitDecision(gateDispute(), gateRow(), { ...strongPack, score: 40 }, NOW)],
+  ];
+  for (const [expected, promise] of cases) {
+    const d = (await promise) as { kind: string; why?: string };
+    assert.equal(d.kind, "refuse", `${expected} should refuse`);
+    assert.equal(d.why, expected);
+  }
+});
+
+test("auto-submit: a high score on thin narrative fields is still refused", async () => {
+  // The gate that stops a package scoring 75 on an email, a date and a name
+  // from being sent to a bank with nothing that argues the case.
+  const thin = {
+    score: 95,
+    fields: { ...fullPackFields("general"), uncategorized_text: "Short.", product_description: "x".repeat(250) },
+  };
+  const d = (await builderWith().autoSubmitDecision(gateDispute(), gateRow(), thin, NOW)) as { kind: string; why?: string };
+  assert.equal(d.kind, "refuse");
+  assert.equal(d.why, "thin_narrative");
+});

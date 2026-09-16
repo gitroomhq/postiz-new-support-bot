@@ -71,6 +71,8 @@ export const EXPECTED_COLUMNS: Record<string, string[]> = {
     "disputeAutoResolveEnabled", "disputeAutoResolveEfw", "disputeAutoResolveMaxUsdMinor",
     "disputeAutoResolveVetoMinutes", "disputeAutoResolveRepeatDays", "disputeAutoResolveReasons",
     "disputeReconcileAt",
+    "disputeAutoPackEnabled", "disputeAutoSubmitEnabled", "disputeAutoSubmitHours",
+    "disputeAutoSubmitMinScore", "disputeAutoSubmitMaxMinor", "disputeTemplateIntercomEnabled",
     "moneyOutEnabled", "moneyOutSweepAt", "moneyOutBackfillDoneAt",
     "radarListCardId", "radarListEmailId", "radarListCustomerId", "radarListIpId",
     "inactivityEnabled", "inactivityAgentWaitDays", "inactivityCustomerWaitDays", "inactivityNagsBeforeClose",
@@ -120,6 +122,8 @@ export const EXPECTED_COLUMNS: Record<string, string[]> = {
     "evidenceDueBy", "evidenceDraft", "evidenceFinal", "evidenceSubmittedAt", "lastReminderAt",
     "lastUrgentReminderAt", "disputeCreatedAt", "closedAt", "createdAt", "updatedAt",
     "planTier", "planPeriod", "cardBrand", "cardFunding", "cardCountry", "networkReason", "tenure",
+    "evidenceAutoStagedAt", "evidenceAutoScore", "evidenceTemplateVersion", "evidenceAutoFields",
+    "evidenceTouchedAt", "evidenceTouchedBy", "evidenceAutoSubmitAt", "evidenceAutoOptOut",
   ],
   stripe_money_out: [
     "id", "kind", "bucket", "category", "amountMinor", "feeMinor", "netMinor", "currency", "source",
@@ -139,6 +143,9 @@ export const EXPECTED_COLUMNS: Record<string, string[]> = {
   billing_notes: ["id", "objectType", "objectId", "authorId", "authorName", "text", "createdAt"],
   billing_bookmarks: ["id", "objectType", "objectId", "label", "addedById", "addedByName", "createdAt"],
   dispute_watches: ["id", "disputeId", "userId", "createdAt"],
+  dispute_evidence_templates: [
+    "id", "reason", "fieldKey", "body", "enabled", "updatedById", "updatedByName", "createdAt", "updatedAt",
+  ],
   dispute_auto_resolves: [
     "id", "stage", "sourceId", "disputeId", "chargeId", "customerId", "amountMinor", "currency",
     "usdMinor", "reason", "state", "guardrail", "fireAt", "alertedAt", "alertChannelId",

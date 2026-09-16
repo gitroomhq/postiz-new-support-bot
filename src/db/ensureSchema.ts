@@ -1059,6 +1059,37 @@ export const STATEMENTS: string[] = [
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "disputeAutoResolveRepeatDays" INTEGER NOT NULL DEFAULT 90`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "disputeAutoResolveReasons" TEXT NOT NULL DEFAULT 'subscription_canceled,duplicate,credit_not_processed,product_unacceptable'`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "disputeReconcileAt" TIMESTAMP(3)`,
+  // Deterministic evidence packs. Auto-pack only stages (submit:false);
+  // auto-submit is the one that reaches the bank, and it ships off.
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "disputeAutoPackEnabled" BOOLEAN NOT NULL DEFAULT false`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "disputeAutoSubmitEnabled" BOOLEAN NOT NULL DEFAULT false`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "disputeAutoSubmitHours" INTEGER NOT NULL DEFAULT 24`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "disputeAutoSubmitMinScore" INTEGER NOT NULL DEFAULT 70`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "disputeAutoSubmitMaxMinor" INTEGER`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "disputeTemplateIntercomEnabled" BOOLEAN NOT NULL DEFAULT true`,
+  `ALTER TABLE "stripe_disputes" ADD COLUMN IF NOT EXISTS "evidenceAutoStagedAt" TIMESTAMP(3)`,
+  `ALTER TABLE "stripe_disputes" ADD COLUMN IF NOT EXISTS "evidenceAutoScore" INTEGER`,
+  `ALTER TABLE "stripe_disputes" ADD COLUMN IF NOT EXISTS "evidenceTemplateVersion" TEXT`,
+  `ALTER TABLE "stripe_disputes" ADD COLUMN IF NOT EXISTS "evidenceAutoFields" JSONB`,
+  `ALTER TABLE "stripe_disputes" ADD COLUMN IF NOT EXISTS "evidenceTouchedAt" TIMESTAMP(3)`,
+  `ALTER TABLE "stripe_disputes" ADD COLUMN IF NOT EXISTS "evidenceTouchedBy" TEXT`,
+  `ALTER TABLE "stripe_disputes" ADD COLUMN IF NOT EXISTS "evidenceAutoSubmitAt" TIMESTAMP(3)`,
+  `ALTER TABLE "stripe_disputes" ADD COLUMN IF NOT EXISTS "evidenceAutoOptOut" BOOLEAN NOT NULL DEFAULT false`,
+  // Operator overrides for the shipped evidence template corpus.
+  `CREATE TABLE IF NOT EXISTS "dispute_evidence_templates" (
+    "id" TEXT NOT NULL,
+    "reason" TEXT NOT NULL,
+    "fieldKey" TEXT NOT NULL,
+    "body" TEXT NOT NULL,
+    "enabled" BOOLEAN NOT NULL DEFAULT true,
+    "updatedById" TEXT,
+    "updatedByName" TEXT,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updatedAt" TIMESTAMP(3) NOT NULL,
+    CONSTRAINT "dispute_evidence_templates_pkey" PRIMARY KEY ("id")
+  )`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS "dispute_evidence_templates_reason_fieldKey_key" ON "dispute_evidence_templates"("reason", "fieldKey")`,
+  `CREATE INDEX IF NOT EXISTS "dispute_evidence_templates_reason_idx" ON "dispute_evidence_templates"("reason")`,
 ];
 
 export async function ensureSchema(prisma: PrismaClient): Promise<void> {

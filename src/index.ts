@@ -120,6 +120,8 @@ import { MoneyOutService } from "./bot/billing/MoneyOutService";
 import { StripeSegmentResolver } from "./bot/billing/StripeSegmentResolver";
 import { AutoResolveStore } from "./bot/billing/AutoResolveStore";
 import { AutoResolveService } from "./bot/billing/AutoResolveService";
+import { TemplateStore } from "./bot/billing/evidence/TemplateStore";
+import { EvidencePackBuilder } from "./bot/billing/evidence/EvidencePackBuilder";
 import { SubscriptionEventStore } from "./bot/billing/SubscriptionEventStore";
 import { SubscriptionEventService } from "./bot/billing/SubscriptionEventService";
 import { DisputeMonitor } from "./bot/billing/DisputeMonitor";
@@ -278,6 +280,18 @@ async function main() {
     intercom: intercomClient,
     settingsStore,
   });
+  // Deterministic evidence packs: template corpus plus operator overrides,
+  // interpolated with real Stripe, platform and support facts. No model.
+  const evidenceTemplateStore = new TemplateStore(prisma);
+  const evidencePackBuilder = new EvidencePackBuilder(
+    stripeClient,
+    settingsStore,
+    sessionStore,
+    disputeStore,
+    disputeEvidenceService,
+    evidenceTemplateStore,
+    intercomClient
+  );
   const blockStore = new BlockStore(prisma);
   const qolStore = new BillingQolStore(prisma);
   const blockService = new BlockService(settingsStore, stripeClient, blockStore);
@@ -302,6 +316,7 @@ async function main() {
   stripeWebhookHandler.setMoneyOutService(moneyOutService);
   stripeWebhookHandler.setSubscriptionEventService(subscriptionEventService);
   stripeWebhookHandler.setAutoResolveService(autoResolveService);
+  stripeWebhookHandler.setEvidencePackBuilder(evidencePackBuilder);
   // Intercom canvas/panel billing actions: approval queue + the shared
   // Discord-independent action brain (levels re-checked per request).
   const approvalStore = new ApprovalStore(prisma);
@@ -518,6 +533,10 @@ async function main() {
   // The client exists as soon as the constructor ran; nothing fires before login.
   bot.setSlaService(slaService);
   bot.setPostizIdentity(postizIdentity, postizClient);
+  // Platform account facts for the evidence templates (org name, plan, login
+  // method). Bound here because the identity service is built after the
+  // billing stack.
+  evidencePackBuilder.bindPostiz(postizIdentity);
   billingAdmin.setPostizIdentity(postizIdentity);
   billingActionService.bindPostizDrift(new PostizDriftService(postizIdentity, postizOrgLinks));
   billingActionService.bindMoneyOut(moneyOutService);

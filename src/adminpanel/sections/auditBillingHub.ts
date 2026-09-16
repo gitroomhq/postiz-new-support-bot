@@ -71,6 +71,12 @@ export function makeAuditBillingHub(deps: AuditBillingHubDeps): HubModule {
           { type: "toggle", key: "disputeAutoCancelSub", label: "Auto-cancel subscription on dispute", value: s.disputeAutoCancelSub() },
           { type: "toggle", key: "disputeAutoBlock", label: "Auto-blocklist on dispute", value: s.disputeAutoBlock() },
           { type: "toggle", key: "disputeAutoAttachReceipt", label: "Auto-attach receipt evidence", value: s.disputeAutoAttachReceipt() },
+          { type: "toggle", key: "disputeAutoPackEnabled", label: "Auto-stage templated evidence", value: s.disputeAutoPackEnabled(), help: "Builds the evidence package from templates and stages it. Submit stays manual." },
+          { type: "toggle", key: "disputeAutoSubmitEnabled", label: "Auto-submit near the deadline", value: s.disputeAutoSubmitEnabled(), help: "Sends a machine-written package to the bank when nobody has touched it. Leave off until you have read a few packs." },
+          { type: "number", key: "disputeAutoSubmitHours", label: "Auto-submit lead (hours)", value: s.disputeAutoSubmitHours(), min: 1, max: 168, unit: "h" },
+          { type: "number", key: "disputeAutoSubmitMinScore", label: "Auto-submit minimum score", value: s.disputeAutoSubmitMinScore(), min: 0, max: 100, unit: "%" },
+          { type: "number", key: "disputeAutoSubmitMaxMinor", label: "Auto-submit amount ceiling", value: s.disputeAutoSubmitMaxMinor(), min: 0, max: 100000000, nullable: true, unit: "¢", help: "Blank = no ceiling. Above it, a human always submits." },
+          { type: "toggle", key: "disputeTemplateIntercomEnabled", label: "Quote support history in evidence", value: s.disputeTemplateIntercomEnabled() },
           { type: "number", key: "disputeReminderDays", label: "Reminder lead (days)", value: s.disputeReminderDays(), min: 0, max: 30 },
           { type: "number", key: "disputeUrgentHours", label: "Urgent threshold (hours)", value: s.disputeUrgentHours(), min: 0, max: 168 },
           { type: "number", key: "disputeRatioWarnPct", label: "Ratio warn %", value: s.disputeRatioWarnPct(), min: 0, max: 100, unit: "%" },
@@ -203,6 +209,23 @@ export function makeAuditBillingHub(deps: AuditBillingHubDeps): HubModule {
           await s.updateDisputes({ [req.field]: v === true });
           await ctx.audit(`set ${req.field} → ${v === true}`);
           return { ok: true };
+        case "disputeAutoPackEnabled":
+        case "disputeAutoSubmitEnabled":
+        case "disputeTemplateIntercomEnabled":
+          await s.updateDisputeEvidenceAutomation({ [req.field]: v === true });
+          await ctx.audit(`set ${req.field} → ${v === true}`);
+          return { ok: true };
+        case "disputeAutoSubmitHours":
+        case "disputeAutoSubmitMinScore": {
+          const max = req.field === "disputeAutoSubmitHours" ? 168 : 100;
+          const parsed = asBoundedInt(v, 0, max);
+          if (!parsed.ok) return { ok: false, fieldErrors: { [req.field]: parsed.error } };
+          await s.updateDisputeEvidenceAutomation({ [req.field]: parsed.value });
+          await ctx.audit(`set ${req.field} → ${parsed.value}`);
+          return { ok: true };
+        }
+        case "disputeAutoSubmitMaxMinor":
+          return boundedNull(100000000, (n) => s.updateDisputeEvidenceAutomation({ disputeAutoSubmitMaxMinor: n }));
         case "disputeReminderDays":
         case "disputeUrgentHours":
         case "disputeRatioWarnPct":

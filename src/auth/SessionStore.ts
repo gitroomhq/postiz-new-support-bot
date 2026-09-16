@@ -230,6 +230,7 @@ export class SessionStore {
       // an early fraud warning and a later inquiry dispute on the same charge
       // must collide rather than refund it twice.
       | "dispute_autoresolve"
+      | "dispute_pack"
   ): Promise<boolean> {
     try {
       await this.prisma.billingAction.create({

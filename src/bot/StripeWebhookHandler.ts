@@ -9,6 +9,7 @@ import type { SubscriptionEventService } from "./billing/SubscriptionEventServic
 import { BlockService } from "./billing/BlockService";
 import { attachReceiptEvidence } from "./billing/receiptEvidence";
 import type { AutoResolveService } from "./billing/AutoResolveService";
+import type { EvidencePackBuilder } from "./billing/evidence/EvidencePackBuilder";
 import { COLORS } from "../util/embeds";
 import { log } from "../util/logger";
 import { metricCount } from "../util/instrument";
@@ -16,6 +17,28 @@ import { exportBillingEvent } from "../metrics/MetricsExporter";
 import { TemporalBufferedError, type TemporalProducers } from "../temporal/producers";
 
 const hookLog = log.child("stripe-webhook");
+
+// Inquiries get a pack too, and that is deliberate: a strong inquiry response
+// is the other way a chargeback never happens.
+const RESPONDABLE_FOR_PACK = new Set(["needs_response", "warning_needs_response"]);
+
+// The Stripe event activity has a 60 second budget and does not heartbeat, and
+// this handler spends part of it before the pack is reached.
+const PACK_DEADLINE_MS = 20_000;
+
+// Resolves to null instead of rejecting when the work outruns the budget. The
+// work itself is abandoned, not cancelled: it stages nothing further because
+// the claim is released and the looper rebuilds from scratch.
+function withDeadline<T>(work: Promise<T>, ms: number): Promise<T | null> {
+  let timer: NodeJS.Timeout | undefined;
+  const deadline = new Promise<null>((resolve) => {
+    timer = setTimeout(() => resolve(null), ms);
+    timer.unref();
+  });
+  return Promise.race([work, deadline]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
 
 // Ingested events (chosen in /config): the full dispute lifecycle + early
 // fraud warnings. All are high-severity, time-sensitive billing signals that
@@ -92,6 +115,13 @@ export class StripeWebhookHandler {
 
   setAutoResolveService(service: AutoResolveService): void {
     this.autoResolve = service;
+  }
+
+  // Deterministic evidence packs — bound late for the same reason.
+  private evidencePack: EvidencePackBuilder | null = null;
+
+  setEvidencePackBuilder(builder: EvidencePackBuilder): void {
+    this.evidencePack = builder;
   }
 
   // Money-out ledger — bound late (it depends on the Prisma-backed store built
@@ -429,6 +459,9 @@ export class StripeWebhookHandler {
     // so Temporal retries the actions.
     const notes: string[] = [];
     let autoActionError: unknown = null;
+    // Whether the receipt slot got filled this run, so the pack's score can
+    // count it without re-reading the dispute from Stripe.
+    let receiptStaged = false;
 
     // Refund-to-prevent. Only records a proposal; the disputes looper executes
     // it once the veto window expires, and only after a vetoable alert has
@@ -506,6 +539,7 @@ export class StripeWebhookHandler {
       if (claimed) {
         try {
           const result = await attachReceiptEvidence(this.stripe, dispute);
+          receiptStaged = result.attached;
           if (result.attached) {
             notes.push("🧾 Receipt auto-staged in the `receipt` evidence slot (submit still manual)");
           } else if (result.reason === "no_receipt") {
@@ -515,6 +549,46 @@ export class StripeWebhookHandler {
           await this.sessionStore.releaseBillingAction(`dispute-receipt-${dispute.id}`).catch(() => {});
           notes.push("⚠️ Receipt auto-attach FAILED. Will retry");
           autoActionError = autoActionError ?? e;
+        }
+      }
+    }
+
+    // Templated evidence pack. Runs AFTER the receipt attach so the receipt
+    // counts toward the pack's score and the charge read is already warm.
+    // Stages with submit:false: a human still presses Submit, they just open a
+    // dispute that is already answered instead of a blank one.
+    //
+    // The whole build races a deadline rather than rethrowing on timeout. The
+    // Stripe event activity has a 60 second budget and no heartbeat, and this
+    // handler has already spent part of it. A pack that misses the webhook is
+    // built by the disputes looper long before the evidence deadline; a webhook
+    // that times out is retried five times and alerts nobody.
+    if (chargeId && this.evidencePack && this.settings.disputeAutoPackEnabled() && RESPONDABLE_FOR_PACK.has(dispute.status)) {
+      const claimed = await this.sessionStore
+        .claimBillingAction("system", `dispute-pack-${dispute.id}`, "dispute_pack")
+        .catch(() => false);
+      if (claimed) {
+        try {
+          const charge = await this.stripe.getCharge(chargeId);
+          const built = await withDeadline(
+            (async () => {
+              const pack = await this.evidencePack!.build(dispute, charge);
+              return this.evidencePack!.stage(dispute, pack, receiptStaged);
+            })(),
+            PACK_DEADLINE_MS
+          );
+          if (built) {
+            notes.push(
+              `📄 Evidence pack auto-staged: ${built.staged.length} field(s), score ${built.pack.score}% (submit still manual)`
+            );
+          } else {
+            await this.sessionStore.releaseBillingAction(`dispute-pack-${dispute.id}`).catch(() => {});
+            notes.push("📄 Evidence pack deferred: it will be built before the deadline");
+          }
+        } catch (e) {
+          await this.sessionStore.releaseBillingAction(`dispute-pack-${dispute.id}`).catch(() => {});
+          notes.push("⚠️ Evidence pack FAILED. The disputes looper will retry");
+          hookLog.warn("evidence pack failed", { "stripe.dispute_id": dispute.id, "error.message": String(e) });
         }
       }
     }

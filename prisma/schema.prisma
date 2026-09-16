@@ -271,6 +271,21 @@ model BotSettings {
   // auto-resolves, but the expensive Stripe sweeps stay on their original 6h
   // cadence behind this stamp.
   disputeReconcileAt            DateTime?
+  // Deterministic evidence packs: template text interpolated with real Stripe,
+  // platform and support facts, staged with submit:false. Auto-pack only
+  // stages, so it is far less dangerous than auto-submit, which actually sends
+  // the package to the bank. Both ship OFF.
+  disputeAutoPackEnabled        Boolean @default(false)
+  disputeAutoSubmitEnabled      Boolean @default(false)
+  // Submit this many hours before the evidence deadline, if nobody touched it.
+  disputeAutoSubmitHours        Int     @default(24)
+  // Completeness score (0-100) a pack must reach before it may auto-submit.
+  disputeAutoSubmitMinScore     Int     @default(70)
+  // Null = no ceiling. A large chargeback always waits for a human.
+  disputeAutoSubmitMaxMinor     Int?
+  // Intercom lookups cost seconds, so they run on the looper's enrich pass
+  // rather than inside the 60s webhook. Switchable for when Intercom is down.
+  disputeTemplateIntercomEnabled Boolean @default(true)
   // Money-out ledger: every outflow (refunds, disputes, fees, concessions)
   // mirrored from Stripe's balance transactions + the concession webhooks.
   // moneyOutSweepAt is the reconcile cursor (sweeps re-read from it minus an
@@ -843,6 +858,18 @@ model StripeDispute {
   cardCountry         String? // ISO-3166 alpha-2 of the ISSUING card
   networkReason       String? // the card network's own reason code (10.4, 4853, …)
   tenure              String? // first_day | under_30d | 1_3mo | 3mo_plus
+  // ---- deterministic evidence pack ----
+  // evidenceTouchedAt is stamped by the UI CALL SITES only, never by the
+  // shared evidence service: the auto-pack stages through the same method and
+  // must not mark itself as human-touched, or it would veto its own auto-submit.
+  evidenceAutoStagedAt    DateTime?
+  evidenceAutoScore       Int? // 0-100 completeness of the last staged pack
+  evidenceTemplateVersion String? // corpus version that produced it
+  evidenceAutoFields      Json? // which fields the pack filled, and which it omitted and why
+  evidenceTouchedAt       DateTime?
+  evidenceTouchedBy       String?
+  evidenceAutoSubmitAt    DateTime?
+  evidenceAutoOptOut      Boolean   @default(false) // a human said "leave this one alone"
   createdAt           DateTime  @default(now())
   updatedAt           DateTime  @updatedAt
 
@@ -915,6 +942,28 @@ model DisputeAutoResolve {
   @@index([chargeId])
   @@index([disputeId])
   @@map("dispute_auto_resolves")
+}
+
+// Operator overrides for the shipped evidence template corpus, edited from the
+// web panel. A row replaces exactly one (reason, field) pair; everything not
+// overridden keeps the reviewed text that ships in the repository.
+//
+// reason "general" is the catch-all the per-field fallback chain checks second,
+// so one row there changes that field for every reason at once.
+model DisputeEvidenceTemplate {
+  id           String   @id @default(cuid())
+  reason       String // a PackReason
+  fieldKey     String // a Stripe text evidence key
+  body         String // paragraphs separated by a blank line; {{token}} interpolation
+  enabled      Boolean  @default(true)
+  updatedById  String?
+  updatedByName String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@unique([reason, fieldKey])
+  @@index([reason])
+  @@map("dispute_evidence_templates")
 }
 
 // Every outflow from the Stripe account, whatever its origin (our panels, the

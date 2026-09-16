@@ -1178,6 +1178,39 @@ export class SettingsStore {
     return this.settings.disputeReconcileAt;
   }
 
+  // ---- Deterministic evidence packs ----
+
+  // Stage a templated evidence package when a dispute arrives. Staging uses
+  // submit:false, so nothing reaches the bank and a human can still edit it.
+  disputeAutoPackEnabled(): boolean {
+    return this.settings.disputeAutoPackEnabled;
+  }
+
+  // The one that actually sends a machine-written package to a bank. Ships OFF
+  // and should stay off until packs have been read against real disputes.
+  disputeAutoSubmitEnabled(): boolean {
+    return this.settings.disputeAutoSubmitEnabled;
+  }
+
+  disputeAutoSubmitHours(): number {
+    return this.settings.disputeAutoSubmitHours;
+  }
+
+  disputeAutoSubmitMinScore(): number {
+    return this.settings.disputeAutoSubmitMinScore;
+  }
+
+  // Null = no ceiling. A large chargeback always waits for a human.
+  disputeAutoSubmitMaxMinor(): number | null {
+    return this.settings.disputeAutoSubmitMaxMinor;
+  }
+
+  // Intercom lookups run on the looper's enrich pass only, never in the 60s
+  // webhook. Switchable for when Intercom is down or rate limiting.
+  disputeTemplateIntercomEnabled(): boolean {
+    return this.settings.disputeTemplateIntercomEnabled;
+  }
+
   // ---- Money-out ledger (/config → Billing → Money out) ----
 
   moneyOutEnabled(): boolean {
@@ -1873,6 +1906,17 @@ export class SettingsStore {
           : {}),
       },
     });
+  }
+
+  async updateDisputeEvidenceAutomation(data: {
+    disputeAutoPackEnabled?: boolean;
+    disputeAutoSubmitEnabled?: boolean;
+    disputeAutoSubmitHours?: number;
+    disputeAutoSubmitMinScore?: number;
+    disputeAutoSubmitMaxMinor?: number | null;
+    disputeTemplateIntercomEnabled?: boolean;
+  }): Promise<void> {
+    this.settings = await this.prisma.botSettings.update({ where: { id: "global" }, data });
   }
 
   // Stamped by the disputes tick once the 6h Stripe sweeps have actually run,

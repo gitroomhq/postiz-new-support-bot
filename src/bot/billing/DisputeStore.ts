@@ -511,6 +511,58 @@ export class DisputeStore {
   // Normal reminder work-list: respondable, unsubmitted, due within the lead
   // window but NOT yet inside the urgent window (that tier pings separately),
   // not pinged in the last 24h. Past-due excluded — the response window is over.
+  // Records what the last templated pack produced. Deliberately does NOT touch
+  // evidenceTouchedAt: the pack stages through the same method a human does,
+  // and marking itself as touched would make it veto its own auto-submit.
+  async recordAutoPack(
+    disputeId: string,
+    pack: { score: number; templateVersion: string; fields: unknown }
+  ): Promise<void> {
+    await this.prisma.stripeDispute.update({
+      where: { id: disputeId },
+      data: {
+        evidenceAutoStagedAt: new Date(),
+        evidenceAutoScore: pack.score,
+        evidenceTemplateVersion: pack.templateVersion,
+        evidenceAutoFields: pack.fields as Prisma.InputJsonValue,
+      },
+    });
+  }
+
+  // Stamped by the UI CALL SITES only (the Discord modals and the web panel
+  // actions), never inside the shared evidence service. Once a human has typed
+  // anything into a dispute they own it, and auto-submit stands down.
+  async markEvidenceTouched(disputeId: string, actorId: string, actorName: string): Promise<void> {
+    await this.prisma.stripeDispute
+      .update({
+        where: { id: disputeId },
+        data: { evidenceTouchedAt: new Date(), evidenceTouchedBy: `${actorName} (${actorId})`.slice(0, 190) },
+      })
+      .catch(() => {
+        // A dispute the mirror has not seen yet is not worth failing an edit over.
+      });
+  }
+
+  // "Leave this one alone": a human opting a dispute out of auto-submit
+  // entirely, without having to edit its evidence to do it.
+  async setAutoOptOut(disputeId: string, optOut: boolean): Promise<void> {
+    await this.prisma.stripeDispute.update({ where: { id: disputeId }, data: { evidenceAutoOptOut: optOut } });
+  }
+
+  // Respondable, unsubmitted, not opted out, and inside the auto-submit window.
+  // The looper's enrich-and-submit work list.
+  async listNeedingAutoEvidence(withinHours: number, now: Date = new Date()): Promise<StripeDispute[]> {
+    return this.prisma.stripeDispute.findMany({
+      where: {
+        status: { in: [...RESPONDABLE_DISPUTE_STATUSES] },
+        evidenceSubmittedAt: null,
+        evidenceAutoOptOut: false,
+        evidenceDueBy: { gt: now, lte: new Date(now.getTime() + withinHours * 3_600_000) },
+      },
+      orderBy: { evidenceDueBy: "asc" },
+    });
+  }
+
   // How many disputes this customer has raised since a cutoff, excluding the
   // one being evaluated. The repeat-offender half of the auto-resolve guardrail:
   // refunding somebody their second dispute in a quarter teaches them the route
