@@ -10,7 +10,7 @@ const schemaLog = log.child("schema");
 // listed here but MISSING from the live database means an ensureSchema mirror was
 // forgotten, which would break the no-CLI deploy at runtime. The check runs after
 // ensureSchema on boot and is non-fatal by default (see verifySchema).
-const EXPECTED_COLUMNS: Record<string, string[]> = {
+export const EXPECTED_COLUMNS: Record<string, string[]> = {
   user_sessions: ["id", "discordUserId", "accessToken", "postizUserId", "stripeCustomerId", "authenticatedAt", "updatedAt"],
   billing_actions: ["id", "discordUserId", "stripeInvoiceId", "action", "createdAt"],
   pending_charge_reviews: [
@@ -68,6 +68,9 @@ const EXPECTED_COLUMNS: Record<string, string[]> = {
     "disputeAutoCancelSub", "disputeAutoBlock", "disputeAutoAttachReceipt", "disputeReminderDays",
     "disputeRatioWarnPct", "disputeRatioCriticalPct", "disputeRatioLastLevel",
     "disputeUrgentHours", "disputeUrgentRoleId", "disputeBackfillDoneAt",
+    "disputeAutoResolveEnabled", "disputeAutoResolveEfw", "disputeAutoResolveMaxUsdMinor",
+    "disputeAutoResolveVetoMinutes", "disputeAutoResolveRepeatDays", "disputeAutoResolveReasons",
+    "disputeReconcileAt",
     "moneyOutEnabled", "moneyOutSweepAt", "moneyOutBackfillDoneAt",
     "radarListCardId", "radarListEmailId", "radarListCustomerId", "radarListIpId",
     "inactivityEnabled", "inactivityAgentWaitDays", "inactivityCustomerWaitDays", "inactivityNagsBeforeClose",
@@ -136,6 +139,12 @@ const EXPECTED_COLUMNS: Record<string, string[]> = {
   billing_notes: ["id", "objectType", "objectId", "authorId", "authorName", "text", "createdAt"],
   billing_bookmarks: ["id", "objectType", "objectId", "label", "addedById", "addedByName", "createdAt"],
   dispute_watches: ["id", "disputeId", "userId", "createdAt"],
+  dispute_auto_resolves: [
+    "id", "stage", "sourceId", "disputeId", "chargeId", "customerId", "amountMinor", "currency",
+    "usdMinor", "reason", "state", "guardrail", "fireAt", "alertedAt", "alertChannelId",
+    "alertMessageId", "vetoedById", "vetoedByName", "vetoedAt", "executedAt", "refundId",
+    "subsCancelledAt", "intercomNotedAt", "attempts", "lastError", "createdAt", "updatedAt",
+  ],
   sentry_feedback_imports: [
     "id", "sentryIssueId", "sentryShortId", "projectSlug", "status", "contactEmail", "contactName",
     "intercomContactId", "intercomConversationId", "intercomTicketId", "pageUrl", "feedbackAt", "importedAt",

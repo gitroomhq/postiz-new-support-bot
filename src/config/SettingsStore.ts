@@ -1131,6 +1131,53 @@ export class SettingsStore {
     return this.settings.disputeBackfillDoneAt;
   }
 
+  // ---- Dispute auto-resolve (/config → Billing → Dispute auto-resolve) ----
+
+  // Master switch. Off means the engine is inert: it proposes nothing, blocks
+  // nothing and writes no metric points at all.
+  disputeAutoResolveEnabled(): boolean {
+    return this.settings.disputeAutoResolveEnabled;
+  }
+
+  // The early-fraud-warning leg, switchable on its own because it acts on a
+  // charge that has not been disputed yet.
+  disputeAutoResolveEfw(): boolean {
+    return this.settings.disputeAutoResolveEfw;
+  }
+
+  // USD cents. Charges in other currencies are converted with the approximate
+  // table in src/bot/billing/fx.ts; an unlisted currency never auto-resolves.
+  disputeAutoResolveMaxUsdMinor(): number {
+    return this.settings.disputeAutoResolveMaxUsdMinor;
+  }
+
+  disputeAutoResolveVetoMinutes(): number {
+    return this.settings.disputeAutoResolveVetoMinutes;
+  }
+
+  disputeAutoResolveRepeatDays(): number {
+    return this.settings.disputeAutoResolveRepeatDays;
+  }
+
+  // Comma-joined in the column (the allowedPriceIds idiom) so the list can be
+  // widened from /config without a schema change, which matters because
+  // production runs no migrations.
+  disputeAutoResolveReasons(): ReadonlySet<string> {
+    return new Set(
+      this.settings.disputeAutoResolveReasons
+        .split(",")
+        .map((r) => r.trim().toLowerCase())
+        .filter(Boolean)
+    );
+  }
+
+  // Cursor for the expensive half of the disputes tick. The looper runs hourly
+  // to drain auto-resolves; the Stripe reconcile and ratio sweeps stay on their
+  // original 6h cadence behind this stamp.
+  disputeReconcileAt(): Date | null {
+    return this.settings.disputeReconcileAt;
+  }
+
   // ---- Money-out ledger (/config → Billing → Money out) ----
 
   moneyOutEnabled(): boolean {
@@ -1804,6 +1851,37 @@ export class SettingsStore {
     disputeBackfillDoneAt?: Date;
   }): Promise<void> {
     this.settings = await this.prisma.botSettings.update({ where: { id: "global" }, data });
+  }
+
+  // The reason allowlist arrives as an array and is stored comma-joined; every
+  // other field passes straight through.
+  async updateDisputeAutoResolve(data: {
+    disputeAutoResolveEnabled?: boolean;
+    disputeAutoResolveEfw?: boolean;
+    disputeAutoResolveMaxUsdMinor?: number;
+    disputeAutoResolveVetoMinutes?: number;
+    disputeAutoResolveRepeatDays?: number;
+    disputeAutoResolveReasons?: string[];
+  }): Promise<void> {
+    const { disputeAutoResolveReasons, ...rest } = data;
+    this.settings = await this.prisma.botSettings.update({
+      where: { id: "global" },
+      data: {
+        ...rest,
+        ...(disputeAutoResolveReasons !== undefined
+          ? { disputeAutoResolveReasons: disputeAutoResolveReasons.join(",") }
+          : {}),
+      },
+    });
+  }
+
+  // Stamped by the disputes tick once the 6h Stripe sweeps have actually run,
+  // so an hourly tick does not re-run them.
+  async recordDisputeReconcile(): Promise<void> {
+    this.settings = await this.prisma.botSettings.update({
+      where: { id: "global" },
+      data: { disputeReconcileAt: new Date() },
+    });
   }
 
   async updateRadarLists(data: {

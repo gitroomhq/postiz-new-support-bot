@@ -4,7 +4,7 @@ import { PrismaClient } from "../generated/prisma/client";
 // Since the deploy environment can't run the CLI, the app creates any missing
 // tables itself on startup. Every statement is idempotent, so this is a safe
 // no-op once the tables exist. Keep in sync with prisma/schema.prisma.
-const STATEMENTS: string[] = [
+export const STATEMENTS: string[] = [
   `CREATE TABLE IF NOT EXISTS "user_sessions" (
     "id" TEXT NOT NULL,
     "discordUserId" TEXT NOT NULL,
@@ -1012,6 +1012,53 @@ const STATEMENTS: string[] = [
   // instead of silently freezing lastSyncAt.
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "sentryFeedbackLastAttemptAt" TIMESTAMP(3)`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "sentryFeedbackLastError" TEXT`,
+  // Dispute auto-resolve proposals: a refund-to-prevent waiting out its veto
+  // window. The unique index on sourceId is the propose-time idempotency lock,
+  // so it is created as its own statement under the name prisma db push would
+  // give it, keeping a dev box and a prod box structurally identical.
+  `CREATE TABLE IF NOT EXISTS "dispute_auto_resolves" (
+    "id" TEXT NOT NULL,
+    "stage" TEXT NOT NULL,
+    "sourceId" TEXT NOT NULL,
+    "disputeId" TEXT,
+    "chargeId" TEXT NOT NULL,
+    "customerId" TEXT,
+    "amountMinor" INTEGER NOT NULL,
+    "currency" TEXT NOT NULL,
+    "usdMinor" INTEGER NOT NULL,
+    "reason" TEXT NOT NULL,
+    "state" TEXT NOT NULL DEFAULT 'PENDING',
+    "guardrail" TEXT,
+    "fireAt" TIMESTAMP(3) NOT NULL,
+    "alertedAt" TIMESTAMP(3),
+    "alertChannelId" TEXT,
+    "alertMessageId" TEXT,
+    "vetoedById" TEXT,
+    "vetoedByName" TEXT,
+    "vetoedAt" TIMESTAMP(3),
+    "executedAt" TIMESTAMP(3),
+    "refundId" TEXT,
+    "subsCancelledAt" TIMESTAMP(3),
+    "intercomNotedAt" TIMESTAMP(3),
+    "attempts" INTEGER NOT NULL DEFAULT 0,
+    "lastError" TEXT,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updatedAt" TIMESTAMP(3) NOT NULL,
+    CONSTRAINT "dispute_auto_resolves_pkey" PRIMARY KEY ("id")
+  )`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS "dispute_auto_resolves_sourceId_key" ON "dispute_auto_resolves"("sourceId")`,
+  `CREATE INDEX IF NOT EXISTS "dispute_auto_resolves_state_fireAt_idx" ON "dispute_auto_resolves"("state", "fireAt")`,
+  `CREATE INDEX IF NOT EXISTS "dispute_auto_resolves_customerId_createdAt_idx" ON "dispute_auto_resolves"("customerId", "createdAt")`,
+  `CREATE INDEX IF NOT EXISTS "dispute_auto_resolves_chargeId_idx" ON "dispute_auto_resolves"("chargeId")`,
+  `CREATE INDEX IF NOT EXISTS "dispute_auto_resolves_disputeId_idx" ON "dispute_auto_resolves"("disputeId")`,
+  // Auto-resolve knobs. Every one that can move money ships OFF.
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "disputeAutoResolveEnabled" BOOLEAN NOT NULL DEFAULT false`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "disputeAutoResolveEfw" BOOLEAN NOT NULL DEFAULT false`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "disputeAutoResolveMaxUsdMinor" INTEGER NOT NULL DEFAULT 6000`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "disputeAutoResolveVetoMinutes" INTEGER NOT NULL DEFAULT 120`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "disputeAutoResolveRepeatDays" INTEGER NOT NULL DEFAULT 90`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "disputeAutoResolveReasons" TEXT NOT NULL DEFAULT 'subscription_canceled,duplicate,credit_not_processed,product_unacceptable'`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "disputeReconcileAt" TIMESTAMP(3)`,
 ];
 
 export async function ensureSchema(prisma: PrismaClient): Promise<void> {

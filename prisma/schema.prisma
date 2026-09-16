@@ -246,6 +246,31 @@ model BotSettings {
   disputeUrgentHours      Int     @default(48)
   disputeUrgentRoleId     String?
   disputeBackfillDoneAt   DateTime? // last all-time dispute history backfill run
+  // Auto-resolve: refunding an INQUIRY-stage dispute closes it as "prevented",
+  // so it never becomes a chargeback and never enters the dispute ratio. An
+  // actionable early fraud warning is the same move one step earlier. Both move
+  // real money without a human, so both ship OFF and both post a vetoable alert
+  // before anything fires.
+  disputeAutoResolveEnabled     Boolean @default(false)
+  disputeAutoResolveEfw         Boolean @default(false)
+  // USD cents. Other currencies are converted with the approximate built-in
+  // rate table in src/bot/billing/fx.ts; a currency absent from it never
+  // auto-resolves.
+  disputeAutoResolveMaxUsdMinor Int     @default(6000)
+  // How long the proposal waits for a human to cancel it. 0 fires on the next
+  // looper tick.
+  disputeAutoResolveVetoMinutes Int     @default(120)
+  // A customer with a dispute or an auto-resolve inside this window is blocked
+  // and escalated instead: refunding a serial disputer teaches them the route.
+  disputeAutoResolveRepeatDays  Int     @default(90)
+  // Comma-separated Stripe dispute reasons. Stored as text rather than columns
+  // so the list can be widened from /config, which has no migration path.
+  // EFWs deliberately ignore this: fraud_type is a different vocabulary.
+  disputeAutoResolveReasons     String  @default("subscription_canceled,duplicate,credit_not_processed,product_unacceptable")
+  // Reconcile/ratio cursor. The disputes looper ticks hourly to drain due
+  // auto-resolves, but the expensive Stripe sweeps stay on their original 6h
+  // cadence behind this stamp.
+  disputeReconcileAt            DateTime?
   // Money-out ledger: every outflow (refunds, disputes, fees, concessions)
   // mirrored from Stripe's balance transactions + the concession webhooks.
   // moneyOutSweepAt is the reconcile cursor (sweeps re-read from it minus an
@@ -827,6 +852,69 @@ model StripeDispute {
   @@index([customerId])
   @@index([closedAt])
   @@map("stripe_disputes")
+}
+
+// A proposed refund-to-prevent, waiting out its veto window. The row IS the
+// durable state of the decision: the webhook only writes it, the hourly
+// disputes looper drains it, and every transition is a compare-and-set so a
+// human pressing Cancel and the looper firing can never both win.
+//
+// Two stages share the table. "inquiry" rows hang off a dispute; "efw" rows
+// have no dispute object at all, so this row is the early fraud warning's only
+// local footprint.
+model DisputeAutoResolve {
+  id String @id @default(cuid())
+
+  stage String // inquiry | efw
+  // Webhook-redelivery lock: the dispute id (dp_/du_) or the EFW id (issfr_).
+  // The prefixes are disjoint, so one column serves both stages, and the unique
+  // constraint is what makes propose idempotent without a claim.
+  sourceId   String  @unique
+  disputeId  String? // null for efw: no dispute exists yet
+  chargeId   String
+  customerId String? // null blocks with guardrail no_customer before it gets here
+
+  // The refundable remainder in the CHARGE's own currency. usdMinor is the
+  // approximate conversion the threshold was compared against, kept only so an
+  // auditor can see the number the decision was made on. Never sum it.
+  amountMinor Int
+  currency    String
+  usdMinor    Int
+  reason      String // dispute reason for inquiry, fraud_type for efw
+
+  state     String  @default("PENDING") // PENDING | EXECUTING | EXECUTED | VETOED | BLOCKED | FAILED | SUPERSEDED
+  guardrail String? // set when state = BLOCKED
+
+  fireAt DateTime // when the veto window expires; the drain's due cursor
+  // No refund ever fires while this is null. If the alert could not be posted
+  // the drain posts it and pushes fireAt out, so an unreachable billing channel
+  // fails closed instead of refunding silently.
+  alertedAt      DateTime?
+  alertChannelId String?
+  alertMessageId String?
+
+  vetoedById String?
+  vetoedByName String?
+  vetoedAt   DateTime?
+
+  executedAt DateTime?
+  refundId   String? // re_… once money actually moved
+  // Side effects, stamped separately so the drain can re-attempt one without
+  // re-attempting the other and without ever re-refunding.
+  subsCancelledAt DateTime?
+  intercomNotedAt DateTime?
+
+  attempts  Int     @default(0)
+  lastError String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([state, fireAt])
+  @@index([customerId, createdAt])
+  @@index([chargeId])
+  @@index([disputeId])
+  @@map("dispute_auto_resolves")
 }
 
 // Every outflow from the Stripe account, whatever its origin (our panels, the

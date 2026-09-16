@@ -32,6 +32,27 @@ export type Guardrail =
   | "repeat_offender"
   | "already_claimed";
 
+// Stripe's dispute reason vocabulary. The /config allowlist field validates
+// against this so a typo comes back as a field error instead of silently
+// switching auto-resolve off for that reason.
+export const STRIPE_DISPUTE_REASONS: readonly string[] = [
+  "bank_cannot_process",
+  "check_returned",
+  "credit_not_processed",
+  "customer_initiated",
+  "debit_not_authorized",
+  "duplicate",
+  "fraudulent",
+  "general",
+  "incorrect_account_details",
+  "insufficient_funds",
+  "noncompliant",
+  "product_not_received",
+  "product_unacceptable",
+  "subscription_canceled",
+  "unrecognized",
+];
+
 export interface AutoResolveConfig {
   enabled: boolean;
   efwEnabled: boolean;

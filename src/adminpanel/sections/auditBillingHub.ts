@@ -9,6 +9,8 @@ import {
   asOptionalId,
   asString,
 } from "./types";
+import { STRIPE_DISPUTE_REASONS } from "../../bot/billing/autoResolvePolicy";
+import { RATES_SAMPLED_AT } from "../../bot/billing/fx";
 
 // Audit & Billing hub (config group). Mirrors /config → Audit & Billing:
 // audit-log channel, refund guardrails, eligibility, allowed plans, the Stripe
@@ -81,7 +83,68 @@ export function makeAuditBillingHub(deps: AuditBillingHubDeps): HubModule {
         ],
         actions: [{ key: "provision_radar", label: "Provision Radar lists", style: "secondary" }],
       };
-      return [audit, billing, webhook, disputes];
+      // Its own section rather than more fields on Disputes: that one already
+      // carries twelve, and these six decide whether money leaves the account
+      // without anyone pressing anything.
+      const autoResolve: Section = {
+        key: "autoresolve",
+        title: "Dispute auto-resolve",
+        fields: [
+          {
+            type: "toggle",
+            key: "disputeAutoResolveEnabled",
+            label: "Enabled",
+            value: s.disputeAutoResolveEnabled(),
+            help: "Refunds an inquiry-stage dispute so Stripe closes it as prevented and it never counts toward the ratio.",
+          },
+          {
+            type: "toggle",
+            key: "disputeAutoResolveEfw",
+            label: "Also refund actionable fraud warnings",
+            value: s.disputeAutoResolveEfw(),
+            help: "Early fraud warnings have no dispute yet. Only ones Stripe marks actionable are eligible.",
+          },
+          {
+            type: "number",
+            key: "disputeAutoResolveMaxUsdMinor",
+            label: "Maximum amount (USD cents)",
+            value: s.disputeAutoResolveMaxUsdMinor(),
+            min: 0,
+            max: 100000000,
+            unit: "¢",
+            help: `Other currencies use an approximate built-in rate table (sampled ${RATES_SAMPLED_AT}); an unlisted currency never auto-resolves.`,
+          },
+          {
+            type: "number",
+            key: "disputeAutoResolveVetoMinutes",
+            label: "Veto window (minutes)",
+            value: s.disputeAutoResolveVetoMinutes(),
+            min: 0,
+            max: 1440,
+            unit: "min",
+            help: "How long the Discord alert can be cancelled before the refund fires. 0 fires on the next hourly tick.",
+          },
+          {
+            type: "number",
+            key: "disputeAutoResolveRepeatDays",
+            label: "Repeat-offender window (days)",
+            value: s.disputeAutoResolveRepeatDays(),
+            min: 0,
+            max: 3650,
+            unit: "d",
+            help: "A customer with a dispute or auto-resolve inside this window is blocked and escalated instead.",
+          },
+          {
+            type: "text",
+            key: "disputeAutoResolveReasons",
+            label: "Eligible reasons",
+            value: [...s.disputeAutoResolveReasons()].sort().join(","),
+            placeholder: "subscription_canceled,duplicate",
+            help: "Comma-separated Stripe dispute reasons. Fraud warnings ignore this list.",
+          },
+        ],
+      };
+      return [audit, billing, webhook, disputes, autoResolve];
     },
 
     async save(ctx: AdminHubContext, req: SaveRequest): Promise<SaveResult> {
@@ -155,6 +218,42 @@ export function makeAuditBillingHub(deps: AuditBillingHubDeps): HubModule {
           await s.updateDisputes({ disputeUrgentRoleId: asOptionalId(v) });
           await ctx.audit("set dispute urgent role");
           return { ok: true };
+        case "disputeAutoResolveEnabled":
+        case "disputeAutoResolveEfw":
+          await s.updateDisputeAutoResolve({ [req.field]: v === true });
+          await ctx.audit(`set ${req.field} → ${v === true}`);
+          return { ok: true };
+        case "disputeAutoResolveMaxUsdMinor":
+        case "disputeAutoResolveVetoMinutes":
+        case "disputeAutoResolveRepeatDays": {
+          const max =
+            req.field === "disputeAutoResolveMaxUsdMinor" ? 100000000 : req.field === "disputeAutoResolveVetoMinutes" ? 1440 : 3650;
+          const parsed = asBoundedInt(v, 0, max);
+          if (!parsed.ok) return { ok: false, fieldErrors: { [req.field]: parsed.error } };
+          await s.updateDisputeAutoResolve({ [req.field]: parsed.value });
+          await ctx.audit(`set ${req.field} → ${parsed.value}`);
+          return { ok: true };
+        }
+        case "disputeAutoResolveReasons": {
+          const reasons = asString(v)
+            .split(/[\s,]+/)
+            .map((x) => x.trim().toLowerCase())
+            .filter(Boolean);
+          // An unknown token would silently exclude that reason forever, so it
+          // is a field error rather than a value we quietly keep.
+          const unknown = reasons.filter((r) => !STRIPE_DISPUTE_REASONS.includes(r));
+          if (unknown.length) {
+            return {
+              ok: false,
+              fieldErrors: {
+                [req.field]: `Not a Stripe dispute reason: ${unknown.join(", ")}. Valid: ${STRIPE_DISPUTE_REASONS.join(", ")}`,
+              },
+            };
+          }
+          await s.updateDisputeAutoResolve({ disputeAutoResolveReasons: [...new Set(reasons)] });
+          await ctx.audit(`set auto-resolve reasons (${reasons.length})`);
+          return { ok: true };
+        }
         case "radarListCardId":
         case "radarListEmailId":
         case "radarListCustomerId":
