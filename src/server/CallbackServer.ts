@@ -12,6 +12,13 @@ import { mountPanel, type MountedPanelRoute } from "./panelMount";
 
 const httpLog = log.child("http");
 
+// A legacy panel URL carries its query string across the redirect: the link
+// token and any deep-link parameters have to survive the hop.
+function queryStringOf(req: Request): string {
+  const q = req.originalUrl.indexOf("?");
+  return q === -1 ? "" : req.originalUrl.slice(q);
+}
+
 // Inbound Intercom webhook wiring. The client secret lives in BotSettings
 // (editable via /config), so it's read per request through the getter.
 // accept() must only do a durable insert (single DB write) — real handling
@@ -60,12 +67,11 @@ export interface IntercomPanelRoute {
 }
 
 // Admin web panel (/config + /intercom) — same transport contract as the Stripe
-// panel (token→cookie exchange on GET, cookie-authed API), but a separate route
-// prefix and cookie so the two panels' sessions never collide.
-export interface AdminPanelRoute {
-  page: (token: string) => Promise<{ html: string; nonce: string; sessionCookie: string } | { status: number; message: string }>;
-  api: (endpoint: string, sessionId: string, body: unknown) => Promise<{ status: number; json: object }>;
-}
+// panel (token→cookie exchange on GET, cookie-authed API), but its own route
+// prefixes and cookies so no two panels' sessions collide. Mounted twice: the
+// standalone bootstrap path and /panel/config inside the merged surface, which
+// is why page() may serve without minting a session cookie.
+export type AdminPanelRoute = MountedPanelRoute;
 
 // Stripe dashboard (account-wide, standing web surface). Same transport
 // contract; page() additionally receives the session cookie so a standing
@@ -246,6 +252,36 @@ export class CallbackServer {
       logLabel: "intercom panel",
       route: () => this.intercomPanel,
     });
+    // The merged admin surface. It began life as the billing dashboard and has
+    // absorbed the configuration panel, so it lives at a neutral /panel: it is
+    // no longer "billing" in any meaningful sense.
+    //
+    // The legacy URLs redirect here and keep working, because they are pasted
+    // in Discord history and sitting in bookmarks. A 302 rather than a 301: a
+    // permanent redirect is cached by the browser forever and would be painful
+    // to undo.
+    //
+    // ORDER MATTERS, twice over, and both orderings are covered by
+    // __tests__/panelRoutes.test.ts because getting either wrong is silent:
+    //  - Express matches in registration order, so these redirects have to be
+    //    registered BEFORE the panel mounts they shadow, or they never run.
+    //  - /panel mounts with spaWildcard, so its GET /panel/*splat would swallow
+    //    /panel/config unless the config mount is registered first.
+    this.app.get("/billing", (req, res) => {
+      res.redirect(302, `/panel${queryStringOf(req)}`);
+    });
+    // /admin/panel keeps serving whenever it carries a link token, because that
+    // is the bootstrap link /config hands out in Discord and the only way to
+    // repair a box whose dashboard login is not configured yet. Without a
+    // token it is just a stale bookmark, so it goes to the merged surface.
+    this.app.get("/admin/panel", (req, res, next) => {
+      if (typeof req.query.t === "string" && req.query.t) {
+        next();
+        return;
+      }
+      res.redirect(302, `/panel/config${queryStringOf(req)}`);
+    });
+
     // Admin web panel (/config + /intercom): served locked, unlocks only after
     // the Discord-side passcode confirm (handled inside the route object).
     mountPanel(this.app, allowIp, {
@@ -256,20 +292,18 @@ export class CallbackServer {
       logLabel: "admin panel",
       route: () => this.adminPanel,
     });
-    // The merged admin surface. It began life as the billing dashboard and has
-    // absorbed the configuration panel, so it lives at a neutral /panel: it is
-    // no longer "billing" in any meaningful sense.
-    //
-    // /billing and /admin/panel both redirect here and keep working, because
-    // those URLs are pasted in Discord history and sitting in bookmarks. A 302
-    // rather than a 301: a permanent redirect is cached by the browser forever
-    // and would be painful to undo.
-    for (const legacy of ["/billing", "/admin/panel"]) {
-      this.app.get(legacy, (req, res) => {
-        const qs = req.originalUrl.includes("?") ? req.originalUrl.slice(req.originalUrl.indexOf("?")) : "";
-        res.redirect(302, `/panel${qs}`);
-      });
-    }
+    // The same panel inside the merged surface, reached from the dashboard's
+    // Configuration nav item. It reads the DASHBOARD session cookie, which is
+    // what makes one login cover the whole surface: AdminPanel bridges an
+    // active admin dashboard session into a config session of its own.
+    mountPanel(this.app, allowIp, {
+      pagePath: "/panel/config",
+      apiPath: "/panel/config/api/:endpoint",
+      cookieName: "__Host-billing",
+      metricName: "adminpanel.auth_failures",
+      logLabel: "admin panel (merged)",
+      route: () => this.adminPanel,
+    });
 
     mountPanel(this.app, allowIp, {
       pagePath: "/panel",

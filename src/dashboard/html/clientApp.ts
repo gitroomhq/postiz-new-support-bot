@@ -181,7 +181,8 @@ D.NAV_ICONS = {
   "money-out": "M2.6 4.4h10.8v7.2H2.6ZM8 6.4a1.6 1.6 0 1 0 0 3.2 1.6 1.6 0 0 0 0-3.2M13.4 8.9 15 8l-1.6-.9",
   reports: "M3 13.4h10.8M4.6 13V8.6h2V13M7.9 13V4.6h2V13M11.2 13V6.6h2V13",
   bookmarks: "M4.2 2.9h7.6v10.2L8 10.6l-3.8 2.5Z",
-  security: "M4.6 7.4V6a3.4 3.4 0 0 1 6.8 0v1.4M3.9 7.4h8.2v6H3.9Z"
+  security: "M4.6 7.4V6a3.4 3.4 0 0 1 6.8 0v1.4M3.9 7.4h8.2v6H3.9Z",
+  config: "M2.6 4.6h10.8M2.6 8h10.8M2.6 11.4h10.8M6 3.3v2.6M10.6 6.7v2.6M5.2 10.1v2.6"
 };
 D.navIcon = function (page) {
   var d = D.NAV_ICONS[(page || "").split(".")[0]];
@@ -220,7 +221,10 @@ D.renderNav = function (v) {
     var count = D.navBadges && D.navBadges[item.key];
     if (count) b.appendChild(D.el("span", "navcount", count));
     if (item.key === v.activeNav) b.classList.add("active");
-    b.addEventListener("click", function () { D.go(D.hrefFor(item.page, {}, {})); });
+    // An href item leaves the SPA entirely: it is a different shell under the
+    // same login, so the router must not try to own it.
+    if (item.href) b.addEventListener("click", function () { window.location.href = item.href; });
+    else b.addEventListener("click", function () { D.go(D.hrefFor(item.page, {}, {})); });
     nav.appendChild(b);
   });
 };

@@ -22,7 +22,7 @@ export function makeDashboardHub(deps: { resetCredentials: (userId: string) => P
         key: "state",
         title: "Stripe dashboard",
         description:
-          "The account-wide billing dashboard at /dashboard. Open it from /billing → Open Web Dashboard. " +
+          "The account-wide admin surface at /panel. Open it from /billing → Open Web Dashboard. " +
           "While disabled, the routes answer 404 and no links can be minted.",
         fields: [
           {

@@ -34,6 +34,11 @@ export const PANEL_SECURITY_HEADERS = {
 export interface PanelRequestMeta {
   ip?: string;
   ua?: string;
+  // The path this panel is mounted at. The admin panel is mounted twice (its
+  // own bootstrap path and the merged /panel/config), and the HTML it serves
+  // has to post back to the mount it was fetched from, because each mount
+  // reads a different session cookie.
+  basePath?: string;
 }
 export interface MountedPanelRoute {
   page(
@@ -79,7 +84,7 @@ export function mountPanel(app: Express, allowIp: (ip: string | undefined) => bo
     const token = typeof req.query.t === "string" ? req.query.t : "";
     const cookie = parseCookies(req.headers.cookie)[spec.cookieName] ?? "";
     try {
-      const result = await route.page(token, cookie, { ip: req.ip, ua: req.header("user-agent") });
+      const result = await route.page(token, cookie, { ip: req.ip, ua: req.header("user-agent"), basePath: spec.pagePath });
       if ("html" in result) {
         res
           .status(200)
@@ -157,6 +162,7 @@ export function mountPanel(app: Express, allowIp: (ip: string | undefined) => bo
       const result = await route.api(String(req.params.endpoint), sessionId, req.body, {
         ip: req.ip,
         ua: req.header("user-agent"),
+        basePath: spec.pagePath,
       });
       if (result.status === 401) metricCount(spec.metricName, 1, { where: "api" });
       res

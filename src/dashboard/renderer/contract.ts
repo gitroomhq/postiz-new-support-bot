@@ -281,6 +281,10 @@ export interface NavItem {
   page: string;
   group?: string;
   badge?: string;
+  // A full-page navigation instead of SPA routing. Used for surfaces that live
+  // under the same login and the same path prefix but render their own shell,
+  // which is currently the configuration panel.
+  href?: string;
 }
 
 export interface PageView {

@@ -6,6 +6,7 @@ import { GuildSnapshotProvider } from "./guildSnapshot";
 import { renderAdminShell } from "./adminPanelHtml";
 import { AdminActor, AdminHubContext, HubModule } from "./sections/types";
 import { ActionResult, HubView, SaveResult } from "./renderer/contract";
+import { PanelRequestMeta } from "../server/panelMount";
 import { log } from "../util/logger";
 
 const panelLog = log.child("adminpanel");
@@ -17,7 +18,11 @@ export type AdminAuditFn = (actor: AdminActor, change: string) => Promise<void>;
 
 // What CallbackServer needs — a thin transport-facing view of this class.
 export interface AdminPanelRoute {
-  page(token: string): Promise<{ html: string; nonce: string; sessionCookie: string } | { status: number; message: string }>;
+  page(
+    token: string,
+    cookie?: string,
+    meta?: PanelRequestMeta
+  ): Promise<{ html: string; nonce: string; sessionCookie?: string } | { status: number; message: string }>;
   api(endpoint: string, sessionId: string, body: unknown): Promise<{ status: number; json: object }>;
 }
 
@@ -88,13 +93,49 @@ export class AdminPanel implements AdminPanelRoute {
     for (const m of modules) this.modules.set(m.hub, m);
   }
 
-  // GET /admin/panel?t=… — exchange the SINGLE-USE link token for a LOCKED
-  // session + HttpOnly cookie, and serve the generic shell. The activation code
-  // is delivered via the activation-status poll (nothing session-specific is
-  // baked into the HTML except the CSP nonce).
+  // GET <mount>?t=… exchanges the SINGLE-USE link token for a LOCKED session +
+  // HttpOnly cookie, and serves the generic shell. The activation code is
+  // delivered via the activation-status poll (nothing session-specific is baked
+  // into the HTML except the CSP nonce and the mount's own api path).
+  //
+  // Without a token the shell is still served when the cookie already carries a
+  // session: this is the merged-panel entry point, because /panel/config is
+  // reached by clicking a nav item, never by minting a link.
   async page(
-    token: string
-  ): Promise<{ html: string; nonce: string; sessionCookie: string } | { status: number; message: string }> {
+    token: string,
+    cookie = "",
+    meta?: PanelRequestMeta
+  ): Promise<{ html: string; nonce: string; sessionCookie?: string } | { status: number; message: string }> {
+    const base = meta?.basePath ?? "/admin/panel";
+    // The merged mount lives under the dashboard's prefix and is the only one
+    // whose cookie is a dashboard session.
+    const merged = base.startsWith("/panel/");
+    const shell = (nonce: string) =>
+      renderAdminShell({ nonce, apiBase: base, backHref: merged ? "/panel" : undefined });
+    if (!token) {
+      // Each mount reads exactly the cookie it owns: the merged mount is handed
+      // a DASHBOARD session id and resolves it through the bridge, the
+      // standalone mount is handed this panel's own. Trying both would mean a
+      // session id from one namespace being looked up in the other.
+      const existing = !cookie
+        ? null
+        : merged
+          ? await this.sharedSession(cookie)
+          : this.sessions.get(cookie, this.settingsStore.adminPanelEpoch());
+      if (!existing) {
+        // Two different dead ends need two different instructions: inside the
+        // merged surface the way back is the dashboard login, not a Discord
+        // link the user would have no reason to mint.
+        return {
+          status: 401,
+          message: merged
+            ? "Your session has ended. Open /panel to sign in again, then choose Configuration."
+            : "This panel link is invalid or expired. Re-run /config or /intercom.",
+        };
+      }
+      const nonce = randomBytes(16).toString("base64");
+      return { html: shell(nonce), nonce };
+    }
     const payload = this.tokens.verify(token);
     if (!payload) return { status: 401, message: "This panel link is invalid or expired. Re-run /config or /intercom." };
     if (!this.allow(`page:${payload.sub}`)) return { status: 429, message: "Too many requests." };
@@ -112,13 +153,13 @@ export class AdminPanel implements AdminPanelRoute {
     const nonce = randomBytes(16).toString("base64");
     panelLog.info("admin panel opened (locked)", { "discord.user_id": payload.sub, "adminpanel.group": payload.panel });
     return {
-      html: renderAdminShell({ nonce }),
+      html: shell(nonce),
       nonce,
       sessionCookie: `__Host-acpanel=${sessionId}; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=1800`,
     };
   }
 
-  // POST /admin/panel/api/:endpoint — cookie-authenticated (CallbackServer
+  // POST <mount>/api/:endpoint, cookie-authenticated (CallbackServer
   // already enforced the CSRF belts). activation-status works while LOCKED;
   // everything else requires an ACTIVE session.
   async api(endpoint: string, sessionId: string, body: unknown): Promise<{ status: number; json: object }> {

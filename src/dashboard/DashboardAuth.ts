@@ -58,7 +58,7 @@ export interface DashboardAuthProvider {
     ip?: string;
     ua?: string;
   }): Promise<{ kind: "page"; sessionCookie?: string } | { kind: "reject"; status: number; message: string }>;
-  // POST /billing/api/* — cookie → subject; null = 401/expired.
+  // POST /panel/api/*: cookie → subject; null = 401/expired.
   authenticate(cookie: string, meta?: { ip?: string }): Promise<DashboardAuthResult | null>;
   // Session-LESS endpoints (the login ceremony + the pre-login activation
   // poll). null = unknown endpoint.

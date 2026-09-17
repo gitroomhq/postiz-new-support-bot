@@ -3,7 +3,7 @@ import { DashboardCtx, DashboardSectionModule, SectionPage, str } from "./types"
 import { isBookmarkType, toggleBookmarkAction } from "./bookmarks";
 import { badgeCell, idCell, isoDateCell, refForId, sentence, text } from "./cells";
 
-// Team bookmarks (/billing/bookmarks, Operate group): the shared board over
+// Team bookmarks (/panel/bookmarks, Operate group): the shared board over
 // BillingQolStore — one list for the whole team, rows deep-link into the
 // typed detail pages (every object family since the bookmark-everything
 // pass; rows route via the shared refForId). Saved filters were considered

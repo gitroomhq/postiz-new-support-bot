@@ -2,7 +2,8 @@ import { panelThemeCss } from "../util/panelTheme";
 
 // Self-contained HTML for the admin web panel (/config + /intercom). Ships as a
 // template string (no build pipeline): inline CSS + vanilla JS, zero external
-// requests (strict CSP allows only same-origin XHR to /admin/panel/api/*).
+// requests (strict CSP allows only same-origin XHR back to this panel's own
+// api path).
 //
 // The page is dumb on purpose: the server (AdminPanel + hub modules) describes
 // every section/field/button; the client renders generically and posts changes
@@ -13,6 +14,14 @@ import { panelThemeCss } from "../util/panelTheme";
 
 export interface AdminShellCtx {
   nonce: string;
+  // Where this shell was served from, so its XHR posts back to the same mount.
+  // The panel is mounted twice and each mount reads a different session cookie,
+  // so a hard-coded path would authenticate against the wrong one.
+  apiBase: string;
+  // Shown in the sidebar when this panel sits inside the merged admin surface:
+  // the way back to the rest of it. Absent on the standalone bootstrap mount,
+  // which is reached without a dashboard login.
+  backHref?: string;
 }
 
 export function renderAdminShell(ctx: AdminShellCtx): string {
@@ -39,6 +48,8 @@ ${panelThemeCss()}
   .side-foot { margin-top:auto; padding:12px 8px 4px; }
   .chip { display:inline-block; text-transform:uppercase; font-size:10.5px; letter-spacing:.08em; color:var(--muted);
     border:1px solid var(--border); border-radius:999px; padding:3px 10px; }
+  .backlink { margin-left:auto; color:var(--accent); text-decoration:none; font-size:13px; font-weight:600; }
+  .backlink:hover { text-decoration:underline; }
   .mainwrap { display:flex; flex-direction:column; min-width:0; }
   .topbar { min-height:56px; display:flex; align-items:center; padding:0 30px; border-bottom:1px solid var(--border);
     color:var(--muted); font-size:13px; position:sticky; top:0; background:var(--bg); z-index:5; }
@@ -76,7 +87,9 @@ ${panelThemeCss()}
     <div class="side-foot"><span class="chip" id="grp"></span></div>
   </aside>
   <div class="mainwrap">
-    <header class="topbar"><span id="who"></span></header>
+    <header class="topbar"><span id="who"></span>${
+      ctx.backHref ? `<a class="backlink" href="${ctx.backHref}">Back to dashboard</a>` : ""
+    }</header>
     <main>
       <div id="flash" class="flash"></div>
       <div id="content"><p class="note">Loading…</p></div>
@@ -119,7 +132,7 @@ ${panelThemeCss()}
   var dragSrc = null;
 
   function api(endpoint, body) {
-    return fetch("/admin/panel/api/" + endpoint, {
+    return fetch(${JSON.stringify(`${ctx.apiBase}/api/`)} + endpoint, {
       method: "POST",
       credentials: "same-origin",
       headers: { "Content-Type": "application/json", "X-Panel-Request": "1" },

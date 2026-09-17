@@ -112,7 +112,7 @@ export class Dashboard implements MountedPanelRoute {
     };
   }
 
-  // POST /billing/api/:endpoint — cookie-authenticated (panelMount already
+  // POST /panel/api/:endpoint, cookie-authenticated (panelMount already
   // enforced the CSRF belts). Without a session, only the login-ceremony
   // endpoints (auth-*) and the pre-login activation-status poll work; with a
   // LOCKED session only activation-status; everything else needs ACTIVE.
@@ -323,7 +323,7 @@ export class Dashboard implements MountedPanelRoute {
     const ctx = this.ctxFor(auth);
     const section = await module.buildPage(ctx, req);
     if (!section) return null;
-    const nav = this.assembleNav();
+    const nav = this.assembleNav(auth);
     const active = module.nav.find((n) => req.page === n.page || req.page.startsWith(`${n.page}.`)) ?? module.nav[0];
     return {
       page: req.page,
@@ -338,9 +338,20 @@ export class Dashboard implements MountedPanelRoute {
     };
   }
 
-  private assembleNav(): NavItem[] {
+  private assembleNav(auth: DashboardAuthResult): NavItem[] {
     const nav: NavItem[] = [];
     for (const m of this.modules) nav.push(...m.nav);
+    // The configuration panel: same login, same path prefix, its own shell, so
+    // it is a real navigation rather than an SPA page. Listed last and in its
+    // own group because it is a different KIND of surface from the rest: these
+    // pages show you the account, that one changes how the bot behaves.
+    //
+    // Admins only, because that is exactly who the panel's session bridge
+    // accepts. Offering a read-only role a door that refuses it is worse than
+    // not showing the door.
+    if (auth.actor.isAdmin) {
+      nav.push({ key: "config", label: "Configuration", page: "config", group: "Settings", href: "/panel/config" });
+    }
     return nav;
   }
 
@@ -370,7 +381,7 @@ export class Dashboard implements MountedPanelRoute {
   private viewRequest(request: Record<string, unknown>): ViewRequest | null {
     const page = typeof request.page === "string" ? request.page : "";
     // Hyphens are allowed so a multi-word page keeps a readable URL
-    // (/billing/money-out). The page name only ever selects a module by
+    // (/panel/money-out). The page name only ever selects a module by
     // ownsPage — it never reaches a filesystem, a query or a shell.
     if (!/^[a-z][a-z0-9_.-]{0,63}$/.test(page)) return null;
     const params: Record<string, string> = {};
