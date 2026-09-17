@@ -143,6 +143,7 @@ export const EXPECTED_COLUMNS: Record<string, string[]> = {
   billing_notes: ["id", "objectType", "objectId", "authorId", "authorName", "text", "createdAt"],
   billing_bookmarks: ["id", "objectType", "objectId", "label", "addedById", "addedByName", "createdAt"],
   dispute_watches: ["id", "disputeId", "userId", "createdAt"],
+  dispute_events: ["id", "disputeId", "at", "kind", "actorId", "actorName", "summary", "detail"],
   dispute_evidence_templates: [
     "id", "reason", "fieldKey", "body", "enabled", "updatedById", "updatedByName", "createdAt", "updatedAt",
   ],

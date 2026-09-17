@@ -1089,6 +1089,20 @@ export const STATEMENTS: string[] = [
   )`,
   `CREATE UNIQUE INDEX IF NOT EXISTS "dispute_evidence_templates_reason_fieldKey_key" ON "dispute_evidence_templates"("reason", "fieldKey")`,
   `CREATE INDEX IF NOT EXISTS "dispute_evidence_templates_reason_idx" ON "dispute_evidence_templates"("reason")`,
+  // Per-dispute history: what happened, when, and who or what did it.
+  `CREATE TABLE IF NOT EXISTS "dispute_events" (
+    "id" TEXT NOT NULL,
+    "disputeId" TEXT NOT NULL,
+    "at" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "kind" TEXT NOT NULL,
+    "actorId" TEXT,
+    "actorName" TEXT,
+    "summary" TEXT NOT NULL,
+    "detail" JSONB,
+    CONSTRAINT "dispute_events_pkey" PRIMARY KEY ("id")
+  )`,
+  `CREATE INDEX IF NOT EXISTS "dispute_events_disputeId_at_idx" ON "dispute_events"("disputeId", "at")`,
+  `CREATE INDEX IF NOT EXISTS "dispute_events_at_idx" ON "dispute_events"("at")`,
 ];
 
 export async function ensureSchema(prisma: PrismaClient): Promise<void> {

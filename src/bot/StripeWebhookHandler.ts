@@ -10,6 +10,7 @@ import { BlockService } from "./billing/BlockService";
 import { attachReceiptEvidence } from "./billing/receiptEvidence";
 import type { AutoResolveService } from "./billing/AutoResolveService";
 import type { EvidencePackBuilder } from "./billing/evidence/EvidencePackBuilder";
+import type { DisputeEventStore } from "./billing/DisputeEventStore";
 import { COLORS } from "../util/embeds";
 import { log } from "../util/logger";
 import { metricCount } from "../util/instrument";
@@ -122,6 +123,14 @@ export class StripeWebhookHandler {
 
   setEvidencePackBuilder(builder: EvidencePackBuilder): void {
     this.evidencePack = builder;
+  }
+
+  // Per-dispute history. Best-effort everywhere: a missing timeline entry is a
+  // gap in an explanation, never a reason to fail a webhook.
+  private events: DisputeEventStore | null = null;
+
+  setDisputeEventStore(store: DisputeEventStore): void {
+    this.events = store;
   }
 
   // Money-out ledger — bound late (it depends on the Prisma-backed store built
@@ -450,6 +459,20 @@ export class StripeWebhookHandler {
     } catch (e) {
       hookLog.error("dispute mirror upsert failed", e, { "stripe.dispute_id": dispute.id });
     }
+
+    await this.events?.record({
+      disputeId: dispute.id,
+      kind: "opened",
+      summary: `Dispute opened: ${dispute.reason.replace(/_/g, " ")}, ${this.stripe.formatAmount(dispute.amount, dispute.currency)}`,
+      detail: {
+        status: dispute.status,
+        chargeId,
+        customerId,
+        evidenceDueBy: dispute.evidence_details?.due_by
+          ? new Date(dispute.evidence_details.due_by * 1000).toISOString()
+          : null,
+      },
+    });
 
     // SLA manager: a fresh dispute may flip stripe.dispute-conditioned rules.
     if (customerId) void this.slaService?.onStripeCustomerTrigger(customerId);

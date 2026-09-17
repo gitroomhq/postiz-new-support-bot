@@ -6831,3 +6831,56 @@ test("template editor: reset needs a typed confirmation, save does not", async (
   assert.equal(done.ok, true);
   assert.deepEqual(templateState.reset, ["general/uncategorized_text"]);
 });
+
+// ---- per-dispute history ----
+
+test("dispute detail: the history timeline and the provenance of the last package render", async () => {
+  const events = [
+    { at: new Date("2026-09-10T08:00:00Z"), kind: "opened", actorId: null, actorName: null, summary: "Dispute opened: subscription canceled, $49.00", detail: null },
+    {
+      at: new Date("2026-09-10T08:01:00Z"),
+      kind: "pack_staged",
+      actorId: null,
+      actorName: null,
+      summary: "Evidence pack staged: 9 field(s), completeness 86%",
+      detail: {
+        templateVersion: "2026-09-17.1",
+        staged: ["product_description", "uncategorized_text"],
+        omitted: [{ field: "refund_refusal_explanation", why: "missing support.no_refund_request" }],
+        sources: { productUsage: true, supportHistory: false },
+      },
+    },
+    { at: new Date("2026-09-10T09:00:00Z"), kind: "evidence_submitted", actorId: "42", actorName: "Ada", summary: "Evidence submitted to the bank", detail: null },
+  ];
+  const fakes = evidenceFakes();
+  const section = makeDisputesSection({ ...disputesDeps(fakes), events: { list: async () => events } as never });
+  const page = await section.buildPage(disputesCtx(fakes), { page: "disputes.detail", params: { id: "dp_1" } });
+
+  const timeline = page!.blocks.find((b) => b.type === "timeline" && /History/.test((b as { title: string }).title)) as {
+    items: Array<{ label: string; text: string; kind: string }>;
+  };
+  assert.ok(timeline, "the history renders");
+  assert.equal(timeline.items.length, 3);
+  // An unattributed entry is the bot; a named one is a person. That distinction
+  // is the whole reason the timeline exists.
+  assert.equal(timeline.items[0].label, "Automatic");
+  assert.equal(timeline.items[2].label, "Ada");
+  assert.equal(timeline.items[2].kind, "ok");
+
+  const kv = page!.blocks.find((b) => b.type === "kv" && /built from/.test((b as { title: string }).title)) as {
+    rows: Array<{ label: string; cell: { v: string } }>;
+  };
+  assert.ok(kv, "the provenance panel renders");
+  const byLabel = Object.fromEntries(kv.rows.map((r) => [r.label, r.cell.v]));
+  assert.match(byLabel["Fields omitted"], /refund_refusal_explanation \(missing support\.no_refund_request\)/);
+  assert.match(byLabel["Sources"], /Product usage: used/);
+  assert.match(byLabel["Sources"], /Support history: no data/);
+  assert.equal(byLabel["Template corpus"], "2026-09-17.1");
+});
+
+test("dispute detail: no history means no timeline block rather than an empty one", async () => {
+  const fakes = evidenceFakes();
+  const section = makeDisputesSection({ ...disputesDeps(fakes), events: { list: async () => [] } as never });
+  const page = await section.buildPage(disputesCtx(fakes), { page: "disputes.detail", params: { id: "dp_1" } });
+  assert.ok(!page!.blocks.some((b) => b.type === "timeline" && /History/.test((b as { title: string }).title)));
+});

@@ -947,6 +947,35 @@ model DisputeAutoResolve {
   @@map("dispute_auto_resolves")
 }
 
+// Everything that has happened to a dispute, automated and human alike, in one
+// ordered stream.
+//
+// The dispute mirror records STATE; this records HISTORY. Those are different
+// questions, and the second one is what an operator actually asks: not "what
+// does this field say" but "where did that text come from, who decided, and
+// what did the engine do at three in the morning". A package that goes to a
+// bank must still be explicable months later, when the people involved have
+// forgotten and the live Stripe object has moved on.
+model DisputeEvent {
+  id        String   @id @default(cuid())
+  disputeId String
+  at        DateTime @default(now())
+  // A bounded vocabulary; see DISPUTE_EVENT_KINDS.
+  kind      String
+  // Null actor = the bot did it unprompted. A present one is a real human.
+  actorId   String?
+  actorName String?
+  // One line, already written for a person to read.
+  summary   String
+  // Structured payload for the detail expander: which fields were filled, which
+  // were omitted and why, which source each fact came from, guardrail names.
+  detail    Json?
+
+  @@index([disputeId, at])
+  @@index([at])
+  @@map("dispute_events")
+}
+
 // Operator overrides for the shipped evidence template corpus, edited from the
 // web panel. A row replaces exactly one (reason, field) pair; everything not
 // overridden keeps the reviewed text that ships in the repository.

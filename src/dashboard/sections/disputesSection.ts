@@ -15,6 +15,7 @@ import {
 import type { EvidencePackBuilder } from "../../bot/billing/evidence/EvidencePackBuilder";
 import type { AutoResolveStore } from "../../bot/billing/AutoResolveStore";
 import type { TemplateStore } from "../../bot/billing/evidence/TemplateStore";
+import type { DisputeEventStore } from "../../bot/billing/DisputeEventStore";
 import { NO_INTERNAL_ARTIFACT, templateTokens, tokensIn } from "../../bot/billing/evidence/renderTemplate";
 import { TOKEN_NAMES } from "../../bot/billing/evidence/tokens";
 import {
@@ -59,6 +60,8 @@ interface DisputesDeps {
   autoResolveStore?: AutoResolveStore | null;
   // Operator overrides for the shipped evidence corpus.
   templateStore?: TemplateStore | null;
+  // Per-dispute history, for the detail page's timeline.
+  events?: DisputeEventStore | null;
 }
 
 
@@ -1134,12 +1137,66 @@ async function detail(ctx: DashboardCtx, deps: DisputesDeps, id: string): Promis
     });
   }
 
+  // What actually happened to this dispute, automated and human alike. The
+  // mirror above says what the evidence IS; this says how it got that way,
+  // which is the question an operator asks when a package is already at a bank.
+  const events = deps.events ? await deps.events.list(id) : [];
+  if (events.length) {
+    main.push({
+      type: "timeline",
+      title: `History (${events.length})`,
+      items: events.map((e) => ({
+        label: e.actorName ?? (e.actorId ? `Admin ${e.actorId}` : "Automatic"),
+        iso: e.at.toISOString(),
+        text: e.summary,
+        kind: eventTone(e.kind),
+      })),
+    });
+
+    // The provenance of the last package built: which fields it filled, which
+    // it deliberately left out and why, and which external sources answered.
+    const lastPack = [...events].reverse().find((e) => e.kind === "pack_staged");
+    const detail = lastPack?.detail as
+      | { staged?: string[]; omitted?: Array<{ field: string; why: string }>; sources?: Record<string, boolean>; templateVersion?: string }
+      | undefined;
+    if (detail) {
+      const sources = Object.entries(detail.sources ?? {})
+        .map(([name, answered]) => `${sentence(name.replace(/([A-Z])/g, " $1").toLowerCase())}: ${answered ? "used" : "no data"}`)
+        .join(" · ");
+      main.push({
+        type: "kv",
+        title: "What the last package was built from",
+        rows: [
+          { label: "Template corpus", cell: text(detail.templateVersion ?? "unknown") },
+          { label: "Fields filled", cell: text((detail.staged ?? []).join(", ") || "none") },
+          {
+            label: "Fields omitted",
+            cell: text(
+              (detail.omitted ?? []).map((o) => `${o.field} (${o.why})`).join("; ") ||
+                "none: every templated field was grounded"
+            ),
+          },
+          { label: "Sources", cell: text(sources || "none") },
+        ],
+      });
+    }
+  }
+
   return {
     title: ctx.stripe.formatAmount(dispute.amount, dispute.currency),
     crumbs: [{ label: "Disputes", ref: { page: "disputes" } }, { label: id, copyId: id }],
     blocks: main,
     rail,
   };
+}
+
+// Colour by what the entry MEANS, so a timeline can be skimmed for trouble:
+// money moved and failures stand out, routine automation does not.
+function eventTone(kind: string): "info" | "ok" | "warn" | "error" {
+  if (kind === "resolve_executed" || kind === "evidence_submitted") return "ok";
+  if (kind === "resolve_failed" || kind === "escalated" || kind === "auto_submit_refused") return "error";
+  if (kind === "resolve_blocked" || kind === "resolve_vetoed" || kind === "accepted") return "warn";
+  return "info";
 }
 
 function dueBadge(dueBy: Date): Badge {

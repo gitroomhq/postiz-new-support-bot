@@ -11,6 +11,7 @@ import { collectSupportFacts } from "./intercomHistory";
 import { renderField, type RenderedField } from "./renderTemplate";
 import { resolveTokens, type EvidenceFacts, type UsageFacts } from "./tokens";
 import type { PostizActivitySource } from "../../../postiz/PostizActivitySource";
+import type { DisputeEventStore } from "../DisputeEventStore";
 import {
   FIELD_WEIGHTS,
   PACK_FIELDS_BY_REASON,
@@ -84,7 +85,8 @@ export class EvidencePackBuilder {
     private templates: TemplateStore,
     private intercom?: IntercomClient | null,
     // Real product usage, read from the platform's Post and Integration tables.
-    private activity?: PostizActivitySource | null
+    private activity?: PostizActivitySource | null,
+    private events?: DisputeEventStore | null
   ) {}
 
   // Bound late: the identity service is built after the billing stack, and an
@@ -203,6 +205,29 @@ export class EvidencePackBuilder {
       score,
       templateVersion: pack.templateVersion,
       fields: { staged, omitted },
+    });
+    // The provenance record: which fields the pack filled, which it left out
+    // and why, and which external sources actually answered. This is what makes
+    // a package explicable months later.
+    await this.events?.record({
+      disputeId: dispute.id,
+      kind: "pack_staged",
+      summary: `Evidence pack staged: ${staged.length} field(s), completeness ${score}%`,
+      detail: {
+        templateVersion: pack.templateVersion,
+        reason: pack.reason,
+        staged,
+        omitted,
+        sources: {
+          stripe: pack.facts.charge != null,
+          subscription: pack.facts.sub != null,
+          paymentHistory: pack.facts.billing != null,
+          postizAccount: pack.facts.postiz != null,
+          productUsage: pack.facts.usage != null,
+          cardHistory: pack.facts.cards != null,
+          supportHistory: pack.facts.support != null,
+        },
+      },
     });
     packLog.info("evidence pack staged", {
       "stripe.dispute_id": dispute.id,

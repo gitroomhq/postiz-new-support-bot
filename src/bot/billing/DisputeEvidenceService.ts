@@ -4,6 +4,7 @@ import type { SessionStore } from "../../auth/SessionStore";
 import { Logger } from "../../util/logger";
 import { attachReceiptEvidence } from "./receiptEvidence";
 import { DisputeStore, RESPONDABLE_DISPUTE_STATUSES, TEXT_EVIDENCE_KEYS } from "./DisputeStore";
+import type { DisputeEventStore } from "./DisputeEventStore";
 import type { StripeDispute } from "../../generated/prisma/client";
 
 const logger = new Logger("billing:dispute-evidence");
@@ -187,7 +188,8 @@ export class DisputeEvidenceService {
   constructor(
     private stripe: StripeClient,
     private disputeStore: DisputeStore,
-    private sessionStore: SessionStore
+    private sessionStore: SessionStore,
+    private events?: DisputeEventStore | null
   ) {}
 
   respondable(status: string): boolean {
@@ -345,6 +347,14 @@ export class DisputeEvidenceService {
     }
     await this.disputeStore.markSubmitted(disputeId);
     await this.disputeStore.upsertFromStripe(result, customerIdHint);
+    // "system" is the looper submitting on its own; anything else is a person.
+    await this.events?.record({
+      disputeId,
+      kind: "evidence_submitted",
+      summary: actorId === "system" ? "Evidence auto-submitted to the bank" : "Evidence submitted to the bank",
+      ...(actorId === "system" ? {} : { actorId }),
+      detail: { submissionCount: result.evidence_details?.submission_count ?? null },
+    });
     return { kind: "submitted", dispute: result };
   }
 
@@ -362,6 +372,12 @@ export class DisputeEvidenceService {
       throw error;
     }
     await this.disputeStore.upsertFromStripe(result, customerIdHint);
+    await this.events?.record({
+      disputeId,
+      kind: "accepted",
+      summary: "Dispute accepted and closed as lost",
+      actorId,
+    });
     return { kind: "accepted", dispute: result };
   }
 }

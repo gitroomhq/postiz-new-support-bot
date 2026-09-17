@@ -19,6 +19,7 @@ import { log } from "../../util/logger";
 import { EXECUTING_LEASE_MS } from "./AutoResolveStore";
 import { refundReasonFor, refundableRemainder } from "./autoResolvePolicy";
 import type { DisputeAutoResolve } from "../../generated/prisma/client";
+import type { DisputeEventStore } from "./DisputeEventStore";
 
 const autoLog = log.child("dispute-auto-resolve");
 
@@ -82,7 +83,8 @@ export class AutoResolveService {
     private disputeStore: DisputeStore,
     private sessionStore?: SessionStore,
     private alerts?: AutoResolveAlerts,
-    private sideEffects?: AutoResolveSideEffects
+    private sideEffects?: AutoResolveSideEffects,
+    private events?: DisputeEventStore | null
   ) {}
 
   config(): AutoResolveConfig {
@@ -209,6 +211,14 @@ export class AutoResolveService {
         currency: ctx.currency,
         guardrail: decision.guardrail,
       });
+      if (ctx.disputeId) {
+        await this.events?.record({
+          disputeId: ctx.disputeId,
+          kind: "resolve_blocked",
+          summary: `Auto-resolve declined: ${decision.guardrail.replace(/_/g, " ")}`,
+          detail: { stage: ctx.stage, guardrail: decision.guardrail },
+        });
+      }
       autoLog.info("auto-resolve blocked", { "auto_resolve.source": ctx.sourceId, "auto_resolve.guardrail": decision.guardrail });
       return { kind: "blocked", guardrail: decision.guardrail };
     }
@@ -227,6 +237,14 @@ export class AutoResolveService {
       currency: ctx.currency,
       amountMinor: decision.amountMinor,
     });
+    if (ctx.disputeId) {
+      await this.events?.record({
+        disputeId: ctx.disputeId,
+        kind: "resolve_proposed",
+        summary: `Auto-resolve proposed: refund ${decision.amountMinor} ${ctx.currency.toUpperCase()} unless cancelled`,
+        detail: { stage: ctx.stage, fireAt: decision.fireAt.toISOString(), amountMinor: decision.amountMinor },
+      });
+    }
     autoLog.info("auto-resolve proposed", {
       "auto_resolve.source": ctx.sourceId,
       "auto_resolve.stage": ctx.stage,
@@ -407,6 +425,14 @@ export class AutoResolveService {
       amountMinor: refund.amount,
     });
     result.executed++;
+    if (row.disputeId) {
+      await this.events?.record({
+        disputeId: row.disputeId,
+        kind: "resolve_executed",
+        summary: `Auto-resolve refunded ${refund.amount} ${refund.currency.toUpperCase()} to prevent the dispute`,
+        detail: { refundId: refund.refundId, chargeId: row.chargeId, stage: row.stage },
+      });
+    }
     autoLog.info("auto-resolve executed", {
       "auto_resolve.id": row.id,
       "stripe.refund_id": refund.refundId,

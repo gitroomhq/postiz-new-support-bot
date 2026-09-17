@@ -123,6 +123,7 @@ import { AutoResolveStore } from "./bot/billing/AutoResolveStore";
 import { AutoResolveService } from "./bot/billing/AutoResolveService";
 import { DiscordAutoResolveAlerts, StripeIntercomSideEffects } from "./bot/billing/AutoResolveAlerts";
 import { PostizActivitySource } from "./postiz/PostizActivitySource";
+import { DisputeEventStore } from "./bot/billing/DisputeEventStore";
 import { TemplateStore } from "./bot/billing/evidence/TemplateStore";
 import { EvidencePackBuilder } from "./bot/billing/evidence/EvidencePackBuilder";
 import { SubscriptionEventStore } from "./bot/billing/SubscriptionEventStore";
@@ -284,9 +285,12 @@ async function main() {
   // notes/bookmarks, the shared ratio cache and the looper tick body.
   const disputeStore = new DisputeStore(prisma);
   disputeStore.bindSegments(segmentResolver);
+  // Per-dispute history: what happened, when, and who or what did it. Declared
+  // before the services that write to it.
+  const disputeEvents = new DisputeEventStore(prisma);
   // Shared dispute-evidence core: /billing → Disputes AND the web dashboard's
   // workbench run this one implementation (catalog, staging, submit claims).
-  const disputeEvidenceService = new DisputeEvidenceService(stripeClient, disputeStore, sessionStore);
+  const disputeEvidenceService = new DisputeEvidenceService(stripeClient, disputeStore, sessionStore, disputeEvents);
   // Deterministic evidence packs: template corpus plus operator overrides,
   // interpolated with real Stripe, platform and support facts. No model.
   // Read-only feed of the customer's real posting activity. Env-configured and
@@ -301,7 +305,8 @@ async function main() {
     disputeEvidenceService,
     evidenceTemplateStore,
     intercomClient,
-    postizActivity
+    postizActivity,
+    disputeEvents
   );
   const blockStore = new BlockStore(prisma);
   const qolStore = new BillingQolStore(prisma);
@@ -320,7 +325,8 @@ async function main() {
     disputeStore,
     sessionStore,
     autoResolveAlerts,
-    new StripeIntercomSideEffects(stripeClient, sessionStore, settingsStore, intercomClient)
+    new StripeIntercomSideEffects(stripeClient, sessionStore, settingsStore, intercomClient),
+    disputeEvents
   );
   const ratioEngine = new CachedRatioEngine(stripeClient);
   const disputeMonitor = new DisputeMonitor(
@@ -349,6 +355,7 @@ async function main() {
   stripeWebhookHandler.setSubscriptionEventService(subscriptionEventService);
   stripeWebhookHandler.setAutoResolveService(autoResolveService);
   stripeWebhookHandler.setEvidencePackBuilder(evidencePackBuilder);
+  stripeWebhookHandler.setDisputeEventStore(disputeEvents);
   // Intercom canvas/panel billing actions: approval queue + the shared
   // Discord-independent action brain (levels re-checked per request).
   const approvalStore = new ApprovalStore(prisma);
@@ -711,6 +718,7 @@ async function main() {
       evidencePack: evidencePackBuilder,
       autoResolveStore,
       templateStore: evidenceTemplateStore,
+      events: disputeEvents,
     }),
     makeCatalogSection(),
     makeLinksSection(),
