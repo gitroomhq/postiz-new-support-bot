@@ -6831,12 +6831,11 @@ export class DiscordBot {
             api: (endpoint, token, body) => this.intercomPanel!.api(endpoint, token, body),
           }
         : undefined,
-      this.adminPanel
-        ? {
-            page: (token) => this.adminPanel!.page(token),
-            api: (endpoint, sessionId, body) => this.adminPanel!.api(endpoint, sessionId, body),
-          }
-        : undefined,
+      // Passed straight through, NOT re-wrapped: the panel is mounted at two
+      // paths and page() needs the cookie and the mount's basePath to know
+      // which one it is serving. A forwarding literal that names fewer
+      // parameters still type-checks and silently drops the rest.
+      this.adminPanel,
       this.dashboard
         ? {
             page: (token, cookie, meta) => this.dashboard!.page(token, cookie, meta),

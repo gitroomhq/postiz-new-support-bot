@@ -4,6 +4,7 @@ import type { Express } from "express";
 import type { AddressInfo } from "node:net";
 import type { Server } from "node:http";
 import { CallbackServer } from "../CallbackServer";
+import { AdminPanel } from "../../adminpanel/AdminPanel";
 import type { MountedPanelRoute } from "../panelMount";
 
 // Route ORDER on the merged admin surface. Express matches in registration
@@ -119,4 +120,59 @@ test("/panel and its deep links still reach the dashboard", async () => {
   assert.match(await root.text(), /<title>dashboard<\/title>/);
   const deep = await fetch(`${base}/panel/customers/cus_123`);
   assert.match(await deep.text(), /<title>dashboard<\/title>/);
+});
+
+// The wiring, end to end, with a REAL AdminPanel behind the mount. The stub
+// above proves the routing; this proves the arguments survive the trip, which
+// is what actually broke: DiscordBot handed CallbackServer a forwarding object
+// literal that named only `token`, so the cookie and the mount path were
+// dropped and every visit rendered the standalone "link expired" page.
+const realPanel = new AdminPanel(
+  { adminPanelEpoch: () => 1 } as never,
+  {} as never,
+  { get: () => null } as never,
+  {} as never,
+  [],
+  undefined
+);
+realPanel.bindSharedAuth({
+  authenticate: async (cookie) =>
+    cookie === "dash-session" ? { actor: { id: "42", name: "Ada", isAdmin: true }, state: "active" } : null,
+});
+
+const realServer = new CallbackServer(
+  { server: { port: 0 } } as never,
+  {} as never,
+  undefined,
+  undefined,
+  undefined,
+  undefined,
+  undefined,
+  realPanel,
+  shell("dashboard"),
+  undefined
+);
+const realApp = (realServer as unknown as { app: Express }).app;
+
+test("a dashboard cookie opens the real config panel, rendered for the mount it was served from", async () => {
+  const s = realApp.listen(0, "127.0.0.1");
+  await new Promise<void>((resolve) => s.once("listening", resolve));
+  const at = `http://127.0.0.1:${(s.address() as AddressInfo).port}`;
+  try {
+    const res = await fetch(`${at}/panel/config`, { headers: { Cookie: "__Host-billing=dash-session" } });
+    assert.equal(res.status, 200);
+    const html = await res.text();
+    assert.match(html, /<title>Admin panel<\/title>/);
+    // Posting anywhere else would authenticate against the other mount's cookie.
+    assert.match(html, /"\/panel\/config\/api\/"/);
+    assert.match(html, /Back to dashboard/);
+
+    // And without the cookie it says how to get back in, rather than telling a
+    // logged-in operator to go re-run a Discord command.
+    const out = await fetch(`${at}/panel/config`);
+    assert.equal(out.status, 401);
+    assert.match(await out.text(), /Open \/panel to sign in again/);
+  } finally {
+    s.close();
+  }
 });
