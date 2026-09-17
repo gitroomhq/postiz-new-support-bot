@@ -24,9 +24,58 @@ export interface AdminPanelRoute {
 // The server half of the admin web panel: token exchange → passcode-gated
 // session → generic form dispatch. Everything the page renders is decided here
 // (mirrors IntercomPanel); the client is a dumb form renderer.
+// The billing dashboard's session verifier, as much of it as this panel needs.
+export interface SharedPanelAuth {
+  authenticate(
+    cookie: string
+  ): Promise<{ actor: { id: string; name: string; isAdmin: boolean; guildId?: string }; state: string } | null>;
+}
+
 export class AdminPanel implements AdminPanelRoute {
   private rate = new Map<string, number[]>();
   private modules = new Map<string, HubModule>();
+
+  // The merged-panel session bridge. When bound, a valid BILLING dashboard
+  // session is accepted in place of this panel's own passcode session, so the
+  // whole admin surface sits behind one login instead of two.
+  //
+  // The panel's own token + passcode path stays in place underneath: it is the
+  // bootstrap route, and a box whose dashboard is misconfigured must still be
+  // repairable through the panel that configures it.
+  private shared: SharedPanelAuth | null = null;
+
+  bindSharedAuth(auth: SharedPanelAuth): void {
+    this.shared = auth;
+  }
+
+  // A dashboard session presented as this panel's own session shape. Only an
+  // ACTIVE dashboard session qualifies: a locked one has not finished its
+  // login, and must not be able to read configuration through the side door.
+  private async sharedSession(cookie: string): Promise<AdminSession | null> {
+    if (!this.shared) return null;
+    const auth = await this.shared.authenticate(cookie).catch(() => null);
+    if (!auth || auth.state !== "active" || !auth.actor.isAdmin) return null;
+    const now = Date.now();
+    return {
+      discordUserId: auth.actor.id,
+      guildId: auth.actor.guildId ?? "",
+      adminName: auth.actor.name,
+      panel: "config",
+      epoch: this.settingsStore.adminPanelEpoch(),
+      // Already activated: the dashboard login earned this with a passkey or a
+      // hardware key, which is a stronger factor than this panel's own Discord
+      // passcode. Requiring a second unlock would be ceremony without security.
+      state: "active",
+      activationCode: "",
+      activationAttempts: 0,
+      // A bridged session cannot run destructive ceremonies: those mint their
+      // code through this panel's Discord path, which a dashboard login never
+      // walked. They stay available on a native panel session.
+      destructiveChallenge: null,
+      createdAt: now,
+      lastSeenAt: now,
+    };
+  }
 
   constructor(
     private settingsStore: SettingsStore,
@@ -73,7 +122,13 @@ export class AdminPanel implements AdminPanelRoute {
   // already enforced the CSRF belts). activation-status works while LOCKED;
   // everything else requires an ACTIVE session.
   async api(endpoint: string, sessionId: string, body: unknown): Promise<{ status: number; json: object }> {
-    const session = sessionId ? this.sessions.get(sessionId, this.settingsStore.adminPanelEpoch()) : null;
+    // Either this panel's own passcode session, or a BILLING dashboard session
+    // bridged in. A dashboard session arrives already activated: it was earned
+    // with a passkey or a hardware key, which is a strictly stronger factor
+    // than this panel's Discord passcode, so it needs no second unlock.
+    const session =
+      (sessionId ? this.sessions.get(sessionId, this.settingsStore.adminPanelEpoch()) : null) ??
+      (sessionId ? await this.sharedSession(sessionId) : null);
     if (!session) return { status: 200, json: { state: "expired", error: "expired" } };
     if (!this.allow(`api:${session.discordUserId}`)) return { status: 429, json: { error: "rate limited" } };
     const request = (body ?? {}) as Record<string, unknown>;

@@ -12,7 +12,7 @@
 // memory. Legacy #/… links still parse and are canonicalized on route change.
 
 export const clientApp = `
-D.BASE = "/billing";
+D.BASE = "/panel";
 
 D.parseRoute = function () {
   var path = location.pathname || "";

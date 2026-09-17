@@ -256,18 +256,31 @@ export class CallbackServer {
       logLabel: "admin panel",
       route: () => this.adminPanel,
     });
-    // Billing dashboard (account-wide standing surface). Lives at /billing —
-    // it is the BILLING dashboard, not "the" bot dashboard (user decision).
+    // The merged admin surface. It began life as the billing dashboard and has
+    // absorbed the configuration panel, so it lives at a neutral /panel: it is
+    // no longer "billing" in any meaningful sense.
+    //
+    // /billing and /admin/panel both redirect here and keep working, because
+    // those URLs are pasted in Discord history and sitting in bookmarks. A 302
+    // rather than a 301: a permanent redirect is cached by the browser forever
+    // and would be painful to undo.
+    for (const legacy of ["/billing", "/admin/panel"]) {
+      this.app.get(legacy, (req, res) => {
+        const qs = req.originalUrl.includes("?") ? req.originalUrl.slice(req.originalUrl.indexOf("?")) : "";
+        res.redirect(302, `/panel${qs}`);
+      });
+    }
+
     mountPanel(this.app, allowIp, {
-      pagePath: "/billing",
-      apiPath: "/billing/api/:endpoint",
+      pagePath: "/panel",
+      apiPath: "/panel/api/:endpoint",
       cookieName: "__Host-billing",
       metricName: "dashboard.auth_failures",
       logLabel: "billing dashboard",
       // Dispute evidence proofs (≤4MB) travel as base64 JSON on the normal
       // api route — never multipart — so this panel takes bigger bodies.
       jsonLimit: "8mb",
-      // Real path URLs: /billing/customers/cus_… serves the shell so
+      // Real path URLs: /panel/customers/cus_… serves the shell so
       // copied links deep-load; the client router owns the path from there.
       spaWildcard: true,
       route: () => this.dashboard,

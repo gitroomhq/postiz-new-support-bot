@@ -10,9 +10,9 @@ import { clientEvidence } from "./clientEvidence";
 import { clientLogin } from "./clientLogin";
 import { clientApp } from "./clientApp";
 
-// Self-contained HTML shell for the Stripe dashboard (/billing). Ships as a
+// Self-contained HTML shell for the merged admin panel (/panel). Ships as a
 // template string (no build pipeline): inline CSS + vanilla JS, zero external
-// requests (strict CSP allows only same-origin XHR to /billing/api/*).
+// requests (strict CSP allows only same-origin XHR to /panel/api/*).
 //
 // The page is dumb on purpose: the server (Dashboard + section modules)
 // describes every block/cell/button; the client renders generically and posts
@@ -43,7 +43,7 @@ ${dashboardCss()}
   <div class="card">
     <div class="spinner"></div>
     <h2>Confirm in Discord to unlock</h2>
-    <p class="muted">Check your Discord DMs (or /billing → <strong>Activate session</strong>) and enter this code:</p>
+    <p class="muted">Check your Discord DMs (or /panel → <strong>Activate session</strong>) and enter this code:</p>
     <div id="lockcode" class="code" title="Click to copy">••••-••••</div>
     <p class="codehint">Click the code to copy it</p>
     <p class="muted">Waiting for confirmation…</p>

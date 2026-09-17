@@ -5061,7 +5061,7 @@ test("schedule editor page: token grammar, add/remove refs, baked server-parsed 
 
 // ---- router fix, +Create, invoice composer, Customer-360 writes ----
 
-test("client router: real /billing paths round-trip (id-less subpages, filters as query params, legacy #/ links) and the shell ships the +Create menu", () => {
+test("client router: real /panel paths round-trip (id-less subpages, filters as query params, legacy #/ links) and the shell ships the +Create menu", () => {
   // Exercise the REAL shipped client code: extract BASE/parseRoute/hrefFor
   // from the clientApp module string and run them with a stubbed location.
   const start = clientApp.indexOf("D.BASE");
@@ -5079,9 +5079,9 @@ test("client router: real /billing paths round-trip (id-less subpages, filters a
     return { pathname: qi < 0 ? href : href.slice(0, qi), search: qi < 0 ? "" : href.slice(qi), hash: "" };
   };
   const roundTrip = (page: string, params: Record<string, string> = {}, filters: Record<string, string> = {}) => {
-    const D = makeD({ pathname: "/billing", search: "", hash: "" });
+    const D = makeD({ pathname: "/panel", search: "", hash: "" });
     const href = D.hrefFor(page, params, filters);
-    assert.ok(href.startsWith("/billing/"), `href ${href} must be a real path`);
+    assert.ok(href.startsWith("/panel/"), `href ${href} must be a real path`);
     return makeD(locFor(href)).parseRoute();
   };
   assert.deepEqual(roundTrip("subscriptions.new"), { page: "subscriptions.new", params: {}, filters: {} });
@@ -5094,12 +5094,12 @@ test("client router: real /billing paths round-trip (id-less subpages, filters a
     filters: {},
   });
   // Filters ride real query params — copyable URLs (user decision).
-  const withFilters = makeD({ pathname: "/billing", search: "", hash: "" }).hrefFor("payments", {}, { status: "failed", date: "7d" });
-  assert.equal(withFilters, "/billing/payments?f_status=failed&f_date=7d");
+  const withFilters = makeD({ pathname: "/panel", search: "", hash: "" }).hrefFor("payments", {}, { status: "failed", date: "7d" });
+  assert.equal(withFilters, "/panel/payments?f_status=failed&f_date=7d");
   assert.deepEqual(makeD(locFor(withFilters)).parseRoute().filters, { status: "failed", date: "7d" });
   // Panel root → default page; legacy #/… links still parse.
-  assert.equal(makeD({ pathname: "/billing", search: "", hash: "" }).parseRoute().page, "home");
-  assert.deepEqual(makeD({ pathname: "/billing", search: "", hash: "#/customers/cus_9?f_x=1" }).parseRoute(), {
+  assert.equal(makeD({ pathname: "/panel", search: "", hash: "" }).parseRoute().page, "home");
+  assert.deepEqual(makeD({ pathname: "/panel", search: "", hash: "#/customers/cus_9?f_x=1" }).parseRoute(), {
     page: "customers.detail",
     params: { id: "cus_9" },
     filters: { x: "1" },

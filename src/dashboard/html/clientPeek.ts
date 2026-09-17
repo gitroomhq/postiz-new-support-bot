@@ -11,10 +11,10 @@ D.peekTimer = null;
 D.peekCard = null;
 D.peekKey = null;
 
-// Parse a path href ("/billing/customers/cus_1") back into { page, id } —
+// Parse a path href ("/panel/customers/cus_1") back into { page, id }:
 // detail pages only (second segment must look like a Stripe id).
 D.peekTarget = function (href) {
-  var base = (D.BASE || "/billing") + "/";
+  var base = (D.BASE || "/panel") + "/";
   if (!href || href.indexOf(base) !== 0) return null;
   var h = href.slice(base.length);
   var q = h.indexOf("?");

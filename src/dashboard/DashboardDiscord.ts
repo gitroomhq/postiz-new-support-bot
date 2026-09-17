@@ -150,7 +150,7 @@ export class DashboardDiscord implements LoginNotifier {
       await interaction.reply({ content: "Could not create a dashboard link. Check the bot logs.", flags: 64 });
       return;
     }
-    const url = `${base}/billing?t=${encodeURIComponent(token)}`;
+    const url = `${base}/panel?t=${encodeURIComponent(token)}`;
     const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder().setStyle(ButtonStyle.Link).setURL(url).setLabel("Open dashboard"),
       new ButtonBuilder().setCustomId("dashpanel_activate").setStyle(ButtonStyle.Primary).setLabel("Activate session"),

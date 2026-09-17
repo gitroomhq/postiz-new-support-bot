@@ -12,7 +12,7 @@ var D = {
 D.q = function (id) { return document.getElementById(id); };
 
 D.api = function (endpoint, body) {
-  return fetch("/billing/api/" + endpoint, {
+  return fetch((D.BASE || "/panel") + "/api/" + endpoint, {
     method: "POST",
     credentials: "same-origin",
     headers: { "Content-Type": "application/json", "X-Panel-Request": "1" },

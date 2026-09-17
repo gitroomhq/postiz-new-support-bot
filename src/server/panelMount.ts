@@ -57,7 +57,7 @@ export interface PanelMountSpec {
   logLabel: string; // e.g. "admin panel"
   jsonLimit?: string; // default "256kb"
   // SPA path routing: ALSO serve the page shell for GET <pagePath>/<anything>
-  // (except <pagePath>/api/…) so copied deep links like /billing/customers/…
+  // (except <pagePath>/api/…) so copied deep links like /panel/customers/…
   // load directly — the client router reads location.pathname on boot.
   spaWildcard?: boolean;
   // Late-bound: CallbackServer receives route objects as optional constructor

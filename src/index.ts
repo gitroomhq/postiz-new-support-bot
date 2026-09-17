@@ -701,6 +701,11 @@ async function main() {
     dashboardAudit
   );
   dashboardOps.resetCredentials = (userId) => dashboardAuth.resetCredentials(userId);
+  // One login for the whole admin surface: the configuration panel accepts a
+  // BILLING dashboard session instead of running a second passcode ceremony.
+  // Its own token path stays as the bootstrap route for a box whose dashboard
+  // is not yet configured.
+  adminPanel.bindSharedAuth({ authenticate: (cookie) => dashboardAuth.authenticate(cookie) });
   const dashboardGateway = new DashboardActionGateway(billingActionService, stripeClient, sessionStore);
   const dashboardStores = { session: sessionStore, dispute: disputeStore, block: blockStore, qol: qolStore, moneyOut: moneyOutStore };
   const dashboardMetrics = new HomeMetrics(stripeClient, settingsStore, disputeStore, moneyOutStore);
