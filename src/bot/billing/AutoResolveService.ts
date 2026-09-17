@@ -13,6 +13,7 @@ import {
   type AutoResolveStage,
   type Guardrail,
 } from "./autoResolvePolicy";
+import { autoExecutes, proposes } from "./disputePhase";
 import { exportDisputeAutoResolve } from "../../metrics/MetricsExporter";
 import { log } from "../../util/logger";
 import { EXECUTING_LEASE_MS } from "./AutoResolveStore";
@@ -86,7 +87,9 @@ export class AutoResolveService {
 
   config(): AutoResolveConfig {
     return {
-      enabled: this.settings.disputeAutoResolveEnabled(),
+      // The policy's "enabled" means "evaluate and record". Whether a recorded
+      // proposal may FIRE is a separate question, answered by autoExecutes.
+      enabled: proposes(this.settings.disputeResolveMode()),
       efwEnabled: this.settings.disputeAutoResolveEfw(),
       maxUsdMinor: this.settings.disputeAutoResolveMaxUsdMinor(),
       vetoMinutes: this.settings.disputeAutoResolveVetoMinutes(),
@@ -96,7 +99,7 @@ export class AutoResolveService {
 
   // Cheap pre-check so a disabled engine costs no Stripe reads at all.
   private enabledFor(stage: AutoResolveStage): boolean {
-    if (!this.settings.disputeAutoResolveEnabled()) return false;
+    if (!proposes(this.settings.disputeResolveMode())) return false;
     return stage === "inquiry" || this.settings.disputeAutoResolveEfw();
   }
 
@@ -238,6 +241,27 @@ export class AutoResolveService {
     };
   }
 
+  // Rows a human has explicitly told to run now. Held in memory only: it is a
+  // single-tick instruction, and losing it on a restart simply means the
+  // operator presses Execute again rather than a refund firing unexpectedly.
+  private forcedExecute = new Set<string>();
+
+  // "Execute now", the manualplus path: a human accepting a proposal rather
+  // than the veto window expiring. The drain still re-runs every live guardrail
+  // before the refund, so accepting is not the same as overriding.
+  async executeNow(rowId: string, now: Date = new Date()): Promise<DrainResult> {
+    const row = await this.store.byId(rowId);
+    const result: DrainResult = { executed: 0, blocked: 0, failed: 0, superseded: 0, alerted: 0 };
+    if (!row || row.state !== "PENDING") return result;
+    this.forcedExecute.add(rowId);
+    try {
+      await this.drainRow(row, now, result);
+    } finally {
+      this.forcedExecute.delete(rowId);
+    }
+    return result;
+  }
+
   // Executes proposals whose veto window has expired. Called by the disputes
   // looper every hour.
   //
@@ -253,7 +277,8 @@ export class AutoResolveService {
   //      crash in a side effect can never cause a second refund
   async drain(now: Date = new Date()): Promise<DrainResult> {
     const result: DrainResult = { executed: 0, blocked: 0, failed: 0, superseded: 0, alerted: 0 };
-    if (!this.settings.disputeAutoResolveEnabled()) return result;
+    const mode = this.settings.disputeResolveMode();
+    if (!proposes(mode)) return result;
 
     const due = await this.store.claimDue(now, DRAIN_LIMIT);
     for (const row of due) {
@@ -288,6 +313,11 @@ export class AutoResolveService {
       result.alerted++;
       return;
     }
+
+    // In manualplus the proposal waits for a human to press Execute, however
+    // long its veto window says. The alert above has already gone out, so the
+    // case is visible; it simply does not fire by itself.
+    if (!autoExecutes(this.settings.disputeResolveMode()) && !this.forcedExecute.has(row.id)) return;
 
     // Reclaim a row abandoned by a crashed process, or take a pending one.
     const claimed =

@@ -1,3 +1,4 @@
+import { autoStages, autoSubmits, isDisputePhase, type DisputePhase } from "../bot/billing/disputePhase";
 import { randomBytes } from "node:crypto";
 import { Prisma, PrismaClient, BotSettings, StatusTag } from "../generated/prisma/client";
 import type { SentryRuntimeConfig } from "../util/logger";
@@ -1133,10 +1134,13 @@ export class SettingsStore {
 
   // ---- Dispute auto-resolve (/config → Billing → Dispute auto-resolve) ----
 
-  // Master switch. Off means the engine is inert: it proposes nothing, blocks
-  // nothing and writes no metric points at all.
-  disputeAutoResolveEnabled(): boolean {
-    return this.settings.disputeAutoResolveEnabled;
+  // Cutover phase for refund-to-prevent. "none" and "manual" leave the engine
+  // inert: it proposes nothing, blocks nothing and writes no metric points.
+  // "manualplus" records proposals and alerts but never fires; "auto" fires
+  // once the veto window expires.
+  disputeResolveMode(): DisputePhase {
+    const v = this.settings.disputeResolveMode;
+    return isDisputePhase(v) ? v : "none";
   }
 
   // The early-fraud-warning leg, switchable on its own because it acts on a
@@ -1180,16 +1184,23 @@ export class SettingsStore {
 
   // ---- Deterministic evidence packs ----
 
-  // Stage a templated evidence package when a dispute arrives. Staging uses
-  // submit:false, so nothing reaches the bank and a human can still edit it.
-  disputeAutoPackEnabled(): boolean {
-    return this.settings.disputeAutoPackEnabled;
+  // Cutover phase for the evidence pipeline. "manual" offers a Build button;
+  // "manualplus" builds and stages automatically but never submits; "auto"
+  // also submits near the deadline when nobody has touched it.
+  disputeEvidenceMode(): DisputePhase {
+    const v = this.settings.disputeEvidenceMode;
+    return isDisputePhase(v) ? v : "none";
   }
 
-  // The one that actually sends a machine-written package to a bank. Ships OFF
-  // and should stay off until packs have been read against real disputes.
+  // Convenience wrappers so call sites read as intent rather than as a phase
+  // comparison. Staging uses submit:false, so nothing reaches the bank.
+  disputeAutoPackEnabled(): boolean {
+    return autoStages(this.disputeEvidenceMode());
+  }
+
+  // The one that actually sends a machine-written package to a bank.
   disputeAutoSubmitEnabled(): boolean {
-    return this.settings.disputeAutoSubmitEnabled;
+    return autoSubmits(this.disputeEvidenceMode());
   }
 
   disputeAutoSubmitHours(): number {
@@ -1889,7 +1900,7 @@ export class SettingsStore {
   // The reason allowlist arrives as an array and is stored comma-joined; every
   // other field passes straight through.
   async updateDisputeAutoResolve(data: {
-    disputeAutoResolveEnabled?: boolean;
+    disputeResolveMode?: DisputePhase;
     disputeAutoResolveEfw?: boolean;
     disputeAutoResolveMaxUsdMinor?: number;
     disputeAutoResolveVetoMinutes?: number;
@@ -1909,8 +1920,7 @@ export class SettingsStore {
   }
 
   async updateDisputeEvidenceAutomation(data: {
-    disputeAutoPackEnabled?: boolean;
-    disputeAutoSubmitEnabled?: boolean;
+    disputeEvidenceMode?: DisputePhase;
     disputeAutoSubmitHours?: number;
     disputeAutoSubmitMinScore?: number;
     disputeAutoSubmitMaxMinor?: number | null;

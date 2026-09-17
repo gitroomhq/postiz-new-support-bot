@@ -1052,7 +1052,7 @@ export const STATEMENTS: string[] = [
   `CREATE INDEX IF NOT EXISTS "dispute_auto_resolves_chargeId_idx" ON "dispute_auto_resolves"("chargeId")`,
   `CREATE INDEX IF NOT EXISTS "dispute_auto_resolves_disputeId_idx" ON "dispute_auto_resolves"("disputeId")`,
   // Auto-resolve knobs. Every one that can move money ships OFF.
-  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "disputeAutoResolveEnabled" BOOLEAN NOT NULL DEFAULT false`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "disputeResolveMode" TEXT NOT NULL DEFAULT 'none'`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "disputeAutoResolveEfw" BOOLEAN NOT NULL DEFAULT false`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "disputeAutoResolveMaxUsdMinor" INTEGER NOT NULL DEFAULT 6000`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "disputeAutoResolveVetoMinutes" INTEGER NOT NULL DEFAULT 120`,
@@ -1061,8 +1061,7 @@ export const STATEMENTS: string[] = [
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "disputeReconcileAt" TIMESTAMP(3)`,
   // Deterministic evidence packs. Auto-pack only stages (submit:false);
   // auto-submit is the one that reaches the bank, and it ships off.
-  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "disputeAutoPackEnabled" BOOLEAN NOT NULL DEFAULT false`,
-  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "disputeAutoSubmitEnabled" BOOLEAN NOT NULL DEFAULT false`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "disputeEvidenceMode" TEXT NOT NULL DEFAULT 'none'`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "disputeAutoSubmitHours" INTEGER NOT NULL DEFAULT 24`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "disputeAutoSubmitMinScore" INTEGER NOT NULL DEFAULT 70`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "disputeAutoSubmitMaxMinor" INTEGER`,

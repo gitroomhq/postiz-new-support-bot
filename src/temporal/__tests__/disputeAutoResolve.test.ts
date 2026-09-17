@@ -312,10 +312,17 @@ const row = (over: Row = {}): Row => ({
   ...over,
 });
 
-function drainHarness(opts: { rows: Row[]; charge?: Stripe.Charge; dispute?: Stripe.Dispute; casOk?: boolean }) {
+function drainHarness(opts: {
+  rows: Row[];
+  charge?: Stripe.Charge;
+  dispute?: Stripe.Dispute;
+  casOk?: boolean;
+  mode?: "none" | "manual" | "manualplus" | "auto";
+}) {
   const calls: string[] = [];
   const store = {
     claimDue: async () => opts.rows,
+    byId: async (id: string) => opts.rows.find((r) => r.id === id) ?? null,
     casExecuting: async () => {
       calls.push("cas");
       return opts.casOk !== false;
@@ -357,7 +364,7 @@ function drainHarness(opts: { rows: Row[]; charge?: Stripe.Charge; dispute?: Str
     formatAmount: (a: number) => `$${(a / 100).toFixed(2)}`,
   };
   const svc = new AutoResolveService(
-    { disputeAutoResolveEnabled: () => true, disputeAutoResolveVetoMinutes: () => 120 } as never,
+    { disputeResolveMode: () => opts.mode ?? "auto", disputeAutoResolveVetoMinutes: () => 120 } as never,
     stripe as never,
     store as never,
     {} as never,
@@ -422,14 +429,48 @@ test("drain: a dispute that became a chargeback during the window is blocked, no
   assert.ok(h.calls.includes("postBlocked"), "a blocked case still reaches a human");
 });
 
-test("drain: the master toggle makes the drain a no-op", async () => {
+test("drain: manualplus alerts and waits, and never refunds on its own", async () => {
+  // The whole point of the phase: the case is visible and a human decides.
+  const h = drainHarness({ rows: [row()], mode: "manualplus" });
+  const result = await h.svc.drain(new Date("2026-09-16T12:00:00.000Z"));
+  assert.equal(result.executed, 0);
+  assert.ok(!h.calls.some((c) => c.startsWith("refund:")), "manualplus must not move money");
+  assert.ok(!h.calls.includes("cas"), "and must not even claim the row");
+});
+
+test("drain: manualplus still posts the alert for a row that has none", async () => {
+  const h = drainHarness({ rows: [row({ alertedAt: null })], mode: "manualplus" });
+  const result = await h.svc.drain(new Date("2026-09-16T12:00:00.000Z"));
+  assert.equal(result.alerted, 1);
+  assert.deepEqual(h.calls, ["postProposal", "recordAlert"]);
+});
+
+test("executeNow: a human accepting a proposal refunds, but still re-checks every guardrail", async () => {
+  const h = drainHarness({ rows: [row()], mode: "manualplus" });
+  const result = await h.svc.executeNow("cjld2cjxh0000qzrmn831i7rn", new Date("2026-09-16T12:00:00.000Z"));
+  assert.equal(result.executed, 1);
+  assert.ok(h.calls.some((c) => c.startsWith("refund:")));
+
+  // Accepting is not overriding: a dispute that became a chargeback still blocks.
+  const moved = drainHarness({ rows: [row()], dispute: dispute({ status: "needs_response" }), mode: "manualplus" });
+  const blocked = await moved.svc.executeNow("cjld2cjxh0000qzrmn831i7rn", new Date("2026-09-16T12:00:00.000Z"));
+  assert.equal(blocked.executed, 0);
+  assert.equal(blocked.blocked, 1);
+});
+
+test("drain: the none and manual phases make the drain a no-op", async () => {
   const h = drainHarness({ rows: [row()] });
   const off = new AutoResolveService(
-    { disputeAutoResolveEnabled: () => false } as never,
+    { disputeResolveMode: () => "none" } as never,
     {} as never,
     { claimDue: async () => [] } as never,
     {} as never
   );
   assert.deepEqual(await off.drain(), { executed: 0, blocked: 0, failed: 0, superseded: 0, alerted: 0 });
   assert.equal(h.calls.length, 0);
+
+  // "manual" means the old button only: the engine records nothing.
+  const manual = drainHarness({ rows: [row()], mode: "manual" });
+  assert.deepEqual(await manual.svc.drain(), { executed: 0, blocked: 0, failed: 0, superseded: 0, alerted: 0 });
+  assert.equal(manual.calls.length, 0);
 });

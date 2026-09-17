@@ -251,7 +251,10 @@ model BotSettings {
   // actionable early fraud warning is the same move one step earlier. Both move
   // real money without a human, so both ship OFF and both post a vetoable alert
   // before anything fires.
-  disputeAutoResolveEnabled     Boolean @default(false)
+  // Cutover phase for refund-to-prevent: none | manual | manualplus | auto.
+  // Replaces the old disputeAutoResolveEnabled boolean, which could only say
+  // "off" or "all the way on" and left no room to run in shadow.
+  disputeResolveMode            String  @default("none")
   disputeAutoResolveEfw         Boolean @default(false)
   // USD cents. Other currencies are converted with the approximate built-in
   // rate table in src/bot/billing/fx.ts; a currency absent from it never
@@ -275,8 +278,8 @@ model BotSettings {
   // platform and support facts, staged with submit:false. Auto-pack only
   // stages, so it is far less dangerous than auto-submit, which actually sends
   // the package to the bank. Both ship OFF.
-  disputeAutoPackEnabled        Boolean @default(false)
-  disputeAutoSubmitEnabled      Boolean @default(false)
+  // Cutover phase for the evidence pipeline: none | manual | manualplus | auto.
+  disputeEvidenceMode           String  @default("none")
   // Submit this many hours before the evidence deadline, if nobody touched it.
   disputeAutoSubmitHours        Int     @default(24)
   // Completeness score (0-100) a pack must reach before it may auto-submit.

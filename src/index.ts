@@ -106,6 +106,7 @@ import { makeIntegrationsHub } from "./adminpanel/sections/integrationsHub";
 import { makeAiAnalyticsHub } from "./adminpanel/sections/aiAnalyticsHub";
 import { makeInfraHub } from "./adminpanel/sections/infraHub";
 import { makeAuditBillingHub } from "./adminpanel/sections/auditBillingHub";
+import { makeDisputesHub } from "./adminpanel/sections/disputesHub";
 import { makeWorkflowHub } from "./adminpanel/sections/workflowHub";
 import { makeAccessHub } from "./adminpanel/sections/accessHub";
 import { makeDashboardHub } from "./adminpanel/sections/dashboardHub";
@@ -121,6 +122,7 @@ import { StripeSegmentResolver } from "./bot/billing/StripeSegmentResolver";
 import { AutoResolveStore } from "./bot/billing/AutoResolveStore";
 import { AutoResolveService } from "./bot/billing/AutoResolveService";
 import { DiscordAutoResolveAlerts, StripeIntercomSideEffects } from "./bot/billing/AutoResolveAlerts";
+import { PostizActivitySource } from "./postiz/PostizActivitySource";
 import { TemplateStore } from "./bot/billing/evidence/TemplateStore";
 import { EvidencePackBuilder } from "./bot/billing/evidence/EvidencePackBuilder";
 import { SubscriptionEventStore } from "./bot/billing/SubscriptionEventStore";
@@ -287,6 +289,9 @@ async function main() {
   const disputeEvidenceService = new DisputeEvidenceService(stripeClient, disputeStore, sessionStore);
   // Deterministic evidence packs: template corpus plus operator overrides,
   // interpolated with real Stripe, platform and support facts. No model.
+  // Read-only feed of the customer's real posting activity. Env-configured and
+  // entirely optional: without it every usage claim is simply omitted.
+  const postizActivity = new PostizActivitySource();
   const evidenceTemplateStore = new TemplateStore(prisma);
   const evidencePackBuilder = new EvidencePackBuilder(
     stripeClient,
@@ -295,7 +300,8 @@ async function main() {
     disputeStore,
     disputeEvidenceService,
     evidenceTemplateStore,
-    intercomClient
+    intercomClient,
+    postizActivity
   );
   const blockStore = new BlockStore(prisma);
   const qolStore = new BillingQolStore(prisma);
@@ -648,6 +654,9 @@ async function main() {
     makeAuditBillingHub({
       applyWebhook: async (on) => { if (on) await stripeWebhookHandler.ensureEndpoint(true); else await stripeWebhookHandler.disableEndpoint(); },
       registerWebhook: async () => { const r = await stripeWebhookHandler.ensureEndpoint(true); return r.detail ? `${r.status}: ${r.detail}` : r.status; },
+    }),
+    makeDisputesHub({
+      postizReadSelfTest: () => postizActivity.selfTest(),
       provisionRadar: async () => {
         const rows = await blockService.ensureRadarLists();
         return rows.map((x) => `${x.kind}: ${x.created ? "created" : x.listId ? "exists" : "failed"}${x.error ? ` (${x.error})` : ""}`).join("; ");
