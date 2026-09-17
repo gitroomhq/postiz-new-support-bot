@@ -40,6 +40,47 @@ export type ProposeResult =
   | { kind: "duplicate" }
   | { kind: "unavailable"; error: string };
 
+// A proposal a human asked for, by pressing a button, rather than one the
+// engine made on its own when a webhook arrived.
+//
+// It differs from the engine path in exactly one way: a decision that BLOCKS is
+// reported and NOT written. The engine records its blocks because nobody is
+// watching when a webhook lands, and the row is the only trace. Here somebody
+// is watching, gets told the guardrail on the spot, and a curiosity press must
+// not leave a Declined row or a metric point behind that cannot be told apart
+// from an engine verdict (a `trigger` tag would split every existing series,
+// so telling them apart is not on the table).
+export type HandProposeResult =
+  | { kind: "off" }
+  | { kind: "out_of_scope"; status: string }
+  | { kind: "blocked"; guardrail: Guardrail }
+  | { kind: "duplicate"; state: string }
+  // `alerted` is not decoration. A row with no posted alert is never executed,
+  // so an unalerted proposal is inert until something posts one, and at phase
+  // manual nothing else ever will: the hourly drain does not run at all there.
+  | { kind: "proposed"; fireAt: Date; amountMinor: number; currency: string; rowId: string; alerted: boolean }
+  | { kind: "unavailable"; error: string };
+
+export interface BackfillResult {
+  scanned: number;
+  proposed: number;
+  blocked: number;
+  duplicate: number;
+  outOfScope: number;
+  unavailable: number;
+  // Proposed but not reachable in Discord. Those cannot fire and cannot be
+  // vetoed, so they are worth naming rather than burying in `proposed`.
+  unalerted: number;
+  // Why the scanned disputes were refused, so a cutover can be calibrated from
+  // one press instead of opening every dispute in turn.
+  guardrails: Record<string, number>;
+  remaining: number;
+}
+
+// One press never evaluates more than this. Each candidate costs two Stripe
+// reads, and an operator waiting on a page deserves an answer.
+const BACKFILL_LIMIT = 25;
+
 // How the engine reaches Discord. Kept as a seam rather than a Client so the
 // drain is testable without discord.js, and so an unreachable channel is a
 // clearly handled `null` rather than a thrown error.
@@ -177,6 +218,159 @@ export class AutoResolveService {
       // tag is documented as a union keyed by stage.
       reason: efw.fraud_type ?? "unknown",
     });
+  }
+
+  // Evaluate ONE dispute because a human asked, outside the webhook path.
+  //
+  // The phase gate is deliberately different from the engine's. A phase says
+  // what may happen WITHOUT a human: "manual" means nothing auto-stages and
+  // nothing fires by itself, not that a human may not ask the question. So this
+  // works from "manual" upward and only a pipeline switched fully off refuses.
+  // Whether the resulting proposal may then FIRE on its own is still decided by
+  // autoExecutes, which this does not touch.
+  async proposeByHand(disputeId: string, now: Date = new Date()): Promise<HandProposeResult> {
+    if (this.settings.disputeResolveMode() === "none") return { kind: "off" };
+
+    // Cheap short-circuit: an existing row means this dispute already has a
+    // verdict, so a re-press costs nothing at Stripe.
+    const existing = await this.store.bySourceId(disputeId).catch(() => null);
+    if (existing) return { kind: "duplicate", state: existing.state };
+
+    let dispute: Stripe.Dispute;
+    let charge: Stripe.Charge;
+    try {
+      dispute = await this.stripe.getDispute(disputeId);
+      const chargeId = typeof dispute.charge === "string" ? dispute.charge : (dispute.charge?.id ?? "");
+      if (!chargeId) return { kind: "out_of_scope", status: dispute.status };
+      charge = await this.stripe.getCharge(chargeId);
+    } catch (error) {
+      autoLog.warn("hand-triggered auto-resolve read failed", {
+        "stripe.dispute_id": disputeId,
+        "error.message": String(error),
+      });
+      return { kind: "unavailable", error: String(error) };
+    }
+
+    const customerId = customerIdOf(charge);
+    const repeat = await this.isRepeatOffender(customerId, disputeId).catch(() => true);
+    // enabled:true overrides the phase gate the engine reads, which is the one
+    // difference between asking by hand and waiting for a webhook.
+    const decision = evaluateDispute(dispute, charge, { ...this.config(), enabled: true }, repeat, now);
+
+    if (decision.kind === "inert") return { kind: "out_of_scope", status: dispute.status };
+    if (decision.kind === "block") {
+      autoLog.info("hand-triggered auto-resolve declined", {
+        "stripe.dispute_id": disputeId,
+        "auto_resolve.guardrail": decision.guardrail,
+      });
+      return { kind: "blocked", guardrail: decision.guardrail };
+    }
+
+    const chargeId = typeof dispute.charge === "string" ? dispute.charge : (dispute.charge?.id ?? "");
+    const recorded = await this.record(decision, {
+      stage: "inquiry",
+      sourceId: dispute.id,
+      disputeId: dispute.id,
+      chargeId,
+      customerId,
+      currency: charge.currency,
+      reason: dispute.reason,
+    });
+    if (recorded.kind === "proposed") {
+      return {
+        kind: "proposed",
+        fireAt: recorded.fireAt,
+        amountMinor: recorded.amountMinor,
+        currency: recorded.currency,
+        rowId: recorded.rowId,
+        alerted: await this.alertProposal(recorded.rowId, now),
+      };
+    }
+    // Raced another writer between the existence check and the insert.
+    return { kind: "duplicate", state: "PENDING" };
+  }
+
+  // Post the proposal alert now, the same way the drain's first branch does.
+  //
+  // The engine can afford to leave this to the next tick. A hand-made proposal
+  // cannot: at phase manual the drain never runs, so the alert would never be
+  // posted, the row could never fire and Execute now would spend its first
+  // press posting the alert instead of accepting the proposal.
+  //
+  // A failure here is the same fail-closed state the engine produces: the row
+  // stands, unalerted, and therefore unexecutable, until an alert lands.
+  private async alertProposal(rowId: string, now: Date): Promise<boolean> {
+    if (!this.alerts) return false;
+    const row = await this.store.byId(rowId).catch(() => null);
+    if (!row) return false;
+    const posted = await this.alerts.postProposal(row).catch(() => null);
+    if (!posted) {
+      autoLog.warn("hand-triggered proposal could not be alerted; it cannot fire until one lands", {
+        "auto_resolve.id": rowId,
+      });
+      return false;
+    }
+    const fireAt = new Date(now.getTime() + this.settings.disputeAutoResolveVetoMinutes() * 60_000);
+    await this.store.recordAlert(row.id, posted.channelId, posted.messageId, fireAt);
+    return true;
+  }
+
+  // Sweep the open inquiries already in the mirror and propose on each.
+  //
+  // This is the cutover tool: turning the engine on only affects disputes that
+  // arrive afterwards, because proposals are made from webhooks, so every
+  // inquiry already on the books would otherwise stay invisible forever.
+  //
+  // Idempotent by construction: a dispute with a row is skipped before any
+  // Stripe read, so re-pressing costs one query and tells you the same thing.
+  async backfillOpenInquiries(now: Date = new Date()): Promise<BackfillResult> {
+    const out: BackfillResult = {
+      scanned: 0,
+      proposed: 0,
+      blocked: 0,
+      duplicate: 0,
+      outOfScope: 0,
+      unavailable: 0,
+      unalerted: 0,
+      guardrails: {},
+      remaining: 0,
+    };
+    if (this.settings.disputeResolveMode() === "none") return out;
+
+    // Only the inquiry stage: a formal chargeback cannot be prevented by a
+    // refund, which is the whole point of the pipeline.
+    const page = await this.disputeStore.listOpen(0, BACKFILL_LIMIT, { status: "warning_needs_response" });
+    out.remaining = Math.max(0, page.total - page.rows.length);
+
+    for (const row of page.rows) {
+      out.scanned++;
+      const result = await this.proposeByHand(row.id, now).catch(
+        (error): HandProposeResult => ({ kind: "unavailable", error: String(error) })
+      );
+      switch (result.kind) {
+        case "proposed":
+          out.proposed++;
+          if (!result.alerted) out.unalerted++;
+          break;
+        case "blocked":
+          out.blocked++;
+          out.guardrails[result.guardrail] = (out.guardrails[result.guardrail] ?? 0) + 1;
+          break;
+        case "duplicate":
+          out.duplicate++;
+          break;
+        case "out_of_scope":
+          out.outOfScope++;
+          break;
+        default:
+          out.unavailable++;
+      }
+    }
+    autoLog.info("auto-resolve backfill swept the open inquiries", {
+      "auto_resolve.scanned": out.scanned,
+      "auto_resolve.proposed": out.proposed,
+    });
+    return out;
   }
 
   // Persists the decision and emits exactly one metric point for it, or none at

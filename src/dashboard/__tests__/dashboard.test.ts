@@ -25,6 +25,7 @@ import {
   recommendedGroupKeys,
 } from "../../bot/billing/DisputeEvidenceService";
 import { TEXT_EVIDENCE_KEYS } from "../../bot/billing/DisputeStore";
+import type { BackfillResult, HandProposeResult } from "../../bot/billing/AutoResolveService";
 import { GlobalSearch } from "../search/GlobalSearch";
 import { actionByKey, ActionExecCtx } from "../../bot/billing/actions/ActionRegistry";
 import { BillingActionService } from "../../bot/billing/actions/BillingActionService";
@@ -2126,6 +2127,7 @@ function disputesCtx(fakes?: ReturnType<typeof evidenceFakes>): DashboardCtx {
     settings: {
       disputeRatioWarnPct: () => 0.75,
       disputeRatioCriticalPct: () => 1.5,
+      disputeResolveMode: () => resolveModeState.mode,
     } as never,
     stores: {
       dispute: {
@@ -2187,6 +2189,10 @@ function disputesCtx(fakes?: ReturnType<typeof evidenceFakes>): DashboardCtx {
 
 // Deps bundle for makeDisputesSection with the real service over the fakes.
 // State of the fake auto-resolve store, so a test can assert what veto did.
+// The resolve pipeline's cutover phase, which decides whether the by-hand
+// propose buttons are offered at all.
+const resolveModeState = { mode: "manualplus" as "none" | "manual" | "manualplus" | "auto" };
+
 const autoResolveState: { rows: Array<Record<string, unknown>>; vetoed: string[]; outcome: Record<string, unknown> } = {
   rows: [],
   vetoed: [],
@@ -6959,6 +6965,123 @@ test("dispute detail: no history means no timeline block rather than an empty on
   const section = makeDisputesSection({ ...disputesDeps(fakes), events: { list: async () => [] } as never });
   const page = await section.buildPage(disputesCtx(fakes), { page: "disputes.detail", params: { id: "dp_1" } });
   assert.ok(!page!.blocks.some((b) => b.type === "timeline" && /History/.test((b as { title: string }).title)));
+});
+
+// ---- proposing by hand, and the backfill that closes the cutover gap ----
+
+function handFakes(over: Partial<{ propose: HandProposeResult; backfill: Partial<BackfillResult> }> = {}) {
+  const asked: string[] = [];
+  return {
+    asked,
+    dep: {
+      executeNow: async () => ({ executed: 0, blocked: 0, failed: 0, superseded: 0 }),
+      proposeByHand: async (id: string) => {
+        asked.push(id);
+        return (
+          over.propose ??
+          ({ kind: "proposed", fireAt: new Date(), amountMinor: 4500, currency: "eur", rowId: "row_1", alerted: true } as HandProposeResult)
+        );
+      },
+      backfillOpenInquiries: async () => ({
+        scanned: 3,
+        proposed: 1,
+        blocked: 1,
+        duplicate: 1,
+        outOfScope: 0,
+        unavailable: 0,
+        guardrails: { repeat_offender: 1 },
+        remaining: 4,
+        ...over.backfill,
+      }),
+    } as never,
+  };
+}
+
+test("propose by hand: offered on an inquiry, withheld on a chargeback and while the phase is off", async () => {
+  const hand = handFakes();
+  const inquiry = evidenceFakes({ dispute: { status: "warning_needs_response" } });
+  const section = makeDisputesSection({ ...disputesDeps(inquiry), autoResolve: hand.dep });
+  const header = (await section.buildPage(disputesCtx(inquiry), { page: "disputes.detail", params: { id: "dp_1" } }))!
+    .blocks[0] as HeaderBlock;
+  assert.ok(header.actions!.some((a) => a.key === "section:disputes.autoresolve_propose"));
+
+  // A formal chargeback can no longer be prevented by a refund, so a button
+  // there would exist only to say no.
+  const chargeback = evidenceFakes();
+  const cbHeader = (await makeDisputesSection({ ...disputesDeps(chargeback), autoResolve: hand.dep }).buildPage(
+    disputesCtx(chargeback),
+    { page: "disputes.detail", params: { id: "dp_1" } }
+  ))!.blocks[0] as HeaderBlock;
+  assert.ok(!cbHeader.actions!.some((a) => a.key === "section:disputes.autoresolve_propose"));
+
+  resolveModeState.mode = "none";
+  try {
+    const offHeader = (await section.buildPage(disputesCtx(inquiry), { page: "disputes.detail", params: { id: "dp_1" } }))!
+      .blocks[0] as HeaderBlock;
+    assert.ok(!offHeader.actions!.some((a) => a.key === "section:disputes.autoresolve_propose"));
+  } finally {
+    resolveModeState.mode = "manualplus";
+  }
+});
+
+test("propose by hand: each engine verdict is reported in the operator's words", async () => {
+  const ctx = disputesCtx(evidenceFakes());
+  const run = async (propose: HandProposeResult) => {
+    const hand = handFakes({ propose });
+    const section = makeDisputesSection({ ...disputesDeps(), autoResolve: hand.dep });
+    const res = await section.action!(ctx, { key: "section:disputes.autoresolve_propose", params: { disputeId: "dp_1" } });
+    return { res, asked: hand.asked };
+  };
+
+  const ok = await run({ kind: "proposed", fireAt: new Date(), amountMinor: 4500, currency: "eur", rowId: "row_1", alerted: true });
+  assert.equal(ok.res.ok, true);
+  assert.deepEqual(ok.asked, ["dp_1"]);
+  assert.match(ok.res.text!, /45\.00 EUR/);
+  // The fail-closed invariant is what the operator is promised here.
+  assert.match(ok.res.text!, /alerted in the billing channel/i);
+
+  // A proposal nobody can see never fires, so that is not reported as a clean win.
+  const mute = await run({ kind: "proposed", fireAt: new Date(), amountMinor: 4500, currency: "eur", rowId: "row_1", alerted: false });
+  assert.match(mute.res.text!, /could not be reached/i);
+  assert.match(mute.res.text!, /never fires/i);
+
+  const blocked = await run({ kind: "blocked", guardrail: "repeat_offender" });
+  assert.equal(blocked.res.ok, false);
+  assert.match(blocked.res.error!, /repeat offender/);
+  assert.match(blocked.res.error!, /Nothing was recorded/);
+
+  const dup = await run({ kind: "duplicate", state: "VETOED" });
+  assert.match(dup.res.error!, /already has an auto-resolve row \(vetoed\)/);
+
+  const scope = await run({ kind: "out_of_scope", status: "needs_response" });
+  assert.match(scope.res.error!, /only an inquiry can be prevented/);
+
+  const off = await run({ kind: "off" });
+  assert.match(off.res.error!, /Raise it in \/config/);
+});
+
+test("backfill: the button sits on the Auto-resolve tab only, and reports what it found", async () => {
+  const hand = handFakes();
+  const section = makeDisputesSection({ ...disputesDeps(), autoResolve: hand.dep });
+  const onTab = (await section.buildPage(disputesCtx(), { page: "disputes", filters: { view: "autoresolve" } }))!
+    .blocks[0] as HeaderBlock;
+  assert.ok(onTab.actions!.some((a) => a.key === "section:disputes.autoresolve_backfill"));
+  const elsewhere = (await section.buildPage(disputesCtx(), { page: "disputes", filters: {} }))!.blocks[0] as HeaderBlock;
+  assert.ok(!elsewhere.actions!.some((a) => a.key === "section:disputes.autoresolve_backfill"));
+
+  const res = await section.action!(disputesCtx(), { key: "section:disputes.autoresolve_backfill", params: {} });
+  assert.equal(res.ok, true);
+  assert.match(res.text!, /Evaluated 3: proposed 1, declined 1, already decided 1/);
+  // Why it refused, so a cutover can be calibrated from one press.
+  assert.match(res.text!, /Declined for: repeat offender 1/);
+  assert.match(res.text!, /4 more are waiting/);
+
+  const none = makeDisputesSection({
+    ...disputesDeps(),
+    autoResolve: handFakes({ backfill: { scanned: 0, remaining: 0 } }).dep,
+  });
+  const empty = await none.action!(disputesCtx(), { key: "section:disputes.autoresolve_backfill", params: {} });
+  assert.match(empty.text!, /No open inquiries to evaluate/);
 });
 
 // ---- accepting a proposal by hand (the manualplus path) ----

@@ -474,3 +474,173 @@ test("drain: the none and manual phases make the drain a no-op", async () => {
   assert.deepEqual(await manual.svc.drain(), { executed: 0, blocked: 0, failed: 0, superseded: 0, alerted: 0 });
   assert.equal(manual.calls.length, 0);
 });
+
+// ---- proposing by hand: the cutover tool ----
+//
+// Proposals are made from webhooks, so switching the engine on does nothing for
+// the disputes already on the books. These cover the button that closes that
+// gap, and the one way it deliberately differs from the engine: a refusal is
+// reported and never written.
+
+function handHarness(opts: {
+  mode?: "none" | "manual" | "manualplus" | "auto";
+  dispute?: Stripe.Dispute;
+  charge?: Stripe.Charge;
+  existing?: { state: string } | null;
+  open?: Array<{ id: string }>;
+  openTotal?: number;
+  priorDisputes?: number;
+  alertFails?: boolean;
+}) {
+  const writes: string[] = [];
+  const store = {
+    bySourceId: async (id: string) => (opts.existing ? { id: "row_1", state: opts.existing.state, sourceId: id } : null),
+    propose: async (input: { sourceId: string; amountMinor: number }) => {
+      writes.push(`propose:${input.sourceId}:${input.amountMinor}`);
+      return { created: true, row: { id: "row_new" } };
+    },
+    recordBlocked: async (input: { guardrail: string }) => {
+      writes.push(`recordBlocked:${input.guardrail}`);
+      return { created: true, row: { id: "row_blocked" } };
+    },
+    recentExecutedForCustomer: async () => 0,
+    byId: async (id: string) => ({ id, chargeId: "ch_test", amountMinor: 2000, currency: "usd" }),
+    recordAlert: async () => {
+      writes.push("recordAlert");
+    },
+  };
+  const disputeStore = {
+    countForCustomerSince: async () => opts.priorDisputes ?? 0,
+    listOpen: async () => ({ rows: opts.open ?? [], total: opts.openTotal ?? (opts.open ?? []).length }),
+  };
+  const alerts = {
+    postProposal: async () => {
+      if (opts.alertFails) return null;
+      writes.push("alert");
+      return { channelId: "c", messageId: "m" };
+    },
+    postBlocked: async () => {},
+    postExecuted: async () => {},
+    postFailed: async () => {},
+  };
+  const stripe = {
+    getDispute: async (id: string) => ({ ...(opts.dispute ?? dispute({})), id }) as Stripe.Dispute,
+    getCharge: async () => opts.charge ?? charge({}),
+  };
+  const svc = new AutoResolveService(
+    {
+      disputeResolveMode: () => opts.mode ?? "manual",
+      disputeAutoResolveEfw: () => true,
+      disputeAutoResolveMaxUsdMinor: () => 6000,
+      disputeAutoResolveVetoMinutes: () => 120,
+      disputeAutoResolveRepeatDays: () => 90,
+      disputeAutoResolveReasons: () => new Set(["subscription_canceled", "duplicate"]),
+    } as never,
+    stripe as never,
+    store as never,
+    disputeStore as never,
+    undefined,
+    alerts as never
+  );
+  return { svc, writes };
+}
+
+test("by hand: works at phase manual, which the engine itself never proposes at", async () => {
+  // The phase says what may happen WITHOUT a human. A human pressing a button
+  // is not the engine acting on its own, so "manual" allows it.
+  const h = handHarness({ mode: "manual" });
+  const r = await h.svc.proposeByHand("dp_9", NOW);
+  assert.equal(r.kind, "proposed");
+  // The alert goes out NOW, not on the next drain: at manual the drain never
+  // runs at all, so a deferred alert would never be posted and the row could
+  // never fire or be vetoed.
+  assert.deepEqual(h.writes, ["propose:dp_9:2000", "alert", "recordAlert"]);
+  assert.equal(r.kind === "proposed" ? r.alerted : false, true);
+
+  // And the engine at that same phase still proposes nothing on its own.
+  const engine = handHarness({ mode: "manual" });
+  const viaWebhook = await engine.svc.proposeFromDispute(dispute({}), "ch_test", "cus_1");
+  assert.equal(viaWebhook.kind, "inert");
+  assert.deepEqual(engine.writes, [], "the webhook path stays inert at manual");
+});
+
+test("by hand: a switched-off pipeline still refuses", async () => {
+  const h = handHarness({ mode: "none" });
+  assert.equal((await h.svc.proposeByHand("dp_9", NOW)).kind, "off");
+  assert.deepEqual(h.writes, []);
+});
+
+test("by hand: a guardrail is reported and NOTHING is written", async () => {
+  // The engine records its blocks because nobody is watching a webhook land.
+  // Here somebody is, and a Declined row could never be told apart from a
+  // verdict the engine reached by itself.
+  const h = handHarness({ mode: "manualplus", priorDisputes: 2 });
+  const r = await h.svc.proposeByHand("dp_9", NOW);
+  assert.equal(r.kind, "blocked");
+  assert.equal(r.kind === "blocked" ? r.guardrail : "", "repeat_offender");
+  assert.deepEqual(h.writes, [], "no row, and therefore no metric point either");
+});
+
+test("by hand: a chargeback is out of scope, because a refund cannot prevent it", async () => {
+  const h = handHarness({ mode: "manualplus", dispute: dispute({ status: "needs_response" }) });
+  const r = await h.svc.proposeByHand("dp_9", NOW);
+  assert.equal(r.kind, "out_of_scope");
+  assert.deepEqual(h.writes, []);
+});
+
+test("by hand: an existing row short-circuits before any Stripe read", async () => {
+  let reads = 0;
+  const h = handHarness({ mode: "manualplus", existing: { state: "VETOED" } });
+  const svc = h.svc as unknown as { stripe: { getDispute: (id: string) => Promise<unknown> } };
+  const real = svc.stripe.getDispute;
+  svc.stripe.getDispute = async (id: string) => {
+    reads++;
+    return real(id);
+  };
+  const r = await h.svc.proposeByHand("dp_9", NOW);
+  assert.equal(r.kind, "duplicate");
+  assert.equal(r.kind === "duplicate" ? r.state : "", "VETOED");
+  assert.equal(reads, 0, "re-pressing costs one query, not two Stripe calls");
+});
+
+test("backfill: sweeps the open inquiries, counts why the rest were refused, and reports the remainder", async () => {
+  const h = handHarness({
+    mode: "manualplus",
+    open: [{ id: "dp_1" }, { id: "dp_2" }],
+    openTotal: 7,
+  });
+  const r = await h.svc.backfillOpenInquiries(NOW);
+  assert.equal(r.scanned, 2);
+  assert.equal(r.proposed, 2);
+  assert.equal(r.remaining, 5, "the operator is told to press again");
+  assert.deepEqual(h.writes, ["propose:dp_1:2000", "alert", "recordAlert", "propose:dp_2:2000", "alert", "recordAlert"]);
+  assert.equal(r.unalerted, 0);
+
+  const refused = handHarness({ mode: "manualplus", open: [{ id: "dp_1" }], priorDisputes: 1 });
+  const rr = await refused.svc.backfillOpenInquiries(NOW);
+  assert.equal(rr.proposed, 0);
+  assert.equal(rr.blocked, 1);
+  assert.deepEqual(rr.guardrails, { repeat_offender: 1 });
+  assert.deepEqual(refused.writes, []);
+});
+
+test("backfill: off means off", async () => {
+  const h = handHarness({ mode: "none", open: [{ id: "dp_1" }] });
+  const r = await h.svc.backfillOpenInquiries(NOW);
+  assert.equal(r.scanned, 0);
+  assert.deepEqual(h.writes, []);
+});
+
+test("by hand: an unreachable billing channel leaves the proposal inert, and says so", async () => {
+  // Same fail-closed state the engine produces: the row stands but cannot fire,
+  // because nothing may execute a proposal nobody could have vetoed.
+  const h = handHarness({ mode: "manual", alertFails: true });
+  const r = await h.svc.proposeByHand("dp_9", NOW);
+  assert.equal(r.kind === "proposed" ? r.alerted : true, false);
+  assert.deepEqual(h.writes, ["propose:dp_9:2000"], "no alert stamp without an alert");
+
+  const swept = handHarness({ mode: "manual", alertFails: true, open: [{ id: "dp_1" }] });
+  const b = await swept.svc.backfillOpenInquiries(NOW);
+  assert.equal(b.proposed, 1);
+  assert.equal(b.unalerted, 1);
+});

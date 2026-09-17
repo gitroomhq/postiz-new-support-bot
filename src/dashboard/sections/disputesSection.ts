@@ -14,6 +14,7 @@ import {
 } from "../../bot/billing/DisputeEvidenceService";
 import type { EvidencePackBuilder } from "../../bot/billing/evidence/EvidencePackBuilder";
 import type { AutoResolveStore } from "../../bot/billing/AutoResolveStore";
+import type { BackfillResult, HandProposeResult } from "../../bot/billing/AutoResolveService";
 import type { TemplateStore } from "../../bot/billing/evidence/TemplateStore";
 import type { DisputeEventStore } from "../../bot/billing/DisputeEventStore";
 import { NO_INTERNAL_ARTIFACT, templateTokens, tokensIn } from "../../bot/billing/evidence/renderTemplate";
@@ -58,8 +59,13 @@ interface DisputesDeps {
   evidencePack?: EvidencePackBuilder | null;
   // Auto-resolve queue, so the money-moving automation is visible and stoppable.
   autoResolveStore?: AutoResolveStore | null;
-  // The engine itself, for accepting a proposal before its window expires.
-  autoResolve?: { executeNow(rowId: string): Promise<{ executed: number; blocked: number; failed: number; superseded: number }> } | null;
+  // The engine itself: accepting a proposal before its window expires, and
+  // making one by hand (single dispute, or a sweep of the open inquiries).
+  autoResolve?: {
+    executeNow(rowId: string): Promise<{ executed: number; blocked: number; failed: number; superseded: number }>;
+    proposeByHand(disputeId: string): Promise<HandProposeResult>;
+    backfillOpenInquiries(): Promise<BackfillResult>;
+  } | null;
   // Operator overrides for the shipped evidence corpus.
   templateStore?: TemplateStore | null;
   // Per-dispute history, for the detail page's timeline.
@@ -197,6 +203,27 @@ async function disputeAction(
     if (result.superseded) return { ok: false, error: "Someone already refunded this charge." };
     if (result.failed) return { ok: false, error: "Stripe refused the refund; the alert carries the error." };
     return { ok: false, error: "Nothing to execute: it is no longer pending." };
+  }
+
+  // A sweep of every open inquiry that has no verdict yet. Lives here with the
+  // other row-keyed actions because it is keyed on nothing: it is the cutover
+  // tool for the moment the engine is switched on and the backlog predates it.
+  if (key === "section:disputes.autoresolve_backfill") {
+    const service = deps.autoResolve;
+    if (!service) return { ok: false, error: "Auto-resolve is not configured." };
+    const r = await service.backfillOpenInquiries();
+    if (!r.scanned) return { ok: true, text: "No open inquiries to evaluate." };
+    await ctx.audit(`Auto-resolve backfill: ${r.scanned} inquiry(s) evaluated, ${r.proposed} proposed`);
+    const why = Object.entries(r.guardrails)
+      .sort((a, b) => b[1] - a[1])
+      .map(([g, n]) => `${g.replace(/_/g, " ")} ${n}`)
+      .join(", ");
+    const parts = [`Evaluated ${r.scanned}: proposed ${r.proposed}, declined ${r.blocked}, already decided ${r.duplicate}.`];
+    if (why) parts.push(`Declined for: ${why}.`);
+    if (r.unalerted) parts.push(`${r.unalerted} could not be alerted in Discord and cannot fire until they are.`);
+    if (r.unavailable) parts.push(`${r.unavailable} could not be read from Stripe.`);
+    if (r.remaining) parts.push(`${r.remaining} more are waiting; press again to continue.`);
+    return { ok: true, text: parts.join(" ") };
   }
 
   if (key === "section:disputes.autoresolve_veto") {
@@ -374,6 +401,44 @@ async function disputeAction(
       };
     }
 
+    // T0: ask the auto-resolve engine about THIS dispute, instead of waiting
+    // for a webhook that already came and went. A decision that refuses is
+    // reported and not recorded: the operator is standing right here being told
+    // why, so a Declined row would add nothing and could never be told apart
+    // from a verdict the engine reached on its own.
+    case "section:disputes.autoresolve_propose": {
+      const service = deps.autoResolve;
+      if (!service) return { ok: false, error: "Auto-resolve is not configured." };
+      const r = await service.proposeByHand(disputeId);
+      switch (r.kind) {
+        case "proposed": {
+          await ctx.audit(`Auto-resolve proposed by hand on ${disputeId}: ${r.rowId}`);
+          const money = ctx.stripe.formatAmount(r.amountMinor, r.currency);
+          // An unalerted proposal is inert by design, so say so plainly rather
+          // than reporting a success the operator cannot act on.
+          return r.alerted
+            ? {
+                ok: true,
+                text: `Proposed: refund ${money}. It is alerted in the billing channel, where it waits for Execute now unless the phase is set to auto.`,
+              }
+            : {
+                ok: true,
+                text: `Proposed: refund ${money}. The billing channel could not be reached, and a proposal with no alert never fires, so fix the channel in /config and it will be alerted on the next pass.`,
+              };
+        }
+        case "blocked":
+          return { ok: false, error: `A guardrail refuses this one: ${r.guardrail.replace(/_/g, " ")}. Nothing was recorded.` };
+        case "duplicate":
+          return { ok: false, error: `This dispute already has an auto-resolve row (${r.state.toLowerCase()}); see the Auto-resolve tab.` };
+        case "out_of_scope":
+          return { ok: false, error: `Refunding cannot prevent a dispute at status ${r.status}; only an inquiry can be prevented.` };
+        case "off":
+          return { ok: false, error: "The resolve phase is off. Raise it in /config to at least Manual." };
+        default:
+          return { ok: false, error: "Stripe could not be read just now; try again." };
+      }
+    }
+
     // T0 — DM-on-status-change subscription (actor ids ARE Discord ids).
     case "section:disputes.watch": {
       const watching = await ctx.stores.dispute.isWatching(disputeId, ctx.actor.id);
@@ -430,6 +495,17 @@ async function list(
     title: "Disputes",
     sub: "Evidence is written from templates and real account facts, with no model involved.",
     actions: [
+      // Only on the tab it acts on: elsewhere it would be an unexplained sweep
+      // button over a page that shows none of what it touches.
+      ...(view === "autoresolve" && deps.autoResolve && ctx.settings.disputeResolveMode() !== "none"
+        ? ([
+            {
+              key: "section:disputes.autoresolve_backfill",
+              label: "Evaluate open inquiries",
+              style: "primary",
+            },
+          ] as ActionButton[])
+        : []),
       { key: "nav.templates", label: "Evidence templates", style: "secondary", ref: { page: "disputes.templates" } },
     ],
   });
@@ -719,7 +795,8 @@ async function autoResolveBlocks(
       };
     }),
     nextCursor: offset + PAGE_SIZE < page.total ? String(offset + PAGE_SIZE) : null,
-    empty: "Nothing proposed yet. Auto-resolve is off by default.",
+    empty:
+      "Nothing proposed yet. Proposals are made when a dispute arrives, so a backlog from before the engine was switched on needs Evaluate open inquiries above.",
     notice:
       "Refunding an inquiry-stage dispute closes it as prevented, so it never counts toward the dispute ratio. Cancelling stops the refund; it does not close the dispute.",
   };
@@ -987,6 +1064,16 @@ async function detail(ctx: DashboardCtx, deps: DisputesDeps, id: string): Promis
       key: "section:disputes.rebuild_pack",
       label: pkg.textFields.length ? "Rebuild evidence" : "Build evidence",
       style: "secondary",
+      params: { disputeId: id },
+    });
+  }
+  // Only at the inquiry stage, and only while the pipeline is not switched off.
+  // On a formal chargeback the engine can only ever answer "out of scope", so
+  // offering the button there would be a button that exists to say no.
+  if (deps.autoResolve && dispute.status === "warning_needs_response" && ctx.settings.disputeResolveMode() !== "none") {
+    actions.push({
+      key: "section:disputes.autoresolve_propose",
+      label: "Propose auto-resolve",
       params: { disputeId: id },
     });
   }
