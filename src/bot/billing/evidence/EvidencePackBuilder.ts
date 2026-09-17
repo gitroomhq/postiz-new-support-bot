@@ -21,6 +21,7 @@ import {
   type PackReason,
 } from "./templates";
 import { TemplateStore } from "./TemplateStore";
+import { exportDisputeEvidenceSource, exportDisputePackBuild } from "../../../metrics/MetricsExporter";
 import { log } from "../../../util/logger";
 
 const packLog = log.child("dispute-evidence-pack");
@@ -228,6 +229,34 @@ export class EvidencePackBuilder {
           supportHistory: pack.facts.support != null,
         },
       },
+    });
+    // Per-source coverage, so a silent feed is visible in Grafana long before
+    // it shows up as a run of weak packages.
+    const sources: Array<[string, boolean]> = [
+      ["stripe_charge", pack.facts.charge != null],
+      ["subscription", pack.facts.sub != null],
+      ["payment_history", pack.facts.billing != null],
+      ["postiz_account", pack.facts.postiz != null],
+      ["product_usage", pack.facts.usage != null],
+      ["card_history", pack.facts.cards != null],
+      ["support_history", pack.facts.support != null],
+    ];
+    for (const [source, answered] of sources) {
+      exportDisputeEvidenceSource({ source, answered, reason: pack.reason });
+    }
+    exportDisputePackBuild({
+      reason: pack.reason,
+      score,
+      fieldsFilled: staged.length,
+      fieldsOmitted: omitted.length,
+      sourcesUsed: sources.filter(([, answered]) => answered).length,
+      sourcesPossible: sources.length,
+      postsAfterCharge: pack.facts.usage?.publishedSinceCharge,
+      postUrls: pack.facts.usage?.recentPostsSinceCharge.length,
+      channelsConnected: pack.facts.usage?.channelsLive,
+      threeDSecure: pack.facts.charge?.threeDSecure === "authenticated",
+      cvcMatched: pack.facts.charge?.cvcCheck === "pass",
+      sameCardPriorCharges: pack.facts.cards?.sameCardPriorCount,
     });
     packLog.info("evidence pack staged", {
       "stripe.dispute_id": dispute.id,

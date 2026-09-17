@@ -7,7 +7,7 @@
     "billing"
   ],
   "schemaVersion": 41,
-  "version": 1,
+  "version": 2,
   "editable": true,
   "graphTooltip": 1,
   "time": {
@@ -2548,6 +2548,345 @@
         "overrides": []
       },
       "description": "What the team did, from the staff-attribution measurement. These events describe ACTIONS, and several of them describe the same dispute, so never sum them as money or as dispute counts. For money use the tiles above."
+    },
+    {
+      "id": 599,
+      "type": "row",
+      "title": "Evidence quality and cutover",
+      "gridPos": {
+        "x": 0,
+        "y": 90,
+        "w": 24,
+        "h": 1
+      },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Cutover phase over time",
+      "description": "0 none, 1 manual, 2 manualplus, 3 auto. Every other panel on this dashboard is uninterpretable without it: a change in win rate or in the ratio means nothing unless you know which week each pipeline was switched up. Written on every disputes tick.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${datasource}"
+          },
+          "refId": "A",
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dispute_modes\")\n  |> filter(fn: (r) => r._field == \"evidence_phase\")\n  |> group()\n  |> aggregateWindow(every: 1h, fn: last, createEmpty: false)\n  |> yield(name: \"evidence\")"
+        },
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${datasource}"
+          },
+          "refId": "B",
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dispute_modes\")\n  |> filter(fn: (r) => r._field == \"resolve_phase\")\n  |> group()\n  |> aggregateWindow(every: 1h, fn: last, createEmpty: false)\n  |> yield(name: \"resolve\")"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "min": 0,
+          "max": 3,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "stepAfter",
+            "fillOpacity": 10
+          }
+        }
+      },
+      "id": 600,
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 91,
+        "w": 12,
+        "h": 8
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Package completeness (score) per build",
+      "description": "Mean and minimum completeness of the packages being produced. The auto-submit gate refuses anything under the configured minimum, so a falling minimum is the leading indicator of packages that will need a human at the deadline.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${datasource}"
+          },
+          "refId": "A",
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dispute_pack_build\")\n  |> filter(fn: (r) => r._field == \"score\")\n  |> group()\n  |> aggregateWindow(every: 1d, fn: mean, createEmpty: false)\n  |> yield(name: \"mean\")"
+        },
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${datasource}"
+          },
+          "refId": "B",
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dispute_pack_build\")\n  |> filter(fn: (r) => r._field == \"score\")\n  |> group()\n  |> aggregateWindow(every: 1d, fn: min, createEmpty: false)\n  |> yield(name: \"min\")"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "decimals": 0,
+          "min": 0,
+          "max": 100,
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          }
+        }
+      },
+      "id": 601,
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 91,
+        "w": 12,
+        "h": 8
+      }
+    },
+    {
+      "type": "barchart",
+      "title": "Fact sources answering, by source",
+      "description": "Share of built packages where each external feed actually returned data. This is the panel that explains a run of weak packages: a source falling to zero here (product usage, support history) is a broken feed, not a change in customer behaviour.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${datasource}"
+          },
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dispute_evidence_source\")\n  |> filter(fn: (r) => r._field == \"answered\")\n  |> group(columns: [\"source\"])\n  |> mean()\n  |> map(fn: (r) => ({ r with _value: r._value * 100.0 }))\n  |> group()",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "decimals": 0,
+          "min": 0,
+          "max": 100
+        }
+      },
+      "id": 602,
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 99,
+        "w": 12,
+        "h": 8
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Usage evidence carried per package",
+      "description": "Posts the customer published AFTER the disputed charge, and how many of those had a public URL a bank analyst can click. Clickable proof of use is the strongest evidence available for fraudulent, unrecognized and product_not_received.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${datasource}"
+          },
+          "refId": "A",
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dispute_pack_build\")\n  |> filter(fn: (r) => r._field == \"posts_after_charge\")\n  |> group()\n  |> aggregateWindow(every: 1d, fn: mean, createEmpty: false)\n  |> yield(name: \"posts after charge\")"
+        },
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${datasource}"
+          },
+          "refId": "B",
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dispute_pack_build\")\n  |> filter(fn: (r) => r._field == \"post_urls\")\n  |> group()\n  |> aggregateWindow(every: 1d, fn: mean, createEmpty: false)\n  |> yield(name: \"clickable post URLs\")"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 1,
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          }
+        }
+      },
+      "id": 603,
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 99,
+        "w": 12,
+        "h": 8
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Packages carrying 3-D Secure",
+      "description": "Share of packages where the disputed payment was authenticated by the cardholder's own bank. Liability has already shifted to the issuer on those, so they should essentially never be lost; a loss here is worth investigating individually.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${datasource}"
+          },
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dispute_pack_build\")\n  |> filter(fn: (r) => r._field == \"three_d_secure\")\n  |> group()\n  |> mean()\n  |> map(fn: (r) => ({ r with _value: r._value * 100.0 }))",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        }
+      },
+      "id": 604,
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 107,
+        "w": 6,
+        "h": 6
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Packages with a matching security code",
+      "description": "Share where the card security code matched at the time of payment. Textbook evidence against an unauthorised-use claim.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${datasource}"
+          },
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dispute_pack_build\")\n  |> filter(fn: (r) => r._field == \"cvc_matched\")\n  |> group()\n  |> mean()\n  |> map(fn: (r) => ({ r with _value: r._value * 100.0 }))",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        }
+      },
+      "id": 605,
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 6,
+        "y": 107,
+        "w": 6,
+        "h": 6
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Auto-resolves accepted by a human",
+      "description": "Refunds that fired because an admin pressed Execute rather than because the veto window expired. In manualplus this should be all of them; in auto a high number means people are not waiting for the window, which is worth asking about.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${datasource}"
+          },
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dispute_auto_resolve\")\n  |> filter(fn: (r) => r._field == \"human_triggered\")\n  |> filter(fn: (r) => r.outcome == \"executed\")\n  |> group()\n  |> sum()",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        }
+      },
+      "id": 606,
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 107,
+        "w": 6,
+        "h": 6
+      }
+    },
+    {
+      "type": "barchart",
+      "title": "Dispute history events by kind",
+      "description": "Everything recorded on the per-dispute timelines, aggregated. auto_submit_refused and escalated are the two to watch: both mean a package reached its deadline needing a person.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${datasource}"
+          },
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dispute_event\")\n  |> filter(fn: (r) => r._field == \"count\")\n  |> group(columns: [\"kind\"])\n  |> sum()\n  |> group()",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0
+        }
+      },
+      "id": 607,
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 18,
+        "y": 107,
+        "w": 6,
+        "h": 6
+      }
     }
   ]
 }

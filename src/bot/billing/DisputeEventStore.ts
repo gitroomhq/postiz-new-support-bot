@@ -1,4 +1,5 @@
 import type { PrismaClient, DisputeEvent, Prisma } from "../../generated/prisma/client";
+import { exportDisputeEvent } from "../../metrics/MetricsExporter";
 import { log } from "../../util/logger";
 
 const eventLog = log.child("dispute-events");
@@ -56,6 +57,7 @@ export class DisputeEventStore {
           detail: (event.detail ?? undefined) as Prisma.InputJsonValue | undefined,
         },
       });
+      exportDisputeEvent({ kind: event.kind, automated: !event.actorId });
     } catch (error) {
       eventLog.warn("dispute event not recorded", {
         "stripe.dispute_id": event.disputeId,

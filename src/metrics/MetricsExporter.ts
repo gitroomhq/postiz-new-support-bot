@@ -424,6 +424,9 @@ export function exportDisputeAutoResolve(p: {
   // guardrail would silently drop every executed point.
   guardrail?: string | null;
   amountMinor?: number | null;
+  // FIELD, not a tag: an admin pressing Execute rather than the veto window
+  // expiring. A tag here would split every existing series.
+  humanTriggered?: boolean;
 }): void {
   writePoint(
     "dispute_auto_resolve",
@@ -434,7 +437,11 @@ export function exportDisputeAutoResolve(p: {
       currency: p.currency.toLowerCase(),
       guardrail: p.guardrail || "none",
     },
-    { count: 1, amount_minor: p.amountMinor ?? undefined }
+    {
+      count: 1,
+      amount_minor: p.amountMinor ?? undefined,
+      human_triggered: p.humanTriggered == null ? undefined : p.humanTriggered ? 1 : 0,
+    }
   );
 }
 
@@ -448,6 +455,25 @@ export function exportDisputeEvidencePack(p: {
   fieldsRecommended: number;
   filesAttached: number;
   autoSubmitted: boolean;
+  // Everything below is OPTIONAL and describes the strength of the package
+  // rather than its size. All are FIELDS, never tags: adding a tag to this
+  // measurement would split every existing series and silently break the
+  // panels already querying it.
+  score?: number;
+  // How many of the external fact sources actually answered for this dispute.
+  sourcesUsed?: number;
+  sourcesPossible?: number;
+  // The usage evidence, which is the strongest thing a package can carry: real
+  // posts published after the disputed charge, with clickable public URLs.
+  postsAfterCharge?: number;
+  postUrls?: number;
+  channelsConnected?: number;
+  // Payment-identity evidence. A 3-D Secure authentication has already shifted
+  // liability to the issuer, so a won/lost split on this field is the clearest
+  // measure of whether the evidence work is what is winning cases.
+  threeDSecure?: boolean;
+  cvcMatched?: boolean;
+  sameCardPriorCharges?: number;
 }): void {
   writePoint(
     "dispute_evidence_pack",
@@ -458,8 +484,89 @@ export function exportDisputeEvidencePack(p: {
       fields_recommended: p.fieldsRecommended,
       files_attached: p.filesAttached,
       auto_submitted: p.autoSubmitted ? 1 : 0,
+      score: p.score ?? undefined,
+      sources_used: p.sourcesUsed ?? undefined,
+      sources_possible: p.sourcesPossible ?? undefined,
+      posts_after_charge: p.postsAfterCharge ?? undefined,
+      post_urls: p.postUrls ?? undefined,
+      channels_connected: p.channelsConnected ?? undefined,
+      three_d_secure: p.threeDSecure == null ? undefined : p.threeDSecure ? 1 : 0,
+      cvc_matched: p.cvcMatched == null ? undefined : p.cvcMatched ? 1 : 0,
+      same_card_prior_charges: p.sameCardPriorCharges ?? undefined,
     }
   );
+}
+
+// One point per BUILD of an evidence package. A dispute can be rebuilt many
+// times (the webhook, the looper's enrich pass, a human pressing Build), so
+// this is deliberately NOT dispute_evidence_pack, which stays exactly one
+// point per dispute because its consumers count it as a dispute count.
+//
+// This is the measurement for "how strong are the packages we are producing",
+// answered continuously rather than once at the end.
+export function exportDisputePackBuild(p: {
+  reason: string;
+  score: number;
+  fieldsFilled: number;
+  fieldsOmitted: number;
+  sourcesUsed: number;
+  sourcesPossible: number;
+  postsAfterCharge?: number;
+  postUrls?: number;
+  channelsConnected?: number;
+  threeDSecure?: boolean;
+  cvcMatched?: boolean;
+  sameCardPriorCharges?: number;
+}): void {
+  writePoint(
+    "dispute_pack_build",
+    { reason: p.reason || "unknown" },
+    {
+      count: 1,
+      score: p.score,
+      fields_filled: p.fieldsFilled,
+      fields_omitted: p.fieldsOmitted,
+      sources_used: p.sourcesUsed,
+      sources_possible: p.sourcesPossible,
+      posts_after_charge: p.postsAfterCharge ?? undefined,
+      post_urls: p.postUrls ?? undefined,
+      channels_connected: p.channelsConnected ?? undefined,
+      three_d_secure: p.threeDSecure == null ? undefined : p.threeDSecure ? 1 : 0,
+      cvc_matched: p.cvcMatched == null ? undefined : p.cvcMatched ? 1 : 0,
+      same_card_prior_charges: p.sameCardPriorCharges ?? undefined,
+    }
+  );
+}
+
+// One point per FACT SOURCE per assembled package. Separate from the pack
+// measurement because the question is different: not "how good was this
+// package" but "which of our feeds is silent", which is what actually explains
+// a run of weak packages. A source that stops answering shows up here as a
+// mean(answered) falling off a cliff, long before win rate moves.
+export function exportDisputeEvidenceSource(p: { source: string; answered: boolean; reason: string }): void {
+  writePoint(
+    "dispute_evidence_source",
+    { source: p.source, reason: p.reason || "unknown" },
+    { count: 1, answered: p.answered ? 1 : 0 }
+  );
+}
+
+// The two cutover phases, as a gauge, so every other dispute panel can be read
+// against what was actually switched on at the time. Without this, a change in
+// win rate or in the ratio is uninterpretable: nobody remembers which week
+// evidence went to auto.
+//
+// Encoded as the phase ORDER (none 0, manual 1, manualplus 2, auto 3) so it
+// charts as a step line rather than as unplottable strings.
+export function exportDisputeModes(p: { evidencePhase: number; resolvePhase: number }): void {
+  writePoint("dispute_modes", {}, { evidence_phase: p.evidencePhase, resolve_phase: p.resolvePhase });
+}
+
+// One point per recorded dispute-history entry. The events table is the
+// authoritative record; this is the aggregate view of it, so "how often does
+// auto-submit refuse at the deadline" is a Grafana query rather than a SQL one.
+export function exportDisputeEvent(p: { kind: string; automated: boolean }): void {
+  writePoint("dispute_event", { kind: p.kind }, { count: 1, automated: p.automated ? 1 : 0 });
 }
 
 // Response timing for the deadline-risk view: how long we took to submit, and

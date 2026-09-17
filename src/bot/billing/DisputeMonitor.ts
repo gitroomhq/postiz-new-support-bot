@@ -5,6 +5,8 @@ import { StripeClient } from "../StripeClient";
 import { DisputeStore, OPEN_DISPUTE_STATUSES, RESPONDABLE_DISPUTE_STATUSES, segmentsOfDispute } from "./DisputeStore";
 import type { EvidencePackBuilder } from "./evidence/EvidencePackBuilder";
 import type { DisputeEvidenceService } from "./DisputeEvidenceService";
+import { DISPUTE_PHASES } from "./disputePhase";
+import type { EvidenceFacts } from "./evidence/tokens";
 import type { StripeSegmentResolver } from "./StripeSegmentResolver";
 import { BlockStore } from "./BlockStore";
 import { CachedRatioEngine, describeRatioWindow, ratioLevel, type RatioLevel } from "./disputeRatio";
@@ -13,6 +15,7 @@ import { log } from "../../util/logger";
 import {
   exportBillingEvent,
   exportDisputeEvidencePack,
+  exportDisputeModes,
   exportDisputeOutcome,
   exportDisputeResponse,
   exportDisputeSnapshot,
@@ -48,6 +51,21 @@ export interface ReconcileResult {
   lost: number;
   otherClosed: number;
   truncated: boolean;
+}
+
+
+// The strength facts that travel with the once-per-dispute pack point, so a
+// won/lost split can be read against what the package actually carried.
+function packStrength(pack: { score: number; facts: EvidenceFacts }) {
+  return {
+    score: pack.score,
+    postsAfterCharge: pack.facts.usage?.publishedSinceCharge,
+    postUrls: pack.facts.usage?.recentPostsSinceCharge.length,
+    channelsConnected: pack.facts.usage?.channelsLive,
+    threeDSecure: pack.facts.charge?.threeDSecure === "authenticated",
+    cvcMatched: pack.facts.charge?.cvcCheck === "pass",
+    sameCardPriorCharges: pack.facts.cards?.sameCardPriorCount,
+  };
 }
 
 const OPEN_SET = new Set<string>(OPEN_DISPUTE_STATUSES);
@@ -208,6 +226,14 @@ export class DisputeMonitor {
   // cheap and time-critical, and a slow reconcile must never push a due refund
   // past the window a human was promised.
   async tick(force: boolean): Promise<DisputesTickResult> {
+    // Written every tick so every other dispute panel can be read against what
+    // was actually switched on at the time. A change in win rate means nothing
+    // without knowing which week evidence went to auto.
+    exportDisputeModes({
+      evidencePhase: DISPUTE_PHASES.indexOf(this.settings.disputeEvidenceMode()),
+      resolvePhase: DISPUTE_PHASES.indexOf(this.settings.disputeResolveMode()),
+    });
+
     const autoResolve = await this.autoResolve?.drain().catch((error) => {
       monitorLog.error("auto-resolve drain failed", error);
       return null;
@@ -294,6 +320,7 @@ export class DisputeMonitor {
               fieldsRecommended: staged.staged.length + staged.omitted.length,
               filesAttached: 0,
               autoSubmitted: true,
+              ...packStrength(staged.pack),
             });
             exportDisputeResponse({
               reason: dispute.reason,
@@ -319,6 +346,7 @@ export class DisputeMonitor {
             fieldsRecommended: staged.staged.length + staged.omitted.length,
             filesAttached: 0,
             autoSubmitted: false,
+            ...packStrength(staged.pack),
           });
           out.escalated++;
         }

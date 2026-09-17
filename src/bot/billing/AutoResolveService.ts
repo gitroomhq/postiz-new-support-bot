@@ -423,6 +423,8 @@ export class AutoResolveService {
       currency: row.currency,
       // The charge's own currency, never the USD comparison value.
       amountMinor: refund.amount,
+      // An admin accepting the proposal, rather than the window expiring.
+      humanTriggered: this.forcedExecute.has(row.id),
     });
     result.executed++;
     if (row.disputeId) {
