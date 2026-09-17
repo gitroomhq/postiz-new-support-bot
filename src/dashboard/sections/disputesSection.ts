@@ -978,6 +978,18 @@ async function detail(ctx: DashboardCtx, deps: DisputesDeps, id: string): Promis
   // Header actions: submit + refund-to-prevent inline, the rest in "···".
   const actions: ActionButton[] = [];
   actions.push(submitButton(ctx, pkg, draftFields));
+  // The same Build Evidence the Discord hub offers, gated the same way (a
+  // configured builder + a status that can still be answered). It stages with
+  // submit:false, so it is not destructive in the sense the modal means and it
+  // fires directly, exactly as the Discord button does.
+  if (deps.evidencePack && pkg.respondable) {
+    actions.push({
+      key: "section:disputes.rebuild_pack",
+      label: pkg.textFields.length ? "Rebuild evidence" : "Build evidence",
+      style: "secondary",
+      params: { disputeId: id },
+    });
+  }
   if (dispute.is_charge_refundable && chargeId) {
     actions.push(
       registryButton(ctx, {

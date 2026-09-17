@@ -2115,7 +2115,13 @@ function disputesCtx(fakes?: ReturnType<typeof evidenceFakes>): DashboardCtx {
     actor: { id: "42", name: "Ada", role: "admin", isAdmin: true },
     stripe: {
       formatAmount: (a: number, c: string) => `${(a / 100).toFixed(2)} ${c.toUpperCase()}`,
-      ...(fakes ? { getDispute: fakes.stripe.getDispute, getChargeCustomerId: fakes.stripe.getChargeCustomerId } : {}),
+      ...(fakes
+        ? {
+            getDispute: fakes.stripe.getDispute,
+            getChargeCustomerId: fakes.stripe.getChargeCustomerId,
+            getCharge: fakes.stripe.getCharge,
+          }
+        : {}),
     } as unknown as DashboardCtx["stripe"],
     settings: {
       disputeRatioWarnPct: () => 0.75,
@@ -2233,12 +2239,33 @@ const fakeTemplateStore = {
   },
 };
 
-function disputesDeps(fakes?: ReturnType<typeof evidenceFakes>) {
+// The deterministic pack builder. Its absence is meaningful: the Build button
+// only renders when one is configured, which is also why the orphaned
+// rebuild_pack handler went unnoticed for so long, since no fixture had one.
+function fakeEvidencePack() {
+  const calls = { build: [] as string[], stage: [] as Array<{ id: string; submit: boolean }> };
+  return {
+    calls,
+    builder: {
+      build: async (dispute: { id: string }, _charge: unknown, opts: { enrich: boolean }) => {
+        calls.build.push(`${dispute.id}:enrich=${opts.enrich}`);
+        return { score: 82 };
+      },
+      stage: async (dispute: { id: string }, pack: { score: number }, submit: boolean) => {
+        calls.stage.push({ id: dispute.id, submit });
+        return { staged: ["product_description", "customer_name"], omitted: [{ field: "refund_policy", why: "no template" }], pack };
+      },
+    },
+  };
+}
+
+function disputesDeps(fakes?: ReturnType<typeof evidenceFakes>, pack?: ReturnType<typeof fakeEvidencePack>) {
   return {
     ratio: fakeRatio,
     evidence: (fakes ?? evidenceFakes()).svc,
     autoResolveStore: fakeAutoResolveStore as never,
     templateStore: fakeTemplateStore as never,
+    evidencePack: (pack ?? fakeEvidencePack()).builder as never,
   };
 }
 
@@ -2437,6 +2464,55 @@ test("dispute workbench: live detail (evidence widget states, submit ceremony, r
 
   // Unstaged-draft warning notice present (draft differs from staged).
   assert.ok(page!.blocks.some((b) => b.type === "notice" && /not staged at Stripe yet/.test((b as { text: string }).text)));
+});
+
+test("dispute workbench: Build evidence is offered on the page, not only in Discord", async () => {
+  // The handler for this key shipped with nothing rendering a button for it, so
+  // the panel half of "a Build button exists in Discord and in the panel" was
+  // simply missing and the pack could only be built from Discord.
+  const fakes = evidenceFakes();
+  const pack = fakeEvidencePack();
+  const section = makeDisputesSection(disputesDeps(fakes, pack));
+  const header = (await section.buildPage(disputesCtx(fakes), { page: "disputes.detail", params: { id: "dp_1" } }))!
+    .blocks[0] as HeaderBlock;
+  const button = header.actions!.find((a) => a.key === "section:disputes.rebuild_pack")!;
+  assert.ok(button, "the button exists");
+  assert.deepEqual(button.params, { disputeId: "dp_1" });
+  // Staging is submit:false, so this must NOT wear the ceremonies that guard
+  // the actions which actually reach the bank.
+  assert.ok(!button.dangerous && !button.reverseConfirm, "building evidence is not a bank-facing action");
+  // Something is already staged on this fixture, so the label says so.
+  assert.equal(button.label, "Rebuild evidence");
+
+  const result = await section.action!(disputesCtx(fakes), {
+    key: "section:disputes.rebuild_pack",
+    params: { disputeId: "dp_1" },
+  });
+  assert.equal(result.ok, true);
+  assert.deepEqual(pack.calls.build, ["dp_1:enrich=true"], "a human is waiting, so the panel always enriches");
+  assert.deepEqual(pack.calls.stage, [{ id: "dp_1", submit: false }], "nothing reaches the bank");
+  assert.match(result.text!, /Staged 2 field\(s\), completeness 82%/);
+  assert.match(result.text!, /Omitted 1: refund_policy \(no template\)/);
+});
+
+test("dispute workbench: Build evidence is withheld with no builder, and on a dispute past answering", async () => {
+  const fakes = evidenceFakes();
+  const noBuilder = makeDisputesSection({ ...disputesDeps(fakes), evidencePack: null });
+  const header = (await noBuilder.buildPage(disputesCtx(fakes), { page: "disputes.detail", params: { id: "dp_1" } }))!
+    .blocks[0] as HeaderBlock;
+  assert.ok(!header.actions!.some((a) => a.key === "section:disputes.rebuild_pack"));
+
+  // Closed: there is nothing left to answer, so offering to build is a lie the
+  // handler would only refuse a round trip later.
+  const closed = evidenceFakes({
+    dispute: { status: "lost", is_charge_refundable: false },
+    row: disputeRow({ status: "lost", closedAt: new Date() }),
+  });
+  const closedHeader = (await makeDisputesSection(disputesDeps(closed)).buildPage(disputesCtx(closed), {
+    page: "disputes.detail",
+    params: { id: "dp_1" },
+  }))!.blocks[0] as HeaderBlock;
+  assert.ok(!closedHeader.actions!.some((a) => a.key === "section:disputes.rebuild_pack"));
 });
 
 test("dispute workbench: closed dispute renders read-only (submit/accept disabled, widget not editable)", async () => {
