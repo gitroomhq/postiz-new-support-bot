@@ -395,6 +395,7 @@ async function main() {
     ratio: ratioEngine,
     evidencePack: evidencePackBuilder,
     autoResolveStore,
+    autoResolve: autoResolveService,
     approvalStore,
     billingActions: billingActionService,
   });
@@ -722,6 +723,7 @@ async function main() {
       evidence: disputeEvidenceService,
       evidencePack: evidencePackBuilder,
       autoResolveStore,
+      autoResolve: autoResolveService,
       templateStore: evidenceTemplateStore,
       events: disputeEvents,
     }),

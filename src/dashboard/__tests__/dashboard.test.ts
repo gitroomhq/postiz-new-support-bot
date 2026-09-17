@@ -6884,3 +6884,49 @@ test("dispute detail: no history means no timeline block rather than an empty on
   const page = await section.buildPage(disputesCtx(fakes), { page: "disputes.detail", params: { id: "dp_1" } });
   assert.ok(!page!.blocks.some((b) => b.type === "timeline" && /History/.test((b as { title: string }).title)));
 });
+
+// ---- accepting a proposal by hand (the manualplus path) ----
+
+test("auto-resolve execute: a pending row offers it, a settled one does not", async () => {
+  autoResolveState.rows = [autoResolveRow(), autoResolveRow({ id: "cjld2cjxh0001qzrmn831i7rn", state: "EXECUTED" })];
+  const section = makeDisputesSection(disputesDeps());
+  const page = await section.buildPage(disputesCtx(), { page: "disputes", filters: { view: "autoresolve" } });
+  const table = page!.blocks.find((b) => b.type === "table" && b.key === "autoresolve") as TableBlock;
+  const exec = table.rows[0].actions!.find((a) => a.key === "section:disputes.autoresolve_execute")!;
+  assert.ok(exec, "a pending proposal can be accepted");
+  // Moving money carries the typed confirmation that cancelling deliberately does not.
+  assert.equal(exec.dangerous, true);
+  assert.match(exec.summary ?? "", /every guardrail is re-checked/i);
+  assert.ok(!table.rows[1].actions?.length, "an executed row offers neither button");
+});
+
+test("auto-resolve execute: needs CONFIRM, and reports a guardrail refusal honestly", async () => {
+  const outcomes = { executed: 0, blocked: 0, failed: 0, superseded: 0 };
+  const section = makeDisputesSection({
+    ...disputesDeps(),
+    autoResolve: { executeNow: async () => outcomes } as never,
+  });
+  const ctx = disputesCtx();
+  const params = { id: "cjld2cjxh0000qzrmn831i7rn" };
+
+  const noConfirm = await section.action!(ctx, { key: "section:disputes.autoresolve_execute", params });
+  assert.equal(noConfirm.ok, false);
+  assert.match(noConfirm.error ?? "", /CONFIRM/);
+
+  outcomes.executed = 1;
+  const done = await section.action!(ctx, { key: "section:disputes.autoresolve_execute", params, confirmWord: "CONFIRM" });
+  assert.equal(done.ok, true);
+  assert.match(done.text ?? "", /prevented/);
+
+  // Accepting is not overriding: a stale proposal still refuses.
+  outcomes.executed = 0;
+  outcomes.blocked = 1;
+  const blocked = await section.action!(ctx, { key: "section:disputes.autoresolve_execute", params, confirmWord: "CONFIRM" });
+  assert.equal(blocked.ok, false);
+  assert.match(blocked.error ?? "", /guardrail refused/i);
+
+  outcomes.blocked = 0;
+  outcomes.superseded = 1;
+  const superseded = await section.action!(ctx, { key: "section:disputes.autoresolve_execute", params, confirmWord: "CONFIRM" });
+  assert.match(superseded.error ?? "", /already refunded/i);
+});

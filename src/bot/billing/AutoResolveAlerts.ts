@@ -81,7 +81,10 @@ export class DiscordAutoResolveAlerts implements AutoResolveAlerts {
       .setTimestamp();
 
     const buttons = new ActionRowBuilder<ButtonBuilder>().addComponents(
-      new ButtonBuilder().setCustomId(`billadmin_dpa_veto:${row.id}`).setLabel("Cancel auto-resolve").setStyle(ButtonStyle.Danger)
+      new ButtonBuilder().setCustomId(`billadmin_dpa_veto:${row.id}`).setLabel("Cancel auto-resolve").setStyle(ButtonStyle.Danger),
+      // The manualplus path: in that phase nothing fires on its own, so this
+      // button IS the mechanism rather than an impatient shortcut.
+      new ButtonBuilder().setCustomId(`billadmin_dpa_exec:${row.id}`).setLabel("Execute now").setStyle(ButtonStyle.Primary)
     );
     if (row.disputeId) {
       buttons.addComponents(

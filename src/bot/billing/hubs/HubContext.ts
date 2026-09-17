@@ -40,6 +40,10 @@ export interface HubContext {
   evidencePack: EvidencePackBuilder;
   // Auto-resolve proposals, for the veto button on the alert message.
   autoResolveStore?: AutoResolveStore | null;
+  // The engine, for accepting a proposal from the alert.
+  autoResolve?: {
+    executeNow(rowId: string): Promise<{ executed: number; blocked: number; failed: number; superseded: number }>;
+  } | null;
   // Intercom canvas/panel billing-action approvals (ApprovalsHub).
   approvalStore: ApprovalStore;
   billingActions: BillingActionService;

@@ -58,6 +58,8 @@ interface DisputesDeps {
   evidencePack?: EvidencePackBuilder | null;
   // Auto-resolve queue, so the money-moving automation is visible and stoppable.
   autoResolveStore?: AutoResolveStore | null;
+  // The engine itself, for accepting a proposal before its window expires.
+  autoResolve?: { executeNow(rowId: string): Promise<{ executed: number; blocked: number; failed: number; superseded: number }> } | null;
   // Operator overrides for the shipped evidence corpus.
   templateStore?: TemplateStore | null;
   // Per-dispute history, for the detail page's timeline.
@@ -179,6 +181,24 @@ async function disputeAction(
   //
   // No typed confirmation on purpose: the ceremony exists to slow down actions
   // that spend money, and this one stops a spend.
+  if (key === "section:disputes.autoresolve_execute") {
+    const service = deps.autoResolve;
+    if (!service) return { ok: false, error: "Auto-resolve is not configured." };
+    if (!confirmed) return { ok: false, error: "Type CONFIRM to refund this charge now." };
+    const rowId = str(p.id, 40);
+    if (!/^c[a-z0-9]{20,32}$/.test(rowId)) return { ok: false, error: "That auto-resolve id is not valid." };
+    // executeNow re-runs every live guardrail before it moves anything, so a
+    // proposal that went stale during the window still blocks rather than
+    // firing because a human clicked.
+    const result = await service.executeNow(rowId);
+    await ctx.audit(`Auto-resolve executed by hand: ${rowId}`);
+    if (result.executed) return { ok: true, text: "Refunded. The dispute should close as prevented." };
+    if (result.blocked) return { ok: false, error: "A guardrail refused it on re-check; open the row to see which." };
+    if (result.superseded) return { ok: false, error: "Someone already refunded this charge." };
+    if (result.failed) return { ok: false, error: "Stripe refused the refund; the alert carries the error." };
+    return { ok: false, error: "Nothing to execute: it is no longer pending." };
+  }
+
   if (key === "section:disputes.autoresolve_veto") {
     const store = deps.autoResolveStore;
     if (!store) return { ok: false, error: "Auto-resolve is not configured." };
@@ -682,6 +702,16 @@ async function autoResolveBlocks(
         ...(pending
           ? {
               actions: [
+                // Accepting a proposal moves real money, so it carries the
+                // typed confirmation that cancelling deliberately does not.
+                {
+                  key: "section:disputes.autoresolve_execute",
+                  label: "Execute now",
+                  style: "primary",
+                  dangerous: true,
+                  params: { id: r.id },
+                  summary: `Refund ${ctx.stripe.formatAmount(r.amountMinor, r.currency)} on ${r.chargeId} now, without waiting for the veto window. Every guardrail is re-checked against live Stripe state first, so this accepts the proposal rather than overriding it.`,
+                },
                 { key: "section:disputes.autoresolve_veto", label: "Cancel", style: "danger", params: { id: r.id } },
               ] as ActionButton[],
             }

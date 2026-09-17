@@ -58,6 +58,9 @@ export interface BillingAdminExtras {
   ratio: CachedRatioEngine;
   evidencePack: EvidencePackBuilder;
   autoResolveStore?: AutoResolveStore | null;
+  autoResolve?: {
+    executeNow(rowId: string): Promise<{ executed: number; blocked: number; failed: number; superseded: number }>;
+  } | null;
   approvalStore: ApprovalStore;
   billingActions: BillingActionService;
 }
@@ -140,6 +143,7 @@ export class BillingAdmin {
       ratio: extras.ratio,
       evidencePack: extras.evidencePack,
       autoResolveStore: extras.autoResolveStore ?? null,
+      autoResolve: extras.autoResolve ?? null,
       approvalStore: extras.approvalStore,
       billingActions: extras.billingActions,
     };

@@ -1181,6 +1181,43 @@ export class DisputesHub {
     },
     {
       kind: "button",
+      id: "billadmin_dpa_exec:",
+      match: "prefix",
+      handler: async (interaction) => {
+        const rowId = interaction.customId.split(":")[1];
+        if (!CUID_RE.test(rowId)) return;
+        // Shared channel message: always ephemeral, never edit the alert.
+        await interaction.deferReply({ flags: 64 });
+        const service = this.ctx.autoResolve;
+        if (!service) {
+          await interaction.editReply({ embeds: [makeEmbed("Auto-resolve is not configured on this instance.", COLORS.warn)] });
+          return;
+        }
+        // Accepting, not overriding: executeNow re-checks every guardrail
+        // against live Stripe state before it moves anything.
+        const result = await service.executeNow(rowId);
+        const text = result.executed
+          ? "✅ Refunded. The dispute should close as prevented, keeping it off the ratio."
+          : result.blocked
+            ? "⚠️ A guardrail refused it on re-check. Open the dispute to see which."
+            : result.superseded
+              ? "⚠️ Someone already refunded this charge."
+              : result.failed
+                ? "⚠️ Stripe refused the refund. The failure alert carries the error."
+                : "⚠️ Nothing to execute: this proposal is no longer pending.";
+        if (result.executed) {
+          this.ctx.audit.log(interaction, {
+            action: "Auto-resolve executed by hand",
+            objectId: rowId,
+            outcome: "Refund-to-prevent accepted before its veto window expired",
+            severity: "danger",
+          });
+        }
+        await interaction.editReply({ embeds: [makeEmbed(text, result.executed ? COLORS.success : COLORS.warn)] });
+      },
+    },
+    {
+      kind: "button",
       id: "billadmin_dpa_veto:",
       match: "prefix",
       handler: async (interaction) => {
