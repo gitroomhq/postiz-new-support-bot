@@ -12,7 +12,7 @@ import {
 // Stamped onto every dispute the pack builder touches, so a package submitted
 // months ago can be traced to the wording that produced it. Bump it whenever
 // the corpus changes in a way that would alter a rendered field.
-export const TEMPLATE_VERSION = "2026-09-16.1";
+export const TEMPLATE_VERSION = "2026-09-17.1";
 
 export type PackReason =
   | "general"

@@ -9,7 +9,8 @@ import type { IntercomClient } from "../../../intercom/IntercomClient";
 import { FactCache, gatherFacts } from "./EvidenceFacts";
 import { collectSupportFacts } from "./intercomHistory";
 import { renderField, type RenderedField } from "./renderTemplate";
-import { resolveTokens, type EvidenceFacts } from "./tokens";
+import { resolveTokens, type EvidenceFacts, type UsageFacts } from "./tokens";
+import type { PostizActivitySource } from "../../../postiz/PostizActivitySource";
 import {
   FIELD_WEIGHTS,
   PACK_FIELDS_BY_REASON,
@@ -81,7 +82,9 @@ export class EvidencePackBuilder {
     private disputeStore: DisputeStore,
     private evidence: DisputeEvidenceService,
     private templates: TemplateStore,
-    private intercom?: IntercomClient | null
+    private intercom?: IntercomClient | null,
+    // Real product usage, read from the platform's Post and Integration tables.
+    private activity?: PostizActivitySource | null
   ) {}
 
   // Bound late: the identity service is built after the billing stack, and an
@@ -108,11 +111,20 @@ export class EvidencePackBuilder {
           ).catch(() => null)
         : null;
 
+    // The platform org id is what the usage tables are keyed on, so it has to
+    // be resolved before the posts can be counted.
+    const usage = await this.usageFor(customerId, dispute, charge).catch(() => null);
+
     const facts = await gatherFacts(
-      { stripe: this.stripe, postiz: this.postiz, support },
+      { stripe: this.stripe, postiz: this.postiz, support, usage },
       dispute,
       charge,
-      { needDuplicates: reason === "duplicate" }
+      {
+        needDuplicates: reason === "duplicate",
+        // The fraud-shaped reasons argue from card identity, so they need the
+        // charge history even though they are not duplicate claims.
+        needCardHistory: reason === "fraudulent" || reason === "unrecognized" || reason === "duplicate",
+      }
     );
     this.facts.set(dispute.id, facts);
     return this.render(reason, facts, await this.templates.overrides(), opts.enrich === true);
@@ -141,6 +153,29 @@ export class EvidencePackBuilder {
     }
 
     return { reason, fields, rendered, score: scorePack(reason, fields, false), templateVersion: TEMPLATE_VERSION, facts };
+  }
+
+  // Resolves the Stripe customer to a platform organisation, then reads that
+  // organisation's real posting activity. Returns null at every step it cannot
+  // complete: a missing usage feed removes those paragraphs, it never weakens
+  // the ones that remain.
+  private async usageFor(
+    customerId: string | null,
+    dispute: Stripe.Dispute,
+    charge: Stripe.Charge
+  ): Promise<UsageFacts | null> {
+    if (!customerId || !this.activity?.configured() || !this.postiz) return null;
+    const lookup = await this.postiz.resolveOrgsForCustomer(customerId).catch(() => null);
+    if (!lookup || lookup.state !== "found") return null;
+    const orgId = lookup.orgs?.[0]?.orgId;
+    if (!orgId) return null;
+    const activity = await this.activity.forOrganization(
+      orgId,
+      new Date(charge.created * 1000),
+      new Date(dispute.created * 1000)
+    );
+    if (!activity) return null;
+    return { ...activity, lastSignInIso: null };
   }
 
   cachedFacts(disputeId: string): EvidenceFacts | null {

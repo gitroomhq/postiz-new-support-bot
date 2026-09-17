@@ -42,6 +42,16 @@ const fullFacts = (over: Partial<EvidenceFacts> = {}): EvidenceFacts => ({
     cardName: "Alex Baker",
     refundStatus: "No refund or credit has been issued on this charge.",
     invoiceNumber: "1A2B-0006",
+    paidPeriodStartIso: "2026-08-14T00:00:00.000Z",
+    paidPeriodEndIso: "2026-09-14T00:00:00.000Z",
+    cvcCheck: "pass",
+    postalCheck: "pass",
+    addressCheck: "pass",
+    threeDSecure: "authenticated",
+    riskLevel: "normal",
+    riskScore: 12,
+    networkStatus: "approved_by_network",
+    fingerprint: "fp_abc",
   },
   customer: {
     id: "cus_1",
@@ -74,6 +84,41 @@ const fullFacts = (over: Partial<EvidenceFacts> = {}): EvidenceFacts => ({
     activated: true,
     subPeriod: "MONTHLY",
   },
+  usage: {
+    published: 142,
+    publishedDeleted: 12,
+    publishedBeforeCharge: 119,
+    publishedSinceCharge: 23,
+    publishedDeletedSinceCharge: 2,
+    deletedAfterDispute: 0,
+    firstPublishedIso: "2026-02-03T00:00:00.000Z",
+    lastPublishedIso: "2026-09-09T00:00:00.000Z",
+    perPlatform: [
+      { platform: "linkedin", count: 61 },
+      { platform: "x", count: 48 },
+      { platform: "instagram", count: 33 },
+    ],
+    perPlatformSinceCharge: [
+      { platform: "linkedin", count: 14 },
+      { platform: "x", count: 9 },
+    ],
+    channelsLive: 3,
+    channelsDeleted: 1,
+    channelsDuringPeriod: 3,
+    channels: [
+      { name: "Example Media", platform: "linkedin", connectedIso: "2026-02-03T00:00:00.000Z", deletedIso: null, disabled: false },
+      { name: "@examplemedia", platform: "x", connectedIso: "2026-02-03T00:00:00.000Z", deletedIso: null, disabled: false },
+    ],
+    recentPosts: [
+      { publishedIso: "2026-09-09T00:00:00.000Z", platform: "linkedin", url: "https://www.linkedin.com/posts/example_abc" },
+    ],
+    recentPostsSinceCharge: [
+      { publishedIso: "2026-09-09T00:00:00.000Z", platform: "linkedin", url: "https://www.linkedin.com/posts/example_abc" },
+    ],
+    queued: 6,
+    lastSignInIso: "2026-09-09T00:00:00.000Z",
+  },
+  cards: { sameCardPriorCount: 6, sameCardFirstIso: "2026-02-14T00:00:00.000Z", sameCard3dsIso: "2026-02-14T00:00:00.000Z" },
   support: {
     historyLines: "2026-08-20 customer asked about scheduling a thread",
     conversationCount: 2,
@@ -94,6 +139,8 @@ const emptyFacts = (): EvidenceFacts => ({
   dup: null,
   postiz: null,
   support: null,
+  usage: null,
+  cards: null,
 });
 
 const allTemplates = (): EvidenceTemplate[] => {
@@ -253,6 +300,7 @@ test("render: the duplicate branches are mutually exclusive and never invent a c
     dispute: { ...fullFacts().dispute, reason: "duplicate" },
     dup: {
       originalChargeId: "ch_original",
+      originalInvoiceNumber: "1A2B-0005",
       originalDateIso: "2026-07-14T00:00:00.000Z",
       originalAmountText: "$29.00",
       daysApart: 31,

@@ -33,6 +33,27 @@ export interface ChargeFacts {
   // itself, so it is one of the few tokens that never resolves to null.
   refundStatus: string;
   invoiceNumber: string | null;
+  // The period the DISPUTED charge paid for, taken from its own invoice line.
+  // NOT the subscription's current period: a dispute raised after a further
+  // renewal would otherwise describe the wrong month entirely.
+  paidPeriodStartIso: string | null;
+  paidPeriodEndIso: string | null;
+  // Verification results at the time of payment. "The cardholder entered the
+  // correct security code and billing postcode" is textbook evidence against
+  // an unauthorised-use claim.
+  cvcCheck: string | null;
+  postalCheck: string | null;
+  addressCheck: string | null;
+  // Whether the bank authenticated the cardholder (3-D Secure). Postiz does not
+  // request it explicitly, but Stripe Checkout applies it automatically under
+  // SCA, so a subset of charges carry a real authenticated result. Where they
+  // do, liability has shifted to the issuer and the dispute should not exist.
+  threeDSecure: string | null;
+  // Stripe's own fraud assessment at authorisation time.
+  riskLevel: string | null;
+  riskScore: number | null;
+  networkStatus: string | null;
+  fingerprint: string | null;
 }
 
 export interface CustomerFacts {
@@ -67,6 +88,7 @@ export interface BillingHistoryFacts {
 
 export interface DuplicateFacts {
   originalChargeId: string;
+  originalInvoiceNumber: string | null;
   originalDateIso: string;
   originalAmountText: string;
   daysApart: number;
@@ -92,6 +114,40 @@ export interface SupportFacts {
   noRefundRequest: boolean | null;
 }
 
+// Real product usage, read from the Postiz Post and Integration tables.
+export interface UsageFacts {
+  published: number;
+  publishedDeleted: number;
+  publishedBeforeCharge: number;
+  publishedSinceCharge: number;
+  publishedDeletedSinceCharge: number;
+  deletedAfterDispute: number;
+  firstPublishedIso: string | null;
+  lastPublishedIso: string | null;
+  perPlatform: Array<{ platform: string; count: number }>;
+  perPlatformSinceCharge: Array<{ platform: string; count: number }>;
+  channelsLive: number;
+  channelsDeleted: number;
+  channelsDuringPeriod: number;
+  channels: Array<{ name: string; platform: string; connectedIso: string; deletedIso: string | null; disabled: boolean }>;
+  recentPosts: Array<{ publishedIso: string; platform: string; url: string }>;
+  recentPostsSinceCharge: Array<{ publishedIso: string; platform: string; url: string }>;
+  queued: number;
+  // Last sign-in. Not currently reachable: it lives on the platform's User
+  // table, which this bot is not granted, and no public endpoint returns it.
+  // Left in the shape so the block that cites it switches on the day it is.
+  lastSignInIso: string | null;
+}
+
+// Card-history facts, which need the charge's card FINGERPRINT rather than its
+// last four digits: last4 collides constantly and an analyst will not accept it
+// as identity evidence.
+export interface CardHistoryFacts {
+  sameCardPriorCount: number;
+  sameCardFirstIso: string | null;
+  sameCard3dsIso: string | null;
+}
+
 export interface EvidenceFacts {
   dispute: DisputeFacts;
   charge: ChargeFacts | null;
@@ -101,6 +157,8 @@ export interface EvidenceFacts {
   dup: DuplicateFacts | null;
   postiz: PostizFacts | null;
   support: SupportFacts | null;
+  usage: UsageFacts | null;
+  cards: CardHistoryFacts | null;
 }
 
 // ---- static merchant facts ----
@@ -149,6 +207,60 @@ function humanTier(v: string | null | undefined): string | null {
   return t.charAt(0).toUpperCase() + t.slice(1).toLowerCase();
 }
 
+// Internal platform identifiers are not product names. An analyst reads
+// "LinkedIn", never "linkedin-page".
+const PLATFORM_NAMES: Record<string, string> = {
+  x: "X",
+  linkedin: "LinkedIn",
+  "linkedin-page": "LinkedIn",
+  instagram: "Instagram",
+  "instagram-standalone": "Instagram",
+  facebook: "Facebook",
+  threads: "Threads",
+  tiktok: "TikTok",
+  youtube: "YouTube",
+  pinterest: "Pinterest",
+  reddit: "Reddit",
+  mastodon: "Mastodon",
+  bluesky: "Bluesky",
+  discord: "Discord",
+  slack: "Slack",
+  telegram: "Telegram",
+  warpcast: "Farcaster",
+  lemmy: "Lemmy",
+  dribbble: "Dribbble",
+  nostr: "Nostr",
+  vk: "VK",
+};
+
+export function platformName(id: string): string {
+  const key = id.trim().toLowerCase();
+  return PLATFORM_NAMES[key] ?? key.split(/[-_]/).map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join(" ");
+}
+
+// "a, b and c". An analyst reads prose, not a comma-separated machine list.
+function joinHuman(parts: string[]): string | null {
+  if (!parts.length) return null;
+  if (parts.length === 1) return parts[0];
+  return `${parts.slice(0, -1).join(", ")} and ${parts[parts.length - 1]}`;
+}
+
+// Clickable proof, newest first. Only live posts reach here: a link that 404s
+// when the analyst tries it is worse than quoting no link at all.
+function postLines(posts: Array<{ publishedIso: string; platform: string; url: string }>): string | null {
+  const rows = posts.slice(0, 3);
+  if (!rows.length) return null;
+  return rows
+    .map((p) => `  ${longDate(p.publishedIso) ?? "date unknown"}   ${platformName(p.platform)}   ${p.url}`)
+    .join("\n");
+}
+
+// A count of zero is evidence FOR the cardholder. It must drop the block that
+// would have cited it, never render as "0".
+function positive(n: number | null | undefined): string | null {
+  return n && n > 0 ? String(n) : null;
+}
+
 // ---- the registry ----
 
 export type TokenResolver = (f: EvidenceFacts) => string | null;
@@ -182,7 +294,15 @@ export const TOKENS: Record<string, TokenResolver> = {
   "billing.address_block": (f) => nonEmpty(f.customer?.addressBlock),
 
   // subscription
-  "sub.plan": (f) => nonEmpty(f.sub?.plan),
+  // A bare plan name. subPlanLabel can render "Pro . $49.00/month" or, when the
+  // product is not expanded, a raw price id; neither belongs in evidence.
+  "sub.plan": (f) => {
+    const tier = humanTier(f.sub?.tier);
+    if (tier) return tier;
+    const label = nonEmpty(f.sub?.plan);
+    if (!label || /^price_/i.test(label)) return null;
+    return label.split("\u00b7")[0].trim() || null;
+  },
   "sub.status": (f) => nonEmpty(f.sub?.status),
   "sub.started": (f) => longDate(f.sub?.startedIso),
   "sub.period": (f) => nonEmpty(f.sub?.period),
@@ -198,6 +318,7 @@ export const TOKENS: Record<string, TokenResolver> = {
 
   // duplicate-reason grounding
   "dup.original_charge_id": (f) => f.dup?.originalChargeId ?? null,
+  "dup.original_invoice_number": (f) => nonEmpty(f.dup?.originalInvoiceNumber),
   "dup.original_date": (f) => longDate(f.dup?.originalDateIso),
   "dup.original_amount": (f) => f.dup?.originalAmountText ?? null,
   "dup.days_apart": (f) => (f.dup ? String(f.dup.daysApart) : null),
@@ -221,6 +342,58 @@ export const TOKENS: Record<string, TokenResolver> = {
     const p = planFacts(f);
     return p ? `$${p.yearlyUsd}` : null;
   },
+
+  // ---- real product usage (Postiz Post and Integration tables) ----
+  "usage.posts_published_total": (f) => positive(f.usage?.published),
+  "usage.posts_before_charge": (f) => positive(f.usage?.publishedBeforeCharge),
+  "usage.posts_after_charge": (f) => positive(f.usage?.publishedSinceCharge),
+  "usage.posts_deleted": (f) => positive(f.usage?.publishedDeleted),
+  "usage.posts_deleted_after_dispute": (f) => positive(f.usage?.deletedAfterDispute),
+  "usage.posts_queued": (f) => positive(f.usage?.queued),
+  "usage.first_post_date": (f) => longDate(f.usage?.firstPublishedIso),
+  "usage.last_post_date": (f) => longDate(f.usage?.lastPublishedIso),
+  "usage.platform_breakdown": (f) =>
+    joinHuman((f.usage?.perPlatform ?? []).slice(0, 4).map((p) => `${p.count} to ${platformName(p.platform)}`)),
+  "usage.platforms_after_charge": (f) =>
+    joinHuman((f.usage?.perPlatformSinceCharge ?? []).slice(0, 4).map((p) => platformName(p.platform))),
+  "usage.post_url_lines": (f) => postLines(f.usage?.recentPosts ?? []),
+  "usage.post_url_lines_after_charge": (f) => postLines(f.usage?.recentPostsSinceCharge ?? []),
+  "usage.channels_connected": (f) => positive(f.usage?.channelsLive),
+  "usage.channels_during_period": (f) => positive(f.usage?.channelsDuringPeriod),
+  "usage.channels_removed": (f) => positive(f.usage?.channelsDeleted),
+  "usage.channel_lines": (f) => {
+    const rows = (f.usage?.channels ?? []).filter((c) => !c.deletedIso && !c.disabled).slice(0, 8);
+    if (!rows.length) return null;
+    return rows
+      .map((c) => `  ${platformName(c.platform)}   ${c.name}   connected ${longDate(c.connectedIso) ?? "an unknown date"}`)
+      .join("\n");
+  },
+  // Not reachable yet: the last sign-in lives on a table this bot is not
+  // granted. Resolves null, so the blocks citing it simply do not render.
+  "usage.last_sign_in": (f) => longDate(f.usage?.lastSignInIso),
+  "usage.last_sign_in_after_charge": (f) => {
+    const seen = f.usage?.lastSignInIso;
+    const charged = f.charge?.dateIso;
+    if (!seen || !charged || new Date(seen) < new Date(charged)) return null;
+    return longDate(seen);
+  },
+
+  // ---- card history, keyed on FINGERPRINT (last4 collides) ----
+  "billing.same_card_prior_count": (f) => positive(f.cards?.sameCardPriorCount),
+  "billing.same_card_first_date": (f) =>
+    f.cards?.sameCardPriorCount ? longDate(f.cards.sameCardFirstIso) : null,
+  "billing.same_card_3ds_date": (f) => longDate(f.cards?.sameCard3dsIso),
+
+  // ---- payment verification and risk ----
+  "charge.cvc_check": (f) => (f.charge?.cvcCheck === "pass" ? "matched" : null),
+  "charge.postal_check": (f) => (f.charge?.postalCheck === "pass" ? "matched" : null),
+  "charge.address_check": (f) => (f.charge?.addressCheck === "pass" ? "matched" : null),
+  // Only an AUTHENTICATED result is worth stating; "attempted" or "failed"
+  // would argue against us, so they resolve null.
+  "charge.three_d_secure": (f) => (f.charge?.threeDSecure === "authenticated" ? "authenticated" : null),
+  "charge.risk_level": (f) => (f.charge?.riskLevel === "normal" ? "normal" : null),
+  "charge.paid_period_start": (f) => longDate(f.charge?.paidPeriodStartIso),
+  "charge.paid_period_end": (f) => longDate(f.charge?.paidPeriodEndIso),
 
   // support contact
   "support.history_lines": (f) => nonEmpty(f.support?.historyLines),
@@ -249,7 +422,9 @@ export const TOKENS: Record<string, TokenResolver> = {
     const paid = f.billing && f.billing.paidCount > 1 ? f.billing.paidCount : null;
     const first = longDate(f.billing?.firstPaidDateIso);
     if (paid && first) {
-      return `the account has paid ${paid} subscription charges since ${first} without previously disputing any of them, which is not consistent with a service that was never delivered.`;
+      // No prior-dispute lookup exists, so the old "without previously
+      // disputing any of them" clause was asserted unverified. Removed.
+      return `the account has paid ${paid} subscription charges since ${first}, which is not consistent with a service that was never delivered.`;
     }
     if (started) return `the subscription on this account has been active since ${started}.`;
     return null;
