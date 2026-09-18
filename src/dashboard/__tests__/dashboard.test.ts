@@ -36,7 +36,7 @@ import type { BlockStore } from "../../bot/billing/BlockStore";
 import type { CredentialStore } from "../auth/CredentialStore";
 import type { DashboardDbSessions } from "../auth/DashboardDbSessions";
 import type { DashboardAudit } from "../auth/DashboardAudit";
-import { Block, EvidenceBlock, HeaderBlock, KeyValueBlock, NoticeBlock, TableBlock, TabsBlock, TimelineBlock } from "../renderer/contract";
+import { Block, EvidenceBlock, HeaderBlock, KeyValueBlock, NoticeBlock, StatsBlock, TableBlock, TabsBlock, TimelineBlock } from "../renderer/contract";
 import { renderDashboardShell } from "../html/shellHtml";
 import { clientCore } from "../html/clientCore";
 import { clientBlocks } from "../html/clientBlocks";
@@ -2067,7 +2067,13 @@ function evidenceFakes(
     markSubmitted: async () => {
       calls.submittedMarks++;
     },
-    upsertFromStripe: async (d: { status: string }) => disputeRow({ status: d.status }),
+    // The real store persists the live dispute over the row it already holds
+    // and hands back the result, so a fixture that discarded its own row
+    // override here made the detail page untestable: it always saw defaults.
+    upsertFromStripe: async (d: { status: string }) => ({
+      ...(rowState.row ?? disputeRow({})),
+      status: d.status,
+    }),
     isWatching: async () => false,
     watch: async () => {},
     unwatch: async () => {},
@@ -2295,17 +2301,27 @@ const fakeRatio = {
 test("disputes overview: tabs + level-tinted ratio strip + due-date board (respondable only, urgency badges)", async () => {
   const section = makeDisputesSection(disputesDeps());
   const page = await section.buildPage(disputesCtx(), { page: "disputes", filters: {} });
-  // The header carries the only entry points to the two editors behind the
-  // pack: the words it writes, and the documents it attaches.
+  // The two editors behind the pack (the words it writes and the documents it
+  // attaches) are one destination now, so the header carries one button to it
+  // instead of asking which kind of thing you meant to change.
   const header = page!.blocks[0] as { type: string; actions?: Array<{ ref?: { page: string } }> };
   assert.equal(header.type, "header");
   const targets = (header.actions ?? []).map((a) => a.ref?.page);
-  assert.ok(targets.includes("disputes.templates"));
-  assert.ok(targets.includes("disputes.documents"));
-  const tabs = page!.blocks[1] as { type: string; items: Array<{ label: string; badge?: string }> };
+  assert.deepEqual(targets, ["disputes.library"]);
+  const tabs = page!.blocks[1] as { type: string; items: Array<{ value: string; label: string; badge?: string }> };
   assert.equal(tabs.type, "tabs");
+  // Renamed: that tab lists proposals the engine made, not disputes.
+  assert.deepEqual(
+    tabs.items.map((i) => i.label),
+    ["Needs response", "All", "Proposals", "History"]
+  );
   assert.equal(tabs.items[0].badge, "3"); // 2 needs_response + 1 warning_needs_response
-  const strip = page!.blocks[2] as { items: Array<{ label: string; value: string; badge?: { text: string } }> };
+  const strip = page!.blocks[2] as {
+    dense?: boolean;
+    items: Array<{ label: string; value: string; badge?: { text: string } }>;
+  };
+  // Context beside the work, not the headline of the page.
+  assert.equal(strip.dense, true);
   const byLabel = Object.fromEntries(strip.items.map((i) => [i.label, i]));
   assert.equal(byLabel["This month"].value, "0.89%");
   assert.equal(byLabel["This month"].badge?.text, "warn"); // ≥0.75 warn threshold
@@ -2662,22 +2678,124 @@ test("dispute actions: file_upload takes base64 JSON (validated), file_remove cl
   assert.deepEqual(fakes.calls.update.at(-1)!.evidence, { uncategorized_file: "" });
 });
 
-test("disputes review page: staged read-back tables, per-file remove actions, unstaged-draft warning", async () => {
+test("dispute detail: the pack IS the body: full text, files with provenance, and the old review URL lands on it", async () => {
+  // The staged read-back used to be a separate page reached from a stat tile,
+  // which put the thing being inspected one click away from the button that
+  // produces it. It is the body of the detail page now, and the old URL is the
+  // same destination rather than a 404.
   const fakes = evidenceFakes();
   fakes.rowState.row = disputeRow({ evidenceDraft: { customer_name: "Unstaged Ada" } });
   const section = makeDisputesSection(disputesDeps(fakes));
   const page = await section.buildPage(disputesCtx(fakes), { page: "disputes.review", params: { id: "dp_1" } });
+  const direct = await section.buildPage(disputesCtx(fakes), { page: "disputes.detail", params: { id: "dp_1" } });
+  assert.deepEqual(
+    page!.blocks.map((b) => b.type),
+    direct!.blocks.map((b) => b.type),
+    "the old review URL renders the detail page rather than 404ing"
+  );
 
-  const fields = page!.blocks.find((b) => b.type === "table" && b.key === "stagedfields") as TableBlock;
+  const fields = page!.blocks.find((b) => b.type === "kv" && /^Evidence text/.test((b as KeyValueBlock).title ?? "")) as KeyValueBlock;
+  assert.equal(fields.title, "Evidence text (1)");
   assert.equal(fields.rows.length, 1);
-  assert.equal((fields.rows[0].cells[0] as { v: string }).v, "product_description");
+  // Catalog label, not the raw Stripe key, and the full value with its own
+  // paragraphs kept: this is the text a bank analyst reads.
+  assert.equal(fields.rows[0].label, "Product / service description");
+  const cell = fields.rows[0].cell as { t: string; v: string; pre?: boolean; sub?: string };
+  assert.equal(cell.v, "Staged description");
+  assert.equal(cell.pre, true, "paragraphs survive");
+  assert.match(cell.sub!, /product_description · 18 characters/);
+
   const files = page!.blocks.find((b) => b.type === "table" && b.key === "stagedfiles") as TableBlock;
   assert.equal(files.rows.length, 1);
   assert.equal(files.rows[0].actions![0].key, "section:disputes.file_remove");
-  assert.ok(page!.blocks.some((b) => b.type === "notice" && /customer_name/.test((b as { text: string }).text)));
-  // Header carries the same submit ceremony as the workbench.
+  // No pack_staged event on this fixture, so nothing claims the file came from
+  // a standing policy document.
+  assert.equal((files.rows[0].cells[1] as { v: string }).v, "Uploaded or built for this dispute");
+
+  // The unstaged-draft warning is the lead state here, so it keeps its sentence.
+  assert.ok(page!.blocks.some((b) => b.type === "notice" && /customer_name/.test((b as NoticeBlock).text)));
+  // Editing is still on the page, just after the thing it edits.
+  const order = page!.blocks.map((b) => b.type);
+  assert.ok(order.indexOf("evidence") > order.indexOf("table"), "the editor sits below the pack");
+});
+
+test("dispute detail: an empty pack says what the Build button is for instead of showing nothing", async () => {
+  const fakes = evidenceFakes({
+    dispute: { evidence: {}, evidence_details: { due_by: null, has_evidence: false, past_due: false, submission_count: 0 } },
+    row: disputeRow({ evidenceDraft: {} }),
+  });
+  const section = makeDisputesSection(disputesDeps(fakes));
+  const page = await section.buildPage(disputesCtx(fakes), { page: "disputes.detail", params: { id: "dp_1" } });
+  const empty = page!.blocks.find((b) => b.type === "empty") as { title: string; hint: string };
+  assert.ok(empty, "an empty pack is stated, not left blank");
+  assert.match(empty.hint, /Nothing reaches the bank until you submit/);
+});
+
+test("dispute detail: the status bar carries the four old stat tiles and leads with ONE state", async () => {
+  // Four stacked notices used to push the workbench below the fold. Precedence
+  // is explicit now: terminal > past due > unstaged drafts > under review.
+  const pastDue = evidenceFakes({
+    dispute: { evidence_details: { due_by: Math.floor(Date.now() / 1000) - 3 * 86400, has_evidence: true, past_due: true, submission_count: 1 } },
+    row: disputeRow({ evidenceDueBy: new Date(Date.now() - 3 * 86400_000), evidenceDraft: { customer_name: "Ada" } }),
+  });
+  const section = makeDisputesSection(disputesDeps(pastDue));
+  const page = await section.buildPage(disputesCtx(pastDue), { page: "disputes.detail", params: { id: "dp_1" } });
   const header = page!.blocks[0] as HeaderBlock;
-  assert.equal(header.actions![0].key, "section:disputes.submit");
+  const meta = Object.fromEntries(header.meta!.map((m) => [m.label, m]));
+
+  // Past due outranks the unstaged drafts, which still appear as a fact.
+  assert.equal(header.meta![0].label, "Past due");
+  assert.match(header.meta![0].value, /Deadline passed 3d ago/);
+  assert.equal(meta["Evidence due"].badge?.text, "OVERDUE", "the deadline carries its own countdown");
+  assert.equal(meta["Staged"].value, "1 field, 1 file");
+  assert.equal(meta["Drafts"].value, "1 unstaged");
+  assert.equal(meta["Submitted"].value, "1×");
+  // Exactly one notice survives, and it is the one that outranked the others.
+  const notices = page!.blocks.filter((b) => b.type === "notice") as NoticeBlock[];
+  assert.equal(notices.length, 1);
+  assert.match(notices[0].text, /deadline has passed/);
+  // The stat-tile row is gone: those four facts are in the bar above.
+  assert.ok(!page!.blocks.some((b) => b.type === "stats"));
+
+  // Terminal outranks everything, including past due.
+  const closed = evidenceFakes({
+    dispute: { status: "lost", is_charge_refundable: false, evidence_details: { due_by: 1, has_evidence: true, past_due: true, submission_count: 0 } },
+    row: disputeRow({ status: "lost", closedAt: new Date() }),
+  });
+  const closedHead = (await makeDisputesSection(disputesDeps(closed)).buildPage(disputesCtx(closed), {
+    page: "disputes.detail",
+    params: { id: "dp_1" },
+  }))!.blocks[0] as HeaderBlock;
+  assert.equal(closedHead.meta![0].label, "Closed");
+  assert.equal(closedHead.meta![0].value, "Lost");
+});
+
+test("dispute detail: Build and Submit sit adjacent at the head of the actions, in loop order", async () => {
+  const fakes = evidenceFakes();
+  const section = makeDisputesSection(disputesDeps(fakes, fakeEvidencePack()));
+  const header = (await section.buildPage(disputesCtx(fakes), { page: "disputes.detail", params: { id: "dp_1" } }))!
+    .blocks[0] as HeaderBlock;
+  // The client renders the first two inline and the rest behind "···", so these
+  // two being first IS the guarantee that the loop is one screen.
+  assert.deepEqual(
+    header.actions!.slice(0, 2).map((a) => a.key),
+    ["section:disputes.rebuild_pack", "section:disputes.submit"]
+  );
+});
+
+test("dispute detail: the rail is two cards, and the customer link lives in the first", async () => {
+  const fakes = evidenceFakes();
+  const section = makeDisputesSection(disputesDeps(fakes));
+  const page = await section.buildPage(disputesCtx(fakes), { page: "disputes.detail", params: { id: "dp_1" } });
+  assert.deepEqual(
+    page!.rail!.map((b) => (b as { title?: string }).title),
+    ["About this dispute", "Team notes (1)"]
+  );
+  const about = page!.rail![0] as KeyValueBlock;
+  const byLabel = Object.fromEntries(about.rows.map((r) => [r.label, r.cell]));
+  assert.deepEqual((byLabel["Customer"] as { ref?: unknown }).ref, { page: "customers.detail", params: { id: "cus_a" } });
+  // Status is a header badge now; repeating it in the rail was filing, not info.
+  assert.ok(!byLabel["Status"]);
 });
 
 
@@ -6885,6 +7003,93 @@ test("template editor: paginates at 10 fields, badges the source, and prefills t
   const body = edit.inputs![0] as { multiline?: boolean; value?: string };
   assert.equal(body.multiline, true);
   assert.ok((body.value ?? "").length > 50, "the shipped text is prefilled");
+});
+
+test("evidence library: one page, two tabs, and both old URLs still open the tab they used to be", async () => {
+  const section = makeDisputesSection({
+    ...disputesDeps(),
+    evidenceDocuments: { bySlot: async () => new Map() } as never,
+  });
+  assert.equal(section.ownsPage("disputes.library"), true);
+
+  const lib = await section.buildPage(disputesCtx(), { page: "disputes.library", filters: {} });
+  assert.equal(lib!.title, "Evidence library");
+  const tabs = lib!.blocks.find((b) => b.type === "tabs") as TabsBlock;
+  assert.equal(tabs.key, "tab");
+  assert.deepEqual(
+    tabs.items.map((i) => i.label),
+    ["Templates", "Policy documents"]
+  );
+  // Templates is the default tab: it is what the pack is mostly made of.
+  assert.ok(lib!.blocks.some((b) => b.type === "table" && b.key === "templates"));
+
+  const docs = await section.buildPage(disputesCtx(), { page: "disputes.library", filters: { tab: "documents" } });
+  assert.ok(docs!.blocks.some((b) => b.type === "table" && b.key === "documents"));
+
+  // A bookmark made before the merge must not 404, and must not land on the
+  // wrong half of the page either.
+  const oldTemplates = await section.buildPage(disputesCtx(), { page: "disputes.templates", filters: {} });
+  assert.ok(oldTemplates!.blocks.some((b) => b.type === "table" && b.key === "templates"));
+  const oldDocuments = await section.buildPage(disputesCtx(), { page: "disputes.documents", filters: {} });
+  assert.ok(oldDocuments!.blocks.some((b) => b.type === "table" && b.key === "documents"));
+  // Even with a stale tab filter riding along, the old URL wins.
+  const pinned = await section.buildPage(disputesCtx(), { page: "disputes.documents", filters: { tab: "" } });
+  assert.ok(pinned!.blocks.some((b) => b.type === "table" && b.key === "documents"));
+});
+
+test("disputes list: the ratio strip is about disputes, so the Proposals tab does not carry it", async () => {
+  const section = makeDisputesSection(disputesDeps());
+  const hasStrip = async (view: string): Promise<boolean> => {
+    const page = await section.buildPage(disputesCtx(), { page: "disputes", filters: view ? { view } : {} });
+    return page!.blocks.some((b) => b.type === "stats" && (b as StatsBlock).dense === true);
+  };
+  assert.equal(await hasStrip(""), true);
+  assert.equal(await hasStrip("history"), true);
+  assert.equal(await hasStrip("all"), false);
+  // Proposals lists decisions the engine made, not disputes you hold.
+  assert.equal(await hasStrip("autoresolve"), false);
+});
+
+test("dispute detail: history and provenance are folded, so the pack stays the first thing read", async () => {
+  const events = [
+    { at: new Date("2026-09-10T08:00:00Z"), kind: "opened", actorId: null, actorName: null, summary: "Dispute opened", detail: null },
+    {
+      at: new Date("2026-09-10T08:01:00Z"),
+      kind: "pack_staged",
+      actorId: null,
+      actorName: null,
+      summary: "Evidence pack staged",
+      detail: {
+        templateVersion: "2026-09-17.1",
+        staged: ["product_description"],
+        omitted: [{ field: "refund_policy", why: "missing support.no_refund_request" }],
+        documents: ["uncategorized_file"],
+        sources: { productUsage: true },
+      },
+    },
+  ];
+  const fakes = evidenceFakes();
+  const section = makeDisputesSection({ ...disputesDeps(fakes), events: { list: async () => events } as never });
+  const page = await section.buildPage(disputesCtx(fakes), { page: "disputes.detail", params: { id: "dp_1" } });
+
+  const history = page!.blocks.find((b) => b.type === "timeline" && /History/.test((b as TimelineBlock).title ?? "")) as TimelineBlock;
+  assert.equal(history.collapsed, true);
+  const provenance = page!.blocks.find((b) => b.type === "kv" && /built from/.test((b as KeyValueBlock).title ?? "")) as KeyValueBlock;
+  assert.equal(provenance.collapsed, true);
+
+  // "What changed in this build" is NOT folded: it is the answer to the button
+  // the operator just pressed, so it sits with the pack.
+  const report = page!.blocks.find((b) => b.type === "kv" && (b as KeyValueBlock).title === "What the last build produced") as KeyValueBlock;
+  assert.ok(report && !report.collapsed);
+  const byLabel = Object.fromEntries(report.rows.map((r) => [r.label, r.cell as { v: string }]));
+  assert.equal(byLabel["Fields filled"].v, "Product / service description");
+  assert.match(byLabel["Fields omitted"].v, /missing support\.no_refund_request/);
+  assert.equal(byLabel["Documents attached"].v, "uncategorized file");
+
+  // A slot the build filled from the standing documents says so, so a file that
+  // is there because of a policy upload is not mistaken for a hand upload.
+  const files = page!.blocks.find((b) => b.type === "table" && b.key === "stagedfiles") as TableBlock;
+  assert.equal((files.rows[0].cells[1] as { b: { text: string } }).b.text, "Standing policy document");
 });
 
 test("template editor: an unknown token is refused, because it would render literally at the bank", async () => {

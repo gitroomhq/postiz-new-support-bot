@@ -119,6 +119,31 @@ export function dashboardCss(): string {
   .pagehead .objid { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12.5px; color:var(--muted);
     margin-top:4px; display:flex; align-items:center; gap:6px; }
   .pagehead .headactions { display:flex; gap:8px; flex-wrap:wrap; }
+  /* Status bar: the page's state on one line under the title, read against the
+     actions beside it rather than stacked above them as notices. */
+  .pagehead .metarow { display:flex; align-items:center; gap:22px; flex-wrap:wrap; margin-top:12px; }
+  .pagehead .metaitem { display:flex; align-items:baseline; gap:7px; font-size:13px; }
+  .pagehead .metaitem + .metaitem { border-left:1px solid var(--border); padding-left:22px; }
+  .pagehead .mlabel { color:var(--faint); font-weight:500; }
+  .pagehead .mvalue { color:var(--heading); font-weight:600; font-variant-numeric:tabular-nums; }
+  @media (max-width:760px) {
+    .pagehead .metarow { gap:6px 14px; }
+    .pagehead .metaitem + .metaitem { border-left:none; padding-left:0; }
+  }
+
+  /* Disclosure: a folded block says how much is behind it and costs no reload. */
+  .foldbtn { display:inline-flex; align-items:center; gap:6px; background:none; border:none; padding:2px 0;
+    margin:0; font:inherit; font-size:13px; font-weight:600; color:var(--muted); cursor:pointer; }
+  .foldbtn:hover { color:var(--accent); }
+  .foldbtn .foldcaret { display:inline-block; transition:transform .12s; font-size:15px; line-height:1; }
+  .foldbtn.open .foldcaret { transform:rotate(90deg); }
+  .foldbody { display:none; margin-top:12px; }
+  .foldbody.open { display:block; }
+  .timeline li.folded { display:none; }
+  .timeline.unfolded li.folded { display:block; }
+  /* The connector runs from each entry to the NEXT one, so the last entry still
+     standing after a fold must not trail a line into the expander. */
+  .timeline:not(.unfolded) li:not(.folded):not(:has(~ li:not(.folded))):before { display:none; }
   .morewrap { position:relative; display:inline-flex; }
   .morebtn { letter-spacing:.1em; padding:6px 10px; }
   .morepop { position:absolute; top:calc(100% + 6px); right:0; z-index:20; background:var(--surface);
@@ -158,6 +183,16 @@ export function dashboardCss(): string {
   .stat .ssub { color:var(--faint); font-size:12.5px; margin-top:2px; }
   .stat.link { cursor:pointer; transition:border-color .1s; }
   .stat.link:hover { border-color:var(--accent); }
+
+  /* Dense: context beside the content, not the headline of the page. One
+     hairline-bounded row of label/value pairs instead of a grid of cards. */
+  .statrow.dense { display:flex; flex-wrap:wrap; gap:0 26px; margin:0 0 18px; padding:9px 14px;
+    border:1px solid var(--border); border-radius:var(--radius); background:var(--surface); }
+  .statrow.dense .stat { background:none; border:none; box-shadow:none; padding:3px 0; display:flex;
+    align-items:baseline; gap:8px; flex-wrap:wrap; }
+  .statrow.dense .slabel { font-size:12.5px; }
+  .statrow.dense .svalue { font-size:14px; margin-top:0; }
+  .statrow.dense .ssub { margin-top:0; }
 
   .tablewrap { overflow-x:auto; margin:0 -20px; padding:0 20px; }
   /* Sticky table headers (desktop only): overflow-x:auto makes
@@ -300,6 +335,8 @@ export function dashboardCss(): string {
   .kv .kvlabel { color:var(--muted); font-weight:450; font-size:13.5px; }
   .kv .kvval { min-width:0; overflow-wrap:anywhere; display:flex; align-items:baseline; gap:6px; flex-wrap:wrap; }
   .kvval .sub { display:block; flex-basis:100%; color:var(--faint); font-size:12px; }
+  /* Evidence text as the bank will read it: the author's paragraphs survive. */
+  .pretext { white-space:pre-wrap; overflow-wrap:anywhere; display:block; flex-basis:100%; line-height:1.55; }
 
   /* Stripe "Payment breakdown": label left, amount flush right, bold Net row
      with a hairline above — hairlines between the other rows are dropped. */

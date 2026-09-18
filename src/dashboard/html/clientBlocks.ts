@@ -53,7 +53,10 @@ D.objIcon = function (kind) {
 D.renderCell = function (td, cell) {
   if (cell == null) { td.textContent = ""; return; }
   if (cell.t === "text") {
-    if (cell.strong) td.appendChild(D.el("span", "strongname", cell.v));
+    // pre keeps the author's line breaks (evidence paragraphs read to a bank).
+    // Still textContent; the span only changes white-space handling.
+    if (cell.pre) td.appendChild(D.el("span", "pretext", cell.v));
+    else if (cell.strong) td.appendChild(D.el("span", "strongname", cell.v));
     else td.appendChild(document.createTextNode(cell.v));
     if (cell.sub) td.appendChild(D.el("span", "sub", cell.sub));
   } else if (cell.t === "money") {
@@ -200,6 +203,20 @@ D.renderHeader = function (b) {
     idl.appendChild(D.copyBtn(b.id));
     titles.appendChild(idl);
   }
+  // The status bar: the facts the page is judged by, on one line under the
+  // title, so the actions above them are read against the state they act on.
+  if (b.meta && b.meta.length) {
+    var meta = D.el("div", "metarow");
+    b.meta.forEach(function (m) {
+      var item = D.el("div", "metaitem");
+      item.appendChild(D.el("span", "mlabel", m.label));
+      var mv = D.el("span", "mvalue", m.value);
+      item.appendChild(mv);
+      if (m.badge) item.appendChild(D.badge(m.badge));
+      meta.appendChild(item);
+    });
+    titles.appendChild(meta);
+  }
   head.appendChild(titles);
   if (b.actions && b.actions.length) {
     var acts = D.el("div", "headactions");
@@ -230,7 +247,7 @@ D.renderHeader = function (b) {
 };
 
 D.renderStats = function (b) {
-  var row = D.el("div", "statrow");
+  var row = D.el("div", "statrow" + (b.dense ? " dense" : ""));
   (b.items || []).forEach(function (it) {
     var card = D.el("div", "stat" + (it.ref ? " link" : ""));
     card.appendChild(D.el("div", "slabel", it.label));
@@ -704,8 +721,45 @@ D.renderPager = function (b) {
   return pager;
 };
 
+// A disclosure control shared by the two collapsible blocks. Starts folded,
+// says how much is behind it, and flips its own label, with no page reload, so the
+// fold is a reading aid and never a round trip.
+D.foldBtn = function (shutLabel, openLabel, onFlip) {
+  var btn = D.el("button", "foldbtn");
+  btn.type = "button";
+  var open = false;
+  var caret = D.el("span", "foldcaret", "\\u203a");
+  var text = D.el("span", null, shutLabel);
+  btn.appendChild(caret);
+  btn.appendChild(text);
+  btn.setAttribute("aria-expanded", "false");
+  btn.addEventListener("click", function () {
+    open = !open;
+    btn.classList.toggle("open", open);
+    btn.setAttribute("aria-expanded", open ? "true" : "false");
+    text.textContent = open ? openLabel : shutLabel;
+    onFlip(open);
+  });
+  return btn;
+};
+
 D.renderKv = function (b) {
   var box = D.el("div", "section kv" + (b.big ? " kvbig" : "") + (b.amounts ? " amounts" : ""));
+  if (b.title && b.collapsed) {
+    var body = D.el("div", "foldbody");
+    box.appendChild(D.foldBtn(b.title, b.title, function (open) { body.classList.toggle("open", open); }));
+    box.appendChild(body);
+    (b.rows || []).forEach(function (r) {
+      var frow = D.el("div", "kvrow");
+      frow.appendChild(D.el("div", "kvlabel", r.label));
+      var fval = D.el("div", "kvval");
+      D.renderCell(fval, r.cell);
+      frow.appendChild(fval);
+      body.appendChild(frow);
+    });
+    (b.actions || []).forEach(function (a) { var fb = D.actionBtn(a); fb.classList.add("secfoot"); body.appendChild(fb); });
+    return box;
+  }
   if (b.title) box.appendChild(D.el("h2", null, b.title));
   (b.rows || []).forEach(function (r) {
     var row = D.el("div", "kvrow");
@@ -722,9 +776,21 @@ D.renderKv = function (b) {
 D.renderTimeline = function (b) {
   var box = D.el("div", "section");
   if (b.title) box.appendChild(D.el("h2", null, b.title));
+  var items = b.items || [];
+  // Collapsed: only the three most recent entries stand. "Recent" is decided
+  // by iso, not by position, so a section that sorts oldest-first and one that
+  // sorts newest-first both show the same three.
+  var hidden = {};
+  if (b.collapsed && items.length > 3) {
+    var byTime = items
+      .map(function (it, i) { return { i: i, t: Date.parse(it.iso) || 0 }; })
+      .sort(function (x, y) { return y.t - x.t; })
+      .slice(3);
+    byTime.forEach(function (x) { hidden[x.i] = true; });
+  }
   var ul = D.el("ul", "timeline");
-  (b.items || []).forEach(function (it) {
-    var li = D.el("li", it.kind || null);
+  items.forEach(function (it, idx) {
+    var li = D.el("li", (it.kind || "") + (hidden[idx] ? " folded" : ""));
     li.appendChild(D.el("span", "tdot"));
     var title = D.el("div", "ttitle");
     if (it.ref) {
@@ -742,6 +808,14 @@ D.renderTimeline = function (b) {
     ul.appendChild(li);
   });
   box.appendChild(ul);
+  var foldedCount = Object.keys(hidden).length;
+  if (foldedCount) {
+    box.appendChild(
+      D.foldBtn("Show " + foldedCount + " earlier", "Show fewer", function (open) {
+        ul.classList.toggle("unfolded", open);
+      })
+    );
+  }
   return box;
 };
 

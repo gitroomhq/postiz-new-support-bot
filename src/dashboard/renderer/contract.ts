@@ -29,7 +29,11 @@ export interface ObjectRef {
 
 // One rendered table/kv cell.
 export type Cell =
-  | { t: "text"; v: string; sub?: string; strong?: boolean } // strong = Stripe's bold dark object name
+  // pre keeps the value's own line breaks (white-space: pre-wrap). Evidence
+  // text is written in paragraphs and read by a bank analyst, so the operator
+  // has to see the shape they will see; every other text cell is one line and
+  // collapses as before.
+  | { t: "text"; v: string; sub?: string; strong?: boolean; pre?: boolean } // strong = Stripe's bold dark object name
   | { t: "money"; v: string; tone?: "pos" | "neg" | "muted" }
   // Stripe amount atom: bold amount + faint ISO code, optionally the status
   // pill in the SAME cell ("€29.00 EUR  [Succeeded ✓]" — the Payments look).
@@ -100,11 +104,20 @@ export interface HeaderBlock {
   subCopy?: boolean; // copy affordance on the sub line
   id?: string; // mono object id with a copy button
   badges?: Badge[];
+  // The status-bar row under the title: the facts a page is judged by, on one
+  // line, beside the actions rather than stacked above them as notices. Each
+  // entry is a label, a short value and an optional pill; a sentence belongs in
+  // a NoticeBlock, not here.
+  meta?: Array<{ label: string; value: string; badge?: Badge }>;
   actions?: ActionButton[];
 }
 export interface StatsBlock {
   type: "stats";
   items: Array<{ label: string; value: string; sub?: string; badge?: Badge; ref?: ObjectRef }>;
+  // Compact inline variant: one hairline-separated row instead of a card grid.
+  // For a strip that is context beside the real content (the dispute ratio)
+  // rather than the headline figures of the page itself.
+  dense?: boolean;
 }
 export interface FilterDef {
   key: string;
@@ -150,12 +163,22 @@ export interface KeyValueBlock {
   // Stripe "Payment breakdown" variant: label left, amount flush right, the
   // LAST row emphasized as the Net/Total line with a hairline above.
   amounts?: boolean;
+  // Folded away behind its own title until the reader asks for it. For a block
+  // that answers a question nobody has yet (how a package came to be built the
+  // way it was) but must still be one click from the thing it explains.
+  // Requires a title: there would otherwise be nothing to click.
+  collapsed?: boolean;
   rows: Array<{ label: string; cell: Cell }>;
   actions?: ActionButton[];
 }
 export interface TimelineBlock {
   type: "timeline";
   title?: string;
+  // Show only the three most RECENT entries, the rest behind an expander. The
+  // client picks them by `iso` rather than by position and then draws them in
+  // the order given, so this means the same thing whichever way a section
+  // sorted its items.
+  collapsed?: boolean;
   items: Array<{ label: string; iso: string; text?: string; kind?: Badge["kind"]; ref?: ObjectRef }>;
 }
 export interface NoticeBlock {
