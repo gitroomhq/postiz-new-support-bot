@@ -140,7 +140,14 @@ async function disputeAction(
   key: string,
   p: Record<string, unknown>,
   confirmWord: string | undefined
-): Promise<{ ok: boolean; text?: string; error?: string; fieldErrors?: Record<string, string>; needsReverse?: boolean }> {
+): Promise<{
+  ok: boolean;
+  text?: string;
+  error?: string;
+  fieldErrors?: Record<string, string>;
+  needsReverse?: boolean;
+  needsStepUp?: boolean;
+}> {
   const confirmed = confirmWord === "CONFIRM";
 
   // Template edits are keyed on (reason, field), not on a dispute, so they also
@@ -386,11 +393,13 @@ async function disputeAction(
       return { ok: true, text: `File slot ${slot} cleared.` };
     }
 
-    // T1 + T3 — submit the staged evidence to the bank. Irreversible; the
+    // T2: submit the staged evidence to the bank. Irreversible, and the
     // cross-surface claim in the service keeps it single-shot.
     case "section:disputes.submit": {
-      if (!confirmed) return { ok: false, error: "Type CONFIRM to run this action." };
-      if (!ctx.reverse?.satisfied) return { ok: false, needsReverse: true };
+      // Enforced HERE as well as in the modal, because the client is hostile:
+      // a button that merely declares stepUp proves nothing about what the
+      // browser actually sent.
+      if (!ctx.security.stepUpFresh()) return { ok: false, needsStepUp: true };
       const outcome = await deps.evidence.submit(disputeId, ctx.actor.id, await customerHint(ctx, disputeId));
       if (outcome.kind === "not_respondable") {
         return { ok: false, error: `Status is ${outcome.status}; evidence can no longer be submitted.` };
@@ -1532,7 +1541,7 @@ function submitButton(ctx: DashboardCtx, pkg: StagedPackage, draftFields: number
     pkg.submissions > 0
       ? `⚠ Evidence was already submitted ${pkg.submissions}×: banks typically accept only ONE submission; resubmit only if Stripe support advised it.`
       : "Banks typically allow exactly one submission; make sure the staged evidence is complete.",
-    "This cannot be recalled. Needs the Discord reverse code (/billing → Show destructive-action code).",
+    "This cannot be recalled, so it asks you to re-assert your passkey first.",
   ]
     .filter(Boolean)
     .join(" ");
@@ -1545,8 +1554,20 @@ function submitButton(ctx: DashboardCtx, pkg: StagedPackage, draftFields: number
     key: "section:disputes.submit",
     label: "Submit evidence",
     style: "primary",
-    dangerous: true,
-    reverseConfirm: true,
+    // A fresh-factor re-assert rather than the Discord reverse code plus a
+    // typed CONFIRM.
+    //
+    // This is the one irreversible action on the dispute path that is also
+    // ROUTINE: it happens on every dispute we answer, and a ceremony that has
+    // to be performed constantly stops being read. The factor is not weaker
+    // for being quicker. A passkey is hardware-bound and phishing-resistant
+    // and proves someone is physically present at this browser, where the
+    // reverse code is a shared secret read off a Discord channel and typed in.
+    //
+    // The genuinely destructive neighbours, Accept as lost and the refund
+    // actions, keep the full ceremony: those are rare, and rarity is what
+    // makes a heavy ceremony something an operator still notices.
+    stepUp: true,
     params: { disputeId: d.id },
     summary,
     ...(disabled ? { disabledReason: disabled } : {}),

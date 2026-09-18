@@ -2455,13 +2455,20 @@ test("dispute workbench: live detail (evidence widget states, submit ceremony, r
   const header = page!.blocks[0] as HeaderBlock;
   const byKey = Object.fromEntries(header.actions!.map((a) => [a.key, a]));
   const submit = byKey["section:disputes.submit"];
-  assert.ok(submit.dangerous && submit.reverseConfirm);
+  // Submitting is irreversible but ROUTINE: it happens on every dispute we
+  // answer, so it asks for a fresh factor instead of a Discord code plus a
+  // typed word. A ceremony performed constantly stops being read.
+  assert.equal(submit.stepUp, true);
+  assert.ok(!submit.dangerous && !submit.reverseConfirm, "no typed CONFIRM, no reverse code");
   assert.deepEqual(submit.params, { disputeId: "dp_1" });
   assert.match(submit.summary!, /1 text field/);
   assert.match(submit.summary!, /exactly one submission/);
   const refund = byKey["charge.refund_full"];
   assert.deepEqual(refund.params, { chargeId: "ch_1" });
+  // Accept as lost did NOT change: it is rare and genuinely destructive, and
+  // rarity is what keeps a heavy ceremony meaningful.
   assert.ok(byKey["section:disputes.accept"].reverseConfirm);
+  assert.ok(byKey["section:disputes.accept"].dangerous);
 
   const widget = page!.blocks.find((b) => b.type === "evidence") as EvidenceBlock;
   assert.equal(widget.editable, true);
@@ -2544,31 +2551,37 @@ test("dispute workbench: closed dispute renders read-only (submit/accept disable
   assert.equal(widget.editable, false);
 });
 
-test("dispute actions: T3 gating; submit/accept demand the Discord reverse code, then run through the shared claims", async () => {
+test("dispute actions: submit demands a FRESH FACTOR, accept still demands the Discord reverse code", async () => {
   const fakes = evidenceFakes();
   const section = makeDisputesSection(disputesDeps(fakes));
+  const stale = (base: DashboardCtx): DashboardCtx =>
+    ({ ...base, security: { ...base.security, stepUpFresh: () => false } }) as DashboardCtx;
 
-  const noReverse = await section.action!(disputesCtx(fakes), {
+  // Declaring stepUp on the button proves nothing: the client is hostile, so
+  // the gate is re-run here and a stale factor is refused outright.
+  const notFresh = await section.action!(stale(disputesCtx(fakes)), {
     key: "section:disputes.submit",
     params: { disputeId: "dp_1" },
-    confirmWord: "CONFIRM",
   });
-  assert.deepEqual(noReverse, { ok: false, needsReverse: true });
-  assert.equal(fakes.calls.claims.length, 0);
+  assert.deepEqual(notFresh, { ok: false, needsStepUp: true });
+  assert.equal(fakes.calls.claims.length, 0, "nothing reached the bank");
 
-  const noConfirm = await section.action!(disputesCtx(fakes), { key: "section:disputes.submit", params: { disputeId: "dp_1" } });
-  assert.equal(noConfirm.ok, false);
-  assert.match(noConfirm.error ?? "", /CONFIRM/);
-
-  const ctxWithReverse = { ...disputesCtx(fakes), reverse: { satisfied: true } } as DashboardCtx;
-  const ran = await section.action!(ctxWithReverse, {
-    key: "section:disputes.submit",
-    params: { disputeId: "dp_1" },
-    confirmWord: "CONFIRM",
-  });
+  // A fresh factor is the whole ceremony now: no typed word, no Discord code.
+  const ran = await section.action!(disputesCtx(fakes), { key: "section:disputes.submit", params: { disputeId: "dp_1" } });
   assert.equal(ran.ok, true);
   assert.deepEqual(fakes.calls.claims, [{ actor: "42", id: "dispute-submit-dp_1", action: "dispute_submit" }]);
 
+  // Accept as lost is unchanged, and a fresh factor does NOT stand in for the
+  // reverse code: the two gates are separate and it still demands its own.
+  const acceptNoReverse = await section.action!(disputesCtx(fakes), {
+    key: "section:disputes.accept",
+    params: { disputeId: "dp_1" },
+    confirmWord: "CONFIRM",
+  });
+  assert.deepEqual(acceptNoReverse, { ok: false, needsReverse: true });
+  assert.deepEqual(fakes.calls.close, []);
+
+  const ctxWithReverse = { ...disputesCtx(fakes), reverse: { satisfied: true } } as DashboardCtx;
   const accept = await section.action!(ctxWithReverse, {
     key: "section:disputes.accept",
     params: { disputeId: "dp_1" },
