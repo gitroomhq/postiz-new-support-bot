@@ -4,7 +4,7 @@ import type { SettingsStore } from "../../../config/SettingsStore";
 import type { SessionStore } from "../../../auth/SessionStore";
 import type { DisputeStore } from "../DisputeStore";
 import type { DisputeEvidenceService } from "../DisputeEvidenceService";
-import type { PostizIdentityService } from "../../../postiz/PostizIdentityService";
+import { confirmedOrgFor, type PostizIdentityService } from "../../../postiz/PostizIdentityService";
 import type { IntercomClient } from "../../../intercom/IntercomClient";
 import { FactCache, gatherFacts } from "./EvidenceFacts";
 import { collectSupportFacts } from "./intercomHistory";
@@ -47,6 +47,9 @@ export interface StageResult {
   pack: EvidencePack;
   staged: string[];
   omitted: Array<{ field: string; why: string }>;
+  // True when every field the pack would stage is already staged at Stripe with
+  // exactly this text, so nothing was written and no history entry was made.
+  unchanged: boolean;
 }
 
 export type AutoSubmitRefusal =
@@ -169,8 +172,11 @@ export class EvidencePackBuilder {
   ): Promise<UsageFacts | null> {
     if (!customerId || !this.activity?.configured() || !this.postiz) return null;
     const lookup = await this.postiz.resolveOrgsForCustomer(customerId).catch(() => null);
-    if (!lookup || lookup.state !== "found") return null;
-    const orgId = lookup.orgs?.[0]?.orgId;
+    if (!lookup) return null;
+    // The same proof the platform paragraphs demand. Counting a stranger's
+    // posts and calling them this customer's use of the product is the single
+    // most damaging thing this pack could tell a bank.
+    const orgId = confirmedOrgFor(lookup)?.orgId;
     if (!orgId) return null;
     const activity = await this.activity.forOrganization(
       orgId,
@@ -198,10 +204,27 @@ export class EvidencePackBuilder {
         why: r.missing.length ? `missing ${[...new Set(r.missing)].join(", ")}` : (r.dropped ?? "unknown"),
       }));
 
+    // The templates are deterministic, so rebuilding an untouched dispute
+    // produces byte-identical text. The looper rebuilds hourly to pick up facts
+    // that arrive late, which means without this guard a dispute collects one
+    // Stripe write, one history entry and one build metric EVERY HOUR until its
+    // deadline, all of them saying the same thing. A timeline of two dozen
+    // identical lines hides the entries that matter.
+    const current = (dispute.evidence ?? {}) as unknown as Record<string, unknown>;
+    const unchanged =
+      staged.length > 0 && staged.every((field) => String(current[field] ?? "") === String(pack.fields[field] ?? ""));
+    const score = scorePack(pack.reason, pack.fields, receiptStaged);
+    if (unchanged) {
+      packLog.debug("evidence pack unchanged; nothing re-staged", {
+        "stripe.dispute_id": dispute.id,
+        "pack.fields": staged.length,
+      });
+      return { pack: { ...pack, score }, staged, omitted, unchanged: true };
+    }
+
     if (staged.length) {
       await this.evidence.stageFields(dispute.id, pack.fields, `pack-${dispute.id}`);
     }
-    const score = scorePack(pack.reason, pack.fields, receiptStaged);
     await this.disputeStore.recordAutoPack(dispute.id, {
       score,
       templateVersion: pack.templateVersion,
@@ -263,7 +286,7 @@ export class EvidencePackBuilder {
       "pack.fields": staged.length,
       "pack.score": score,
     });
-    return { pack: { ...pack, score }, staged, omitted };
+    return { pack: { ...pack, score }, staged, omitted, unchanged: false };
   }
 
   // Every gate that must hold before a machine-written package is sent to a

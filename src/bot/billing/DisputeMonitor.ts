@@ -306,7 +306,10 @@ export class DisputeMonitor {
         const charge = await this.stripe.getCharge(chargeId);
         const pack = await builder.build(dispute, charge, { enrich: true });
         const staged = await builder.stage(dispute, pack, false);
-        out.packed++;
+        // A rebuild that produced identical text staged nothing, so it is not a
+        // pack this tick made. Counting it would report an hourly stream of
+        // work on a dispute nobody has touched since the day it arrived.
+        if (!staged.unchanged) out.packed++;
 
         const decision = await builder.autoSubmitDecision(dispute, row, staged.pack);
         if (decision.kind === "submit") {

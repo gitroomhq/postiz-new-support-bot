@@ -73,6 +73,20 @@ function ownerScore(a: PostizAccount): number {
   return live * 100 + (ROLE_RANK[(a.role ?? "").toUpperCase()] ?? 0);
 }
 
+// The one organisation a lookup PROVES belongs to this Stripe customer, or null.
+//
+// `state: "found"` only says the search returned rows, and the list is merely
+// sorted to put a confirmed match first, so orgs[0] can easily be a stranger's
+// organisation. Anywhere the answer becomes a claim about the customer, and
+// above all in dispute evidence read by a bank, preference is not evidence:
+// the org's own Stripe payment id has to be this customer. Surfaces that show
+// a human the near-misses (the customers panel) read the list directly and
+// caveat what they show; this is for the surfaces that cannot caveat.
+export function confirmedOrgFor(lookup: PostizOrgLookup): PostizOrgSummary | null {
+  if (lookup.state !== "found") return null;
+  return (lookup.orgs ?? []).find((o) => o.customerMatches === true && !o.orgDeleted) ?? null;
+}
+
 function summarizeOrgs(result: PostizSearchResult, customerId: string): PostizOrgSummary[] {
   const byOrg = new Map<string, PostizAccount[]>();
   for (const a of result.accounts) {

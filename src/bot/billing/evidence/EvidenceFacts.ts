@@ -1,6 +1,6 @@
 import type Stripe from "stripe";
 import type { StripeClient } from "../../StripeClient";
-import type { PostizIdentityService } from "../../../postiz/PostizIdentityService";
+import { confirmedOrgFor, type PostizIdentityService } from "../../../postiz/PostizIdentityService";
 import { subPlanLabel } from "../ui";
 import type {
   BillingHistoryFacts,
@@ -288,7 +288,11 @@ async function postizFacts(postiz: PostizIdentityService | null | undefined, cus
   // "off", "none", "timeout" and "error" are all distinct from "found", and
   // none of them licenses a claim about the platform account.
   if (!lookup || lookup.state !== "found") return null;
-  const org = lookup.orgs?.[0];
+  // Taking orgs[0] blind would describe a stranger's organisation to a bank:
+  // its name, its plan, how its owner signed up. Nothing but a proven match
+  // licenses that, and a lookup that cannot prove one answers with nothing, so
+  // every paragraph citing a postiz.* token drops itself.
+  const org = confirmedOrgFor(lookup);
   if (!org) return null;
   return {
     orgName: org.orgName ?? null,

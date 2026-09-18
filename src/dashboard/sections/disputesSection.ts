@@ -395,6 +395,14 @@ async function disputeAction(
       const omitted = staged.omitted.length
         ? ` Omitted ${staged.omitted.length}: ${staged.omitted.map((o: { field: string; why: string }) => `${o.field} (${o.why})`).join(", ")}.`
         : "";
+      // The templates are deterministic, so an untouched dispute rebuilds to
+      // the same text. Saying so beats reporting a write that did not happen.
+      if (staged.unchanged) {
+        return {
+          ok: true,
+          text: `No change: the staged package already matches what the templates and the current facts produce (${staged.staged.length} field(s), completeness ${staged.pack.score}%).${omitted}`,
+        };
+      }
       return {
         ok: true,
         text: `Staged ${staged.staged.length} field(s), completeness ${staged.pack.score}%.${omitted} Review the sections below, then submit.`,

@@ -2009,7 +2009,9 @@ export class DisputesHub {
     await this.renderDetail(
       interaction,
       token,
-      `📄 Staged ${staged.staged.length} field(s), completeness ${staged.pack.score}%${omitted}. Review, then submit.`
+      staged.unchanged
+        ? `📄 No change: the staged package already matches the templates and the current facts (${staged.staged.length} field(s), completeness ${staged.pack.score}%)${omitted}.`
+        : `📄 Staged ${staged.staged.length} field(s), completeness ${staged.pack.score}%${omitted}. Review, then submit.`
     );
   }
 
