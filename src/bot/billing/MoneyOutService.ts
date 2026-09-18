@@ -7,15 +7,16 @@ import {
   buildRefundFeeRow,
   classifyBalanceTransaction,
   classifyCreditNote,
-  classifyDiscount,
+  classifyInvoiceDiscount,
   classifyWriteOff,
+  invoiceDiscountCount,
   type MoneyOutCategory,
   type MoneyOutRow,
   type MoneyOutSource,
 } from "./moneyOutTaxonomy";
 import { StripeSegmentResolver } from "./StripeSegmentResolver";
 import { UNKNOWN, chargeAgeBucket, normalizeRefundReason, type MoneySegments } from "./segments";
-import { exportMoneyOut, exportMoneyOutSweep } from "../../metrics/MetricsExporter";
+import { emitMoneyOut, exportMoneyOutSweep } from "../../metrics/MetricsExporter";
 import { flushInflux, influxActive } from "../../metrics/InfluxWriter";
 import { log } from "../../util/logger";
 import type { MoneyOutTickResult } from "../../temporal/types";
@@ -114,15 +115,17 @@ export interface MoneyOutBackfillResult {
   created: number;
   points: number;
   truncated: boolean;
+  // Rows repaired in place: ones that already existed and whose segments, fees
+  // or USD columns an earlier, less-informed pass never filled in.
+  repaired: number;
   // Concessions have no balance transaction, so they are swept from their own
   // endpoints rather than the ledger.
   creditNotes: number;
   writeOffs: number;
+  // Discount ROWS booked, one per discount per paid invoice — real money not
+  // collected, not the one-per-coupon estimate this used to report.
   discounts: number;
-  // Discounts that ended before the backfill ran cannot be recovered: Stripe
-  // has no list endpoint for historical discounts, only the live ones still
-  // attached to a subscription or customer.
-  discountsHistoricalUnavailable: boolean;
+  invoicesScanned: number;
 }
 
 // The money-out ledger engine.
@@ -227,26 +230,51 @@ export class MoneyOutService {
   // Idempotent throughout: rows key on their Stripe id, and points carry each
   // row's real occurredAt, so identical points overwrite rather than double-count.
   async backfillHistory(
-    opts: { scope?: MoneyOutBackfillScope; reemitAll?: boolean; onProgress?: () => void } = {}
+    opts: {
+      scope?: MoneyOutBackfillScope;
+      reemitAll?: boolean;
+      onProgress?: () => void;
+      // Correct rows that already exist instead of skipping them, and buy
+      // segments for the whole history. Both are off for the ordinary backfill
+      // button and on for the analytics rebuild, which exists to fix exactly
+      // what those defaults leave undone.
+      repairExisting?: boolean;
+      // Stripe reads the WHOLE run may spend on descriptive segments. One
+      // budget for the run, not one per page: the old per-page allowance meant
+      // the cap never capped — thirty lookups times two thousand pages is sixty
+      // thousand reads with no ceiling at all.
+      segmentBudget?: number;
+      // Suppress inline point emission. The rebuild repairs with Influx closed
+      // and re-emits afterwards in its own phase.
+      emitPoints?: boolean;
+    } = {}
   ): Promise<MoneyOutBackfillResult> {
     const scope = opts.scope ?? "all";
     const onProgress = opts.onProgress;
+    const enrich = opts.segmentBudget != null && opts.segmentBudget > 0;
+    // One budget for the entire run; see segmentBudget above.
+    if (enrich) this.segments.startBatch(opts.segmentBudget!);
     // No per-charge customer lookups: an all-time sweep would otherwise spend
     // thousands of Stripe reads on a display column. Points ARE emitted inline
     // (each row carries its real timestamp), so there is no second full-table
     // walk in the normal case.
     const swept =
       scope === "concessions" || scope === "none"
-        ? { scanned: 0, created: 0, truncated: false }
+        ? { scanned: 0, created: 0, repaired: 0, truncated: false }
         : await this.sweep({
             maxPages: MAX_PAGES_BACKFILL,
             source: "backfill",
             resolveCustomers: false,
             // Segments cost up to three Stripe reads per row. Over all-time
-            // history that is thousands of calls for axes on rows nobody
-            // slices, so history charts as "unknown" by design — the forward
-            // sweep and the webhooks enrich everything from here on.
-            enrichSegments: false,
+            // history that is thousands of calls, so the plain backfill leaves
+            // them as "unknown" by design and the forward sweep enriches from
+            // there on. The analytics rebuild passes a budget and pays for them.
+            enrichSegments: enrich,
+            // null = this call owns the budget opened above, so enrichSegments
+            // must not reopen a fresh one per page.
+            runBudget: enrich,
+            repairExisting: opts.repairExisting,
+            emitPoints: opts.emitPoints,
             onProgress,
           });
 
@@ -254,33 +282,28 @@ export class MoneyOutService {
     // no trail for them at all.
     const concessions =
       scope === "ledger" || scope === "none"
-        ? { creditNotes: 0, writeOffs: 0, discounts: 0, discountsHistoricalUnavailable: false }
+        ? { creditNotes: 0, writeOffs: 0, discounts: 0, invoicesScanned: 0, truncated: false }
         : await this.backfillConcessions(onProgress);
 
     // Opt-in only: re-emit the WHOLE mirror at historical timestamps. Needed
     // exactly once, when Influx is enabled AFTER rows were already imported —
     // every other run emits its new rows inline as it writes them.
     let points = 0;
-    if (opts.reemitAll && influxActive()) {
+    if (opts.reemitAll && influxActive() && opts.emitPoints !== false) {
       let sinceFlush = 0;
       for await (const batch of this.store.iterateAll()) {
         onProgress?.();
         for (const row of batch) {
-          exportMoneyOut({
-            bucket: row.bucket,
-            category: row.category,
-            currency: row.currency,
-            source: "backfill",
-            amountMinor: row.amountMinor,
-            feeMinor: row.feeMinor,
-            netMinor: row.netMinor,
-            // Whatever the mirror learned when the row was first written. This
-            // is the point of keeping segments in Postgres: an Influx bucket
-            // that was wiped or aged out can be rebuilt with its axes intact,
-            // without re-reading a single thing from Stripe.
-            segments: segmentsOf(row),
-            ts: row.occurredAt,
-          });
+          // Straight from the mirror row, which is the point of keeping the
+          // segments in Postgres: a wiped Influx bucket can be rebuilt with its
+          // axes intact without re-reading anything from Stripe.
+          //
+          // This used to hardcode source:"backfill" while the live paths
+          // emitted the row's real source. `source` was a TAG, so every
+          // re-emitted row landed as a SECOND point beside the original rather
+          // than overwriting it, and every money panel doubled. It is a field
+          // now, and both paths run through the same function.
+          emitMoneyOut(row);
           points++;
           // The client silently DROPS points once its buffer fills, which on an
           // all-time history would quietly lose most of it.
@@ -297,9 +320,13 @@ export class MoneyOutService {
     return {
       scanned: swept.scanned,
       created: swept.created,
+      repaired: swept.repaired,
       points,
-      truncated: swept.truncated,
-      ...concessions,
+      truncated: swept.truncated || concessions.truncated,
+      creditNotes: concessions.creditNotes,
+      writeOffs: concessions.writeOffs,
+      discounts: concessions.discounts,
+      invoicesScanned: concessions.invoicesScanned,
     };
   }
 
@@ -310,7 +337,8 @@ export class MoneyOutService {
     creditNotes: number;
     writeOffs: number;
     discounts: number;
-    discountsHistoricalUnavailable: boolean;
+    invoicesScanned: number;
+    truncated: boolean;
   }> {
     let creditNotes = 0;
     let writeOffs = 0;
@@ -352,126 +380,80 @@ export class MoneyOutService {
       }
     }
 
-    // ---- discounts, live ones only ----
-    // Stripe exposes no way to list discounts that have already ended, so this
-    // captures what is currently attached and nothing older. Reported honestly
-    // rather than left to look like a complete history.
+    // ---- discounts, from the invoices that actually granted them ----
     //
-    // Deliberately does NOT expand discounts on the list call: if Stripe
-    // rejects that expand path the whole page throws, the catch swallows it,
-    // and the backfill reports "0 coupons" for an account full of them. Instead
-    // the cheap list finds WHICH subscriptions carry a discount, then each of
-    // those is re-read expanded — one extra call per discounted subscription,
-    // and a failure can only ever lose that one.
-    let sawDiscounts = 0;
-    for (const status of ["active", "trialing"] as const) {
-      try {
-        let startingAfter: string | undefined;
-        for (let page = 0; page < MAX_PAGES_BACKFILL; page++) {
-          onProgress?.();
-          const res = await this.stripe.listAllSubscriptions({
-            status,
-            limit: 100,
-            ...(startingAfter ? { startingAfter } : {}),
-          });
-          for (const sub of res.subscriptions) {
-            if ((sub.discounts?.length ?? 0) === 0) continue;
-            sawDiscounts++;
-            // Bare ids are the norm here; re-read expanded so they can be priced.
-            const needsExpand = sub.discounts.some((d) => typeof d === "string");
-            const full = needsExpand ? await this.stripe.getSubscriptionWithDiscounts(sub.id) : sub;
-            const booked = await this.recordDiscountsOn(full?.discounts ?? sub.discounts, {
-              customerId: idOf(sub.customer as string | { id: string } | null),
-              subscriptionId: sub.id,
-              createdFallback: sub.created,
-            });
-            if (booked) discounts++;
-          }
-          if (!res.hasMore || res.subscriptions.length === 0) break;
-          startingAfter = res.subscriptions[res.subscriptions.length - 1].id;
-        }
-      } catch (error) {
-        moneyLog.warn("money-out discount backfill failed", { "money_out.status": status, "error.message": String(error) });
-      }
-    }
-    // Loud when the two disagree: subscriptions carrying a coupon that we could
-    // not book is the exact shape of the bug that made this report zero.
-    if (sawDiscounts !== discounts) {
-      moneyLog.warn("money-out: some subscription coupons could not be booked", {
-        "money_out.subs_with_discounts": sawDiscounts,
-        "money_out.booked": discounts,
-      });
-    }
+    // This used to walk active subscriptions for attached coupons and book ONE
+    // row per coupon, valued at a single billing cycle and stamped at the date
+    // the coupon was attached. Every part of that was wrong: a 50%-off coupon
+    // running for three years was recorded as one month of value, three years
+    // ago, and coupons that had already ended were invisible because Stripe has
+    // no endpoint that lists them.
+    //
+    // An invoice states how much was actually discounted and when. It recurs
+    // the way the discount really recurred, and it reaches back as far as the
+    // account does. The estimate rows those old sweeps wrote are retired by the
+    // analytics rebuild so the two can never be counted together.
+    const discountResult = await this.backfillInvoiceDiscounts(onProgress);
+    discounts += discountResult.rows;
 
-    // Customer-level coupons: applied to the customer rather than one
-    // subscription, so the subscription walk above never sees them.
-    try {
-      let startingAfter: string | undefined;
-      for (let page = 0; page < MAX_PAGES_BACKFILL; page++) {
-        onProgress?.();
-        const res = await this.stripe.listCustomersPage({
-          limit: 100,
-          ...(startingAfter ? { startingAfter } : {}),
-        });
-        for (const customer of res.customers) {
-          const discount = (customer as { discount?: Stripe.Discount | null }).discount;
-          if (!discount) continue;
-          const booked = await this.recordDiscountsOn(discount, {
-            customerId: customer.id,
-            subscriptionId: null,
-            createdFallback: customer.created,
-          });
-          if (booked) discounts++;
-        }
-        if (!res.hasMore || res.customers.length === 0) break;
-        startingAfter = res.customers[res.customers.length - 1].id;
-      }
-    } catch (error) {
-      moneyLog.warn("money-out customer discount backfill failed", { "error.message": String(error) });
-    }
-
-    return { creditNotes, writeOffs, discounts, discountsHistoricalUnavailable: true };
+    return {
+      creditNotes,
+      writeOffs,
+      discounts,
+      invoicesScanned: discountResult.invoicesScanned,
+      truncated: discountResult.truncated,
+    };
   }
 
-  // Books every discount attached to a subscription or a customer. Returns true
-  // when at least one was recorded, so the caller counts subjects rather than
-  // raw coupon objects.
-  private async recordDiscountsOn(
-    discounts: Array<string | Stripe.Discount> | Stripe.Discount | null | undefined,
-    scope: { customerId: string | null; subscriptionId: string | null; createdFallback: number }
-  ): Promise<boolean> {
-    const list = Array.isArray(discounts) ? discounts : discounts ? [discounts] : [];
-    let any = false;
-    for (const raw of list) {
-      // An unexpanded DISCOUNT is a dead end: Stripe has no discounts.retrieve.
-      if (typeof raw === "string") continue;
-      // An unexpanded COUPON is not — and it is the common case, which is why
-      // skipping it made the coupon backfill report zero every time.
-      const coupon = await this.resolveCoupon(raw.source?.coupon ?? null);
-      if (!coupon) continue;
+  // Walk every PAID invoice and book one row per discount on it.
+  //
+  // Paid only. A discount on an open invoice has not been given away yet, and a
+  // void or uncollectible invoice is already booked as a write-off — counting
+  // its discount here as well would double the concession bucket.
+  private async backfillInvoiceDiscounts(
+    onProgress?: () => void
+  ): Promise<{ rows: number; invoicesScanned: number; truncated: boolean }> {
+    let rows = 0;
+    let invoicesScanned = 0;
+    let startingAfter: string | undefined;
 
-      let baseMinor = 0;
-      let currency = coupon.currency ?? "usd";
-      if (coupon.percent_off != null) {
-        const priced = await this.priceDiscountBase(scope.customerId, scope.subscriptionId).catch(() => null);
-        if (!priced) continue;
-        baseMinor = priced.baseMinor;
-        currency = priced.currency;
+    for (let page = 0; page < MAX_PAGES_BACKFILL; page++) {
+      onProgress?.();
+      let res;
+      try {
+        res = await this.stripe.listInvoicesByStatus(null, "paid", 100, startingAfter);
+      } catch (error) {
+        moneyLog.warn("money-out invoice discount sweep failed", { "error.message": String(error) });
+        return { rows, invoicesScanned, truncated: true };
       }
-      await this.recordDiscount({
-        discountId: raw.id,
-        customerId: scope.customerId,
-        currency,
-        baseMinor,
-        percentOff: coupon.percent_off,
-        amountOffMinor: coupon.amount_off,
-        reason: `${coupon.name ?? coupon.id}${coupon.duration ? ` (${coupon.duration})` : ""}`,
-        occurredAt: new Date((raw.start ?? scope.createdFallback) * 1000),
-        source: "backfill",
-      });
-      any = true;
+      for (const invoice of res.data) {
+        invoicesScanned++;
+        rows += await this.recordInvoiceDiscounts(invoice, "backfill");
+      }
+      if (!res.has_more || res.data.length === 0) {
+        return { rows, invoicesScanned, truncated: false };
+      }
+      startingAfter = res.data[res.data.length - 1].id;
     }
-    return any;
+    return { rows, invoicesScanned, truncated: true };
+  }
+
+  // Book every discount on one invoice. Also the live path: the invoice.paid
+  // webhook calls this, so a discount reaches the ledger within seconds of the
+  // invoice that granted it rather than at the next full sweep.
+  //
+  // Idempotent by key: the row id is the invoice plus the discount, so a
+  // webhook, a sweep and a backfill all write the same primary key.
+  async recordInvoiceDiscounts(invoice: Stripe.Invoice, source: MoneyOutSource): Promise<number> {
+    if (!this.settings.moneyOutEnabled()) return 0;
+    let booked = 0;
+    for (let i = 0; i < invoiceDiscountCount(invoice); i++) {
+      const row = classifyInvoiceDiscount(invoice, i, source);
+      if (!row) continue;
+      await this.record(row);
+      booked++;
+    }
+    return booked;
   }
 
   // One charge read per distinct charge for the life of the sweep: several
@@ -482,20 +464,6 @@ export class MoneyOutService {
     if (this.chargeFeeCache.has(chargeId)) return this.chargeFeeCache.get(chargeId) ?? null;
     const fetched = await this.stripe.getChargeWithFee(chargeId).catch(() => null);
     this.chargeFeeCache.set(chargeId, fetched);
-    return fetched;
-  }
-
-  // Coupons arrive as bare ids far more often than as objects, and the same
-  // handful of coupons repeat across every subscription, so this is cached for
-  // the life of the sweep.
-  private couponCache = new Map<string, Stripe.Coupon | null>();
-
-  private async resolveCoupon(coupon: string | Stripe.Coupon | null): Promise<Stripe.Coupon | null> {
-    if (!coupon) return null;
-    if (typeof coupon !== "string") return coupon;
-    if (this.couponCache.has(coupon)) return this.couponCache.get(coupon) ?? null;
-    const fetched = await this.stripe.getCoupon(coupon).catch(() => null);
-    this.couponCache.set(coupon, fetched);
     return fetched;
   }
 
@@ -510,11 +478,20 @@ export class MoneyOutService {
     resolveCustomers?: boolean;
     resolveRefundFees?: boolean;
     enrichSegments?: boolean;
-  }): Promise<{ scanned: number; created: number; truncated: boolean }> {
+    // Correct rows that already exist rather than skipping them. Off for the
+    // ordinary tick, where a known balance transaction genuinely has nothing
+    // new to say; on for the analytics rebuild, which is here precisely to fix
+    // what earlier passes got wrong or never looked up.
+    repairExisting?: boolean;
+    // The CALLER opened one segment budget for the whole run, so enrichSegments
+    // must not open a fresh one per page. Without this the cap never caps.
+    runBudget?: boolean;
+  }): Promise<{ scanned: number; created: number; repaired: number; truncated: boolean }> {
     const emitPoints = opts.emitPoints !== false;
     let startingAfter: string | undefined;
     let scanned = 0;
     let created = 0;
+    let repaired = 0;
     let pages = 0;
 
     for (;;) {
@@ -567,24 +544,25 @@ export class MoneyOutService {
 
       // Descriptive segments, before the write so the mirror and the Influx
       // points carry the same axes. Never fatal: see enrichSegments.
-      if (opts.enrichSegments !== false) await this.enrichSegments(pageRows, btByRowId);
+      if (opts.enrichSegments !== false) await this.enrichSegments(pageRows, btByRowId, opts.runBudget);
 
       const fresh = await this.store.insertNew(pageRows);
       created += fresh.length;
+
+      // Correct what was already on disk. Without this a row written by an
+      // earlier, less-informed pass keeps its nulls forever, because insertNew
+      // skips every id it has seen — which is precisely why all historical
+      // money charted as "unknown" on every segment axis.
+      if (opts.repairExisting) {
+        const freshIds = new Set(fresh.map((r) => r.id));
+        repaired += await this.store.repair(pageRows.filter((r) => !freshIds.has(r.id)));
+      }
+
       if (emitPoints) {
-        for (const row of fresh) {
-          exportMoneyOut({
-            bucket: row.bucket,
-            category: row.category,
-            currency: row.currency,
-            source: row.source,
-            amountMinor: row.amountMinor,
-            feeMinor: row.feeMinor,
-            netMinor: row.netMinor,
-            segments: row.segments,
-            ts: row.occurredAt,
-          });
-        }
+        // From the PERSISTED rows. Emitting from the in-memory candidates is
+        // what let the live and rebuild paths disagree by a tag and double the
+        // totals; see the header of moneyPoints.ts.
+        for (const row of fresh) emitMoneyOut(row);
         // The Influx client drops points once its buffer fills (5000 lines), so
         // a long sweep MUST flush as it goes or it silently loses history.
         await flushInflux();
@@ -596,11 +574,11 @@ export class MoneyOutService {
       // dashboard column rather than the totals.
       if (opts.resolveCustomers !== false) await this.backfillCustomers(fresh);
       if (!page.hasMore || page.transactions.length === 0) {
-        return { scanned, created, truncated: false };
+        return { scanned, created, repaired, truncated: false };
       }
       if (pages >= opts.maxPages) {
         moneyLog.warn("money-out sweep hit the page cap", { "money_out.pages": pages, "money_out.scanned": scanned });
-        return { scanned, created, truncated: true };
+        return { scanned, created, repaired, truncated: true };
       }
       startingAfter = page.transactions[page.transactions.length - 1].id;
     }
@@ -619,13 +597,18 @@ export class MoneyOutService {
   // no mirror at all.
   private async enrichSegments(
     rows: MoneyOutRow[],
-    btByRowId: Map<string, Stripe.BalanceTransaction>
+    btByRowId: Map<string, Stripe.BalanceTransaction>,
+    runBudget?: boolean
   ): Promise<void> {
     if (!this.settings.moneyOutEnrichEnabled()) return;
     const targets = rows.filter((r) => SEGMENTABLE_CATEGORIES.has(r.category));
     if (targets.length === 0) return;
 
-    this.segments.startBatch(MAX_SEGMENT_LOOKUPS_PER_PAGE);
+    // Per-page allowance for the ordinary tick, which reads one or two pages.
+    // Skipped when the caller opened a budget for the whole run: reopening it
+    // here would hand every page a fresh allowance, so a two-thousand-page
+    // backfill would spend sixty thousand Stripe reads under a cap of thirty.
+    if (!runBudget) this.segments.startBatch(MAX_SEGMENT_LOOKUPS_PER_PAGE);
     for (const row of targets) {
       try {
         row.segments = await this.segmentsForRow(row, btByRowId.get(row.id));
@@ -686,7 +669,7 @@ export class MoneyOutService {
   // account with thousands of refunds cannot turn into thousands of extra
   // Stripe calls — the rest simply keep a null customer, which costs one
   // dashboard column and nothing else.
-  private async backfillCustomers(rows: MoneyOutRow[]): Promise<void> {
+  private async backfillCustomers(rows: Array<Pick<MoneyOutRow, "customerId" | "chargeId">>): Promise<void> {
     const needing = rows.filter((r) => !r.customerId && r.chargeId);
     if (needing.length === 0) return;
     const chargeIds = [...new Set(needing.map((r) => r.chargeId!))].slice(0, MAX_CUSTOMER_LOOKUPS_PER_PAGE);
@@ -711,80 +694,6 @@ export class MoneyOutService {
     await this.record(classifyWriteOff(invoice, source));
   }
 
-  // What a discount is worth per billing cycle.
-  //
-  // This is the number that made concessions read as zero: classifyDiscount
-  // refuses to book a percentage coupon it cannot price, and the only base we
-  // used to try was an upcoming-invoice preview — which returns nothing for a
-  // customer-level discount, or for any subscription without a next invoice.
-  // Now the subscription's own line items answer it directly, with the preview
-  // as the fallback rather than the only route.
-  async priceDiscountBase(
-    customerId: string | null,
-    subscriptionId: string | null
-  ): Promise<{ baseMinor: number; currency: string } | null> {
-    if (subscriptionId) {
-      const fromItems = await this.subscriptionRecurringTotal(subscriptionId);
-      if (fromItems) return fromItems;
-      if (customerId) {
-        const preview = await this.stripe.previewUpcomingInvoice(customerId, subscriptionId).catch(() => null);
-        // subtotal is pre-discount, which is exactly the base a percentage
-        // applies to (total would already have the discount taken off).
-        if (preview && preview.subtotal > 0) return { baseMinor: preview.subtotal, currency: preview.currency };
-      }
-      return null;
-    }
-    // Customer-level discount: it applies to whatever they are subscribed to,
-    // so the base is the sum of their active subscriptions.
-    if (!customerId) return null;
-    const subs = await this.stripe.listSubscriptions(customerId).catch(() => []);
-    let baseMinor = 0;
-    let currency: string | null = null;
-    for (const sub of subs) {
-      if (sub.status !== "active" && sub.status !== "trialing") continue;
-      const priced = await this.subscriptionRecurringTotal(sub);
-      if (!priced) continue;
-      baseMinor += priced.baseMinor;
-      currency = currency ?? priced.currency;
-    }
-    return baseMinor > 0 && currency ? { baseMinor, currency } : null;
-  }
-
-  // Sum of a subscription's line items at list price: quantity × unit amount.
-  // Deterministic and available even when there is no upcoming invoice.
-  private async subscriptionRecurringTotal(
-    subscriptionOrId: string | Stripe.Subscription
-  ): Promise<{ baseMinor: number; currency: string } | null> {
-    const sub =
-      typeof subscriptionOrId === "string"
-        ? await this.stripe.getSubscription(subscriptionOrId).catch(() => null)
-        : subscriptionOrId;
-    if (!sub) return null;
-    let baseMinor = 0;
-    let currency: string | null = null;
-    for (const item of sub.items?.data ?? []) {
-      const unit = item.price?.unit_amount;
-      if (unit == null) continue; // tiered/metered price — not knowable up front
-      baseMinor += unit * (item.quantity ?? 1);
-      currency = currency ?? item.price.currency;
-    }
-    return baseMinor > 0 && currency ? { baseMinor, currency } : null;
-  }
-
-  async recordDiscount(input: {
-    discountId: string;
-    customerId: string | null;
-    currency: string;
-    baseMinor: number;
-    percentOff?: number | null;
-    amountOffMinor?: number | null;
-    reason?: string | null;
-    occurredAt?: Date;
-    source: MoneyOutSource;
-  }): Promise<void> {
-    await this.record(classifyDiscount({ ...input, occurredAt: input.occurredAt ?? new Date() }));
-  }
-
   async recordBalanceConcession(input: {
     id: string;
     category: Extract<MoneyOutCategory, "credit_grant" | "balance_credit">;
@@ -804,18 +713,13 @@ export class MoneyOutService {
     if (!row) return;
     if (!this.settings.moneyOutEnabled()) return;
     try {
-      const isNew = await this.store.upsert(row);
-      if (!isNew) return;
-      exportMoneyOut({
-        bucket: row.bucket,
-        category: row.category,
-        currency: row.currency,
-        source: row.source,
-        amountMinor: row.amountMinor,
-        feeMinor: row.feeMinor,
-        netMinor: row.netMinor,
-        ts: row.occurredAt,
-      });
+      const { created, row: saved } = await this.store.upsert(row);
+      if (!created) return;
+      // From the SAVED row. This used to emit from the in-memory candidate and
+      // pass no segments at all, so every concession point carried eleven
+      // "unknown" tags while the rebuild emitted the mirror's real ones — two
+      // different series for one movement.
+      emitMoneyOut(saved);
     } catch (error) {
       moneyLog.warn("money-out concession record failed", {
         "money_out.id": row.id,

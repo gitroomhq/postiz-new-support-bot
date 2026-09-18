@@ -76,6 +76,12 @@ const EVENTS: Stripe.WebhookEndpointCreateParams.EnabledEvent[] = [
   "credit_note.created",
   "invoice.voided",
   "invoice.marked_uncollectible",
+  // Discounts are booked from the invoices that applied them, which is the only
+  // place the REAL amount and date exist. customer.discount.created stays
+  // subscribed for the log line, but no longer books money: it fires once, when
+  // a coupon is attached, and knows nothing about the thirty-six invoices that
+  // coupon will go on to discount.
+  "invoice.paid",
   "customer.discount.created",
 ];
 
@@ -368,6 +374,23 @@ export class StripeWebhookHandler {
         });
         return;
       }
+      case "invoice.paid": {
+        if (!firstDelivery) return;
+        const invoice = event.data.object as Stripe.Invoice;
+        const booked = await this.moneyOut?.recordInvoiceDiscounts(invoice, "webhook").catch((e) => {
+          hookLog.warn("money-out invoice discount failed", { "error.message": String(e) });
+          return 0;
+        });
+        if (booked) {
+          exportBillingEvent({
+            event: "discount",
+            amountMinor: invoice.total_discount_amounts?.reduce((sum, d) => sum + d.amount, 0) ?? null,
+            currency: invoice.currency,
+            reason: event.type,
+          });
+        }
+        return;
+      }
       case "customer.discount.created": {
         if (!firstDelivery) return;
         await this.onDiscountCreated(event.data.object as Stripe.Discount);
@@ -394,59 +417,27 @@ export class StripeWebhookHandler {
     }
   }
 
-  // A discount's cost is only knowable against what it will be applied to, so
-  // resolve the base from the subscription it landed on (or the customer's
-  // upcoming invoice). No base = no row: an unquantified concession is worse
-  // than a missing one, because it would silently read as zero.
+  // A coupon was attached to a customer or subscription.
+  //
+  // This NO LONGER BOOKS MONEY, and that is the fix rather than a regression.
+  // It used to write one money-out row priced at a single billing cycle and
+  // stamped at this moment — so a 50%-off coupon that went on to discount
+  // thirty-six invoices was recorded as one month of value, three years before
+  // most of that money was actually forgone. Nothing could repair it either,
+  // because Stripe has no endpoint listing discounts that have ended.
+  //
+  // The money is booked from invoice.paid instead, where the real amount and
+  // the real date both exist. This is kept as a log line: knowing a coupon was
+  // attached is still useful when reading why a concession total starts to rise.
   private async onDiscountCreated(discount: Stripe.Discount): Promise<void> {
-    if (!this.moneyOut) return;
-    const customerId = typeof discount.customer === "string" ? discount.customer : (discount.customer?.id ?? null);
-    // SDK v20 moved the coupon behind discount.source; it can still arrive
-    // unexpanded as a bare id, which carries no percent/amount to price.
     const rawCoupon = discount.source?.coupon ?? null;
     const coupon = rawCoupon && typeof rawCoupon !== "string" ? rawCoupon : null;
-    if (!coupon) return;
-
-    let baseMinor = 0;
-    let currency = coupon.currency ?? "usd";
-    // A flat amount_off prices itself; only a percentage needs a base.
-    if (coupon.percent_off != null) {
-      const subscriptionId = typeof discount.subscription === "string" ? discount.subscription : null;
-      const priced = await this.moneyOut.priceDiscountBase(customerId, subscriptionId).catch((e) => {
-        hookLog.warn("money-out discount base lookup failed", { "error.message": String(e) });
-        return null;
-      });
-      if (!priced) {
-        // Better a loud gap than a silent zero: a discount booked at 0 would
-        // read as "this concession cost nothing", which is worse than absent.
-        hookLog.warn("money-out discount not priced", {
-          "stripe.discount_id": discount.id,
-          "stripe.customer_id": customerId ?? "",
-          "money_out.reason": "no subscription line items or upcoming invoice to price the percentage against",
-        });
-        return;
-      }
-      baseMinor = priced.baseMinor;
-      currency = priced.currency;
-    }
-
-    await this.moneyOut
-      .recordDiscount({
-        discountId: discount.id,
-        customerId,
-        currency,
-        baseMinor,
-        percentOff: coupon.percent_off,
-        amountOffMinor: coupon.amount_off,
-        // Duration matters for reading the number later: this books ONE billing
-        // cycle, so a repeating/forever coupon is worth more than recorded.
-        reason: `${coupon.name ?? coupon.id}${coupon.duration ? ` (${coupon.duration})` : ""}`,
-        occurredAt: new Date((discount.start ?? Math.floor(Date.now() / 1000)) * 1000),
-        source: "webhook",
-      })
-      .catch((e) => {
-        hookLog.warn("money-out discount record failed", { "error.message": String(e) });
-      });
+    hookLog.info("stripe.discount_attached", {
+      "stripe.discount_id": discount.id,
+      "stripe.customer_id": typeof discount.customer === "string" ? discount.customer : (discount.customer?.id ?? ""),
+      "money_out.coupon": coupon?.name ?? (typeof rawCoupon === "string" ? rawCoupon : ""),
+      "money_out.duration": coupon?.duration ?? "",
+    });
   }
 
   private async onDisputeCreated(dispute: Stripe.Dispute, firstDelivery: boolean): Promise<void> {

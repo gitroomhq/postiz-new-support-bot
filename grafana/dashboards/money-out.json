@@ -74,7 +74,7 @@
             "type": "influxdb",
             "uid": "${datasource}"
           },
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_minor\")\n  |> filter(fn: (r) => r.category != \"stripe_fee\")\n  // group() collapses every series into one before aggregating: money_out\n  // carries plan, card and region tags now, and Flux aggregates PER SERIES,\n  // so without this the panel returns one row per tag combination instead\n  // of a single total.\n  |> group()\n  |> sum()\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))",
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_usd_minor\")\n  |> filter(fn: (r) => r.category != \"stripe_fee\")\n  // group() collapses every series into one before aggregating: money_out\n  // carries plan, card and region tags now, and Flux aggregates PER SERIES,\n  // so without this the panel returns one row per tag combination instead\n  // of a single total.\n  |> group()\n  |> sum()\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))",
           "refId": "A"
         }
       ],
@@ -130,7 +130,7 @@
             "type": "influxdb",
             "uid": "${datasource}"
           },
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_minor\")\n  |> filter(fn: (r) => r.category != \"stripe_fee\")\n  |> filter(fn: (r) => r.bucket == \"CASH\")\n  // group() collapses every series into one before aggregating: money_out\n  // carries plan, card and region tags now, and Flux aggregates PER SERIES,\n  // so without this the panel returns one row per tag combination instead\n  // of a single total.\n  |> group()\n  |> sum()\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))",
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_usd_minor\")\n  |> filter(fn: (r) => r.category != \"stripe_fee\")\n  |> filter(fn: (r) => r.bucket == \"CASH\")\n  // group() collapses every series into one before aggregating: money_out\n  // carries plan, card and region tags now, and Flux aggregates PER SERIES,\n  // so without this the panel returns one row per tag combination instead\n  // of a single total.\n  |> group()\n  |> sum()\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))",
           "refId": "A"
         }
       ],
@@ -186,7 +186,7 @@
             "type": "influxdb",
             "uid": "${datasource}"
           },
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_minor\")\n  |> filter(fn: (r) => r.category != \"stripe_fee\")\n  |> filter(fn: (r) => r.bucket == \"FEES\")\n  // group() collapses every series into one before aggregating: money_out\n  // carries plan, card and region tags now, and Flux aggregates PER SERIES,\n  // so without this the panel returns one row per tag combination instead\n  // of a single total.\n  |> group()\n  |> sum()\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))",
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_usd_minor\")\n  |> filter(fn: (r) => r.category != \"stripe_fee\")\n  |> filter(fn: (r) => r.bucket == \"FEES\")\n  // group() collapses every series into one before aggregating: money_out\n  // carries plan, card and region tags now, and Flux aggregates PER SERIES,\n  // so without this the panel returns one row per tag combination instead\n  // of a single total.\n  |> group()\n  |> sum()\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))",
           "refId": "A"
         }
       ],
@@ -242,7 +242,7 @@
             "type": "influxdb",
             "uid": "${datasource}"
           },
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_minor\")\n  |> filter(fn: (r) => r.category != \"stripe_fee\")\n  |> filter(fn: (r) => r.bucket == \"CONCESSION\")\n  // group() collapses every series into one before aggregating: money_out\n  // carries plan, card and region tags now, and Flux aggregates PER SERIES,\n  // so without this the panel returns one row per tag combination instead\n  // of a single total.\n  |> group()\n  |> sum()\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))",
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_usd_minor\")\n  |> filter(fn: (r) => r.category != \"stripe_fee\")\n  |> filter(fn: (r) => r.bucket == \"CONCESSION\")\n  // group() collapses every series into one before aggregating: money_out\n  // carries plan, card and region tags now, and Flux aggregates PER SERIES,\n  // so without this the panel returns one row per tag combination instead\n  // of a single total.\n  |> group()\n  |> sum()\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))",
           "refId": "A"
         }
       ],
@@ -354,7 +354,7 @@
             "type": "influxdb",
             "uid": "${datasource}"
           },
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_minor\")\n  |> filter(fn: (r) => r.category != \"stripe_fee\")\n  |> filter(fn: (r) => r.category != \"refund_failure\" and r.category != \"dispute_reversal\")\n  |> keep(columns: [\"_time\", \"_value\", \"category\"])\n  |> group(columns: [\"category\"])\n  |> aggregateWindow(every: 1d, fn: sum, createEmpty: true)\n  |> fill(value: 0.0)\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))",
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_usd_minor\")\n  |> filter(fn: (r) => r.category != \"stripe_fee\")\n  |> filter(fn: (r) => r.category != \"refund_failure\" and r.category != \"dispute_reversal\")\n  |> keep(columns: [\"_time\", \"_value\", \"category\"])\n  |> group(columns: [\"category\"])\n  |> aggregateWindow(every: 1d, fn: sum, createEmpty: true)\n  |> fill(value: 0.0)\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))",
           "refId": "A"
         }
       ],
@@ -418,7 +418,7 @@
             "type": "influxdb",
             "uid": "${datasource}"
           },
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_minor\")\n  |> filter(fn: (r) => r.category != \"stripe_fee\")\n  |> keep(columns: [\"_value\", \"category\"])\n  |> group(columns: [\"category\"])\n  |> sum()\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))\n  |> group()",
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_usd_minor\")\n  |> filter(fn: (r) => r.category != \"stripe_fee\")\n  |> keep(columns: [\"_value\", \"category\"])\n  |> group(columns: [\"category\"])\n  |> sum()\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))\n  |> group()",
           "refId": "A"
         }
       ],
@@ -491,7 +491,7 @@
             "type": "influxdb",
             "uid": "${datasource}"
           },
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_minor\")\n  |> filter(fn: (r) => r.category != \"stripe_fee\")\n  |> filter(fn: (r) => r.category == \"refund\")\n  // group() collapses every series into one before aggregating: money_out\n  // carries plan, card and region tags now, and Flux aggregates PER SERIES,\n  // so without this the panel returns one row per tag combination instead\n  // of a single total.\n  |> group()\n  |> sum()\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))",
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_usd_minor\")\n  |> filter(fn: (r) => r.category != \"stripe_fee\")\n  |> filter(fn: (r) => r.category == \"refund\")\n  // group() collapses every series into one before aggregating: money_out\n  // carries plan, card and region tags now, and Flux aggregates PER SERIES,\n  // so without this the panel returns one row per tag combination instead\n  // of a single total.\n  |> group()\n  |> sum()\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))",
           "refId": "A"
         }
       ],
@@ -547,7 +547,7 @@
             "type": "influxdb",
             "uid": "${datasource}"
           },
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_minor\")\n  |> filter(fn: (r) => r.category != \"stripe_fee\")\n  |> filter(fn: (r) => r.category == \"refund_failure\")\n  // group() collapses every series into one before aggregating: money_out\n  // carries plan, card and region tags now, and Flux aggregates PER SERIES,\n  // so without this the panel returns one row per tag combination instead\n  // of a single total.\n  |> group()\n  |> sum()\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))",
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_usd_minor\")\n  |> filter(fn: (r) => r.category != \"stripe_fee\")\n  |> filter(fn: (r) => r.category == \"refund_failure\")\n  // group() collapses every series into one before aggregating: money_out\n  // carries plan, card and region tags now, and Flux aggregates PER SERIES,\n  // so without this the panel returns one row per tag combination instead\n  // of a single total.\n  |> group()\n  |> sum()\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))",
           "refId": "A"
         }
       ],
@@ -603,7 +603,7 @@
             "type": "influxdb",
             "uid": "${datasource}"
           },
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_minor\")\n  |> filter(fn: (r) => r.category != \"stripe_fee\")\n  |> filter(fn: (r) => r.category == \"refund_fee\")\n  // group() collapses every series into one before aggregating: money_out\n  // carries plan, card and region tags now, and Flux aggregates PER SERIES,\n  // so without this the panel returns one row per tag combination instead\n  // of a single total.\n  |> group()\n  |> sum()\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))",
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_usd_minor\")\n  |> filter(fn: (r) => r.category != \"stripe_fee\")\n  |> filter(fn: (r) => r.category == \"refund_fee\")\n  // group() collapses every series into one before aggregating: money_out\n  // carries plan, card and region tags now, and Flux aggregates PER SERIES,\n  // so without this the panel returns one row per tag combination instead\n  // of a single total.\n  |> group()\n  |> sum()\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))",
           "refId": "A"
         }
       ],
@@ -659,7 +659,7 @@
             "type": "influxdb",
             "uid": "${datasource}"
           },
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_minor\")\n  |> filter(fn: (r) => r.category != \"stripe_fee\")\n  |> filter(fn: (r) => r.category == \"dispute\")\n  // group() collapses every series into one before aggregating: money_out\n  // carries plan, card and region tags now, and Flux aggregates PER SERIES,\n  // so without this the panel returns one row per tag combination instead\n  // of a single total.\n  |> group()\n  |> sum()\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))",
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_usd_minor\")\n  |> filter(fn: (r) => r.category != \"stripe_fee\")\n  |> filter(fn: (r) => r.category == \"dispute\")\n  // group() collapses every series into one before aggregating: money_out\n  // carries plan, card and region tags now, and Flux aggregates PER SERIES,\n  // so without this the panel returns one row per tag combination instead\n  // of a single total.\n  |> group()\n  |> sum()\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))",
           "refId": "A"
         }
       ],
@@ -715,7 +715,7 @@
             "type": "influxdb",
             "uid": "${datasource}"
           },
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_minor\")\n  |> filter(fn: (r) => r.category != \"stripe_fee\")\n  |> filter(fn: (r) => r.category == \"dispute_reversal\")\n  // group() collapses every series into one before aggregating: money_out\n  // carries plan, card and region tags now, and Flux aggregates PER SERIES,\n  // so without this the panel returns one row per tag combination instead\n  // of a single total.\n  |> group()\n  |> sum()\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))",
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_usd_minor\")\n  |> filter(fn: (r) => r.category != \"stripe_fee\")\n  |> filter(fn: (r) => r.category == \"dispute_reversal\")\n  // group() collapses every series into one before aggregating: money_out\n  // carries plan, card and region tags now, and Flux aggregates PER SERIES,\n  // so without this the panel returns one row per tag combination instead\n  // of a single total.\n  |> group()\n  |> sum()\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))",
           "refId": "A"
         }
       ],
@@ -771,7 +771,7 @@
             "type": "influxdb",
             "uid": "${datasource}"
           },
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_minor\")\n  |> filter(fn: (r) => r.category != \"stripe_fee\")\n  |> filter(fn: (r) => r.category == \"dispute\" or r.category == \"dispute_reversal\" or r.category == \"dispute_fee\")\n  // group() collapses every series into one before aggregating: money_out\n  // carries plan, card and region tags now, and Flux aggregates PER SERIES,\n  // so without this the panel returns one row per tag combination instead\n  // of a single total.\n  |> group()\n  |> sum()\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))",
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_usd_minor\")\n  |> filter(fn: (r) => r.category != \"stripe_fee\")\n  |> filter(fn: (r) => r.category == \"dispute\" or r.category == \"dispute_reversal\" or r.category == \"dispute_fee\")\n  // group() collapses every series into one before aggregating: money_out\n  // carries plan, card and region tags now, and Flux aggregates PER SERIES,\n  // so without this the panel returns one row per tag combination instead\n  // of a single total.\n  |> group()\n  |> sum()\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))",
           "refId": "A"
         }
       ],
@@ -827,7 +827,7 @@
             "type": "influxdb",
             "uid": "${datasource}"
           },
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_minor\" and r.bucket == \"CASH\")\n  |> filter(fn: (r) => r.category != \"refund_failure\" and r.category != \"dispute_reversal\")\n  |> keep(columns: [\"_time\", \"_value\", \"category\"])\n  |> group(columns: [\"category\"])\n  |> aggregateWindow(every: 1d, fn: sum, createEmpty: true)\n  |> fill(value: 0.0)\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))",
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_usd_minor\" and r.bucket == \"CASH\")\n  |> filter(fn: (r) => r.category != \"refund_failure\" and r.category != \"dispute_reversal\")\n  |> keep(columns: [\"_time\", \"_value\", \"category\"])\n  |> group(columns: [\"category\"])\n  |> aggregateWindow(every: 1d, fn: sum, createEmpty: true)\n  |> fill(value: 0.0)\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))",
           "refId": "A"
         }
       ],
@@ -891,7 +891,7 @@
             "type": "influxdb",
             "uid": "${datasource}"
           },
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_minor\" and r.bucket == \"CONCESSION\")\n  |> keep(columns: [\"_time\", \"_value\", \"category\"])\n  |> group(columns: [\"category\"])\n  |> aggregateWindow(every: 1d, fn: sum, createEmpty: true)\n  |> fill(value: 0.0)\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))",
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_usd_minor\" and r.bucket == \"CONCESSION\")\n  |> keep(columns: [\"_time\", \"_value\", \"category\"])\n  |> group(columns: [\"category\"])\n  |> aggregateWindow(every: 1d, fn: sum, createEmpty: true)\n  |> fill(value: 0.0)\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))",
           "refId": "A"
         }
       ],
@@ -956,7 +956,7 @@
             "type": "influxdb",
             "uid": "${datasource}"
           },
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_minor\")\n  |> filter(fn: (r) => r.category == \"refund_failure\" or r.category == \"dispute_reversal\")\n  |> keep(columns: [\"_time\", \"_value\", \"category\"])\n  |> group(columns: [\"category\"])\n  |> aggregateWindow(every: 1d, fn: sum, createEmpty: true)\n  |> fill(value: 0.0)\n  |> map(fn: (r) => ({ r with _value: r._value / -100.0 }))",
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_usd_minor\")\n  |> filter(fn: (r) => r.category == \"refund_failure\" or r.category == \"dispute_reversal\")\n  |> keep(columns: [\"_time\", \"_value\", \"category\"])\n  |> group(columns: [\"category\"])\n  |> aggregateWindow(every: 1d, fn: sum, createEmpty: true)\n  |> fill(value: 0.0)\n  |> map(fn: (r) => ({ r with _value: r._value / -100.0 }))",
           "refId": "A"
         }
       ],
@@ -1032,7 +1032,7 @@
             "type": "influxdb",
             "uid": "${datasource}"
           },
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_minor\")\n  |> filter(fn: (r) => r.category != \"stripe_fee\")\n  |> keep(columns: [\"_value\", \"source\"])\n  |> group(columns: [\"source\"])\n  |> sum()\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))\n  |> group()",
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_usd_minor\")\n  |> filter(fn: (r) => r.category != \"stripe_fee\")\n  |> keep(columns: [\"_value\", \"source\"])\n  |> group(columns: [\"source\"])\n  |> sum()\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))\n  |> group()",
           "refId": "A"
         }
       ],
@@ -1234,7 +1234,7 @@
             "type": "influxdb",
             "uid": "${datasource}"
           },
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_minor\" and r.category == \"stripe_fee\")\n  // group() collapses every series into one before aggregating: money_out\n  // carries plan, card and region tags now, and Flux aggregates PER SERIES,\n  // so without this the panel returns one row per tag combination instead\n  // of a single total.\n  |> group()\n  |> sum()\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))",
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_usd_minor\" and r.category == \"stripe_fee\")\n  // group() collapses every series into one before aggregating: money_out\n  // carries plan, card and region tags now, and Flux aggregates PER SERIES,\n  // so without this the panel returns one row per tag combination instead\n  // of a single total.\n  |> group()\n  |> sum()\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))",
           "refId": "A"
         }
       ],
@@ -1291,7 +1291,7 @@
             "type": "influxdb",
             "uid": "${datasource}"
           },
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_minor\" and r.category == \"write_off\")\n  // group() collapses every series into one before aggregating: money_out\n  // carries plan, card and region tags now, and Flux aggregates PER SERIES,\n  // so without this the panel returns one row per tag combination instead\n  // of a single total.\n  |> group()\n  |> aggregateWindow(every: 1d, fn: sum, createEmpty: true)\n  |> fill(value: 0.0)\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))",
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_usd_minor\" and r.category == \"write_off\")\n  // group() collapses every series into one before aggregating: money_out\n  // carries plan, card and region tags now, and Flux aggregates PER SERIES,\n  // so without this the panel returns one row per tag combination instead\n  // of a single total.\n  |> group()\n  |> aggregateWindow(every: 1d, fn: sum, createEmpty: true)\n  |> fill(value: 0.0)\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))",
           "refId": "A"
         }
       ],
@@ -1353,7 +1353,7 @@
             "type": "influxdb",
             "uid": "${datasource}"
           },
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_minor\" and r.category == \"stripe_fee\")\n  // group() collapses every series into one before aggregating: money_out\n  // carries plan, card and region tags now, and Flux aggregates PER SERIES,\n  // so without this the panel returns one row per tag combination instead\n  // of a single total.\n  |> group()\n  |> aggregateWindow(every: 1d, fn: sum, createEmpty: true)\n  |> fill(value: 0.0)\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))",
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_usd_minor\" and r.category == \"stripe_fee\")\n  // group() collapses every series into one before aggregating: money_out\n  // carries plan, card and region tags now, and Flux aggregates PER SERIES,\n  // so without this the panel returns one row per tag combination instead\n  // of a single total.\n  |> group()\n  |> aggregateWindow(every: 1d, fn: sum, createEmpty: true)\n  |> fill(value: 0.0)\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))",
           "refId": "A"
         }
       ],

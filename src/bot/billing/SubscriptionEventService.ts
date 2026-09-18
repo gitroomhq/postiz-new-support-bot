@@ -4,7 +4,7 @@ import { SettingsStore } from "../../config/SettingsStore";
 import { SubscriptionEventStore } from "./SubscriptionEventStore";
 import { classifySubscriptionEvent, type PreviousAttributes, type SubscriptionMovement } from "./subscriptionEvents";
 import { planTagsFromSubscription, subscriptionMrrMinor } from "./segments";
-import { exportPlanMix, exportSubscriptionEvent } from "../../metrics/MetricsExporter";
+import { emitSubscriptionEvent, exportPlanMix } from "../../metrics/MetricsExporter";
 import { flushInflux, influxActive } from "../../metrics/InfluxWriter";
 import { log } from "../../util/logger";
 
@@ -148,22 +148,7 @@ export class SubscriptionEventService {
     for await (const batch of this.store.iterateAll()) {
       onProgress?.();
       for (const row of batch) {
-        exportSubscriptionEvent({
-          event: row.event as Parameters<typeof exportSubscriptionEvent>[0]["event"],
-          planTier: row.planTier,
-          planPeriod: row.planPeriod,
-          fromTier: row.fromTier,
-          fromPeriod: row.fromPeriod,
-          currency: row.currency,
-          churnType: row.churnType,
-          cancelReason: row.cancelReason,
-          cancelFeedback: row.cancelFeedback,
-          cardCountry: row.cardCountry,
-          mrrDeltaMinor: row.mrrDeltaMinor,
-          mrrAtRiskMinor: row.mrrAtRiskMinor,
-          comment: row.comment,
-          ts: row.occurredAt,
-        });
+        emitSubscriptionEvent(row);
         points++;
         if (++sinceFlush >= REPLAY_FLUSH_EVERY) {
           sinceFlush = 0;
@@ -230,7 +215,7 @@ export class SubscriptionEventService {
     // One Stripe event can carry several movements, so the row key is the event
     // id plus the movement name — unique per movement, stable across replays.
     const rows = movements.map((movement) => ({ id: `${eventId}:${movement.event}`, source, movement }));
-    let fresh: typeof rows;
+    let fresh: Awaited<ReturnType<SubscriptionEventStore["insertNew"]>>;
     try {
       fresh = await this.store.insertNew(rows);
     } catch (error) {
@@ -240,24 +225,9 @@ export class SubscriptionEventService {
       });
       return 0;
     }
-    for (const { movement: m } of fresh) {
-      exportSubscriptionEvent({
-        event: m.event,
-        planTier: m.planTier,
-        planPeriod: m.planPeriod,
-        fromTier: m.fromTier,
-        fromPeriod: m.fromPeriod,
-        currency: m.currency,
-        churnType: m.churnType,
-        cancelReason: m.cancelReason,
-        cancelFeedback: m.cancelFeedback,
-        cardCountry: m.cardCountry,
-        mrrDeltaMinor: m.mrrDeltaMinor,
-        mrrAtRiskMinor: m.mrrAtRiskMinor,
-        comment: m.comment,
-        ts: m.occurredAt,
-      });
-    }
+    // From the PERSISTED rows, so this point and the one a rebuild produces
+    // from the same row are identical rather than merely similar.
+    for (const row of fresh) emitSubscriptionEvent(row);
     return fresh.length;
   }
 }

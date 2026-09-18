@@ -130,7 +130,7 @@
             "type": "influxdb",
             "uid": "${datasource}"
           },
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_minor\" and r.category == \"refund\")\n  // Flux aggregates PER SERIES and every tag is part of the group key,\n  // so this collapses them all into one table first. Without it the panel\n  // shows one row per plan/card/region combination instead of a total.\n  |> group()\n  |> sum()\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))",
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_usd_minor\" and r.category == \"refund\")\n  // Flux aggregates PER SERIES and every tag is part of the group key,\n  // so this collapses them all into one table first. Without it the panel\n  // shows one row per plan/card/region combination instead of a total.\n  |> group()\n  |> sum()\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))",
           "refId": "A"
         }
       ],
@@ -298,7 +298,7 @@
             "type": "influxdb",
             "uid": "${datasource}"
           },
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_minor\" and r.category == \"refund_fee\")\n  // Flux aggregates PER SERIES and every tag is part of the group key,\n  // so this collapses them all into one table first. Without it the panel\n  // shows one row per plan/card/region combination instead of a total.\n  |> group()\n  |> sum()\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))",
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_usd_minor\" and r.category == \"refund_fee\")\n  // Flux aggregates PER SERIES and every tag is part of the group key,\n  // so this collapses them all into one table first. Without it the panel\n  // shows one row per plan/card/region combination instead of a total.\n  |> group()\n  |> sum()\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))",
           "refId": "A"
         }
       ],
@@ -470,7 +470,7 @@
             "type": "influxdb",
             "uid": "${datasource}"
           },
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_minor\" and r.category == \"refund\")\n  |> keep(columns: [\"_value\", \"plan_tier\"])\n  |> group(columns: [\"plan_tier\"])\n  |> sum()\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))\n  |> group()\n  |> sort(columns: [\"_value\"], desc: true)",
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_usd_minor\" and r.category == \"refund\")\n  |> keep(columns: [\"_value\", \"plan_tier\"])\n  |> group(columns: [\"plan_tier\"])\n  |> sum()\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))\n  |> group()\n  |> sort(columns: [\"_value\"], desc: true)",
           "refId": "A"
         }
       ],
@@ -835,7 +835,7 @@
             "type": "influxdb",
             "uid": "${datasource}"
           },
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_minor\" and r.category == \"refund\")\n  |> keep(columns: [\"_time\", \"_value\", \"refund_reason\"])\n  |> group(columns: [\"refund_reason\"])\n  |> aggregateWindow(every: 1d, fn: sum, createEmpty: true)\n  |> fill(value: 0.0)\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))",
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_usd_minor\" and r.category == \"refund\")\n  |> keep(columns: [\"_time\", \"_value\", \"refund_reason\"])\n  |> group(columns: [\"refund_reason\"])\n  |> aggregateWindow(every: 1d, fn: sum, createEmpty: true)\n  |> fill(value: 0.0)\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))",
           "refId": "A"
         }
       ],
@@ -969,7 +969,7 @@
             "type": "influxdb",
             "uid": "${datasource}"
           },
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_minor\" and r.category == \"dispute\")\n  // Flux aggregates PER SERIES and every tag is part of the group key,\n  // so this collapses them all into one table first. Without it the panel\n  // shows one row per plan/card/region combination instead of a total.\n  |> group()\n  |> sum()\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))",
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_usd_minor\" and r.category == \"dispute\")\n  // Flux aggregates PER SERIES and every tag is part of the group key,\n  // so this collapses them all into one table first. Without it the panel\n  // shows one row per plan/card/region combination instead of a total.\n  |> group()\n  |> sum()\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))",
           "refId": "A"
         }
       ],
@@ -1193,7 +1193,7 @@
             "type": "influxdb",
             "uid": "${datasource}"
           },
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_minor\" and r.category == \"dispute_fee\")\n  // Flux aggregates PER SERIES and every tag is part of the group key,\n  // so this collapses them all into one table first. Without it the panel\n  // shows one row per plan/card/region combination instead of a total.\n  |> group()\n  |> sum()\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))",
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"money_out\")\n  |> filter(fn: (r) => r._field == \"amount_usd_minor\" and r.category == \"dispute_fee\")\n  // Flux aggregates PER SERIES and every tag is part of the group key,\n  // so this collapses them all into one table first. Without it the panel\n  // shows one row per plan/card/region combination instead of a total.\n  |> group()\n  |> sum()\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))",
           "refId": "A"
         }
       ],
@@ -1790,7 +1790,7 @@
             "type": "influxdb",
             "uid": "${datasource}"
           },
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"subscription_events\")\n  |> filter(fn: (r) => r._field == \"mrr_delta_minor\")\n  // Flux aggregates PER SERIES and every tag is part of the group key,\n  // so this collapses them all into one table first. Without it the panel\n  // shows one row per plan/card/region combination instead of a total.\n  |> group()\n  |> sum()\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))",
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"subscription_events\")\n  |> filter(fn: (r) => r._field == \"mrr_delta_usd_minor\")\n  // Flux aggregates PER SERIES and every tag is part of the group key,\n  // so this collapses them all into one table first. Without it the panel\n  // shows one row per plan/card/region combination instead of a total.\n  |> group()\n  |> sum()\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))",
           "refId": "A"
         }
       ],
@@ -1846,7 +1846,7 @@
             "type": "influxdb",
             "uid": "${datasource}"
           },
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"subscription_events\")\n  |> filter(fn: (r) => r._field == \"mrr_delta_minor\" and r.event == \"canceled\")\n  // Flux aggregates PER SERIES and every tag is part of the group key,\n  // so this collapses them all into one table first. Without it the panel\n  // shows one row per plan/card/region combination instead of a total.\n  |> group()\n  |> sum()\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))",
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"subscription_events\")\n  |> filter(fn: (r) => r._field == \"mrr_delta_usd_minor\" and r.event == \"canceled\")\n  // Flux aggregates PER SERIES and every tag is part of the group key,\n  // so this collapses them all into one table first. Without it the panel\n  // shows one row per plan/card/region combination instead of a total.\n  |> group()\n  |> sum()\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))",
           "refId": "A"
         }
       ],
@@ -1902,7 +1902,7 @@
             "type": "influxdb",
             "uid": "${datasource}"
           },
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"subscription_events\")\n  |> filter(fn: (r) => r._field == \"mrr_at_risk_minor\")\n  // Flux aggregates PER SERIES and every tag is part of the group key,\n  // so this collapses them all into one table first. Without it the panel\n  // shows one row per plan/card/region combination instead of a total.\n  |> group()\n  |> sum()\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))",
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"subscription_events\")\n  |> filter(fn: (r) => r._field == \"mrr_at_risk_usd_minor\")\n  // Flux aggregates PER SERIES and every tag is part of the group key,\n  // so this collapses them all into one table first. Without it the panel\n  // shows one row per plan/card/region combination instead of a total.\n  |> group()\n  |> sum()\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))",
           "refId": "A"
         }
       ],
@@ -2190,7 +2190,7 @@
             "type": "influxdb",
             "uid": "${datasource}"
           },
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"subscription_events\")\n  |> filter(fn: (r) => r._field == \"mrr_delta_minor\" and r.event == \"canceled\")\n  |> keep(columns: [\"_value\", \"plan_tier\"])\n  |> group(columns: [\"plan_tier\"])\n  |> sum()\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))\n  |> group()\n  |> sort(columns: [\"_value\"], desc: true)",
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"subscription_events\")\n  |> filter(fn: (r) => r._field == \"mrr_delta_usd_minor\" and r.event == \"canceled\")\n  |> keep(columns: [\"_value\", \"plan_tier\"])\n  |> group(columns: [\"plan_tier\"])\n  |> sum()\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))\n  |> group()\n  |> sort(columns: [\"_value\"], desc: true)",
           "refId": "A"
         }
       ],
@@ -2315,7 +2315,7 @@
             "type": "influxdb",
             "uid": "${datasource}"
           },
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"subscription_events\")\n  |> filter(fn: (r) => r._field == \"mrr_delta_minor\")\n  |> keep(columns: [\"_time\", \"_value\", \"event\"])\n  |> group(columns: [\"event\"])\n  |> aggregateWindow(every: 1d, fn: sum, createEmpty: true)\n  |> fill(value: 0.0)\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))",
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"subscription_events\")\n  |> filter(fn: (r) => r._field == \"mrr_delta_usd_minor\")\n  |> keep(columns: [\"_time\", \"_value\", \"event\"])\n  |> group(columns: [\"event\"])\n  |> aggregateWindow(every: 1d, fn: sum, createEmpty: true)\n  |> fill(value: 0.0)\n  |> map(fn: (r) => ({ r with _value: r._value / 100.0 }))",
           "refId": "A"
         }
       ],

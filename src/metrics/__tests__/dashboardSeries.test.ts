@@ -13,7 +13,15 @@ import { join } from "node:path";
 
 const root = process.cwd();
 const dashboardDir = join(root, "grafana", "dashboards");
-const exporterSrc = readFileSync(join(root, "src", "metrics", "MetricsExporter.ts"), "utf8");
+// BOTH emitter modules. The three money measurements (money_out,
+// dispute_outcomes, subscription_events) live in moneyPoints.ts, because they
+// are built from a Postgres row rather than from loose parameters — see that
+// file's header. Reading only MetricsExporter.ts would silently report them as
+// unwritten and mark every money panel an orphan.
+const exporterSrc = [
+  readFileSync(join(root, "src", "metrics", "MetricsExporter.ts"), "utf8"),
+  readFileSync(join(root, "src", "bot", "billing", "moneyPoints.ts"), "utf8"),
+].join("\n");
 
 // writePoint("name", ...) with the name on the same line or the next one.
 function emittedMeasurements(src: string): Set<string> {
@@ -32,16 +40,20 @@ function queriedMeasurements(json: string): Set<string> {
 // Measurements whose EMITTERS were deleted, leaving panels that can never draw
 // anything. These are pre-existing and known, not new breakage:
 //
-//   ticket_events, ticket_snapshot, ai_scores, ai_runs, ai_staff_scores
+//   ticket_events, ticket_snapshot, ai_scores, ai_staff_scores
 //     retired by the agent-rip, which removed ticket scoring, the report loop
 //     and the ticket-side Influx writes. The panels reading them were left
 //     behind. support-overview.json is 9/13 dead and bot-ops.json 2/9; both
 //     need either new emitters or the panels removed, which is a product
 //     decision rather than a test's to make.
 //
+// ai_runs used to be on this list and should not have been: it is still emitted
+// (exportAiRun, from ClaudeCodeRunner and LightAiRunner), so listing it here
+// exempted a live measurement from the orphan check for no reason.
+//
 // Listing them here keeps the hole visible and permanently tracked while still
 // failing on any NEW orphan.
-const RETIRED_MEASUREMENTS = new Set(["ticket_events", "ticket_snapshot", "ai_scores", "ai_runs", "ai_staff_scores"]);
+const RETIRED_MEASUREMENTS = new Set(["ticket_events", "ticket_snapshot", "ai_scores", "ai_staff_scores"]);
 
 const emitted = emittedMeasurements(exporterSrc);
 const files = readdirSync(dashboardDir).filter((f) => f.endsWith(".json"));
@@ -85,6 +97,88 @@ test("no dashboard queries a measurement the exporter never writes", () => {
     [],
     `these panels would render empty forever, because nothing writes the series:\n  ${orphans.join("\n  ")}`
   );
+});
+
+// A dashboard can also query the right MEASUREMENT and the wrong FIELD, which
+// fails identically: an empty panel that looks like "nothing happened".
+//
+// This is not hypothetical. The money measurements changed from amount_minor
+// (in the row's own currency, so a mixed-currency total added EUR minor units
+// to USD ones) to amount_usd_minor, and a dashboard left on the old name would
+// have read zero everywhere — indistinguishable from the rebuild having deleted
+// the data it had just restored.
+function queriedFields(json: string): Set<string> {
+  const names = new Set<string>();
+  for (const m of json.matchAll(/_field\s*==\s*\\"([a-z0-9_]+)\\"/g)) names.add(m[1]);
+  return names;
+}
+
+test("no dashboard queries a money field the exporter never writes", () => {
+  // Only the money measurements: the gauges write their fields through spread
+  // objects the regex above cannot see, so asserting on them would be a test
+  // that fails for being unable to look rather than for anything being wrong.
+  const known = new Set([
+    "count",
+    "amount_usd_minor",
+    "fee_usd_minor",
+    "net_usd_minor",
+    "mrr_delta_usd_minor",
+    "mrr_at_risk_usd_minor",
+    "fx_rate",
+    "usd_convertible",
+    "currency",
+    "source",
+    "submitted",
+    "closed_at_estimated",
+    "closed_at_source",
+    "has_comment",
+    "comment",
+  ]);
+  const stale: string[] = [];
+  for (const file of files) {
+    const raw = readFileSync(join(dashboardDir, file), "utf8");
+    const measurements = queriedMeasurements(raw);
+    const touchesMoney = ["money_out", "dispute_outcomes", "subscription_events"].some((m) => measurements.has(m));
+    if (!touchesMoney) continue;
+    for (const field of queriedFields(raw)) {
+      // A dashboard can mix money panels with others; only flag the fields that
+      // look like the ones that moved.
+      if (/_minor$/.test(field) && !known.has(field)) stale.push(`${file}: ${field}`);
+    }
+  }
+  assert.deepEqual(
+    stale,
+    [],
+    `these panels query a money field that no longer exists, and would read zero forever:\n  ${stale.join("\n  ")}`
+  );
+});
+
+test("every measurement is classified as rebuildable or fixed", async () => {
+  // The analytics rebuild DELETES everything on the rebuildable list. An
+  // unclassified measurement is therefore a silent bug in one of two
+  // directions: left off both lists it survives a wipe while its mirror is
+  // re-emitted around it (double-counted forever), and wrongly listed as
+  // rebuildable it is deleted with nothing able to restore it.
+  //
+  // Neither shows up until someone reads a chart months later, so the only
+  // workable guard is to make adding a measurement without classifying it fail
+  // the build.
+  const { REBUILDABLE_MEASUREMENTS, FIXED_MEASUREMENTS } = await import("../measurements");
+  const rebuildable = new Set<string>(REBUILDABLE_MEASUREMENTS);
+  const fixed = new Set<string>(FIXED_MEASUREMENTS);
+
+  const overlap = [...rebuildable].filter((m) => fixed.has(m));
+  assert.deepEqual(overlap, [], `a measurement cannot be both rebuildable and fixed: ${overlap.join(", ")}`);
+
+  const unclassified = [...emitted].filter((m) => !rebuildable.has(m) && !fixed.has(m));
+  assert.deepEqual(
+    unclassified,
+    [],
+    `classify these in src/metrics/measurements.ts before shipping — the rebuild either wipes them with no way back, or leaves them to double-count:\n  ${unclassified.join("\n  ")}`
+  );
+
+  const phantom = [...rebuildable, ...fixed].filter((m) => !emitted.has(m));
+  assert.deepEqual(phantom, [], `classified but never emitted (stale entry?): ${phantom.join(", ")}`);
 });
 
 test("every dispute measurement the exporter writes is charted somewhere", () => {

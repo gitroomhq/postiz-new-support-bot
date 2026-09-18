@@ -315,6 +315,18 @@ model BotSettings {
   influxOrg               String?
   influxBucket            String?
   influxToken             String?
+  // Full analytics rebuild (/config → Analytics → Rebuild): wipe the rebuildable
+  // measurements, re-walk Stripe into the Postgres mirrors, re-emit everything.
+  //
+  // analyticsRebuildPhase is BOTH the single-flight lock and the emission gate:
+  // while it is non-null the canonical emitters stay silent, because the repair
+  // pass rewrites tag values and a point written mid-repair would be orphaned
+  // by the wipe that follows. Persisted rather than held in memory so a restart
+  // mid-rebuild resumes with the gate still closed.
+  analyticsRebuildPhase     String?   // preflight | repair | wipe | reemit | gauges
+  analyticsRebuildStartedAt DateTime?
+  analyticsRebuildDoneAt    DateTime?
+  analyticsRebuildStatsJson String?   // last run's per-phase counts, for the panel
   // AI ticket scoring (Batch API, cheap model). Interval default 6h = 4 batches/day;
   // the Batch discount is identical at any cadence, so this is purely freshness.
   scoringEnabled            Boolean   @default(false)
@@ -849,6 +861,19 @@ model StripeDispute {
   lastUrgentReminderAt DateTime? // urgent-tier damper (≤1 urgent ping / 24h / dispute)
   disputeCreatedAt    DateTime
   closedAt            DateTime?
+  // Stripe exposes no closed-at timestamp on a dispute, so closedAt is often a
+  // best-available ESTIMATE (the latest balance transaction, else an elapsed
+  // evidence deadline, else creation). True until something authoritative — a
+  // Stripe event inside its 30-day retention — replaces it. Exported as a field
+  // so a panel can say "estimated" instead of implying precision it has not got.
+  closedAtEstimated   Boolean   @default(true)
+  // Where closedAt came from, so the estimate can be improved rather than
+  // guessed at twice: stripe_event (authoritative, within Stripe's 30-day event
+  // retention) | balance_txn | evidence_deadline | created | observed.
+  closedAtSource      String?
+  // Frozen USD conversion of `amount`; see StripeMoneyOut for the rule.
+  usdMinor            Int?
+  fxRate              Float?
   // ---- descriptive segments: who disputed us, without identifying them ----
   // Bounded enums and an ISO country code only. Never a name, an email or a
   // card number. src/bot/billing/segments.ts owns what may be written here.
@@ -928,6 +953,11 @@ model DisputeAutoResolve {
   vetoedAt   DateTime?
 
   executedAt DateTime?
+  // BLOCKED and FAILED used to be readable only off updatedAt, which `attempts`
+  // also bumps. Stamped explicitly so the analytics rebuild can place those two
+  // outcomes at the moment they happened instead of at the last retry.
+  blockedAt  DateTime?
+  failedAt   DateTime?
   refundId   String? // re_… once money actually moved
   // Side effects, stamped separately so the drain can re-attempt one without
   // re-attempting the other and without ever re-refunding.
@@ -1067,6 +1097,31 @@ model StripeMoneyOut {
   tenure         String? // first_day | under_30d | 1_3mo | 3mo_plus
   networkReason  String? // card-network reason code on a dispute (10.4, 4853, …)
   surface        String? // discord | panel | dashboard | stripe
+  // ---- frozen USD conversion ----
+  // The row keeps its ORIGINAL amount and currency above, which is what makes
+  // it reconcilable line-by-line against Stripe. These are the same numbers in
+  // USD, converted once at ingest and never again: fxRate is the rate that was
+  // used and fxRatesAt stamps which revision of the table it came from, so
+  // revising fx.ts next year restates nothing that already happened.
+  //
+  // Null for a currency fx.ts has no rate for — an unconvertible amount charts
+  // as absent rather than as zero.
+  usdMinor       Int?
+  feeUsdMinor    Int?
+  netUsdMinor    Int?
+  fxRate         Float?
+  fxRatesAt      String? // RATES_SAMPLED_AT of the table that produced fxRate
+  // A row superseded by a better measurement of the same money — currently only
+  // the one-per-coupon discount ESTIMATES replaced by invoice-derived actuals.
+  // Retired rather than deleted: this is a money ledger, and an operator asking
+  // "why did the concession total move" deserves an answer. Every read excludes
+  // retiredAt != null, so a retired row counts towards nothing.
+  retiredAt      DateTime?
+  retiredReason  String?
+  // Invoice behind an invoice-derived discount row. Discounts are the one
+  // category whose real money lives on invoices rather than on a balance
+  // transaction, so this is how a discount row points back at its source.
+  invoiceId      String?
   createdAt      DateTime @default(now())
   updatedAt      DateTime @updatedAt
 
@@ -1078,6 +1133,11 @@ model StripeMoneyOut {
   @@index([stripeObjectId])
   @@index([planTier, occurredAt])
   @@index([cardCountry, occurredAt])
+  @@index([invoiceId])
+  @@index([retiredAt])
+  // The rebuild's tail catch-up asks "which rows changed since the run started",
+  // which is a sequential scan without this.
+  @@index([updatedAt])
   @@map("stripe_money_out")
 }
 
@@ -1119,6 +1179,12 @@ model StripeSubscriptionEvent {
   comment         String? // scrubbed + truncated customer free text
   cardCountry     String?
   source          String // webhook | replay
+  // Frozen USD conversion of the two MRR figures — same rule as the ledger's:
+  // converted once at ingest, rate stored, never re-converted. Null when fx.ts
+  // has no rate for the currency.
+  mrrDeltaUsdMinor  Int?
+  mrrAtRiskUsdMinor Int?
+  fxRate            Float?
   occurredAt      DateTime
   createdAt       DateTime @default(now())
 

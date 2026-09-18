@@ -107,6 +107,9 @@ export interface MoneyOutRow {
   stripeObjectId: string | null;
   chargeId: string | null;
   customerId: string | null;
+  // Set only on invoice-derived discount rows, which are the one category whose
+  // real money lives on an invoice rather than on a balance transaction.
+  invoiceId?: string | null;
   occurredAt: Date;
   // Descriptive axes (plan, card, country, refund reason, charge age, customer
   // tenure). Optional everywhere: the classifiers below are pure and cannot
@@ -370,6 +373,88 @@ export function classifyWriteOff(invoice: Stripe.Invoice, source: MoneyOutSource
 // so the caller passes the base it computed (the subscription's next invoice
 // total, the charge amount, whatever it had). percentOff wins when both are set,
 // matching Stripe's own coupon semantics.
+// One row per discount actually applied to one invoice.
+//
+// This REPLACES the coupon estimate below, and the difference is the whole
+// point. The estimate booked a coupon once, valued at a single billing cycle,
+// stamped at the moment the coupon was attached: a 50%-off coupon that has
+// since applied to thirty-six monthly invoices was recorded as one month of
+// value, at a date thirty-six months ago, and Stripe has no endpoint that could
+// ever recover the rest.
+//
+// An invoice, by contrast, states exactly how much was discounted and when, it
+// recurs the way the discount actually recurred, and it goes back as far as the
+// account does.
+//
+// PAID invoices only. A discount on an open invoice has not been given away
+// yet, and a void or uncollectible one is already booked as a write-off —
+// counting it here as well would double the concession bucket.
+export function classifyInvoiceDiscount(
+  invoice: Pick<Stripe.Invoice, "id" | "currency" | "customer" | "created" | "effective_at" | "total_discount_amounts">,
+  index: number,
+  source: MoneyOutSource
+): MoneyOutRow | null {
+  const entry = invoice.total_discount_amounts?.[index];
+  if (!entry || entry.amount <= 0) return null;
+  const invoiceId = invoice.id;
+  if (!invoiceId) return null;
+  const discountId = idOf(entry.discount as string | { id: string } | null) ?? String(index);
+  // The coupon name when the expand landed, else the bare id. A failed expand
+  // costs the LABEL, never the amount — which is the lesson the coupon backfill
+  // already learned the expensive way (see MoneyOutService's discount comment).
+  const couponName = couponNameOf(entry.discount);
+  return row({
+    // Disjoint from every other key space in this table: txn_… (ledger rows),
+    // txn_…:fee (fee rows), cn_… (credit notes), in_… (write-offs, keyed on the
+    // bare invoice id) and the legacy di_… estimates. The ":disc:" infix is
+    // what keeps it clear of the write-off key in particular.
+    id: `${invoiceId}:disc:${discountId}`,
+    kind: "CONCESSION",
+    category: "discount",
+    amountMinor: entry.amount,
+    feeMinor: 0,
+    currency: invoice.currency.toLowerCase(),
+    source,
+    reason: couponName ?? discountId,
+    stripeObjectId: discountId,
+    chargeId: null,
+    customerId: idOf(invoice.customer as string | { id: string } | null),
+    invoiceId,
+    occurredAt: new Date((invoice.effective_at ?? invoice.created) * 1000),
+  });
+}
+
+// The coupon's human name, when everything happened to be expanded. Every step
+// is optional because each is a place the expand may not have reached, and none
+// of them affects the amount.
+// A deleted discount is one Stripe still references from a historical invoice
+// but no longer describes, so it is structurally one of the "not expanded"
+// cases rather than a separate problem.
+function couponNameOf(
+  discount: string | Stripe.Discount | Stripe.DeletedDiscount | null | undefined
+): string | null {
+  if (!discount || typeof discount === "string") return null;
+  const coupon = (discount as Stripe.Discount).source?.coupon;
+  if (!coupon || typeof coupon === "string") return null;
+  return coupon.name ?? null;
+}
+
+// How many discount rows an invoice yields. Separate from the classifier so a
+// caller can walk the entries without reaching into the Stripe shape itself.
+export function invoiceDiscountCount(
+  invoice: Pick<Stripe.Invoice, "total_discount_amounts">
+): number {
+  return invoice.total_discount_amounts?.length ?? 0;
+}
+
+// SUPERSEDED by classifyInvoiceDiscount above, and no longer reachable from any
+// money path: the webhook no longer books a discount here and the backfill no
+// longer walks subscriptions for coupons.
+//
+// Kept only because rows it wrote are still in the table (retired, not deleted —
+// see MoneyOutStore.retireEstimatedDiscounts) and because its arithmetic is
+// still what documents how those historical rows got their value. Do not call
+// it: it books a projection, not money that moved.
 export function classifyDiscount(input: {
   discountId: string;
   customerId: string | null;

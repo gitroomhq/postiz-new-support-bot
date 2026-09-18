@@ -119,6 +119,51 @@ export function toUsdMinor(amountMinor: number, currency: string): number | null
   return Math.ceil(major * rate * 100);
 }
 
+// ---- ledger conversion ----
+//
+// The SECOND use of this table, and the only one that stores a number rather
+// than comparing one. The money-out ledger keeps every amount in its original
+// currency (that is what makes it reconcilable against Stripe), and carries a
+// USD figure alongside it so a Grafana total over a mixed-currency account
+// means something instead of adding EUR minor units to USD ones.
+//
+// Three deliberate differences from toUsdMinor above:
+//
+//   ROUNDING is to NEAREST, not up. toUsdMinor rounds up because overstating a
+//   charge can only block an auto-refund, which is the cheap failure. Here the
+//   number is summed over the whole account, and rounding every row in the same
+//   direction would bias the total upward without limit.
+//
+//   NEGATIVES round symmetrically. Ledger amounts are signed (a reversal is
+//   negative), and Math.round(-2.5) is -2 while Math.round(2.5) is 3 — that
+//   asymmetry would make a refund and its reversal fail to cancel out.
+//
+//   THE RATE COMES BACK. It is stored on the row and reused verbatim on every
+//   re-emit, so revising this table next year restates nothing that has already
+//   happened and an auditor can always see which rate produced a figure.
+export interface UsdConversion {
+  usdMinor: number;
+  rate: number;
+}
+
+export function usdMinorOf(amountMinor: number, currency: string): UsdConversion | null {
+  if (!Number.isFinite(amountMinor)) return null;
+  const c = currency.toLowerCase();
+  const rate = RATES[c];
+  if (rate == null) return null;
+  const major = amountMinor / minorUnitsPerMajor(c);
+  const cents = major * rate * 100;
+  return { usdMinor: Math.sign(cents) * Math.round(Math.abs(cents)), rate };
+}
+
+// Re-converts a stored amount using a rate that was frozen on the row. Used by
+// the analytics re-emit so a rebuild reproduces the figure the row was written
+// with, rather than today's.
+export function usdMinorAtRate(amountMinor: number, currency: string, rate: number): number {
+  const cents = (amountMinor / minorUnitsPerMajor(currency)) * rate * 100;
+  return Math.sign(cents) * Math.round(Math.abs(cents));
+}
+
 // Whether a currency can be compared against the threshold at all. Exposed so
 // surfaces can say "this currency is not convertible" instead of showing a
 // guardrail name that reads like a policy decision.

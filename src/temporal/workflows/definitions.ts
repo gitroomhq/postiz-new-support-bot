@@ -52,3 +52,11 @@ export const applyStatusUpdate = defineUpdate<ApplyStatusResult, [StatusChangeRe
 export const getStateQuery = defineQuery<{ snapshot: TicketSnapshot | null; outbox: IcEvent[]; outboxDepth: number }>(
   QRY_TICKET_STATE
 );
+
+// Live progress for the /config panel while a rebuild is running. A query
+// rather than a signal: the panel asks, the workflow answers, and nothing is
+// written to history for a page refresh.
+export const analyticsRebuildProgressQuery = defineQuery<{
+  phase: string;
+  stats: unknown;
+}>("analyticsRebuildProgress");

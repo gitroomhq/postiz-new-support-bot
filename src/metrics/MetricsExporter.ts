@@ -1,4 +1,4 @@
-import { writePoint } from "./InfluxWriter";
+import { nsTimestamp, writePoint } from "./InfluxWriter";
 import { segmentTags, type MoneySegments } from "../bot/billing/segments";
 
 // Typed, fire-and-forget domain-event exporters over writePoint. Every helper
@@ -27,6 +27,12 @@ export interface AiRunExport {
   costUsd: number;
   toolCalls?: number;
   toolErrors?: number;
+  // The ai_runs Postgres row this mirrors. Supplied by the rebuild so a
+  // re-emitted run lands at the moment it happened rather than at "now", and by
+  // the live path so two batch runs in the same millisecond stay two points —
+  // the tag set carries no run identity, so without it they collapse into one.
+  rowId?: string;
+  at?: Date;
 }
 
 export function exportAiRun(run: AiRunExport): void {
@@ -45,7 +51,8 @@ export function exportAiRun(run: AiRunExport): void {
       tool_calls: run.toolCalls ?? 0,
       tool_errors: run.toolErrors ?? 0,
       session_id: run.sessionId ?? undefined,
-    }
+    },
+    run.at && run.rowId ? nsTimestamp(run.at, run.rowId) : undefined
   );
 }
 
@@ -109,93 +116,29 @@ export function exportBillingEvent(p: {
   );
 }
 
-// One point per dispute OUTCOME (terminal transition), reason-tagged so
-// Grafana can split win rate by fraudulent / subscription_canceled / etc.
-// Live emissions stamp "now"; the history backfill passes the historical
-// closedAt so pre-bot outcomes chart correctly. Identical points (same tags +
-// timestamp) overwrite on re-runs, so the backfill is idempotent.
-export function exportDisputeOutcome(p: {
-  outcome: string; // won | lost | prevented | warning_closed
-  reason: string;
-  amountMinor: number;
-  currency: string;
-  submitted: boolean; // evidence was submitted before it closed
-  // Who disputed us, described without identifying anyone: card brand and
-  // funding type, issuing country, the plan they were on, the network's own
-  // reason code, and how long they had been a customer. See segments.ts.
-  segments?: MoneySegments | null;
-  ts?: Date;
-}): void {
-  writePoint(
-    "dispute_outcomes",
-    {
-      outcome: p.outcome,
-      reason: p.reason,
-      currency: p.currency.toLowerCase(),
-      ...segmentTags(p.segments),
-    },
-    { count: 1, amount_minor: p.amountMinor, submitted: p.submitted ? 1 : 0 },
-    p.ts
-  );
-}
+// ---- the three money measurements ----
+//
+// money_out, dispute_outcomes and subscription_events are emitted from
+// src/bot/billing/moneyPoints.ts instead of from here, and are re-exported so
+// this module stays the one import site for metrics.
+//
+// They moved because they are the only measurements built from a Postgres
+// mirror, and that mirror is what makes them rebuildable — which in turn
+// demands something the helpers in this file cannot offer: a point whose tag
+// set is a pure function of ONE PERSISTED ROW. A helper taking loose
+// parameters lets a caller emit from an in-memory candidate, and two callers
+// that disagree by a single tag produce two points where they meant one. That
+// is not hypothetical: it is what made the money totals double. See the header
+// of moneyPoints.ts for the full account.
+export {
+  emitMoneyOut,
+  emitDisputeOutcome,
+  emitSubscriptionEvent,
+  MONEY_OUT_TAG_KEYS,
+  DISPUTE_OUTCOME_TAG_KEYS,
+  SUBSCRIPTION_EVENT_TAG_KEYS,
+} from "../bot/billing/moneyPoints";
 
-// One point per money-out ledger row. This is the measurement to SUM when the
-// question is "how much money left the account" — billing_events answers the
-// different question of "what did our staff do", and its refund/
-// charge_review_approved events overlap by design.
-//
-// amount_minor is signed (positive = out, negative = returned), so a window sum
-// is already net of reversals. Live emissions stamp "now"; the sweep and the
-// all-time backfill pass the real occurrence time, so identical points (same
-// tags + timestamp) overwrite instead of double-counting on a re-run.
-export function exportMoneyOut(p: {
-  bucket: string; // CASH | FEES | CONCESSION
-  category: string;
-  currency: string;
-  source: string; // webhook | sweep | backfill | action
-  amountMinor: number;
-  feeMinor?: number;
-  netMinor?: number;
-  // Descriptive axes: which plan, which card, which country, why, how old the
-  // charge was, how long the customer had been paying. Always ALL of them —
-  // segmentTags fills what the caller did not know with "unknown", because a
-  // tag present on some points and missing on others splits a Grafana group-by
-  // into two disjoint answers to one question. Never any PII: see segments.ts.
-  segments?: MoneySegments | null;
-  ts?: Date;
-}): void {
-  writePoint(
-    "money_out",
-    {
-      bucket: p.bucket,
-      category: p.category,
-      currency: p.currency.toLowerCase(),
-      source: p.source,
-      ...segmentTags(p.segments),
-    },
-    {
-      count: 1,
-      amount_minor: p.amountMinor,
-      fee_minor: p.feeMinor ?? 0,
-      net_minor: p.netMinor ?? p.amountMinor,
-    },
-    p.ts
-  );
-}
-
-// One point per subscription lifecycle movement: a signup, a plan change, a
-// scheduled or completed cancellation, a trial converting, a payment starting
-// or stopping to fail.
-//
-// This is the churn measurement, and it is NOT a money_out measurement: a
-// cancellation moves no money on the day it happens, it removes future revenue.
-// Mixing the two would double-count a refund-and-cancel as two losses.
-//
-// mrr_delta_minor is SIGNED and normalised to a month (a yearly plan counts a
-// twelfth per month), so a window sum is net revenue movement: signups and
-// upgrades positive, downgrades and churn negative. mrr_at_risk_minor is the
-// separate "scheduled to leave but has not left yet" number, which must never
-// be added to the delta or a cancellation counts twice.
 export type SubscriptionEventKind =
   | "created"
   | "trial_started"
@@ -209,55 +152,6 @@ export type SubscriptionEventKind =
   | "resumed"
   | "payment_failing"
   | "payment_recovered";
-
-export function exportSubscriptionEvent(p: {
-  event: SubscriptionEventKind;
-  planTier: string;
-  planPeriod: string;
-  // Plan change only: where it moved from. "none" on everything else, so the
-  // tag key stays present on every point in the measurement.
-  fromTier?: string | null;
-  fromPeriod?: string | null;
-  currency: string;
-  // voluntary | involuntary | unknown — a dunning failure and a decision to
-  // leave are different problems and must never share a number.
-  churnType?: string | null;
-  // Stripe's own bounded enums. The customer's free-text comment is a FIELD
-  // below, never a tag.
-  cancelReason?: string | null;
-  cancelFeedback?: string | null;
-  cardCountry?: string | null;
-  mrrDeltaMinor?: number | null;
-  mrrAtRiskMinor?: number | null;
-  // Scrubbed and truncated by segments.scrubFreeText. Free text written by a
-  // customer, so it is stored only as a field and only after redaction.
-  comment?: string | null;
-  ts?: Date;
-}): void {
-  writePoint(
-    "subscription_events",
-    {
-      event: p.event,
-      plan_tier: p.planTier,
-      plan_period: p.planPeriod,
-      from_tier: p.fromTier || "none",
-      from_period: p.fromPeriod || "none",
-      currency: p.currency.toLowerCase(),
-      churn_type: p.churnType || "unknown",
-      cancel_reason: p.cancelReason || "none",
-      cancel_feedback: p.cancelFeedback || "none",
-      card_country: p.cardCountry || "unknown",
-    },
-    {
-      count: 1,
-      mrr_delta_minor: p.mrrDeltaMinor ?? 0,
-      mrr_at_risk_minor: p.mrrAtRiskMinor ?? 0,
-      has_comment: p.comment ? 1 : 0,
-      comment: p.comment ?? undefined,
-    },
-    p.ts
-  );
-}
 
 // Gauge of the installed base, one point per tier/period on every snapshot
 // tick. Churn counts are meaningless without it: ten cancellations out of
@@ -427,6 +321,22 @@ export function exportDisputeAutoResolve(p: {
   // FIELD, not a tag: an admin pressing Execute rather than the veto window
   // expiring. A tag here would split every existing series.
   humanTriggered?: boolean;
+  // The same amount in USD cents, taken from the row's stored usdMinor.
+  //
+  // amountMinor stays in the CHARGE's own currency and must never be summed
+  // across rows — the console panel doing exactly that was adding EUR cents to
+  // USD cents and calling the result money. This is the field to total.
+  amountUsdMinor?: number | null;
+  // The dispute_auto_resolves row and the moment of THIS transition. Supplied
+  // by the live path and by the analytics rebuild; without `at` a rebuild would
+  // stamp years of decisions with the minute it ran.
+  //
+  // The dedupe key folds the outcome in because ONE row emits up to two points
+  // over its life (proposed, then its terminal outcome). Keyed on the row id
+  // alone they would share a sub-millisecond offset and, on a row proposed and
+  // blocked inside the same second, collapse into one point.
+  rowId?: string;
+  at?: Date;
 }): void {
   writePoint(
     "dispute_auto_resolve",
@@ -440,8 +350,10 @@ export function exportDisputeAutoResolve(p: {
     {
       count: 1,
       amount_minor: p.amountMinor ?? undefined,
+      amount_usd_minor: p.amountUsdMinor ?? undefined,
       human_triggered: p.humanTriggered == null ? undefined : p.humanTriggered ? 1 : 0,
-    }
+    },
+    p.at && p.rowId ? nsTimestamp(p.at, `${p.rowId}:${p.outcome}`) : undefined
   );
 }
 
@@ -576,8 +488,23 @@ export function exportDisputeModes(p: { evidencePhase: number; resolvePhase: num
 // One point per recorded dispute-history entry. The events table is the
 // authoritative record; this is the aggregate view of it, so "how often does
 // auto-submit refuse at the deadline" is a Grafana query rather than a SQL one.
-export function exportDisputeEvent(p: { kind: string; automated: boolean }): void {
-  writePoint("dispute_event", { kind: p.kind }, { count: 1, automated: p.automated ? 1 : 0 });
+// rowId + at place the point at the moment the entry was recorded. Both are
+// supplied by the live path and by the analytics rebuild: without `at` a
+// rebuild would stamp every historical entry with the minute it ran, and
+// without `rowId` two entries of the same kind in one millisecond would be the
+// same point (the tag set carries no dispute identity, by design).
+export function exportDisputeEvent(p: {
+  kind: string;
+  automated: boolean;
+  rowId?: string;
+  at?: Date;
+}): void {
+  writePoint(
+    "dispute_event",
+    { kind: p.kind },
+    { count: 1, automated: p.automated ? 1 : 0 },
+    p.at && p.rowId ? nsTimestamp(p.at, p.rowId) : undefined
+  );
 }
 
 // Response timing for the deadline-risk view: how long we took to submit, and

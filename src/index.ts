@@ -118,6 +118,7 @@ import { makeAssignmentHub } from "./adminpanel/sections/assignmentHub";
 import { CachedRatioEngine } from "./bot/billing/disputeRatio";
 import { MoneyOutStore } from "./bot/billing/MoneyOutStore";
 import { MoneyOutService } from "./bot/billing/MoneyOutService";
+import { AnalyticsRebuildService } from "./bot/billing/AnalyticsRebuildService";
 import { StripeSegmentResolver } from "./bot/billing/StripeSegmentResolver";
 import { AutoResolveStore } from "./bot/billing/AutoResolveStore";
 import { AutoResolveService } from "./bot/billing/AutoResolveService";
@@ -359,6 +360,24 @@ async function main() {
   stripeWebhookHandler.setAutoResolveService(autoResolveService);
   stripeWebhookHandler.setEvidencePackBuilder(evidencePackBuilder);
   stripeWebhookHandler.setDisputeEventStore(disputeEvents);
+  // Full analytics rebuild (/config → Analytics → Rebuild). Reaches across every
+  // money mirror, so it is constructed here rather than owned by any one of
+  // them.
+  const analyticsRebuild = new AnalyticsRebuildService(
+    prisma,
+    settingsStore,
+    stripeClient,
+    moneyOutService,
+    moneyOutStore,
+    subscriptionEventService,
+    subscriptionEventStore,
+    disputeStore,
+    segmentResolver
+  );
+  // A restart that landed mid-rebuild must come back with the emission gate
+  // still closed, or the repair phase's half-corrected rows would start writing
+  // points that the wipe then orphans.
+  analyticsRebuild.restoreSuppression();
   // Intercom canvas/panel billing actions: approval queue + the shared
   // Discord-independent action brain (levels re-checked per request).
   const approvalStore = new ApprovalStore(prisma);
@@ -815,6 +834,8 @@ async function main() {
     billingCategory,
     disputeMonitor,
     moneyOutService,
+    analyticsRebuild,
+    analyticsRebuildReporter: (stats, error) => bot.reportAnalyticsRebuild(stats, error),
     vaultMigrator,
     client: bot.client,
     producers: temporalProducers,

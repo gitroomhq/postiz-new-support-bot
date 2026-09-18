@@ -430,6 +430,7 @@ export class AutoResolveService {
       reason: ctx.reason,
       currency: ctx.currency,
       amountMinor: decision.amountMinor,
+      amountUsdMinor: decision.usdMinor,
     });
     if (ctx.disputeId) {
       await this.events?.record({

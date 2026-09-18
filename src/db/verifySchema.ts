@@ -56,6 +56,8 @@ export const EXPECTED_COLUMNS: Record<string, string[]> = {
     "kbRefreshEnabled", "kbRefreshIntervalHours", "kbLastRefreshAt", "refundMaxPer24hPerUser", "stripeWebhookEnabled",
     "stripeWebhookEndpointId", "stripeWebhookSecret", "stripeSecretKey", "publicBaseUrl",
     "influxEnabled", "influxUrl", "influxOrg", "influxBucket", "influxToken",
+    "analyticsRebuildPhase", "analyticsRebuildStartedAt", "analyticsRebuildDoneAt",
+    "analyticsRebuildStatsJson",
     "moneyOutEnrichEnabled", "subscriptionEventsEnabled", "subscriptionReplayDoneAt",
     "scoringEnabled", "scoringIntervalHours", "scoringModel", "scoringMaxTicketsPerBatch",
     "scoringMaxBudgetUsdPerDay", "scoringLastRunAt", "scoringBackfillPending",
@@ -124,17 +126,21 @@ export const EXPECTED_COLUMNS: Record<string, string[]> = {
     "planTier", "planPeriod", "cardBrand", "cardFunding", "cardCountry", "networkReason", "tenure",
     "evidenceAutoStagedAt", "evidenceAutoScore", "evidenceTemplateVersion", "evidenceAutoFields",
     "evidenceTouchedAt", "evidenceTouchedBy", "evidenceAutoSubmitAt", "evidenceAutoOptOut",
+    "closedAtEstimated", "closedAtSource", "usdMinor", "fxRate",
   ],
   stripe_money_out: [
     "id", "kind", "bucket", "category", "amountMinor", "feeMinor", "netMinor", "currency", "source",
     "reason", "stripeObjectId", "chargeId", "customerId", "occurredAt", "createdAt", "updatedAt",
     "planTier", "planPeriod", "cardBrand", "cardFunding", "cardCountry", "refundReason", "refundKind",
     "chargeAge", "tenure", "networkReason", "surface",
+    "usdMinor", "feeUsdMinor", "netUsdMinor", "fxRate", "fxRatesAt", "invoiceId",
+    "retiredAt", "retiredReason",
   ],
   stripe_subscription_events: [
     "id", "subscriptionId", "customerId", "event", "planTier", "planPeriod", "fromTier", "fromPeriod",
     "currency", "mrrMinor", "mrrDeltaMinor", "mrrAtRiskMinor", "churnType", "cancelReason",
     "cancelFeedback", "comment", "cardCountry", "source", "occurredAt", "createdAt",
+    "mrrDeltaUsdMinor", "mrrAtRiskUsdMinor", "fxRate",
   ],
   blocked_entities: [
     "id", "kind", "value", "reason", "source", "actorId", "actorName", "customerId", "disputeId",
@@ -155,6 +161,7 @@ export const EXPECTED_COLUMNS: Record<string, string[]> = {
     "usdMinor", "reason", "state", "guardrail", "fireAt", "alertedAt", "alertChannelId",
     "alertMessageId", "vetoedById", "vetoedByName", "vetoedAt", "executedAt", "refundId",
     "subsCancelledAt", "intercomNotedAt", "attempts", "lastError", "createdAt", "updatedAt",
+    "blockedAt", "failedAt",
   ],
   sentry_feedback_imports: [
     "id", "sentryIssueId", "sentryShortId", "projectSlug", "status", "contactEmail", "contactName",

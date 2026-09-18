@@ -16,7 +16,7 @@ import {
   exportBillingEvent,
   exportDisputeEvidencePack,
   exportDisputeModes,
-  exportDisputeOutcome,
+  emitDisputeOutcome,
   exportDisputeResponse,
   exportDisputeSnapshot,
 } from "../../metrics/MetricsExporter";
@@ -118,6 +118,10 @@ export interface DisputeBackfillResult {
   swept: number;
   terminal: number;
   points: number;
+  // Disputes whose closedAt was upgraded from a guess to the real moment, taken
+  // from Stripe's event stream. Reported because it is the number that explains
+  // a win-rate chart shifting along the time axis after a rebuild.
+  closedAtImproved: number;
   truncated: boolean;
 }
 
@@ -147,50 +151,105 @@ const BACKFILL_SEGMENT_BUDGET = 400;
 export async function backfillDisputeHistory(
   stripe: StripeClient,
   disputeStore: DisputeStore,
-  segments?: StripeSegmentResolver
+  segments?: StripeSegmentResolver,
+  opts: {
+    // Stripe reads the whole run may spend on segments. Overridable so the
+    // analytics rebuild, which is allowed to be slow and thorough, can buy
+    // axes for a history this default deliberately leaves as "unknown".
+    segmentBudget?: number;
+    // Skip the re-emission entirely. The analytics rebuild repairs the mirror
+    // with Influx suppressed and re-emits afterwards in its own phase, so
+    // emitting here would write points the wipe then deletes.
+    repairOnly?: boolean;
+    onProgress?: () => void;
+  } = {}
 ): Promise<DisputeBackfillResult> {
   const now = new Date();
   const sweep = await stripe.listAllDisputes();
   // One budget for the run. Letting each upsert open its own would mean the cap
   // never caps: a thousand disputes would each get a fresh allowance.
-  segments?.startBatch(BACKFILL_SEGMENT_BUDGET);
+  segments?.startBatch(opts.segmentBudget ?? BACKFILL_SEGMENT_BUDGET);
+  // Authoritative close times, where Stripe still remembers them. Fetched once
+  // for the whole sweep rather than per dispute: it is a handful of event pages
+  // against a 30-day window, and it is the only way an already-stored estimate
+  // can ever be replaced (closedAt is otherwise write-once).
+  const exactCloses = await fetchExactCloseTimes(stripe).catch((error) => {
+    monitorLog.warn("dispute close-time lookup failed", { "error.message": String(error) });
+    return new Map<string, Date>();
+  });
+  let closedAtImproved = 0;
+
   for (const dispute of sweep.disputes) {
+    opts.onProgress?.();
     const chargeId = typeof dispute.charge === "string" ? dispute.charge : (dispute.charge?.id ?? null);
     const existing = await disputeStore.get(dispute.id);
     const customerId =
       existing?.customerId ??
       (chargeId ? await stripe.getChargeCustomerId(chargeId).catch(() => null) : null);
+    const exact = exactCloses.get(dispute.id);
+    if (exact && existing?.closedAtEstimated !== false) closedAtImproved++;
     await disputeStore.upsertFromStripe(dispute, customerId, {
       closedAtHint: guessClosedAt(dispute, now),
+      ...(exact ? { closedAtExact: { at: exact, source: "stripe_event" } } : {}),
       // null = this loop owns the budget opened above.
       enrichBudget: segments ? null : undefined,
+      silent: opts.repairOnly,
     });
   }
 
-  // Emit outcome points for the WHOLE terminal mirror at the stored closedAt.
-  // Live transition points used the same closedAt, so re-emission overwrites
-  // rather than double-counting.
-  let points = 0;
-  if (influxActive()) {
-    for (const row of await disputeStore.listTerminalForExport()) {
-      exportDisputeOutcome({
-        outcome: row.status,
-        reason: row.reason,
-        amountMinor: row.amount,
-        currency: row.currency,
-        submitted: row.evidenceSubmittedAt != null,
-        // Whatever the mirror knows about who disputed us. Re-emitting from the
-        // mirror rather than from Stripe is what lets a wiped Influx bucket be
-        // rebuilt with its axes intact.
-        segments: segmentsOfDispute(row),
-        ts: row.closedAt ?? undefined,
-      });
-      points++;
-    }
-    await flushInflux();
-  }
   const terminal = sweep.disputes.filter((d) => !OPEN_SET.has(d.status)).length;
-  return { swept: sweep.disputes.length, terminal, points, truncated: sweep.truncated };
+  const points = opts.repairOnly ? 0 : await reemitDisputeOutcomes(disputeStore);
+  return { swept: sweep.disputes.length, terminal, points, closedAtImproved, truncated: sweep.truncated };
+}
+
+// Emit an outcome point for the WHOLE terminal mirror at its stored closedAt.
+//
+// Idempotent by construction now that both this and the live transition emit
+// through emitDisputeOutcome(row): same row, same tags, same timestamp, so a
+// re-run overwrites instead of double-counting.
+export async function reemitDisputeOutcomes(
+  disputeStore: DisputeStore,
+  onProgress?: () => void
+): Promise<number> {
+  if (!influxActive()) return 0;
+  let points = 0;
+  for (const row of await disputeStore.listTerminalForExport()) {
+    onProgress?.();
+    emitDisputeOutcome(row);
+    points++;
+  }
+  await flushInflux();
+  return points;
+}
+
+// Real close times from Stripe's own event stream.
+//
+// Stripe puts no closed-at field on a dispute, so the mirror otherwise stores a
+// guess (guessClosedAt). Events carry the actual moment, but only for 30 days —
+// past that the guess is all there is, which is exactly why closedAtEstimated
+// exists as a column rather than the estimate being passed off as fact.
+async function fetchExactCloseTimes(stripe: StripeClient): Promise<Map<string, Date>> {
+  const out = new Map<string, Date>();
+  const createdGte = Math.floor((Date.now() - 30 * DAY_S * 1000) / 1000);
+  let startingAfter: string | undefined;
+  for (let page = 0; page < 40; page++) {
+    const { events, hasMore } = await stripe.listEventsByType({
+      types: ["charge.dispute.closed"],
+      createdGte,
+      limit: 100,
+      ...(startingAfter ? { startingAfter } : {}),
+    });
+    if (events.length === 0) break;
+    for (const event of events) {
+      const dispute = event.data.object as Stripe.Dispute;
+      if (!dispute?.id) continue;
+      // Events page newest-first, so an earlier entry is the more recent close.
+      if (!out.has(dispute.id)) out.set(dispute.id, new Date(event.created * 1000));
+    }
+    if (!hasMore) break;
+    startingAfter = events[events.length - 1].id;
+  }
+  return out;
 }
 
 // The disputes-looper tick body: reconcile → evidence-due reminders → ratio

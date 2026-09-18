@@ -32,6 +32,15 @@ export const SINGLETONS = {
 } as const;
 
 export const VAULT_UPGRADE_WORKFLOW_ID = "vault-upgrade";
+
+// The full analytics rebuild, started ON DEMAND by the /config button.
+//
+// Deliberately NOT in SINGLETONS. ensureBaseline() signal-with-starts every
+// entry in that map on EVERY boot and on every Temporal recovery, so a rebuild
+// registered there would wipe and re-import InfluxDB on each deploy. It follows
+// the vault-upgrade shape above instead: a fixed id, started only when someone
+// asks for it.
+export const ANALYTICS_REBUILD_WORKFLOW_ID = "analytics-rebuild";
 export const STATUS_REPORT_SCHEDULE_ID = "status-report";
 
 // ---- Retired workflows/schedules (agent-rip release) ----
@@ -473,4 +482,40 @@ export interface CoreActivities {
   handleStripeEvent(input: StripeEventInput): Promise<void>;
   executeRefundCore(input: RefundWorkflowInput): Promise<RefundOutcome>;
   runVaultUpgradeJob(): Promise<void>;
+
+  // analytics rebuild — one activity per phase, so a failure retries that phase
+  // rather than restarting an hour of Stripe paging.
+  analyticsRebuildPreflight(): Promise<void>;
+  analyticsRebuildBegin(): Promise<void>;
+  analyticsRebuildRepair(stats: AnalyticsRebuildStats): Promise<AnalyticsRebuildStats>;
+  analyticsRebuildWipe(stats: AnalyticsRebuildStats): Promise<AnalyticsRebuildStats>;
+  analyticsRebuildReemit(stats: AnalyticsRebuildStats): Promise<AnalyticsRebuildStats>;
+  analyticsRebuildCatchUp(stats: AnalyticsRebuildStats, sinceMs: number): Promise<AnalyticsRebuildStats>;
+  analyticsRebuildGauges(): Promise<void>;
+  analyticsRebuildFinish(stats: AnalyticsRebuildStats | null, error: string | null): Promise<void>;
+  analyticsRebuildReport(stats: AnalyticsRebuildStats | null, error: string | null): Promise<void>;
+}
+
+// Per-phase counters, threaded through the workflow so the final report can say
+// what each phase actually did. A plain data bag: it crosses the workflow
+// sandbox boundary, so it holds no Dates and no class instances.
+export interface AnalyticsRebuildStats {
+  moneyScanned: number;
+  moneyCreated: number;
+  moneyRepaired: number;
+  creditNotes: number;
+  writeOffs: number;
+  discountRows: number;
+  invoicesScanned: number;
+  retiredEstimates: number;
+  disputesSwept: number;
+  disputeClosedAtImproved: number;
+  churnScanned: number;
+  churnCreated: number;
+  churnUsdBackfilled: number;
+  deleted: string[];
+  droppedLines: number;
+  points: number;
+  catchUpPoints: number;
+  truncated: boolean;
 }

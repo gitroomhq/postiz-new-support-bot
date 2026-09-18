@@ -2368,6 +2368,54 @@ export class DiscordBot {
 
   // Posts a standalone embed to the billing audit channel (falling back to the
   // general audit channel), for results that outlive their interaction.
+  // Final report for an analytics rebuild, posted to the billing audit channel.
+  //
+  // The audit channel rather than the ephemeral reply because the run outlives
+  // the interaction by hours, and because the numbers below are exactly what
+  // someone will want to re-read next week when a chart looks different.
+  async reportAnalyticsRebuild(stats: unknown, error: string | null): Promise<void> {
+    const s = (stats ?? {}) as Record<string, number | string[] | boolean>;
+    const n = (k: string): number => (typeof s[k] === "number" ? (s[k] as number) : 0);
+
+    if (error) {
+      await this.postBillingAuditEmbed(
+        makeEmbed(
+          `❌ **Analytics rebuild failed**\n\`\`\`${String(error).slice(0, 900)}\`\`\`\n` +
+            (n("points") > 0
+              ? "⚠️ It had already started re-emitting, so the bucket may be partly rebuilt. Running it again is safe and will finish the job."
+              : "The InfluxDB bucket was **not** modified: the wipe only runs after the Stripe walk succeeds."),
+          COLORS.danger
+        )
+      );
+      return;
+    }
+
+    const lines = [
+      `• Ledger: scanned **${n("moneyScanned")}**, **${n("moneyCreated")}** new, **${n("moneyRepaired")}** corrected`,
+      `• Concessions: **${n("creditNotes")}** credit note(s), **${n("writeOffs")}** write-off(s), **${n("discountRows")}** discount(s) across **${n("invoicesScanned")}** paid invoice(s)`,
+      `• Retired **${n("retiredEstimates")}** superseded coupon estimate(s)`,
+      `• Disputes: **${n("disputesSwept")}** swept, **${n("disputeClosedAtImproved")}** close time(s) upgraded from an estimate`,
+      `• Churn: **${n("churnScanned")}** event(s) scanned, **${n("churnCreated")}** new, **${n("churnUsdBackfilled")}** USD-backfilled`,
+      `• Re-emitted **${n("points")}** point(s), plus **${n("catchUpPoints")}** written during the run`,
+    ];
+    if (n("droppedLines") > 0) {
+      lines.push(
+        `• ⚠️ Dropped **${n("droppedLines")}** buffered line(s) that Influx had refused earlier — a sign it was unhealthy during the run`
+      );
+    }
+    if (s.truncated) {
+      lines.push("• ⚠️ A sweep hit its page cap, so the import is incomplete. Run it again to continue.");
+    }
+
+    await this.postBillingAuditEmbed(
+      makeEmbed(
+        `✅ **Analytics rebuild complete**\n${lines.join("\n")}\n\n` +
+          "_Totals are now USD across every currency, historical segments are populated rather than \"unknown\", and discounts are per-invoice actuals. Numbers will differ from before, and that is the point._",
+        COLORS.success
+      )
+    );
+  }
+
   private async postBillingAuditEmbed(embed: EmbedBuilder): Promise<void> {
     const channelId = this.settingsStore.billingAuditChannelId() ?? this.settingsStore.auditLogChannelId();
     if (!channelId) return;
@@ -3026,6 +3074,7 @@ export class DiscordBot {
                 : "**off**"
           }`,
           `**Token:** ${tokenLine}`,
+          `**Rebuild:** ${this.analyticsRebuildLine()}`,
           "",
           "Exports billing/dispute gauges, Intercom bridge health and AI run costs. Settings apply live on save.",
         ].join("\n")
@@ -3045,7 +3094,35 @@ export class DiscordBot {
       new ButtonBuilder().setCustomId("config_aianalytics").setLabel("Back").setStyle(ButtonStyle.Secondary)
     );
 
-    return { embeds: [embed], components: [influxRow] };
+    const rebuildRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId("config_analytics_rebuild")
+        .setLabel("Full rebuild")
+        .setStyle(ButtonStyle.Danger)
+        // Nothing to rebuild into when the exporter is inactive, and a second
+        // run while one is in flight would fight it for the same bucket.
+        .setDisabled(!influxActive() || s.analyticsRebuildActive())
+    );
+
+    return { embeds: [embed], components: [influxRow, rebuildRow] };
+  }
+
+  // One line of rebuild state for the Analytics panel.
+  private analyticsRebuildLine(): string {
+    const s = this.settingsStore;
+    const phase = s.analyticsRebuildPhase();
+    if (phase) {
+      const since = s.analyticsRebuildStartedAt();
+      const mins = since ? Math.round((Date.now() - since.getTime()) / 60_000) : 0;
+      return `**running** — ${phase} (${mins}m)`;
+    }
+    const done = s.analyticsRebuildDoneAt();
+    if (!done) return "never run";
+    const stats = s.analyticsRebuildStats();
+    const failed = stats && typeof stats.error === "string" && stats.error;
+    return failed
+      ? `last run <t:${Math.floor(done.getTime() / 1000)}:R> ⚠️ failed`
+      : `last run <t:${Math.floor(done.getTime() / 1000)}:R>`;
   }
 
   // One-line Vault state for the main config panel's Infrastructure field.
@@ -4677,7 +4754,7 @@ export class DiscordBot {
           }
           if (scope !== "ledger" && !reemit) {
             parts.push(
-              `**${result.creditNotes}** credit note(s), **${result.writeOffs}** write-off(s), **${result.discounts}** subscription(s) with live coupons`
+              `**${result.creditNotes}** credit note(s), **${result.writeOffs}** write-off(s), **${result.discounts}** discount(s) across **${result.invoicesScanned}** paid invoice(s)`
             );
           }
           if (result.points) parts.push(`**${result.points}** point(s) re-emitted to InfluxDB`);
@@ -4686,8 +4763,8 @@ export class DiscordBot {
             makeEmbed(
               `✅ **Money-out backfill complete** (${reemit ? "re-emit" : scope}, ${secs}s)\n` +
                 (parts.length ? parts.map((p) => `• ${p}`).join("\n") : "• nothing found") +
-                (result.discountsHistoricalUnavailable
-                  ? "\n\n⚠️ Only coupons **currently attached** to an active subscription could be imported. Stripe has no endpoint for discounts that already ended, so past coupons are not recoverable: from here on they are captured live by webhook."
+                (result.repaired
+                  ? `\n\n🔧 Corrected **${result.repaired}** existing row(s) that an earlier pass had left incomplete.`
                   : "") +
                 (result.truncated ? "\n⚠️ The ledger sweep hit its page cap. Run it again to continue." : "") +
                 (!result.points && !reemit
@@ -5197,6 +5274,96 @@ export class DiscordBot {
       await reconfigureInflux(this.settingsStore.influxConfig());
       this.auditConfig(interaction, `Influx export → ${this.settingsStore.influxEnabled() ? "on" : "off"}`);
       await interaction.update(await this.buildAnalyticsPanel());
+      return;
+    }
+
+    if (id === "config_analytics_rebuild") {
+      // Confirm step, even though the run itself is one press.
+      //
+      // This is not a dry run — it is the only defense against a misclick, and
+      // against a staging instance that has been pointed at the production
+      // bucket. Naming the BUCKET is the part that matters: an operator who
+      // reads the wrong name here is the one person who can still stop it.
+      await interaction.deferReply({ flags: 64 });
+      const st = this.settingsStore;
+      if (st.analyticsRebuildActive()) {
+        await interaction.editReply({
+          embeds: [
+            makeEmbed(
+              `A rebuild is already running (**${st.analyticsRebuildPhase()}**). Its result will post to the billing audit channel.`,
+              COLORS.warn
+            ),
+          ],
+        });
+        return;
+      }
+      const confirm = new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder()
+          .setCustomId("config_analytics_rebuild_go")
+          .setLabel("Wipe and rebuild")
+          .setStyle(ButtonStyle.Danger),
+        new ButtonBuilder().setCustomId("config_analytics").setLabel("Cancel").setStyle(ButtonStyle.Secondary)
+      );
+      await interaction.editReply({
+        embeds: [
+          makeEmbed(
+            [
+              `⚠️ This **permanently deletes** analytics data from bucket \`${st.influxBucket()}\` at \`${st.influxUrl()}\`.`,
+              "",
+              "**Deleted and rebuilt** from Postgres: money_out, dispute_outcomes, subscription_events, dispute_event, dispute_auto_resolve, ai_runs.",
+              "**Left alone**: billing_events and every gauge — nothing can regenerate those, so they are never touched.",
+              "",
+              "It re-walks all of Stripe first and only wipes once that succeeds, so a failure part-way leaves the bucket as it is.",
+              "Expect **minutes to hours**. Progress and the result post to the billing audit channel.",
+              "",
+              "_Numbers will move: historical segments stop reading \"unknown\", discounts switch from a one-per-coupon estimate to per-invoice actuals, and totals are USD rather than mixed currencies._",
+            ].join("\n"),
+            COLORS.danger
+          ),
+        ],
+        components: [confirm],
+      });
+      return;
+    }
+
+    if (id === "config_analytics_rebuild_go") {
+      await interaction.deferReply({ flags: 64 });
+      // /config is admin-gated at the entry point, but this is destructive and
+      // irreversible, so the handler re-checks rather than trusting that.
+      if (!interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)) {
+        await interaction.editReply({
+          embeds: [makeEmbed("Administrator permission is required to rebuild analytics.", COLORS.danger)],
+        });
+        return;
+      }
+      const started = await this.temporalProducers?.startAnalyticsRebuild().catch((e) => ({
+        ok: false as const,
+        reason: String(e),
+      }));
+      if (!started?.ok) {
+        // No in-process fallback on purpose. A multi-hour job that a restart
+        // silently abandons is exactly what the workflow exists to prevent, and
+        // abandoning it half-way through the wipe would be worse than not
+        // starting at all.
+        await interaction.editReply({
+          embeds: [
+            makeEmbed(
+              "Could not start the rebuild: Temporal is unreachable, and this job is not safe to run without it (a restart mid-run would abandon it). Check the worker in /config → Temporal and try again.",
+              COLORS.danger
+            ),
+          ],
+        });
+        return;
+      }
+      this.auditConfig(interaction, `Full analytics rebuild started (bucket ${this.settingsStore.influxBucket()})`);
+      await interaction.editReply({
+        embeds: [
+          makeEmbed(
+            "⏳ Rebuild started. It walks Stripe first, then wipes and re-emits.\n\nThe result posts to the billing audit channel; you can close this and keep working.",
+            COLORS.brand
+          ),
+        ],
+      });
       return;
     }
 

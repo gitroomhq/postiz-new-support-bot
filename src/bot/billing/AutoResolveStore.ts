@@ -85,7 +85,7 @@ export class AutoResolveStore {
   async recordBlocked(input: BlockedInput): Promise<{ created: boolean; row: DisputeAutoResolve }> {
     try {
       const row = await this.prisma.disputeAutoResolve.create({
-        data: { ...input, state: "BLOCKED", fireAt: new Date() },
+        data: { ...input, state: "BLOCKED", fireAt: new Date(), blockedAt: new Date() },
       });
       return { created: true, row };
     } catch (error) {
@@ -168,7 +168,13 @@ export class AutoResolveStore {
   }
 
   async markBlocked(id: string, guardrail: Guardrail): Promise<void> {
-    await this.prisma.disputeAutoResolve.update({ where: { id }, data: { state: "BLOCKED", guardrail } });
+    // blockedAt is stamped separately from updatedAt because `attempts` also
+    // bumps updatedAt, so it cannot say WHEN the decision was blocked — which
+    // is what the analytics rebuild needs to place the point in time.
+    await this.prisma.disputeAutoResolve.update({
+      where: { id },
+      data: { state: "BLOCKED", guardrail, blockedAt: new Date() },
+    });
   }
 
   // A human refunded inside the veto window, so the engine's work is already
@@ -183,7 +189,13 @@ export class AutoResolveStore {
     const failed = (row?.attempts ?? 0) >= maxAttempts;
     await this.prisma.disputeAutoResolve.update({
       where: { id },
-      data: { state: failed ? "FAILED" : "PENDING", lastError: error.slice(0, 500) },
+      data: {
+        state: failed ? "FAILED" : "PENDING",
+        lastError: error.slice(0, 500),
+        // Only on the transition that ends the row; a retry back to PENDING
+        // has not failed yet.
+        ...(failed ? { failedAt: new Date() } : {}),
+      },
     });
     return failed ? "failed" : "retry";
   }

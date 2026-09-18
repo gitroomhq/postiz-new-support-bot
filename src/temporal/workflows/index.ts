@@ -22,3 +22,6 @@ export {
   moneyOutWorkflow,
 } from "./loopers.workflow";
 export { publishStatusReportWorkflow, stripeEventWorkflow, refundWorkflow, vaultUpgradeWorkflow } from "./ops.workflow";
+// Started on demand by /config → Analytics → Rebuild, never by ensureBaseline:
+// it is not a looper, and registering it as one would rebuild on every deploy.
+export { analyticsRebuildWorkflow } from "./analyticsRebuild.workflow";

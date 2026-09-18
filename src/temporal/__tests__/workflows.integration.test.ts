@@ -396,4 +396,98 @@ test("workflow suite (time-skipping)", { skip: !ENABLED && "set TEMPORAL_TEST=1 
       assert.equal(await retireWorkflowId(env.client, "never-started-retired", "agent-rip test"), false);
     });
   });
+
+  await t.test("analyticsRebuildWorkflow runs its phases in order and reports", async () => {
+    const calls: string[] = [];
+    const stats = { points: 0 } as Record<string, unknown>;
+    const activities: AnyRecord = {
+      analyticsRebuildPreflight: async () => {
+        calls.push("preflight");
+      },
+      analyticsRebuildBegin: async () => {
+        calls.push("begin");
+      },
+      analyticsRebuildRepair: async () => {
+        calls.push("repair");
+        return stats;
+      },
+      analyticsRebuildWipe: async () => {
+        calls.push("wipe");
+        return stats;
+      },
+      analyticsRebuildReemit: async () => {
+        calls.push("reemit");
+        return stats;
+      },
+      analyticsRebuildCatchUp: async () => {
+        calls.push("catchup");
+        return stats;
+      },
+      analyticsRebuildGauges: async () => {
+        calls.push("gauges");
+      },
+      analyticsRebuildFinish: async () => {
+        calls.push("finish");
+      },
+      analyticsRebuildReport: async () => {
+        calls.push("report");
+      },
+    };
+    const worker = await makeWorker(activities);
+    await worker.runUntil(async () => {
+      await env.client.workflow.execute("analyticsRebuildWorkflow", {
+        taskQueue,
+        workflowId: "analytics-rebuild-ok",
+      });
+    });
+    // Repair BEFORE wipe is the ordering the whole design rests on: a Stripe
+    // walk that dies part-way must leave the bucket untouched.
+    assert.deepEqual(calls, [
+      "preflight",
+      "begin",
+      "repair",
+      "wipe",
+      "reemit",
+      "catchup",
+      "gauges",
+      "finish",
+      "report",
+    ]);
+  });
+
+  await t.test("a failed preflight never reaches the wipe", async () => {
+    // The single most important assertion in this file. Preflight exists to
+    // prove the delete endpoint works BEFORE anything destructive happens; if a
+    // refactor ever let the wipe run regardless, this is what catches it.
+    const calls: string[] = [];
+    const activities: AnyRecord = {
+      analyticsRebuildPreflight: async () => {
+        calls.push("preflight");
+        throw ApplicationFailure.nonRetryable("influx delete unsupported", "influx_delete_unsupported");
+      },
+      analyticsRebuildBegin: async () => calls.push("begin"),
+      analyticsRebuildRepair: async () => calls.push("repair"),
+      analyticsRebuildWipe: async () => calls.push("wipe"),
+      analyticsRebuildReemit: async () => calls.push("reemit"),
+      analyticsRebuildCatchUp: async () => calls.push("catchup"),
+      analyticsRebuildGauges: async () => calls.push("gauges"),
+      analyticsRebuildFinish: async () => calls.push("finish"),
+      analyticsRebuildReport: async () => calls.push("report"),
+    };
+    const worker = await makeWorker(activities);
+    await worker.runUntil(async () => {
+      await assert.rejects(
+        env.client.workflow.execute("analyticsRebuildWorkflow", {
+          taskQueue,
+          workflowId: "analytics-rebuild-preflight-fail",
+        })
+      );
+    });
+    assert.ok(!calls.includes("wipe"), "the bucket must never be wiped after a failed preflight");
+    assert.ok(!calls.includes("repair"), "nor should Stripe be walked");
+    // The gate and the single-flight lock must still be cleared, or every money
+    // point stays suppressed until somebody notices.
+    assert.ok(calls.includes("finish"), "finish must run on the failure path");
+    assert.ok(calls.includes("report"), "and the failure must be reported");
+  });
 });

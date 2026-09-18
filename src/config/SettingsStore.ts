@@ -1255,6 +1255,46 @@ export class SettingsStore {
     this.settings = await this.prisma.botSettings.update({ where: { id: "global" }, data });
   }
 
+  // ---- Full analytics rebuild ----
+
+  // Non-null means a rebuild is in flight. It is BOTH the single-flight lock
+  // and the Influx emission gate, and it lives in the database rather than in
+  // memory so a restart mid-rebuild resumes with the gate still closed.
+  analyticsRebuildPhase(): string | null {
+    return this.settings.analyticsRebuildPhase;
+  }
+
+  analyticsRebuildActive(): boolean {
+    return this.settings.analyticsRebuildPhase != null;
+  }
+
+  analyticsRebuildStartedAt(): Date | null {
+    return this.settings.analyticsRebuildStartedAt;
+  }
+
+  analyticsRebuildDoneAt(): Date | null {
+    return this.settings.analyticsRebuildDoneAt;
+  }
+
+  analyticsRebuildStats(): Record<string, unknown> | null {
+    const raw = this.settings.analyticsRebuildStatsJson;
+    if (!raw) return null;
+    try {
+      return JSON.parse(raw) as Record<string, unknown>;
+    } catch {
+      return null;
+    }
+  }
+
+  async updateAnalyticsRebuild(data: {
+    analyticsRebuildPhase?: string | null;
+    analyticsRebuildStartedAt?: Date | null;
+    analyticsRebuildDoneAt?: Date | null;
+    analyticsRebuildStatsJson?: string | null;
+  }): Promise<void> {
+    this.settings = await this.prisma.botSettings.update({ where: { id: "global" }, data });
+  }
+
   // ---- Subscription lifecycle / churn analytics ----
 
   subscriptionEventsEnabled(): boolean {

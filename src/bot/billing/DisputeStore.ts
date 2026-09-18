@@ -1,6 +1,7 @@
 import type Stripe from "stripe";
 import { Prisma, PrismaClient, StripeDispute } from "../../generated/prisma/client";
-import { exportDisputeOutcome } from "../../metrics/MetricsExporter";
+import { emitDisputeOutcome } from "../../metrics/MetricsExporter";
+import { usdMinorOf } from "./fx";
 import type { StripeSegmentResolver } from "./StripeSegmentResolver";
 import type { MoneySegments } from "./segments";
 
@@ -42,6 +43,46 @@ export function segmentsOfDispute(row: {
     networkReason: row.networkReason,
     tenure: row.tenure,
   };
+}
+
+// When a dispute closed, and how sure we are.
+//
+// Stripe exposes no closed-at timestamp, so this is inferred unless an
+// authoritative source says otherwise. Three cases, in priority order:
+//
+//   closedAtExact  — a real moment, from Stripe's own events. Overwrites a
+//                    stored estimate, which is the whole point: closedAt is
+//                    otherwise write-once, so a first bad guess would be
+//                    permanent and the estimate could never be improved.
+//   stored         — already decided; an estimate stays put rather than
+//                    drifting every time a webhook re-reads the dispute.
+//   hint / now     — the backfill's guess, or "we saw it close just now",
+//                    which is accurate for a live transition and is therefore
+//                    recorded as observed rather than estimated.
+function closedAtColumns(
+  terminal: boolean,
+  existing: StripeDispute | null,
+  opts?: { closedAtHint?: Date; closedAtExact?: { at: Date; source: string } }
+): { closedAt: Date | null; closedAtEstimated?: boolean; closedAtSource?: string } {
+  if (!terminal) return { closedAt: null };
+  if (opts?.closedAtExact) {
+    return {
+      closedAt: opts.closedAtExact.at,
+      closedAtEstimated: false,
+      closedAtSource: opts.closedAtExact.source,
+    };
+  }
+  if (existing?.closedAt) return { closedAt: existing.closedAt };
+  if (opts?.closedAtHint) {
+    return { closedAt: opts.closedAtHint, closedAtEstimated: true, closedAtSource: "backfill_guess" };
+  }
+  // We watched it happen, so the time is real even though Stripe never said it.
+  return { closedAt: new Date(), closedAtEstimated: false, closedAtSource: "observed" };
+}
+
+function usdColumns(amountMinor: number, currency: string): { usdMinor?: number; fxRate?: number } {
+  const usd = usdMinorOf(amountMinor, currency);
+  return usd ? { usdMinor: usd.usdMinor, fxRate: usd.rate } : {};
 }
 
 // Terminal states never regress: a late-delivered charge.dispute.updated must
@@ -160,6 +201,19 @@ export class DisputeStore {
       // budget covers every dispute instead of each one getting a fresh
       // allowance and the sweep costing reads without limit).
       enrichBudget?: number | null;
+      // An AUTHORITATIVE close time, which replaces whatever is stored.
+      //
+      // Distinct from closedAtHint, which only fills a blank: closedAt is
+      // otherwise write-once (`existing?.closedAt ?? …`), so a first, bad guess
+      // is permanent and there is no way to improve it later. The rebuild
+      // derives the real moment from Stripe's own events, within their 30-day
+      // retention, and this is how that gets in.
+      closedAtExact?: { at: Date; source: string };
+      // Suppress the outcome point for this upsert. The analytics rebuild
+      // repairs the whole mirror with emission off and then re-emits the
+      // finished state in one pass; a point written mid-repair would be built
+      // from half-corrected tags.
+      silent?: boolean;
     }
   ): Promise<StripeDispute> {
     const chargeId = typeof d.charge === "string" ? d.charge : (d.charge?.id ?? "");
@@ -190,7 +244,12 @@ export class DisputeStore {
       // object stops carrying useful evidence long after closing? it doesn't,
       // but an empty read must not wipe a previous snapshot).
       evidenceFinal: finalSnapshot ?? (existing?.evidenceFinal as Prisma.InputJsonValue | undefined) ?? undefined,
-      closedAt: terminal ? (existing?.closedAt ?? opts?.closedAtHint ?? new Date()) : null,
+      ...closedAtColumns(terminal, existing, opts),
+      // The frozen USD conversion, so a dispute_outcomes point can be summed
+      // across currencies. Converted once, with the rate kept, and never
+      // recomputed: `amount` and `currency` cannot change on a dispute, so a
+      // row that already has one keeps it.
+      ...(existing?.fxRate != null ? {} : usdColumns(d.amount, d.currency)),
       // Never blank out an axis a previous pass resolved: a lookup that ran out
       // of budget returns undefined here and leaves the stored value alone.
       planTier: segments?.planTier ?? undefined,
@@ -210,16 +269,11 @@ export class DisputeStore {
     // Disputes first seen already-closed are covered by the history backfill
     // (which emits at their historical closedAt) — emitting them here would
     // burst a fresh deploy's first reconcile at "now".
-    if (existing && !TERMINAL_STATUSES.has(existing.status) && terminal) {
-      exportDisputeOutcome({
-        outcome: row.status,
-        reason: row.reason,
-        amountMinor: row.amount,
-        currency: row.currency,
-        submitted: row.evidenceSubmittedAt != null,
-        segments: segmentsOfDispute(row),
-        ts: row.closedAt ?? undefined,
-      });
+    //
+    // Emitted from `row`, the value Postgres just returned, so this point and
+    // the one a later rebuild produces are identical by construction.
+    if (!opts?.silent && existing && !TERMINAL_STATUSES.has(existing.status) && terminal) {
+      emitDisputeOutcome(row);
     }
     return row;
   }
@@ -418,7 +472,11 @@ export class DisputeStore {
         | "amount"
         | "currency"
         | "closedAt"
+        | "closedAtEstimated"
+        | "closedAtSource"
         | "evidenceSubmittedAt"
+        | "usdMinor"
+        | "fxRate"
         // The descriptive axes, so a re-emit carries them without re-reading
         // Stripe. That is the whole point of mirroring them.
         | "planTier"
@@ -440,7 +498,41 @@ export class DisputeStore {
         amount: true,
         currency: true,
         closedAt: true,
+        closedAtEstimated: true,
+        closedAtSource: true,
         evidenceSubmittedAt: true,
+        usdMinor: true,
+        fxRate: true,
+        planTier: true,
+        planPeriod: true,
+        cardBrand: true,
+        cardFunding: true,
+        cardCountry: true,
+        networkReason: true,
+        tenure: true,
+      },
+      orderBy: { closedAt: "asc" },
+    });
+  }
+
+  // Terminal disputes whose row changed since a moment — the rebuild's tail
+  // catch-up. A dispute that closed while emission was suppressed, or after the
+  // re-emit had already read the mirror, would otherwise never reach Influx.
+  async listTerminalChangedSince(since: Date): Promise<Awaited<ReturnType<DisputeStore["listTerminalForExport"]>>> {
+    return this.prisma.stripeDispute.findMany({
+      where: { status: { in: [...TERMINAL_STATUSES] }, updatedAt: { gte: since } },
+      select: {
+        id: true,
+        status: true,
+        reason: true,
+        amount: true,
+        currency: true,
+        closedAt: true,
+        closedAtEstimated: true,
+        closedAtSource: true,
+        evidenceSubmittedAt: true,
+        usdMinor: true,
+        fxRate: true,
         planTier: true,
         planPeriod: true,
         cardBrand: true,

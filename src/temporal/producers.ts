@@ -11,6 +11,7 @@ import {
   retireByQuery,
   retireWorkflowId,
 } from "./looperGeneration";
+import { analyticsRebuildProgressQuery } from "./workflows/definitions";
 import {
   inboxWorkflowId,
   LOOPER_GENERATIONS,
@@ -37,6 +38,7 @@ import {
   stripeEventWorkflowId,
   ticketWorkflowId,
   UPD_APPLY_STATUS,
+  ANALYTICS_REBUILD_WORKFLOW_ID,
   VAULT_UPGRADE_WORKFLOW_ID,
   type KeywordSaKey,
   type ApplyStatusResult,
@@ -233,6 +235,36 @@ export class TemporalProducers {
   }
 
   // ---- ops ----
+
+  // Start the full analytics rebuild. On demand only — it is deliberately absent
+  // from ensureBaseline's `singles`, where it would fire on every boot.
+  //
+  // FAIL rather than USE_EXISTING on conflict: a second press must report "one
+  // is already running" instead of silently resolving to the first, because the
+  // operator needs to know which run they are watching.
+  async startAnalyticsRebuild(): Promise<GatewayResult> {
+    return this.temporal.startWorkflow({
+      workflowType: "analyticsRebuildWorkflow",
+      workflowId: ANALYTICS_REBUILD_WORKFLOW_ID,
+      options: { workflowIdConflictPolicy: "FAIL" },
+    });
+  }
+
+  // Live phase for the /config panel. Null when nothing is running, which is
+  // also what a Temporal that is unreachable looks like — the panel falls back
+  // to the persisted phase for that case.
+  async analyticsRebuildProgress(): Promise<{ phase: string; stats: unknown } | null> {
+    try {
+      const client = await this.temporal.client();
+      if (!client) return null;
+      const handle = client.workflow.getHandle(ANALYTICS_REBUILD_WORKFLOW_ID);
+      const desc = await handle.describe();
+      if (desc.status.name !== "RUNNING") return null;
+      return await handle.query(analyticsRebuildProgressQuery);
+    } catch {
+      return null;
+    }
+  }
 
   async startVaultUpgrade(): Promise<GatewayResult> {
     return this.temporal.startWorkflow({

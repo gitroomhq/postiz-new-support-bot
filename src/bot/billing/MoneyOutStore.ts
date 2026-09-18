@@ -1,6 +1,31 @@
 import { PrismaClient, StripeMoneyOut } from "../../generated/prisma/client";
 import type { MoneyOutBucket, MoneyOutCategory, MoneyOutRow } from "./moneyOutTaxonomy";
 import type { MoneySegments } from "./segments";
+import { RATES_SAMPLED_AT, usdMinorOf } from "./fx";
+
+// Every read excludes retired rows, and this is the one place that says so.
+//
+// A retired row is one superseded by a better measurement of the same money —
+// currently only the per-coupon discount ESTIMATES replaced by invoice-derived
+// actuals. It is kept for the audit trail and must count towards nothing, so
+// missing this filter on a single query silently doubles a concession total.
+const LIVE = { retiredAt: null } as const;
+
+// The frozen USD conversion for a row being written. Converted once, with the
+// rate and the table revision stored alongside, so a later revision of fx.ts
+// restates nothing that has already happened. A currency with no rate gets
+// nulls and charts as absent rather than as zero.
+function usdColumns(row: Pick<MoneyOutRow, "amountMinor" | "feeMinor" | "netMinor" | "currency">) {
+  const amount = usdMinorOf(row.amountMinor, row.currency);
+  if (!amount) return { usdMinor: null, feeUsdMinor: null, netUsdMinor: null, fxRate: null, fxRatesAt: null };
+  return {
+    usdMinor: amount.usdMinor,
+    feeUsdMinor: usdMinorOf(row.feeMinor, row.currency)?.usdMinor ?? 0,
+    netUsdMinor: usdMinorOf(row.netMinor, row.currency)?.usdMinor ?? amount.usdMinor,
+    fxRate: amount.rate,
+    fxRatesAt: RATES_SAMPLED_AT,
+  };
+}
 
 // The segment axes flattened into their own columns. Kept as columns rather
 // than a JSON blob so Postgres can group by them directly — the Discord and
@@ -65,10 +90,14 @@ export interface MoneyOutPageFilters {
 export class MoneyOutStore {
   constructor(private prisma: PrismaClient) {}
 
-  // Returns true when the row did NOT exist before — the caller uses that to
-  // decide whether to emit an Influx point, so a re-sweep of already-known
-  // transactions stays silent instead of re-counting them.
-  async upsert(row: MoneyOutRow): Promise<boolean> {
+  // Writes the row and hands back what the database now holds, plus whether it
+  // was new. The caller emits a point only when it was new, so a re-sweep of
+  // already-known transactions stays silent instead of re-counting.
+  //
+  // Returning the PERSISTED row matters as much as the flag: the caller must
+  // emit from the same shape a later rebuild reads back out of Postgres, or the
+  // two produce points that differ by a tag — which in Influx is two points.
+  async upsert(row: MoneyOutRow): Promise<{ created: boolean; row: StripeMoneyOut }> {
     const existing = await this.prisma.stripeMoneyOut.findUnique({ where: { id: row.id }, select: { id: true } });
     const data = {
       kind: row.kind,
@@ -83,11 +112,12 @@ export class MoneyOutStore {
       stripeObjectId: row.stripeObjectId,
       chargeId: row.chargeId,
       customerId: row.customerId,
+      invoiceId: row.invoiceId ?? null,
       occurredAt: row.occurredAt,
     };
-    await this.prisma.stripeMoneyOut.upsert({
+    const saved = await this.prisma.stripeMoneyOut.upsert({
       where: { id: row.id },
-      create: { id: row.id, ...data, ...segmentColumns(row.segments) },
+      create: { id: row.id, ...data, ...usdColumns(row), ...segmentColumns(row.segments) },
       // A later pass may know things the first one didn't (the customer id the
       // webhook path resolves), but must never blank out what is already there.
       update: {
@@ -97,7 +127,7 @@ export class MoneyOutStore {
         ...definedSegmentColumns(row.segments),
       },
     });
-    return existing == null;
+    return { created: existing == null, row: saved };
   }
 
   // Bulk path for the ledger sweeps, which page 100 transactions at a time.
@@ -105,11 +135,15 @@ export class MoneyOutStore {
   // exist, then createMany the rest. Returns the rows that were actually new,
   // so the caller knows exactly which ones to emit as Influx points.
   //
-  // Existing rows are deliberately NOT rewritten: a balance transaction is
-  // immutable once Stripe has written it, so an update would spend a query to
-  // store the identical values. Concessions, which CAN change, keep using
-  // upsert() above.
-  async insertNew(rows: MoneyOutRow[]): Promise<MoneyOutRow[]> {
+  // Existing rows are NOT rewritten here: a balance transaction is immutable
+  // once Stripe has written it, so an update would spend a query storing
+  // identical values. Concessions, which CAN change, use upsert() above, and
+  // repair() below is how a pass that knows MORE than the first one (segments,
+  // a resolved refund kind) corrects a row already on disk.
+  //
+  // Returns the PERSISTED rows so the caller emits from what the database
+  // holds; see the header of moneyPoints.ts for why that is not a detail.
+  async insertNew(rows: MoneyOutRow[]): Promise<StripeMoneyOut[]> {
     if (rows.length === 0) return [];
     // Same id twice in one page (a fee row keyed off its movement row cannot
     // collide, but a retry inside one sweep could) would make createMany throw.
@@ -121,7 +155,7 @@ export class MoneyOutStore {
     const known = new Set(existing.map((e) => e.id));
     const fresh = deduped.filter((r) => !known.has(r.id));
     if (fresh.length === 0) return [];
-    await this.prisma.stripeMoneyOut.createMany({
+    return this.prisma.stripeMoneyOut.createManyAndReturn({
       data: fresh.map((r) => ({
         id: r.id,
         kind: r.kind,
@@ -136,14 +170,82 @@ export class MoneyOutStore {
         stripeObjectId: r.stripeObjectId,
         chargeId: r.chargeId,
         customerId: r.customerId,
+        invoiceId: r.invoiceId ?? null,
         occurredAt: r.occurredAt,
+        ...usdColumns(r),
         ...segmentColumns(r.segments),
       })),
       // A concurrent sweep (webhook mini-sweep racing the looper) may have
       // inserted the same id between the read and the write.
       skipDuplicates: true,
     });
-    return fresh;
+  }
+
+  // Correct rows that already exist, for the analytics rebuild's repair phase.
+  //
+  // This is the missing half of insertNew: a first sweep that ran without a
+  // segment budget wrote nulls, and because insertNew skips every id it has
+  // seen, those nulls were permanent — which is why all historical money
+  // charted as "unknown" on every axis.
+  //
+  // What it may NOT touch is the point: everything in MONEY_OUT_FROZEN_COLUMNS
+  // is part of a point's identity, so changing one would produce a SECOND point
+  // rather than correcting the first. Repair fills in what was unknown; it does
+  // not restate what the money was.
+  async repair(rows: MoneyOutRow[]): Promise<number> {
+    let repaired = 0;
+    for (const row of rows) {
+      const data = {
+        // Knowable only later, and never blanked back out.
+        ...definedSegmentColumns(row.segments),
+        ...(row.customerId ? { customerId: row.customerId } : {}),
+        ...(row.chargeId ? { chargeId: row.chargeId } : {}),
+        ...(row.reason ? { reason: row.reason } : {}),
+        ...(row.invoiceId ? { invoiceId: row.invoiceId } : {}),
+        // The fee a refund loses is resolved by a charge read the first pass
+        // may not have spent. netMinor moves with it.
+        ...(row.feeMinor ? { feeMinor: row.feeMinor, netMinor: row.netMinor } : {}),
+        // Frozen conversion for rows written before the columns existed.
+        ...usdColumns(row),
+      };
+      const res = await this.prisma.stripeMoneyOut.updateMany({ where: { id: row.id }, data });
+      repaired += res.count;
+    }
+    return repaired;
+  }
+
+  // Retire the per-coupon discount ESTIMATES, superseded by invoice-derived
+  // actuals. Identifiable exactly: they are the only discount rows keyed on a
+  // Stripe discount id.
+  //
+  // Retired, not deleted. This is a money ledger: an operator who sees the
+  // concession total move deserves to be able to find out why, and a second
+  // rebuild needs to be able to tell that this already happened.
+  async retireEstimatedDiscounts(reason: string): Promise<number> {
+    const res = await this.prisma.stripeMoneyOut.updateMany({
+      where: { category: "discount", id: { startsWith: "di_" }, retiredAt: null },
+      data: { retiredAt: new Date(), retiredReason: reason },
+    });
+    return res.count;
+  }
+
+  // Rows touched since a moment, for the rebuild's tail catch-up: anything a
+  // live webhook wrote while emission was suppressed, or after the re-emit
+  // cursor had already walked past its id.
+  async *iterateChangedSince(since: Date, chunkSize = 500): AsyncGenerator<StripeMoneyOut[]> {
+    let cursor: string | null = null;
+    for (;;) {
+      const batch: StripeMoneyOut[] = await this.prisma.stripeMoneyOut.findMany({
+        where: { ...LIVE, updatedAt: { gte: since } },
+        take: chunkSize,
+        ...(cursor ? { skip: 1, cursor: { id: cursor } } : {}),
+        orderBy: { id: "asc" },
+      });
+      if (batch.length === 0) return;
+      yield batch;
+      cursor = batch[batch.length - 1].id;
+      if (batch.length < chunkSize) return;
+    }
   }
 
   // Late attribution: fill in the customer on rows a sweep wrote before it
@@ -165,10 +267,10 @@ export class MoneyOutStore {
   // no amount of re-emitting will fix it.
   async coverage(): Promise<{ rows: number; oldest: Date | null; newest: Date | null; byCategory: Array<{ category: string; count: number }> }> {
     const [rows, oldest, newest, grouped] = await Promise.all([
-      this.prisma.stripeMoneyOut.count(),
-      this.prisma.stripeMoneyOut.findFirst({ orderBy: { occurredAt: "asc" }, select: { occurredAt: true } }),
-      this.prisma.stripeMoneyOut.findFirst({ orderBy: { occurredAt: "desc" }, select: { occurredAt: true } }),
-      this.prisma.stripeMoneyOut.groupBy({ by: ["category"], _count: { _all: true } }),
+      this.prisma.stripeMoneyOut.count({ where: LIVE }),
+      this.prisma.stripeMoneyOut.findFirst({ where: LIVE, orderBy: { occurredAt: "asc" }, select: { occurredAt: true } }),
+      this.prisma.stripeMoneyOut.findFirst({ where: LIVE, orderBy: { occurredAt: "desc" }, select: { occurredAt: true } }),
+      this.prisma.stripeMoneyOut.groupBy({ by: ["category"], where: LIVE, _count: { _all: true } }),
     ]);
     return {
       rows,
@@ -181,7 +283,7 @@ export class MoneyOutStore {
   }
 
   async count(): Promise<number> {
-    return this.prisma.stripeMoneyOut.count();
+    return this.prisma.stripeMoneyOut.count({ where: LIVE });
   }
 
   // Window totals grouped by bucket/category/currency — the stat tiles and the
@@ -189,7 +291,7 @@ export class MoneyOutStore {
   async windowTotals(from: Date, to: Date): Promise<MoneyOutTotal[]> {
     const grouped = await this.prisma.stripeMoneyOut.groupBy({
       by: ["bucket", "category", "currency"],
-      where: { occurredAt: { gte: from, lte: to } },
+      where: { ...LIVE, occurredAt: { gte: from, lte: to } },
       _sum: { amountMinor: true },
       _count: { _all: true },
     });
@@ -215,6 +317,7 @@ export class MoneyOutStore {
              SUM("amountMinor") AS amount
         FROM "stripe_money_out"
        WHERE "occurredAt" >= ${from} AND "occurredAt" <= ${to}
+         AND "retiredAt" IS NULL
        GROUP BY 1, 2, 3
        ORDER BY 1 ASC
     `;
@@ -235,6 +338,7 @@ export class MoneyOutStore {
     take: number
   ): Promise<{ rows: StripeMoneyOut[]; total: number }> {
     const where = {
+      ...LIVE,
       ...(filters.bucket ? { bucket: filters.bucket } : {}),
       ...(filters.category
         ? { category: filters.category }
@@ -262,7 +366,7 @@ export class MoneyOutStore {
   async topCustomers(from: Date, to: Date, limit: number): Promise<Array<{ customerId: string; amountMinor: number; count: number }>> {
     const grouped = await this.prisma.stripeMoneyOut.groupBy({
       by: ["customerId"],
-      where: { occurredAt: { gte: from, lte: to }, customerId: { not: null } },
+      where: { ...LIVE, occurredAt: { gte: from, lte: to }, customerId: { not: null } },
       _sum: { amountMinor: true },
       _count: { _all: true },
       orderBy: { _sum: { amountMinor: "desc" } },
@@ -279,6 +383,7 @@ export class MoneyOutStore {
     let cursor: string | null = null;
     for (;;) {
       const batch: StripeMoneyOut[] = await this.prisma.stripeMoneyOut.findMany({
+        where: LIVE,
         take: chunkSize,
         ...(cursor ? { skip: 1, cursor: { id: cursor } } : {}),
         orderBy: { id: "asc" },

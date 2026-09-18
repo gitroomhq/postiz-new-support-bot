@@ -14,6 +14,7 @@ import { RECLOSE_DELAY_MS } from "../../bot/StatusService";
 import type { BillingCategory } from "../../categories/BillingCategory";
 import type { DisputeMonitor } from "../../bot/billing/DisputeMonitor";
 import type { MoneyOutService } from "../../bot/billing/MoneyOutService";
+import type { AnalyticsRebuildService, RebuildStats } from "../../bot/billing/AnalyticsRebuildService";
 import type { IntercomStore } from "../../intercom/IntercomStore";
 import { isIntercomExempt, type IntercomSyncService } from "../../intercom/IntercomSyncService";
 import type { IntercomEventExecutor } from "../../intercom/IntercomEventExecutor";
@@ -72,6 +73,10 @@ export interface ActivityDeps {
   billingCategory: BillingCategory;
   disputeMonitor: DisputeMonitor;
   moneyOutService: MoneyOutService;
+  // Optional so a deploy without the analytics rebuild wired up still starts;
+  // the activities below then fail loudly rather than silently doing nothing.
+  analyticsRebuild?: AnalyticsRebuildService | null;
+  analyticsRebuildReporter?: ((stats: unknown, error: string | null) => Promise<void>) | null;
   vaultMigrator: VaultMigrator;
   client: Client;
   producers: TemporalProducers;
@@ -102,6 +107,8 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
     billingCategory,
     disputeMonitor,
     moneyOutService,
+    analyticsRebuild,
+    analyticsRebuildReporter,
     vaultMigrator,
     client,
     producers,
@@ -779,5 +786,69 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
       await vaultMigrator.runUpgradeJob();
       reconfigureInflux(settingsStore.influxConfig());
     },
+
+    // ================= analytics rebuild =================
+    //
+    // One activity per phase, so a failure retries that phase instead of
+    // restarting an hour of Stripe paging. Every long phase heartbeats per page.
+
+    async analyticsRebuildPreflight() {
+      await requireRebuild().preflight();
+    },
+
+    async analyticsRebuildBegin() {
+      await requireRebuild().begin();
+    },
+
+    async analyticsRebuildRepair(stats) {
+      heartbeat();
+      const s = stats as RebuildStats;
+      await requireRebuild().repair(s, () => heartbeat());
+      return s;
+    },
+
+    async analyticsRebuildWipe(stats) {
+      heartbeat();
+      const s = stats as RebuildStats;
+      await requireRebuild().wipe(s);
+      return s;
+    },
+
+    async analyticsRebuildReemit(stats) {
+      heartbeat();
+      const s = stats as RebuildStats;
+      await requireRebuild().reemit(s, () => heartbeat());
+      return s;
+    },
+
+    async analyticsRebuildCatchUp(stats, sinceMs) {
+      heartbeat();
+      const s = stats as RebuildStats;
+      await requireRebuild().catchUp(s, new Date(sinceMs), () => heartbeat());
+      return s;
+    },
+
+    async analyticsRebuildGauges() {
+      heartbeat();
+      await requireRebuild().refreshGauges();
+    },
+
+    async analyticsRebuildFinish(stats, error) {
+      // Must succeed even when the run failed: it clears the emission gate and
+      // the single-flight lock, and leaving either set would keep every money
+      // point suppressed until somebody noticed.
+      await requireRebuild().finish(stats as RebuildStats | null, error);
+    },
+
+    async analyticsRebuildReport(stats, error) {
+      await analyticsRebuildReporter?.(stats, error);
+    },
   };
+
+  function requireRebuild(): AnalyticsRebuildService {
+    if (!analyticsRebuild) {
+      throw new Error("the analytics rebuild service is not wired up on this deploy");
+    }
+    return analyticsRebuild;
+  }
 }

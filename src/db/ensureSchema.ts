@@ -969,6 +969,36 @@ export const STATEMENTS: string[] = [
   `ALTER TABLE "stripe_money_out" ADD COLUMN IF NOT EXISTS "surface" TEXT`,
   `CREATE INDEX IF NOT EXISTS "stripe_money_out_planTier_occurredAt_idx" ON "stripe_money_out"("planTier", "occurredAt")`,
   `CREATE INDEX IF NOT EXISTS "stripe_money_out_cardCountry_occurredAt_idx" ON "stripe_money_out"("cardCountry", "occurredAt")`,
+  // Frozen USD conversion of the ledger amounts. The original amountMinor and
+  // currency stay exactly as they were — these are the same money in one
+  // comparable unit, converted once at ingest with the rate kept alongside, so
+  // a later revision of fx.ts cannot restate history.
+  `ALTER TABLE "stripe_money_out" ADD COLUMN IF NOT EXISTS "usdMinor" INTEGER`,
+  `ALTER TABLE "stripe_money_out" ADD COLUMN IF NOT EXISTS "feeUsdMinor" INTEGER`,
+  `ALTER TABLE "stripe_money_out" ADD COLUMN IF NOT EXISTS "netUsdMinor" INTEGER`,
+  `ALTER TABLE "stripe_money_out" ADD COLUMN IF NOT EXISTS "fxRate" DOUBLE PRECISION`,
+  `ALTER TABLE "stripe_money_out" ADD COLUMN IF NOT EXISTS "fxRatesAt" TEXT`,
+  // Invoice behind an invoice-derived discount row.
+  `ALTER TABLE "stripe_money_out" ADD COLUMN IF NOT EXISTS "invoiceId" TEXT`,
+  `CREATE INDEX IF NOT EXISTS "stripe_money_out_invoiceId_idx" ON "stripe_money_out"("invoiceId")`,
+  // Superseded rows (the one-per-coupon discount estimates) are retired, never
+  // deleted: a money ledger has to be able to explain why a total moved.
+  `ALTER TABLE "stripe_money_out" ADD COLUMN IF NOT EXISTS "retiredAt" TIMESTAMP(3)`,
+  `ALTER TABLE "stripe_money_out" ADD COLUMN IF NOT EXISTS "retiredReason" TEXT`,
+  `CREATE INDEX IF NOT EXISTS "stripe_money_out_retiredAt_idx" ON "stripe_money_out"("retiredAt")`,
+  // The rebuild's tail catch-up queries updatedAt >= runStart; without this it
+  // is a sequential scan of the whole ledger.
+  `CREATE INDEX IF NOT EXISTS "stripe_money_out_updatedAt_idx" ON "stripe_money_out"("updatedAt")`,
+  // Dispute mirror: the same frozen conversion, plus an honest flag on closedAt,
+  // which Stripe does not expose and which is therefore usually an estimate.
+  `ALTER TABLE "stripe_disputes" ADD COLUMN IF NOT EXISTS "usdMinor" INTEGER`,
+  `ALTER TABLE "stripe_disputes" ADD COLUMN IF NOT EXISTS "fxRate" DOUBLE PRECISION`,
+  `ALTER TABLE "stripe_disputes" ADD COLUMN IF NOT EXISTS "closedAtEstimated" BOOLEAN NOT NULL DEFAULT true`,
+  `ALTER TABLE "stripe_disputes" ADD COLUMN IF NOT EXISTS "closedAtSource" TEXT`,
+  // BLOCKED / FAILED transition stamps — updatedAt is also bumped by retries, so
+  // it cannot place those outcomes in time.
+  `ALTER TABLE "dispute_auto_resolves" ADD COLUMN IF NOT EXISTS "blockedAt" TIMESTAMP(3)`,
+  `ALTER TABLE "dispute_auto_resolves" ADD COLUMN IF NOT EXISTS "failedAt" TIMESTAMP(3)`,
   // Subscription lifecycle mirror — the churn half of the money analytics.
   // Keyed on the Stripe event id so the 30-day replay is idempotent.
   `CREATE TABLE IF NOT EXISTS "stripe_subscription_events" (
@@ -999,6 +1029,17 @@ export const STATEMENTS: string[] = [
   `CREATE INDEX IF NOT EXISTS "stripe_subscription_events_subscriptionId_idx" ON "stripe_subscription_events"("subscriptionId")`,
   `CREATE INDEX IF NOT EXISTS "stripe_subscription_events_customerId_idx" ON "stripe_subscription_events"("customerId")`,
   `CREATE INDEX IF NOT EXISTS "stripe_subscription_events_planTier_occurredAt_idx" ON "stripe_subscription_events"("planTier", "occurredAt")`,
+  // Frozen USD conversion of the two MRR figures; same rule as the ledger's.
+  `ALTER TABLE "stripe_subscription_events" ADD COLUMN IF NOT EXISTS "mrrDeltaUsdMinor" INTEGER`,
+  `ALTER TABLE "stripe_subscription_events" ADD COLUMN IF NOT EXISTS "mrrAtRiskUsdMinor" INTEGER`,
+  `ALTER TABLE "stripe_subscription_events" ADD COLUMN IF NOT EXISTS "fxRate" DOUBLE PRECISION`,
+  // Full analytics rebuild state. analyticsRebuildPhase is both the single-flight
+  // lock and the Influx emission gate, persisted so a restart mid-rebuild
+  // resumes with the gate still closed.
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "analyticsRebuildPhase" TEXT`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "analyticsRebuildStartedAt" TIMESTAMP(3)`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "analyticsRebuildDoneAt" TIMESTAMP(3)`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "analyticsRebuildStatsJson" TEXT`,
   // Segment enrichment costs Stripe reads, so it is switchable independently of
   // the ledger itself; and the churn replay records how far it last got.
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "moneyOutEnrichEnabled" BOOLEAN NOT NULL DEFAULT true`,
