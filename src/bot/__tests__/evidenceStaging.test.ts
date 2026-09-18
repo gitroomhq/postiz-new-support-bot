@@ -301,3 +301,32 @@ test("documents: a slot a human filled is reported separately from a document th
   assert.ok(res.documentsSkipped.some((s) => s.slot === "refund_policy" && s.why === "slot already filled"));
   assert.ok(res.documentsSkipped.some((s) => s.slot === "service_documentation" && s.why !== "slot already filled"));
 });
+
+test("documents: an EMPTY library says so, per slot, instead of returning quietly", async () => {
+  // The state that reads as a broken feature. An operator who believes they
+  // uploaded a policy and sees nothing attached cannot tell a failed upload
+  // from a working one unless the pack names the slots it found nothing in.
+  const h = docHarness({ held: {} });
+  const res = await h.builder.stage(h.dispute, h.pack, false);
+  const why = Object.fromEntries(res.documentsSkipped.map((s) => [s.slot, s.why]));
+  for (const slot of ["refund_policy", "cancellation_policy", "uncategorized_file"]) {
+    assert.match(why[slot] ?? "", /no document uploaded/, slot);
+  }
+  assert.deepEqual(h.updates, [], "an empty library costs no Stripe call");
+});
+
+test("documents: an attach that THROWS is reported, not just logged", async () => {
+  // Swallowed into a log line, a Stripe rejection here looks exactly like a
+  // feature that quietly does nothing, which is how this went unexplained.
+  const h = docHarness();
+  const builder = h.builder as unknown as { stripe: { updateDisputeEvidence: () => Promise<void> } };
+  builder.stripe.updateDisputeEvidence = async () => {
+    throw new Error("idempotency_error");
+  };
+  const res = await h.builder.stage(h.dispute, h.pack, false);
+  assert.deepEqual(res.documents, []);
+  assert.ok(
+    res.documentsSkipped.some((s) => /attach failed: idempotency_error/.test(s.why)),
+    JSON.stringify(res.documentsSkipped)
+  );
+});

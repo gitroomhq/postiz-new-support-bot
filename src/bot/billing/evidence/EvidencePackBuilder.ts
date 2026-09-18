@@ -224,24 +224,31 @@ export class EvidencePackBuilder {
     if (this.documents) {
       const result = await attachStandingDocuments(this.stripe, this.documents, dispute).catch((error) => {
         // A policy that could not be attached must never sink the text pack:
-        // the fields are the argument, the documents corroborate it.
+        // the fields are the argument, the documents corroborate it. But it
+        // must not vanish into a log either: a failure reported nowhere is
+        // indistinguishable from a feature that does nothing.
+        const why = error instanceof Error ? error.message : String(error);
         packLog.warn("standing evidence documents could not be attached", {
           "stripe.dispute_id": dispute.id,
-          "error.message": error instanceof Error ? error.message : String(error),
+          "error.message": why,
         });
+        documentsSkipped.push({ slot: "policy documents", why: `attach failed: ${why}` });
         return null;
       });
       documents.push(...(result?.attached ?? []));
       for (const slot of result?.occupied ?? []) documentsSkipped.push({ slot, why: "slot already filled" });
+      for (const slot of result?.empty ?? []) documentsSkipped.push({ slot, why: "no document uploaded for this slot" });
     }
     // The two built from this dispute's own facts. Each is produced only when
     // its slot is empty, so a dispute uploads them once and the hourly rebuild
     // never touches Stripe's file API again.
     const generated = await attachGeneratedDocuments(this.stripe, dispute, pack.facts).catch((error) => {
+      const why = error instanceof Error ? error.message : String(error);
       packLog.warn("generated evidence documents could not be attached", {
         "stripe.dispute_id": dispute.id,
-        "error.message": error instanceof Error ? error.message : String(error),
+        "error.message": why,
       });
+      documentsSkipped.push({ slot: "generated documents", why: `build or attach failed: ${why}` });
       return null;
     });
     documents.push(...(generated?.attached ?? []));

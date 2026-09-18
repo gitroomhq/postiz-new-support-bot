@@ -7152,3 +7152,83 @@ test("auto-resolve execute: needs CONFIRM, and reports a guardrail refusal hones
   const superseded = await section.action!(ctx, { key: "section:disputes.autoresolve_execute", params, confirmWord: "CONFIRM" });
   assert.match(superseded.error ?? "", /already refunded/i);
 });
+
+// ---- the standing policy documents, from upload to attach ----
+
+test("policy documents: uploading one stores the Stripe file id against its slot", async () => {
+  // Never covered end to end before: the attach path was tested with a
+  // pre-populated fake store, so nothing proved the upload ever filled it.
+  const stored: Array<Record<string, unknown>> = [];
+  const uploads: string[] = [];
+  const section = makeDisputesSection({
+    ...disputesDeps(),
+    evidenceDocuments: {
+      bySlot: async () => new Map(),
+      list: async () => [],
+      put: async (input: Record<string, unknown>) => {
+        stored.push(input);
+      },
+      remove: async () => true,
+    } as never,
+  });
+  const ctx = {
+    ...disputesCtx(),
+    stripe: {
+      ...disputesCtx().stripe,
+      uploadDisputeEvidenceFile: async (name: string) => {
+        uploads.push(name);
+        return { id: "file_policy_1" };
+      },
+    },
+  } as unknown as DashboardCtx;
+
+  const res = await section.action!(ctx, {
+    key: "section:disputes.document_put",
+    params: {
+      slot: "refund_policy",
+      docName: "refund-policy.pdf",
+      docType: "application/pdf",
+      docB64: Buffer.from("%PDF-1.4 pretend").toString("base64"),
+    },
+  });
+  assert.equal(res.ok, true, res.error);
+  assert.deepEqual(uploads, ["refund-policy.pdf"]);
+  assert.equal(stored.length, 1);
+  assert.equal(stored[0].slot, "refund_policy");
+  assert.equal(stored[0].stripeFileId, "file_policy_1");
+});
+
+test("policy documents: a bad slot, type or payload is refused before anything reaches Stripe", async () => {
+  const uploads: string[] = [];
+  const section = makeDisputesSection({
+    ...disputesDeps(),
+    evidenceDocuments: { bySlot: async () => new Map(), put: async () => {}, remove: async () => true } as never,
+  });
+  const ctx = {
+    ...disputesCtx(),
+    stripe: { ...disputesCtx().stripe, uploadDisputeEvidenceFile: async () => { uploads.push("x"); return { id: "f" }; } },
+  } as unknown as DashboardCtx;
+  const b64 = Buffer.from("hi").toString("base64");
+
+  const badSlot = await section.action!(ctx, {
+    key: "section:disputes.document_put",
+    params: { slot: "receipt", docName: "a.pdf", docType: "application/pdf", docB64: b64 },
+  });
+  assert.equal(badSlot.ok, false);
+  assert.match(badSlot.error ?? "", /not a policy document slot/);
+
+  const badType = await section.action!(ctx, {
+    key: "section:disputes.document_put",
+    params: { slot: "refund_policy", docName: "a.exe", docType: "application/x-msdownload", docB64: b64 },
+  });
+  assert.equal(badType.ok, false);
+  assert.match(badType.error ?? "", /PDF, PNG or JPEG/);
+
+  const empty = await section.action!(ctx, {
+    key: "section:disputes.document_put",
+    params: { slot: "refund_policy", docName: "a.pdf", docType: "application/pdf", docB64: "" },
+  });
+  assert.equal(empty.ok, false);
+
+  assert.deepEqual(uploads, [], "a rejected upload never reaches Stripe");
+});

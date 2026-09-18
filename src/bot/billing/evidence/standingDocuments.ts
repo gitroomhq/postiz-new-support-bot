@@ -1,7 +1,7 @@
 import type Stripe from "stripe";
 import type { StripeClient } from "../../StripeClient";
 import { RESPONDABLE_DISPUTE_STATUSES } from "../DisputeStore";
-import type { EvidenceDocumentStore } from "./EvidenceDocumentStore";
+import { STANDING_DOCUMENT_SLOTS, type EvidenceDocumentStore } from "./EvidenceDocumentStore";
 import { log } from "../../../util/logger";
 
 const docLog = log.child("dispute-evidence-docs");
@@ -13,6 +13,10 @@ export interface AttachDocumentsResult {
   // policy that never attaches because a proof is sitting in its slot is worth
   // seeing.
   occupied: string[];
+  // Slots with no document in the library. This is the state that reads as a
+  // broken feature: an operator who believes they uploaded a policy and sees
+  // nothing attached has no way to tell a failed upload from a working one.
+  empty: string[];
 }
 
 // Stamp every standing document into its slot, for the slots this dispute has
@@ -31,10 +35,13 @@ export async function attachStandingDocuments(
   store: EvidenceDocumentStore,
   dispute: Stripe.Dispute
 ): Promise<AttachDocumentsResult> {
-  const out: AttachDocumentsResult = { attached: [], occupied: [] };
+  const out: AttachDocumentsResult = { attached: [], occupied: [], empty: [] };
   if (!RESPONDABLE.has(dispute.status)) return out;
 
   const documents = await store.bySlot();
+  // Walk the slots this panel offers rather than only the rows that exist, so
+  // an empty library reports itself instead of returning quietly.
+  for (const spec of STANDING_DOCUMENT_SLOTS) if (!documents.has(spec.slot)) out.empty.push(spec.slot);
   if (!documents.size) return out;
 
   const current = (dispute.evidence ?? {}) as unknown as Record<string, unknown>;
