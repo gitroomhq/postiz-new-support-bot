@@ -125,9 +125,13 @@ ${DARK_TOKENS}
   td.act .btn { margin-left:5px; }
 
   .flash:empty { display:none; }
-  .flash.ok,.flash.error { padding:10px 14px; border-radius:var(--radius-sm); font-size:14px; margin:0 0 16px; }
+  .flash.ok,.flash.error { padding:10px 14px; border-radius:var(--radius-sm); font-size:14px; margin:0 0 16px;
+    white-space:pre-line; }
   .flash.ok { background:var(--ok-weak); color:var(--ok); }
   .flash.error { background:var(--danger-weak); color:var(--danger); white-space:pre-wrap; }
+  /* A report that has to be read is dismissed by the reader, not by a timer. */
+  .flash.sticky { cursor:pointer; }
+  .flash.sticky::after { content:"Click to dismiss"; display:block; margin-top:6px; font-size:12px; opacity:.7; }
   .note { color:var(--muted); }
   .muted { color:var(--muted); }
   .ok { color:var(--ok); }

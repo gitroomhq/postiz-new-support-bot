@@ -3,10 +3,11 @@ import type { PrismaClient, DisputeEvidenceDocument } from "../../../generated/p
 // The standing evidence documents: the merchant's own published policies,
 // uploaded once and attached to every dispute that has an empty slot for them.
 //
-// Deliberately NOT per dispute. A refund policy is the same document for
-// everyone, and a file uploaded to Stripe with purpose dispute_evidence can be
-// referenced by any number of disputes, so the upload happens once and each
-// dispute costs one more field on an update call it was already making.
+// The operator uploads each policy ONCE here. What is stored is a master copy:
+// a Stripe file with purpose dispute_evidence belongs to exactly one dispute
+// ("That file is already attached to something else" on the second), so
+// standingDocuments.ts takes a fresh copy of the master for each dispute rather
+// than sharing the stored id.
 
 // Which Stripe FILE evidence slots may hold a standing document. The generated
 // per-dispute documents (a usage log, a support transcript) are a different

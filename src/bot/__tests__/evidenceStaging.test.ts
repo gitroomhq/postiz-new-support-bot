@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import type Stripe from "stripe";
 import { EvidencePackBuilder, type EvidencePack } from "../billing/evidence/EvidencePackBuilder";
+import { resetStandingDocumentCache } from "../billing/evidence/standingDocuments";
 import { confirmedOrgFor, type PostizOrgLookup, type PostizOrgSummary } from "../../postiz/PostizIdentityService";
 
 // Two defects that showed up in production on one dispute: a history timeline
@@ -189,16 +190,31 @@ test("provenance: a quality refusal is not reported as a dead feed", async () =>
 
 // ---- standing policy documents ----
 
-function docHarness(opts: { held?: Record<string, string>; currentEvidence?: Record<string, string> } = {}) {
+function docHarness(
+  opts: { held?: Record<string, string>; currentEvidence?: Record<string, string>; masterUnreadable?: boolean } = {}
+) {
   const updates: Array<{ evidence: Record<string, unknown>; submit: boolean; key: string }> = [];
+  const uploads: string[] = [];
+  const reads: string[] = [];
   const held = opts.held ?? { refund_policy: "file_refund", cancellation_policy: "file_cancel" };
   const store = {
     bySlot: async () =>
       new Map(Object.entries(held).map(([slot, stripeFileId]) => [slot, { slot, stripeFileId, fileName: `${slot}.pdf` }])),
   };
+  let uploadSeq = 0;
   const stripe = {
     updateDisputeEvidence: async (_id: string, evidence: Record<string, unknown>, submit: boolean, key: string) => {
       updates.push({ evidence, submit, key });
+    },
+    getEvidenceFileWithContents: async (fileId: string) => {
+      reads.push(fileId);
+      if (opts.masterUnreadable) return { filename: "x.pdf", sizeBytes: 0, mimeType: null, data: null, skipped: "unsupported_type" };
+      return { filename: `${fileId}.pdf`, sizeBytes: 10, mimeType: "application/pdf", data: Buffer.from("%PDF-1.4 x"), skipped: null };
+    },
+    uploadDisputeEvidenceFile: async (name: string) => {
+      uploadSeq += 1;
+      uploads.push(name);
+      return { id: `copy_${uploadSeq}` };
     },
   };
   const builder = new EvidencePackBuilder(
@@ -227,7 +243,7 @@ function docHarness(opts: { held?: Record<string, string>; currentEvidence?: Rec
     templateVersion: "t",
     facts: { reach: { charge: true, sub: false, billing: false, postiz: false, usage: false, cards: false, support: false } },
   } as unknown as EvidencePack;
-  return { builder, dispute, pack, updates };
+  return { builder, dispute, pack, updates, uploads, reads };
 }
 
 test("documents: the standing policies are stamped into empty slots, staged not submitted", async () => {
@@ -235,7 +251,10 @@ test("documents: the standing policies are stamped into empty slots, staged not 
   const res = await h.builder.stage(h.dispute, h.pack, false);
   assert.deepEqual(res.documents.sort(), ["cancellation_policy", "refund_policy"]);
   assert.equal(h.updates.length, 1, "one update call for the whole set");
-  assert.deepEqual(h.updates[0].evidence, { refund_policy: "file_refund", cancellation_policy: "file_cancel" });
+  // A COPY per slot, never the stored id: Stripe binds an evidence file to one
+  // dispute, so reusing the master is refused on the second dispute that needs
+  // it, which is exactly how this shipped broken.
+  assert.deepEqual(h.updates[0].evidence, { refund_policy: "copy_1", cancellation_policy: "copy_2" });
   // The bank sees nothing until Submit evidence, exactly like every other
   // thing this builder writes.
   assert.equal(h.updates[0].submit, false);
@@ -247,7 +266,7 @@ test("documents: a slot a human already filled is never overwritten", async () =
   const h = docHarness({ currentEvidence: { refund_policy: "file_uploaded_by_a_person" } });
   const res = await h.builder.stage(h.dispute, h.pack, false);
   assert.deepEqual(res.documents, ["cancellation_policy"]);
-  assert.deepEqual(h.updates[0].evidence, { cancellation_policy: "file_cancel" });
+  assert.deepEqual(h.updates[0].evidence, { cancellation_policy: "copy_1" });
 });
 
 test("documents: a policy uploaded later still reaches a dispute whose text has not changed", async () => {
@@ -329,4 +348,53 @@ test("documents: an attach that THROWS is reported, not just logged", async () =
     res.documentsSkipped.some((s) => /attach failed: idempotency_error/.test(s.why)),
     JSON.stringify(res.documentsSkipped)
   );
+});
+
+test("documents: two disputes each get their OWN copy, because Stripe binds a file to one dispute", async () => {
+  // The bug this feature shipped with. Stamping the stored id onto a second
+  // dispute is refused with "That file is already attached to something else",
+  // so the first dispute answered consumed every policy and every dispute after
+  // it silently received nothing.
+  //
+  // One harness, so both disputes share a Stripe: that is what makes "the ids
+  // differ" mean anything.
+  resetStandingDocumentCache();
+  const h = docHarness();
+  await h.builder.stage(h.dispute, h.pack, false);
+  const other = { ...h.dispute, id: "dp_2", evidence: {} } as unknown as Stripe.Dispute;
+  await h.builder.stage(other, h.pack, false);
+
+  assert.equal(h.updates.length, 2, "both disputes were stamped");
+  const first = Object.values(h.updates[0].evidence);
+  const second = Object.values(h.updates[1].evidence);
+  assert.equal(new Set([...first, ...second]).size, 4, "four distinct files for two slots across two disputes");
+  for (const id of [...first, ...second]) {
+    assert.ok(id !== "file_refund" && id !== "file_cancel", "the stored master is never stamped onto a dispute");
+  }
+  assert.equal(h.uploads.length, 4, "a fresh upload per slot per dispute");
+});
+
+test("documents: the master is downloaded once per process, not once per dispute", async () => {
+  // A 4MB policy fetched again for every dispute would be a real cost for no
+  // gain: the bytes never change while the id does not.
+  resetStandingDocumentCache();
+  const h = docHarness();
+  await h.builder.stage(h.dispute, h.pack, false);
+  const readsAfterFirst = h.reads.length;
+  assert.equal(readsAfterFirst, 2, "one read per master on the first pass");
+
+  const again = docHarness();
+  await again.builder.stage(again.dispute, again.pack, false);
+  assert.deepEqual(again.reads, [], "the second dispute reuses the cached bytes");
+  assert.equal(Object.keys(again.updates[0].evidence).length, 2, "and still gets fresh copies");
+});
+
+test("documents: an unreadable master fails ONE slot, and the rest still attach", async () => {
+  resetStandingDocumentCache();
+  const h = docHarness({ masterUnreadable: true });
+  const res = await h.builder.stage(h.dispute, h.pack, false);
+  assert.deepEqual(res.documents, []);
+  assert.deepEqual(h.updates, [], "nothing is stamped when nothing could be copied");
+  const why = res.documentsSkipped.filter((s) => /master file unreadable/.test(s.why));
+  assert.equal(why.length, 2, JSON.stringify(res.documentsSkipped));
 });

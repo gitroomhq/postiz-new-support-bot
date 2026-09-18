@@ -112,7 +112,10 @@ D.copyBtn = function (value) {
   return b;
 };
 
-D.clearFlash = function () { var f = D.q("flash"); f.textContent = ""; f.className = "flash"; };
+D.clearFlash = function () {
+  var f = D.q("flash");
+  f.textContent = ""; f.className = "flash"; f.onclick = null; f.removeAttribute("title");
+};
 // Optional link: an anchor appended as a CHILD NODE (textContent label,
 // rel=noopener — never innerHTML). Link flashes don't auto-clear: the URL may
 // be short-lived (report downloads) and must stay clickable until navigation.
@@ -128,7 +131,17 @@ D.flashOk = function (msg, link) {
     f.appendChild(a);
     return;
   }
-  setTimeout(function () { if (f.classList.contains("ok")) D.clearFlash(); }, 2600);
+  // 2.6 seconds is right for "Done." and useless for a staging report: the
+  // message that most needs reading is the one that vanished first. Anything
+  // substantial stays until the reader dismisses it; short confirmations still
+  // get out of the way on their own.
+  if (msg && msg.length > 110) {
+    f.classList.add("sticky");
+    f.title = "Click to dismiss";
+    f.onclick = function () { D.clearFlash(); };
+    return;
+  }
+  setTimeout(function () { if (f.classList.contains("ok")) D.clearFlash(); }, 3500);
 };
 D.flashErr = function (msg) { var f = D.q("flash"); f.textContent = msg; f.className = "flash error"; };
 `;

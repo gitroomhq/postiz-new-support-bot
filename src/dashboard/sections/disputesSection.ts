@@ -461,30 +461,31 @@ async function disputeAction(
       await ctx.audit(
         `Dispute evidence pack rebuilt on ${disputeId}: ${staged.staged.length} field(s), score ${staged.pack.score}%`
       );
-      const omitted = staged.omitted.length
-        ? ` Omitted ${staged.omitted.length}: ${staged.omitted.map((o: { field: string; why: string }) => `${o.field} (${o.why})`).join(", ")}.`
-        : "";
-      // The templates are deterministic, so an untouched dispute rebuilds to
-      // the same text. Saying so beats reporting a write that did not happen.
-      // Only the reasons a human can act on. "Slot already filled" is the
-      // system protecting their own upload, not a problem to report.
-      const missing = staged.documentsSkipped
-        .filter((skip: { why: string }) => skip.why !== "slot already filled")
-        .map((skip: { slot: string; why: string }) => `${skip.slot.replace(/_/g, " ")} (${skip.why})`);
-      const notMade = missing.length ? ` No ${missing.join(", no ")}.` : "";
-      if (staged.unchanged) {
-        return {
-          ok: true,
-          text: `No change: the staged package already matches what the templates and the current facts produce (${staged.staged.length} field(s), completeness ${staged.pack.score}%).${notMade}${omitted}`,
-        };
+      // Written as lines rather than one long sentence: this is a report on
+      // four separate things (fields, documents, refusals, omissions) and a
+      // reader scanning it needs to find the one that concerns them.
+      const lines: string[] = [];
+      lines.push(
+        staged.unchanged
+          ? `No change: the staged package already matches the templates and the current facts (${staged.staged.length} field(s), completeness ${staged.pack.score}%).`
+          : `Staged ${staged.staged.length} field(s), completeness ${staged.pack.score}%.`
+      );
+      if (staged.documents.length) {
+        lines.push(`Attached: ${staged.documents.map((d: string) => d.replace(/_/g, " ")).join(", ")}.`);
       }
-      const docs = staged.documents.length
-        ? ` Attached ${staged.documents.length} document(s): ${staged.documents.map((d: string) => d.replace(/_/g, " ")).join(", ")}.`
-        : "";
-      return {
-        ok: true,
-        text: `Staged ${staged.staged.length} field(s), completeness ${staged.pack.score}%.${docs}${notMade}${omitted} Review the sections below, then submit.`,
-      };
+      // Only what a human can act on. "Slot already filled" is the system
+      // protecting their own upload, not a problem to report.
+      const missing = staged.documentsSkipped.filter((skip: { why: string }) => skip.why !== "slot already filled");
+      if (missing.length) {
+        lines.push("Not attached:");
+        for (const skip of missing) lines.push(`  ${skip.slot.replace(/_/g, " ")}: ${skip.why}`);
+      }
+      if (staged.omitted.length) {
+        lines.push("Fields omitted:");
+        for (const o of staged.omitted as Array<{ field: string; why: string }>) lines.push(`  ${o.field}: ${o.why}`);
+      }
+      if (!staged.unchanged) lines.push("Review the sections below, then submit.");
+      return { ok: true, text: lines.join("\n") };
     }
 
     // T0: ask the auto-resolve engine about THIS dispute, instead of waiting
@@ -927,7 +928,7 @@ async function documentsPage(ctx: DashboardCtx, deps: DisputesDeps): Promise<Sec
         label: doc ? "Replace" : "Upload",
         style: doc ? "secondary" : "primary",
         params: { slot: spec.slot },
-        summary: `${doc ? "Replaces" : "Sets"} the ${spec.label.toLowerCase()} attached to every dispute from now on. PDF, PNG or JPEG, up to 4MB. Disputes already staged keep the file they were given.`,
+        summary: `${doc ? "Replaces" : "Sets"} the ${spec.label.toLowerCase()} copied onto every dispute from now on. PDF, PNG or JPEG, up to 4MB. Disputes already staged keep the copy they were given.`,
         inputs: [
           { type: "file", key: "doc", label: `${spec.label} (PDF, PNG or JPEG)`, accept: DOCUMENT_TYPES, maxBytes: DOCUMENT_MAX_BYTES },
         ],
@@ -960,7 +961,7 @@ async function documentsPage(ctx: DashboardCtx, deps: DisputesDeps): Promise<Sec
     nextCursor: null,
     empty: "No document slots.",
     notice:
-      "Uploaded once and reused: a dispute_evidence file can be referenced by any number of disputes, so these cost nothing per dispute. They attach whenever a pack is built, never overwrite a slot a human has filled, and reach the bank only when you submit evidence.",
+      "Uploaded once here and copied per dispute, because Stripe binds an evidence file to a single dispute. They attach whenever a pack is built, never overwrite a slot a human has filled, and reach the bank only when you submit evidence.",
   };
 
   return {

@@ -2515,7 +2515,9 @@ test("dispute workbench: Build evidence is offered on the page, not only in Disc
   assert.deepEqual(pack.calls.build, ["dp_1:enrich=true"], "a human is waiting, so the panel always enriches");
   assert.deepEqual(pack.calls.stage, [{ id: "dp_1", submit: false }], "nothing reaches the bank");
   assert.match(result.text!, /Staged 2 field\(s\), completeness 82%/);
-  assert.match(result.text!, /Omitted 1: refund_policy \(no template\)/);
+  // Reported as lines, not one long sentence: four separate things are being
+  // said and a reader needs to find the one that concerns them.
+  assert.match(result.text!, /\nFields omitted:\n {2}refund_policy: no template/);
 });
 
 test("dispute workbench: Build evidence is withheld with no builder, and on a dispute past answering", async () => {

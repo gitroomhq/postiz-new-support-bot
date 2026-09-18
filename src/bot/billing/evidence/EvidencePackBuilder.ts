@@ -238,6 +238,7 @@ export class EvidencePackBuilder {
       documents.push(...(result?.attached ?? []));
       for (const slot of result?.occupied ?? []) documentsSkipped.push({ slot, why: "slot already filled" });
       for (const slot of result?.empty ?? []) documentsSkipped.push({ slot, why: "no document uploaded for this slot" });
+      documentsSkipped.push(...(result?.failed ?? []));
     }
     // The two built from this dispute's own facts. Each is produced only when
     // its slot is empty, so a dispute uploads them once and the hourly rebuild
