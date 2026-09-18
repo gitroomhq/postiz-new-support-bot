@@ -14,6 +14,11 @@ import {
 } from "../../bot/billing/DisputeEvidenceService";
 import type { EvidencePackBuilder } from "../../bot/billing/evidence/EvidencePackBuilder";
 import type { AutoResolveStore } from "../../bot/billing/AutoResolveStore";
+import {
+  STANDING_DOCUMENT_SLOTS,
+  isStandingSlot,
+  type EvidenceDocumentStore,
+} from "../../bot/billing/evidence/EvidenceDocumentStore";
 import type { BackfillResult, HandProposeResult } from "../../bot/billing/AutoResolveService";
 import type { TemplateStore } from "../../bot/billing/evidence/TemplateStore";
 import type { DisputeEventStore } from "../../bot/billing/DisputeEventStore";
@@ -57,6 +62,8 @@ interface DisputesDeps {
   // Deterministic evidence packs. Optional so the section still renders on an
   // instance where the builder is not wired.
   evidencePack?: EvidencePackBuilder | null;
+  // The standing policy documents, uploaded once and reused on every dispute.
+  evidenceDocuments?: EvidenceDocumentStore | null;
   // Auto-resolve queue, so the money-moving automation is visible and stoppable.
   autoResolveStore?: AutoResolveStore | null;
   // The engine itself: accepting a proposal before its window expires, and
@@ -82,13 +89,15 @@ export function makeDisputesSection(deps: DisputesDeps): DashboardSectionModule 
         page === "disputes" ||
         page === "disputes.detail" ||
         page === "disputes.review" ||
-        page === "disputes.templates"
+        page === "disputes.templates" ||
+        page === "disputes.documents"
       );
     },
 
     async buildPage(ctx: DashboardCtx, req): Promise<SectionPage | null> {
       if (req.page === "disputes") return list(ctx, deps, req.filters ?? {}, req.cursor ?? null);
       if (req.page === "disputes.templates") return templatesPage(ctx, deps, req.filters ?? {}, req.cursor ?? null);
+      if (req.page === "disputes.documents") return documentsPage(ctx, deps);
       const id = validId("dispute", req.params?.id);
       if (!id) return notFound("That dispute id is not valid (dp_/du_…).");
       if (req.page === "disputes.review") return review(ctx, deps, id);
@@ -224,6 +233,57 @@ async function disputeAction(
     if (r.unavailable) parts.push(`${r.unavailable} could not be read from Stripe.`);
     if (r.remaining) parts.push(`${r.remaining} more are waiting; press again to continue.`);
     return { ok: true, text: parts.join(" ") };
+  }
+
+  // The standing policy documents. Keyed on a slot, not a dispute, so they are
+  // handled before the dispute-id guard.
+  if (key === "section:disputes.document_put") {
+    const store = deps.evidenceDocuments;
+    if (!store) return { ok: false, error: "The document store is not configured." };
+    if (!deps.evidencePack) return { ok: false, error: "The evidence pack builder is not configured." };
+    const slot = str(p.slot, 40);
+    if (!isStandingSlot(slot)) return { ok: false, error: "That is not a policy document slot." };
+    const fileName = str(p.docName, 200).replace(/[/\\]/g, "_") || "policy";
+    const contentType = str(p.docType, 60).toLowerCase();
+    if (!DOCUMENT_TYPES.includes(contentType)) return { ok: false, error: "The bank accepts PDF, PNG or JPEG only." };
+    const dataB64 = typeof p.docB64 === "string" ? p.docB64 : "";
+    // ~5.6MB of base64 covers the 4MB cap; anything beyond that is hostile.
+    if (!dataB64 || dataB64.length > 6_000_000) return { ok: false, error: "Bad or oversized file payload." };
+    let data: Buffer;
+    try {
+      data = Buffer.from(dataB64, "base64");
+    } catch {
+      return { ok: false, error: "Bad file payload." };
+    }
+    if (!data.length || data.length > DOCUMENT_MAX_BYTES) return { ok: false, error: "Bad or oversized file payload." };
+
+    const file = await ctx.stripe.uploadDisputeEvidenceFile(fileName, data, contentType);
+    await store.put({
+      slot,
+      stripeFileId: file.id,
+      fileName,
+      sizeBytes: data.length,
+      contentType,
+      uploadedById: ctx.actor.id,
+      uploadedByName: ctx.actor.name,
+    });
+    await ctx.audit(`Standing evidence document set for ${slot}: ${fileName} (${file.id})`);
+    return {
+      ok: true,
+      text: `${fileName} will be attached as ${slot} on every dispute whose slot is empty, from the next pack build. Nothing reaches a bank until evidence is submitted.`,
+    };
+  }
+
+  if (key === "section:disputes.document_remove") {
+    const store = deps.evidenceDocuments;
+    if (!store) return { ok: false, error: "The document store is not configured." };
+    if (!confirmed) return { ok: false, error: "Type CONFIRM to stop attaching this document." };
+    const slot = str(p.slot, 40);
+    if (!isStandingSlot(slot)) return { ok: false, error: "That is not a policy document slot." };
+    const removed = await store.remove(slot);
+    if (!removed) return { ok: false, error: "There was no document in that slot." };
+    await ctx.audit(`Standing evidence document cleared for ${slot}`);
+    return { ok: true, text: `Future disputes will not receive a ${slot.replace(/_/g, " ")}. Nothing already staged changed.` };
   }
 
   if (key === "section:disputes.autoresolve_veto") {
@@ -403,9 +463,12 @@ async function disputeAction(
           text: `No change: the staged package already matches what the templates and the current facts produce (${staged.staged.length} field(s), completeness ${staged.pack.score}%).${omitted}`,
         };
       }
+      const docs = staged.documents.length
+        ? ` Attached ${staged.documents.length} policy document(s): ${staged.documents.map((d: string) => d.replace(/_/g, " ")).join(", ")}.`
+        : "";
       return {
         ok: true,
-        text: `Staged ${staged.staged.length} field(s), completeness ${staged.pack.score}%.${omitted} Review the sections below, then submit.`,
+        text: `Staged ${staged.staged.length} field(s), completeness ${staged.pack.score}%.${docs}${omitted} Review the sections below, then submit.`,
       };
     }
 
@@ -514,6 +577,7 @@ async function list(
             },
           ] as ActionButton[])
         : []),
+      { key: "nav.documents", label: "Policy documents", style: "secondary", ref: { page: "disputes.documents" } },
       { key: "nav.templates", label: "Evidence templates", style: "secondary", ref: { page: "disputes.templates" } },
     ],
   });
@@ -809,6 +873,93 @@ async function autoResolveBlocks(
       "Refunding an inquiry-stage dispute closes it as prevented, so it never counts toward the dispute ratio. Cancelling stops the refund; it does not close the dispute.",
   };
   return [table];
+}
+
+// The standing policy documents: uploaded once here, stamped into every
+// dispute that has an empty slot for them.
+//
+// Three rows, so no pagination: Stripe has exactly these file slots a published
+// policy can occupy, and inventing more would only produce slots a bank does
+// not read.
+const DOCUMENT_MAX_BYTES = 4 * 1024 * 1024;
+const DOCUMENT_TYPES = ["application/pdf", "image/png", "image/jpeg"];
+
+async function documentsPage(ctx: DashboardCtx, deps: DisputesDeps): Promise<SectionPage> {
+  const crumbs = [{ label: "Disputes", ref: { page: "disputes" } }, { label: "Policy documents" }];
+  const store = deps.evidenceDocuments;
+  if (!store) {
+    return {
+      title: "Policy documents",
+      crumbs,
+      blocks: [{ type: "notice", badge: { kind: "info", text: "Off" }, text: "The document store is not configured." }],
+    };
+  }
+
+  const held = await store.bySlot();
+  const table: TableBlock = {
+    type: "table",
+    key: "documents",
+    columns: [
+      { key: "slot", label: "Slot" },
+      { key: "file", label: "Document" },
+      { key: "size", label: "Size", align: "right" },
+      { key: "who", label: "Uploaded" },
+    ],
+    rows: STANDING_DOCUMENT_SLOTS.map((spec) => {
+      const doc = held.get(spec.slot);
+      const upload: ActionButton = {
+        key: "section:disputes.document_put",
+        label: doc ? "Replace" : "Upload",
+        style: doc ? "secondary" : "primary",
+        params: { slot: spec.slot },
+        summary: `${doc ? "Replaces" : "Sets"} the ${spec.label.toLowerCase()} attached to every dispute from now on. PDF, PNG or JPEG, up to 4MB. Disputes already staged keep the file they were given.`,
+        inputs: [
+          { type: "file", key: "doc", label: `${spec.label} (PDF, PNG or JPEG)`, accept: DOCUMENT_TYPES, maxBytes: DOCUMENT_MAX_BYTES },
+        ],
+      };
+      return {
+        id: spec.slot,
+        cells: [
+          strong(spec.label),
+          doc ? text(doc.fileName) : ({ t: "badge", b: { kind: "warn", text: "none" } } as Cell),
+          text(doc ? `${Math.max(1, Math.round(doc.sizeBytes / 1024))}KB` : ""),
+          text(doc ? `${doc.uploadedByName}, ${doc.uploadedAt.toISOString().slice(0, 10)}` : spec.help),
+        ] as Cell[],
+        actions: [
+          upload,
+          ...(doc
+            ? ([
+                {
+                  key: "section:disputes.document_remove",
+                  label: "Stop attaching",
+                  style: "danger",
+                  dangerous: true,
+                  params: { slot: spec.slot },
+                  summary: `Future disputes stop receiving the ${spec.label.toLowerCase()}. Nothing already staged is touched and the file stays in the Stripe account.`,
+                },
+              ] as ActionButton[])
+            : []),
+        ] as ActionButton[],
+      };
+    }),
+    nextCursor: null,
+    empty: "No document slots.",
+    notice:
+      "Uploaded once and reused: a dispute_evidence file can be referenced by any number of disputes, so these cost nothing per dispute. They attach whenever a pack is built, never overwrite a slot a human has filled, and reach the bank only when you submit evidence.",
+  };
+
+  return {
+    title: "Policy documents",
+    crumbs,
+    blocks: [
+      {
+        type: "notice",
+        badge: { kind: "info", text: "Which document" },
+        text: "Attach the policy exactly as published. An analyst is checking whether what you assert in the text is a real, published rule, so a document written for the dispute argues less than the page the customer could have read.",
+      },
+      table,
+    ],
+  };
 }
 
 // Evidence template editor.
@@ -1294,11 +1445,27 @@ async function detail(ctx: DashboardCtx, deps: DisputesDeps, id: string): Promis
     // it deliberately left out and why, and which external sources answered.
     const lastPack = [...events].reverse().find((e) => e.kind === "pack_staged");
     const detail = lastPack?.detail as
-      | { staged?: string[]; omitted?: Array<{ field: string; why: string }>; sources?: Record<string, boolean>; templateVersion?: string }
+      | {
+          staged?: string[];
+          omitted?: Array<{ field: string; why: string }>;
+          sources?: Record<string, boolean>;
+          reached?: Record<string, boolean>;
+          templateVersion?: string;
+        }
       | undefined;
     if (detail) {
+      // Three states, not two. A source that answered and was not used was
+      // refused on quality, which reads as a broken feed if it is reported the
+      // same way as one that said nothing. Entries written before this existed
+      // carry no `reached` map and keep the old two-state wording rather than
+      // being relabelled with a guess.
       const sources = Object.entries(detail.sources ?? {})
-        .map(([name, answered]) => `${sentence(name.replace(/([A-Z])/g, " $1").toLowerCase())}: ${answered ? "used" : "no data"}`)
+        .map(([name, used]) => {
+          const label = sentence(name.replace(/([A-Z])/g, " $1").toLowerCase());
+          if (used) return `${label}: used`;
+          if (!detail.reached) return `${label}: no data`;
+          return `${label}: ${detail.reached[name] ? "answered, not enough to cite" : "no data"}`;
+        })
         .join(" · ");
       main.push({
         type: "kv",

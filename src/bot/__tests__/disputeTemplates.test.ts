@@ -124,8 +124,12 @@ const fullFacts = (over: Partial<EvidenceFacts> = {}): EvidenceFacts => ({
     conversationCount: 2,
     firstContactIso: "2026-03-02T00:00:00.000Z",
     lastContactIso: "2026-08-20T00:00:00.000Z",
+    transcript: [],
     noRefundRequest: true,
   },
+  // Reach only drives reporting, never rendering: a token resolves from the
+  // fact, not from whether its feed was alive.
+  reach: { charge: true, sub: true, billing: true, postiz: true, usage: true, cards: true, support: true },
   ...over,
 });
 
@@ -141,6 +145,7 @@ const emptyFacts = (): EvidenceFacts => ({
   support: null,
   usage: null,
   cards: null,
+  reach: { charge: false, sub: false, billing: false, postiz: false, usage: false, cards: false, support: false },
 });
 
 const allTemplates = (): EvidenceTemplate[] => {

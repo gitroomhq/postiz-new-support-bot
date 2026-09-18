@@ -1012,6 +1012,19 @@ export const STATEMENTS: string[] = [
   // instead of silently freezing lastSyncAt.
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "sentryFeedbackLastAttemptAt" TIMESTAMP(3)`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "sentryFeedbackLastError" TEXT`,
+  // Standing evidence documents: one row per Stripe file evidence slot, holding
+  // a file uploaded once and reused on every dispute.
+  `CREATE TABLE IF NOT EXISTS "dispute_evidence_documents" (
+    "slot" TEXT NOT NULL,
+    "stripeFileId" TEXT NOT NULL,
+    "fileName" TEXT NOT NULL,
+    "sizeBytes" INTEGER NOT NULL,
+    "contentType" TEXT NOT NULL,
+    "uploadedById" TEXT NOT NULL,
+    "uploadedByName" TEXT NOT NULL,
+    "uploadedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT "dispute_evidence_documents_pkey" PRIMARY KEY ("slot")
+  )`,
   // Dispute auto-resolve proposals: a refund-to-prevent waiting out its veto
   // window. The unique index on sourceId is the propose-time idempotency lock,
   // so it is created as its own statement under the name prisma db push would

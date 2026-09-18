@@ -63,7 +63,12 @@ export type InputField =
     }
   | { type: "number"; key: string; label: string; min?: number; max?: number; placeholder?: string }
   | { type: "select"; key: string; label: string; options: Opt[]; value?: string }
-  | { type: "toggle"; key: string; label: string; value?: boolean };
+  | { type: "toggle"; key: string; label: string; value?: boolean }
+  // A file the browser reads and sends inline. The action receives three keys
+  // derived from this one: `<key>B64`, `<key>Name` and `<key>Type`. Bounds are
+  // enforced client-side for the error message and AGAIN on the server, which
+  // is the one that counts.
+  | { type: "file"; key: string; label: string; accept: string[]; maxBytes: number };
 
 export interface ActionButton {
   key: string; // registry key ("charge.refund_full") or section key ("section:notes.add")

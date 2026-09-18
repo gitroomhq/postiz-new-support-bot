@@ -21,6 +21,9 @@ import {
   type PackReason,
 } from "./templates";
 import { TemplateStore } from "./TemplateStore";
+import { attachStandingDocuments } from "./standingDocuments";
+import { attachGeneratedDocuments } from "./generatedDocuments";
+import type { EvidenceDocumentStore } from "./EvidenceDocumentStore";
 import { exportDisputeEvidenceSource, exportDisputePackBuild } from "../../../metrics/MetricsExporter";
 import { log } from "../../../util/logger";
 
@@ -50,6 +53,8 @@ export interface StageResult {
   // True when every field the pack would stage is already staged at Stripe with
   // exactly this text, so nothing was written and no history entry was made.
   unchanged: boolean;
+  // Standing policy documents attached to empty file slots on this pass.
+  documents: string[];
 }
 
 export type AutoSubmitRefusal =
@@ -90,7 +95,9 @@ export class EvidencePackBuilder {
     private intercom?: IntercomClient | null,
     // Real product usage, read from the platform's Post and Integration tables.
     private activity?: PostizActivitySource | null,
-    private events?: DisputeEventStore | null
+    private events?: DisputeEventStore | null,
+    // The standing policy documents. Absent simply means none are attached.
+    private documents?: EvidenceDocumentStore | null
   ) {}
 
   // Bound late: the identity service is built after the billing stack, and an
@@ -204,22 +211,56 @@ export class EvidencePackBuilder {
         why: r.missing.length ? `missing ${[...new Set(r.missing)].join(", ")}` : (r.dropped ?? "unknown"),
       }));
 
+    // The standing policy documents go in FIRST, and before the unchanged check
+    // below, because they are independent of the text: a policy uploaded after
+    // this dispute was last staged must still reach it, even though the
+    // templates produce exactly the same words they did yesterday.
+    const documents: string[] = [];
+    if (this.documents) {
+      const result = await attachStandingDocuments(this.stripe, this.documents, dispute).catch((error) => {
+        // A policy that could not be attached must never sink the text pack:
+        // the fields are the argument, the documents corroborate it.
+        packLog.warn("standing evidence documents could not be attached", {
+          "stripe.dispute_id": dispute.id,
+          "error.message": error instanceof Error ? error.message : String(error),
+        });
+        return null;
+      });
+      documents.push(...(result?.attached ?? []));
+    }
+    // The two built from this dispute's own facts. Each is produced only when
+    // its slot is empty, so a dispute uploads them once and the hourly rebuild
+    // never touches Stripe's file API again.
+    const generated = await attachGeneratedDocuments(this.stripe, dispute, pack.facts).catch((error) => {
+      packLog.warn("generated evidence documents could not be attached", {
+        "stripe.dispute_id": dispute.id,
+        "error.message": error instanceof Error ? error.message : String(error),
+      });
+      return null;
+    });
+    documents.push(...(generated?.attached ?? []));
+
     // The templates are deterministic, so rebuilding an untouched dispute
     // produces byte-identical text. The looper rebuilds hourly to pick up facts
     // that arrive late, which means without this guard a dispute collects one
     // Stripe write, one history entry and one build metric EVERY HOUR until its
     // deadline, all of them saying the same thing. A timeline of two dozen
     // identical lines hides the entries that matter.
+    // A pass that attached a policy is never "unchanged": it fills the whole
+    // path below so the history records what landed, which happens at most once
+    // per slot and is exactly the entry worth keeping.
     const current = (dispute.evidence ?? {}) as unknown as Record<string, unknown>;
     const unchanged =
-      staged.length > 0 && staged.every((field) => String(current[field] ?? "") === String(pack.fields[field] ?? ""));
+      documents.length === 0 &&
+      staged.length > 0 &&
+      staged.every((field) => String(current[field] ?? "") === String(pack.fields[field] ?? ""));
     const score = scorePack(pack.reason, pack.fields, receiptStaged);
     if (unchanged) {
       packLog.debug("evidence pack unchanged; nothing re-staged", {
         "stripe.dispute_id": dispute.id,
         "pack.fields": staged.length,
       });
-      return { pack: { ...pack, score }, staged, omitted, unchanged: true };
+      return { pack: { ...pack, score }, staged, omitted, unchanged: true, documents };
     }
 
     if (staged.length) {
@@ -236,12 +277,17 @@ export class EvidencePackBuilder {
     await this.events?.record({
       disputeId: dispute.id,
       kind: "pack_staged",
-      summary: `Evidence pack staged: ${staged.length} field(s), completeness ${score}%`,
+      summary: `Evidence pack staged: ${staged.length} field(s), completeness ${score}%${
+        documents.length ? `, ${documents.length} policy document(s) attached` : ""
+      }`,
       detail: {
         templateVersion: pack.templateVersion,
         reason: pack.reason,
         staged,
         omitted,
+        ...(documents.length ? { documents } : {}),
+        // Kept as-is so every pack_staged entry ever written still reads the
+        // same way. `used` is the claim; `reached` is the feed.
         sources: {
           stripe: pack.facts.charge != null,
           subscription: pack.facts.sub != null,
@@ -251,21 +297,34 @@ export class EvidencePackBuilder {
           cardHistory: pack.facts.cards != null,
           supportHistory: pack.facts.support != null,
         },
+        // Which of those answered at all. A source that answered and was not
+        // used was refused on quality (one invoice is not a history, an
+        // unproven organisation is not this customer), which is a completely
+        // different thing from a feed that said nothing.
+        reached: {
+          stripe: pack.facts.reach.charge,
+          subscription: pack.facts.reach.sub,
+          paymentHistory: pack.facts.reach.billing,
+          postizAccount: pack.facts.reach.postiz,
+          productUsage: pack.facts.reach.usage,
+          cardHistory: pack.facts.reach.cards,
+          supportHistory: pack.facts.reach.support,
+        },
       },
     });
     // Per-source coverage, so a silent feed is visible in Grafana long before
     // it shows up as a run of weak packages.
-    const sources: Array<[string, boolean]> = [
-      ["stripe_charge", pack.facts.charge != null],
-      ["subscription", pack.facts.sub != null],
-      ["payment_history", pack.facts.billing != null],
-      ["postiz_account", pack.facts.postiz != null],
-      ["product_usage", pack.facts.usage != null],
-      ["card_history", pack.facts.cards != null],
-      ["support_history", pack.facts.support != null],
+    const sources: Array<[string, boolean, boolean]> = [
+      ["stripe_charge", pack.facts.charge != null, pack.facts.reach.charge],
+      ["subscription", pack.facts.sub != null, pack.facts.reach.sub],
+      ["payment_history", pack.facts.billing != null, pack.facts.reach.billing],
+      ["postiz_account", pack.facts.postiz != null, pack.facts.reach.postiz],
+      ["product_usage", pack.facts.usage != null, pack.facts.reach.usage],
+      ["card_history", pack.facts.cards != null, pack.facts.reach.cards],
+      ["support_history", pack.facts.support != null, pack.facts.reach.support],
     ];
-    for (const [source, answered] of sources) {
-      exportDisputeEvidenceSource({ source, answered, reason: pack.reason });
+    for (const [source, answered, reached] of sources) {
+      exportDisputeEvidenceSource({ source, answered, reached, reason: pack.reason });
     }
     exportDisputePackBuild({
       reason: pack.reason,
@@ -286,7 +345,7 @@ export class EvidencePackBuilder {
       "pack.fields": staged.length,
       "pack.score": score,
     });
-    return { pack: { ...pack, score }, staged, omitted, unchanged: false };
+    return { pack: { ...pack, score }, staged, omitted, unchanged: false, documents };
   }
 
   // Every gate that must hold before a machine-written package is sent to a

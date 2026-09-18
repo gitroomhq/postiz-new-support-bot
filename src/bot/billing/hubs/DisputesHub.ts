@@ -2006,6 +2006,7 @@ export class DisputesHub {
       outcome: `${staged.staged.length} field(s) staged, completeness ${staged.pack.score}%`,
     });
     const omitted = staged.omitted.length ? ` · omitted ${staged.omitted.map((o) => o.field).join(", ")}` : "";
+    const docs = staged.documents.length ? ` · attached ${staged.documents.length} policy document(s)` : "";
     await this.renderDetail(
       interaction,
       token,

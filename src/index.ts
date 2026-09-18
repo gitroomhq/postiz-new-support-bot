@@ -125,6 +125,7 @@ import { DiscordAutoResolveAlerts, StripeIntercomSideEffects } from "./bot/billi
 import { PostizActivitySource } from "./postiz/PostizActivitySource";
 import { DisputeEventStore } from "./bot/billing/DisputeEventStore";
 import { TemplateStore } from "./bot/billing/evidence/TemplateStore";
+import { EvidenceDocumentStore } from "./bot/billing/evidence/EvidenceDocumentStore";
 import { EvidencePackBuilder } from "./bot/billing/evidence/EvidencePackBuilder";
 import { SubscriptionEventStore } from "./bot/billing/SubscriptionEventStore";
 import { SubscriptionEventService } from "./bot/billing/SubscriptionEventService";
@@ -297,6 +298,7 @@ async function main() {
   // entirely optional: without it every usage claim is simply omitted.
   const postizActivity = new PostizActivitySource();
   const evidenceTemplateStore = new TemplateStore(prisma);
+  const evidenceDocumentStore = new EvidenceDocumentStore(prisma);
   const evidencePackBuilder = new EvidencePackBuilder(
     stripeClient,
     settingsStore,
@@ -306,7 +308,8 @@ async function main() {
     evidenceTemplateStore,
     intercomClient,
     postizActivity,
-    disputeEvents
+    disputeEvents,
+    evidenceDocumentStore
   );
   const blockStore = new BlockStore(prisma);
   const qolStore = new BillingQolStore(prisma);
@@ -722,6 +725,7 @@ async function main() {
       ratio: ratioEngine,
       evidence: disputeEvidenceService,
       evidencePack: evidencePackBuilder,
+      evidenceDocuments: evidenceDocumentStore,
       autoResolveStore,
       autoResolve: autoResolveService,
       templateStore: evidenceTemplateStore,

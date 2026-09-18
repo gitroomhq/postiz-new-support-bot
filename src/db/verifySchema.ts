@@ -147,6 +147,9 @@ export const EXPECTED_COLUMNS: Record<string, string[]> = {
   dispute_evidence_templates: [
     "id", "reason", "fieldKey", "body", "enabled", "updatedById", "updatedByName", "createdAt", "updatedAt",
   ],
+  dispute_evidence_documents: [
+    "slot", "stripeFileId", "fileName", "sizeBytes", "contentType", "uploadedById", "uploadedByName", "uploadedAt",
+  ],
   dispute_auto_resolves: [
     "id", "stage", "sourceId", "disputeId", "chargeId", "customerId", "amountMinor", "currency",
     "usdMinor", "reason", "state", "guardrail", "fireAt", "alertedAt", "alertChannelId",

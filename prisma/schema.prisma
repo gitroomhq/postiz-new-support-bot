@@ -998,6 +998,27 @@ model DisputeEvidenceTemplate {
   @@map("dispute_evidence_templates")
 }
 
+// A standing evidence document: the merchant's own published policy, uploaded
+// once and stamped into the matching Stripe evidence slot on every dispute.
+//
+// The Stripe file id is the whole point. A file uploaded with purpose
+// dispute_evidence can be referenced by any number of disputes, so the upload
+// happens once and each dispute costs one field on an update call it was
+// already making. One row per slot: replacing a policy overwrites the row, and
+// disputes staged before that keep the file they were actually given.
+model DisputeEvidenceDocument {
+  slot           String   @id // a Stripe FILE evidence key: refund_policy | cancellation_policy | uncategorized_file
+  stripeFileId   String
+  fileName       String
+  sizeBytes      Int
+  contentType    String
+  uploadedById   String
+  uploadedByName String
+  uploadedAt     DateTime @default(now())
+
+  @@map("dispute_evidence_documents")
+}
+
 // Every outflow from the Stripe account, whatever its origin (our panels, the
 // Stripe Dashboard, Stripe itself). Two disjoint key spaces in one table:
 //

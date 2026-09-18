@@ -543,11 +543,22 @@ export function exportDisputePackBuild(p: {
 // package" but "which of our feeds is silent", which is what actually explains
 // a run of weak packages. A source that stops answering shows up here as a
 // mean(answered) falling off a cliff, long before win rate moves.
-export function exportDisputeEvidenceSource(p: { source: string; answered: boolean; reason: string }): void {
+// `answered` keeps its original meaning, so the panels built on it are
+// untouched: the source produced facts the pack was willing to use. `reached`
+// is a NEW FIELD (never a new tag, which would split every existing series)
+// saying the feed responded at all. reached=1 with answered=0 is a quality
+// refusal; reached=0 is a feed that has gone quiet, and only the second is an
+// operational problem.
+export function exportDisputeEvidenceSource(p: {
+  source: string;
+  answered: boolean;
+  reached: boolean;
+  reason: string;
+}): void {
   writePoint(
     "dispute_evidence_source",
     { source: p.source, reason: p.reason || "unknown" },
-    { count: 1, answered: p.answered ? 1 : 0 }
+    { count: 1, answered: p.answered ? 1 : 0, reached: p.reached ? 1 : 0 }
   );
 }
 

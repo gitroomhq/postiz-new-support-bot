@@ -282,24 +282,35 @@ function humanProvider(provider: string | null): string | null {
   return null;
 }
 
-async function postizFacts(postiz: PostizIdentityService | null | undefined, customerId: string | null): Promise<PostizFacts | null> {
-  if (!postiz || !customerId) return null;
+// Returns the facts AND whether the platform answered, which are different
+// questions: "off/timeout/error" is a dead feed, while a search that returned
+// organisations none of which are provably this customer is a live feed whose
+// answer we refuse to use.
+async function postizFacts(
+  postiz: PostizIdentityService | null | undefined,
+  customerId: string | null
+): Promise<{ facts: PostizFacts | null; reached: boolean }> {
+  if (!postiz || !customerId) return { facts: null, reached: false };
   const lookup = await postiz.resolveOrgsForCustomer(customerId).catch(() => null);
-  // "off", "none", "timeout" and "error" are all distinct from "found", and
-  // none of them licenses a claim about the platform account.
-  if (!lookup || lookup.state !== "found") return null;
+  // "off", "timeout" and "error" are a feed that did not answer. "none" IS an
+  // answer: the platform looked and has no such account.
+  const reached = !!lookup && (lookup.state === "found" || lookup.state === "none");
+  if (!lookup || lookup.state !== "found") return { facts: null, reached };
   // Taking orgs[0] blind would describe a stranger's organisation to a bank:
   // its name, its plan, how its owner signed up. Nothing but a proven match
   // licenses that, and a lookup that cannot prove one answers with nothing, so
   // every paragraph citing a postiz.* token drops itself.
   const org = confirmedOrgFor(lookup);
-  if (!org) return null;
+  if (!org) return { facts: null, reached };
   return {
-    orgName: org.orgName ?? null,
-    tier: org.tier ?? null,
-    loginProvider: humanProvider(org.ownerProvider ?? null),
-    activated: org.ownerActivated ?? null,
-    subPeriod: org.subPeriod ?? null,
+    facts: {
+      orgName: org.orgName ?? null,
+      tier: org.tier ?? null,
+      loginProvider: humanProvider(org.ownerProvider ?? null),
+      activated: org.ownerActivated ?? null,
+      subPeriod: org.subPeriod ?? null,
+    },
+    reached,
   };
 }
 
@@ -341,6 +352,20 @@ export async function gatherFacts(
   ]);
   const invoice = invoiceId ? (invoices.find((i) => i.id === invoiceId) ?? null) : null;
 
+  // What each feed returned, before any quality bar is applied. The bars
+  // themselves live in the *Facts helpers and are deliberate; this records that
+  // the source was alive and had something to say, so a refusal to argue from
+  // one invoice is never mistaken for Stripe having gone silent.
+  const reach = {
+    charge: true, // the disputed charge is the input; it is always present
+    sub: subs.length > 0,
+    billing: invoices.length > 0,
+    postiz: postiz.reached,
+    usage: sources.usage != null,
+    cards: (opts.needCardHistory ?? false) && otherCharges.length > 0,
+    support: sources.support != null,
+  };
+
   return {
     dispute: {
       id: dispute.id,
@@ -354,7 +379,8 @@ export async function gatherFacts(
     sub: subFacts(stripe, subs, invoice),
     billing: billingFacts(stripe, invoices, invoiceId),
     dup: opts.needDuplicates ? await duplicateFacts(stripe, otherCharges, charge, invoices) : null,
-    postiz,
+    postiz: postiz.facts,
+    reach,
     support: sources.support ?? null,
     usage: sources.usage ?? null,
     cards: opts.needCardHistory ? cardHistory(otherCharges, charge) : null,

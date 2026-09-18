@@ -42,7 +42,7 @@ function stageHarness(currentEvidence: Record<string, string>) {
     rendered: [],
     score: 0,
     templateVersion: "2026-09-17.1",
-    facts: {},
+    facts: { reach: { charge: true, sub: false, billing: false, postiz: false, usage: false, cards: false, support: false } },
   } as unknown as EvidencePack;
   return { builder, dispute, pack, calls };
 }
@@ -131,4 +131,151 @@ test("org gate: every non-found state answers with nothing", () => {
   for (const state of ["off", "none", "timeout", "error"] as const) {
     assert.equal(confirmedOrgFor(lookup([org()], state)), null, state);
   }
+});
+
+// ---- answered, but not enough to cite ----
+
+test("provenance: a quality refusal is not reported as a dead feed", async () => {
+  // The two failures this separates, both seen in production on one dispute:
+  // a customer with a single paid invoice (Stripe answered; the pack refuses to
+  // call one line a payment history) and a Postiz search that returned an
+  // organisation we cannot prove is this customer's. Reported as "no data",
+  // both look like a broken integration, and the Grafana coverage chart, whose
+  // whole job is spotting a feed that went quiet, counts them as outages.
+  const calls: Array<{ kind: string; detail: unknown }> = [];
+  const builder = new EvidencePackBuilder(
+    {} as never,
+    {} as never,
+    {} as never,
+    { recordAutoPack: async () => {} } as never,
+    { stageFields: async () => {} } as never,
+    {} as never,
+    null,
+    null,
+    { record: async (e: { kind: string; detail: unknown }) => calls.push(e) } as never
+  );
+  const pack = {
+    reason: "general",
+    fields: { product_description: "text" },
+    rendered: [],
+    score: 0,
+    templateVersion: "t",
+    facts: {
+      charge: { id: "ch_1" },
+      billing: null,
+      postiz: null,
+      sub: null,
+      usage: null,
+      cards: null,
+      support: null,
+      // Stripe returned invoices and the platform answered; neither cleared the
+      // bar to be cited.
+      reach: { charge: true, sub: false, billing: true, postiz: true, usage: false, cards: false, support: false },
+    },
+  } as unknown as EvidencePack;
+
+  await builder.stage({ id: "dp_1", reason: "subscription_canceled", evidence: {} } as unknown as Stripe.Dispute, pack, false);
+  const detail = calls[0].detail as { sources: Record<string, boolean>; reached: Record<string, boolean> };
+
+  // What was CITED is unchanged, so every entry written before this still reads
+  // the same way.
+  assert.equal(detail.sources.paymentHistory, false);
+  assert.equal(detail.sources.postizAccount, false);
+  // What ANSWERED is new, and is what tells the two cases apart.
+  assert.equal(detail.reached.paymentHistory, true);
+  assert.equal(detail.reached.postizAccount, true);
+  assert.equal(detail.reached.supportHistory, false, "a source that truly said nothing still reads as nothing");
+});
+
+// ---- standing policy documents ----
+
+function docHarness(opts: { held?: Record<string, string>; currentEvidence?: Record<string, string> } = {}) {
+  const updates: Array<{ evidence: Record<string, unknown>; submit: boolean; key: string }> = [];
+  const held = opts.held ?? { refund_policy: "file_refund", cancellation_policy: "file_cancel" };
+  const store = {
+    bySlot: async () =>
+      new Map(Object.entries(held).map(([slot, stripeFileId]) => [slot, { slot, stripeFileId, fileName: `${slot}.pdf` }])),
+  };
+  const stripe = {
+    updateDisputeEvidence: async (_id: string, evidence: Record<string, unknown>, submit: boolean, key: string) => {
+      updates.push({ evidence, submit, key });
+    },
+  };
+  const builder = new EvidencePackBuilder(
+    stripe as never,
+    {} as never,
+    {} as never,
+    { recordAutoPack: async () => {} } as never,
+    { stageFields: async () => {} } as never,
+    {} as never,
+    null,
+    null,
+    { record: async () => {} } as never,
+    store as never
+  );
+  const dispute = {
+    id: "dp_1",
+    status: "needs_response",
+    reason: "subscription_canceled",
+    evidence: opts.currentEvidence ?? {},
+  } as unknown as Stripe.Dispute;
+  const pack = {
+    reason: "general",
+    fields: { product_description: "text" },
+    rendered: [],
+    score: 0,
+    templateVersion: "t",
+    facts: { reach: { charge: true, sub: false, billing: false, postiz: false, usage: false, cards: false, support: false } },
+  } as unknown as EvidencePack;
+  return { builder, dispute, pack, updates };
+}
+
+test("documents: the standing policies are stamped into empty slots, staged not submitted", async () => {
+  const h = docHarness();
+  const res = await h.builder.stage(h.dispute, h.pack, false);
+  assert.deepEqual(res.documents.sort(), ["cancellation_policy", "refund_policy"]);
+  assert.equal(h.updates.length, 1, "one update call for the whole set");
+  assert.deepEqual(h.updates[0].evidence, { refund_policy: "file_refund", cancellation_policy: "file_cancel" });
+  // The bank sees nothing until Submit evidence, exactly like every other
+  // thing this builder writes.
+  assert.equal(h.updates[0].submit, false);
+});
+
+test("documents: a slot a human already filled is never overwritten", async () => {
+  // Same rule the receipt follows: a proof someone uploaded by hand beats a
+  // standing document every time.
+  const h = docHarness({ currentEvidence: { refund_policy: "file_uploaded_by_a_person" } });
+  const res = await h.builder.stage(h.dispute, h.pack, false);
+  assert.deepEqual(res.documents, ["cancellation_policy"]);
+  assert.deepEqual(h.updates[0].evidence, { cancellation_policy: "file_cancel" });
+});
+
+test("documents: a policy uploaded later still reaches a dispute whose text has not changed", async () => {
+  // The whole reason the attach runs before the unchanged guard. Without it a
+  // document added today would never reach any dispute already staged, because
+  // deterministic templates rebuild to the same words forever.
+  const h = docHarness({ currentEvidence: { product_description: "text" } });
+  const res = await h.builder.stage(h.dispute, h.pack, false);
+  assert.equal(res.unchanged, false, "attaching a document is a real change");
+  assert.deepEqual(res.documents.sort(), ["cancellation_policy", "refund_policy"]);
+
+  // And once they are in place, the hourly rebuild goes quiet again.
+  const settled = docHarness({
+    currentEvidence: { product_description: "text", refund_policy: "file_refund", cancellation_policy: "file_cancel" },
+  });
+  const second = await settled.builder.stage(settled.dispute, settled.pack, false);
+  assert.equal(second.unchanged, true);
+  assert.deepEqual(settled.updates, [], "nothing written at all");
+});
+
+test("documents: a dispute past answering is left alone, and no documents means no call", async () => {
+  const closed = docHarness();
+  (closed.dispute as unknown as { status: string }).status = "lost";
+  const res = await closed.builder.stage(closed.dispute, closed.pack, false);
+  assert.deepEqual(res.documents, []);
+  assert.deepEqual(closed.updates, []);
+
+  const none = docHarness({ held: {} });
+  await none.builder.stage(none.dispute, none.pack, false);
+  assert.deepEqual(none.updates, [], "an empty library costs no Stripe call");
 });

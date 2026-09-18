@@ -108,6 +108,18 @@ export interface SupportFacts {
   conversationCount: number;
   firstContactIso: string | null;
   lastContactIso: string | null;
+  // The same conversations, kept whole, for the transcript DOCUMENT. The text
+  // field above is clipped hard because a Stripe evidence field is capped;
+  // an attached PDF is not, and a transcript that stops mid-sentence argues
+  // less than one that does not. Collected on the same fetch, so it costs
+  // nothing extra at Intercom.
+  transcript: Array<{
+    conversationId: string;
+    startedAtIso: string | null;
+    messages: Array<{ atIso: string | null; author: string; text: string }>;
+    // True when this conversation had more messages than were kept.
+    clipped: boolean;
+  }>;
   // True ONLY when Intercom actually answered and returned no refund request.
   // A lookup that was off, timed out or errored leaves this null, so a negative
   // is never asserted from an absent answer.
@@ -159,6 +171,28 @@ export interface EvidenceFacts {
   support: SupportFacts | null;
   usage: UsageFacts | null;
   cards: CardHistoryFacts | null;
+  reach: FactReach;
+}
+
+// Did each source ANSWER, as distinct from whether its answer was enough to
+// argue from.
+//
+// The two are not the same thing and collapsing them makes the provenance line
+// lie in both directions. A customer with one paid invoice has a payment
+// record; the pack simply refuses to call a single line a history. A Postiz
+// lookup that returned an organisation we cannot prove is this customer's has
+// answered; the pack refuses to describe a stranger's account. Reporting both
+// of those as "no data" hides a deliberate quality decision behind what looks
+// like a dead feed, and it does the same to the Grafana coverage chart, which
+// exists precisely to catch a feed that has gone quiet.
+export interface FactReach {
+  charge: boolean;
+  sub: boolean;
+  billing: boolean;
+  postiz: boolean;
+  usage: boolean;
+  cards: boolean;
+  support: boolean;
 }
 
 // ---- static merchant facts ----

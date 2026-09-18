@@ -93,6 +93,16 @@ D.openModal = function (a) {
       return;
     }
     var l = document.createElement("label"); l.textContent = inp.label; inputsEl.appendChild(l);
+    if (inp.type === "file") {
+      // The bytes are read on Run, not on pick: a modal the operator cancels
+      // must not have base64 of their file sitting in the action body.
+      var fi = document.createElement("input");
+      fi.type = "file"; fi.id = "mi_" + inp.key;
+      fi.accept = (inp.accept || []).join(",");
+      fi.setAttribute("data-maxbytes", String(inp.maxBytes || 0));
+      inputsEl.appendChild(fi);
+      return;
+    }
     if (inp.type === "select") {
       var sel = document.createElement("select"); sel.id = "mi_" + inp.key;
       (inp.options || []).forEach(function (o) { sel.appendChild(new Option(o.label, o.value)); });
@@ -132,21 +142,52 @@ D.bindModal = function () {
     var params = {};
     var baked = a.params || {};
     Object.keys(baked).forEach(function (k) { params[k] = baked[k]; });
+    var pending = null;
     (a.inputs || []).forEach(function (inp) {
       var c = D.q("mi_" + inp.key);
       if (!c) return;
       if (inp.type === "toggle") params[inp.key] = c.checked;
       else if (inp.type === "number") params[inp.key] = c.value === "" ? null : Number(c.value);
+      else if (inp.type === "file") pending = { inp: inp, el: c };
       else params[inp.key] = c.value;
     });
     var body = { key: a.key, params: params };
     if (a.dangerous) body.confirmWord = D.q("confirmWord").value;
     if (a.reverseConfirm) body.reverseCode = D.q("reverseCode").value;
     if (a.dangerous && body.confirmWord !== "CONFIRM") { D.modalErr("Type CONFIRM to proceed."); return; }
-    D.dispatchAction(body, function (kind) {
-      if (kind === "reverse") { D.q("modalReverse").hidden = false; D.modalErr("Enter the reverse code from Discord."); }
-      else D.modalErr(kind);
-    });
+    var go = function () {
+      D.dispatchAction(body, function (kind) {
+        if (kind === "reverse") { D.q("modalReverse").hidden = false; D.modalErr("Enter the reverse code from Discord."); }
+        else D.modalErr(kind);
+      });
+    };
+    if (!pending) { go(); return; }
+    // A file action reads the bytes here, on Run, so a cancelled modal never
+    // built a base64 body at all.
+    var file = pending.el.files && pending.el.files[0];
+    if (!file) { D.modalErr("Choose a file first."); return; }
+    var max = Number(pending.el.getAttribute("data-maxbytes")) || 0;
+    if (max && file.size > max) {
+      D.modalErr("File too large: keep it under " + Math.floor(max / (1024 * 1024)) + "MB.");
+      return;
+    }
+    var accept = pending.inp.accept || [];
+    if (accept.length && accept.indexOf((file.type || "").toLowerCase()) === -1) {
+      D.modalErr("That file type is not accepted here.");
+      return;
+    }
+    var reader = new FileReader();
+    reader.onload = function () {
+      var url = String(reader.result || "");
+      var comma = url.indexOf(",");
+      if (comma < 0) { D.modalErr("Could not read the file."); return; }
+      params[pending.inp.key + "B64"] = url.slice(comma + 1);
+      params[pending.inp.key + "Name"] = file.name;
+      params[pending.inp.key + "Type"] = (file.type || "").toLowerCase();
+      go();
+    };
+    reader.onerror = function () { D.modalErr("Could not read the file."); };
+    reader.readAsDataURL(file);
   });
 };
 `;

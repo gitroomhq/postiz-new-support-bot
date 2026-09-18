@@ -2259,7 +2259,13 @@ function fakeEvidencePack() {
       },
       stage: async (dispute: { id: string }, pack: { score: number }, submit: boolean) => {
         calls.stage.push({ id: dispute.id, submit });
-        return { staged: ["product_description", "customer_name"], omitted: [{ field: "refund_policy", why: "no template" }], pack };
+        return {
+          staged: ["product_description", "customer_name"],
+          omitted: [{ field: "refund_policy", why: "no template" }],
+          pack,
+          unchanged: false,
+          documents: [],
+        };
       },
     },
   };
@@ -2288,10 +2294,13 @@ const fakeRatio = {
 test("disputes overview: tabs + level-tinted ratio strip + due-date board (respondable only, urgency badges)", async () => {
   const section = makeDisputesSection(disputesDeps());
   const page = await section.buildPage(disputesCtx(), { page: "disputes", filters: {} });
-  // The header carries the only entry point to the template editor.
+  // The header carries the only entry points to the two editors behind the
+  // pack: the words it writes, and the documents it attaches.
   const header = page!.blocks[0] as { type: string; actions?: Array<{ ref?: { page: string } }> };
   assert.equal(header.type, "header");
-  assert.equal(header.actions?.[0].ref?.page, "disputes.templates");
+  const targets = (header.actions ?? []).map((a) => a.ref?.page);
+  assert.ok(targets.includes("disputes.templates"));
+  assert.ok(targets.includes("disputes.documents"));
   const tabs = page!.blocks[1] as { type: string; items: Array<{ label: string; badge?: string }> };
   assert.equal(tabs.type, "tabs");
   assert.equal(tabs.items[0].badge, "3"); // 2 needs_response + 1 warning_needs_response
