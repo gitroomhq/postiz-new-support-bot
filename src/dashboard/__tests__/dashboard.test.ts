@@ -2265,6 +2265,7 @@ function fakeEvidencePack() {
           pack,
           unchanged: false,
           documents: [],
+          documentsSkipped: [],
         };
       },
     },

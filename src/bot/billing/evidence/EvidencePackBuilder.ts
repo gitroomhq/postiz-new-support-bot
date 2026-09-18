@@ -55,6 +55,10 @@ export interface StageResult {
   unchanged: boolean;
   // Standing policy documents attached to empty file slots on this pass.
   documents: string[];
+  // Why the others were not. A document refuses to exist when the facts behind
+  // it do not, which from the outside looks exactly like a button that does
+  // nothing, so the reason has to travel back to whoever pressed it.
+  documentsSkipped: Array<{ slot: string; why: string }>;
 }
 
 export type AutoSubmitRefusal =
@@ -216,6 +220,7 @@ export class EvidencePackBuilder {
     // this dispute was last staged must still reach it, even though the
     // templates produce exactly the same words they did yesterday.
     const documents: string[] = [];
+    const documentsSkipped: Array<{ slot: string; why: string }> = [];
     if (this.documents) {
       const result = await attachStandingDocuments(this.stripe, this.documents, dispute).catch((error) => {
         // A policy that could not be attached must never sink the text pack:
@@ -227,6 +232,7 @@ export class EvidencePackBuilder {
         return null;
       });
       documents.push(...(result?.attached ?? []));
+      for (const slot of result?.occupied ?? []) documentsSkipped.push({ slot, why: "slot already filled" });
     }
     // The two built from this dispute's own facts. Each is produced only when
     // its slot is empty, so a dispute uploads them once and the hourly rebuild
@@ -239,6 +245,7 @@ export class EvidencePackBuilder {
       return null;
     });
     documents.push(...(generated?.attached ?? []));
+    documentsSkipped.push(...(generated?.skipped ?? []));
 
     // The templates are deterministic, so rebuilding an untouched dispute
     // produces byte-identical text. The looper rebuilds hourly to pick up facts
@@ -260,7 +267,7 @@ export class EvidencePackBuilder {
         "stripe.dispute_id": dispute.id,
         "pack.fields": staged.length,
       });
-      return { pack: { ...pack, score }, staged, omitted, unchanged: true, documents };
+      return { pack: { ...pack, score }, staged, omitted, unchanged: true, documents, documentsSkipped };
     }
 
     if (staged.length) {
@@ -345,7 +352,7 @@ export class EvidencePackBuilder {
       "pack.fields": staged.length,
       "pack.score": score,
     });
-    return { pack: { ...pack, score }, staged, omitted, unchanged: false, documents };
+    return { pack: { ...pack, score }, staged, omitted, unchanged: false, documents, documentsSkipped };
   }
 
   // Every gate that must hold before a machine-written package is sent to a

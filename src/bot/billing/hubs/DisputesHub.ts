@@ -2006,7 +2006,9 @@ export class DisputesHub {
       outcome: `${staged.staged.length} field(s) staged, completeness ${staged.pack.score}%`,
     });
     const omitted = staged.omitted.length ? ` · omitted ${staged.omitted.map((o) => o.field).join(", ")}` : "";
-    const docs = staged.documents.length ? ` · attached ${staged.documents.length} policy document(s)` : "";
+    const docs = staged.documents.length ? ` · attached ${staged.documents.length} document(s)` : "";
+    const missing = staged.documentsSkipped.filter((skip) => skip.why !== "slot already filled");
+    const notMade = missing.length ? ` · no ${missing.map((m) => `${m.slot.replace(/_/g, " ")} (${m.why})`).join(", no ")}` : "";
     await this.renderDetail(
       interaction,
       token,

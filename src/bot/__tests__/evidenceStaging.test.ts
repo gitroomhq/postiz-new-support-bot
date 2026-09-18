@@ -279,3 +279,25 @@ test("documents: a dispute past answering is left alone, and no documents means 
   await none.builder.stage(none.dispute, none.pack, false);
   assert.deepEqual(none.updates, [], "an empty library costs no Stripe call");
 });
+
+test("documents: a button that attaches nothing says WHY, rather than looking broken", async () => {
+  // Reported from production: pressing Rebuild on a dispute with no usage feed
+  // and no support history attached neither generated document and said
+  // nothing about it, which is indistinguishable from a dead button. The
+  // documents were right to refuse; the silence was the defect.
+  const h = docHarness({ held: {} });
+  const res = await h.builder.stage(h.dispute, h.pack, false);
+  assert.deepEqual(res.documents, []);
+  const why = Object.fromEntries(res.documentsSkipped.map((s) => [s.slot, s.why]));
+  assert.match(why.service_documentation, /published nothing|no usage feed/);
+  assert.match(why.customer_communication, /no support conversation/);
+});
+
+test("documents: a slot a human filled is reported separately from a document that could not be built", async () => {
+  // The two need different words: one is the system protecting an upload, the
+  // other is a fact we do not have.
+  const h = docHarness({ currentEvidence: { refund_policy: "file_from_a_person" } });
+  const res = await h.builder.stage(h.dispute, h.pack, false);
+  assert.ok(res.documentsSkipped.some((s) => s.slot === "refund_policy" && s.why === "slot already filled"));
+  assert.ok(res.documentsSkipped.some((s) => s.slot === "service_documentation" && s.why !== "slot already filled"));
+});

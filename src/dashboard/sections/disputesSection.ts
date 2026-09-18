@@ -457,18 +457,24 @@ async function disputeAction(
         : "";
       // The templates are deterministic, so an untouched dispute rebuilds to
       // the same text. Saying so beats reporting a write that did not happen.
+      // Only the reasons a human can act on. "Slot already filled" is the
+      // system protecting their own upload, not a problem to report.
+      const missing = staged.documentsSkipped
+        .filter((skip: { why: string }) => skip.why !== "slot already filled")
+        .map((skip: { slot: string; why: string }) => `${skip.slot.replace(/_/g, " ")} (${skip.why})`);
+      const notMade = missing.length ? ` No ${missing.join(", no ")}.` : "";
       if (staged.unchanged) {
         return {
           ok: true,
-          text: `No change: the staged package already matches what the templates and the current facts produce (${staged.staged.length} field(s), completeness ${staged.pack.score}%).${omitted}`,
+          text: `No change: the staged package already matches what the templates and the current facts produce (${staged.staged.length} field(s), completeness ${staged.pack.score}%).${notMade}${omitted}`,
         };
       }
       const docs = staged.documents.length
-        ? ` Attached ${staged.documents.length} policy document(s): ${staged.documents.map((d: string) => d.replace(/_/g, " ")).join(", ")}.`
+        ? ` Attached ${staged.documents.length} document(s): ${staged.documents.map((d: string) => d.replace(/_/g, " ")).join(", ")}.`
         : "";
       return {
         ok: true,
-        text: `Staged ${staged.staged.length} field(s), completeness ${staged.pack.score}%.${docs}${omitted} Review the sections below, then submit.`,
+        text: `Staged ${staged.staged.length} field(s), completeness ${staged.pack.score}%.${docs}${notMade}${omitted} Review the sections below, then submit.`,
       };
     }
 
