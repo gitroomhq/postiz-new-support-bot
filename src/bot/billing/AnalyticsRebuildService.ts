@@ -33,7 +33,14 @@ const FLUSH_EVERY = 500;
 // axes the ordinary backfill leaves as "unknown", and it runs rarely. The
 // resolver caches process-wide, so a busy account spends far less than this —
 // the same handful of subscriptions repeat endlessly.
-const SEGMENT_BUDGET = 20_000;
+//
+// Raised from 20k after the first production run: the budget is now spent ONLY
+// on rows that actually lack segments (MoneyOutStore.idsNeedingSegments), so it
+// buys history rather than re-confirming rows the live sweep already did. A cap
+// still exists because a runaway crawl against Stripe is the thing it guards
+// against, and running out is now reported rather than silent — and resumable,
+// because a row the budget never reached keeps segmentsResolvedAt null.
+const SEGMENT_BUDGET = 50_000;
 
 export type RebuildPhase = "preflight" | "repair" | "wipe" | "reemit" | "catchup" | "gauges";
 
@@ -41,6 +48,8 @@ export interface RebuildStats {
   moneyScanned: number;
   moneyCreated: number;
   moneyRepaired: number;
+  segmentsEnriched: number;
+  segmentBudgetExhausted: boolean;
   creditNotes: number;
   writeOffs: number;
   discountRows: number;
@@ -63,6 +72,8 @@ function emptyStats(): RebuildStats {
     moneyScanned: 0,
     moneyCreated: 0,
     moneyRepaired: 0,
+    segmentsEnriched: 0,
+    segmentBudgetExhausted: false,
     creditNotes: 0,
     writeOffs: 0,
     discountRows: 0,
@@ -158,6 +169,14 @@ export class AnalyticsRebuildService {
     if (!this.settings.moneyOutEnabled()) {
       throw new Error("The money-out ledger is switched off, so a rebuild would import nothing.");
     }
+    // Enrichment off means every segment axis resolves to "unknown", which is
+    // the single thing this rebuild exists to fix. Silently producing a bucket
+    // full of "unknown" and calling it a success is worse than refusing.
+    if (!this.settings.moneyOutEnrichEnabled()) {
+      throw new Error(
+        "Money-out segment enrichment is switched off (/config → Billing → Money-out), so every plan, card and region would rebuild as \"unknown\". Turn it on first."
+      );
+    }
     await probeInfluxDelete();
     rebuildLog.info("analytics rebuild preflight ok", {});
   }
@@ -204,6 +223,8 @@ export class AnalyticsRebuildService {
     stats.moneyScanned = money.scanned;
     stats.moneyCreated = money.created;
     stats.moneyRepaired = money.repaired;
+    stats.segmentsEnriched = money.segmentsEnriched;
+    stats.segmentBudgetExhausted = money.segmentBudgetExhausted;
     stats.creditNotes = money.creditNotes;
     stats.writeOffs = money.writeOffs;
     stats.discountRows = money.discounts;

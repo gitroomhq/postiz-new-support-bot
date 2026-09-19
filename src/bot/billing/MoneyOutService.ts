@@ -118,6 +118,15 @@ export interface MoneyOutBackfillResult {
   // Rows repaired in place: ones that already existed and whose segments, fees
   // or USD columns an earlier, less-informed pass never filled in.
   repaired: number;
+  // Rows that came back with a real plan or card rather than "unknown".
+  segmentsEnriched: number;
+  // The run's Stripe lookup budget ran out before the walk finished, so some
+  // rows are still "unknown" and a re-run would enrich more.
+  //
+  // Reported because the first production run had no way to say this: it spent
+  // its whole budget on rows that already had segments, finished, and claimed
+  // success while every historical row stayed unknown.
+  segmentBudgetExhausted: boolean;
   // Concessions have no balance transaction, so they are swept from their own
   // endpoints rather than the ledger.
   creditNotes: number;
@@ -260,7 +269,7 @@ export class MoneyOutService {
     // walk in the normal case.
     const swept =
       scope === "concessions" || scope === "none"
-        ? { scanned: 0, created: 0, repaired: 0, truncated: false }
+        ? { scanned: 0, created: 0, repaired: 0, segmentsEnriched: 0, truncated: false }
         : await this.sweep({
             maxPages: MAX_PAGES_BACKFILL,
             source: "backfill",
@@ -321,6 +330,10 @@ export class MoneyOutService {
       scanned: swept.scanned,
       created: swept.created,
       repaired: swept.repaired,
+      segmentsEnriched: swept.segmentsEnriched,
+      // Checked AFTER the walk: a budget at zero means lookups were being
+      // refused by the time it finished.
+      segmentBudgetExhausted: enrich && this.segments.remainingBudget() <= 0,
       points,
       truncated: swept.truncated || concessions.truncated,
       creditNotes: concessions.creditNotes,
@@ -486,12 +499,19 @@ export class MoneyOutService {
     // The CALLER opened one segment budget for the whole run, so enrichSegments
     // must not open a fresh one per page. Without this the cap never caps.
     runBudget?: boolean;
-  }): Promise<{ scanned: number; created: number; repaired: number; truncated: boolean }> {
+  }): Promise<{
+    scanned: number;
+    created: number;
+    repaired: number;
+    segmentsEnriched: number;
+    truncated: boolean;
+  }> {
     const emitPoints = opts.emitPoints !== false;
     let startingAfter: string | undefined;
     let scanned = 0;
     let created = 0;
     let repaired = 0;
+    let segmentsEnriched = 0;
     let pages = 0;
 
     for (;;) {
@@ -544,7 +564,22 @@ export class MoneyOutService {
 
       // Descriptive segments, before the write so the mirror and the Influx
       // points carry the same axes. Never fatal: see enrichSegments.
-      if (opts.enrichSegments !== false) await this.enrichSegments(pageRows, btByRowId, opts.runBudget);
+      //
+      // In repair mode, ask the mirror which of these rows are actually missing
+      // segments first. One query per page buys back thousands of Stripe reads
+      // that would otherwise be spent re-resolving rows that already have them.
+      if (opts.enrichSegments !== false) {
+        const needSegments = opts.repairExisting
+          ? await this.store.idsNeedingSegments(pageRows.map((r) => r.id))
+          : null;
+        segmentsEnriched += await this.enrichSegments(
+          pageRows,
+          btByRowId,
+          opts.runBudget,
+          needSegments,
+          opts.onProgress
+        );
+      }
 
       const fresh = await this.store.insertNew(pageRows);
       created += fresh.length;
@@ -574,11 +609,11 @@ export class MoneyOutService {
       // dashboard column rather than the totals.
       if (opts.resolveCustomers !== false) await this.backfillCustomers(fresh);
       if (!page.hasMore || page.transactions.length === 0) {
-        return { scanned, created, repaired, truncated: false };
+        return { scanned, created, repaired, segmentsEnriched, truncated: false };
       }
       if (pages >= opts.maxPages) {
         moneyLog.warn("money-out sweep hit the page cap", { "money_out.pages": pages, "money_out.scanned": scanned });
-        return { scanned, created, repaired, truncated: true };
+        return { scanned, created, repaired, segmentsEnriched, truncated: true };
       }
       startingAfter = page.transactions[page.transactions.length - 1].id;
     }
@@ -598,20 +633,55 @@ export class MoneyOutService {
   private async enrichSegments(
     rows: MoneyOutRow[],
     btByRowId: Map<string, Stripe.BalanceTransaction>,
-    runBudget?: boolean
-  ): Promise<void> {
-    if (!this.settings.moneyOutEnrichEnabled()) return;
-    const targets = rows.filter((r) => SEGMENTABLE_CATEGORIES.has(r.category));
-    if (targets.length === 0) return;
+    runBudget?: boolean,
+    // Repair mode only: the ids that still have no segments stored. Rows
+    // outside it are skipped without spending a single Stripe read.
+    //
+    // This filter is the difference between a repair that works and one that
+    // silently does nothing. Stripe lists balance transactions NEWEST FIRST,
+    // and the newest rows are precisely the ones the live sweep already
+    // enriched — so enriching every row in page order burns the whole run
+    // budget on rows that did not need it and never reaches the history. That
+    // is exactly what the first production run did: it completed, reported
+    // success, and left every historical row reading "unknown".
+    needSegments?: Set<string> | null,
+    // Heartbeat. A page can hold a hundred segmentable rows costing up to four
+    // Stripe reads each, which on a slow day outlasts the activity's two-minute
+    // heartbeat timeout — and a killed activity takes the whole phase with it.
+    onProgress?: () => void
+  ): Promise<number> {
+    if (!this.settings.moneyOutEnrichEnabled()) return 0;
+    const targets = rows.filter(
+      (r) => SEGMENTABLE_CATEGORIES.has(r.category) && (!needSegments || needSegments.has(r.id))
+    );
+    if (targets.length === 0) return 0;
 
     // Per-page allowance for the ordinary tick, which reads one or two pages.
     // Skipped when the caller opened a budget for the whole run: reopening it
     // here would hand every page a fresh allowance, so a two-thousand-page
     // backfill would spend sixty thousand Stripe reads under a cap of thirty.
     if (!runBudget) this.segments.startBatch(MAX_SEGMENT_LOOKUPS_PER_PAGE);
+    let enriched = 0;
     for (const row of targets) {
+      // STOP rather than resolve-to-unknown once the run budget is spent.
+      //
+      // Continuing would write the literal string "unknown" into every axis of
+      // every remaining row, and a stored "unknown" is indistinguishable from a
+      // real one — so the next run would skip exactly the rows this one failed
+      // to enrich, and the gap would be permanent. Leaving them untouched keeps
+      // segmentsResolvedAt null, which is what makes the repair resumable.
+      if (runBudget && this.segments.remainingBudget() <= 0) break;
+      onProgress?.();
       try {
-        row.segments = await this.segmentsForRow(row, btByRowId.get(row.id));
+        const segments = await this.segmentsForRow(row, btByRowId.get(row.id));
+        row.segments = segments;
+        // A lookup was paid for, so "unknown" here is a real answer and must
+        // not be retried on every future run.
+        row.segmentsResolved = true;
+        // Counted only when something was actually learned. A row resolved
+        // entirely to "unknown" means Stripe had nothing, and calling that
+        // "enriched" is how a no-op passes for work.
+        if (segments.planTier !== UNKNOWN || segments.cardBrand !== UNKNOWN) enriched++;
       } catch (error) {
         // A chart axis is never worth failing a money movement over.
         moneyLog.debug("segment enrichment failed", {
@@ -620,6 +690,7 @@ export class MoneyOutService {
         });
       }
     }
+    return enriched;
   }
 
   private async segmentsForRow(

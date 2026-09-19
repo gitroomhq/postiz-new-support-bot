@@ -102,6 +102,8 @@ function emptyStats(): AnalyticsRebuildStats {
     moneyScanned: 0,
     moneyCreated: 0,
     moneyRepaired: 0,
+    segmentsEnriched: 0,
+    segmentBudgetExhausted: false,
     creditNotes: 0,
     writeOffs: 0,
     discountRows: 0,

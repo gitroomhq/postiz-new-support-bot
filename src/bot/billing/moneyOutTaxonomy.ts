@@ -120,6 +120,11 @@ export interface MoneyOutRow {
   // NEVER any PII: every value is a bounded enum or an ISO country code. See
   // segments.ts, which is the single place that decides what may live here.
   segments?: MoneySegments | null;
+  // True when a segment lookup was actually PAID FOR on this row, whatever it
+  // found. Distinct from `segments` being populated: an exhausted budget fills
+  // every axis with the literal string "unknown", which reads exactly like a
+  // real answer once stored. See StripeMoneyOut.segmentsResolvedAt.
+  segmentsResolved?: boolean;
 }
 
 function row(input: Omit<MoneyOutRow, "bucket" | "netMinor"> & { netMinor?: number }): MoneyOutRow {

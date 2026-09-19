@@ -986,6 +986,12 @@ export const STATEMENTS: string[] = [
   `ALTER TABLE "stripe_money_out" ADD COLUMN IF NOT EXISTS "retiredAt" TIMESTAMP(3)`,
   `ALTER TABLE "stripe_money_out" ADD COLUMN IF NOT EXISTS "retiredReason" TEXT`,
   `CREATE INDEX IF NOT EXISTS "stripe_money_out_retiredAt_idx" ON "stripe_money_out"("retiredAt")`,
+  // Whether a segment lookup was ever actually paid for on this row. Null means
+  // "never looked", which is what makes an interrupted repair resumable: an
+  // exhausted budget writes "unknown" into every axis, and without this column
+  // those rows are indistinguishable from genuinely-unknown ones and get
+  // skipped forever.
+  `ALTER TABLE "stripe_money_out" ADD COLUMN IF NOT EXISTS "segmentsResolvedAt" TIMESTAMP(3)`,
   // The rebuild's tail catch-up queries updatedAt >= runStart; without this it
   // is a sequential scan of the whole ledger.
   `CREATE INDEX IF NOT EXISTS "stripe_money_out_updatedAt_idx" ON "stripe_money_out"("updatedAt")`,

@@ -134,7 +134,7 @@ export const EXPECTED_COLUMNS: Record<string, string[]> = {
     "planTier", "planPeriod", "cardBrand", "cardFunding", "cardCountry", "refundReason", "refundKind",
     "chargeAge", "tenure", "networkReason", "surface",
     "usdMinor", "feeUsdMinor", "netUsdMinor", "fxRate", "fxRatesAt", "invoiceId",
-    "retiredAt", "retiredReason",
+    "retiredAt", "retiredReason", "segmentsResolvedAt",
   ],
   stripe_subscription_events: [
     "id", "subscriptionId", "customerId", "event", "planTier", "planPeriod", "fromTier", "fromPeriod",

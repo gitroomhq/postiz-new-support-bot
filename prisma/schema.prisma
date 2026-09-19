@@ -1118,6 +1118,18 @@ model StripeMoneyOut {
   // retiredAt != null, so a retired row counts towards nothing.
   retiredAt      DateTime?
   retiredReason  String?
+  // When a segment lookup actually HAPPENED for this row, whatever it found.
+  //
+  // The distinction this draws is the difference between a resumable repair and
+  // one that freezes its own gaps. The segment columns above cannot express it:
+  // an exhausted lookup budget returns the literal string "unknown" for every
+  // axis, which is indistinguishable from a real answer of "this charge has no
+  // subscription" once written. A repair that skipped already-"unknown" rows
+  // would then skip precisely the rows it failed to enrich last time, forever.
+  //
+  // Null means nobody has looked yet, so a later run must try again. Set means
+  // a lookup was paid for and "unknown" is the real answer.
+  segmentsResolvedAt DateTime?
   // Invoice behind an invoice-derived discount row. Discounts are the one
   // category whose real money lives on invoices rather than on a balance
   // transaction, so this is how a discount row points back at its source.

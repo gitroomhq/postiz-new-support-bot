@@ -503,6 +503,8 @@ export interface AnalyticsRebuildStats {
   moneyScanned: number;
   moneyCreated: number;
   moneyRepaired: number;
+  segmentsEnriched: number;
+  segmentBudgetExhausted: boolean;
   creditNotes: number;
   writeOffs: number;
   discountRows: number;

@@ -2392,6 +2392,10 @@ export class DiscordBot {
 
     const lines = [
       `• Ledger: scanned **${n("moneyScanned")}**, **${n("moneyCreated")}** new, **${n("moneyRepaired")}** corrected`,
+      `• Segments resolved on **${n("segmentsEnriched")}** row(s)` +
+        (n("segmentsEnriched") === 0
+          ? " — ⚠️ **nothing was enriched**, so every plan/card/region axis is still `unknown`"
+          : ""),
       `• Concessions: **${n("creditNotes")}** credit note(s), **${n("writeOffs")}** write-off(s), **${n("discountRows")}** discount(s) across **${n("invoicesScanned")}** paid invoice(s)`,
       `• Retired **${n("retiredEstimates")}** superseded coupon estimate(s)`,
       `• Disputes: **${n("disputesSwept")}** swept, **${n("disputeClosedAtImproved")}** close time(s) upgraded from an estimate`,
@@ -2406,6 +2410,15 @@ export class DiscordBot {
     if (s.truncated) {
       lines.push("• ⚠️ A sweep hit its page cap, so the import is incomplete. Run it again to continue.");
     }
+    if (s.segmentBudgetExhausted) {
+      // The failure mode that made the first run look successful while leaving
+      // every historical row "unknown". It has to be said out loud, because the
+      // rest of the numbers look perfectly healthy when it happens.
+      lines.push(
+        "• ⚠️ The Stripe lookup budget ran out before the walk finished, so some rows are still `unknown`. " +
+          "**Run it again** — each run picks up where the last one left off, because rows that already have segments are skipped."
+      );
+    }
 
     await this.postBillingAuditEmbed(
       makeEmbed(
@@ -2418,10 +2431,24 @@ export class DiscordBot {
 
   private async postBillingAuditEmbed(embed: EmbedBuilder): Promise<void> {
     const channelId = this.settingsStore.billingAuditChannelId() ?? this.settingsStore.auditLogChannelId();
-    if (!channelId) return;
+    if (!channelId) {
+      // Silently dropping a result is how a long job becomes indistinguishable
+      // from one that never ran. The log line is the fallback record.
+      this.discordLog.warn("billing audit embed dropped: no audit channel configured", {
+        "discord.embed_title": embed.data.title ?? "",
+      });
+      return;
+    }
     const channel = await this.client.channels.fetch(channelId).catch(() => null);
-    if (!channel?.isSendable()) return;
-    await channel.send({ embeds: [embed] }).catch(() => undefined);
+    if (!channel?.isSendable()) {
+      this.discordLog.warn("billing audit embed dropped: channel unreachable or not sendable", {
+        "discord.channel_id": channelId,
+      });
+      return;
+    }
+    await channel.send({ embeds: [embed] }).catch((e) => {
+      this.discordLog.warn("billing audit embed send failed", { "error.message": String(e) });
+    });
   }
 
   private async buildMoneyOutConfigPanel() {
@@ -3107,7 +3134,14 @@ export class DiscordBot {
     return { embeds: [embed], components: [influxRow, rebuildRow] };
   }
 
-  // One line of rebuild state for the Analytics panel.
+  // Rebuild state for the Analytics panel, INCLUDING what the last run actually
+  // did.
+  //
+  // The counters are here rather than only in the audit-channel embed because
+  // the first real run posted no embed at all — the billing audit channel is
+  // optional and postBillingAuditEmbed returns silently when it is unset, so a
+  // completed rebuild was indistinguishable from one that never ran. A result
+  // nobody can see is the same as no result.
   private analyticsRebuildLine(): string {
     const s = this.settingsStore;
     const phase = s.analyticsRebuildPhase();
@@ -3118,11 +3152,23 @@ export class DiscordBot {
     }
     const done = s.analyticsRebuildDoneAt();
     if (!done) return "never run";
+
+    const when = `<t:${Math.floor(done.getTime() / 1000)}:R>`;
     const stats = s.analyticsRebuildStats();
-    const failed = stats && typeof stats.error === "string" && stats.error;
-    return failed
-      ? `last run <t:${Math.floor(done.getTime() / 1000)}:R> ⚠️ failed`
-      : `last run <t:${Math.floor(done.getTime() / 1000)}:R>`;
+    if (!stats) return `last run ${when}`;
+    if (typeof stats.error === "string" && stats.error) {
+      return `last run ${when} ⚠️ **failed** — ${String(stats.error).slice(0, 140)}`;
+    }
+
+    const n = (k: string): number => (typeof stats[k] === "number" ? (stats[k] as number) : 0);
+    const points = n("points") + n("catchUpPoints");
+    return [
+      `last run ${when} ✅`,
+      `↳ ${n("moneyScanned")} scanned · ${n("moneyCreated")} new · ${n("moneyRepaired")} repaired · ` +
+        `${n("discountRows")} discount row(s) · ${n("retiredEstimates")} estimate(s) retired`,
+      `↳ **${points}** point(s) written to InfluxDB` +
+        (points === 0 ? " — ⚠️ nothing was emitted, so the bucket is empty" : ""),
+    ].join("\n");
   }
 
   // One-line Vault state for the main config panel's Infrastructure field.

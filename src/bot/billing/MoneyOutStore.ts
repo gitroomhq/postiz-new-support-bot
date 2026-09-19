@@ -1,6 +1,6 @@
 import { PrismaClient, StripeMoneyOut } from "../../generated/prisma/client";
 import type { MoneyOutBucket, MoneyOutCategory, MoneyOutRow } from "./moneyOutTaxonomy";
-import type { MoneySegments } from "./segments";
+import { UNKNOWN, type MoneySegments } from "./segments";
 import { RATES_SAMPLED_AT, usdMinorOf } from "./fx";
 
 // Every read excludes retired rows, and this is the one place that says so.
@@ -117,7 +117,13 @@ export class MoneyOutStore {
     };
     const saved = await this.prisma.stripeMoneyOut.upsert({
       where: { id: row.id },
-      create: { id: row.id, ...data, ...usdColumns(row), ...segmentColumns(row.segments) },
+      create: {
+        id: row.id,
+        ...data,
+        ...usdColumns(row),
+        ...segmentColumns(row.segments),
+        ...(row.segmentsResolved ? { segmentsResolvedAt: new Date() } : {}),
+      },
       // A later pass may know things the first one didn't (the customer id the
       // webhook path resolves), but must never blank out what is already there.
       update: {
@@ -174,11 +180,48 @@ export class MoneyOutStore {
         occurredAt: r.occurredAt,
         ...usdColumns(r),
         ...segmentColumns(r.segments),
+        ...(r.segmentsResolved ? { segmentsResolvedAt: new Date() } : {}),
       })),
       // A concurrent sweep (webhook mini-sweep racing the looper) may have
       // inserted the same id between the read and the write.
       skipDuplicates: true,
     });
+  }
+
+  // Which of these ids still need their descriptive segments resolved.
+  //
+  // This is what stops a repair pass from spending its entire Stripe budget
+  // re-resolving rows that were already enriched. Stripe lists balance
+  // transactions NEWEST FIRST, and the newest rows are exactly the ones the
+  // live sweep already enriched — so without this filter the budget is gone
+  // long before the walk reaches the history the rebuild exists to fix, and
+  // nothing says so.
+  //
+  // "Needs" means the same thing it means on the dispute mirror: no plan and no
+  // card. An id that is not in the table yet is new, so it needs them too.
+  async idsNeedingSegments(ids: string[]): Promise<Set<string>> {
+    const need = new Set<string>(ids);
+    if (ids.length === 0) return need;
+    const known = await this.prisma.stripeMoneyOut.findMany({
+      where: { id: { in: ids } },
+      select: { id: true, planTier: true, cardBrand: true, segmentsResolvedAt: true },
+    });
+    for (const row of known) {
+      // A paid-for lookup settles it, whatever it found.
+      if (row.segmentsResolvedAt) {
+        need.delete(row.id);
+        continue;
+      }
+      // Legacy rows enriched before segmentsResolvedAt existed: a REAL plan and
+      // card mean somebody clearly looked. The explicit "unknown" check is what
+      // lets the damage from the first production run be repaired — that run
+      // wrote "unknown" into rows whose budget had run out, and treating those
+      // as resolved would skip them forever.
+      if (row.planTier && row.planTier !== UNKNOWN && row.cardBrand && row.cardBrand !== UNKNOWN) {
+        need.delete(row.id);
+      }
+    }
+    return need;
   }
 
   // Correct rows that already exist, for the analytics rebuild's repair phase.
@@ -207,6 +250,10 @@ export class MoneyOutStore {
         ...(row.feeMinor ? { feeMinor: row.feeMinor, netMinor: row.netMinor } : {}),
         // Frozen conversion for rows written before the columns existed.
         ...usdColumns(row),
+        // Only when a lookup was actually paid for. Stamping it on a row the
+        // budget never reached would mark an untried row as tried, and it
+        // would be skipped by every future run.
+        ...(row.segmentsResolved ? { segmentsResolvedAt: new Date() } : {}),
       };
       const res = await this.prisma.stripeMoneyOut.updateMany({ where: { id: row.id }, data });
       repaired += res.count;
