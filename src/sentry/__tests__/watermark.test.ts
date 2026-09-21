@@ -6,7 +6,7 @@ const item = (id: string, iso: string) => ({ id, firstSeen: iso });
 
 test("planFeedbackWalk drops items at/under the floor, sorts ascending, dedupes by id", () => {
   const floor = new Date("2026-07-20T10:00:00Z");
-  const { todo, overflow } = planFeedbackWalk(
+  const todo = planFeedbackWalk(
     [
       item("c", "2026-07-20T12:00:00Z"),
       item("a", "2026-07-20T10:30:00Z"),
@@ -16,25 +16,24 @@ test("planFeedbackWalk drops items at/under the floor, sorts ascending, dedupes 
       item("b", "2026-07-20T11:00:00Z"),
       item("bad", "not-a-date"),
     ],
-    floor,
-    10
+    floor
   );
   assert.deepEqual(
     todo.map((i) => i.id),
     ["a", "b", "c"]
   );
-  assert.equal(overflow, 0);
 });
 
-test("planFeedbackWalk caps with an explicit overflow count (oldest first survive)", () => {
+test("planFeedbackWalk plans the WHOLE window, so known items cannot hide newer ones", () => {
+  // The plan used to stop at the per-tick import cap. With a window whose
+  // oldest entries were all already processed, every newer submission sat
+  // behind them and never got walked at all.
   const floor = new Date("2026-07-20T10:00:00Z");
-  const items = Array.from({ length: 7 }, (_, i) => item(`i${i}`, `2026-07-20T1${i + 1}:00:00Z`));
-  const { todo, overflow } = planFeedbackWalk(items, floor, 5);
-  assert.deepEqual(
-    todo.map((i) => i.id),
-    ["i0", "i1", "i2", "i3", "i4"]
-  );
-  assert.equal(overflow, 2);
+  const items = Array.from({ length: 40 }, (_, i) => item(`i${i}`, `2026-07-20T10:${String(i + 1).padStart(2, "0")}:00Z`));
+  const todo = planFeedbackWalk(items, floor);
+  assert.equal(todo.length, 40);
+  assert.equal(todo[0].id, "i0");
+  assert.equal(todo[39].id, "i39");
 });
 
 test("advanceWatermark advances through terminal outcomes to the max feedbackAt", () => {

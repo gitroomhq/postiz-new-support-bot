@@ -1,5 +1,10 @@
 import { PrismaClient, SentryFeedbackImport } from "../generated/prisma/client";
 
+// Attempts before a failing submission is parked. Five 15-minute ticks is ~an
+// hour of transient-outage tolerance; past that the failure is structural and
+// re-running it every tick only costs Intercom calls.
+export const MAX_ITEM_ATTEMPTS = 5;
+
 // Ledger accessors for sentry_feedback_imports: dedup by Sentry issue id,
 // exemption lookups by Intercom conversation id, and the /config counters.
 export class SentryFeedbackStore {
@@ -9,11 +14,26 @@ export class SentryFeedbackStore {
     return this.prisma.sentryFeedbackImport.findUnique({ where: { sentryIssueId } });
   }
 
+  // Ledger state for a whole listing page in ONE indexed query. The walk used
+  // to issue a findUnique per listed item, which put the dedup cost on the
+  // same budget as the imports themselves.
+  async ledgerStates(sentryIssueIds: string[]): Promise<Map<string, { status: string; attempts: number }>> {
+    if (sentryIssueIds.length === 0) return new Map();
+    const rows = await this.prisma.sentryFeedbackImport.findMany({
+      where: { sentryIssueId: { in: sentryIssueIds } },
+      select: { sentryIssueId: true, status: true, attempts: true },
+    });
+    return new Map(rows.map((r) => [r.sentryIssueId, { status: r.status, attempts: r.attempts }]));
+  }
+
   getByConversationId(intercomConversationId: string): Promise<SentryFeedbackImport | null> {
     return this.prisma.sentryFeedbackImport.findUnique({ where: { intercomConversationId } });
   }
 
-  async insertImported(data: {
+  // Upsert, not create: an item that failed on an earlier tick already has a
+  // row (that row is what let the watermark move past it), so the import that
+  // finally succeeds must update it in place rather than hit the unique index.
+  async recordImported(data: {
     sentryIssueId: string;
     sentryShortId: string | null;
     projectSlug: string | null;
@@ -27,10 +47,16 @@ export class SentryFeedbackStore {
     postizOrgId?: string | null;
     stripeCustomerId?: string | null;
   }): Promise<void> {
-    await this.prisma.sentryFeedbackImport.create({ data: { ...data, status: "imported" } });
+    const { sentryIssueId, ...rest } = data;
+    await this.prisma.sentryFeedbackImport.upsert({
+      where: { sentryIssueId },
+      create: { sentryIssueId, ...rest, status: "imported" },
+      // importedAt moves to the real import time; lastError is history now.
+      update: { ...rest, status: "imported", lastError: null, importedAt: new Date() },
+    });
   }
 
-  async insertSkipped(data: {
+  async recordSkipped(data: {
     sentryIssueId: string;
     sentryShortId: string | null;
     projectSlug: string | null;
@@ -41,7 +67,62 @@ export class SentryFeedbackStore {
     postizOrgId?: string | null;
     stripeCustomerId?: string | null;
   }): Promise<void> {
-    await this.prisma.sentryFeedbackImport.create({ data: { ...data, status: "skipped_no_email" } });
+    const { sentryIssueId, ...rest } = data;
+    await this.prisma.sentryFeedbackImport.upsert({
+      where: { sentryIssueId },
+      create: { sentryIssueId, ...rest, status: "skipped_no_email" },
+      update: { ...rest, status: "skipped_no_email", lastError: null },
+    });
+  }
+
+  // The failure ledger. Writing this row is what unblocks the queue: the walk
+  // treats it as a processed item, so the watermark advances past a submission
+  // that cannot be imported instead of re-walking it forever.
+  async recordFailure(data: {
+    sentryIssueId: string;
+    sentryShortId: string | null;
+    projectSlug: string | null;
+    feedbackAt: Date;
+    error: string;
+  }): Promise<void> {
+    const { sentryIssueId, error, ...rest } = data;
+    await this.prisma.sentryFeedbackImport.upsert({
+      where: { sentryIssueId },
+      create: { sentryIssueId, ...rest, status: "failed", attempts: 1, lastError: error },
+      // status is deliberately NOT written here: a decoration that failed
+      // after a successful import must never downgrade an imported row.
+      update: { attempts: { increment: 1 }, lastError: error },
+    });
+  }
+
+  // Failed rows that still have attempts left, oldest first. The walk never
+  // retries them (they are behind the watermark by then) — this drain owns
+  // every retry, so an item is attempted exactly once per tick.
+  listFailedForRetry(limit: number): Promise<SentryFeedbackImport[]> {
+    return this.prisma.sentryFeedbackImport.findMany({
+      where: { status: "failed", attempts: { lt: MAX_ITEM_ATTEMPTS } },
+      orderBy: { feedbackAt: "asc" },
+      take: limit,
+    });
+  }
+
+  // Panel counters: still retrying vs parked for good.
+  async countFailed(): Promise<{ retryable: number; parked: number }> {
+    const [retryable, parked] = await Promise.all([
+      this.prisma.sentryFeedbackImport.count({ where: { status: "failed", attempts: { lt: MAX_ITEM_ATTEMPTS } } }),
+      this.prisma.sentryFeedbackImport.count({ where: { status: "failed", attempts: { gte: MAX_ITEM_ATTEMPTS } } }),
+    ]);
+    return { retryable, parked };
+  }
+
+  // The newest failure reason, for the /config line that says WHY.
+  async lastFailure(): Promise<{ sentryShortId: string | null; sentryIssueId: string; error: string | null } | null> {
+    const row = await this.prisma.sentryFeedbackImport.findFirst({
+      where: { status: "failed" },
+      orderBy: { feedbackAt: "desc" },
+      select: { sentryShortId: true, sentryIssueId: true, lastError: true },
+    });
+    return row ? { sentryShortId: row.sentryShortId, sentryIssueId: row.sentryIssueId, error: row.lastError } : null;
   }
 
   // Replay candidates: submissions dropped as anonymous that have never been
@@ -83,7 +164,7 @@ export class SentryFeedbackStore {
   ): Promise<void> {
     await this.prisma.sentryFeedbackImport.update({
       where: { sentryIssueId },
-      data: { ...data, status: "imported" },
+      data: { ...data, status: "imported", lastError: null },
     });
   }
 

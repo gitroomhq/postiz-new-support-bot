@@ -94,6 +94,11 @@ function harness(opts: HarnessOpts = {}) {
     async listSkippedForRetry(limit: number) {
       return (opts.rows ?? []).slice(0, limit);
     },
+    // The failure drain shares the tick; these tests are about the anonymous
+    // replay, so it has nothing to do.
+    async listFailedForRetry() {
+      return [];
+    },
     async markRetried(sentryIssueId: string) {
       retried.push(sentryIssueId);
       ops.push(`store.retried:${sentryIssueId}`);

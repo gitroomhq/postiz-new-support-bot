@@ -886,6 +886,10 @@ export const STATEMENTS: string[] = [
   // ledger's ticket-id column for the sweeper/enforcer exemption lookups.
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "sentryFeedbackTicketTypeId" TEXT`,
   `ALTER TABLE "sentry_feedback_imports" ADD COLUMN IF NOT EXISTS "intercomTicketId" TEXT`,
+  // Failure bookkeeping: a failed item is recorded instead of freezing the
+  // watermark, retried from the ledger, and parked once attempts run out.
+  `ALTER TABLE "sentry_feedback_imports" ADD COLUMN IF NOT EXISTS "attempts" INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE "sentry_feedback_imports" ADD COLUMN IF NOT EXISTS "lastError" TEXT`,
   // Forwarded-email conversion (lite-seat forwards → conversation recreated for
   // the original sender): ledger table + the /intercom → Automation knobs.
   `CREATE TABLE IF NOT EXISTS "forwarded_email_converts" (

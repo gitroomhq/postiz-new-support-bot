@@ -281,17 +281,25 @@ export class IntercomClient {
     await this.json(`/contacts/${encodeURIComponent(contactId)}/unarchive`, "POST", undefined, "contact unarchive");
   }
 
-  // Existence/archived probe for the 404 self-heal: a merged or hard-deleted
-  // contact must be re-resolved, an archived one merely unarchived.
-  async getContact(contactId: string): Promise<{ id: string; archived: boolean } | null> {
+  // Existence/archived probe for the 404 self-heal and the create-conflict
+  // ladder: a merged or hard-deleted contact must be re-resolved, an archived
+  // one merely unarchived. Role comes along because a conflict resolved by id
+  // still has to pick the conversation's from-type.
+  async getContact(contactId: string): Promise<{ id: string; archived: boolean; role: "user" | "lead" | null } | null> {
     try {
-      const data = await this.json<{ id?: string | number; archived?: boolean }>(
+      const data = await this.json<{ id?: string | number; archived?: boolean; role?: string }>(
         `/contacts/${encodeURIComponent(contactId)}`,
         "GET",
         undefined,
         "contact get"
       );
-      return data.id != null ? { id: String(data.id), archived: data.archived === true } : null;
+      return data.id != null
+        ? {
+            id: String(data.id),
+            archived: data.archived === true,
+            role: data.role === "user" || data.role === "lead" ? data.role : null,
+          }
+        : null;
     } catch (e) {
       if (e instanceof IntercomHttpError && e.status === 404) return null;
       throw e;

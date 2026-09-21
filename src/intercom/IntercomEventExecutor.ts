@@ -1057,6 +1057,18 @@ export function archivedContactId(e: unknown): string | null {
   return m ? m[1] : null;
 }
 
+// Intercom names the blocking record in every create conflict, but not always
+// with the word "archived": the external_id path says "...archived contact...
+// id=X" while the email path says "A contact matching those details already
+// exists with id=X". The second wording is the one the Sentry feedback import
+// hits, and reading only the first is why a single archived submitter could
+// dead-letter that import forever — search is blind to archived contacts, so
+// the id in the error body is the ONLY way back to the record.
+export function conflictingContactId(e: unknown): string | null {
+  if (!(e instanceof IntercomHttpError)) return null;
+  return /\bid=([A-Za-z0-9_-]+)/.exec(e.message)?.[1] ?? null;
+}
+
 // Unarchive rejects a contact already inside Intercom's permanent-deletion grace
 // ("...marked for permanent deletion and is not restorable") — its external_id
 // stays locked for ~7 days, so the resolver must fall through to another id.

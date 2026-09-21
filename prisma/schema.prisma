@@ -1428,7 +1428,7 @@ model SentryFeedbackImport {
   sentryIssueId          String   @unique
   sentryShortId          String?
   projectSlug            String?
-  status                 String // "imported" | "skipped_no_email"
+  status                 String // "imported" | "skipped_no_email" | "failed"
   contactEmail           String?
   contactName            String?
   intercomContactId      String?
@@ -1446,6 +1446,13 @@ model SentryFeedbackImport {
   // that still resolves to nothing stays skipped rather than being re-read on
   // every tick forever.
   retriedAt              DateTime?
+  // Failure bookkeeping. A row is written the MOMENT an item fails, which is
+  // what lets the watermark move past it: without it a single unimportable
+  // submission froze the walk and the whole feature stopped silently. The
+  // retry drain re-runs a "failed" row until attempts reaches its cap, then
+  // parks it (visible in /config, never retried again).
+  attempts               Int      @default(0)
+  lastError              String?
   feedbackAt             DateTime // Sentry issue firstSeen — watermark math + audit
   importedAt             DateTime @default(now())
 

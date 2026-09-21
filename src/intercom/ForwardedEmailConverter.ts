@@ -2,8 +2,9 @@ import type { AuditLogger } from "../bot/AuditLogger";
 import type { SettingsStore } from "../config/SettingsStore";
 import { log } from "../util/logger";
 import type { ForwardConvertStore } from "./ForwardConvertStore";
-import { IntercomHttpError, type IntercomClient } from "./IntercomClient";
-import { archivedContactId, escapeHtmlText } from "./IntercomEventExecutor";
+import { type IntercomClient } from "./IntercomClient";
+import { ensureEmailContact } from "./emailContact";
+import { escapeHtmlText } from "./IntercomEventExecutor";
 import { buildForwardConversationBody, parseForwardedEmail } from "./forwardedEmailParse";
 import { ForwarderRoster } from "./forwarderRoster";
 import type { IntercomAdmin } from "./types";
@@ -104,27 +105,14 @@ export class ForwardedEmailConverter {
       bodyText: string;
     }
   ): Promise<string> {
-    // Contact: prefer an existing user-role match (real customer record); a
-    // lead-only match is reused as-is; else create — same ladder as the Sentry
-    // feedback importer, plus the executor's archived-409 unarchive.
-    const matches = await this.client.searchContactsByEmail(input.email);
-    let match = matches.find((m) => m.role === "user") ?? matches.find((m) => m.role === "lead") ?? null;
-    if (!match) {
-      try {
-        match = { id: (await this.client.createEmailContact({ email: input.email, name: input.name })).id, role: "user" };
-      } catch (e) {
-        if (!(e instanceof IntercomHttpError && e.status === 409)) throw e;
-        const archivedId = archivedContactId(e);
-        if (archivedId) {
-          await this.client.unarchiveContact(archivedId);
-          match = { id: archivedId, role: "user" };
-        } else {
-          const retry = await this.client.searchContactsByEmail(input.email);
-          match = retry.find((m) => m.role === "user") ?? retry[0] ?? null;
-          if (!match) throw e;
-        }
-      }
-    }
+    // Contact: the shared email ladder (search → create → resolve the record a
+    // create conflict names → one re-search), identical to the Sentry feedback
+    // import so an archived sender is revived here too.
+    const match = await ensureEmailContact(
+      this.client,
+      { email: input.email, name: input.name },
+      { onWarn: (message, fields) => cvLog.warn(message, fields) }
+    );
     const fromType = match.role === "lead" ? "lead" : "user";
     // The conversation author is the forwarder's CONTACT record; the matching
     // teammate id (when their email is on a seat) is the useful audit datum.

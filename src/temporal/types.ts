@@ -389,6 +389,12 @@ export interface SentryFeedbackTickResult {
   imported: number;
   skippedNoEmail: number;
   deduped: number;
+  // Failure bookkeeping. `failed` are items recorded as failed this tick,
+  // `recovered` are failed rows that imported on a later attempt, and `parked`
+  // are listed items whose attempts ran out (walked for free, never retried).
+  failed: number;
+  recovered: number;
+  parked: number;
   // Previously-anonymous submissions re-examined this tick: `replayed` were
   // imported after all, `replayExhausted` had no identity and stay skipped.
   replayed: number;

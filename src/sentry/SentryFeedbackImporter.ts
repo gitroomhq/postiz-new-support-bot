@@ -1,5 +1,6 @@
 import type { SettingsStore } from "../config/SettingsStore";
 import { IntercomHttpError, type IntercomClient } from "../intercom/IntercomClient";
+import { ensureEmailContact } from "../intercom/emailContact";
 import type { SentryFeedbackTickResult } from "../temporal/types";
 import { log, redactSecrets } from "../util/logger";
 import {
@@ -10,7 +11,7 @@ import {
   planFeedbackWalk,
 } from "./feedbackFormat";
 import type { SentryFeedbackClient, SentryFeedbackIssue } from "./SentryFeedbackClient";
-import type { SentryFeedbackStore } from "./SentryFeedbackStore";
+import { MAX_ITEM_ATTEMPTS, type SentryFeedbackStore } from "./SentryFeedbackStore";
 import type { PostizOrgLinkStore } from "../postiz/PostizOrgLinkStore";
 
 const syncLog = log.child("sentry:feedback");
@@ -21,8 +22,10 @@ const WATERMARK_OVERLAP_MS = 10 * 60 * 1000;
 // 10 pages × 100 = the listing bound per tick; anything past it surfaces on
 // the next tick because the watermark only advances through processed items.
 const MAX_PAGES = 10;
-// Import cap per tick (each import = up to ~5 Intercom writes). Overflow is
-// logged and picked up next tick — never a silent drop.
+// Import cap per tick, counted in IMPORTS — items already in the ledger cost
+// one row of a query that has already run, so they are walked for free.
+// Counting them against this cap is what let a window of 24 known items plus
+// one permanent failure starve every newer submission for thirteen days.
 const MAX_IMPORTS_PER_TICK = 25;
 // Politeness pacing between Intercom writes (shared sweep idiom).
 const WRITE_SPACING_MS = 400;
@@ -42,8 +45,25 @@ const MAX_STORED_ERROR_CHARS = 300;
 
 function describeTickError(e: unknown): string {
   const raw = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
-  const clean = redactSecrets(raw).replace(/\s+/g, " ").trim() || "unknown error";
+  return trimStoredError(redactSecrets(raw));
+}
+
+function trimStoredError(text: string): string {
+  const clean = text.replace(/\s+/g, " ").trim() || "unknown error";
   return clean.length > MAX_STORED_ERROR_CHARS ? `${clean.slice(0, MAX_STORED_ERROR_CHARS - 1)}…` : clean;
+}
+
+// Per-tick state every item-level step shares: the counters it reports into,
+// the admin it writes as, the pacing/heartbeat hooks, and the memoized tag.
+interface WalkContext {
+  adminId: string;
+  result: SentryFeedbackTickResult;
+  paceWrite: () => Promise<void>;
+  beat: () => void;
+  ensureTag: () => Promise<string>;
+  // Newest item failure, surfaced on the /config panel so a tick that imports
+  // nothing because of a bad item never again reads as "completed".
+  lastItemError: string | null;
 }
 
 // Sentry User Feedback widget → Intercom: each feedback issue becomes ONE
@@ -164,6 +184,9 @@ export class SentryFeedbackImporter {
       imported: 0,
       skippedNoEmail: 0,
       deduped: 0,
+      failed: 0,
+      recovered: 0,
+      parked: 0,
       replayed: 0,
       replayExhausted: 0,
       errors: 0,
@@ -201,10 +224,10 @@ export class SentryFeedbackImporter {
     const floor = new Date(watermark.getTime() - WATERMARK_OVERLAP_MS);
 
     // ---- list (newest-first pages; planFeedbackWalk re-sorts ascending) ----
-    // A Sentry-side failure is held rather than thrown: the replay drain below
-    // talks to a different API surface and must still run (and still record
-    // its progress) while Sentry is refusing the listing. It is rethrown at
-    // the end so the tick still counts as failed.
+    // A Sentry-side failure is held rather than thrown: the drains below talk
+    // to a different API surface and must still run (and still record their
+    // progress) while Sentry is refusing the listing. It is rethrown at the
+    // end so the tick still counts as failed.
     const items: SentryFeedbackIssue[] = [];
     let listError: unknown = null;
     let cursor: string | undefined;
@@ -227,7 +250,7 @@ export class SentryFeedbackImporter {
       } catch (e) {
         listError = e;
         result.errors++;
-        syncLog.warn("sentry feedback: listing failed, replay drain still runs", {
+        syncLog.warn("sentry feedback: listing failed, the drains still run", {
           "feedback.page": page,
           "error.message": e instanceof Error ? e.message : String(e),
         });
@@ -244,16 +267,13 @@ export class SentryFeedbackImporter {
         ? items.filter((i) => i.projectSlug && projectFilter.has(i.projectSlug.toLowerCase()))
         : items;
 
-    const { todo, overflow } = planFeedbackWalk(scoped, floor, MAX_IMPORTS_PER_TICK);
-    if (overflow > 0) {
-      result.capped = true;
-      syncLog.warn("sentry.feedback.cap_hit", { "feedback.remaining": overflow });
-    }
+    const eligible = planFeedbackWalk(scoped, floor);
+    // One query for the whole page instead of one per item: the dedup verdict
+    // has to be cheap, because every listed item is walked every tick until
+    // the watermark passes it.
+    const states: Map<string, { status: string; attempts: number }> =
+      eligible.length > 0 ? await this.store.ledgerStates(eligible.map((i) => i.id)) : new Map();
 
-    // Ascending outcomes drive the watermark: it advances through terminal
-    // items and freezes at the first failure (retried next tick; the ledger
-    // dedups everything committed behind it).
-    const outcomes: Array<{ feedbackAt: Date; terminal: boolean }> = [];
     let lastWriteAt = 0;
     const paceWrite = async (): Promise<void> => {
       beat();
@@ -262,183 +282,78 @@ export class SentryFeedbackImporter {
       lastWriteAt = Date.now();
     };
     let tagId: string | null = null;
+    const ctx: WalkContext = {
+      adminId,
+      result,
+      paceWrite,
+      beat,
+      ensureTag: async () => {
+        if (tagId === null) tagId = (await this.intercom.findOrCreateTag(FEEDBACK_TAG)).id;
+        return tagId;
+      },
+      lastItemError: null,
+    };
 
-    for (const issue of todo) {
+    // Ascending outcomes drive the watermark: it advances through terminal
+    // items (imported, skipped, deduped, and failures the ledger accepted) and
+    // freezes only at an item whose outcome could NOT be recorded — anything
+    // else would replay that item forever.
+    const outcomes: Array<{ feedbackAt: Date; terminal: boolean }> = [];
+    let budget = MAX_IMPORTS_PER_TICK;
+
+    for (const issue of eligible) {
       beat();
       // Stopping here is not a loss: `outcomes` already holds everything
       // finished, so the watermark advances past it and the remainder becomes
-      // the next tick's `todo`.
+      // the next tick's work.
       if (outOfTime()) {
         result.capped = true;
         syncLog.warn("sentry.feedback.budget_hit", { "feedback.phase": "import", "feedback.done": outcomes.length });
         break;
       }
       const feedbackAt = new Date(issue.firstSeen);
-      try {
-        if (await this.store.getByIssueId(issue.id)) {
-          result.deduped++;
-          outcomes.push({ feedbackAt, terminal: true });
-          continue;
-        }
-        const context = await this.sentry.getFeedbackContext(issue.id);
-        beat();
-        await this.harvestLink(context.identity);
-        const email = context.contactEmail;
-        if (!email) {
-          await this.store.insertSkipped({
-            sentryIssueId: issue.id,
-            sentryShortId: issue.shortId,
-            projectSlug: issue.projectSlug,
-            contactName: context.name,
-            pageUrl: context.url,
-            feedbackAt,
-            // Kept even without an email: an org or Stripe id still identifies
-            // the account, and a later replay starts from these.
-            postizUserId: context.identity.userId,
-            postizOrgId: context.identity.orgId,
-            stripeCustomerId: context.identity.stripeCustomerId,
-          });
-          result.skippedNoEmail++;
-          outcomes.push({ feedbackAt, terminal: true });
-          continue;
-        }
-
-        const match = await this.ensureContact(email, context.name, paceWrite);
-        await this.stampContactIdentity(match.id, context.identity);
-        const fromType = match.role === "lead" ? "lead" : "user";
-
-        await paceWrite();
-        const conversationId = await this.intercom.createConversation(
-          match.id,
-          buildConversationBody(context.message ?? ""),
-          issue.firstSeen,
-          fromType
-        );
-        // Commit point — the ledger row lands directly after the only
-        // non-idempotent call (create-then-insert: a crash inside this window
-        // can duplicate ONE conversation, which is visible and trivially
-        // closed; insert-first would silently lose feedback instead).
-        await this.store.insertImported({
-          sentryIssueId: issue.id,
-          sentryShortId: issue.shortId,
-          projectSlug: issue.projectSlug,
-          contactEmail: email,
-          contactName: context.name,
-          intercomContactId: match.id,
-          intercomConversationId: conversationId,
-          pageUrl: context.url,
-          feedbackAt,
-          postizUserId: context.identity.userId,
-          postizOrgId: context.identity.orgId,
-          stripeCustomerId: context.identity.stripeCustomerId,
-        });
-        result.imported++;
+      const state = states.get(issue.id);
+      if (state) {
+        // Already accounted for, whatever its outcome was. A failure counts
+        // here too: retrying it is the drain's job, never the walk's, so one
+        // bad submission can never again hold the queue behind it.
+        if (state.status === "failed" && state.attempts >= MAX_ITEM_ATTEMPTS) result.parked++;
+        else result.deduped++;
         outcomes.push({ feedbackAt, terminal: true });
-
-        // Decorations are best-effort: the ledger row exists, so dedup and
-        // the sweeper/SLA exemptions hold even when any of these fail.
-        // Ticket conversion first ("normal ticket" parity): convert failure
-        // leaves a plain conversation import standing — retrying the whole
-        // item would duplicate the conversation instead.
-        let ticketId: string | null = null;
-        const ticketTypeId = this.settingsStore.sentryFeedbackTicketTypeId();
-        if (ticketTypeId) {
-          try {
-            await paceWrite();
-            ticketId = await this.convertFeedbackConversation(
-              conversationId,
-              ticketTypeId,
-              buildTicketAttributes({ message: context.message })
-            );
-            await this.store.setTicketId(issue.id, ticketId);
-          } catch (e) {
-            ticketId = null;
-            syncLog.warn("sentry feedback import: ticket conversion failed, staying a conversation", {
-              "intercom.conversation_id": conversationId,
-              "error.message": e instanceof Error ? e.message : String(e),
-            });
-          }
-        }
-        // Team routing directly after conversion (before note/tag): all
-        // assignment-relevant writes land as early as possible — the balanced
-        // admin pick itself is deliberately left to the enforcer's stray
-        // sweep (the creation webhook skips imports to avoid churn).
-        const teamId = this.settingsStore.sentryFeedbackTeamId();
-        if (teamId) {
-          try {
-            await paceWrite();
-            await this.intercom.assignConversationToTeam(conversationId, teamId, adminId);
-          } catch (e) {
-            syncLog.warn("sentry feedback import: team assignment failed", {
-              "intercom.conversation_id": conversationId,
-              "error.message": e instanceof Error ? e.message : String(e),
-            });
-          }
-          if (ticketId) {
-            // Bridge parity: the converted ticket gets the team too.
-            try {
-              await paceWrite();
-              await this.intercom.updateTicket(ticketId, { assigneeId: teamId, adminId });
-            } catch (e) {
-              syncLog.warn("sentry feedback import: ticket team assignment failed", {
-                "intercom.ticket_id": ticketId,
-                "error.message": e instanceof Error ? e.message : String(e),
-              });
-            }
-          }
-        }
-        try {
-          await paceWrite();
-          await this.intercom.replyAsAdmin(conversationId, {
-            adminId,
-            note: true,
-            body: buildMetadataNote({
-              pageUrl: context.url,
-              shortId: issue.shortId,
-              permalink: issue.permalink,
-              identity: context.identity,
-            }),
-          });
-        } catch (e) {
-          syncLog.warn("sentry feedback import: metadata note failed", {
-            "intercom.conversation_id": conversationId,
-            "error.message": e instanceof Error ? e.message : String(e),
-          });
-        }
-        try {
-          if (tagId === null) tagId = (await this.intercom.findOrCreateTag(FEEDBACK_TAG)).id;
-          await paceWrite();
-          await this.intercom.tagConversation(conversationId, tagId, adminId);
-        } catch (e) {
-          syncLog.warn("sentry feedback import: tag failed", {
-            "intercom.conversation_id": conversationId,
-            "error.message": e instanceof Error ? e.message : String(e),
-          });
-        }
-      } catch (e) {
-        result.errors++;
-        outcomes.push({ feedbackAt, terminal: false });
-        syncLog.warn("sentry feedback import: item failed", {
-          "sentry.issue_id": issue.id,
-          "error.message": e instanceof Error ? e.message : String(e),
-        });
+        continue;
       }
+      if (budget <= 0) {
+        result.capped = true;
+        syncLog.warn("sentry.feedback.cap_hit", { "feedback.remaining": eligible.length - outcomes.length });
+        break;
+      }
+      budget--;
+      outcomes.push({ feedbackAt, terminal: await this.processItem(issue, ctx) });
     }
 
-    // Replay shares the tick's import budget so a large backlog cannot flood
-    // Intercom in one pass; whatever is left over drains on later ticks.
+    // Both drains share what is left of the import budget so a backlog cannot
+    // flood Intercom in one pass; whatever is left over drains on later ticks.
     //
-    // Isolated from the walk above on purpose. The drain is a best-effort
-    // background job, but it used to run INSIDE the tick's only success path,
+    // Isolated from the walk above on purpose. A drain is best-effort
+    // background work, but it used to run INSIDE the tick's only success path,
     // so anything it threw (its candidate query included) discarded a walk
     // that had already imported and left the watermark where it was: the tick
     // then redid the same work every 15 minutes forever, importing nothing.
-    let replayError: string | null = null;
+    let drainError: string | null = null;
+    try {
+      await this.retryFailedItems(ctx, MAX_IMPORTS_PER_TICK - result.imported, outOfTime);
+    } catch (e) {
+      result.errors++;
+      drainError = `failure retry drain failed: ${describeTickError(e)}`;
+      syncLog.warn("sentry feedback: failure retry drain failed, the import walk still counts", {
+        "error.message": e instanceof Error ? e.message : String(e),
+      });
+    }
     try {
       await this.replaySkipped(result, MAX_IMPORTS_PER_TICK - result.imported, adminId, paceWrite, now, outOfTime, beat);
     } catch (e) {
       result.errors++;
-      replayError = `replay drain failed: ${describeTickError(e)}`;
+      drainError = `${drainError ? `${drainError} · ` : ""}replay drain failed: ${describeTickError(e)}`;
       syncLog.warn("sentry feedback: replay drain failed, the import walk still counts", {
         "error.message": e instanceof Error ? e.message : String(e),
       });
@@ -449,20 +364,33 @@ export class SentryFeedbackImporter {
     // catch does that) and leaves both stamps where they were.
     if (listError) throw listError;
 
+    // Item failures are the panel's business too. Before this they lived only
+    // in the logs, so a tick that imported nothing because a submission could
+    // not be created still rendered as "completed".
+    const problems: string[] = [];
+    if (result.failed > 0) {
+      problems.push(`${result.failed} item(s) failed${ctx.lastItemError ? `: ${ctx.lastItemError}` : ""}`);
+    }
+    if (drainError) problems.push(drainError);
+
     const newMark = advanceWatermark(outcomes, watermark);
     await this.settingsStore.recordSentryFeedbackSync({
       attemptAt,
       lastSyncAt: now,
       watermarkAt: newMark.getTime() > watermark.getTime() ? newMark : undefined,
-      // The walk completed, so the sync stamp moves; a failed drain still
-      // leaves its reason on the panel rather than passing as healthy.
-      error: replayError,
+      // The walk completed, so the sync stamp moves; a bad item or a failed
+      // drain still leaves its reason on the panel rather than passing as
+      // healthy.
+      error: problems.length > 0 ? trimStoredError(problems.join(" · ")) : null,
     });
     syncLog.info("sentry.feedback_sync", {
       "feedback.listed": result.listed,
       "feedback.imported": result.imported,
       "feedback.skipped_no_email": result.skippedNoEmail,
       "feedback.deduped": result.deduped,
+      "feedback.failed": result.failed,
+      "feedback.recovered": result.recovered,
+      "feedback.parked": result.parked,
       "feedback.replayed": result.replayed,
       "feedback.replay_exhausted": result.replayExhausted,
       "feedback.errors": result.errors,
@@ -472,28 +400,215 @@ export class SentryFeedbackImporter {
     return result;
   }
 
-  // Intercom contact for a submitter email: prefer an existing user-role match
-  // (a real customer record), reuse a lead-only match as-is, else create.
-  private async ensureContact(
-    email: string,
-    name: string | null,
-    paceWrite: () => Promise<void>
-  ): Promise<{ id: string; role: string | null }> {
-    const matches = await this.intercom.searchContactsByEmail(email);
-    const found = matches.find((m) => m.role === "user") ?? matches.find((m) => m.role === "lead") ?? null;
-    if (found) return found;
-
-    await paceWrite();
+  // One item, counted and recorded. Returns whether the outcome reached the
+  // ledger: a failure that was WRITTEN is terminal (the drain owns it from
+  // here), while one that could not be written keeps the watermark back so the
+  // next tick sees the item again.
+  private async processItem(issue: SentryFeedbackIssue, ctx: WalkContext): Promise<boolean> {
     try {
-      return { id: (await this.intercom.createEmailContact({ email, name })).id, role: "user" };
+      const outcome = await this.importItem(issue, ctx);
+      if (outcome === "imported") ctx.result.imported++;
+      else ctx.result.skippedNoEmail++;
+      return true;
     } catch (e) {
-      // 409 = create raced an existing/archived record — one re-search; still
-      // nothing → item failure (retried next tick).
-      if (!(e instanceof IntercomHttpError && e.status === 409)) throw e;
-      const retry = await this.intercom.searchContactsByEmail(email);
-      const raced = retry.find((m) => m.role === "user") ?? retry[0] ?? null;
-      if (!raced) throw e;
-      return raced;
+      ctx.result.errors++;
+      ctx.result.failed++;
+      ctx.lastItemError = describeTickError(e);
+      syncLog.warn("sentry feedback import: item failed", {
+        "sentry.issue_id": issue.id,
+        "error.message": e instanceof Error ? e.message : String(e),
+      });
+      try {
+        await this.store.recordFailure({
+          sentryIssueId: issue.id,
+          sentryShortId: issue.shortId,
+          projectSlug: issue.projectSlug,
+          feedbackAt: new Date(issue.firstSeen),
+          error: ctx.lastItemError,
+        });
+        return true;
+      } catch (ledgerErr) {
+        syncLog.warn("sentry feedback import: recording the item failure failed", {
+          "sentry.issue_id": issue.id,
+          "error.message": ledgerErr instanceof Error ? ledgerErr.message : String(ledgerErr),
+        });
+        return false;
+      }
+    }
+  }
+
+  // The import itself: contact → conversation → ledger → decorations. Shared
+  // by the fresh walk and the failure retry drain, so a retried submission
+  // lands exactly like a first-attempt one.
+  private async importItem(issue: SentryFeedbackIssue, ctx: WalkContext): Promise<"imported" | "skipped"> {
+    const feedbackAt = new Date(issue.firstSeen);
+    const context = await this.sentry.getFeedbackContext(issue.id);
+    ctx.beat();
+    await this.harvestLink(context.identity);
+    const email = context.contactEmail;
+    if (!email) {
+      await this.store.recordSkipped({
+        sentryIssueId: issue.id,
+        sentryShortId: issue.shortId,
+        projectSlug: issue.projectSlug,
+        contactName: context.name,
+        pageUrl: context.url,
+        feedbackAt,
+        // Kept even without an email: an org or Stripe id still identifies
+        // the account, and a later replay starts from these.
+        postizUserId: context.identity.userId,
+        postizOrgId: context.identity.orgId,
+        stripeCustomerId: context.identity.stripeCustomerId,
+      });
+      return "skipped";
+    }
+
+    const match = await ensureEmailContact(
+      this.intercom,
+      { email, name: context.name },
+      { beforeWrite: ctx.paceWrite, onWarn: (message, fields) => syncLog.warn(message, fields) }
+    );
+    await this.stampContactIdentity(match.id, context.identity);
+    const fromType = match.role === "lead" ? "lead" : "user";
+
+    await ctx.paceWrite();
+    const conversationId = await this.intercom.createConversation(
+      match.id,
+      buildConversationBody(context.message ?? ""),
+      issue.firstSeen,
+      fromType
+    );
+    // Commit point — the ledger row lands directly after the only
+    // non-idempotent call (create-then-record: a crash inside this window
+    // can duplicate ONE conversation, which is visible and trivially
+    // closed; recording first would silently lose feedback instead).
+    await this.store.recordImported({
+      sentryIssueId: issue.id,
+      sentryShortId: issue.shortId,
+      projectSlug: issue.projectSlug,
+      contactEmail: email,
+      contactName: context.name,
+      intercomContactId: match.id,
+      intercomConversationId: conversationId,
+      pageUrl: context.url,
+      feedbackAt,
+      postizUserId: context.identity.userId,
+      postizOrgId: context.identity.orgId,
+      stripeCustomerId: context.identity.stripeCustomerId,
+    });
+
+    // Decorations are best-effort: the ledger row exists, so dedup and
+    // the sweeper/SLA exemptions hold even when any of these fail.
+    // Ticket conversion first ("normal ticket" parity): convert failure
+    // leaves a plain conversation import standing — retrying the whole
+    // item would duplicate the conversation instead.
+    let ticketId: string | null = null;
+    const ticketTypeId = this.settingsStore.sentryFeedbackTicketTypeId();
+    if (ticketTypeId) {
+      try {
+        await ctx.paceWrite();
+        ticketId = await this.convertFeedbackConversation(
+          conversationId,
+          ticketTypeId,
+          buildTicketAttributes({ message: context.message })
+        );
+        await this.store.setTicketId(issue.id, ticketId);
+      } catch (e) {
+        ticketId = null;
+        syncLog.warn("sentry feedback import: ticket conversion failed, staying a conversation", {
+          "intercom.conversation_id": conversationId,
+          "error.message": e instanceof Error ? e.message : String(e),
+        });
+      }
+    }
+    // Team routing directly after conversion (before note/tag): all
+    // assignment-relevant writes land as early as possible — the balanced
+    // admin pick itself is deliberately left to the enforcer's stray
+    // sweep (the creation webhook skips imports to avoid churn).
+    const teamId = this.settingsStore.sentryFeedbackTeamId();
+    if (teamId) {
+      try {
+        await ctx.paceWrite();
+        await this.intercom.assignConversationToTeam(conversationId, teamId, ctx.adminId);
+      } catch (e) {
+        syncLog.warn("sentry feedback import: team assignment failed", {
+          "intercom.conversation_id": conversationId,
+          "error.message": e instanceof Error ? e.message : String(e),
+        });
+      }
+      if (ticketId) {
+        // Bridge parity: the converted ticket gets the team too.
+        try {
+          await ctx.paceWrite();
+          await this.intercom.updateTicket(ticketId, { assigneeId: teamId, adminId: ctx.adminId });
+        } catch (e) {
+          syncLog.warn("sentry feedback import: ticket team assignment failed", {
+            "intercom.ticket_id": ticketId,
+            "error.message": e instanceof Error ? e.message : String(e),
+          });
+        }
+      }
+    }
+    try {
+      await ctx.paceWrite();
+      await this.intercom.replyAsAdmin(conversationId, {
+        adminId: ctx.adminId,
+        note: true,
+        body: buildMetadataNote({
+          pageUrl: context.url,
+          shortId: issue.shortId,
+          permalink: issue.permalink,
+          identity: context.identity,
+        }),
+      });
+    } catch (e) {
+      syncLog.warn("sentry feedback import: metadata note failed", {
+        "intercom.conversation_id": conversationId,
+        "error.message": e instanceof Error ? e.message : String(e),
+      });
+    }
+    try {
+      const tag = await ctx.ensureTag();
+      await ctx.paceWrite();
+      await this.intercom.tagConversation(conversationId, tag, ctx.adminId);
+    } catch (e) {
+      syncLog.warn("sentry feedback import: tag failed", {
+        "intercom.conversation_id": conversationId,
+        "error.message": e instanceof Error ? e.message : String(e),
+      });
+    }
+    return "imported";
+  }
+
+  // Re-runs submissions whose import failed. They are already behind the
+  // watermark (that is the whole point of recording the failure), so the walk
+  // will never see them again and this drain owns every retry — at most one
+  // attempt per item per tick, until the attempt cap parks the row for good
+  // and /config shows it.
+  private async retryFailedItems(ctx: WalkContext, budget: number, outOfTime: () => boolean): Promise<void> {
+    if (budget <= 0 || outOfTime()) return;
+    const rows = await this.store.listFailedForRetry(budget);
+    for (const row of rows) {
+      if (outOfTime()) {
+        ctx.result.capped = true;
+        return;
+      }
+      ctx.beat();
+      const before = ctx.result.imported;
+      // The permalink is not on the ledger row, so the retried note carries
+      // the short id alone.
+      await this.processItem(
+        {
+          id: row.sentryIssueId,
+          shortId: row.sentryShortId,
+          title: null,
+          firstSeen: row.feedbackAt.toISOString(),
+          permalink: null,
+          projectSlug: row.projectSlug,
+        },
+        ctx
+      );
+      if (ctx.result.imported > before) ctx.result.recovered++;
     }
   }
 
@@ -535,7 +650,11 @@ export class SentryFeedbackImporter {
           continue;
         }
 
-        const match = await this.ensureContact(email, context.name ?? row.contactName, paceWrite);
+        const match = await ensureEmailContact(
+          this.intercom,
+          { email, name: context.name ?? row.contactName },
+          { beforeWrite: paceWrite, onWarn: (message, fields) => syncLog.warn(message, fields) }
+        );
         await this.stampContactIdentity(match.id, context.identity);
         await paceWrite();
         const conversationId = await this.intercom.createConversation(
@@ -609,5 +728,4 @@ export class SentryFeedbackImporter {
       throw e;
     }
   }
-
 }

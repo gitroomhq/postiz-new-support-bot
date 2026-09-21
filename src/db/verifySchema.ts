@@ -166,7 +166,7 @@ export const EXPECTED_COLUMNS: Record<string, string[]> = {
   sentry_feedback_imports: [
     "id", "sentryIssueId", "sentryShortId", "projectSlug", "status", "contactEmail", "contactName",
     "intercomContactId", "intercomConversationId", "intercomTicketId", "pageUrl", "feedbackAt", "importedAt",
-    "postizUserId", "postizOrgId", "stripeCustomerId", "retriedAt",
+    "postizUserId", "postizOrgId", "stripeCustomerId", "retriedAt", "attempts", "lastError",
   ],
   postiz_org_links: ["id", "orgId", "stripeCustomerId", "firstSeenAt", "lastSeenAt", "observations"],
   forwarded_email_converts: [

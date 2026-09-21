@@ -135,6 +135,11 @@ function makeHarness(opts: HarnessOpts = {}): Harness {
     async unarchiveContact(id: string) {
       ops.push(`ic.unarchive:${id}`);
     },
+    // The conflict ladder probes the record the 409 names before reviving it.
+    async getContact(id: string) {
+      ops.push(`ic.getContact:${id}`);
+      return { id, archived: opts.create409 === "archived", role: "user" as const };
+    },
     async createConversation(contactId: string, _body: string, _iso?: string, fromType = "user") {
       ops.push(`ic.createConv:${contactId}:${fromType}`);
       return "new-conv-1";

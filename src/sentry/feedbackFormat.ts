@@ -77,15 +77,12 @@ export function buildTicketAttributes(input: { message: string | null }): Record
 
 // One page-walk plan: everything newer than the floor, oldest first (so the
 // watermark can advance monotonically), deduped by id (the floor overlap can
-// re-list items across ticks), capped with an explicit overflow count — the
-// caller logs the remainder, never silently drops it.
-export function planFeedbackWalk<T extends { id: string; firstSeen: string }>(
-  items: T[],
-  floor: Date,
-  cap: number
-): { todo: T[]; overflow: number } {
+// re-list items across ticks). Deliberately UNCAPPED: the tick's import budget
+// is spent in the walk itself, because capping the plan meant a window full of
+// already-processed items could hide every newer submission behind it.
+export function planFeedbackWalk<T extends { id: string; firstSeen: string }>(items: T[], floor: Date): T[] {
   const seen = new Set<string>();
-  const eligible = items
+  return items
     .filter((i) => {
       if (seen.has(i.id)) return false;
       seen.add(i.id);
@@ -93,7 +90,6 @@ export function planFeedbackWalk<T extends { id: string; firstSeen: string }>(
       return Number.isFinite(t) && t > floor.getTime();
     })
     .sort((a, b) => Date.parse(a.firstSeen) - Date.parse(b.firstSeen));
-  return { todo: eligible.slice(0, cap), overflow: Math.max(0, eligible.length - cap) };
 }
 
 // Outcomes MUST be in ascending feedbackAt order (planFeedbackWalk order). The
@@ -120,4 +116,33 @@ export function parseSentryLinkHeader(header: string | null): string | null {
     return /cursor="([^"]+)"/.exec(part)?.[1] ?? null;
   }
   return null;
+}
+
+// The /config "Import Floor" input. The floor is the one knob that decides
+// which feedback is imported at all, so the accepted forms are deliberately
+// small and unambiguous: a relative age ("3d", "12h", "90m"), "now", or an
+// explicit timestamp. Returns null when the text is not one of those — the
+// caller refuses rather than guessing, because a wrong floor silently writes
+// off real submissions.
+export function parseImportFloor(input: string, now: Date): Date | null {
+  const text = input.trim().toLowerCase();
+  if (!text) return null;
+  if (text === "now") return now;
+
+  const relative = /^(\d+)\s*([mhdw])$/.exec(text);
+  if (relative) {
+    const amount = Number(relative[1]);
+    if (!Number.isFinite(amount) || amount <= 0) return null;
+    const unitMs = { m: 60_000, h: 3_600_000, d: 86_400_000, w: 604_800_000 }[relative[2] as "m" | "h" | "d" | "w"];
+    return new Date(now.getTime() - amount * unitMs);
+  }
+
+  // An explicit timestamp. A bare date is read as UTC midnight (Date.parse's
+  // own rule for the date-only form) so the value does not shift with the
+  // host's timezone.
+  const parsed = Date.parse(input.trim());
+  if (!Number.isFinite(parsed)) return null;
+  // A floor in the future would park every future submission behind it.
+  if (parsed > now.getTime()) return null;
+  return new Date(parsed);
 }

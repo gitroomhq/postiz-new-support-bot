@@ -12,7 +12,7 @@ import type { SettingsStore } from "../../config/SettingsStore";
 interface Harness {
   importer: SentryFeedbackImporter;
   ops: string[];
-  ledger: Map<string, { status: string }>;
+  ledger: Map<string, { status: string; attempts: number }>;
   recorded: Array<{ attemptAt: Date; lastSyncAt?: Date; watermarkAt?: Date; error: string | null }>;
 }
 
@@ -28,7 +28,14 @@ interface HarnessOpts {
   ticketTypeId?: string | null;
   projectSlugs?: string[];
   createContact409?: boolean;
+  // The 409 body names the blocking record ("…already exists with id=X"), which
+  // is the production shape that used to dead-letter an item forever.
+  createContact409Id?: string;
+  contactProbe?: { archived: boolean; role?: "user" | "lead" | null } | null;
+  unarchiveFails?: boolean;
   searchAfter409?: Array<{ id: string; role: "user" | "lead" | null }>;
+  failedRows?: unknown[];
+  ledgerWriteFails?: boolean;
   failNthConversation?: number; // the Nth createConversation call throws
   convertFails?: "permanent" | "permanent-with-existing" | "transient";
   noteFails?: boolean;
@@ -56,7 +63,9 @@ const context = (email: string | null, message = "hello"): SentryFeedbackContext
 
 function makeHarness(opts: HarnessOpts = {}): Harness {
   const ops: string[] = [];
-  const ledger = new Map<string, { status: string }>((opts.existingLedgerIds ?? []).map((id) => [id, { status: "imported" }]));
+  const ledger = new Map<string, { status: string; attempts: number }>(
+    (opts.existingLedgerIds ?? []).map((id) => [id, { status: "imported", attempts: 0 }])
+  );
   const recorded: Array<{ attemptAt: Date; lastSyncAt?: Date; watermarkAt?: Date; error: string | null }> = [];
 
   const sentry = {
@@ -86,10 +95,25 @@ function makeHarness(opts: HarnessOpts = {}): Harness {
       ops.push(`ic.createContact:${input.email}`);
       if (opts.createContact409) {
         after409 = true;
-        throw new IntercomHttpError(409, "duplicate contact");
+        throw new IntercomHttpError(
+          409,
+          opts.createContact409Id
+            ? `A contact matching those details already exists with id=${opts.createContact409Id}`
+            : "duplicate contact"
+        );
       }
       contactSeq++;
       return { id: `contact-${contactSeq}` };
+    },
+    async getContact(contactId: string) {
+      ops.push(`ic.getContact:${contactId}`);
+      return opts.contactProbe === undefined
+        ? null
+        : opts.contactProbe && { id: contactId, archived: opts.contactProbe.archived, role: opts.contactProbe.role ?? null };
+    },
+    async unarchiveContact(contactId: string) {
+      ops.push(`ic.unarchive:${contactId}`);
+      if (opts.unarchiveFails) throw new IntercomHttpError(400, "marked for permanent deletion and is not restorable");
     },
     async createConversation(contactId: string, _body: string, _createdAtIso?: string, fromType = "user") {
       ops.push(`ic.createConversation:${contactId}:${fromType}`);
@@ -133,13 +157,28 @@ function makeHarness(opts: HarnessOpts = {}): Harness {
     async getByIssueId(id: string) {
       return ledger.get(id) ?? null;
     },
-    async insertImported(data: { sentryIssueId: string }) {
-      ops.push(`store.imported:${data.sentryIssueId}`);
-      ledger.set(data.sentryIssueId, { status: "imported" });
+    // One query for the whole window: the dedup verdict must not cost an
+    // Intercom-sized budget slot per item.
+    async ledgerStates(ids: string[]) {
+      ops.push(`store.states:${ids.length}`);
+      return new Map(ids.filter((id) => ledger.has(id)).map((id) => [id, ledger.get(id)!]));
     },
-    async insertSkipped(data: { sentryIssueId: string }) {
+    async recordImported(data: { sentryIssueId: string }) {
+      ops.push(`store.imported:${data.sentryIssueId}`);
+      ledger.set(data.sentryIssueId, { status: "imported", attempts: 0 });
+    },
+    async recordSkipped(data: { sentryIssueId: string }) {
       ops.push(`store.skipped:${data.sentryIssueId}`);
-      ledger.set(data.sentryIssueId, { status: "skipped_no_email" });
+      ledger.set(data.sentryIssueId, { status: "skipped_no_email", attempts: 0 });
+    },
+    async recordFailure(data: { sentryIssueId: string; error: string }) {
+      ops.push(`store.failed:${data.sentryIssueId}`);
+      if (opts.ledgerWriteFails) throw new Error("ledger write boom");
+      const prev = ledger.get(data.sentryIssueId);
+      ledger.set(data.sentryIssueId, { status: prev?.status ?? "failed", attempts: (prev?.attempts ?? 0) + 1 });
+    },
+    async listFailedForRetry() {
+      return opts.failedRows ?? [];
     },
     async setTicketId(sentryIssueId: string, ticketId: string) {
       ops.push(`store.ticket:${sentryIssueId}:${ticketId}`);
@@ -155,7 +194,7 @@ function makeHarness(opts: HarnessOpts = {}): Harness {
     },
     async promoteToImported(sentryIssueId: string) {
       ops.push(`store.promoted:${sentryIssueId}`);
-      ledger.set(sentryIssueId, { status: "imported" });
+      ledger.set(sentryIssueId, { status: "imported", attempts: 0 });
     },
   } as unknown as SentryFeedbackStore;
 
@@ -327,7 +366,7 @@ test("anonymous feedback is skipped into the ledger with zero Intercom calls", a
   const result = await h.importer.tick(false);
   assert.equal(result.skippedNoEmail, 1);
   assert.equal(result.imported, 0);
-  assert.deepEqual(h.ops, ["sentry.list", "sentry.context:1", "store.skipped:1"]);
+  assert.deepEqual(h.ops, ["sentry.list", "store.states:1", "sentry.context:1", "store.skipped:1"]);
   assert.equal(h.recorded[0].watermarkAt?.toISOString(), "2026-07-20T11:00:00.000Z");
 });
 
@@ -345,6 +384,7 @@ test("existing user-role contact is reused; conversation → ledger → decorati
   assert.equal(result.imported, 1);
   assert.deepEqual(h.ops, [
     "sentry.list",
+    "store.states:1",
     "sentry.context:1",
     "ic.search:a@b.c",
     "ic.createConversation:user-7:user",
@@ -380,6 +420,61 @@ test("no match creates an email contact; a 409 falls back to one re-search", asy
   assert.ok(h.ops.includes("ic.createConversation:user-42:user"));
 });
 
+test("a 409 naming an archived contact revives it instead of dead-lettering the item", async () => {
+  // The production stall: Intercom refuses the create because an ARCHIVED
+  // contact holds the email, and search cannot see archived records — so the
+  // re-search found nothing and the item failed on every tick forever.
+  const h = makeHarness({
+    issues: [issue("1", "2026-07-20T11:00:00Z")],
+    contexts: { "1": context("a@b.c") },
+    emailMatches: [],
+    createContact409: true,
+    createContact409Id: "arch-1",
+    contactProbe: { archived: true, role: "user" },
+    searchAfter409: [],
+  });
+  const result = await h.importer.tick(false);
+  assert.equal(result.imported, 1);
+  assert.equal(result.failed, 0);
+  assert.ok(h.ops.includes("ic.unarchive:arch-1"));
+  assert.ok(h.ops.includes("ic.createConversation:arch-1:user"));
+});
+
+test("a 409 naming a live contact reuses it without unarchiving", async () => {
+  const h = makeHarness({
+    issues: [issue("1", "2026-07-20T11:00:00Z")],
+    contexts: { "1": context("a@b.c") },
+    emailMatches: [],
+    createContact409: true,
+    createContact409Id: "live-1",
+    contactProbe: { archived: false, role: "lead" },
+    searchAfter409: [],
+  });
+  const result = await h.importer.tick(false);
+  assert.equal(result.imported, 1);
+  assert.ok(!h.ops.some((op) => op.startsWith("ic.unarchive:")));
+  assert.ok(h.ops.includes("ic.createConversation:live-1:lead"));
+});
+
+test("an unrestorable archived contact fails the item once, and the ledger takes it", async () => {
+  const h = makeHarness({
+    issues: [issue("1", "2026-07-20T11:00:00Z")],
+    contexts: { "1": context("a@b.c") },
+    emailMatches: [],
+    createContact409: true,
+    createContact409Id: "arch-1",
+    contactProbe: { archived: true },
+    unarchiveFails: true,
+    searchAfter409: [],
+  });
+  const result = await h.importer.tick(false);
+  assert.equal(result.imported, 0);
+  assert.equal(result.failed, 1);
+  // Recorded, so the watermark still advances and the drain owns the retries.
+  assert.ok(h.ops.includes("store.failed:1"));
+  assert.equal(h.recorded[0].watermarkAt?.toISOString(), "2026-07-20T11:00:00.000Z");
+});
+
 test("a decoration failure does not fail the item (ledger row already committed)", async () => {
   const h = makeHarness({
     issues: [issue("1", "2026-07-20T11:00:00Z")],
@@ -395,7 +490,7 @@ test("a decoration failure does not fail the item (ledger row already committed)
   assert.equal(h.recorded[0].watermarkAt?.toISOString(), "2026-07-20T11:00:00.000Z");
 });
 
-test("an item failure freezes the watermark; earlier successes advance it", async () => {
+test("a failed item is recorded and the walk moves past it instead of stalling", async () => {
   const h = makeHarness({
     issues: [
       issue("1", "2026-07-20T11:00:00Z"),
@@ -409,28 +504,102 @@ test("an item failure freezes the watermark; earlier successes advance it", asyn
   });
   const result = await h.importer.tick(false);
   assert.equal(result.imported, 2);
-  assert.equal(result.errors, 1);
-  // Watermark stops at item 1 (the last terminal before the failure).
-  assert.equal(h.recorded[0].watermarkAt?.toISOString(), "2026-07-20T11:00:00.000Z");
-  // Item 3 is ledger-protected for the retry tick.
-  assert.ok(h.ledger.has("3"));
+  assert.equal(result.failed, 1);
+  // The failure is ledgered, which is what lets the watermark pass it: one
+  // submission Intercom refuses used to freeze the walk for good while every
+  // newer submission sat behind it and the panel read "completed".
+  assert.ok(h.ops.includes("store.failed:2"));
+  assert.equal(h.ledger.get("2")?.attempts, 1);
+  assert.equal(h.recorded[0].watermarkAt?.toISOString(), "2026-07-20T13:00:00.000Z");
+  assert.match(h.recorded[0].error ?? "", /1 item\(s\) failed/);
 });
 
-test("ledger hits dedup without Intercom calls and still advance the watermark (cap-safe path)", async () => {
+test("a failure the ledger refuses keeps the watermark back", async () => {
+  const h = makeHarness({
+    issues: [issue("1", "2026-07-20T11:00:00Z"), issue("2", "2026-07-20T12:00:00Z")],
+    contexts: { "1": context("a@b.c"), "2": context("b@b.c") },
+    emailMatches: [{ id: "user-7", role: "user" }],
+    failNthConversation: 1,
+    ledgerWriteFails: true,
+  });
+  const result = await h.importer.tick(false);
+  assert.equal(result.failed, 1);
+  // Nothing recorded the failure, so the next tick has to see the item again:
+  // the watermark stays put even though the later item imported.
+  assert.equal(h.recorded[0].watermarkAt, undefined);
+});
+
+test("the failure drain retries a ledgered failure and imports it", async () => {
+  const h = makeHarness({
+    issues: [],
+    contexts: { "9": context("late@b.c") },
+    emailMatches: [{ id: "user-7", role: "user" }],
+    failedRows: [
+      {
+        sentryIssueId: "9",
+        sentryShortId: "POSTIZ-9",
+        projectSlug: "postiz-web",
+        feedbackAt: new Date("2026-07-20T11:00:00Z"),
+        attempts: 1,
+      },
+    ],
+  });
+  const result = await h.importer.tick(false);
+  assert.equal(result.imported, 1);
+  assert.equal(result.recovered, 1);
+  assert.ok(h.ops.includes("store.imported:9"));
+});
+
+test("known items are walked for free: they never consume the import budget", async () => {
+  // 30 already-imported items in front of one new submission. The plan used to
+  // stop at the per-tick cap, so the new item was invisible — exactly how the
+  // import stopped for thirteen days while every tick reported success.
+  const known = Array.from({ length: 30 }, (_, i) =>
+    issue(`i${i}`, `2026-07-20T11:${String(i).padStart(2, "0")}:00Z`)
+  );
+  const fresh = issue("new", "2026-07-20T13:00:00Z");
+  const h = makeHarness({
+    issues: [...known, fresh],
+    existingLedgerIds: known.map((i) => i.id),
+    contexts: { new: context("a@b.c") },
+    emailMatches: [{ id: "user-7", role: "user" }],
+  });
+  const result = await h.importer.tick(false);
+  assert.equal(result.deduped, 30);
+  assert.equal(result.imported, 1);
+  assert.equal(result.capped, false);
+  // One batched query for the dedup verdicts, not one per item.
+  assert.equal(h.ops.filter((op) => op.startsWith("store.states:")).length, 1);
+  assert.equal(h.recorded[0].watermarkAt?.toISOString(), "2026-07-20T13:00:00.000Z");
+});
+
+test("the import budget still caps fresh work, and the remainder waits for the next tick", async () => {
   const issues = Array.from({ length: 30 }, (_, i) =>
     issue(`i${i}`, `2026-07-20T11:${String(i).padStart(2, "0")}:00Z`)
   );
   const h = makeHarness({
     issues,
-    existingLedgerIds: issues.map((i) => i.id),
+    contexts: Object.fromEntries(issues.map((i) => [i.id, context(`${i.id}@b.c`)])),
+    emailMatches: [{ id: "user-7", role: "user" }],
   });
   const result = await h.importer.tick(false);
-  assert.equal(result.deduped, 25); // MAX_IMPORTS_PER_TICK
+  assert.equal(result.imported, 25); // MAX_IMPORTS_PER_TICK
   assert.equal(result.capped, true);
-  assert.equal(result.imported, 0);
-  assert.ok(!h.ops.some((op) => op.startsWith("ic.")));
-  // Watermark advanced through the 25 processed items only.
   assert.equal(h.recorded[0].watermarkAt?.toISOString(), "2026-07-20T11:24:00.000Z");
+});
+
+test("a parked failure is walked for free and is never retried by the walk", async () => {
+  const h = makeHarness({
+    issues: [issue("bad", "2026-07-20T11:00:00Z"), issue("good", "2026-07-20T12:00:00Z")],
+    contexts: { good: context("a@b.c") },
+    emailMatches: [{ id: "user-7", role: "user" }],
+  });
+  h.ledger.set("bad", { status: "failed", attempts: 5 });
+  const result = await h.importer.tick(false);
+  assert.equal(result.parked, 1);
+  assert.equal(result.imported, 1);
+  assert.ok(!h.ops.includes("sentry.context:bad"));
+  assert.equal(h.recorded[0].watermarkAt?.toISOString(), "2026-07-20T12:00:00.000Z");
 });
 
 test("ticket type set: convert lands right after the ledger commit, ticket gets the team too", async () => {
@@ -445,6 +614,7 @@ test("ticket type set: convert lands right after the ledger commit, ticket gets 
   assert.equal(result.imported, 1);
   assert.deepEqual(h.ops, [
     "sentry.list",
+    "store.states:1",
     "sentry.context:1",
     "ic.search:a@b.c",
     "ic.createConversation:user-7:user",

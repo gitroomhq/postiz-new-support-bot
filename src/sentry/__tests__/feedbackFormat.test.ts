@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { buildConversationBody, buildMetadataNote, buildTicketAttributes, parseSentryLinkHeader } from "../feedbackFormat";
+import { buildConversationBody, buildMetadataNote, buildTicketAttributes, parseSentryLinkHeader, parseImportFloor } from "../feedbackFormat";
 
 test("buildConversationBody escapes HTML and keeps structure", () => {
   const body = buildConversationBody('Hello <script>alert("x")</script> & friends\n\nSecond para\nwith break');
@@ -62,4 +62,24 @@ test("parseSentryLinkHeader extracts the next cursor only when results are pendi
 
   assert.equal(parseSentryLinkHeader(null), null);
   assert.equal(parseSentryLinkHeader('<https://x>; rel="previous"; results="true"; cursor="1:2:3"'), null);
+});
+
+test("parseImportFloor reads relative ages, now and explicit timestamps", () => {
+  const now = new Date("2026-09-21T12:00:00Z");
+  assert.equal(parseImportFloor("3d", now)?.toISOString(), "2026-09-18T12:00:00.000Z");
+  assert.equal(parseImportFloor(" 12H ", now)?.toISOString(), "2026-09-21T00:00:00.000Z");
+  assert.equal(parseImportFloor("90m", now)?.toISOString(), "2026-09-21T10:30:00.000Z");
+  assert.equal(parseImportFloor("2w", now)?.toISOString(), "2026-09-07T12:00:00.000Z");
+  assert.equal(parseImportFloor("now", now)?.toISOString(), now.toISOString());
+  assert.equal(parseImportFloor("2026-09-18T00:00:00Z", now)?.toISOString(), "2026-09-18T00:00:00.000Z");
+});
+
+test("parseImportFloor refuses anything it cannot read exactly", () => {
+  const now = new Date("2026-09-21T12:00:00Z");
+  // A misread floor silently writes off real submissions, so nothing is guessed.
+  for (const bad of ["", "soon", "3 days", "0d", "-2d", "3x", "yesterday"]) {
+    assert.equal(parseImportFloor(bad, now), null, bad);
+  }
+  // A floor in the future would park everything behind it.
+  assert.equal(parseImportFloor("2027-01-01T00:00:00Z", now), null);
 });

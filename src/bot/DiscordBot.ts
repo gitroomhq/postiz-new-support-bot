@@ -46,6 +46,7 @@ import type { PostizClient } from "../postiz/PostizClient";
 import type { PostizAccount } from "../postiz/PostizClient";
 import type { PostizIdentityService } from "../postiz/PostizIdentityService";
 import { IDENTITY_TAGS, type SentryFeedbackClient } from "../sentry/SentryFeedbackClient";
+import { parseImportFloor } from "../sentry/feedbackFormat";
 import { EscalationTier, StatusTag } from "../generated/prisma/client";
 import { EscalationTierStore } from "../config/EscalationTierStore";
 import { SessionStore } from "../auth/SessionStore";
@@ -2917,10 +2918,12 @@ export class DiscordBot {
     // Backticked into the embed, so a backtick in the upstream message would
     // break out of the span.
     const lastError = s.sentryFeedbackLastError()?.replace(/`/g, "'") ?? null;
-    const [counts, awaitingReplay, lastImport, looper] = await Promise.all([
+    const [counts, awaitingReplay, lastImport, failures, lastFailure, looper] = await Promise.all([
       this.sentryFeedback?.statusCounts().catch(() => null) ?? null,
       this.sentryFeedback?.countSkippedForRetry().catch(() => null) ?? null,
       this.sentryFeedback?.lastImportedAt().catch(() => null) ?? null,
+      this.sentryFeedback?.countFailed().catch(() => null) ?? null,
+      this.sentryFeedback?.lastFailure().catch(() => null) ?? null,
       this.temporalOps?.producers.looperHealth(SINGLETONS.sentryFeedback) ?? null,
     ]);
     // The import runs in a Temporal looper, so "configured and enabled" says
@@ -2951,7 +2954,7 @@ export class DiscordBot {
           ? "**never enabled**: toggling on stamps the import floor (older feedback never imports)"
           : s.sentryReadEnabled()
             ? lastError || looper?.wedged || (looper != null && looper.status !== "RUNNING")
-              ? "⚠️ **degraded**: the poll is not completing (see Looper and Last attempt below)"
+              ? "⚠️ **degraded**: the poll is not importing cleanly (see Looper, Last attempt and Failed below)"
               : "**on**: webhook accelerator + 15-min poll"
             : "**off** (Sync Now still runs a one-shot test)";
 
@@ -2975,11 +2978,19 @@ export class DiscordBot {
           // inbox.
           `${lastError ? "⚠️ " : ""}**Last attempt:** ${lastAttempt ? `<t:${Math.floor(lastAttempt.getTime() / 1000)}:R>` : "**never**"} · ${lastError ? `\`${lastError}\`` : "completed"} · **Looper:** ${looperLine}`,
           `**Imported:** ${counts?.imported ?? 0} · **Skipped (no email):** ${counts?.skippedNoEmail ?? 0} · **Awaiting replay:** ${awaitingReplay ?? 0}`,
+          // Failed items are the difference between a quiet inbox and a queue
+          // that is stuck: one submission Intercom refuses used to stall every
+          // newer import silently, so the count and the reason are on the panel.
+          `**Failed:** ${failures ? `${failures.retryable} retrying · ${failures.parked} parked` : "0"}${
+            failures && failures.retryable + failures.parked > 0 && lastFailure?.error
+              ? ` · latest ${lastFailure.sentryShortId ? `\`${lastFailure.sentryShortId}\`` : `issue ${lastFailure.sentryIssueId}`}: \`${lastFailure.error.replace(/`/g, "'")}\``
+              : ""
+          }`,
           `**Last import:** ${lastImport ? `<t:${Math.floor(lastImport.getTime() / 1000)}:R>` : "_never_"}`,
           `**Webhook URL:** ${base ? `\`${base}/sentry/webhook\`` : "⚠️ _no public URL: set one via Billing → Stripe Webhooks_"}`,
           "",
           "Each User Feedback widget item becomes an Intercom conversation authored by the submitter (email contact): replies are emailed to them and their answers thread back. Feedback with no resolvable identity is parked and re-examined once (Awaiting replay). Create a Sentry **internal integration** (token scopes `org:read project:read event:read`), point its webhook at the URL above and paste its client secret here; unsigned posts are rejected and the 15-min poll covers delivery.",
-          "Feedback conversations get agent-idle notes but are never nagged, auto-closed or SLA-clocked. Disabling keeps the import floor: a re-enable imports the gap.",
+          "Feedback conversations get agent-idle notes but are never nagged, auto-closed or SLA-clocked. Disabling keeps the import floor: a re-enable imports the gap. **Import Floor** moves that line by hand: forward to write off a backlog (skipped for good), back to re-examine it (already-imported feedback is deduped).",
         ].join("\n")
       );
 
@@ -2989,7 +3000,8 @@ export class DiscordBot {
         .setLabel(`Enabled: ${s.sentryReadEnabled() ? "on" : "off"}`)
         .setStyle(s.sentryReadEnabled() ? ButtonStyle.Success : ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId("config_sentryfeedback_creds").setLabel("Credentials").setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId("config_sentryfeedback_scope").setLabel("Org & Projects").setStyle(ButtonStyle.Primary)
+      new ButtonBuilder().setCustomId("config_sentryfeedback_scope").setLabel("Org & Projects").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("config_sentryfeedback_floor").setLabel("Import Floor").setStyle(ButtonStyle.Secondary)
     );
     const row2 = new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder().setCustomId("config_sentryfeedback_tickettype").setLabel("Ticket Type").setStyle(ButtonStyle.Secondary),
@@ -5051,6 +5063,23 @@ export class DiscordBot {
       return;
     }
 
+    if (id === "config_sentryfeedback_floor") {
+      const current = this.settingsStore.sentryFeedbackWatermarkAt();
+      const modal = new ModalBuilder().setCustomId("config_sentryfeedback_floor_modal").setTitle("Sentry Import Floor");
+      modal.addComponents(
+        new ActionRowBuilder<TextInputBuilder>().addComponents(
+          new TextInputBuilder()
+            .setCustomId("floor")
+            .setLabel("Floor: 3d, 12h, now, or 2026-09-18T00:00Z")
+            .setStyle(TextInputStyle.Short)
+            .setPlaceholder(current ? current.toISOString() : "blank = keep")
+            .setRequired(false)
+        )
+      );
+      await interaction.showModal(modal);
+      return;
+    }
+
     if (id === "config_sentryfeedback_tickettype") {
       await interaction.deferUpdate();
       try {
@@ -5942,6 +5971,48 @@ export class DiscordBot {
         ).toUpperCase()}`
       );
       await interaction.reply({ embeds: [makeEmbed("Sentry feedback scope saved.", COLORS.success)], flags: 64 });
+      return;
+    }
+
+    if (interaction.customId === "config_sentryfeedback_floor_modal") {
+      const raw = interaction.fields.getTextInputValue("floor").trim();
+      if (!raw) {
+        await interaction.reply({ embeds: [makeEmbed("Import floor unchanged.", COLORS.neutral)], flags: 64 });
+        return;
+      }
+      const parsed = parseImportFloor(raw, new Date());
+      if (!parsed) {
+        await interaction.reply({
+          embeds: [
+            makeEmbed(
+              "Could not read that. Use a relative age (`3d`, `12h`, `90m`), `now`, or an ISO timestamp (`2026-09-18T00:00Z`).",
+              COLORS.warn
+            ),
+          ],
+          flags: 64,
+        });
+        return;
+      }
+      const previous = this.settingsStore.sentryFeedbackWatermarkAt();
+      await this.settingsStore.updateSentryFeedback({ sentryFeedbackWatermarkAt: parsed });
+      const forward = !previous || parsed.getTime() > previous.getTime();
+      this.auditConfig(
+        interaction,
+        `Sentry feedback import floor → ${parsed.toISOString()}${forward ? " (older feedback is skipped for good)" : " (the gap is re-examined; imported feedback dedups)"}`
+      );
+      await interaction.reply({
+        embeds: [
+          makeEmbed(
+            `Import floor set to <t:${Math.floor(parsed.getTime() / 1000)}:f>. ${
+              forward
+                ? "Feedback older than that is written off: it will never import."
+                : "The next tick re-examines everything newer than that; anything already in the ledger dedups."
+            }`,
+            COLORS.success
+          ),
+        ],
+        flags: 64,
+      });
       return;
     }
 
