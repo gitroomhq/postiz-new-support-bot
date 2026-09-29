@@ -118,6 +118,7 @@ import { VaultMigrator, COLUMN_LABELS, type MigrateItemResult, type MigrateRepor
 import { EMAIL_COMMAND, EMAIL_PREFIX, EmailCommand } from "./EmailCommand";
 import type { EmailDeliverabilityService } from "../resend/EmailDeliverabilityService";
 import type { ResendClient } from "../resend/ResendClient";
+import type { DeliveryLogService } from "../resend/DeliveryLogService";
 
 type TicketSearchFilters = {
   categoryId?: string;
@@ -179,6 +180,7 @@ export class DiscordBot {
   // Resend suppression tooling: the /config panel and the /email command.
   private emailDelivery: EmailDeliverabilityService | null = null;
   private resendClient: ResendClient | null = null;
+  private deliveryLog: DeliveryLogService | null = null;
   private emailCommand = new EmailCommand(
     () => this.emailDelivery,
     () => this.postizIdentity,
@@ -281,9 +283,10 @@ export class DiscordBot {
     this.postizClient = client;
   }
 
-  setEmailDelivery(service: EmailDeliverabilityService, client: ResendClient): void {
+  setEmailDelivery(service: EmailDeliverabilityService, client: ResendClient, deliveryLog: DeliveryLogService): void {
     this.emailDelivery = service;
     this.resendClient = client;
+    this.deliveryLog = deliveryLog;
   }
 
   // Read-only Sentry access for the per-account error list.
@@ -2306,6 +2309,14 @@ export class DiscordBot {
         : source === "env"
           ? "from `RESEND_API_KEY` in the environment (a key stored here would win)"
           : `${stateLabel[s.secretState("resendApiKey")]}, and no \`RESEND_API_KEY\` in the environment`;
+    const hookUrl = this.deliveryLog?.webhookUrl() ?? null;
+    const hookLine = this.deliveryLog?.webhookRegistered()
+      ? `registered → \`${hookUrl ?? "no public URL"}\``
+      : hookUrl
+        ? "not registered"
+        : "not registered, and no public URL is set (Billing → Stripe Webhooks)";
+    const backfill = s.resendBackfill();
+    const backfillLine = backfill.at ? `${backfill.status ?? "?"} <t:${Math.floor(backfill.at.getTime() / 1000)}:R>` : "never run";
     const statusLine =
       source === "none"
         ? "**not configured**: set a key below"
@@ -2322,8 +2333,25 @@ export class DiscordBot {
           "",
           "Postiz sends its activation, password-reset and notification mail through Resend. An address that hard-bounced or reported spam lands on Resend's suppression list, and every later email to it is silently dropped. This lets support see that, and remove the address.",
           "The key must be a **Full access** key from the same Resend team Postiz sends from: a sending-only key cannot read the suppression list. Test Connection says which kind you have and lists the team's sending domains.",
+          "",
+          `**Delivery log webhook:** ${hookLine}`,
+          `**Last month import:** ${backfillLine}`,
+          "The delivery log records every email Resend sends for the team (sent, delivered, delayed, bounced, failed, spam, suppressed) for 180 days, and support sees it per address. Registering creates the webhook on the Resend team and imports the last month.",
         ].join("\n")
       );
+    const registered = this.deliveryLog?.webhookRegistered() ?? false;
+    const logRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId("config_resend_hook")
+        .setLabel(registered ? "Re-register Webhook" : "Register Webhook")
+        .setStyle(ButtonStyle.Primary)
+        .setDisabled(!this.deliveryLog || source === "none"),
+      new ButtonBuilder()
+        .setCustomId("config_resend_unhook")
+        .setLabel("Remove Webhook")
+        .setStyle(ButtonStyle.Danger)
+        .setDisabled(!registered)
+    );
     const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder()
         .setCustomId("config_resend_toggle")
@@ -2333,7 +2361,7 @@ export class DiscordBot {
       new ButtonBuilder().setCustomId("config_resend_test").setLabel("Test Connection").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("config_integrations").setLabel("Back").setStyle(ButtonStyle.Secondary)
     );
-    return { embeds: [embed], components: [row] };
+    return { embeds: [embed], components: [row, logRow] };
   }
 
   private buildAiAnalyticsHubPanel() {
@@ -5049,6 +5077,34 @@ export class DiscordBot {
       return;
     }
 
+    if (id === "config_resend_hook" || id === "config_resend_unhook") {
+      await interaction.deferReply({ flags: 64 });
+      const logSvc = this.deliveryLog;
+      if (!logSvc) {
+        await interaction.editReply({ embeds: [makeEmbed("The delivery log is not available on this instance.", COLORS.warn)] });
+        return;
+      }
+      const actor = { surface: "config" as const, id: interaction.user.id, name: interaction.user.username };
+      if (id === "config_resend_hook") {
+        const r = await logSvc.registerAndBackfill(actor);
+        if (r.ok) this.auditConfig(interaction, "Resend delivery webhook registered");
+        await interaction.editReply({ embeds: [makeEmbed(r.text, r.ok ? COLORS.success : COLORS.danger)] });
+      } else {
+        const r = await logSvc.removeWebhook(actor);
+        if (r.ok) this.auditConfig(interaction, "Resend delivery webhook removed");
+        await interaction.editReply({
+          embeds: [
+            makeEmbed(
+              r.ok ? "Webhook removed. The log keeps what it has and stops growing." : `Could not remove it: ${r.error}`,
+              r.ok ? COLORS.success : COLORS.danger
+            ),
+          ],
+        });
+      }
+      await interaction.webhook.editMessage(interaction.message, this.buildResendPanel()).catch(() => {});
+      return;
+    }
+
     if (id === "config_resend_test") {
       await interaction.deferReply({ flags: 64 });
       const client = this.resendClient;
@@ -7298,7 +7354,10 @@ export class DiscordBot {
             await this.temporalOps?.producers.sentryFeedbackRunNow();
           };
         })(),
-      }
+      },
+      this.deliveryLog
+        ? { handle: (raw, headers) => this.deliveryLog!.handleWebhook(raw, headers) }
+        : undefined
     );
     callbackServer.start();
   }

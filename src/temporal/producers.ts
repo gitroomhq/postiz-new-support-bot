@@ -39,6 +39,7 @@ import {
   ticketWorkflowId,
   UPD_APPLY_STATUS,
   ANALYTICS_REBUILD_WORKFLOW_ID,
+  RESEND_BACKFILL_WORKFLOW_ID,
   VAULT_UPGRADE_WORKFLOW_ID,
   type KeywordSaKey,
   type ApplyStatusResult,
@@ -264,6 +265,16 @@ export class TemporalProducers {
     } catch {
       return null;
     }
+  }
+
+  // Resend delivery log backfill, started by "Register webhook". FAIL on
+  // conflict so a second press says one is already running.
+  async startResendBackfill(): Promise<GatewayResult> {
+    return this.temporal.startWorkflow({
+      workflowType: "resendBackfillWorkflow",
+      workflowId: RESEND_BACKFILL_WORKFLOW_ID,
+      options: { workflowIdConflictPolicy: "FAIL" },
+    });
   }
 
   async startVaultUpgrade(): Promise<GatewayResult> {

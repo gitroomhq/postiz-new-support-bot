@@ -41,6 +41,7 @@ export const VAULT_UPGRADE_WORKFLOW_ID = "vault-upgrade";
 // the vault-upgrade shape above instead: a fixed id, started only when someone
 // asks for it.
 export const ANALYTICS_REBUILD_WORKFLOW_ID = "analytics-rebuild";
+export const RESEND_BACKFILL_WORKFLOW_ID = "resend-backfill";
 export const STATUS_REPORT_SCHEDULE_ID = "status-report";
 
 // ---- Retired workflows/schedules (agent-rip release) ----
@@ -506,6 +507,12 @@ export interface CoreActivities {
   analyticsRebuildGauges(): Promise<void>;
   analyticsRebuildFinish(stats: AnalyticsRebuildStats | null, error: string | null): Promise<void>;
   analyticsRebuildReport(stats: AnalyticsRebuildStats | null, error: string | null): Promise<void>;
+
+  // Resend delivery log: the one-month import after the webhook is registered.
+  // Resumes from its heartbeat cursor on retry; returns the status line it
+  // recorded. resendBackfillRecord stamps a failure the activity could not.
+  resendBackfill(): Promise<string>;
+  resendBackfillRecord(status: string): Promise<void>;
 }
 
 // Per-phase counters, threaded through the workflow so the final report can say

@@ -134,6 +134,8 @@ import { DisputeMonitor } from "./bot/billing/DisputeMonitor";
 import { DisputeVerdictService } from "./bot/billing/DisputeVerdictService";
 import { ResendClient } from "./resend/ResendClient";
 import { EmailDeliverabilityService } from "./resend/EmailDeliverabilityService";
+import { DeliveryLogStore } from "./resend/DeliveryLogStore";
+import { DeliveryLogService } from "./resend/DeliveryLogService";
 import { AnnualChargeResolver } from "./bot/billing/annualCharge";
 import { TemporalService } from "./temporal/TemporalService";
 import { TemporalWorkerManager } from "./temporal/TemporalWorkerManager";
@@ -573,6 +575,14 @@ async function main() {
   // arrives) and take it off. Ships off; /config → Integrations → Resend.
   const resendClient = new ResendClient(settingsStore);
   const emailDelivery = new EmailDeliverabilityService(settingsStore, resendClient, auditLogger);
+  // The delivery log: what happened to each email Resend sent (webhook fed,
+  // one-month backfill, 180-day retention). /config → Resend → Register webhook.
+  const deliveryLog = new DeliveryLogService(settingsStore, resendClient, new DeliveryLogStore(prisma), auditLogger);
+  deliveryLog.bindBackfillStarter(async () => {
+    if (!temporalProducers.enabled()) return false;
+    const r = await temporalProducers.startResendBackfill();
+    return r.ok || r.buffered || r.alreadyRunning === true;
+  });
   // Internal notes from the sidebar: bridged conversations go through the
   // executor's echo-safe path so the note is never relayed back into Discord.
   const intercomNoteWriter = async (conversationId: string, text: string): Promise<void> => {
@@ -631,7 +641,7 @@ async function main() {
   // The client exists as soon as the constructor ran; nothing fires before login.
   bot.setSlaService(slaService);
   bot.setPostizIdentity(postizIdentity, postizClient);
-  bot.setEmailDelivery(emailDelivery, resendClient);
+  bot.setEmailDelivery(emailDelivery, resendClient, deliveryLog);
   // Platform account facts for the evidence templates (org name, plan, login
   // method). Bound here because the identity service is built after the
   // billing stack.
@@ -704,6 +714,15 @@ async function main() {
         const r = await resendClient.selfTest();
         resendClient.clearCache();
         return r.detail;
+      },
+      resendWebhook: {
+        registered: () => deliveryLog.webhookRegistered(),
+        url: () => deliveryLog.webhookUrl(),
+        register: async (actor) => (await deliveryLog.registerAndBackfill({ surface: "config", ...actor })).text,
+        remove: async (actor) => {
+          const r = await deliveryLog.removeWebhook({ surface: "config", ...actor });
+          return r.ok ? "Webhook removed. The log keeps what it has and stops growing." : `Could not remove it: ${r.error}`;
+        },
       },
       reconfigureSentry: async () => {
         const r = await reconfigureSentry(settingsStore.sentryConfig());
@@ -882,6 +901,7 @@ async function main() {
     moneyOutService,
     analyticsRebuild,
     analyticsRebuildReporter: (stats, error) => bot.reportAnalyticsRebuild(stats, error),
+    deliveryLog,
     vaultMigrator,
     client: bot.client,
     producers: temporalProducers,

@@ -184,6 +184,13 @@ model BotSettings {
   // the environment is the fallback. Encrypted (crypto.ts/Vault).
   resendEnabled       Boolean @default(false)
   resendApiKey        String?
+  // Delivery log: the Resend webhook this bot registered for itself (POST
+  // /resend/webhook) and its Svix signing secret (encrypted, crypto.ts/Vault).
+  // The backfill stamps say when the one-month import last ran and how it went.
+  resendWebhookId        String?
+  resendWebhookSecret    String?
+  resendBackfillAt       DateTime?
+  resendBackfillStatus   String?
   // Forwarded-email conversion (lite-seat teammate forwards a customer email to
   // support@ → recreate the conversation for the original sender; edited via
   // /intercom → Automation). Replicates Intercom's "Detect customers in
@@ -1537,4 +1544,41 @@ model ForwardedEmailConvert {
 
   @@index([convertedAt])
   @@map("forwarded_email_converts")
+}
+
+// Resend delivery log: one row per email Resend sent for the team (Postiz's
+// activation, reset and notification mail), fed by the webhook and a one-month
+// backfill. Metadata only, never a body. `recipient` is the first To address,
+// lowercased, which is what support searches by (Postiz sends to one address).
+// Rows older than 180 days are purged by the cleanup tick.
+model ResendEmail {
+  id            String   @id // Resend email id
+  recipient     String
+  fromAddress   String?
+  subject       String?
+  category      String // activation | password_reset | invite | login_changed | notification | other
+  sentAt        DateTime
+  lastEvent     String // sent | delivered | delivery_delayed | bounced | failed | complained | suppressed
+  lastEventAt   DateTime
+  detail        String? // bounce / failure / suppression reason, from the event that set lastEvent
+  source        String // webhook | backfill
+  updatedAt     DateTime @updatedAt
+
+  @@index([recipient, sentAt])
+  @@index([sentAt])
+  @@map("resend_emails")
+}
+
+// Every delivery event the webhook received, for the per-email timeline.
+// id = the Svix message id, so a redelivered webhook is a no-op.
+model ResendEmailEvent {
+  id         String   @id
+  emailId    String
+  type       String
+  occurredAt DateTime
+  detail     String?
+
+  @@index([emailId, occurredAt])
+  @@index([occurredAt])
+  @@map("resend_email_events")
 }

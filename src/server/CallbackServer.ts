@@ -55,6 +55,15 @@ export interface SentryWebhookRoute {
   onEvent: () => Promise<void>;
 }
 
+// Resend delivery webhook (Svix-signed). The handler verifies the signature
+// itself against the stored signing secret and stores the event.
+export interface ResendWebhookRoute {
+  handle: (
+    raw: Buffer,
+    headers: { id?: string | null; timestamp?: string | null; signature?: string | null }
+  ) => Promise<"stored" | "duplicate" | "ignored" | "forbidden">;
+}
+
 // Stripe panel (tokenized standalone page opened from the Intercom canvas).
 // GET exchanges the SINGLE-USE HMAC link token for an HttpOnly session cookie
 // (verified/consumed inside the route object); the API authenticates by that
@@ -100,7 +109,8 @@ export class CallbackServer {
     private intercomPanel?: IntercomPanelRoute,
     private adminPanel?: AdminPanelRoute,
     private dashboard?: DashboardRoute,
-    private sentryWebhook?: SentryWebhookRoute
+    private sentryWebhook?: SentryWebhookRoute,
+    private resendWebhook?: ResendWebhookRoute
   ) {
     this.app = express();
     // req.ip drives the panel per-IP throttle. Without this, req.ip is the
@@ -400,6 +410,42 @@ export class CallbackServer {
         metricCount("sentry.webhooks", 1, { accepted: true });
         await this.sentryWebhook.onEvent().catch(() => {});
         res.status(200).send("ok");
+      }
+    );
+
+    // Resend delivery webhook (the email delivery log). Svix signs the RAW
+    // body; an unverifiable delivery is a 403. A storage failure is a 500 so
+    // Resend retries it (the event row is keyed by svix-id, so a retry of a
+    // half-stored delivery is harmless).
+    this.app.post(
+      "/resend/webhook",
+      express.json({
+        limit: "1mb",
+        verify: (req, _res, buf) => {
+          (req as RawBodyRequest).rawBody = buf;
+        },
+      }),
+      async (req, res) => {
+        const raw = (req as RawBodyRequest).rawBody;
+        if (!this.resendWebhook || !raw) {
+          res.status(403).send("Forbidden");
+          return;
+        }
+        try {
+          const outcome = await this.resendWebhook.handle(raw, {
+            id: req.header("svix-id") ?? null,
+            timestamp: req.header("svix-timestamp") ?? null,
+            signature: req.header("svix-signature") ?? null,
+          });
+          if (outcome === "forbidden") {
+            res.status(403).send("Forbidden");
+            return;
+          }
+          res.status(200).send("ok");
+        } catch (e) {
+          httpLog.error("resend webhook store failed", e);
+          res.status(500).send("retry later");
+        }
       }
     );
 

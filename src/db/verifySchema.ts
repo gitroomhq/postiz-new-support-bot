@@ -48,6 +48,7 @@ export const EXPECTED_COLUMNS: Record<string, string[]> = {
     "sentryFeedbackTeamId", "sentryFeedbackWatermarkAt", "sentryFeedbackLastSyncAt", "sentryWebhookSecret",
     "sentryFeedbackTicketTypeId", "sentryFeedbackLastAttemptAt", "sentryFeedbackLastError",
     "postizLookupEnabled", "postizBaseUrl", "postizApiKey", "resendEnabled", "resendApiKey",
+    "resendWebhookId", "resendWebhookSecret", "resendBackfillAt", "resendBackfillStatus",
     "forwardConvertEnabled", "forwardConvertTagName", "forwardConvertCloseNote", "forwardConvertExtraEmails",
     "forwardDetachForwarder",
     "aiModel", "aiModelLight",
@@ -171,6 +172,11 @@ export const EXPECTED_COLUMNS: Record<string, string[]> = {
     "intercomContactId", "intercomConversationId", "intercomTicketId", "pageUrl", "feedbackAt", "importedAt",
     "postizUserId", "postizOrgId", "stripeCustomerId", "retriedAt", "attempts", "lastError",
   ],
+  resend_emails: [
+    "id", "recipient", "fromAddress", "subject", "category", "sentAt", "lastEvent", "lastEventAt", "detail", "source",
+    "updatedAt",
+  ],
+  resend_email_events: ["id", "emailId", "type", "occurredAt", "detail"],
   postiz_org_links: ["id", "orgId", "stripeCustomerId", "firstSeenAt", "lastSeenAt", "observations"],
   forwarded_email_converts: [
     "id", "originalConversationId", "newConversationId", "forwarderAdminId", "forwarderEmail", "customerEmail",

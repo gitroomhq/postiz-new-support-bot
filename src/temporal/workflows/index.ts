@@ -25,3 +25,5 @@ export { publishStatusReportWorkflow, stripeEventWorkflow, refundWorkflow, vault
 // Started on demand by /config → Analytics → Rebuild, never by ensureBaseline:
 // it is not a looper, and registering it as one would rebuild on every deploy.
 export { analyticsRebuildWorkflow } from "./analyticsRebuild.workflow";
+// Started on demand by /config → Resend → Register webhook, never by ensureBaseline.
+export { resendBackfillWorkflow } from "./resendBackfill.workflow";

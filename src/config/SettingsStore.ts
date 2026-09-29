@@ -79,7 +79,7 @@ const DEFAULT_TAGS: TagInput[] = [
   { emoji: "📁", label: "Closed", closesThread: true, reminderEnabled: false },
 ];
 
-// The ten global secrets and their Vault KV home (one KV entry per
+// The eleven global secrets and their Vault KV home (one KV entry per
 // integration; field names live inside the entry). Shared by the read
 // resolver, the write router, the panel state helper and the migrator.
 export type GlobalSecretColumn =
@@ -92,7 +92,8 @@ export type GlobalSecretColumn =
   | "influxToken"
   | "yubicoApiSecret"
   | "postizApiKey"
-  | "resendApiKey";
+  | "resendApiKey"
+  | "resendWebhookSecret";
 
 export const GLOBAL_SECRETS: Record<GlobalSecretColumn, { integration: VaultIntegration; field: string }> = {
   intercomAccessToken: { integration: "intercom", field: "accessToken" },
@@ -105,6 +106,7 @@ export const GLOBAL_SECRETS: Record<GlobalSecretColumn, { integration: VaultInte
   yubicoApiSecret: { integration: "yubico", field: "apiSecret" },
   postizApiKey: { integration: "postiz", field: "apiKey" },
   resendApiKey: { integration: "resend", field: "apiKey" },
+  resendWebhookSecret: { integration: "resend", field: "webhookSecret" },
 };
 
 // Panel-facing storage state of a global secret column.
@@ -1802,6 +1804,37 @@ export class SettingsStore {
           ? { resendApiKey: await this.routeSecretWrite("resendApiKey", resendApiKey) }
           : {}),
       },
+    });
+  }
+
+  // The webhook this bot registered on the Resend team for the delivery log.
+  // The id is what "Remove webhook" deletes; the secret verifies deliveries.
+  resendWebhookId(): string | null {
+    return this.settings.resendWebhookId ?? null;
+  }
+
+  resendWebhookSecret(): string | null {
+    return this.resolveSecret(this.settings.resendWebhookSecret, "resendWebhookSecret");
+  }
+
+  async setResendWebhook(data: { id: string | null; secret: string | null }): Promise<void> {
+    this.settings = await this.prisma.botSettings.update({
+      where: { id: "global" },
+      data: {
+        resendWebhookId: data.id,
+        resendWebhookSecret: await this.routeSecretWrite("resendWebhookSecret", data.secret),
+      },
+    });
+  }
+
+  resendBackfill(): { at: Date | null; status: string | null } {
+    return { at: this.settings.resendBackfillAt ?? null, status: this.settings.resendBackfillStatus ?? null };
+  }
+
+  async recordResendBackfill(status: string): Promise<void> {
+    this.settings = await this.prisma.botSettings.update({
+      where: { id: "global" },
+      data: { resendBackfillAt: new Date(), resendBackfillStatus: status.slice(0, 500) },
     });
   }
 

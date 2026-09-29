@@ -2,7 +2,7 @@ import type { SettingsStore } from "../config/SettingsStore";
 import type { AuditLogger } from "../bot/AuditLogger";
 import { metricCount } from "../util/instrument";
 import { log } from "../util/logger";
-import { ResendHttpError, type EmailSummary, type ResendClient, type Suppression } from "./ResendClient";
+import { ResendHttpError, SUPPRESSION_BATCH_MAX, type EmailSummary, type ResendClient, type Suppression } from "./ResendClient";
 
 const deliveryLog = log.child("email-delivery");
 
@@ -37,7 +37,7 @@ export type RemoveResult =
   | { kind: "error"; error: string };
 
 export interface DeliveryActor {
-  surface: "intercom" | "discord" | "dashboard";
+  surface: "intercom" | "discord" | "dashboard" | "config";
   id: string;
   name: string;
 }
@@ -88,6 +88,42 @@ export function distinctEmails(emails: Array<string | null | undefined>, cap = M
     if (out.length >= cap) break;
   }
   return out;
+}
+
+// Admin batch removal and the suppression list browser. Resend filters the
+// list by origin only, so dates and the recipient domain are matched here.
+export interface SuppressionFilter {
+  origin: "any" | "bounce" | "complaint" | "manual";
+  since: Date | null;
+  until: Date | null;
+  domain: string | null; // recipient domain, lowercase, no "@"
+}
+
+// A whole-list walk is one request per 100 entries at the client's pace (about
+// four a second). Past this many entries the scan stops and says so, rather
+// than spend minutes of the rate limit Postiz sends on.
+export const SCAN_MAX_ENTRIES = 20_000;
+
+export interface SuppressionScan {
+  matches: Suppression[];
+  scanned: number;
+  truncated: boolean;
+}
+
+export function describeFilter(f: SuppressionFilter): string {
+  const parts = [f.origin === "any" ? "any origin" : originLabel(f.origin)];
+  if (f.domain) parts.push(`@${f.domain}`);
+  if (f.since) parts.push(`from ${f.since.toISOString().slice(0, 10)}`);
+  if (f.until) parts.push(`until ${f.until.toISOString().slice(0, 10)}`);
+  return parts.join(", ");
+}
+
+export function matchesFilter(s: Suppression, f: SuppressionFilter): boolean {
+  if (f.origin !== "any" && s.origin !== f.origin) return false;
+  if (f.domain && domainOf(s.email) !== f.domain) return false;
+  if (f.since && (!s.createdAt || s.createdAt < f.since)) return false;
+  if (f.until && (!s.createdAt || s.createdAt > f.until)) return false;
+  return true;
 }
 
 export class EmailDeliverabilityService {
@@ -184,6 +220,85 @@ export class EmailDeliverabilityService {
     }
   }
 
+  // Walks the suppression list and returns every entry the filter matches,
+  // newest first.
+  async scanSuppressions(filter: SuppressionFilter): Promise<SuppressionScan> {
+    const matches: Suppression[] = [];
+    let after: string | null = null;
+    let scanned = 0;
+    let truncated = false;
+    for (;;) {
+      const page = await this.client.listSuppressions({
+        after,
+        origin: filter.origin === "any" ? null : filter.origin,
+        limit: 100,
+      });
+      scanned += page.items.length;
+      for (const s of page.items) if (matchesFilter(s, filter)) matches.push(s);
+      const last = page.items[page.items.length - 1];
+      if (!page.hasMore || !last) break;
+      if (scanned >= SCAN_MAX_ENTRIES) {
+        truncated = true;
+        break;
+      }
+      after = last.id;
+    }
+    matches.sort((a, b) => (b.createdAt?.getTime() ?? 0) - (a.createdAt?.getTime() ?? 0));
+    return { matches, scanned, truncated };
+  }
+
+  // Admin-only (callers check). Re-scans with the same filter instead of
+  // trusting the preview, removes in batches of 100, and audits one summary
+  // entry. `expected` is the preview's count, reported next to what happened.
+  async removeMatching(
+    filter: SuppressionFilter,
+    actor: DeliveryActor,
+    expected: number
+  ): Promise<{ ok: true; removed: number; matched: number; failed: number } | { ok: false; error: string }> {
+    if (!this.enabled()) return { ok: false, error: "Resend support is off." };
+    try {
+      const scan = await this.scanSuppressions(filter);
+      const ids = scan.matches.map((m) => m.id).filter(Boolean);
+      let removed = 0;
+      for (let i = 0; i < ids.length; i += SUPPRESSION_BATCH_MAX) {
+        removed += (await this.client.removeSuppressionsBatch(ids.slice(i, i + SUPPRESSION_BATCH_MAX))).length;
+      }
+      metricCount("resend.suppression_removed", removed, { origin: filter.origin, surface: actor.surface });
+      deliveryLog.info("resend suppression batch removal", {
+        "resend.matched": ids.length,
+        "resend.removed": removed,
+        "resend.origin": filter.origin,
+      });
+      void this.audit?.log({
+        title: "📧 Batch removal from the Resend suppression list",
+        severity: "warn",
+        actor: actor.name,
+        fields: [
+          { name: "Filter", value: describeFilter(filter), inline: false },
+          { name: "Removed", value: String(removed), inline: true },
+          { name: "Matched", value: `${ids.length} (preview said ${expected})`, inline: true },
+          ...(scan.truncated ? [{ name: "Note", value: `Scan stopped at ${SCAN_MAX_ENTRIES} entries`, inline: false }] : []),
+          { name: "From", value: SURFACE_LABELS[actor.surface], inline: true },
+        ],
+      });
+      return { ok: true, removed, matched: ids.length, failed: ids.length - removed };
+    } catch (e) {
+      return {
+        ok: false,
+        error:
+          e instanceof ResendHttpError
+            ? e.code === "restricted_api_key"
+              ? "The Resend key can only send email; a Full access key is needed."
+              : e.status === 429
+                ? "Resend is rate limiting; try again in a moment."
+                : e.message
+            : e instanceof Error
+              ? e.message
+              : String(e),
+      };
+    }
+  }
+
   // Ask Postiz to send the activation email again, to exactly this address.
   // Uses the platform's own public "resend activation" route (the one behind
   // the login page's button), so the mail is the real one, sent by Postiz
@@ -224,4 +339,5 @@ const SURFACE_LABELS: Record<DeliveryActor["surface"], string> = {
   intercom: "Intercom sidebar",
   discord: "Discord /email",
   dashboard: "Web customer page",
+  config: "/config",
 };

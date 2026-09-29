@@ -1186,6 +1186,37 @@ export const STATEMENTS: string[] = [
   )`,
   `CREATE INDEX IF NOT EXISTS "dispute_events_disputeId_at_idx" ON "dispute_events"("disputeId", "at")`,
   `CREATE INDEX IF NOT EXISTS "dispute_events_at_idx" ON "dispute_events"("at")`,
+  // Resend delivery log (webhook + one-month backfill), purged after 180 days.
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "resendWebhookId" TEXT`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "resendWebhookSecret" TEXT`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "resendBackfillAt" TIMESTAMP(3)`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "resendBackfillStatus" TEXT`,
+  `CREATE TABLE IF NOT EXISTS "resend_emails" (
+    "id" TEXT NOT NULL,
+    "recipient" TEXT NOT NULL,
+    "fromAddress" TEXT,
+    "subject" TEXT,
+    "category" TEXT NOT NULL,
+    "sentAt" TIMESTAMP(3) NOT NULL,
+    "lastEvent" TEXT NOT NULL,
+    "lastEventAt" TIMESTAMP(3) NOT NULL,
+    "detail" TEXT,
+    "source" TEXT NOT NULL,
+    "updatedAt" TIMESTAMP(3) NOT NULL,
+    CONSTRAINT "resend_emails_pkey" PRIMARY KEY ("id")
+  )`,
+  `CREATE INDEX IF NOT EXISTS "resend_emails_recipient_sentAt_idx" ON "resend_emails"("recipient", "sentAt")`,
+  `CREATE INDEX IF NOT EXISTS "resend_emails_sentAt_idx" ON "resend_emails"("sentAt")`,
+  `CREATE TABLE IF NOT EXISTS "resend_email_events" (
+    "id" TEXT NOT NULL,
+    "emailId" TEXT NOT NULL,
+    "type" TEXT NOT NULL,
+    "occurredAt" TIMESTAMP(3) NOT NULL,
+    "detail" TEXT,
+    CONSTRAINT "resend_email_events_pkey" PRIMARY KEY ("id")
+  )`,
+  `CREATE INDEX IF NOT EXISTS "resend_email_events_emailId_occurredAt_idx" ON "resend_email_events"("emailId", "occurredAt")`,
+  `CREATE INDEX IF NOT EXISTS "resend_email_events_occurredAt_idx" ON "resend_email_events"("occurredAt")`,
 ];
 
 export async function ensureSchema(prisma: PrismaClient): Promise<void> {

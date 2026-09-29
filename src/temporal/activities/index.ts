@@ -1,4 +1,4 @@
-import { heartbeat } from "@temporalio/activity";
+import { Context, heartbeat } from "@temporalio/activity";
 import { ApplicationFailure } from "@temporalio/common";
 import { Client, ThreadChannel } from "discord.js";
 import type { StatusTag } from "../../generated/prisma/client";
@@ -37,6 +37,7 @@ import { embed, COLORS } from "../../util/embeds";
 import { log } from "../../util/logger";
 import type { TemporalProducers } from "../producers";
 import { type CoreActivities, type IcEventType, type TicketSnapshot, type TimerCheckResult } from "../types";
+import type { DeliveryLogService } from "../../resend/DeliveryLogService";
 
 const actLog = log.child("temporal:activities");
 
@@ -78,6 +79,8 @@ export interface ActivityDeps {
   analyticsRebuild?: AnalyticsRebuildService | null;
   analyticsRebuildReporter?: ((stats: unknown, error: string | null) => Promise<void>) | null;
   vaultMigrator: VaultMigrator;
+  // Resend delivery log: purge in the cleanup tick, and the backfill.
+  deliveryLog?: DeliveryLogService | null;
   client: Client;
   producers: TemporalProducers;
 }
@@ -110,6 +113,7 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
     analyticsRebuild,
     analyticsRebuildReporter,
     vaultMigrator,
+    deliveryLog,
     client,
     producers,
   } = deps;
@@ -729,6 +733,7 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
       await sessionStore.cleanOldStripeEvents().catch((e) => actLog.error("clean stripe events failed", e));
       await intercomStore.cleanupEchoParts(new Date(Date.now() - ECHO_RETENTION_MS)).catch(() => {});
       await intercomStore.cleanupPendingPosts(new Date(Date.now() - PENDING_POST_RETENTION_MS)).catch(() => {});
+      await deliveryLog?.purge().catch((e) => actLog.error("resend log purge failed", e));
     },
 
     // ================= agent-rip tombstone stubs =================
@@ -840,6 +845,27 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
       // the single-flight lock, and leaving either set would keep every money
       // point suppressed until somebody noticed.
       await requireRebuild().finish(stats as RebuildStats | null, error);
+    },
+
+    // ================= resend delivery log =================
+
+    async resendBackfill() {
+      if (!deliveryLog) throw new Error("the Resend delivery log is not wired into this worker");
+      // A retried attempt resumes after the last page the previous one stored.
+      const resume = Context.current().info.heartbeatDetails as { after?: string; scanned?: number } | undefined;
+      heartbeat(resume ?? {});
+      const result = await deliveryLog.backfill({
+        after: resume?.after ?? null,
+        onPage: (after, scanned) => heartbeat({ after, scanned: (resume?.scanned ?? 0) + scanned }),
+      });
+      const scanned = (resume?.scanned ?? 0) + result.scanned;
+      const status = `ok: ${result.created} emails imported (${scanned} scanned)`;
+      await deliveryLog.recordBackfill(status);
+      return status;
+    },
+
+    async resendBackfillRecord(status) {
+      await deliveryLog?.recordBackfill(status);
     },
 
     async analyticsRebuildReport(stats, error) {

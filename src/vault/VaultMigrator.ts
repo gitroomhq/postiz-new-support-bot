@@ -19,6 +19,7 @@ export const COLUMN_LABELS: Record<GlobalSecretColumn, string> = {
   yubicoApiSecret: "Yubico API secret",
   postizApiKey: "Postiz API key",
   resendApiKey: "Resend API key",
+  resendWebhookSecret: "Resend webhook signing secret",
 };
 
 export interface MigrateItemResult {

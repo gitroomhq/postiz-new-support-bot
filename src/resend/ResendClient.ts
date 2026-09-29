@@ -1,17 +1,25 @@
 import type { SettingsStore } from "../config/SettingsStore";
 
 // Resend, the provider Postiz sends its activation, password-reset and
-// notification mail through. This bot only ever READS and REMOVES entries on
-// the team's suppression list: when an address hard-bounces or files a spam
-// complaint, Resend suppresses it team-wide and silently skips every later
-// send to it, which is how a customer ends up never receiving the mail that
-// would let them log in.
+// notification mail through. This bot never sends mail. It reads and removes
+// entries on the team's suppression list (when an address hard-bounces or
+// files a spam complaint, Resend suppresses it team-wide and silently skips
+// every later send to it, which is how a customer ends up never receiving the
+// mail that would let them log in), reads sent-email metadata for the
+// delivery log, registers the webhook that feeds that log, and mints share
+// links for admins.
 //
-// Contract, verified against resend.com/docs (suppressions reference):
-//   GET    /suppressions/{email|id}  -> the entry, or 404 when not suppressed
-//   DELETE /suppressions/{email|id}  -> { deleted: true }
-//   GET    /suppressions?limit=1     -> the self-test (needs a FULL access key)
-//   GET    /emails/{id}              -> the email that caused a suppression
+// Contract, verified against resend.com/docs:
+//   GET    /suppressions/{email|id}   -> the entry, or 404 when not suppressed
+//   DELETE /suppressions/{email|id}   -> { deleted: true }
+//   GET    /suppressions?limit&after&origin -> a page of the list (the self-test
+//                                        uses limit=1: needs a FULL access key)
+//   POST   /suppressions/batch/remove -> { ids } up to 100 at a time
+//   GET    /emails/{id}               -> one sent email's metadata
+//   GET    /emails?limit&after        -> sent emails, newest first (no filters)
+//   POST   /emails/{id}/share         -> { url } valid for expires_in (max 48h)
+//   POST   /webhooks                  -> { id, signing_secret }
+//   DELETE /webhooks/{id}
 //
 // Two platform rules shape this file:
 //   - a User-Agent header is REQUIRED (Resend answers 403 without one);
@@ -21,7 +29,7 @@ import type { SettingsStore } from "../config/SettingsStore";
 //     email got rate limited.
 
 const BASE_URL = "https://api.resend.com";
-const USER_AGENT = "postiz-support-bot (suppression lookups)";
+const USER_AGENT = "postiz-support-bot (delivery lookups)";
 const REQUEST_TIMEOUT_MS = 10_000;
 const CACHE_TTL_MS = 60_000;
 const CACHE_MAX_ENTRIES = 500;
@@ -74,6 +82,37 @@ export function parseResendDate(raw: unknown): Date | null {
 }
 
 type RawSuppression = { id?: string; email?: string; origin?: string; source_id?: string | null; created_at?: string };
+
+// One sent email as GET /emails lists it: the backfill's raw material.
+export interface SentEmail {
+  id: string;
+  to: string[];
+  from: string | null;
+  subject: string | null;
+  createdAt: Date | null;
+  lastEvent: string | null;
+}
+
+type RawSentEmail = {
+  id?: string;
+  to?: string[] | string | null;
+  from?: string | null;
+  subject?: string | null;
+  created_at?: string;
+  last_event?: string | null;
+};
+
+export const SUPPRESSION_BATCH_MAX = 100;
+
+function toSuppression(raw: RawSuppression, fallbackEmail = ""): Suppression {
+  return {
+    id: raw.id ?? "",
+    email: raw.email ?? fallbackEmail,
+    origin: raw.origin ?? "unknown",
+    sourceId: raw.source_id ?? null,
+    createdAt: parseResendDate(raw.created_at),
+  };
+}
 
 export class ResendClient {
   private cache = new Map<string, { at: number; value: Suppression | null }>();
@@ -153,6 +192,96 @@ export class ResendClient {
     }
   }
 
+  // One page of the suppression list, oldest-first order as Resend returns it.
+  async listSuppressions(opts: { after?: string | null; origin?: string | null; limit?: number } = {}): Promise<{
+    items: Suppression[];
+    hasMore: boolean;
+  }> {
+    const q = new URLSearchParams({ limit: String(Math.min(Math.max(opts.limit ?? 100, 1), 100)) });
+    if (opts.after) q.set("after", opts.after);
+    if (opts.origin) q.set("origin", opts.origin);
+    const raw = await this.request<{ data?: RawSuppression[]; has_more?: boolean }>(
+      "GET",
+      `/suppressions?${q.toString()}`,
+      "suppression list"
+    );
+    return { items: (raw.data ?? []).map((r) => toSuppression(r)), hasMore: raw.has_more === true };
+  }
+
+  // Remove up to SUPPRESSION_BATCH_MAX entries by id. Returns the ids Resend
+  // confirmed deleted; anything missing from that set was not removed.
+  async removeSuppressionsBatch(ids: string[]): Promise<string[]> {
+    if (!ids.length) return [];
+    if (ids.length > SUPPRESSION_BATCH_MAX) throw new Error(`at most ${SUPPRESSION_BATCH_MAX} ids per batch`);
+    try {
+      const raw = await this.request<{ data?: Array<{ id?: string; deleted?: boolean }> }>(
+        "POST",
+        "/suppressions/batch/remove",
+        "suppression batch remove",
+        { ids }
+      );
+      return (raw.data ?? []).filter((d) => d.deleted && d.id).map((d) => d.id!);
+    } finally {
+      this.clearCache();
+    }
+  }
+
+  // One page of sent emails, newest first. Resend offers no recipient or date
+  // filter here, which is why the delivery log is fed by the webhook.
+  async listEmails(opts: { after?: string | null; limit?: number } = {}): Promise<{ items: SentEmail[]; hasMore: boolean }> {
+    const q = new URLSearchParams({ limit: String(Math.min(Math.max(opts.limit ?? 100, 1), 100)) });
+    if (opts.after) q.set("after", opts.after);
+    const raw = await this.request<{ data?: RawSentEmail[]; has_more?: boolean }>("GET", `/emails?${q.toString()}`, "email list");
+    const items = (raw.data ?? [])
+      .filter((r): r is RawSentEmail & { id: string } => typeof r.id === "string" && r.id.length > 0)
+      .map((r) => ({
+        id: r.id,
+        to: Array.isArray(r.to) ? r.to.filter((t) => typeof t === "string") : typeof r.to === "string" ? [r.to] : [],
+        from: r.from ?? null,
+        subject: r.subject ?? null,
+        createdAt: parseResendDate(r.created_at),
+        lastEvent: r.last_event ?? null,
+      }));
+    return { items, hasMore: raw.has_more === true };
+  }
+
+  // A link that shows the whole email (body included) to whoever opens it,
+  // until it expires. Callers gate this to admins and audit it.
+  async shareEmail(emailId: string, expiresIn: string): Promise<{ url: string } | null> {
+    try {
+      const raw = await this.request<{ url?: string }>(
+        "POST",
+        `/emails/${encodeURIComponent(emailId)}/share`,
+        "email share",
+        { expires_in: expiresIn }
+      );
+      return raw.url ? { url: raw.url } : null;
+    } catch (e) {
+      if (e instanceof ResendHttpError && e.status === 404) return null;
+      throw e;
+    }
+  }
+
+  async createWebhook(endpoint: string, events: readonly string[]): Promise<{ id: string; signingSecret: string }> {
+    const raw = await this.request<{ id?: string; signing_secret?: string }>("POST", "/webhooks", "webhook create", {
+      endpoint,
+      events,
+    });
+    if (!raw.id || !raw.signing_secret) throw new Error("Resend webhook create: the answer had no id or signing secret");
+    return { id: raw.id, signingSecret: raw.signing_secret };
+  }
+
+  // true = deleted; false = Resend no longer knew it.
+  async deleteWebhook(id: string): Promise<boolean> {
+    try {
+      await this.request("DELETE", `/webhooks/${encodeURIComponent(id)}`, "webhook delete");
+      return true;
+    } catch (e) {
+      if (e instanceof ResendHttpError && e.status === 404) return false;
+      throw e;
+    }
+  }
+
   // For the /config panels: can this key read the suppression list, and which
   // team does it belong to (its sending domains are the tell). A sending-only
   // key, the kind Postiz itself runs on, is named as such, because "401" alone
@@ -199,13 +328,7 @@ export class ResendClient {
   private async lookup(candidate: string): Promise<Suppression | null> {
     try {
       const raw = await this.request<RawSuppression>("GET", `/suppressions/${encodeURIComponent(candidate)}`, "suppression get");
-      return {
-        id: raw.id ?? "",
-        email: raw.email ?? candidate,
-        origin: raw.origin ?? "unknown",
-        sourceId: raw.source_id ?? null,
-        createdAt: parseResendDate(raw.created_at),
-      };
+      return toSuppression(raw, candidate);
     } catch (e) {
       if (e instanceof ResendHttpError && e.status === 404) return null;
       throw e;
@@ -233,7 +356,7 @@ export class ResendClient {
     };
   }
 
-  private async request<T>(method: "GET" | "DELETE", path: string, what: string): Promise<T> {
+  private async request<T>(method: "GET" | "POST" | "DELETE", path: string, what: string, body?: unknown): Promise<T> {
     const key = this.settings.resendApiKey();
     if (!key) throw new ResendHttpError(401, "missing_api_key", `Resend ${what}: no API key configured`);
     const release = await this.slot();
@@ -244,7 +367,9 @@ export class ResendClient {
           Authorization: `Bearer ${key}`,
           Accept: "application/json",
           "User-Agent": USER_AGENT,
+          ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
         },
+        ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       });
       if (!res.ok) {

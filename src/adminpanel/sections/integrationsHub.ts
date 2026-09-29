@@ -16,6 +16,13 @@ export interface IntegrationsHubDeps {
   // Says whether the Resend key is Full access (a sending key cannot read the
   // suppression list) and which team's sending domains it sees.
   testResend: () => Promise<string>;
+  // The delivery log's webhook: register (then backfill a month) or remove.
+  resendWebhook: {
+    registered: () => boolean;
+    url: () => string | null;
+    register: (actor: { id: string; name: string }) => Promise<string>;
+    remove: (actor: { id: string; name: string }) => Promise<string>;
+  };
 }
 
 // POSTIZ_ADMIN_TOKEN overrides the stored key (see config/env.ts). The field
@@ -158,7 +165,44 @@ export function makeIntegrationsHub(deps: IntegrationsHubDeps): HubModule {
         ],
         actions: [{ key: "resend_test", label: "Test connection", style: "secondary" }],
       };
-      return [intercom, sentry, postiz, resend];
+      const hookUrl = deps.resendWebhook.url();
+      const backfill = s.resendBackfill();
+      const resendLog: Section = {
+        key: "resend_log",
+        title: "Resend delivery log",
+        description:
+          "Every email Resend sends for the team (sent, delivered, delayed, bounced, failed, spam, suppressed), shown per address in the Intercom sidebar, /email and the customer page. Registering creates the webhook on the Resend team (Full access key needed) and imports the last month. Kept 180 days.",
+        fields: [
+          {
+            type: "static",
+            key: "resendWebhookState",
+            label: "Webhook",
+            value: deps.resendWebhook.registered()
+              ? `registered → ${hookUrl ?? "(no public URL)"}`
+              : hookUrl
+                ? `not registered (would point at ${hookUrl})`
+                : "not registered: set a public URL first (Billing → Stripe Webhooks)",
+            badge: deps.resendWebhook.registered() ? { kind: "ok", text: "Live" } : { kind: "info", text: "Off" },
+          },
+          {
+            type: "static",
+            key: "resendBackfillState",
+            label: "Last month import",
+            value: backfill.at ? `${backfill.status ?? "?"} (${backfill.at.toISOString().slice(0, 16).replace("T", " ")} UTC)` : "never run",
+          },
+        ],
+        actions: [
+          {
+            key: "resend_webhook_register",
+            label: deps.resendWebhook.registered() ? "Re-register webhook" : "Register webhook",
+            style: "primary",
+          },
+          ...(deps.resendWebhook.registered()
+            ? [{ key: "resend_webhook_remove", label: "Remove webhook", style: "danger" as const, dangerous: true }]
+            : []),
+        ],
+      };
+      return [intercom, sentry, postiz, resend, resendLog];
     },
 
     async save(ctx: AdminHubContext, req: SaveRequest): Promise<SaveResult> {
@@ -254,7 +298,17 @@ export function makeIntegrationsHub(deps: IntegrationsHubDeps): HubModule {
       }
     },
 
-    async action(_ctx: AdminHubContext, req: ActionRequest): Promise<ActionResult> {
+    async action(ctx: AdminHubContext, req: ActionRequest): Promise<ActionResult> {
+      if (req.key === "resend_webhook_register") {
+        const text = await deps.resendWebhook.register(ctx.actor);
+        await ctx.audit("registered the resend delivery webhook");
+        return { ok: true, text };
+      }
+      if (req.key === "resend_webhook_remove") {
+        const text = await deps.resendWebhook.remove(ctx.actor);
+        await ctx.audit("removed the resend delivery webhook");
+        return { ok: true, text };
+      }
       if (req.key === "sentry_test") {
         const msg = await deps.reconfigureSentry();
         return { ok: true, text: msg };
