@@ -418,8 +418,18 @@ const gateDispute = (over: Record<string, unknown> = {}) =>
     evidence_details: { due_by: dueIn(12), submission_count: 0 },
     ...over,
   }) as never;
+// A complete Fight verdict by default: every other gate is tested against a
+// dispute the rules would fight, so a refusal can only be that gate's own.
 const gateRow = (over: Record<string, unknown> = {}) =>
-  ({ evidenceTouchedAt: null, evidenceAutoOptOut: false, evidenceSubmittedAt: null, ...over }) as never;
+  ({
+    evidenceTouchedAt: null,
+    evidenceAutoOptOut: false,
+    evidenceSubmittedAt: null,
+    verdict: "fight",
+    verdictOverride: null,
+    verdictComplete: true,
+    ...over,
+  }) as never;
 const strongPack = { score: 90, fields: fullPackFields("general") };
 
 test("auto-submit: a strong, untouched, near-deadline pack is allowed through", async () => {
@@ -457,4 +467,30 @@ test("auto-submit: a high score on thin narrative fields is still refused", asyn
   const d = (await builderWith().autoSubmitDecision(gateDispute(), gateRow(), thin, NOW)) as { kind: string; why?: string };
   assert.equal(d.kind, "refuse");
   assert.equal(d.why, "thin_narrative");
+});
+
+// ---- the verdict gates: nothing goes to a bank that the rules would not fight ----
+
+test("auto-submit: the verdict refuses before the phase switch, so manualplus pages nobody for an Accept", async () => {
+  const off = builderWith({ disputeAutoSubmitEnabled: () => false });
+  const cases: Array<[string, Record<string, unknown>]> = [
+    ["verdict_accept", { verdict: "accept" }],
+    ["verdict_incomplete", { verdict: "accept", verdictComplete: false }],
+    ["verdict_missing", { verdict: null }],
+    // A human override wins over the rules in both directions.
+    ["verdict_accept", { verdict: "fight", verdictOverride: "accept" }],
+  ];
+  for (const [expected, row] of cases) {
+    const d = (await off.autoSubmitDecision(gateDispute(), gateRow(row), strongPack, NOW)) as { kind: string; why?: string };
+    assert.equal(d.why, expected, JSON.stringify(row));
+  }
+  // An override to Fight on an Accept verdict passes the verdict gate and meets
+  // the ordinary ones.
+  const fought = await builderWith().autoSubmitDecision(
+    gateDispute(),
+    gateRow({ verdict: "accept", verdictOverride: "fight", verdictComplete: false }),
+    strongPack,
+    NOW
+  );
+  assert.deepEqual(fought, { kind: "submit" });
 });

@@ -299,7 +299,13 @@ async function main() {
   const disputeVerdicts = new DisputeVerdictService(settingsStore, disputeStore, sessionStore, ticketStore, disputeEvents);
   // Shared dispute-evidence core: /billing → Disputes AND the web dashboard's
   // workbench run this one implementation (catalog, staging, submit claims).
-  const disputeEvidenceService = new DisputeEvidenceService(stripeClient, disputeStore, sessionStore, disputeEvents);
+  const disputeEvidenceService = new DisputeEvidenceService(
+    stripeClient,
+    disputeStore,
+    sessionStore,
+    disputeEvents,
+    disputeVerdicts
+  );
   // Deterministic evidence packs: template corpus plus operator overrides,
   // interpolated with real Stripe, platform and support facts. No model.
   // Read-only feed of the customer's real posting activity. Env-configured and

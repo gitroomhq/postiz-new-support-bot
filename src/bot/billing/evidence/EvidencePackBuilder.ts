@@ -26,6 +26,7 @@ import { attachGeneratedDocuments } from "./generatedDocuments";
 import type { EvidenceDocumentStore } from "./EvidenceDocumentStore";
 import { exportDisputeEvidenceSource, exportDisputePackBuild } from "../../../metrics/MetricsExporter";
 import { log } from "../../../util/logger";
+import { effectiveVerdict } from "../disputeVerdict";
 
 const packLog = log.child("dispute-evidence-pack");
 
@@ -72,6 +73,12 @@ export type AutoSubmitRefusal =
   | "disabled"
   | "not_respondable"
   | "already_submitted"
+  // The verdict says this one is not worth fighting.
+  | "verdict_accept"
+  // The verdict leans Accept, but a source did not answer, so a human decides.
+  | "verdict_incomplete"
+  // No verdict has been computed for this dispute yet.
+  | "verdict_missing"
   | "no_deadline"
   | "not_due_yet"
   | "past_deadline"
@@ -83,6 +90,13 @@ export type AutoSubmitRefusal =
   | "already_claimed";
 
 export type AutoSubmitDecision = { kind: "submit" } | { kind: "refuse"; why: AutoSubmitRefusal; score: number };
+
+// The verdict columns the automation reads off the mirror row.
+export interface VerdictColumns {
+  verdict?: string | null;
+  verdictOverride?: string | null;
+  verdictComplete?: boolean;
+}
 
 // Independent of the score: a package can reach 70 on cheap scalar fields
 // (an email, a date, a name) while saying nothing that argues the case. These
@@ -397,15 +411,24 @@ export class EvidencePackBuilder {
   // actually blocked it rather than a list.
   async autoSubmitDecision(
     dispute: Stripe.Dispute,
-    row: { evidenceTouchedAt: Date | null; evidenceAutoOptOut: boolean; evidenceSubmittedAt: Date | null },
+    row: { evidenceTouchedAt: Date | null; evidenceAutoOptOut: boolean; evidenceSubmittedAt: Date | null } & VerdictColumns,
     pack: { score: number; fields: Record<string, string> },
     now: Date = new Date()
   ): Promise<AutoSubmitDecision> {
     const refuse = (why: AutoSubmitRefusal): AutoSubmitDecision => ({ kind: "refuse", why, score: pack.score });
 
-    if (!this.settings.disputeAutoSubmitEnabled()) return refuse("disabled");
     if (dispute.status !== "needs_response" && dispute.status !== "warning_needs_response") return refuse("not_respondable");
     if (row.evidenceSubmittedAt || (dispute.evidence_details?.submission_count ?? 0) > 0) return refuse("already_submitted");
+    // The verdict comes BEFORE the phase switch, so that in manualplus, where
+    // every refusal is "disabled" and a human is pinged to press Submit, a
+    // dispute the rules would not fight is refused as what it is and nobody
+    // is paged to answer it.
+    const verdict = effectiveVerdict({ verdict: row.verdict ?? null, verdictOverride: row.verdictOverride ?? null });
+    if (verdict === "accept") {
+      return refuse(row.verdictOverride || row.verdictComplete ? "verdict_accept" : "verdict_incomplete");
+    }
+    if (verdict == null) return refuse("verdict_missing");
+    if (!this.settings.disputeAutoSubmitEnabled()) return refuse("disabled");
     if (row.evidenceAutoOptOut) return refuse("opted_out");
     // A human who opened this dispute and typed anything owns it now.
     if (row.evidenceTouchedAt) return refuse("human_touched");

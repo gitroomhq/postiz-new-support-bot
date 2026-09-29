@@ -5,7 +5,7 @@ import { StripeClient } from "../StripeClient";
 import { DisputeStore, OPEN_DISPUTE_STATUSES, RESPONDABLE_DISPUTE_STATUSES, segmentsOfDispute } from "./DisputeStore";
 import type { EvidencePackBuilder } from "./evidence/EvidencePackBuilder";
 import type { DisputeEvidenceService } from "./DisputeEvidenceService";
-import type { DisputeVerdictService } from "./DisputeVerdictService";
+import { quietAccept, type DisputeVerdictService } from "./DisputeVerdictService";
 import { VERDICT_VERSION } from "./disputeVerdict";
 import { DISPUTE_PHASES } from "./disputePhase";
 import type { EvidenceFacts } from "./evidence/tokens";
@@ -282,7 +282,8 @@ export class DisputeMonitor {
     private autoResolve?: { drain(): Promise<{ executed: number; blocked: number; failed: number }> } | null,
     private evidencePack?: EvidencePackBuilder | null,
     private evidence?: DisputeEvidenceService | null,
-    // Fight or accept. Absent, packs still build and no verdict is kept.
+    // Fight or accept. Absent, packs still build and nothing auto-submits,
+    // because the submit gate refuses a dispute with no verdict.
     private verdicts?: DisputeVerdictService | null
   ) {}
 
@@ -503,9 +504,12 @@ export class DisputeMonitor {
   }
 
   // Only a refusal that a human can still act on is worth a ping. "Not due yet"
-  // and "already submitted" are the system working, not a problem.
+  // and "already submitted" are the system working, not a problem, and neither
+  // is a dispute the verdict says not to fight: letting it lapse IS accepting it.
   private shouldEscalate(why: string, dispute: Stripe.Dispute): boolean {
-    if (why === "not_due_yet" || why === "already_submitted" || why === "opted_out") return false;
+    if (why === "not_due_yet" || why === "already_submitted" || why === "opted_out" || why === "verdict_accept") {
+      return false;
+    }
     const dueBy = dispute.evidence_details?.due_by;
     if (!dueBy) return false;
     return (dueBy * 1000 - Date.now()) / 3_600_000 <= this.settings.disputeAutoSubmitHours();
@@ -520,12 +524,19 @@ export class DisputeMonitor {
     const dueBy = dispute.evidence_details?.due_by ?? 0;
     const hours = Math.max(0, Math.round((dueBy * 1000 - Date.now()) / 3_600_000));
     const roleId = this.settings.disputeUrgentRoleId();
+    // A verdict that could not be completed, or was never made, is a decision
+    // for a human, not a Submit press: submitting against it asks for a reason.
+    const verdictGap = why === "verdict_incomplete" || why === "verdict_missing";
     const embed = new EmbedBuilder()
       .setTitle("⏳ Evidence needs a human before the deadline")
       .setColor(COLORS.danger)
       .setDescription(
-        `The evidence package for \`${dispute.id}\` is staged but was NOT auto-submitted: **${why.replace(/_/g, " ")}**. ` +
-          "Nothing was un-staged, so opening it and pressing Submit is all that is required."
+        verdictGap
+          ? `The evidence package for \`${dispute.id}\` is staged, but whether to fight it could not be decided: **${
+              why === "verdict_missing" ? "no verdict yet" : "a source did not answer"
+            }**. Open the dispute and choose: submit (with a reason) or accept it as lost.`
+          : `The evidence package for \`${dispute.id}\` is staged but was NOT auto-submitted: **${why.replace(/_/g, " ")}**. ` +
+              "Nothing was un-staged, so opening it and pressing Submit is all that is required."
       )
       .addFields(
         { name: "Completeness", value: `${score}%`, inline: true },
@@ -560,10 +571,16 @@ export class DisputeMonitor {
   private async sendReminders(): Promise<number> {
     const withinDays = this.settings.disputeReminderDays();
     const urgentHours = this.settings.disputeUrgentHours();
-    const [normal, urgent] = await Promise.all([
+    const [allNormal, allUrgent] = await Promise.all([
       this.disputeStore.listNeedingReminder(withinDays, urgentHours),
       this.disputeStore.listNeedingUrgentReminder(urgentHours),
     ]);
+    // A dispute the verdict concedes needs nothing from anyone: it lapses to
+    // lost at the deadline, the same outcome accepting would give. Paging a
+    // human to "submit evidence" for it would be asking for the fight we
+    // decided not to have.
+    const normal = allNormal.filter((row) => !quietAccept(row));
+    const urgent = allUrgent.filter((row) => !quietAccept(row));
     let sent = 0;
     for (const row of urgent) {
       if (await this.sendReminderAlert(row, true, urgentHours)) {

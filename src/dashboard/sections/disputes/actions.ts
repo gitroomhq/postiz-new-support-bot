@@ -1,4 +1,5 @@
-import { EVIDENCE_GROUPS, EVIDENCE_KEY_SET } from "../../../bot/billing/DisputeEvidenceService";
+import { EVIDENCE_GROUPS, EVIDENCE_KEY_SET, OVERRIDE_REASON_MIN } from "../../../bot/billing/DisputeEvidenceService";
+import { VERDICT_SIGNAL_LABELS } from "../../../bot/billing/disputeVerdict";
 import { isStandingSlot } from "../../../bot/billing/evidence/EvidenceDocumentStore";
 import { NO_INTERNAL_ARTIFACT, tokensIn } from "../../../bot/billing/evidence/renderTemplate";
 import { TOKEN_NAMES } from "../../../bot/billing/evidence/tokens";
@@ -281,15 +282,37 @@ export async function disputeAction(
       // a button that merely declares stepUp proves nothing about what the
       // browser actually sent.
       if (!ctx.security.stepUpFresh()) return { ok: false, needsStepUp: true };
-      const outcome = await deps.evidence.submit(disputeId, ctx.actor.id, await customerHint(ctx, disputeId));
+      const overrideReason = str(p.overrideReason, 500).trim();
+      const outcome = await deps.evidence.submit(disputeId, ctx.actor.id, await customerHint(ctx, disputeId), {
+        overrideReason,
+        actorName: ctx.actor.name,
+      });
       if (outcome.kind === "not_respondable") {
         return { ok: false, error: `Status is ${outcome.status}; evidence can no longer be submitted.` };
       }
       if (outcome.kind === "already_claimed") {
         return { ok: false, error: "Evidence for this dispute was already submitted via the bot." };
       }
+      if (outcome.kind === "verdict_override_required" || outcome.kind === "verdict_blocked") {
+        const why =
+          outcome.verdict === "accept"
+            ? `The verdict is Accept${
+                outcome.kind === "verdict_override_required" && outcome.decisive
+                  ? ` (${(VERDICT_SIGNAL_LABELS[outcome.decisive as keyof typeof VERDICT_SIGNAL_LABELS] ?? outcome.decisive).toLowerCase()})`
+                  : ""
+              }`
+            : "There is no verdict for this dispute yet";
+        return {
+          ok: false,
+          error: `${why}. Nothing was submitted: say why this one should be fought (at least ${OVERRIDE_REASON_MIN} characters). Reload the page if the reason box is missing.`,
+        };
+      }
       const d = outcome.dispute;
-      await ctx.audit(`Dispute evidence SUBMITTED on ${disputeId} (${ctx.stripe.formatAmount(d.amount, d.currency)}); status now ${d.status}`);
+      await ctx.audit(
+        `Dispute evidence SUBMITTED on ${disputeId} (${ctx.stripe.formatAmount(d.amount, d.currency)}); status now ${d.status}${
+          overrideReason ? `; fought against the verdict: ${overrideReason.slice(0, 300)}` : ""
+        }`
+      );
       exportBillingEvent({
         event: "evidence_submitted",
         amountMinor: d.amount,

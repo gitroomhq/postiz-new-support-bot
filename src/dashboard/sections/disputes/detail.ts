@@ -12,6 +12,7 @@ import { ActionButton, Badge, Block, Cell, EvidenceBlock, HeaderBlock, TableBloc
 import { DashboardCtx, SectionPage } from "../types";
 import { badgeCell, idCell, isoDateCell, sentence, text } from "../cells";
 import { DisputesDeps, dueBadge, dueCells, eventTone, notFound, registryButton, statusBadgeFor } from "./cells";
+import { effectiveVerdict, type Verdict } from "../../../bot/billing/disputeVerdict";
 
 // The dispute detail page: build the pack, read what it produced, submit.
 //
@@ -304,7 +305,7 @@ export async function detail(ctx: DashboardCtx, deps: DisputesDeps, id: string):
       params: { disputeId: id },
     });
   }
-  actions.push(submitButton(ctx, pkg, draftFields));
+  actions.push(submitButton(ctx, pkg, draftFields, effectiveVerdict(row)));
   // Only at the inquiry stage, and only while the pipeline is not switched off.
   // On a formal chargeback the engine can only ever answer "out of scope", so
   // offering the button there would be a button that exists to say no.
@@ -497,11 +498,24 @@ export async function detail(ctx: DashboardCtx, deps: DisputesDeps, id: string):
 
 // The submit ceremony button: a fresh factor, with the staged summary baked
 // into the modal text (single-submission warning).
-export function submitButton(ctx: DashboardCtx, pkg: StagedPackage, draftFields: number): ActionButton {
+export function submitButton(
+  ctx: DashboardCtx,
+  pkg: StagedPackage,
+  draftFields: number,
+  verdict: Verdict | null = "fight"
+): ActionButton {
   const d = pkg.dispute;
   const dueTs = d.evidence_details?.due_by || null;
+  // Anything but a Fight verdict needs a reason, which the shared submit path
+  // enforces for every surface; the modal just asks for it up front.
+  const againstVerdict = verdict !== "fight";
   const summary = [
     `Submit the staged evidence for ${d.id} (${ctx.stripe.formatAmount(d.amount, d.currency)}, ${d.reason}) to the bank.`,
+    againstVerdict
+      ? verdict === "accept"
+        ? "⚠ The verdict is Accept: fighting this one needs a reason, kept in the dispute history."
+        : "⚠ There is no verdict for this dispute yet: fighting it needs a reason, kept in the dispute history."
+      : null,
     `Staged right now: ${pkg.textFields.length} text field(s) + ${pkg.files.length} file(s).`,
     pkg.unstagedDraft.length
       ? `⚠ ${pkg.unstagedDraft.length} local draft field(s) are NOT staged and will not be sent.`
@@ -539,6 +553,21 @@ export function submitButton(ctx: DashboardCtx, pkg: StagedPackage, draftFields:
     stepUp: true,
     params: { disputeId: d.id },
     summary,
+    ...(againstVerdict
+      ? {
+          inputs: [
+            {
+              type: "text" as const,
+              key: "overrideReason",
+              label: "Why fight despite the verdict?",
+              multiline: true,
+              rows: 3,
+              maxLength: 500,
+              placeholder: "What makes this one winnable?",
+            },
+          ],
+        }
+      : {}),
     ...(disabled ? { disabledReason: disabled } : {}),
   };
 }

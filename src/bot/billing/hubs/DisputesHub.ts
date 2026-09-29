@@ -33,11 +33,15 @@ import {
   EVIDENCE_FILE_SLOTS,
   EVIDENCE_GROUPS,
   EVIDENCE_KEY_SET,
+  OVERRIDE_REASON_MIN,
   PROOF_MAX_BYTES,
   PROOF_TYPES,
   recommendedGroupKeys,
   type EvidenceGroup,
+  type SubmitResult,
 } from "../DisputeEvidenceService";
+import { VERDICT_SIGNAL_LABELS, effectiveVerdict, type VerdictSignal } from "../disputeVerdict";
+import type { AuditActor } from "../AdminAudit";
 import {
   pushNav,
   type BillAdminSession,
@@ -311,32 +315,55 @@ export class DisputesHub {
             await this.renderDetail(interaction, token, `⚠️ Status is **${dispute.status}**: evidence can no longer be submitted.`);
             return;
           }
-          const submissions = dispute.evidence_details?.submission_count ?? 0;
-          const dueTs = dispute.evidence_details?.due_by || null;
-          const embed = new EmbedBuilder()
-            .setTitle("Submit evidence to the bank")
-            .setColor(COLORS.danger)
-            .setDescription(
-              [
-                `Submit the staged evidence for \`${dispute.id}\` (**${this.ctx.stripe.formatAmount(dispute.amount, dispute.currency)}**, ${dispute.reason})?`,
-                dueTs ? `Evidence deadline: <t:${dueTs}:R>.` : null,
-                submissions > 0
-                  ? `⚠️ Evidence was already submitted **${submissions}×**: banks typically accept only ONE submission; resubmit only if Stripe support advised it.`
-                  : "Stripe typically allows exactly one submission. Make sure the staged evidence is complete (use Edit Evidence first).",
-                "This sends everything currently staged at Stripe. It cannot be recalled.",
-              ]
-                .filter(Boolean)
-                .join("\n\n")
-            );
-          await interaction.editReply({
-            embeds: [embed],
-            components: [
-              buttonRow(
-                btn(`billadmin_dp_ev_submitx:${token}`, "Submit Evidence", ButtonStyle.Danger),
-                btn(`billadmin_dp_det:${token}`, "Back", ButtonStyle.Secondary)
-              ),
-            ],
+          await this.renderSubmitConfirm(interaction, token, dispute);
+        });
+      },
+    },
+    // Fighting against the verdict: the reason is asked for in a modal, and
+    // the shared submit path records it as an override before the bank sees
+    // anything. No defer, because showModal must be the first response.
+    {
+      kind: "button",
+      id: "billadmin_dp_ev_fight:",
+      match: "prefix",
+      handler: async (interaction) => {
+        const token = interaction.customId.split(":")[1];
+        const session = await this.ctx.sessions.getOwnedSession(token, interaction);
+        if (!session?.disputeId) return;
+        await interaction.showModal(
+          new ModalBuilder()
+            .setCustomId(`billadmin_dp_ev_fightm:${token}`)
+            .setTitle(`Fight ${session.disputeId}`.slice(0, 45))
+            .addComponents(
+              new ActionRowBuilder<TextInputBuilder>().addComponents(
+                textInput("reason", "Why fight despite the verdict?", {
+                  required: true,
+                  style: TextInputStyle.Paragraph,
+                  maxLength: 500,
+                  placeholder: "What makes this one winnable? Kept in the dispute history.",
+                })
+              )
+            )
+        );
+      },
+    },
+    {
+      kind: "modal",
+      id: "billadmin_dp_ev_fightm:",
+      match: "prefix",
+      handler: async (interaction) => {
+        const token = interaction.customId.split(":")[1];
+        const session = await this.ctx.sessions.getOwnedSession(token, interaction);
+        if (!session?.disputeId) return;
+        const disputeId = session.disputeId;
+        const reason = interaction.fields.getTextInputValue("reason").trim();
+        await this.ctx.sessions.ackModal(interaction);
+        await this.ctx.sessions.runExclusive(token, interaction, async () => {
+          const outcome = await this.ctx.disputeEvidence.submit(disputeId, interaction.user.id, session.customerId ?? null, {
+            overrideReason: reason,
+            actorName: interaction.user.username,
           });
+          await this.finishSubmit(interaction, token, session, outcome, reason);
         });
       },
     },
@@ -353,26 +380,10 @@ export class DisputesHub {
         await this.ctx.sessions.runExclusive(token, interaction, async () => {
           // Live re-check + cross-admin claim + submit live in the shared
           // service (runExclusive only serializes this panel session).
-          const outcome = await this.ctx.disputeEvidence.submit(disputeId, interaction.user.id, session.customerId ?? null);
-          if (outcome.kind === "not_respondable") {
-            await this.renderDetail(interaction, token, `⚠️ Status changed to **${outcome.status}**: nothing was submitted.`);
-            return;
-          }
-          if (outcome.kind === "already_claimed") {
-            await this.renderDetail(interaction, token, "⚠️ Evidence for this dispute was already submitted via the bot.");
-            return;
-          }
-          const result = outcome.dispute;
-          this.ctx.audit.log(interaction, {
-            action: "Dispute evidence submitted",
-            targetCustomerId: session.customerId,
-            objectId: disputeId,
-            amountText: this.ctx.stripe.formatAmount(result.amount, result.currency),
-            outcome: `Submitted to the bank, status now ${result.status}`,
-            severity: "warn",
+          const outcome = await this.ctx.disputeEvidence.submit(disputeId, interaction.user.id, session.customerId ?? null, {
+            actorName: interaction.user.username,
           });
-          exportBillingEvent({ event: "evidence_submitted", amountMinor: result.amount, currency: result.currency, chargeId: session.chargeId });
-          await this.renderDetail(interaction, token, "📨 Evidence submitted to the bank.");
+          await this.finishSubmit(interaction, token, session, outcome, null);
         });
       },
     },
@@ -1487,6 +1498,103 @@ export class DisputesHub {
       )
     );
     await interaction.editReply({ embeds: [embed], components });
+  }
+
+  // The submit confirmation. When the verdict is anything but Fight it says so
+  // and offers "Fight anyway", which asks for the reason the shared submit
+  // path requires; a plain Submit button would only bounce off that gate.
+  private async renderSubmitConfirm(
+    interaction: RenderInteraction,
+    token: string,
+    dispute: Stripe.Dispute,
+    notice?: string
+  ): Promise<void> {
+    const row = await this.ctx.disputeStore.get(dispute.id).catch(() => null);
+    const verdict = row ? effectiveVerdict(row) : null;
+    const submissions = dispute.evidence_details?.submission_count ?? 0;
+    const dueTs = dispute.evidence_details?.due_by || null;
+    const decisive = row?.verdictDecisive as VerdictSignal | null | undefined;
+    const verdictLine =
+      verdict === "fight"
+        ? null
+        : verdict === "accept"
+          ? `⚖️ The verdict is **Accept**${decisive && VERDICT_SIGNAL_LABELS[decisive] ? ` (${VERDICT_SIGNAL_LABELS[decisive].toLowerCase()})` : ""}${
+              row?.verdictOverride ? `, set by ${row.verdictOverrideBy ?? "a human"}` : ""
+            }. Fighting it needs a reason, kept in the dispute history.`
+          : "⚖️ No verdict has been made for this dispute yet. Fighting it needs a reason, kept in the dispute history.";
+    const embed = new EmbedBuilder()
+      .setTitle("Submit evidence to the bank")
+      .setColor(COLORS.danger)
+      .setDescription(
+        [
+          notice ?? null,
+          `Submit the staged evidence for \`${dispute.id}\` (**${this.ctx.stripe.formatAmount(dispute.amount, dispute.currency)}**, ${dispute.reason})?`,
+          verdictLine,
+          dueTs ? `Evidence deadline: <t:${dueTs}:R>.` : null,
+          submissions > 0
+            ? `⚠️ Evidence was already submitted **${submissions}×**: banks typically accept only ONE submission; resubmit only if Stripe support advised it.`
+            : "Stripe typically allows exactly one submission. Make sure the staged evidence is complete (use Edit Evidence first).",
+          "This sends everything currently staged at Stripe. It cannot be recalled.",
+        ]
+          .filter(Boolean)
+          .join("\n\n")
+      );
+    await interaction.editReply({
+      embeds: [embed],
+      components: [
+        buttonRow(
+          verdict === "fight"
+            ? btn(`billadmin_dp_ev_submitx:${token}`, "Submit Evidence", ButtonStyle.Danger)
+            : btn(`billadmin_dp_ev_fight:${token}`, "Fight anyway", ButtonStyle.Danger),
+          btn(`billadmin_dp_det:${token}`, "Back", ButtonStyle.Secondary)
+        ),
+      ],
+    });
+  }
+
+  // Shared by the plain Submit and the "Fight anyway" modal.
+  private async finishSubmit(
+    interaction: RenderInteraction & AuditActor,
+    token: string,
+    session: BillAdminSession,
+    outcome: SubmitResult,
+    overrideReason: string | null
+  ): Promise<void> {
+    const disputeId = session.disputeId!;
+    if (outcome.kind === "not_respondable") {
+      await this.renderDetail(interaction, token, `⚠️ Status changed to **${outcome.status}**: nothing was submitted.`);
+      return;
+    }
+    if (outcome.kind === "already_claimed") {
+      await this.renderDetail(interaction, token, "⚠️ Evidence for this dispute was already submitted via the bot.");
+      return;
+    }
+    if (outcome.kind === "verdict_override_required" || outcome.kind === "verdict_blocked") {
+      // The verdict moved between the confirmation and the press, or the
+      // reason was too short to count. Back to the confirmation, which now
+      // shows the verdict and the Fight anyway button.
+      const dispute = await this.ctx.stripe.getDispute(disputeId);
+      await this.renderSubmitConfirm(
+        interaction,
+        token,
+        dispute,
+        overrideReason != null
+          ? `⚠️ Nothing was submitted: the reason must be at least ${OVERRIDE_REASON_MIN} characters.`
+          : "⚠️ Nothing was submitted: the verdict is not Fight."
+      );
+      return;
+    }
+    const result = outcome.dispute;
+    this.ctx.audit.log(interaction, {
+      action: overrideReason ? "Dispute evidence submitted against the verdict" : "Dispute evidence submitted",
+      targetCustomerId: session.customerId,
+      objectId: disputeId,
+      amountText: this.ctx.stripe.formatAmount(result.amount, result.currency),
+      outcome: `Submitted to the bank, status now ${result.status}${overrideReason ? `. Reason: ${overrideReason.slice(0, 300)}` : ""}`,
+      severity: "warn",
+    });
+    exportBillingEvent({ event: "evidence_submitted", amountMinor: result.amount, currency: result.currency, chargeId: session.chargeId });
+    await this.renderDetail(interaction, token, "📨 Evidence submitted to the bank.");
   }
 
   private async renderDetail(interaction: RenderInteraction, token: string, notice?: string): Promise<void> {

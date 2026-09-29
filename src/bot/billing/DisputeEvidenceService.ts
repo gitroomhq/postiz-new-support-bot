@@ -6,6 +6,7 @@ import { attachReceiptEvidence } from "./receiptEvidence";
 import { DisputeStore, RESPONDABLE_DISPUTE_STATUSES, TEXT_EVIDENCE_KEYS } from "./DisputeStore";
 import type { DisputeEventStore } from "./DisputeEventStore";
 import type { StripeDispute } from "../../generated/prisma/client";
+import { effectiveVerdict, type Verdict } from "./disputeVerdict";
 
 const logger = new Logger("billing:dispute-evidence");
 
@@ -175,7 +176,15 @@ export interface StagedPackage {
 export type SubmitResult =
   | { kind: "submitted"; dispute: Stripe.Dispute }
   | { kind: "not_respondable"; status: string }
-  | { kind: "already_claimed" };
+  | { kind: "already_claimed" }
+  // The verdict is not Fight and no override reason came with the press.
+  | { kind: "verdict_override_required"; verdict: Verdict | null; decisive: string | null }
+  // The automation tried to submit against a non-Fight verdict. Never happens
+  // through the auto-submit gate; this is the belt behind it.
+  | { kind: "verdict_blocked"; verdict: Verdict | null };
+
+// A reason shorter than this is a keystroke, not a reason.
+export const OVERRIDE_REASON_MIN = 5;
 
 export type AcceptResult = { kind: "accepted"; dispute: Stripe.Dispute } | { kind: "already_claimed" };
 
@@ -189,8 +198,22 @@ export class DisputeEvidenceService {
     private stripe: StripeClient,
     private disputeStore: DisputeStore,
     private sessionStore: SessionStore,
-    private events?: DisputeEventStore | null
+    private events?: DisputeEventStore | null,
+    // Records a human's override when they fight against the verdict. Absent,
+    // the override still lands on the mirror, just without a history entry.
+    private verdicts?: {
+      override(disputeId: string, verdict: Verdict, reason: string, actor: { id: string; name: string }): Promise<void>;
+    } | null
   ) {}
+
+  private async recordOverride(disputeId: string, reason: string, actorId: string, actorName: string | null): Promise<void> {
+    const actor = { id: actorId, name: actorName ?? `Admin ${actorId}` };
+    if (this.verdicts) {
+      await this.verdicts.override(disputeId, "fight", reason, actor);
+      return;
+    }
+    await this.disputeStore.recordVerdictOverride(disputeId, { verdict: "fight", by: `${actor.name} (${actor.id})`, reason });
+  }
 
   respondable(status: string): boolean {
     return RESPONDABLE.has(status);
@@ -333,11 +356,36 @@ export class DisputeEvidenceService {
   // exactly once). Live status re-check + cross-admin claim: whichever
   // surface's confirm lands first wins, everyone else gets already_claimed.
   // The claim is released on Stripe failure so a retry stays possible.
-  async submit(disputeId: string, actorId: string, customerIdHint: string | null): Promise<SubmitResult> {
+  //
+  // The fight-or-accept verdict is enforced HERE, the one path every surface
+  // submits through, so no button can forget it. Anything other than a Fight
+  // verdict (Accept, or no verdict at all yet) needs a typed reason from a
+  // human, which is recorded as an override; the automation never gets one.
+  async submit(
+    disputeId: string,
+    actorId: string,
+    customerIdHint: string | null,
+    opts: { overrideReason?: string | null; actorName?: string | null } = {}
+  ): Promise<SubmitResult> {
     const fresh = await this.stripe.getDispute(disputeId);
     if (!RESPONDABLE.has(fresh.status)) return { kind: "not_respondable", status: fresh.status };
+    const row = await this.disputeStore.get(disputeId).catch(() => null);
+    const verdict = row ? effectiveVerdict(row) : null;
+    const overrideReason = (opts.overrideReason ?? "").trim();
+    if (verdict !== "fight") {
+      if (actorId === "system") return { kind: "verdict_blocked", verdict };
+      if (overrideReason.length < OVERRIDE_REASON_MIN) {
+        return { kind: "verdict_override_required", verdict, decisive: row?.verdictDecisive ?? null };
+      }
+    }
     const claimed = await this.sessionStore.claimBillingAction(actorId, `dispute-submit-${disputeId}`, "dispute_submit");
     if (!claimed) return { kind: "already_claimed" };
+    if (verdict !== "fight") {
+      // Recorded before the bank sees anything: the decision to fight against
+      // the rules is the thing worth keeping, whether or not Stripe then
+      // accepts the submission.
+      await this.recordOverride(disputeId, overrideReason, actorId, opts.actorName ?? null).catch(() => {});
+    }
     let result: Stripe.Dispute;
     try {
       result = await this.stripe.updateDisputeEvidence(disputeId, {}, true, `billadmin-dpsubmit-${disputeId}`);

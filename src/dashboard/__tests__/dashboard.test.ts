@@ -2113,6 +2113,19 @@ function disputeRow(over: Record<string, unknown>) {
     evidenceSubmittedAt: null,
     disputeCreatedAt: new Date(Date.now() - 48 * 3600_000),
     closedAt: null,
+    // A complete Fight verdict unless a test says otherwise, so every
+    // submit-path test exercises its own gate and not the verdict's.
+    verdict: "fight",
+    verdictDecisive: "posts_after_charge",
+    verdictSignals: null,
+    verdictComplete: true,
+    verdictVersion: "v1",
+    verdictSource: "live",
+    verdictAt: new Date(Date.now() - 3600_000),
+    verdictOverride: null,
+    verdictOverrideBy: null,
+    verdictOverrideReason: null,
+    verdictOverrideAt: null,
     ...over,
   };
 }
@@ -2796,6 +2809,37 @@ test("dispute detail: the rail is two cards, and the customer link lives in the 
   assert.deepEqual((byLabel["Customer"] as { ref?: unknown }).ref, { page: "customers.detail", params: { id: "cus_a" } });
   // Status is a header badge now; repeating it in the rail was filing, not info.
   assert.ok(!byLabel["Status"]);
+});
+
+
+// ---- fight or accept ----
+
+test("evidence service: fighting against the verdict needs a reason, is recorded, and the automation never gets one", async () => {
+  const f = evidenceFakes({ row: disputeRow({ verdict: "accept", verdictDecisive: "thin_first_charge" }) });
+  const overrides: Array<Record<string, unknown>> = [];
+  (f.disputeStore as Record<string, unknown>).recordVerdictOverride = async (id: string, o: Record<string, unknown>) => {
+    overrides.push({ id, ...o });
+  };
+
+  assert.deepEqual(await f.svc.submit("dp_1", "42", null), {
+    kind: "verdict_override_required",
+    verdict: "accept",
+    decisive: "thin_first_charge",
+  });
+  assert.equal(f.calls.claims.length, 0, "no claim is burned by a press without a reason");
+  assert.equal((await f.svc.submit("dp_1", "42", null, { overrideReason: "no" })).kind, "verdict_override_required");
+  assert.deepEqual(await f.svc.submit("dp_1", "system", null, { overrideReason: "the machine insists" }), {
+    kind: "verdict_blocked",
+    verdict: "accept",
+  });
+
+  const ok = await f.svc.submit("dp_1", "42", null, { overrideReason: "Posted daily, logs attached", actorName: "Ada" });
+  assert.equal(ok.kind, "submitted");
+  assert.deepEqual(overrides, [{ id: "dp_1", verdict: "fight", by: "Ada (42)", reason: "Posted daily, logs attached" }]);
+
+  // No verdict at all is not a Fight: a human still owes a reason.
+  const none = evidenceFakes({ row: disputeRow({ verdict: null, verdictDecisive: null }) });
+  assert.equal((await none.svc.submit("dp_1", "42", null)).kind, "verdict_override_required");
 });
 
 
