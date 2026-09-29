@@ -420,12 +420,13 @@ export class DisputeEvidenceService {
       throw error;
     }
     await this.disputeStore.upsertFromStripe(result, customerIdHint);
-    await this.events?.record({
-      disputeId,
-      kind: "accepted",
-      summary: "Dispute accepted and closed as lost",
-      actorId,
-    });
+    // "system" is the auto-accept acting on an Accept verdict; anything else
+    // is a person, which is the distinction the timeline exists to show.
+    await this.events?.record(
+      actorId === "system"
+        ? { disputeId, kind: "auto_accepted", summary: "Dispute auto-accepted and closed as lost (verdict: Accept)" }
+        : { disputeId, kind: "accepted", summary: "Dispute accepted and closed as lost", actorId }
+    );
     return { kind: "accepted", dispute: result };
   }
 }

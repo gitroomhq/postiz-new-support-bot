@@ -24,13 +24,14 @@ export function phaseAtLeast(phase: DisputePhase, atLeast: DisputePhase): boolea
 //   manual      a Build button exists in Discord and in the panel
 //   manualplus  the pack is built and staged automatically when a dispute
 //               arrives, and never submitted
-//   auto        as manualplus, plus it submits itself near the deadline when
-//               nobody has touched it and every gate passes
+//   auto        as manualplus, plus near the deadline, when nobody has
+//               touched it and every gate passes, it submits a Fight verdict
+//               and accepts an Accept verdict as lost
 export const EVIDENCE_PHASE_LABELS: Record<DisputePhase, string> = {
   none: "Off",
   manual: "Manual: a Build button, nothing automatic",
   manualplus: "Manual plus: auto-build and stage, never submit",
-  auto: "Auto: also submits near the deadline if untouched",
+  auto: "Auto: near the deadline, submits Fight and accepts Accept if untouched",
 };
 
 // RESOLVE pipeline (refund-to-prevent).
@@ -50,7 +51,7 @@ export function autoStages(phase: DisputePhase): boolean {
   return phaseAtLeast(phase, "manualplus");
 }
 
-/** Evidence: may a pack submit itself to the bank? */
+/** Evidence: may a pack submit itself to the bank (and, on an Accept verdict, concede)? */
 export function autoSubmits(phase: DisputePhase): boolean {
   return phase === "auto";
 }

@@ -6,7 +6,7 @@ import { DisputeStore, OPEN_DISPUTE_STATUSES, RESPONDABLE_DISPUTE_STATUSES, segm
 import type { EvidencePackBuilder } from "./evidence/EvidencePackBuilder";
 import type { DisputeEvidenceService } from "./DisputeEvidenceService";
 import { quietAccept, type DisputeVerdictService } from "./DisputeVerdictService";
-import { VERDICT_VERSION } from "./disputeVerdict";
+import { VERDICT_SIGNAL_LABELS, VERDICT_VERSION } from "./disputeVerdict";
 import { DISPUTE_PHASES } from "./disputePhase";
 import type { EvidenceFacts } from "./evidence/tokens";
 import type { StripeSegmentResolver } from "./StripeSegmentResolver";
@@ -325,7 +325,7 @@ export class DisputeMonitor {
 
     const evidence = await this.runAutoEvidence(beat).catch((error) => {
       monitorLog.error("dispute auto-evidence failed", error);
-      return { packed: 0, autoSubmitted: 0, escalated: 0, touched: new Set<string>() };
+      return { packed: 0, autoSubmitted: 0, autoAccepted: 0, escalated: 0, touched: new Set<string>() };
     });
 
     const verdicts = await this.runVerdicts(evidence.touched, startedAt, beat).catch((error) => {
@@ -362,6 +362,7 @@ export class DisputeMonitor {
       autoResolveFailed: autoResolve?.failed ?? 0,
       packed: evidence.packed,
       autoSubmitted: evidence.autoSubmitted,
+      autoAccepted: evidence.autoAccepted,
       escalated: evidence.escalated,
       verdicts: verdicts.verdicts,
     };
@@ -373,10 +374,11 @@ export class DisputeMonitor {
   private async runAutoEvidence(beat: () => void): Promise<{
     packed: number;
     autoSubmitted: number;
+    autoAccepted: number;
     escalated: number;
     touched: Set<string>;
   }> {
-    const out = { packed: 0, autoSubmitted: 0, escalated: 0, touched: new Set<string>() };
+    const out = { packed: 0, autoSubmitted: 0, autoAccepted: 0, escalated: 0, touched: new Set<string>() };
     const builder = this.evidencePack;
     if (!builder || !this.settings.disputeAutoPackEnabled()) return out;
 
@@ -408,6 +410,21 @@ export class DisputeMonitor {
         const row = (await this.disputeStore.get(listed.id).catch(() => null)) ?? listed;
 
         const decision = await builder.autoSubmitDecision(dispute, row, staged.pack);
+        if (decision.kind === "refuse" && decision.why === "verdict_accept") {
+          // Not worth fighting. In auto mode, concede it inside the same window
+          // a fight would have been submitted in; otherwise it simply lapses,
+          // which loses it exactly as accepting would, with nobody paged.
+          const accept = builder.autoAcceptDecision(dispute, row);
+          if (accept.kind === "accept" && this.evidence) {
+            const result = await this.evidence.accept(dispute.id, "system", row.customerId);
+            if (result.kind === "accepted") {
+              out.autoAccepted++;
+              exportBillingEvent({ event: "dispute_accepted", amountMinor: dispute.amount, currency: dispute.currency, chargeId });
+              await this.postAutoAccepted(dispute, row);
+            }
+          }
+          continue;
+        }
         if (decision.kind === "submit") {
           const result = await this.evidence!.submit(dispute.id, "system", row.customerId);
           if (result.kind === "submitted") {
@@ -551,6 +568,30 @@ export class DisputeMonitor {
     // Share the urgent damper so the ordinary urgent ping does not double-fire
     // in the same hour for the same dispute.
     await this.disputeStore.recordUrgentReminder(dispute.id).catch(() => {});
+  }
+
+  // The record of an irreversible thing the bot did on its own, mirroring the
+  // auto-submit notice. It names the rule, because "auto-accepted" without a
+  // why is the one message nobody can check.
+  private async postAutoAccepted(
+    dispute: Stripe.Dispute,
+    row: { verdictDecisive: string | null; verdictOverride: string | null; verdictOverrideBy: string | null }
+  ): Promise<void> {
+    const why = row.verdictOverride
+      ? `overridden to Accept by ${row.verdictOverrideBy ?? "a human"}`
+      : (VERDICT_SIGNAL_LABELS[row.verdictDecisive as keyof typeof VERDICT_SIGNAL_LABELS] ?? row.verdictDecisive ?? "verdict");
+    const embed = new EmbedBuilder()
+      .setTitle("🏳️ Dispute auto-accepted")
+      .setColor(COLORS.warn)
+      .setDescription(
+        `\`${dispute.id}\` was accepted as lost before its deadline because the verdict is **Accept**: ${why}. No evidence was sent, so no countered-dispute fee applies.`
+      )
+      .addFields(
+        { name: "Amount", value: this.stripe.formatAmount(dispute.amount, dispute.currency), inline: true },
+        { name: "Reason", value: dispute.reason || "unknown", inline: true }
+      )
+      .setTimestamp();
+    await this.postAlert(embed, [this.openButtonRow(dispute.id)]);
   }
 
   private async postAutoSubmitted(dispute: Stripe.Dispute, score: number): Promise<void> {

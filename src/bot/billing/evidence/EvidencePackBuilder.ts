@@ -91,6 +91,20 @@ export type AutoSubmitRefusal =
 
 export type AutoSubmitDecision = { kind: "submit" } | { kind: "refuse"; why: AutoSubmitRefusal; score: number };
 
+export type AutoAcceptRefusal =
+  | "disabled"
+  | "not_chargeback"
+  | "already_submitted"
+  | "not_accept"
+  | "incomplete"
+  | "opted_out"
+  | "human_touched"
+  | "no_deadline"
+  | "not_due_yet"
+  | "past_deadline";
+
+export type AutoAcceptDecision = { kind: "accept" } | { kind: "refuse"; why: AutoAcceptRefusal };
+
 // The verdict columns the automation reads off the mirror row.
 export interface VerdictColumns {
   verdict?: string | null;
@@ -447,6 +461,43 @@ export class EvidencePackBuilder {
       if ((pack.fields[field] ?? "").length < NARRATIVE_MIN_CHARS) return refuse("thin_narrative");
     }
     return { kind: "submit" };
+  }
+
+  // The mirror image of auto-submit: concede, without a human, a dispute the
+  // verdict says not to fight. Irreversible, so every gate is stricter than
+  // the submit side's:
+  //  - evidence auto mode only (the same switch that lets packages go out);
+  //  - formal chargebacks only, because accepting an inquiry does not close
+  //    it (a refund does, and that is auto-resolve's job);
+  //  - a COMPLETE verdict, or a human's own override to Accept;
+  //  - nobody touched the evidence or opted the dispute out;
+  //  - inside the same window before the deadline as auto-submit, so a human
+  //    has exactly as long to object as they have to a fight.
+  autoAcceptDecision(
+    dispute: Stripe.Dispute,
+    row: { evidenceTouchedAt: Date | null; evidenceAutoOptOut: boolean; evidenceSubmittedAt: Date | null } & VerdictColumns,
+    now: Date = new Date()
+  ): AutoAcceptDecision {
+    const refuse = (why: AutoAcceptRefusal): AutoAcceptDecision => ({ kind: "refuse", why });
+
+    if (!this.settings.disputeAutoSubmitEnabled()) return refuse("disabled");
+    if (dispute.status !== "needs_response") return refuse("not_chargeback");
+    if (row.evidenceSubmittedAt || (dispute.evidence_details?.submission_count ?? 0) > 0) return refuse("already_submitted");
+    const verdict = effectiveVerdict({ verdict: row.verdict ?? null, verdictOverride: row.verdictOverride ?? null });
+    if (verdict !== "accept") return refuse("not_accept");
+    const humanSaidAccept = row.verdictOverride === "accept";
+    if (!humanSaidAccept && !row.verdictComplete) return refuse("incomplete");
+    if (row.evidenceAutoOptOut) return refuse("opted_out");
+    // Somebody typing into the evidence is somebody preparing to fight, unless
+    // they then said Accept themselves.
+    if (row.evidenceTouchedAt && !humanSaidAccept) return refuse("human_touched");
+
+    const dueBy = dispute.evidence_details?.due_by;
+    if (!dueBy) return refuse("no_deadline");
+    const hoursLeft = (dueBy * 1000 - now.getTime()) / 3_600_000;
+    if (hoursLeft <= 0) return refuse("past_deadline");
+    if (hoursLeft > this.settings.disputeAutoSubmitHours()) return refuse("not_due_yet");
+    return { kind: "accept" };
   }
 }
 

@@ -371,6 +371,8 @@ export interface DisputesTickResult {
   // that hit the deadline needing a human instead.
   packed: number;
   autoSubmitted: number;
+  // Disputes conceded because the verdict said not to fight (auto mode only).
+  autoAccepted: number;
   escalated: number;
   // Fight-or-accept verdicts refreshed on open disputes.
   verdicts: number;

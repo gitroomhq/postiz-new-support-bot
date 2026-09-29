@@ -494,3 +494,36 @@ test("auto-submit: the verdict refuses before the phase switch, so manualplus pa
   );
   assert.deepEqual(fought, { kind: "submit" });
 });
+
+test("auto-accept: concedes only a complete Accept on a chargeback inside the window, in auto mode", () => {
+  const accept = (over: Record<string, unknown> = {}) => gateRow({ verdict: "accept", ...over });
+  assert.deepEqual(builderWith().autoAcceptDecision(gateDispute(), accept(), NOW), { kind: "accept" });
+
+  const cases: Array<[string, ReturnType<EvidencePackBuilder["autoAcceptDecision"]>]> = [
+    ["disabled", builderWith({ disputeAutoSubmitEnabled: () => false }).autoAcceptDecision(gateDispute(), accept(), NOW)],
+    // Accepting an inquiry does not close it; only a refund does.
+    ["not_chargeback", builderWith().autoAcceptDecision(gateDispute({ status: "warning_needs_response" }), accept(), NOW)],
+    ["already_submitted", builderWith().autoAcceptDecision(gateDispute(), accept({ evidenceSubmittedAt: NOW }), NOW)],
+    ["not_accept", builderWith().autoAcceptDecision(gateDispute(), gateRow(), NOW)],
+    ["not_accept", builderWith().autoAcceptDecision(gateDispute(), accept({ verdictOverride: "fight" }), NOW)],
+    ["incomplete", builderWith().autoAcceptDecision(gateDispute(), accept({ verdictComplete: false }), NOW)],
+    ["opted_out", builderWith().autoAcceptDecision(gateDispute(), accept({ evidenceAutoOptOut: true }), NOW)],
+    ["human_touched", builderWith().autoAcceptDecision(gateDispute(), accept({ evidenceTouchedAt: NOW }), NOW)],
+    ["no_deadline", builderWith().autoAcceptDecision(gateDispute({ evidence_details: { due_by: null, submission_count: 0 } }), accept(), NOW)],
+    ["past_deadline", builderWith().autoAcceptDecision(gateDispute({ evidence_details: { due_by: dueIn(-1), submission_count: 0 } }), accept(), NOW)],
+    ["not_due_yet", builderWith().autoAcceptDecision(gateDispute({ evidence_details: { due_by: dueIn(100), submission_count: 0 } }), accept(), NOW)],
+  ];
+  for (const [expected, d] of cases) {
+    assert.equal(d.kind, "refuse", `${expected} should refuse`);
+    assert.equal((d as { why: string }).why, expected);
+  }
+});
+
+test("auto-accept: a human's own Accept overrides both completeness and their earlier edits", () => {
+  const d = builderWith().autoAcceptDecision(
+    gateDispute(),
+    gateRow({ verdict: "fight", verdictComplete: false, verdictOverride: "accept", evidenceTouchedAt: NOW }),
+    NOW
+  );
+  assert.deepEqual(d, { kind: "accept" });
+});
