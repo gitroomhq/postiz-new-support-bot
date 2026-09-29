@@ -33,7 +33,6 @@ const server = new CallbackServer(
   undefined,
   undefined,
   undefined,
-  undefined,
   shell("admin"),
   shell("dashboard"),
   undefined
@@ -143,7 +142,6 @@ realPanel.bindSharedAuth({
 const realServer = new CallbackServer(
   { server: { port: 0 } } as never,
   {} as never,
-  undefined,
   undefined,
   undefined,
   undefined,

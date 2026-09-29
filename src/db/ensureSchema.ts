@@ -696,7 +696,7 @@ export const STATEMENTS: string[] = [
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "intercomPanelAdminsJson" JSONB`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "billingActionLevelsJson" JSONB`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "panelTokenSecret" TEXT`,
-  // Stripe-panel link/session revocation epoch ("Revoke Stripe Panel Links").
+  // Stripe-panel link/session revocation epoch. Retired with the Stripe panel; the column stays.
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "panelTokenEpoch" INTEGER NOT NULL DEFAULT 0`,
   // Admin web-panel (/config + /intercom) revocation epoch — independent of the
   // Stripe-panel epoch above ("Revoke Admin Panel Links").

@@ -28,7 +28,7 @@ const stamped = (over: Record<string, unknown> = {}) =>
 function render(identity: PostizIdentityService | undefined) {
   const app = new IntercomInboxApp(
     {} as never, {} as never, {} as never, {} as never, {} as never,
-    () => null, {} as never, {} as never, {} as never, {} as never,
+    () => null, {} as never, {} as never,
     identity
   );
   return async (input: unknown): Promise<string[]> => {

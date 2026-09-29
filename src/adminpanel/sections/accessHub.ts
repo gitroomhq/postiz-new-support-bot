@@ -33,7 +33,7 @@ export function makeAccessHub(deps: { listIntercomAdmins: () => Promise<Array<{ 
       const admins: Section = {
         key: "admins",
         title: "Intercom admins",
-        description: "Teammates who may run admin-level billing actions from the canvas / Stripe panel.",
+        description: "Teammates who may run admin-level billing actions from the Intercom sidebar.",
         notice: note ? { kind: "warn", text: note } : undefined,
         fields: [
           {

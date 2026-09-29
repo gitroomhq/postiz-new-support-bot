@@ -67,7 +67,6 @@ import { IntercomStore } from "../intercom/IntercomStore";
 import { IntercomClient, IntercomHttpError } from "../intercom/IntercomClient";
 import { INTERCOM_WEBHOOK_TOPICS, IntercomWebhookHandler } from "../intercom/IntercomWebhookHandler";
 import { IntercomInboxApp } from "../intercom/IntercomInboxApp";
-import { IntercomPanel } from "../intercom/panel/IntercomPanel";
 import { BillingAdmin } from "./BillingAdmin";
 import { IntercomAdmin } from "./IntercomAdmin";
 import { AdminPanel } from "../adminpanel/AdminPanel";
@@ -229,8 +228,6 @@ export class DiscordBot {
       // lookups hit a warm cache instead of re-reading charges it already saw.
       segments?: StripeSegmentResolver;
     },
-    // Stripe panel (tokenized standalone page opened from the Intercom canvas).
-    private intercomPanel?: IntercomPanel,
     // /intercom admin panel (bridge/SLA/automation/maintenance hubs).
     private intercomAdmin?: IntercomAdmin,
     // Money-out ledger (drives /config → Billing → Money Out: the enable
@@ -7333,12 +7330,6 @@ export class DiscordBot {
         constructEvent: (raw, sig, secret) => this.stripeWebhook.constructEvent(raw, sig, secret),
         handle: (event) => this.stripeWebhook.handle(event),
       },
-      this.intercomPanel
-        ? {
-            page: (token) => this.intercomPanel!.page(token),
-            api: (endpoint, token, body) => this.intercomPanel!.api(endpoint, token, body),
-          }
-        : undefined,
       // Passed straight through, NOT re-wrapped: the panel is mounted at two
       // paths and page() needs the cookie and the mount's basePath to know
       // which one it is serving. A forwarding literal that names fewer

@@ -8,8 +8,6 @@ import { Logger } from "../util/logger";
 import { IntercomStore } from "./IntercomStore";
 import type { BillingActionService } from "../bot/billing/actions/BillingActionService";
 import type { ActionActor } from "../bot/billing/actions/ActionRegistry";
-import type { PanelTokens } from "./panel/PanelTokens";
-import type { PanelSessions } from "./panel/PanelSessions";
 import type { PostizIdentityService } from "../postiz/PostizIdentityService";
 import type { PostizAccount } from "../postiz/PostizClient";
 import type { IntercomClient } from "./IntercomClient";
@@ -20,6 +18,10 @@ import {
   type DeliveryStatus,
   type EmailDeliverabilityService,
 } from "../resend/EmailDeliverabilityService";
+import { PROBLEM_EVENTS, categoryLabel, eventLabel, type LoggedEmail } from "../resend/DeliveryLogStore";
+import type { DeliveryLogService } from "../resend/DeliveryLogService";
+import type { DisputeStore } from "../bot/billing/DisputeStore";
+import type { BlockStore } from "../bot/billing/BlockStore";
 
 // Canvas Kit inbox app: renders a live context card in the Intercom inbox
 // sidebar. Everything is fetched at render time (plan, charges, ticket state)
@@ -27,11 +29,15 @@ import {
 // external fetch is time-boxed; degraded rows say "unavailable" instead of
 // failing the whole card.
 //
-// Beyond the read-only card, the canvas now carries the billing-action
-// surfaces: charge-review Approve/Deny, the pending-approvals list, and the
-// "Open Stripe Panel" button (Canvas Kit sheets are Messenger-only, so the
-// panel is a tokenized standalone page — the submit body's `admin` object is
-// the authentic clicker, and the minted link is bound to them).
+// The card is a small navigator. The main view holds only who this is (one
+// identity line) and warnings that are true right now (email suppressed or
+// bouncing, delinquent, blocked, open dispute, refund review or approvals
+// waiting). Everything else sits behind a button, each opening its own view
+// with a Back: Postiz Account, E-Mail Deliverability (suppression status and
+// removal, the delivery log), Billing (subscriptions, charges, the refund
+// review and approvals), Discord Ticket. Which view is open travels in the
+// component ids only; the server re-derives everything else on every press.
+// The submit body's `admin` object is the authentic clicker.
 //
 // Developer Hub setup (same app as the webhook subscription):
 //   Canvas Kit → "For teammates" → Inbox app;
@@ -55,6 +61,12 @@ interface CanvasRequestBody {
   input_values?: Record<string, unknown>;
 }
 
+type View = "home" | "postiz" | "email" | "billing" | "discord";
+const VIEWS: readonly View[] = ["home", "postiz", "email", "billing", "discord"];
+
+// Delivery log rows per page in the email view.
+const LOG_PAGE_SIZE = 10;
+
 // What the email-delivery section is in the middle of. Carried from one
 // submit to the next only through component ids and the prefilled input, so
 // the server re-derives everything that matters (which address, whose) on
@@ -68,6 +80,9 @@ interface EmailView {
   confirmQuery?: boolean;
   // Offer "resend activation email" for this listed address (or the query).
   activation?: number | "q";
+  // Delivery log page, and the logged email opened for its timeline.
+  logPage?: number;
+  openEmailId?: string;
 }
 
 // Everything the card knows about who this conversation is with, resolved
@@ -79,8 +94,9 @@ interface CanvasContext {
   nativeContact: { email: string | null; name: string | null; contactId: string | null; sourceLabel: string } | null;
   account: PostizAccount | null;
   stripeCustomerId: string | null;
-  // Filled on first use by addressesFor.
+  // Filled on first use by addressesFor (the customer too, for its flags).
   addresses?: string[];
+  customer?: { email: string | null; delinquent: boolean } | null;
 }
 
 // How long one resolved context is reused: long enough to span an action and
@@ -103,8 +119,6 @@ export class IntercomInboxApp {
     private stripe: StripeClient,
     private categoryLabelResolver: (id: string | null) => string | null,
     private billingActions: BillingActionService,
-    private panelTokens: PanelTokens,
-    private panelSessions: PanelSessions,
     // Reads the contact behind a conversation this bot did not create (email,
     // website, Sentry feedback) — those have no Discord link to read from.
     private intercomClient?: IntercomClient,
@@ -116,8 +130,17 @@ export class IntercomInboxApp {
     private emailDelivery?: EmailDeliverabilityService | null,
     // Posts an internal note on a conversation (bridged ones through the
     // executor's echo-safe path). Best effort: the removal is audited anyway.
-    private noteWriter?: ((conversationId: string, text: string) => Promise<void>) | null
+    private noteWriter?: ((conversationId: string, text: string) => Promise<void>) | null,
+    // The Resend delivery log (what happened to each email sent to them).
+    private deliveryLog?: DeliveryLogService | null
   ) {}
+
+  // Local mirrors behind the main view's "open dispute" and "blocked" warnings.
+  private badgeSources: { disputes: DisputeStore; blocks: BlockStore } | null = null;
+
+  bindBadgeSources(sources: { disputes: DisputeStore; blocks: BlockStore }): void {
+    this.badgeSources = sources;
+  }
 
   bindClient(client: Client): void {
     this.client = client;
@@ -131,8 +154,8 @@ export class IntercomInboxApp {
     return this.buildCanvas(body);
   }
 
-  // component_id router: billing actions + panel-link minting; anything else
-  // (refresh, stale ids) is a plain re-render.
+  // component_id router: navigation, billing actions and email actions;
+  // anything else (refresh, stale ids) re-renders the view it names.
   async submit(body: unknown): Promise<object> {
     const request = body as CanvasRequestBody;
     const componentId = typeof request?.component_id === "string" ? request.component_id : "";
@@ -142,20 +165,10 @@ export class IntercomInboxApp {
     if (conversationId == null || !actor) return this.buildCanvas(body);
 
     try {
-      if (componentId === "open_panel") {
-        return await this.handleOpenPanel(body, String(conversationId), actor);
-      }
-      if (componentId === "unlock_panel") {
-        const rawv = request.input_values && typeof request.input_values["panel_code"] === "string" ? String(request.input_values["panel_code"]) : "";
-        const norm = rawv.toUpperCase().replace(/[^0-9A-Z]/g, "");
-        const code = norm.length === 8 ? `${norm.slice(0, 4)}-${norm.slice(4)}` : rawv.toUpperCase();
-        const ok = rawv ? this.panelSessions.activate(actor.id, code, this.settingsStore.panelTokenEpoch()) : false;
-        return this.buildCanvas(
-          body,
-          ok
-            ? "✅ Panel unlocked. Return to your browser."
-            : "⚠️ That code didn't match. Open the panel link and enter the exact code shown."
-        );
+      if (componentId.startsWith("nav:") || componentId.startsWith("refresh:")) {
+        const view = componentId.slice(componentId.indexOf(":") + 1) as View;
+        if (componentId.startsWith("refresh:")) this.ctxMemo.delete(String(conversationId));
+        return this.buildCanvas(body, undefined, {}, VIEWS.includes(view) ? view : "home");
       }
       if (componentId === "review_approve" || componentId === "review_deny") {
         const decision = componentId === "review_approve" ? "approve" : "deny";
@@ -163,7 +176,7 @@ export class IntercomInboxApp {
           this.billingActions.request(String(conversationId), actor, "charge_review", { decision }),
           ACTION_TIMEOUT_MS
         ).catch(() => null);
-        return this.buildCanvas(body, this.noticeForRequest(outcome));
+        return this.buildCanvas(body, this.noticeForRequest(outcome), {}, "billing");
       }
       if (componentId.startsWith("email_")) {
         return await this.handleEmailComponent(body, request, componentId, String(conversationId), actor);
@@ -175,7 +188,7 @@ export class IntercomInboxApp {
           this.billingActions.actOnApproval(approvalId, actor, decision),
           ACTION_TIMEOUT_MS
         ).catch(() => null);
-        return this.buildCanvas(body, this.noticeForApproval(outcome));
+        return this.buildCanvas(body, this.noticeForApproval(outcome), {}, "billing");
       }
     } catch (e) {
       this.log.warn("canvas submit action failed", { error: e instanceof Error ? e.message : String(e) });
@@ -227,26 +240,6 @@ export class IntercomInboxApp {
     }
   }
 
-  // "Open Stripe Panel": mint a 15-min token bound to the clicking teammate +
-  // conversation, and re-render with a personal URL button. The canvas is
-  // stored per-conversation, so the button row names its owner.
-  private async handleOpenPanel(body: unknown, conversationId: string, actor: ActionActor): Promise<object> {
-    const base = this.settingsStore.resolvedPublicBaseUrl();
-    if (!base) {
-      return this.buildCanvas(body, "⚠️ Set the public URL first (/config → Billing → Webhooks).");
-    }
-    const token = await this.panelTokens.mint({
-      adminId: actor.id,
-      adminName: actor.name,
-      conversationId,
-    });
-    const url = `${base}/intercom/panel?t=${encodeURIComponent(token)}`;
-    return this.buildCanvas(body, undefined, {
-      label: `Open Stripe Panel · link for ${actor.name}, valid 15 minutes`,
-      url,
-    });
-  }
-
   // Who this conversation is with. A conversation is EITHER Discord-bridged
   // (this bot opened it and knows the customer from its own link table) or
   // native: email, website Messenger, or a Sentry feedback import. Native
@@ -286,76 +279,144 @@ export class IntercomInboxApp {
   // the one they wrote from, the one Postiz sends to, the one Stripe bills.
   private async addressesFor(ctx: CanvasContext): Promise<string[]> {
     if (ctx.addresses) return ctx.addresses;
-    const stripeEmail = ctx.stripeCustomerId
+    ctx.customer = ctx.stripeCustomerId
       ? await timeBox(this.stripe.getCustomer(ctx.stripeCustomerId), FETCH_TIMEOUT_MS)
-          .then((c) => c?.email ?? null)
+          .then((c) => (c ? { email: c.email ?? null, delinquent: c.delinquent === true } : null))
           .catch(() => null)
       : null;
-    ctx.addresses = distinctEmails([ctx.nativeContact?.email, ctx.account?.email, stripeEmail]);
+    ctx.addresses = distinctEmails([ctx.nativeContact?.email, ctx.account?.email, ctx.customer?.email]);
     return ctx.addresses;
   }
 
-  private async buildCanvas(
-    body: unknown,
-    notice?: string,
-    panelLink?: { label: string; url: string },
-    emailView: EmailView = {}
-  ): Promise<object> {
+  private async buildCanvas(body: unknown, notice?: string, emailView: EmailView = {}, view: View = "home"): Promise<object> {
     const request = body as CanvasRequestBody;
     const conversationId = request?.conversation?.id ?? request?.context?.conversation_id;
     if (conversationId == null) return canvas([text("No conversation context.")]);
 
     const ctx = await this.resolveContext(String(conversationId));
-    const { link, ticket, session, nativeContact, stripeCustomerId } = ctx;
-
     const components: CanvasComponent[] = [];
     if (notice) components.push(text(notice), divider());
 
-    // Identity first: who this is comes before what they pay.
+    switch (view) {
+      case "postiz":
+        components.push(...(await this.postizView(ctx)));
+        break;
+      case "email":
+        components.push(...(await this.emailView(ctx, emailView)));
+        break;
+      case "billing":
+        components.push(...(await this.billingView(ctx, String(conversationId))));
+        break;
+      case "discord":
+        components.push(...(await this.discordView(ctx)));
+        break;
+      default:
+        components.push(...(await this.homeView(ctx, String(conversationId))));
+        return canvas(components);
+    }
+    components.push(divider(), button("nav:home", "Back", "secondary"), button(`refresh:${view}`, "Refresh", "secondary"));
+    return canvas(components);
+  }
+
+  // ---- views ----
+
+  // Who, and what is wrong right now. Every warning is computed from data the
+  // other views also show, so a badge never says something a view cannot back.
+  private async homeView(ctx: CanvasContext, conversationId: string): Promise<CanvasComponent[]> {
+    const addresses = await this.addressesFor(ctx);
+    const emailOn = this.emailDelivery?.enabled() === true;
+    const [subs, statuses, lastProblem, review, approvals, disputes, blocks] = await Promise.all([
+      ctx.stripeCustomerId
+        ? timeBox(this.stripe.listSubscriptions(ctx.stripeCustomerId), FETCH_TIMEOUT_MS).catch(() => null)
+        : Promise.resolve(null),
+      emailOn ? this.emailDelivery!.statusFor(addresses) : Promise.resolve([] as DeliveryStatus[]),
+      emailOn ? this.lastProblemEmail(addresses) : Promise.resolve(null),
+      ctx.link ? this.sessionStore.getPendingChargeReview(ctx.link.ticketThreadId).catch(() => null) : Promise.resolve(null),
+      this.billingActions.pendingForConversation(conversationId, 10).catch(() => []),
+      ctx.stripeCustomerId && this.badgeSources
+        ? this.badgeSources.disputes.listByCustomer(ctx.stripeCustomerId, 10).catch(() => [])
+        : Promise.resolve([]),
+      ctx.stripeCustomerId && this.badgeSources
+        ? this.badgeSources.blocks.listForCustomer(ctx.stripeCustomerId, ctx.customer?.email ?? null).catch(() => [])
+        : Promise.resolve([]),
+    ]);
+
+    const who =
+      ctx.account?.name ?? ctx.nativeContact?.name ?? ctx.ticket?.customerDisplayName ?? ctx.account?.email ?? ctx.nativeContact?.email ?? "Unknown person";
+    const whoEmail = ctx.account?.email ?? ctx.nativeContact?.email ?? addresses[0] ?? null;
+    const plan = ctx.account?.tier ?? ctx.ticket?.postizTier ?? null;
+    const subStatus = subs == null ? (ctx.stripeCustomerId ? "unavailable" : null) : subscriptionSummary(subs);
+    const identity = [
+      whoEmail && whoEmail !== who ? `${who} · ${whoEmail}` : who,
+      [plan ? `Postiz ${plan}` : "no Postiz plan", subStatus ? `Stripe ${subStatus}` : "no Stripe customer"].join(" · "),
+    ];
+
+    const warnings: string[] = [];
+    for (const st of statuses) if (st.state === "suppressed") warnings.push(`⛔ Email suppressed: ${st.email}`);
+    if (lastProblem) {
+      warnings.push(`⚠️ Last email ${eventLabel(lastProblem.lastEvent).toLowerCase()}: ${categoryLabel(lastProblem.category)} to ${lastProblem.recipient}`);
+    }
+    if (ctx.customer?.delinquent) warnings.push("⚠️ Delinquent: an invoice is unpaid");
+    if (blocks.length) warnings.push("⛔ Blocked from buying");
+    const open = disputes.filter((d) => OPEN_DISPUTE.has(d.status));
+    if (open.length) warnings.push(`⚠️ Open dispute${open.length > 1 ? `s (${open.length})` : ""}`);
+    if (review) warnings.push("⚠️ Refund review pending");
+    if (approvals.length) warnings.push(`📋 ${approvals.length} approval${approvals.length > 1 ? "s" : ""} pending`);
+
+    const components: CanvasComponent[] = [header(`👤 ${identity[0]}`), text(identity[1])];
+    if (warnings.length) components.push(...warnings.map((w) => ({ type: "text", text: w, style: "paragraph" })));
     components.push(
-      ...(await this.postizSection(
-        {
-          stampedUserId: ticket?.postizUserId ?? session?.postizUserId ?? null,
-          email: nativeContact?.email ?? null,
-          stamped: ticket,
-        },
-        { account: ctx.account }
-      ))
+      divider(),
+      button("nav:postiz", "Postiz Account", "secondary"),
+      ...(this.emailDelivery?.enabled() ? [button("nav:email", "E-Mail Deliverability", "secondary")] : []),
+      button("nav:billing", "Billing", "secondary"),
+      ...(ctx.ticket || ctx.link ? [button("nav:discord", "Discord Ticket", "secondary")] : []),
+      button("refresh:home", "Refresh", "secondary")
     );
+    return components;
+  }
 
-    // Then whether our mail reaches them: an "I never got the email" is the
-    // most common reason to be looking at this card at all.
-    if (this.emailDelivery?.enabled()) {
-      components.push(...(await this.emailSection(await this.addressesFor(ctx), emailView)));
+  private async postizView(ctx: CanvasContext): Promise<CanvasComponent[]> {
+    return this.postizSection(
+      {
+        stampedUserId: ctx.ticket?.postizUserId ?? ctx.session?.postizUserId ?? null,
+        email: ctx.nativeContact?.email ?? null,
+        stamped: ctx.ticket,
+      },
+      { account: ctx.account }
+    );
+  }
+
+  private async emailView(ctx: CanvasContext, view: EmailView): Promise<CanvasComponent[]> {
+    if (!this.emailDelivery?.enabled()) return [header("📧 Email delivery"), text("Resend is not enabled (/config → Integrations → Resend).")];
+    const addresses = await this.addressesFor(ctx);
+    if (view.openEmailId) return this.emailDetail(view.openEmailId, view.logPage ?? 0);
+    return [...(await this.emailSection(addresses, view)), ...(await this.deliveryLogSection(addresses, view.logPage ?? 0))];
+  }
+
+  private async billingView(ctx: CanvasContext, conversationId: string): Promise<CanvasComponent[]> {
+    const components: CanvasComponent[] = [];
+    if (ctx.stripeCustomerId) components.push(...(await this.billingSection(ctx.stripeCustomerId)));
+    else components.push(header("💳 Billing"), text("No linked Stripe customer."));
+    if (ctx.link) components.push(...(await this.chargeReviewSection(ctx.link.ticketThreadId)));
+    components.push(...(await this.approvalsSection(conversationId)));
+    return components;
+  }
+
+  private async discordView(ctx: CanvasContext): Promise<CanvasComponent[]> {
+    const { ticket, link, nativeContact } = ctx;
+    if (!ticket && !link) {
+      return [header("🎫 Discord ticket"), text(`${nativeContact?.sourceLabel ?? "Native Intercom conversation"} · no Discord ticket.`)];
     }
-
-    components.push(divider());
-    if (stripeCustomerId) {
-      components.push(...(await this.billingSection(stripeCustomerId)));
-    } else {
-      components.push(text("💳 No linked Stripe customer."));
-    }
-
-    // Discord context last, and only when there is any: an email conversation
-    // has no ticket, category or thread to show.
+    const components: CanvasComponent[] = [header("🎫 Discord ticket")];
     if (ticket) {
       const who = ticket.customerDisplayName ?? ticket.customerId ?? "unknown";
       const category = this.categoryLabelResolver(ticket.categoryId);
       components.push(
-        divider(),
-        header("🎫 Discord ticket"),
         dataRow("Customer", category ? `${who} · ${category}` : who),
         ...(ticket.csatScore != null ? [dataRow("CSAT", `${ticket.csatScore}/5`)] : [])
       );
-    } else if (!link) {
-      components.push(divider(), text(`🎫 ${nativeContact?.sourceLabel ?? "Native Intercom conversation"} · no Discord ticket.`));
     }
-
-    if (link) components.push(...(await this.chargeReviewSection(link.ticketThreadId)));
-    components.push(...(await this.approvalsSection(String(conversationId))));
-
-    components.push(divider());
-
     const threadUrl = link ? await this.threadUrl(link.ticketThreadId) : null;
     if (threadUrl) {
       components.push({
@@ -366,35 +427,19 @@ export class IntercomInboxApp {
         action: { type: "url", url: threadUrl },
       });
     }
-    if (panelLink) {
-      components.push({
-        type: "button",
-        id: "panel_link",
-        label: panelLink.label,
-        style: "primary",
-        action: { type: "url", url: panelLink.url },
-      });
-      // The panel opens LOCKED and shows a code — confirm it here to unlock.
-      components.push({ type: "input", id: "panel_code", label: "Panel code (shown on the page)", placeholder: "XXXX-XXXX" });
-      components.push({ type: "button", id: "unlock_panel", label: "Unlock panel", style: "secondary", action: { type: "submit" } });
-    } else {
-      components.push({
-        type: "button",
-        id: "open_panel",
-        label: "Open Stripe Panel",
-        style: "secondary",
-        action: { type: "submit" },
-      });
-    }
-    components.push({
-      type: "button",
-      id: "refresh",
-      label: "🔄 Refresh",
-      style: "secondary",
-      action: { type: "submit" },
-    });
+    return components;
+  }
 
-    return canvas(components);
+  // The newest logged email to any of these addresses, when it went wrong.
+  private async lastProblemEmail(addresses: string[]): Promise<LoggedEmail | null> {
+    if (!this.deliveryLog || !addresses.length) return null;
+    const latest = await Promise.all(
+      addresses.map((a) => this.deliveryLog!.historyFor(a, 0, 1).then((r) => r.rows[0] ?? null).catch(() => null))
+    );
+    const newest = latest
+      .filter((r): r is LoggedEmail => r != null)
+      .sort((a, b) => b.sentAt.getTime() - a.sentAt.getTime())[0];
+    return newest && PROBLEM_EVENTS.has(newest.lastEvent) ? newest : null;
   }
 
   // Guardrail-blocked refund awaiting review: amount/charge/reason rows +
@@ -455,7 +500,7 @@ export class IntercomInboxApp {
         }
       );
     }
-    if (pending.length > 3) components.push(text(`…more in the Stripe panel.`));
+    if (pending.length > 3) components.push(text(`…more on the web panel's Approvals page.`));
     return components;
   }
 
@@ -613,6 +658,59 @@ export class IntercomInboxApp {
     return components;
   }
 
+  // Every logged email to this person's addresses, newest first, a page at a
+  // time; a dropdown opens one for its event timeline.
+  private async deliveryLogSection(addresses: string[], page: number): Promise<CanvasComponent[]> {
+    const components: CanvasComponent[] = [divider(), header("📬 Delivery log")];
+    if (!this.deliveryLog) return [...components, text("Not available on this instance.")];
+    if (!this.deliveryLog.webhookRegistered()) {
+      components.push(text("Not collecting: an admin can register the webhook in /config → Integrations → Resend."));
+    }
+    const history = await timeBox(this.deliveryLog.historyForMany(addresses, page, LOG_PAGE_SIZE), FETCH_TIMEOUT_MS).catch(() => null);
+    if (!history) return [...components, text("Unavailable right now.")];
+    if (!history.rows.length) return [...components, text("No email to these addresses in the last 180 days.")];
+    const pages = Math.max(1, Math.ceil(history.total / LOG_PAGE_SIZE));
+    const current = Math.min(page, pages - 1);
+    components.push(text(`${history.total} email${history.total === 1 ? "" : "s"}${pages > 1 ? ` · page ${current + 1}/${pages}` : ""}`));
+    for (const r of history.rows) components.push(dataRow(logWhen(r.sentAt), logSummary(r, addresses.length > 1)));
+    components.push(
+      {
+        type: "dropdown",
+        id: "email_pick",
+        label: "Open an email",
+        options: history.rows.map((r) => ({
+          type: "option",
+          id: r.id,
+          text: `${logWhen(r.sentAt)} ${categoryLabel(r.category)}: ${eventLabel(r.lastEvent)}`.slice(0, 100),
+        })),
+      },
+      button(`email_open:${current}`, "Open", "secondary")
+    );
+    if (current > 0) components.push(button(`email_logp:${current - 1}`, "Newer", "secondary"));
+    if (current < pages - 1) components.push(button(`email_logp:${current + 1}`, "Older", "secondary"));
+    return components;
+  }
+
+  private async emailDetail(emailId: string, page: number): Promise<CanvasComponent[]> {
+    const found = this.deliveryLog ? await timeBox(this.deliveryLog.email(emailId), FETCH_TIMEOUT_MS).catch(() => null) : null;
+    const back = button(`email_logp:${page}`, "Back to the log", "secondary");
+    if (!found) return [header("✉️ Email"), text("That email is not in the delivery log anymore."), back];
+    const { email: m, events } = found;
+    return [
+      header(`✉️ ${m.subject ?? "(no subject)"}`),
+      dataRow("To", m.recipient),
+      dataRow("Kind", categoryLabel(m.category)),
+      dataRow("Status", eventLabel(m.lastEvent)),
+      dataRow("Sent", `${logWhen(m.sentAt)} UTC`),
+      ...(m.detail ? [dataRow("Reason", m.detail)] : []),
+      header("Timeline"),
+      ...(events.length
+        ? events.map((e) => text(`${logWhen(e.occurredAt)} ${eventLabel(e.type)}${e.detail ? `: ${e.detail.slice(0, 160)}` : ""}`))
+        : [text(m.source === "backfill" ? "Imported from Resend's history: only the last status is known." : "No events stored.")]),
+      back,
+    ];
+  }
+
   // Every email_* press. Which address a button means is re-derived here from
   // the conversation (listed addresses) or read from the input the teammate
   // typed into (checked ones), never trusted from anything else.
@@ -625,22 +723,34 @@ export class IntercomInboxApp {
   ): Promise<object> {
     const svc = this.emailDelivery;
     if (!svc?.enabled()) return this.buildCanvas(body, "⚠️ Resend is not enabled (/config → Integrations → Resend).");
+    const inEmail = (notice: string | undefined, v: EmailView) => this.buildCanvas(body, notice, v, "email");
     const typed = typeof request.input_values?.["email_query"] === "string" ? String(request.input_values["email_query"]).trim() : "";
     const query = typed && EMAIL_RE.test(typed) ? typed : undefined;
 
-    if (componentId === "email_check_open") return this.buildCanvas(body, undefined, undefined, { checkOpen: true });
-    if (componentId === "email_cancel") return this.buildCanvas(body, undefined, undefined, { checkOpen: !!typed, query });
+    if (componentId === "email_check_open") return inEmail(undefined, { checkOpen: true });
+    if (componentId === "email_cancel") return inEmail(undefined, { checkOpen: !!typed, query });
     if (componentId === "email_check") {
-      if (!query) return this.buildCanvas(body, "⚠️ That is not an email address.", undefined, { checkOpen: true });
-      return this.buildCanvas(body, undefined, undefined, { checkOpen: true, query });
+      if (!query) return inEmail("⚠️ That is not an email address.", { checkOpen: true });
+      return inEmail(undefined, { checkOpen: true, query });
     }
     if (componentId === "email_rm_q") {
-      if (!query) return this.buildCanvas(body, "⚠️ That is not an email address.", undefined, { checkOpen: true });
-      return this.buildCanvas(body, undefined, undefined, { checkOpen: true, query, confirmQuery: true });
+      if (!query) return inEmail("⚠️ That is not an email address.", { checkOpen: true });
+      return inEmail(undefined, { checkOpen: true, query, confirmQuery: true });
     }
     if (componentId.startsWith("email_rm:")) {
       const index = Number(componentId.slice("email_rm:".length));
-      return this.buildCanvas(body, undefined, undefined, { confirm: Number.isInteger(index) ? index : -1 });
+      return inEmail(undefined, { confirm: Number.isInteger(index) ? index : -1 });
+    }
+
+    if (componentId.startsWith("email_logp:")) {
+      return inEmail(undefined, { logPage: Math.max(0, Number(componentId.slice("email_logp:".length)) || 0) });
+    }
+    if (componentId.startsWith("email_open:")) {
+      // The dropdown's pick; which page to return to rides in the id.
+      const picked = typeof request.input_values?.["email_pick"] === "string" ? String(request.input_values["email_pick"]) : "";
+      const page = Math.max(0, Number(componentId.slice("email_open:".length)) || 0);
+      if (!picked) return inEmail("⚠️ Pick an email first.", { logPage: page });
+      return inEmail(undefined, { logPage: page, openEmailId: picked });
     }
 
     // The presses that act: resolve who, then which address.
@@ -655,18 +765,18 @@ export class IntercomInboxApp {
 
     if (componentId.startsWith("email_rmx")) {
       const { email, slot } = pick(componentId, "email_rmx");
-      if (!email) return this.buildCanvas(body, "⚠️ That address is no longer on this card; nothing was removed.", undefined, keepCheck);
+      if (!email) return inEmail("⚠️ That address is no longer on this card; nothing was removed.", keepCheck);
       const result = await timeBox(
         svc.remove(email, { surface: "intercom", id: actor.id, name: actor.name }, { conversationId }),
         ACTION_TIMEOUT_MS
       ).catch(() => null);
-      if (!result) return this.buildCanvas(body, "⏳ Still processing. Press Refresh in a few seconds.", undefined, keepCheck);
+      if (!result) return inEmail("⏳ Still processing. Press Refresh in a few seconds.", keepCheck);
       if (result.kind === "not_suppressed") {
-        return this.buildCanvas(body, `ℹ️ ${email} was not on the suppression list; nothing to remove.`, undefined, keepCheck);
+        return inEmail(`ℹ️ ${email} was not on the suppression list; nothing to remove.`, keepCheck);
       }
       if (result.kind !== "removed") {
         const why = result.kind === "error" || result.kind === "invalid" ? result.error : "Resend is not enabled.";
-        return this.buildCanvas(body, `⚠️ ${why}`, undefined, keepCheck);
+        return inEmail(`⚠️ ${why}`, keepCheck);
       }
       const was = result.previous ? describeSuppression(result.previous, null) : "suppressed";
       void this.noteWriter?.(
@@ -676,19 +786,14 @@ export class IntercomInboxApp {
       // The usual reason this mattered: the activation mail never arrived.
       const account = ctx.account?.email?.toLowerCase() === email.toLowerCase() ? ctx.account : slot === "q" ? await this.resolveAccount(email) : null;
       const offer = account?.userActivated === false && account.email?.toLowerCase() === email.toLowerCase();
-      return this.buildCanvas(
-        body,
-        `✅ Removed ${email} from the suppression list. New mail from Postiz will be delivered to it.${
+      return inEmail(`✅ Removed ${email} from the suppression list. New mail from Postiz will be delivered to it.${
           offer ? " Their Postiz account is not activated yet: resend the activation email below." : ""
-        }`,
-        undefined,
-        { ...keepCheck, ...(offer ? { activation: slot } : {}) }
-      );
+        }`, { ...keepCheck, ...(offer ? { activation: slot } : {}) });
     }
 
     if (componentId.startsWith("email_act")) {
       const { email } = pick(componentId, "email_act");
-      if (!email) return this.buildCanvas(body, "⚠️ That address is no longer on this card.", undefined, keepCheck);
+      if (!email) return inEmail("⚠️ That address is no longer on this card.", keepCheck);
       const sent = await timeBox(
         svc.resendActivation(email, { surface: "intercom", id: actor.id, name: actor.name }),
         ACTION_TIMEOUT_MS
@@ -696,14 +801,9 @@ export class IntercomInboxApp {
       if (sent.ok) {
         void this.noteWriter?.(conversationId, `${actor.name} asked Postiz to resend the activation email to ${email}.`).catch(() => {});
       }
-      return this.buildCanvas(
-        body,
-        sent.ok ? `✅ Postiz is sending a new activation email to ${email}.` : `⚠️ ${sent.error}`,
-        undefined,
-        keepCheck
-      );
+      return inEmail(sent.ok ? `✅ Postiz is sending a new activation email to ${email}.` : `⚠️ ${sent.error}`, keepCheck);
     }
-    return this.buildCanvas(body, undefined, undefined, keepCheck);
+    return inEmail(undefined, keepCheck);
   }
 
   private async billingSection(stripeCustomerId: string): Promise<CanvasComponent[]> {
@@ -799,6 +899,25 @@ export class IntercomInboxApp {
     const channel = await this.client.channels.fetch(threadId).catch(() => null);
     return channel?.isThread() ? (channel.url ?? null) : null;
   }
+}
+
+const OPEN_DISPUTE = new Set(["needs_response", "warning_needs_response", "under_review", "warning_under_review"]);
+
+// "active", "2 active", "past_due, 1 canceled": what Stripe says, briefly.
+function subscriptionSummary(subs: Stripe.Subscription[]): string {
+  if (!subs.length) return "no subscription";
+  const counts = new Map<string, number>();
+  for (const sub of subs) counts.set(sub.status, (counts.get(sub.status) ?? 0) + 1);
+  return [...counts.entries()].map(([status, n]) => (n > 1 ? `${n} ${status}` : status)).join(", ");
+}
+
+function logWhen(d: Date): string {
+  return d.toISOString().slice(0, 16).replace("T", " ");
+}
+
+function logSummary(r: LoggedEmail, showRecipient: boolean): string {
+  const status = PROBLEM_EVENTS.has(r.lastEvent) ? `⚠️ ${eventLabel(r.lastEvent)}` : eventLabel(r.lastEvent);
+  return `${categoryLabel(r.category)} · ${status}${showRecipient ? ` · ${r.recipient}` : ""}`;
 }
 
 // ---- Canvas Kit JSON helpers ----

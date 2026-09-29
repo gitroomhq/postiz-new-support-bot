@@ -10,7 +10,7 @@ const maintLog = log.child("intercom-admin:maint");
 
 // /intercom → Maintenance: backfill, heal message gaps, closed-state re-sync,
 // reset bridge data, wipe Intercom data (all verbatim ports of the /config
-// handlers) plus "Revoke Stripe Panel Links" (panel token epoch bump).
+// handlers).
 export class MaintenanceHub {
   constructor(private ctx: HubContext) {}
 
@@ -23,7 +23,6 @@ export class MaintenanceHub {
     { kind: "button", id: "icadmin_maint_reset_go", match: "exact", handler: (i) => this.handleResetGo(i) },
     { kind: "button", id: "icadmin_maint_wipe", match: "exact", handler: (i) => this.handleWipeConfirm(i) },
     { kind: "button", id: "icadmin_maint_wipe_go", match: "exact", handler: (i) => this.handleWipeGo(i) },
-    { kind: "button", id: "icadmin_maint_revoke_panel", match: "exact", handler: (i) => this.handleRevokePanelLinks(i) },
   ];
 
   async buildPanel(): Promise<Panel> {
@@ -41,7 +40,6 @@ export class MaintenanceHub {
         "**Sync Closed Tickets**: re-assert the closed state of Discord-closed tickets onto Intercom (fixes incident auto-reopens).",
         "**Reset bridge data**: wipe the bot's LOCAL bridge state (nothing deleted in Intercom).",
         "**Wipe Intercom data**: permanently delete bridge-created conversations/tickets from Intercom + clear local state.",
-        "**Revoke Stripe Panel Links**: instantly invalidate every outstanding Stripe-panel link and session.",
         "",
         "Destructive tools ask twice.",
       ].join("\n")
@@ -56,8 +54,7 @@ export class MaintenanceHub {
         ),
         buttonRow(
           btn("icadmin_maint_reset", "Reset bridge data", ButtonStyle.Danger),
-          btn("icadmin_maint_wipe", "Wipe Intercom data", ButtonStyle.Danger),
-          btn("icadmin_maint_revoke_panel", "Revoke Stripe Panel Links", ButtonStyle.Secondary)
+          btn("icadmin_maint_wipe", "Wipe Intercom data", ButtonStyle.Danger)
         ),
         backRow(),
       ],
@@ -440,22 +437,6 @@ export class MaintenanceHub {
         COLORS.danger
       );
     }
-  }
-
-  // ---- Stripe panel link revocation ----
-
-  private async handleRevokePanelLinks(interaction: ButtonInteraction): Promise<void> {
-    const epoch = await this.ctx.settingsStore.bumpPanelTokenEpoch();
-    this.ctx.auditConfig(interaction, `Stripe panel links revoked (token epoch → ${epoch})`);
-    await interaction.reply({
-      embeds: [
-        makeEmbed(
-          "All outstanding Stripe-panel links and sessions are now invalid. Agents reopen the panel from the Intercom conversation (Open Stripe Panel).",
-          COLORS.success
-        ),
-      ],
-      flags: 64,
-    });
   }
 
   // ---- shared: outbox clearing (reset/wipe) ----

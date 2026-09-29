@@ -64,22 +64,12 @@ export interface ResendWebhookRoute {
   ) => Promise<"stored" | "duplicate" | "ignored" | "forbidden">;
 }
 
-// Stripe panel (tokenized standalone page opened from the Intercom canvas).
-// GET exchanges the SINGLE-USE HMAC link token for an HttpOnly session cookie
-// (verified/consumed inside the route object); the API authenticates by that
-// cookie. The transport belts (per-IP throttle, security headers with a
-// per-response CSP nonce, CSRF checks) live in panelMount.ts, shared by all
-// tokenized panels.
-export interface IntercomPanelRoute {
-  page: (token: string) => Promise<{ html: string; nonce: string; sessionCookie: string } | { status: number; message: string }>;
-  api: (endpoint: string, sessionId: string, body: unknown) => Promise<{ status: number; json: object }>;
-}
-
-// Admin web panel (/config + /intercom) — same transport contract as the Stripe
-// panel (token→cookie exchange on GET, cookie-authed API), but its own route
-// prefixes and cookies so no two panels' sessions collide. Mounted twice: the
-// standalone bootstrap path and /panel/config inside the merged surface, which
-// is why page() may serve without minting a session cookie.
+// Admin web panel (/config + /intercom): token→cookie exchange on GET,
+// cookie-authed API, with its own route prefixes and cookies so no two panels'
+// sessions collide. The transport belts (per-IP throttle, security headers
+// with a per-response CSP nonce, CSRF checks) live in panelMount.ts. Mounted
+// twice: the standalone bootstrap path and /panel/config inside the merged
+// surface, which is why page() may serve without minting a session cookie.
 export type AdminPanelRoute = MountedPanelRoute;
 
 // Stripe dashboard (account-wide, standing web surface). Same transport
@@ -106,7 +96,6 @@ export class CallbackServer {
     private intercomWebhook?: IntercomWebhookRoute,
     private intercomCanvas?: IntercomCanvasRoute,
     private stripeWebhook?: StripeWebhookRoute,
-    private intercomPanel?: IntercomPanelRoute,
     private adminPanel?: AdminPanelRoute,
     private dashboard?: DashboardRoute,
     private sentryWebhook?: SentryWebhookRoute,
@@ -252,16 +241,6 @@ export class CallbackServer {
     // pre-auth throttle, CSP-nonced security headers, CSRF triple belt,
     // cookie-authed API. Panel semantics live in the mounted route objects.
     const allowIp = (ip: string | undefined) => this.allowPanelIp(ip);
-    // Stripe panel: a tokenized standalone page (Canvas Kit sheets are
-    // Messenger-only, so the canvas mints a 15-min personal link instead).
-    mountPanel(this.app, allowIp, {
-      pagePath: "/intercom/panel",
-      apiPath: "/intercom/panel/api/:endpoint",
-      cookieName: "__Host-icpanel",
-      metricName: "intercom.panel_auth_failures",
-      logLabel: "intercom panel",
-      route: () => this.intercomPanel,
-    });
     // The merged admin surface. It began life as the billing dashboard and has
     // absorbed the configuration panel, so it lives at a neutral /panel: it is
     // no longer "billing" in any meaningful sense.

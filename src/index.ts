@@ -47,9 +47,6 @@ import { BlockService } from "./bot/billing/BlockService";
 import { RefundCoreService } from "./bot/billing/RefundCoreService";
 import { ApprovalStore } from "./bot/billing/ApprovalStore";
 import { BillingActionService } from "./bot/billing/actions/BillingActionService";
-import { PanelTokens } from "./intercom/panel/PanelTokens";
-import { PanelSessions } from "./intercom/panel/PanelSessions";
-import { IntercomPanel } from "./intercom/panel/IntercomPanel";
 import { SlaRuleStore } from "./sla/SlaRuleStore";
 import { SlaFactsLoader } from "./sla/facts";
 import { SlaService } from "./sla/SlaService";
@@ -413,20 +410,6 @@ async function main() {
     intercomExecutor,
     auditLogger
   );
-  const panelTokens = new PanelTokens(settingsStore);
-  // Shared between the Stripe panel (web) and the Intercom canvas (passcode).
-  const panelSessions = new PanelSessions();
-  const intercomPanel = new IntercomPanel(
-    settingsStore,
-    intercomStore,
-    ticketStore,
-    sessionStore,
-    stripeClient,
-    disputeStore,
-    billingActionService,
-    panelTokens,
-    panelSessions
-  );
   const billingAdmin = new BillingAdmin(config, stripeClient, sessionStore, settingsStore, auditLogger, {
     disputeStore,
     disputeEvidence: disputeEvidenceService,
@@ -604,13 +587,13 @@ async function main() {
     stripeClient,
     categoryLabelResolver,
     billingActionService,
-    panelTokens,
-    panelSessions,
     intercomClient,
     postizIdentity,
     emailDelivery,
-    intercomNoteWriter
+    intercomNoteWriter,
+    deliveryLog
   );
+  intercomInboxApp.bindBadgeSources({ disputes: disputeStore, blocks: blockStore });
 
   const bot = new DiscordBot(
     config,
@@ -633,7 +616,6 @@ async function main() {
     intercomInboxApp,
     { service: vaultService, migrator: vaultMigrator },
     { blockService, stripeClient, disputeStore, segments: segmentResolver },
-    intercomPanel,
     intercomAdmin,
     moneyOutService,
     subscriptionEventService

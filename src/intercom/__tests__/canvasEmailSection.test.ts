@@ -50,8 +50,6 @@ function harness(opts: { activated?: boolean | null; removeKind?: "removed" | "n
     { findCustomersByEmail: async () => [] } as never,
     () => null,
     { pendingForConversation: async () => [] } as never,
-    {} as never,
-    {} as never,
     { getConversationContact: async () => ({ email: "jamie@example.com", name: "Jamie", contactId: "c_1" }) } as never,
     {
       resolve: async () => ({
@@ -86,17 +84,30 @@ function harness(opts: { activated?: boolean | null; removeKind?: "removed" | "n
 const texts = (c: Component[]) => c.map((x) => x.text ?? "").join("\n");
 const ids = (c: Component[]) => c.map((x) => x.id).filter(Boolean);
 
-test("sidebar: a suppressed contact address is shown with its cause and a Remove button, before billing", async () => {
+test("sidebar: the main card keeps to identity and warnings, with the detail behind buttons", async () => {
   const h = harness();
-  const c = await h.press(null);
+  const home = await h.press(null);
+  const t = texts(home);
+  assert.match(t, /Jamie · jamie@example\.com/);
+  assert.match(t, /Postiz PRO · no Stripe customer/);
+  assert.match(t, /⛔ Email suppressed: jamie@example\.com/);
+  for (const id of ["nav:postiz", "nav:email", "nav:billing", "refresh:home"]) assert.ok(ids(home).includes(id), id);
+  assert.ok(!ids(home).includes("nav:discord"), "no ticket, no Discord view");
+  assert.ok(!ids(home).includes("open_panel"), "the Stripe panel is gone");
+  assert.ok(!ids(home).includes("email_rm:0"), "actions live in the views");
+});
+
+test("sidebar: the email view shows a suppressed address with its cause and a Remove button", async () => {
+  const h = harness();
+  const c = await h.press("nav:email");
   const t = texts(c);
   assert.match(t, /Email delivery/);
   assert.match(t, /jamie@example\.com:\* ⛔ suppressed since 2026-09-12 \(hard bounce\), after "Activate your account"/);
   assert.ok(ids(c).includes("email_rm:0"));
   assert.ok(ids(c).includes("email_check_open"));
+  assert.ok(ids(c).includes("nav:home"), "every view has a way back");
   // Deduplicated: the contact and the Postiz account share one address.
   assert.equal((t.match(/jamie@example\.com:\*/g) ?? []).length, 1);
-  assert.ok(t.indexOf("Email delivery") < t.indexOf("No linked Stripe customer"), "identity, then delivery, then billing");
 });
 
 test("sidebar: Remove asks first, then removes the RE-DERIVED address, notes it and offers activation", async () => {

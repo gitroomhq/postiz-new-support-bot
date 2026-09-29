@@ -32,7 +32,6 @@ export function makeMaintenanceHub(deps: {
           fields: [],
           actions: [
             { key: "revoke_admin", label: "Revoke admin panel links", dangerous: true, summary: "Logs everyone out of the /config + /intercom web panels (including you)." },
-            { key: "revoke_stripe", label: "Revoke Stripe panel links", dangerous: true, summary: "Invalidates every outstanding Stripe-panel link/session." },
           ],
         },
         {
@@ -60,11 +59,6 @@ export function makeMaintenanceHub(deps: {
           const n = await ctx.settings.bumpAdminPanelEpoch();
           await ctx.audit("revoke admin panel links");
           return { ok: true, text: `Admin panel links revoked (epoch ${n}). Re-run /config for a fresh link.` };
-        }
-        case "revoke_stripe": {
-          const n = await ctx.settings.bumpPanelTokenEpoch();
-          await ctx.audit("revoke stripe panel links");
-          return { ok: true, text: `Stripe panel links revoked (epoch ${n}).` };
         }
         case "reset_bridge": {
           if (!ctx.reverse?.satisfied) return { ok: false, needsReverse: true, error: "Confirm with the Discord code." };

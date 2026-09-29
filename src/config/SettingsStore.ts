@@ -586,7 +586,7 @@ export class SettingsStore {
     }
   }
 
-  // ---- Intercom billing actions (canvas approve/deny + Stripe panel) ----
+  // ---- Intercom billing actions (canvas approve/deny) ----
 
   // Intercom teammates who count as billing admins for canvas/panel actions
   // (names snapshotted for display; ids are the authority).
@@ -659,24 +659,8 @@ export class SettingsStore {
     return secret;
   }
 
-  // Panel link/session revocation epoch: minted tokens embed it; bumping it
-  // ("Revoke Stripe Panel Links" in /intercom → Maintenance) invalidates every
-  // outstanding link and session instantly.
-  panelTokenEpoch(): number {
-    return this.settings.panelTokenEpoch;
-  }
-
-  async bumpPanelTokenEpoch(): Promise<number> {
-    this.settings = await this.prisma.botSettings.update({
-      where: { id: "global" },
-      data: { panelTokenEpoch: { increment: 1 } },
-    });
-    return this.settings.panelTokenEpoch;
-  }
-
-  // Admin web-panel (/config + /intercom) revocation epoch — a separate lever
-  // from panelTokenEpoch so "Revoke Admin Panel Links" and "Revoke Stripe Panel
-  // Links" are independent. Admin tokens/sessions embed this value.
+  // Admin web-panel (/config + /intercom) revocation epoch. Admin
+  // tokens/sessions embed this value; bumping it revokes them all.
   adminPanelEpoch(): number {
     return this.settings.adminPanelEpoch;
   }
