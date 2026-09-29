@@ -4,8 +4,8 @@ A Discord-first customer support bot for [Postiz](https://github.com/gitroomhq/p
 
 ## How it works
 
-- **Discord** (`discord.js` v14): the customer UI + the Stripe-side staff tooling Intercom doesn't cover. Customers open tickets from a panel; the surviving slash commands are `/setup`, `/config`, `/search-tickets`, `/charge`, `/billing`. All other agent actions (status, notes, reminders, escalation, canned replies, AI assist, reports) were retired in the **agent-rip** release — agents work tickets in Intercom.
-- **Dispute-evidence AI** (`@anthropic-ai/claude-code` CLI): `/billing → Disputes` drafts dispute evidence by spawning the `claude` CLI with its working directory set to `search/`, where the **Postiz source and docs are cloned** (`search/postiz-app`, `search/postiz-docs`) — policy text is grounded in real code/docs. The model + speed limits live in `/config → AI (dispute evidence)`; a scheduler refreshes the snapshots periodically (GitHub tarball download + atomic swap — the runtime image has no git binary). Short dispute summaries run on a cheaper model **via the direct Messages API** (`src/bot/LightAiRunner.ts`).
+- **Discord** (`discord.js` v14): the customer UI + the Stripe-side staff tooling Intercom doesn't cover. Customers open tickets from a panel; the slash commands are `/setup`, `/config`, `/intercom`, `/search-tickets`, `/postiz`, `/email`, `/charge`, `/billing` (plus the `/debug-attribute` diagnostic). All other agent actions (status, notes, reminders, escalation, canned replies, AI assist, reports) were retired in the **agent-rip** release: agents work tickets in Intercom.
+- **Dispute evidence** (`src/bot/billing/evidence/`): `/billing → Disputes` and the web panel build evidence packs from a deterministic template corpus (operator overrides live in the panel's template editor), filled in with real Stripe, Postiz-usage and support facts. No model writes evidence: the `claude` CLI runner and `LightAiRunner` are orphaned (constructed, never called) until a follow-up removes them together with the knowledge-base refresh of `search/`, the cloned Postiz source and docs the template wording was written against. Every dispute also carries a fight-or-accept **verdict** (see [Dispute verdict](#dispute-verdict-fight-or-accept)).
 - **InfluxDB export** (`src/metrics/`): optional InfluxDB 2.x exporter for billing events (refunds/discounts/charge reviews/disputes/fraud warnings), dispute gauges, the dispute automation surface (auto-resolve outcomes, evidence-pack strength, fact-source coverage, per-dispute history events and the two cutover phases), money-out with segment tags, subscription churn, Intercom bridge health (queue depths, webhook outcomes, inactivity sweeps) and a bot-health heartbeat. Connection (url/org/bucket/token — token encrypted at rest) is set in `/config → Analytics`. Grafana dashboards live in `grafana/dashboards/` (user-managed).
 - **Intercom bridge** (`src/intercom/`): optional two-way sync (`none` / `push` / `bi`) of each Discord ticket to an Intercom conversation + customer ticket, with a durable outbox/inbox, echo-suppression, and a Canvas Kit inbox sidebar. HMAC-verified webhooks.
 - **Stripe** (`src/bot/StripeClient.ts`, `BillingAdmin`, `src/bot/billing/`): customer self-service "refund & cancel" with guardrails (amount cap, per-24h velocity global + per-user, min membership age), plus a large staff `/billing` admin console. Dispute / early-fraud-warning **webhooks** are registered programmatically (no dashboard access needed) and alert staff.
@@ -27,9 +27,11 @@ Almost everything is configured live through the admin-only **`/config`** panel 
 
 **Required:** `DISCORD_TOKEN`, `DISCORD_CLIENT_ID`, `STRIPE_SECRET_KEY`, `DATABASE_URL`. Also `ANTHROPIC_API_KEY` for the AI CLI.
 
-**Optional** (feature-gating, or first-boot seeds that `/config` then owns): `DISCORD_THREADS_CHANNEL_ID`, `DISCORD_SUPPORT_ROLE_ID`, `POSTIZ_FRONTEND_URL`, `POSTIZ_API_URL`, `POSTIZ_CLIENT_ID`, `POSTIZ_CLIENT_SECRET`, `POSTIZ_CALLBACK_URL`, `GH_BOT_TOKEN`, `GH_BOT_REPO`, `STRIPE_DISCOUNT_COUPON_ID`, `SERVER_PORT` (default 3000), `SENTRY_DSN`, `INTERCOM_*`, `SCHEMA_DRIFT_STRICT`.
+**Optional** (feature-gating, or first-boot seeds that `/config` then owns): `DISCORD_THREADS_CHANNEL_ID`, `DISCORD_SUPPORT_ROLE_ID`, `POSTIZ_FRONTEND_URL`, `POSTIZ_API_URL`, `POSTIZ_CLIENT_ID`, `POSTIZ_CLIENT_SECRET`, `POSTIZ_CALLBACK_URL`, `GH_BOT_TOKEN`, `GH_BOT_REPO`, `STRIPE_DISCOUNT_COUPON_ID`, `SERVER_PORT` (default 3000), `SENTRY_DSN`, `INTERCOM_*`, `SCHEMA_DRIFT_STRICT`, `RESEND_API_KEY`.
 
-**Infrastructure overrides (`VAULT_*` / `TEMPORAL_*`)**: these are the only env vars that **win over `/config`**. Vault holds the Temporal mTLS certs, Temporal runs the background work, and `/config` is only reachable once the bot is up — so a deploy needs a way to pin the bootstrap layer regardless of what the database holds. Setting one pins the value; leaving it blank hands the setting back to Discord. Both panels label every pinned field and keep accepting edits, which are stored in `BotSettings` and take effect as soon as the variable is removed.
+**`RESEND_API_KEY` is a fallback, not an override**: it is used only while `/config → Integrations → Resend` holds no key of its own, and a stored key wins. That is the reverse of `POSTIZ_ADMIN_TOKEN` (which pins the Postiz admin key) and of the infrastructure pins below, on purpose: a deploy's variable is often the sending-only key Postiz itself uses, which cannot read the suppression list, and a Full access replacement has to be settable by someone with no access to the environment.
+
+**Infrastructure overrides (`VAULT_*` / `TEMPORAL_*`)**: these, with `POSTIZ_ADMIN_TOKEN`, are the only env vars that **win over `/config`**. Vault holds the Temporal mTLS certs, Temporal runs the background work, and `/config` is only reachable once the bot is up, so a deploy needs a way to pin the bootstrap layer regardless of what the database holds. Setting one pins the value; leaving it blank hands the setting back to Discord. Both panels label every pinned field and keep accepting edits, which are stored in `BotSettings` and take effect as soon as the variable is removed.
 
 - **Vault** (`/config → Vault`): `VAULT_ENABLED`, `VAULT_ADDR`, `VAULT_TOKEN`, `VAULT_KV_MOUNT`, `VAULT_KV_BASE_PATH`, `VAULT_TRANSIT_MOUNT`, `VAULT_TRANSIT_KEY`.
 - **Temporal** (`/config → Temporal → Connection`): `TEMPORAL_ENABLED` (worker pause switch), `TEMPORAL_ADDRESS`, `TEMPORAL_NAMESPACE`, `TEMPORAL_TASK_QUEUE`, `TEMPORAL_DEPLOYMENT_NAME`, `TEMPORAL_TLS_SERVER_NAME`. Booleans accept `1/true/yes/on` and `0/false/no/off`; anything else is ignored with a warning.
@@ -98,6 +100,48 @@ Setup (`/config → Integrations → Sentry Feedback`):
 
 Imported conversations are tagged `sentry-feedback`, carry an internal metadata note (submitter, page URL, Sentry link — the conversation itself is backdated to the submission time), get agent-idle reminder notes (once — the ticket sweep skips converted imports), and are **never** customer-nagged, auto-closed or SLA-clocked.
 
+### Resend email suppression
+
+Postiz sends its activation, password-reset and notification mail through [Resend](https://resend.com). An address that hard-bounces or files a spam complaint lands on the Resend team's suppression list, and every later email to it is silently dropped: that is how a customer ends up never receiving the mail that would let them log in. Support can see a suppression and remove it from three places:
+
+- the **Intercom inbox sidebar** (*Email delivery* section): the conversation's contact email, the Postiz account email and the Stripe billing email, plus a *Check another address* input;
+- **`/email <address>`** in Discord: support role and admins only, checked at runtime on the command and on every button, with ephemeral replies;
+- the **web customer page** (*Email delivery* card): the Stripe email and the owner of each Postiz organisation linked to the customer. Removal there takes a typed CONFIRM.
+
+Any teammate on those surfaces may remove an address. Every removal goes to the audit channel (who, from which surface, what the address was suppressed for), and the sidebar also leaves an internal note on the conversation. When the address belongs to a Postiz account that was never activated, each surface offers **Resend activation email**, which calls Postiz's own `/auth/resend-activation` route.
+
+Setup (`/config → Integrations → Resend`, or the Integrations hub of the web panel):
+
+1. In the Resend team Postiz sends from, create a **Full access** API key (a sending-only key cannot read the suppression list) and paste it via **API Key**. It is stored like every global secret (Vault KV entry `resend`, or local encryption) and never echoed back. Without one, `RESEND_API_KEY` from the environment is used.
+2. **Test Connection** must answer *Full access* and list that team's sending domains.
+3. Toggle **Enabled: on** (ships off).
+
+Lookups are throttled to about four requests a second and cached for a minute, because Resend's limit of 10 requests a second is per team and Postiz's own sending draws on it too.
+
+### Dispute verdict: fight or accept
+
+A complete evidence pack is not a winning one, and fighting a case that cannot be won costs the countered-dispute fee on top of the loss. So every dispute carries a **verdict**, Fight or Accept, from fixed rules in `src/bot/billing/disputeVerdict.ts`. First match wins:
+
+1. a refund already issued on the disputed charge: **Fight**;
+2. an annual charge: **Fight**;
+3. a *subscription canceled* claim where support saw a request to cancel before the charge: **Accept**;
+4. 3-D Secure authenticated, or Visa Compelling Evidence 3.0 qualified: **Fight**;
+5. very little data, meaning any one of: the customer's first successful payment, an evidence pack below the thin-data bar (default 40%), or a card never verified by 3-D Secure, CVC or postcode on this or an earlier charge: **Accept**;
+6. any weak signal: Postiz usage (posts before or after the charge, channels connected in the paid period, queued posts), support contact before the dispute (Intercom conversations or Discord tickets), or a cancel claim Stripe disproves: **Fight**;
+7. otherwise: **Accept**.
+
+A source that did not answer (Postiz usage, support history, payment history) never counts as a "no". It makes the verdict *provisional*: shown everywhere, but nothing automatic acts on it.
+
+- **When it is decided**: the disputes looper keeps a verdict on every open dispute, re-evaluated daily, at most 10 per hourly tick inside a 5-minute budget. In manualplus and auto, where the pack is built on the dispute webhook, a provisional verdict is made there first (the webhook never calls Intercom). *Recompute* on the web dispute page decides one on the spot.
+- **Submitting**: every submit path (Discord `/billing`, the web panel, auto-submit) goes through one gate. Submitting against anything but a Fight verdict needs a typed reason, kept in the dispute's history as an override; the automation never gets one, so auto-submit only ever sends Fight verdicts. A complete Accept, or a human's Accept, gets no reminder or escalation pings: letting it lapse loses it exactly as accepting would.
+- **Auto-accept**: only when evidence runs in **auto** mode, only on formal chargebacks, only on a complete Accept nobody has edited or a human's own override to Accept, never on a dispute opted out of automation, and only inside the same window before the deadline as auto-submit. The dispute is accepted as lost and an alert names the rule that decided it. In manual and manualplus nothing is accepted automatically.
+- **Inquiries**: auto-resolve still refunds them to keep them off the dispute ratio, except annual charges, which it never refunds (guardrail `annual_charge`).
+- **Override**: *Override verdict* on the web dispute page (typed CONFIRM plus a reason) wins over the rules everywhere, auto-submit and auto-accept included. The thin-data bar lives in the web panel's Disputes hub, under *Fight or accept*.
+- **Backtest**: *Disputes → Analysis → Run backtest* (admins) evaluates every decided chargeback from the last 365 days as if it had just arrived, counting usage, support contact and payments up to each dispute's own date, in looper batches of 15. A verdict made while a dispute was live is kept as it was shown; a re-run re-decides earlier backtest verdicts under the current settings. The Analysis tab groups decided chargebacks by reason, network code, card brand, verdict or deciding rule, with fought vs unanswered, win rate and the dispute fees the money-out ledger recorded.
+- **Changing the rules**: bump `VERDICT_VERSION`. Open disputes are then re-decided over the next ticks, and a backtest treats older backtest verdicts as stale.
+
+Keep Stripe's own Smart Disputes auto-response off, or Stripe submits evidence on disputes the verdict concedes.
+
 ## Setup
 
 ```bash
@@ -121,11 +165,16 @@ src/
 ├── bot/                # DiscordBot (core), ClaudeCodeRunner, StripeClient, billing/, schedulers, TicketStore…
 ├── categories/         # customer ticket categories (How-To, Bugs, Billing)
 ├── intercom/           # two-way Intercom bridge
-├── mcp/                # read-only Stripe MCP server (spawned for /ai)
+├── adminpanel/         # web admin panel hubs (/config and /intercom settings on the web)
+├── dashboard/          # web billing console (customers, disputes, payments, ...)
 ├── metrics/            # InfluxDB writer + exporters + snapshot scheduler
-├── scoring/            # AI ticket scoring (Batch API pipeline + scheduler)
+├── postiz/             # Postiz platform lookups (identity, usage feed)
+├── resend/             # Resend suppression client + email deliverability service
+├── sentry/             # Sentry feedback → Intercom import
+├── sla/                # SLA clocks, balanced assignment, office hours
 ├── server/             # Express callback + webhook server
 ├── temporal/           # Temporal platform (service/worker/producers) + workflows/ + activities/
+├── vault/              # Vault KV/Transit secret storage
 ├── db/                 # ensureSchema + verifySchema
 └── util/               # embeds, logger (Sentry), crypto, instrument
 grafana/dashboards/     # 8 importable Grafana dashboards (InfluxDB 2.x / Flux)
