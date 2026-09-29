@@ -333,6 +333,21 @@ export class MoneyOutStore {
     return this.prisma.stripeMoneyOut.count({ where: LIVE });
   }
 
+  // Dispute fees Stripe kept, per dispute and currency. A dispute fee row
+  // carries the dispute (dp_) as its source object, so the dispute pages can
+  // put a price on the fights they list without reading Stripe.
+  async disputeFeesFor(disputeIds: string[]): Promise<Array<{ disputeId: string; currency: string; feeMinor: number }>> {
+    if (disputeIds.length === 0) return [];
+    const grouped = await this.prisma.stripeMoneyOut.groupBy({
+      by: ["stripeObjectId", "currency"],
+      where: { ...LIVE, category: "dispute_fee", stripeObjectId: { in: disputeIds } },
+      _sum: { amountMinor: true },
+    });
+    return grouped
+      .filter((g) => g.stripeObjectId != null)
+      .map((g) => ({ disputeId: g.stripeObjectId as string, currency: g.currency, feeMinor: g._sum.amountMinor ?? 0 }));
+  }
+
   // Window totals grouped by bucket/category/currency — the stat tiles and the
   // category breakdown chart both read this one query.
   async windowTotals(from: Date, to: Date): Promise<MoneyOutTotal[]> {

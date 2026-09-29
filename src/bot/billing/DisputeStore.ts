@@ -114,6 +114,9 @@ export const TEXT_EVIDENCE_KEYS = [
   "uncategorized_text",
 ] as const;
 
+// The axes the loss breakdown can group decided chargebacks by.
+export type LossAxis = "reason" | "networkReason" | "cardBrand" | "verdict" | "decisive";
+
 // Overview filter/sort state (kept in the panel session).
 export type DisputeSort = "due" | "amount" | "new";
 export interface OpenDisputeFilter {
@@ -737,6 +740,112 @@ export class DisputeStore {
     return { won, lost };
   }
 
+  // The backtest's population: formal chargebacks that reached a decision
+  // (won or lost) since a cutoff. Inquiries are left out on purpose, because a
+  // refund, not a fight, is what closes those.
+  private backtestScope(since: Date): Prisma.StripeDisputeWhereInput {
+    return { status: { in: ["won", "lost"] }, disputeCreatedAt: { gte: since } };
+  }
+
+  // Closed disputes the backtest still has to evaluate: never evaluated, or
+  // evaluated by an older rule set. A verdict made while the dispute was LIVE
+  // is never recomputed, because that is the verdict that was actually shown.
+  async listBacktestCandidates(
+    version: string,
+    since: Date,
+    take: number,
+    excludeIds: string[] = []
+  ): Promise<StripeDispute[]> {
+    return this.prisma.stripeDispute.findMany({
+      where: {
+        ...this.backtestScope(since),
+        OR: [
+          { verdict: null },
+          { verdictSource: "backtest", verdictVersion: null },
+          { verdictSource: "backtest", verdictVersion: { not: version } },
+        ],
+        ...(excludeIds.length ? { id: { notIn: excludeIds } } : {}),
+      },
+      orderBy: { disputeCreatedAt: "desc" },
+      take,
+    });
+  }
+
+  // A re-run re-decides every backtest verdict under the CURRENT settings (the
+  // thin-data bar is one), not only those from an older rule set. Live
+  // verdicts are untouched: they are what was actually shown at the time.
+  async resetBacktestVerdicts(): Promise<number> {
+    const r = await this.prisma.stripeDispute.updateMany({
+      where: { verdictSource: "backtest" },
+      data: { verdictVersion: null },
+    });
+    return r.count;
+  }
+
+  async backtestProgress(version: string, since: Date): Promise<{ eligible: number; done: number }> {
+    const scope = this.backtestScope(since);
+    const [eligible, done] = await Promise.all([
+      this.prisma.stripeDispute.count({ where: scope }),
+      this.prisma.stripeDispute.count({
+        where: {
+          ...scope,
+          verdict: { not: null },
+          OR: [{ verdictSource: "live" }, { verdictVersion: version }],
+        },
+      }),
+    ]);
+    return { eligible, done };
+  }
+
+  // Fought vs unanswered outcomes, grouped by one descriptive axis. "Fought"
+  // means evidence reached the bank; a dispute lost without any is a loss we
+  // chose (or missed), not one the evidence lost.
+  async lossBreakdown(axis: LossAxis): Promise<
+    Array<{ key: string; foughtWon: number; foughtLost: number; unanswered: number; ids: string[] }>
+  > {
+    const rows = await this.prisma.stripeDispute.findMany({
+      where: { status: { in: ["won", "lost"] } },
+      select: {
+        id: true,
+        status: true,
+        evidenceSubmittedAt: true,
+        reason: true,
+        networkReason: true,
+        cardBrand: true,
+        verdict: true,
+        verdictOverride: true,
+        verdictDecisive: true,
+      },
+      take: 5000,
+    });
+    const keyOf = (r: (typeof rows)[number]): string | null => {
+      switch (axis) {
+        case "reason":
+          return r.reason;
+        case "networkReason":
+          return r.networkReason;
+        case "cardBrand":
+          return r.cardBrand;
+        case "verdict":
+          return r.verdictOverride ?? r.verdict ?? "none";
+        case "decisive":
+          return r.verdict ? r.verdictDecisive : "none";
+      }
+    };
+    const groups = new Map<string, { key: string; foughtWon: number; foughtLost: number; unanswered: number; ids: string[] }>();
+    for (const r of rows) {
+      const key = keyOf(r) || "unknown";
+      const g = groups.get(key) ?? { key, foughtWon: 0, foughtLost: 0, unanswered: 0, ids: [] };
+      if (!r.evidenceSubmittedAt) g.unanswered++;
+      else if (r.status === "won") g.foughtWon++;
+      else g.foughtLost++;
+      g.ids.push(r.id);
+      groups.set(key, g);
+    }
+    return [...groups.values()].sort(
+      (a, b) => b.foughtWon + b.foughtLost + b.unanswered - (a.foughtWon + a.foughtLost + a.unanswered)
+    );
+  }
 
   // Respondable, unsubmitted, not opted out, and inside the auto-submit window.
   // The looper's enrich-and-submit work list.

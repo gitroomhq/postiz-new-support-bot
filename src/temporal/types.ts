@@ -374,8 +374,10 @@ export interface DisputesTickResult {
   // Disputes conceded because the verdict said not to fight (auto mode only).
   autoAccepted: number;
   escalated: number;
-  // Fight-or-accept verdicts refreshed on open disputes.
+  // Fight-or-accept verdicts refreshed on open disputes, and closed disputes
+  // evaluated for a requested backtest.
   verdicts: number;
+  backtested: number;
 }
 
 export interface MoneyOutTickResult {

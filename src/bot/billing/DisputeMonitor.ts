@@ -38,16 +38,19 @@ const RECONCILE_INTERVAL_MS = 6 * 60 * 60_000;
 // Evidence packs enrich through Intercom, so a tick handles a bounded number.
 const AUTO_EVIDENCE_LIMIT = 10;
 
-// Verdicts for open disputes outside the auto-submit window. Each costs one
-// enriched build (a handful of Stripe reads, one platform lookup, up to ten
-// Intercom calls), so the sweep is capped, and it stops starting new work
-// once the tick has run this long: the activity allows ten minutes and the
-// ratio sweep still has to fit after it.
+// Verdicts for open disputes outside the auto-submit window, and backtest
+// verdicts for closed ones. Each costs one enriched build (a handful of Stripe
+// reads, one platform lookup, up to ten Intercom calls), so both are capped,
+// and both stop starting new work once the tick has run this long: the
+// activity allows ten minutes and the ratio sweep still has to fit after them.
 const VERDICT_LIMIT = 10;
+const BACKTEST_LIMIT = 15;
 const VERDICT_TIME_BUDGET_MS = 5 * 60_000;
 // An open dispute's verdict is re-evaluated once a day: usage and support
 // contact keep arriving while a dispute waits for its deadline.
 const VERDICT_STALE_MS = 24 * 60 * 60_000;
+// How far back the backtest reaches.
+export const BACKTEST_WINDOW_DAYS = 365;
 
 const RESPONDABLE = new Set<string>(RESPONDABLE_DISPUTE_STATUSES);
 
@@ -270,6 +273,10 @@ async function fetchExactCloseTimes(stripe: StripeClient): Promise<Map<string, D
 // same as StripeWebhookHandler).
 export class DisputeMonitor {
   private client: Client | null = null;
+  // Closed disputes the backtest could not evaluate in this process (a charge
+  // Stripe no longer returns, say). Skipped so one bad row cannot keep the
+  // backtest "running" forever; a restart gives them one more chance.
+  private backtestFailed = new Set<string>();
 
   constructor(
     private settings: SettingsStore,
@@ -330,7 +337,7 @@ export class DisputeMonitor {
 
     const verdicts = await this.runVerdicts(evidence.touched, startedAt, beat).catch((error) => {
       monitorLog.error("dispute verdict sweep failed", error);
-      return { verdicts: 0 };
+      return { verdicts: 0, backtested: 0 };
     });
 
     const last = this.settings.disputeReconcileAt();
@@ -365,6 +372,7 @@ export class DisputeMonitor {
       autoAccepted: evidence.autoAccepted,
       escalated: evidence.escalated,
       verdicts: verdicts.verdicts,
+      backtested: verdicts.backtested,
     };
   }
 
@@ -475,13 +483,14 @@ export class DisputeMonitor {
 
   // Keeps a current, enriched verdict on every open dispute, not only the ones
   // already inside the auto-submit window, so the list can be triaged the day
-  // a dispute arrives.
+  // a dispute arrives. Then, with whatever budget is left, works through a
+  // requested backtest over closed disputes.
   private async runVerdicts(
     skip: Set<string>,
     startedAt: number,
     beat: () => void
-  ): Promise<{ verdicts: number }> {
-    const out = { verdicts: 0 };
+  ): Promise<{ verdicts: number; backtested: number }> {
+    const out = { verdicts: 0, backtested: 0 };
     const builder = this.evidencePack;
     const verdicts = this.verdicts;
     if (!builder || !verdicts) return out;
@@ -496,6 +505,29 @@ export class DisputeMonitor {
       if (overBudget()) return out;
       beat();
       if (await this.verdictFor(row.id, "live")) out.verdicts++;
+    }
+
+    const requested = this.settings.disputeBacktestRequestedAt();
+    if (!requested) return out;
+    const since = new Date(Date.now() - BACKTEST_WINDOW_DAYS * 24 * 60 * 60_000);
+    const failed = [...this.backtestFailed];
+    const candidates = await this.disputeStore.listBacktestCandidates(VERDICT_VERSION, since, BACKTEST_LIMIT, failed);
+    for (const row of candidates) {
+      if (overBudget()) return out;
+      beat();
+      if (await this.verdictFor(row.id, "backtest")) out.backtested++;
+      else this.backtestFailed.add(row.id);
+    }
+    // Finished when nothing evaluable is left. What failed is reported rather
+    // than retried forever: it shows up in the tables as "No verdict".
+    const left = await this.disputeStore.listBacktestCandidates(VERDICT_VERSION, since, 1, [...this.backtestFailed]);
+    if (left.length === 0) {
+      await this.settings.updateDisputeVerdict({ disputeBacktestRequestedAt: null }).catch(() => {});
+      monitorLog.info("dispute verdict backtest finished", {
+        "verdict.version": VERDICT_VERSION,
+        "verdict.unevaluable": this.backtestFailed.size,
+      });
+      this.backtestFailed.clear();
     }
     return out;
   }

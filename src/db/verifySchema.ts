@@ -75,7 +75,7 @@ export const EXPECTED_COLUMNS: Record<string, string[]> = {
     "disputeReconcileAt",
     "disputeEvidenceMode", "disputeAutoSubmitHours",
     "disputeAutoSubmitMinScore", "disputeAutoSubmitMaxMinor", "disputeTemplateIntercomEnabled",
-    "disputeVerdictMinScore",
+    "disputeVerdictMinScore", "disputeBacktestRequestedAt",
     "moneyOutEnabled", "moneyOutSweepAt", "moneyOutBackfillDoneAt",
     "radarListCardId", "radarListEmailId", "radarListCustomerId", "radarListIpId",
     "inactivityEnabled", "inactivityAgentWaitDays", "inactivityCustomerWaitDays", "inactivityNagsBeforeClose",

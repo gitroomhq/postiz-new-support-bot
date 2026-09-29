@@ -1232,6 +1232,12 @@ export class SettingsStore {
     return this.settings.disputeVerdictMinScore;
   }
 
+  // Non-null while a backtest over closed disputes is waiting to be worked
+  // through by the disputes looper.
+  disputeBacktestRequestedAt(): Date | null {
+    return this.settings.disputeBacktestRequestedAt;
+  }
+
   // ---- Money-out ledger (/config → Billing → Money out) ----
 
   moneyOutEnabled(): boolean {
@@ -2015,6 +2021,7 @@ export class SettingsStore {
 
   async updateDisputeVerdict(data: {
     disputeVerdictMinScore?: number;
+    disputeBacktestRequestedAt?: Date | null;
   }): Promise<void> {
     this.settings = await this.prisma.botSettings.update({ where: { id: "global" }, data });
   }

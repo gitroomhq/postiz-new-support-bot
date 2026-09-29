@@ -1,21 +1,27 @@
 import { CachedRatioEngine, RatioWindowNumbers } from "../../../bot/billing/disputeRatio";
-import { RESPONDABLE_DISPUTE_STATUSES } from "../../../bot/billing/DisputeStore";
+import { RESPONDABLE_DISPUTE_STATUSES, type LossAxis } from "../../../bot/billing/DisputeStore";
+import { BACKTEST_WINDOW_DAYS } from "../../../bot/billing/DisputeMonitor";
+import { VERDICT_VERSION } from "../../../bot/billing/disputeVerdict";
 import { ActionButton, Badge, Block, Cell, StatsBlock, TableBlock } from "../../renderer/contract";
 import { DashboardCtx, SectionPage } from "../types";
 import { amount, badgeCell, idCell, isoDateCell, sentence, strong, text } from "../cells";
 import { autoResolveBlocks } from "./proposals";
-import { BOARD_WINDOW, DisputesDeps, PAGE_SIZE, disputeRow, statusBadgeFor, verdictCell } from "./cells";
+import { BOARD_WINDOW, DisputesDeps, PAGE_SIZE, disputeRow, signalLabel, statusBadgeFor, verdictCell } from "./cells";
 
-// The disputes overview. One page, four tabs, in the order the work happens:
-// what is owed a response, everything, what the engine wants to refund, and
-// what already closed.
+// The disputes overview. One page, five tabs, in the order the work happens:
+// what is owed a response, everything, what the engine wants to refund, what
+// already closed, and how the closed ones went (Analysis).
 //
 // "Proposals" is not a fourth list of disputes. It lists what the auto-resolve
 // engine has proposed, refused and executed, which is why the ratio strip is
 // withheld there: the strip is about the disputes you have, and that tab is
 // about decisions the machine made.
 
-type View = "" | "all" | "autoresolve" | "history";
+type View = "" | "all" | "autoresolve" | "history" | "analysis";
+
+// The analysis table is one paginated table whatever it is grouped by, and a
+// grouping can have dozens of rows (network codes), so it pages at ten.
+const ANALYSIS_PAGE_SIZE = 10;
 
 export async function list(
   ctx: DashboardCtx,
@@ -24,7 +30,7 @@ export async function list(
   cursor: string | null
 ): Promise<SectionPage> {
   const view: View =
-    filters.view === "all" || filters.view === "history" || filters.view === "autoresolve"
+    filters.view === "all" || filters.view === "history" || filters.view === "autoresolve" || filters.view === "analysis"
       ? (filters.view as View)
       : "";
   const counts = await ctx.stores.dispute.countsByStatus().catch(() => []);
@@ -61,6 +67,7 @@ export async function list(
       { value: "all", label: "All" },
       { value: "autoresolve", label: "Proposals" },
       { value: "history", label: "History" },
+      { value: "analysis", label: "Analysis" },
     ],
   });
 
@@ -70,6 +77,7 @@ export async function list(
   if (view === "" || view === "history") blocks.push(await ratioStrip(ctx, deps.ratio));
 
   if (view === "history") blocks.push(...(await historyBlocks(ctx, cursor)));
+  else if (view === "analysis") blocks.push(...(await analysisBlocks(ctx, deps, filters, cursor)));
   else if (view === "autoresolve") blocks.push(...(await autoResolveBlocks(ctx, deps, filters, cursor)));
   else if (view === "all") blocks.push(...(await allBlocks(ctx, filters, cursor, counts)));
   else blocks.push(await boardBlock(ctx));
@@ -311,5 +319,165 @@ async function historyBlocks(ctx: DashboardCtx, cursor: string | null): Promise<
       : {}),
   });
 
+  return blocks;
+}
+
+// ---- Analysis: where the fights were lost, and what the verdict would have done ----
+
+const ANALYSIS_AXES: Array<{ value: LossAxis; label: string }> = [
+  { value: "reason", label: "Reason" },
+  { value: "networkReason", label: "Network code" },
+  { value: "cardBrand", label: "Card brand" },
+  { value: "verdict", label: "Verdict" },
+  { value: "decisive", label: "Deciding rule" },
+];
+
+function axisLabel(axis: LossAxis, key: string): string {
+  if (key === "none") return axis === "verdict" || axis === "decisive" ? "No verdict" : "Unknown";
+  switch (axis) {
+    case "reason":
+      return sentence(key.replace(/_/g, " "));
+    case "cardBrand":
+      return sentence(key);
+    case "verdict":
+      return key === "fight" ? "Fight" : key === "accept" ? "Accept" : sentence(key);
+    case "decisive":
+      return signalLabel(key);
+    default:
+      return key;
+  }
+}
+
+function pct(won: number, lost: number): Cell {
+  const decided = won + lost;
+  if (!decided) return text("N/A");
+  const rate = (won / decided) * 100;
+  return badgeCell(rate >= 50 ? "ok" : "warn", `${rate.toFixed(0)}%`);
+}
+
+async function analysisBlocks(
+  ctx: DashboardCtx,
+  deps: DisputesDeps,
+  filters: Record<string, string>,
+  cursor: string | null
+): Promise<Block[]> {
+  const axis = ANALYSIS_AXES.find((a) => a.value === filters.group)?.value ?? "reason";
+  const offset = /^\d{1,6}$/.test(cursor ?? "") ? Number(cursor) : 0;
+  const since = new Date(Date.now() - BACKTEST_WINDOW_DAYS * 24 * 60 * 60_000);
+  const [groups, byVerdict, progress] = await Promise.all([
+    ctx.stores.dispute.lossBreakdown(axis),
+    axis === "verdict" ? Promise.resolve(null) : ctx.stores.dispute.lossBreakdown("verdict"),
+    ctx.stores.dispute.backtestProgress(VERDICT_VERSION, since),
+  ]);
+  const verdictGroups = byVerdict ?? groups;
+  const fight = verdictGroups.find((g) => g.key === "fight");
+  const accept = verdictGroups.find((g) => g.key === "accept");
+  const foughtWon = groups.reduce((sum, g) => sum + g.foughtWon, 0);
+  const foughtLost = groups.reduce((sum, g) => sum + g.foughtLost, 0);
+  const unanswered = groups.reduce((sum, g) => sum + g.unanswered, 0);
+
+  const blocks: Block[] = [];
+  blocks.push({
+    type: "stats",
+    items: [
+      { label: "Fought", value: String(foughtWon + foughtLost), sub: `won ${foughtWon}, lost ${foughtLost}` },
+      { label: "Win rate when fought", value: foughtWon + foughtLost ? `${((foughtWon / (foughtWon + foughtLost)) * 100).toFixed(0)}%` : "N/A" },
+      {
+        label: "Verdict Fight",
+        value: fight ? `${fight.foughtWon} of ${fight.foughtWon + fight.foughtLost} won` : "none yet",
+        sub: fight ? `${fight.unanswered} not fought` : undefined,
+      },
+      {
+        label: "Verdict Accept",
+        value: accept ? `${accept.foughtLost} fought and lost` : "none yet",
+        // Both sides of the ledger: the losses it would have conceded (and the
+        // countered fee each one cost), and the wins it would have given away.
+        sub: accept ? `would have been conceded; ${accept.foughtWon} of these were won` : undefined,
+        ...(accept && accept.foughtLost > 0 ? { badge: { kind: "warn", text: "fees avoidable" } as Badge } : {}),
+      },
+      { label: "Lost unanswered", value: String(unanswered) },
+    ],
+  });
+
+  const requested = ctx.settings.disputeBacktestRequestedAt();
+  const complete = progress.eligible > 0 && progress.done >= progress.eligible;
+  blocks.push({
+    type: "notice",
+    badge: requested ? { kind: "info", text: "Backtest running" } : complete ? { kind: "ok", text: "Backtest complete" } : { kind: "neutral", text: "Backtest" },
+    text: requested
+      ? `${progress.done} of ${progress.eligible} decided chargebacks from the last ${BACKTEST_WINDOW_DAYS} days have a verdict. The disputes looper evaluates a batch every hour (and one right away); results fill in as it goes.`
+      : complete
+        ? `Every decided chargeback from the last ${BACKTEST_WINDOW_DAYS} days has a verdict under the current rules (${VERDICT_VERSION}). Group by Verdict or Deciding rule to see which fights the rules would have made.`
+        : `${progress.done} of ${progress.eligible} decided chargebacks from the last ${BACKTEST_WINDOW_DAYS} days have a verdict. The backtest evaluates the rest as if they had just arrived: posts, support contact and payments are counted up to each dispute's own date.`,
+    actions: [
+      {
+        key: "section:disputes.backtest_run",
+        label: requested ? "Backtest running" : complete ? "Re-run backtest" : "Run backtest",
+        style: "secondary",
+        ...(requested
+          ? { disabledReason: "Already running." }
+          : !ctx.actor.isAdmin
+            ? { disabledReason: "Admins only." }
+            : !deps.verdicts || !deps.evidencePack
+              ? { disabledReason: "The verdict service is not configured." }
+              : {}),
+      },
+    ],
+  });
+
+  const page = groups.slice(offset, offset + ANALYSIS_PAGE_SIZE);
+  const fees = deps.moneyOut
+    ? await deps.moneyOut.disputeFeesFor(page.flatMap((g) => g.ids)).catch(() => [])
+    : [];
+  const feeByDispute = new Map<string, Array<{ currency: string; feeMinor: number }>>();
+  for (const f of fees) feeByDispute.set(f.disputeId, [...(feeByDispute.get(f.disputeId) ?? []), f]);
+  const feeCell = (ids: string[]): Cell => {
+    const byCurrency: Record<string, number> = {};
+    for (const id of ids) for (const f of feeByDispute.get(id) ?? []) byCurrency[f.currency] = (byCurrency[f.currency] ?? 0) + f.feeMinor;
+    const parts = Object.entries(byCurrency).map(([cur, minor]) => ctx.stripe.formatAmount(minor, cur));
+    return text(parts.join(" + ") || (deps.moneyOut ? "none recorded" : "N/A"));
+  };
+
+  const axisName = ANALYSIS_AXES.find((a) => a.value === axis)!.label;
+  blocks.push({
+    type: "table",
+    key: "analysis",
+    title: `Decided chargebacks by ${axisName.toLowerCase()}`,
+    filters: [
+      {
+        key: "group",
+        label: "Group by",
+        kind: "select",
+        value: axis === "reason" ? undefined : axis,
+        options: ANALYSIS_AXES.map((a) => ({ value: a.value, label: a.label })),
+      },
+    ],
+    columns: [
+      { key: "group", label: axisName },
+      { key: "fought", label: "Fought", align: "right" },
+      { key: "won", label: "Won", align: "right" },
+      { key: "lost", label: "Lost", align: "right" },
+      { key: "rate", label: "Win rate", align: "right" },
+      { key: "unanswered", label: "Unanswered", align: "right" },
+      { key: "fees", label: "Dispute fees", align: "right" },
+    ],
+    rows: page.map((g) => ({
+      id: g.key,
+      cells: [
+        strong(axisLabel(axis, g.key)),
+        text(String(g.foughtWon + g.foughtLost)),
+        text(String(g.foughtWon)),
+        text(String(g.foughtLost)),
+        pct(g.foughtWon, g.foughtLost),
+        text(String(g.unanswered)),
+        feeCell(g.ids),
+      ] as Cell[],
+    })),
+    nextCursor: offset + ANALYSIS_PAGE_SIZE < groups.length ? String(offset + ANALYSIS_PAGE_SIZE) : null,
+    empty: "No decided chargebacks in the mirror yet.",
+    ...(page.length ? { footer: `${page.length} of ${groups.length} group${groups.length === 1 ? "" : "s"}` } : {}),
+    notice:
+      "Fought means evidence reached the bank; unanswered means it closed as lost without a submission. Fees are the dispute fees the money-out ledger recorded against these disputes.",
+  });
   return blocks;
 }

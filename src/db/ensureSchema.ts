@@ -1156,6 +1156,7 @@ export const STATEMENTS: string[] = [
   `ALTER TABLE "stripe_disputes" ADD COLUMN IF NOT EXISTS "verdictOverrideAt" TIMESTAMP(3)`,
   `CREATE INDEX IF NOT EXISTS "stripe_disputes_verdict_idx" ON "stripe_disputes"("verdict")`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "disputeVerdictMinScore" INTEGER NOT NULL DEFAULT 40`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "disputeBacktestRequestedAt" TIMESTAMP(3)`,
   // Operator overrides for the shipped evidence template corpus.
   `CREATE TABLE IF NOT EXISTS "dispute_evidence_templates" (
     "id" TEXT NOT NULL,

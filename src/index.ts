@@ -793,6 +793,8 @@ async function main() {
       templateStore: evidenceTemplateStore,
       events: disputeEvents,
       verdicts: disputeVerdicts,
+      moneyOut: moneyOutStore,
+      runNow: () => temporalProducers.disputesRunNow(),
     }),
     makeCatalogSection(),
     makeLinksSection(),

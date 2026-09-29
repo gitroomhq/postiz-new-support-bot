@@ -176,6 +176,24 @@ export async function disputeAction(
     return { ok: true, text: `Future disputes will not receive a ${slot.replace(/_/g, " ")}. Nothing already staged changed.` };
   }
 
+  // A backtest is keyed on nothing: it sweeps the decided chargebacks. It only
+  // SETS a flag and wakes the looper, which does the reading in its own
+  // time-boxed batches, so the press itself is cheap and safe to repeat.
+  if (key === "section:disputes.backtest_run") {
+    if (!ctx.actor.isAdmin) return { ok: false, error: "Only admins can start a backtest." };
+    if (!deps.verdicts || !deps.evidencePack) return { ok: false, error: "The verdict service is not configured." };
+    // Re-decided under the current settings, so a changed thin-data bar shows
+    // up in the tables instead of the old answers standing.
+    const reset = await ctx.stores.dispute.resetBacktestVerdicts();
+    await ctx.settings.updateDisputeVerdict({ disputeBacktestRequestedAt: new Date() });
+    await deps.runNow?.().catch(() => undefined);
+    await ctx.audit(`Dispute verdict backtest requested (${reset} earlier backtest verdict(s) to re-decide)`);
+    return {
+      ok: true,
+      text: "Backtest started. The disputes looper evaluates a batch now and more every hour; this tab fills in as it goes.",
+    };
+  }
+
   if (key === "section:disputes.autoresolve_veto") {
     const store = deps.autoResolveStore;
     if (!store) return { ok: false, error: "Auto-resolve is not configured." };

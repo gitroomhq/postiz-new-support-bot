@@ -8,6 +8,7 @@ import type { BackfillResult, HandProposeResult } from "../../../bot/billing/Aut
 import type { TemplateStore } from "../../../bot/billing/evidence/TemplateStore";
 import type { DisputeEventStore } from "../../../bot/billing/DisputeEventStore";
 import type { DisputeVerdictService } from "../../../bot/billing/DisputeVerdictService";
+import type { MoneyOutStore } from "../../../bot/billing/MoneyOutStore";
 import { VERDICT_SIGNAL_LABELS, effectiveVerdict, type VerdictSignal } from "../../../bot/billing/disputeVerdict";
 import type { ActionActor } from "../../../bot/billing/actions/BillingActionService";
 import { ActionButton, Badge, Cell, TableBlock } from "../../renderer/contract";
@@ -52,8 +53,13 @@ export interface DisputesDeps {
   templateStore?: TemplateStore | null;
   // Per-dispute history, for the detail page's timeline.
   events?: DisputeEventStore | null;
-  // Fight or accept: the verdict card and its override.
+  // Fight or accept: the verdict card, its override, and the backtest.
   verdicts?: DisputeVerdictService | null;
+  // Dispute fees from the money-out ledger, for the loss breakdown.
+  moneyOut?: Pick<MoneyOutStore, "disputeFeesFor"> | null;
+  // Wakes the disputes looper so a requested backtest starts now rather than
+  // at the next hourly tick.
+  runNow?: (() => Promise<unknown>) | null;
 }
 
 export function actionActor(ctx: DashboardCtx): ActionActor {

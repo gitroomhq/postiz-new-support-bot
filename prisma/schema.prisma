@@ -298,6 +298,9 @@ model BotSettings {
   // Fight-or-accept verdict: a pack completeness below this counts as "very
   // little data" and turns every weak fight signal into Accept.
   disputeVerdictMinScore        Int     @default(40)
+  // Set while a verdict backtest over closed disputes is requested; the
+  // disputes looper works through it in batches and clears it when done.
+  disputeBacktestRequestedAt    DateTime?
   // Money-out ledger: every outflow (refunds, disputes, fees, concessions)
   // mirrored from Stripe's balance transactions + the concession webhooks.
   // moneyOutSweepAt is the reconcile cursor (sweeps re-read from it minus an

@@ -2326,7 +2326,7 @@ test("disputes overview: tabs + level-tinted ratio strip + due-date board (respo
   // Renamed: that tab lists proposals the engine made, not disputes.
   assert.deepEqual(
     tabs.items.map((i) => i.label),
-    ["Needs response", "All", "Proposals", "History"]
+    ["Needs response", "All", "Proposals", "History", "Analysis"]
   );
   assert.equal(tabs.items[0].badge, "3"); // 2 needs_response + 1 warning_needs_response
   const strip = page!.blocks[2] as {
@@ -2846,6 +2846,63 @@ test("evidence service: fighting against the verdict needs a reason, is recorded
   assert.equal((await none.svc.submit("dp_1", "42", null)).kind, "verdict_override_required");
 });
 
+test("dispute actions: submit against Accept asks why; override needs CONFIRM and a reason; backtest is admin-only", async () => {
+  const fakes = evidenceFakes({ row: disputeRow({ verdict: "accept", verdictDecisive: "no_signal" }) });
+  (fakes.disputeStore as Record<string, unknown>).recordVerdictOverride = async () => {};
+  const overrides: unknown[][] = [];
+  let woke = 0;
+  const section = makeDisputesSection({
+    ...disputesDeps(fakes),
+    verdicts: { override: async (...args: unknown[]) => void overrides.push(args) } as never,
+    runNow: async () => {
+      woke++;
+    },
+  });
+  const ctx = disputesCtx(fakes);
+  const writes: Array<Record<string, unknown>> = [];
+  Object.assign(ctx.settings as object, {
+    updateDisputeVerdict: async (d: Record<string, unknown>) => void writes.push(d),
+  });
+  let resets = 0;
+  Object.assign(ctx.stores.dispute as object, {
+    resetBacktestVerdicts: async () => {
+      resets++;
+      return 3;
+    },
+  });
+
+  const bare = await section.action!(ctx, { key: "section:disputes.submit", params: { disputeId: "dp_1" } });
+  assert.equal(bare.ok, false);
+  assert.match(bare.error ?? "", /verdict is Accept \(no reason to fight\)/);
+  assert.equal(fakes.calls.claims.length, 0, "nothing reached the bank");
+  const fought = await section.action!(ctx, {
+    key: "section:disputes.submit",
+    params: { disputeId: "dp_1", overrideReason: "They posted every day" },
+  });
+  assert.equal(fought.ok, true);
+
+  const params = { disputeId: "dp_1", verdict: "fight", reason: "strong usage logs" };
+  assert.equal((await section.action!(ctx, { key: "section:disputes.verdict_override", params })).ok, false);
+  const short = await section.action!(ctx, {
+    key: "section:disputes.verdict_override",
+    params: { ...params, reason: "x" },
+    confirmWord: "CONFIRM",
+  });
+  assert.equal(short.ok, false);
+  const set = await section.action!(ctx, { key: "section:disputes.verdict_override", params, confirmWord: "CONFIRM" });
+  assert.equal(set.ok, true);
+  assert.deepEqual(overrides[0].slice(0, 3), ["dp_1", "fight", "strong usage logs"]);
+
+  const operator = { ...ctx, actor: { ...ctx.actor, isAdmin: false } } as DashboardCtx;
+  assert.equal((await section.action!(operator, { key: "section:disputes.backtest_run", params: {} })).ok, false);
+  assert.equal(woke, 0);
+  const run = await section.action!(ctx, { key: "section:disputes.backtest_run", params: {} });
+  assert.equal(run.ok, true);
+  assert.equal(woke, 1, "the looper is woken rather than waiting an hour");
+  assert.equal(resets, 1, "earlier backtest verdicts are re-decided under the current settings");
+  assert.ok(writes[0].disputeBacktestRequestedAt instanceof Date);
+});
+
 test("dispute detail: the verdict card explains itself, and Submit asks for a reason only against the verdict", async () => {
   const signals = {
     result: {
@@ -2898,6 +2955,51 @@ test("dispute detail: the verdict card explains itself, and Submit asks for a re
     params: { id: "dp_1" },
   }))!.blocks[0] as HeaderBlock;
   assert.equal(fightHeader.actions!.find((a) => a.key === "section:disputes.submit")!.inputs, undefined);
+});
+
+test("disputes analysis tab: fought vs unanswered by axis, both sides of the verdict's ledger, one paginated table", async () => {
+  const ctx = disputesCtx();
+  const groupsBy: Record<string, Array<{ key: string; foughtWon: number; foughtLost: number; unanswered: number; ids: string[] }>> = {
+    reason: Array.from({ length: 12 }, (_, i) => ({
+      key: i === 0 ? "fraudulent" : `reason_${i}`,
+      foughtWon: 0,
+      foughtLost: i === 0 ? 20 : 1,
+      unanswered: 1,
+      ids: [`dp_${i}`],
+    })),
+    verdict: [
+      { key: "fight", foughtWon: 1, foughtLost: 9, unanswered: 2, ids: ["dp_f"] },
+      { key: "accept", foughtWon: 1, foughtLost: 21, unanswered: 5, ids: ["dp_a"] },
+    ],
+  };
+  Object.assign(ctx.stores.dispute as object, {
+    lossBreakdown: async (axis: string) => groupsBy[axis] ?? [],
+    backtestProgress: async () => ({ eligible: 40, done: 12 }),
+  });
+  Object.assign(ctx.settings as object, { disputeBacktestRequestedAt: () => null });
+  const feeReads: string[][] = [];
+  const section = makeDisputesSection({
+    ...disputesDeps(),
+    verdicts: {} as never,
+    moneyOut: {
+      disputeFeesFor: async (ids: string[]) => {
+        feeReads.push(ids);
+        return ids.map((id) => ({ disputeId: id, currency: "usd", feeMinor: 1500 }));
+      },
+    },
+  });
+  const page = await section.buildPage(ctx, { page: "disputes", filters: { view: "analysis" } });
+  const tiles = page!.blocks.find((b) => b.type === "stats") as { items: Array<{ label: string; value: string; sub?: string }> };
+  const tile = Object.fromEntries(tiles.items.map((i) => [i.label, i]));
+  assert.equal(tile["Verdict Accept"].value, "21 fought and lost");
+  assert.match(tile["Verdict Accept"].sub ?? "", /1 of these were won/);
+  const table = page!.blocks.find((b) => b.type === "table" && b.key === "analysis") as TableBlock;
+  assert.equal(table.rows.length, 10);
+  assert.equal(table.nextCursor, "10");
+  assert.equal(feeReads[0].length, 10, "fees are read for the visible page only");
+  assert.ok(table.filters!.some((f) => f.key === "group"));
+  const notice = page!.blocks.find((b) => b.type === "notice") as NoticeBlock;
+  assert.match(notice.text, /12 of 40/);
 });
 
 
