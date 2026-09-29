@@ -1,5 +1,6 @@
 import { EVIDENCE_GROUPS, EVIDENCE_KEY_SET, OVERRIDE_REASON_MIN } from "../../../bot/billing/DisputeEvidenceService";
 import { VERDICT_SIGNAL_LABELS } from "../../../bot/billing/disputeVerdict";
+import { verdictWord } from "../../../bot/billing/DisputeVerdictService";
 import { isStandingSlot } from "../../../bot/billing/evidence/EvidenceDocumentStore";
 import { NO_INTERNAL_ARTIFACT, tokensIn } from "../../../bot/billing/evidence/renderTemplate";
 import { TOKEN_NAMES } from "../../../bot/billing/evidence/tokens";
@@ -390,6 +391,48 @@ export async function disputeAction(
       }
       if (!staged.unchanged) lines.push("Review the sections below, then submit.");
       return { ok: true, text: lines.join("\n") };
+    }
+
+    // T0: re-decide the verdict from fresh facts. Read-only at Stripe (the
+    // build gathers and renders, it never stages), so it needs no ceremony.
+    case "section:disputes.verdict_recompute": {
+      if (!deps.verdicts || !deps.evidencePack) return { ok: false, error: "The verdict service is not configured." };
+      const live = await ctx.stripe.getDispute(disputeId);
+      if (deps.evidence.terminal(live.status)) {
+        return { ok: false, error: `Dispute is already ${live.status}; closed disputes are evaluated by the backtest.` };
+      }
+      const chargeId = typeof live.charge === "string" ? live.charge : live.charge?.id;
+      if (!chargeId) return { ok: false, error: "This dispute has no charge to decide from." };
+      const charge = await ctx.stripe.getCharge(chargeId);
+      const pack = await deps.evidencePack.build(live, charge, { enrich: true });
+      const v = await deps.verdicts.evaluateAndStore(live, charge, pack, "live");
+      if (!v) return { ok: false, error: "The dispute is not in the local mirror yet; try again after the next sync." };
+      await ctx.audit(`Dispute verdict recomputed on ${disputeId}: ${v.verdict} (${v.decisive})`);
+      return {
+        ok: true,
+        text: `Verdict: ${verdictWord(v.verdict)} (${VERDICT_SIGNAL_LABELS[v.decisive].toLowerCase()})${
+          v.complete ? "." : ". Provisional: a source did not answer, so nothing automatic will act on it."
+        }`,
+      };
+    }
+
+    // T1: a human sets the verdict. Wins over the rules everywhere the verdict
+    // is read, including auto-submit and auto-accept, which is exactly why it
+    // takes a typed CONFIRM and a reason.
+    case "section:disputes.verdict_override": {
+      if (!deps.verdicts) return { ok: false, error: "The verdict service is not configured." };
+      if (!confirmed) return { ok: false, error: "Type CONFIRM to override the verdict." };
+      const verdict = p.verdict === "fight" || p.verdict === "accept" ? p.verdict : null;
+      if (!verdict) return { ok: false, fieldErrors: { verdict: "Choose Fight or Accept." } };
+      const reason = str(p.reason, 1000).trim();
+      if (reason.length < OVERRIDE_REASON_MIN) {
+        return { ok: false, fieldErrors: { reason: `Say why, in at least ${OVERRIDE_REASON_MIN} characters.` } };
+      }
+      const live = await ctx.stripe.getDispute(disputeId);
+      if (deps.evidence.terminal(live.status)) return { ok: false, error: `Dispute is already ${live.status}.` };
+      await deps.verdicts.override(disputeId, verdict, reason, { id: ctx.actor.id, name: ctx.actor.name });
+      await ctx.audit(`Dispute verdict overridden on ${disputeId} to ${verdict}: ${reason.slice(0, 300)}`);
+      return { ok: true, text: `Verdict set to ${verdictWord(verdict)}. It wins over the rules until changed again.` };
     }
 
     // T0: ask the auto-resolve engine about THIS dispute, instead of waiting

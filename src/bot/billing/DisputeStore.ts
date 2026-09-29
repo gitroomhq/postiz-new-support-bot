@@ -557,12 +557,26 @@ export class DisputeStore {
   async listMirror(
     skip: number,
     take: number,
-    filter?: { status?: string; reason?: string },
+    filter?: { status?: string; reason?: string; verdict?: "fight" | "accept" | "none" },
     sort: DisputeSort = "new"
   ): Promise<{ rows: StripeDispute[]; total: number }> {
-    const where = {
+    // The EFFECTIVE verdict: a human override wins over the rules, so a
+    // dispute the rules call Accept but a human set to Fight lists as Fight.
+    const verdictWhere: Prisma.StripeDisputeWhereInput | null =
+      filter?.verdict === "none"
+        ? { verdict: null, verdictOverride: null }
+        : filter?.verdict
+          ? {
+              OR: [
+                { verdictOverride: filter.verdict },
+                { verdictOverride: null, verdict: filter.verdict },
+              ],
+            }
+          : null;
+    const where: Prisma.StripeDisputeWhereInput = {
       ...(filter?.status ? { status: filter.status } : {}),
       ...(filter?.reason ? { reason: filter.reason } : {}),
+      ...(verdictWhere ?? {}),
     };
     const orderBy: Prisma.StripeDisputeOrderByWithRelationInput[] =
       sort === "amount"
@@ -710,6 +724,17 @@ export class DisputeStore {
       orderBy: [{ evidenceDueBy: { sort: "asc", nulls: "last" } }, { disputeCreatedAt: "asc" }],
       take,
     });
+  }
+
+  // How fights on this reason have gone: decided disputes where evidence
+  // actually reached the bank. The context a verdict is read in.
+  async foughtRecordForReason(reason: string): Promise<{ won: number; lost: number }> {
+    const where = { reason, evidenceSubmittedAt: { not: null } };
+    const [won, lost] = await Promise.all([
+      this.prisma.stripeDispute.count({ where: { ...where, status: "won" } }),
+      this.prisma.stripeDispute.count({ where: { ...where, status: "lost" } }),
+    ]);
+    return { won, lost };
   }
 
 

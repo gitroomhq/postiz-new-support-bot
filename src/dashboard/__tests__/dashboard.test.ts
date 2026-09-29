@@ -2343,7 +2343,11 @@ test("disputes overview: tabs + level-tinted ratio strip + due-date board (respo
   const board = page!.blocks.find((b) => b.type === "table") as TableBlock;
   assert.deepEqual(board.rows.map((r) => r.id), ["dp_1", "dp_3"]); // under_review filtered out
   assert.deepEqual(board.rows[0].ref, { page: "disputes.detail", params: { id: "dp_1" } });
-  const urgency = board.rows[1].cells[4] as { badges: Array<{ text: string }> };
+  // The verdict pill rides right after the reason: whether to fight comes
+  // before when.
+  const verdict = board.rows[0].cells[2] as { badges: Array<{ text: string }> };
+  assert.equal(verdict.badges[0].text, "Fight");
+  const urgency = board.rows[1].cells[5] as { badges: Array<{ text: string }> };
   assert.equal(urgency.badges[0].text, "OVERDUE");
   assert.equal(await section.navBadge!(disputesCtx()), "3");
 });
@@ -2840,6 +2844,60 @@ test("evidence service: fighting against the verdict needs a reason, is recorded
   // No verdict at all is not a Fight: a human still owes a reason.
   const none = evidenceFakes({ row: disputeRow({ verdict: null, verdictDecisive: null }) });
   assert.equal((await none.svc.submit("dp_1", "42", null)).kind, "verdict_override_required");
+});
+
+test("dispute detail: the verdict card explains itself, and Submit asks for a reason only against the verdict", async () => {
+  const signals = {
+    result: {
+      verdict: "accept",
+      decisive: "thin_first_charge",
+      signals: ["posts_before_charge"],
+      thin: ["thin_first_charge"],
+      missing: [],
+      complete: true,
+    },
+    postsAfterCharge: 0,
+    postsBeforeCharge: 3,
+    channelsInPeriod: 0,
+    queuedPosts: 0,
+    intercomContacts: 0,
+    discordTickets: 0,
+    priorCharges: 0,
+    cardVerified: true,
+    packScore: 55,
+    minScore: 40,
+    refundedMinor: 0,
+    currency: "eur",
+    annual: false,
+    threeDSecure: null,
+    visaCe3: null,
+    cancelAskBeforeCharge: null,
+    cancelledBeforeCharge: null,
+  };
+  const fakes = evidenceFakes({
+    row: disputeRow({ verdict: "accept", verdictDecisive: "thin_first_charge", verdictSignals: signals }),
+  });
+  const section = makeDisputesSection({ ...disputesDeps(fakes), verdicts: { override: async () => {} } as never });
+  const page = await section.buildPage(disputesCtx(fakes), { page: "disputes.detail", params: { id: "dp_1" } });
+  const card = page!.blocks.find((b) => b.type === "kv" && (b as KeyValueBlock).title === "Fight or accept") as KeyValueBlock;
+  const rows = Object.fromEntries(card.rows.map((r) => [r.label, r.cell]));
+  assert.equal((rows["Verdict"] as { badges: Array<{ text: string }> }).badges[0].text, "Accept");
+  assert.match((rows["Decided by"] as { v: string }).v, /first successful payment/);
+  assert.match((rows["Also for fighting"] as { v: string }).v, /Published 3 posts before the charge/);
+  assert.deepEqual(
+    card.actions!.map((a) => a.key),
+    ["section:disputes.verdict_recompute", "section:disputes.verdict_override"]
+  );
+  const submit = (page!.blocks[0] as HeaderBlock).actions!.find((a) => a.key === "section:disputes.submit")!;
+  assert.equal(submit.inputs?.[0].key, "overrideReason");
+  assert.equal(submit.stepUp, true, "the reason is on top of the fresh factor, not instead of it");
+
+  const fight = evidenceFakes();
+  const fightHeader = (await makeDisputesSection(disputesDeps(fight)).buildPage(disputesCtx(fight), {
+    page: "disputes.detail",
+    params: { id: "dp_1" },
+  }))!.blocks[0] as HeaderBlock;
+  assert.equal(fightHeader.actions!.find((a) => a.key === "section:disputes.submit")!.inputs, undefined);
 });
 
 

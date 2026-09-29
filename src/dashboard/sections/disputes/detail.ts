@@ -11,8 +11,19 @@ import {
 import { ActionButton, Badge, Block, Cell, EvidenceBlock, HeaderBlock, TableBlock } from "../../renderer/contract";
 import { DashboardCtx, SectionPage } from "../types";
 import { badgeCell, idCell, isoDateCell, sentence, text } from "../cells";
-import { DisputesDeps, dueBadge, dueCells, eventTone, notFound, registryButton, statusBadgeFor } from "./cells";
+import {
+  DisputesDeps,
+  dueBadge,
+  dueCells,
+  eventTone,
+  notFound,
+  registryButton,
+  signalLabel,
+  statusBadgeFor,
+  verdictBadge,
+} from "./cells";
 import { effectiveVerdict, type Verdict } from "../../../bot/billing/disputeVerdict";
+import type { VerdictDetail } from "../../../bot/billing/DisputeVerdictService";
 
 // The dispute detail page: build the pack, read what it produced, submit.
 //
@@ -377,6 +388,9 @@ export async function detail(ctx: DashboardCtx, deps: DisputesDeps, id: string):
   const notice = leadNotice(state, pkg, dispute.status);
   if (notice) main.push(notice);
 
+  // ---- beat 0: is this one worth fighting at all ----
+  main.push(await verdictBlock(ctx, deps, row, dispute, pkg));
+
   // ---- beat 2: the pack, as the bank will receive it ----
   if (prov) main.push(buildReportBlock(prov));
   main.push(...packBlocks(pkg, id, policySlots));
@@ -570,6 +584,168 @@ export function submitButton(
       : {}),
     ...(disabled ? { disabledReason: disabled } : {}),
   };
+}
+
+// ---- the verdict card ----
+
+function isDetail(v: unknown): v is VerdictDetail {
+  return !!v && typeof v === "object" && !!(v as { result?: unknown }).result && typeof (v as VerdictDetail).result === "object";
+}
+
+function plainCount(n: number | null | undefined, one: string, many: string): string {
+  const k = n ?? 0;
+  return `${k} ${k === 1 ? one : many}`;
+}
+
+// One sentence per signal, with the number that makes it checkable.
+function signalSentence(ctx: DashboardCtx, code: string, d: VerdictDetail): string {
+  switch (code) {
+    case "refunded":
+      return `${ctx.stripe.formatAmount(d.refundedMinor, d.currency)} was already refunded on this charge.`;
+    case "annual":
+      return "The disputed charge paid for a yearly plan.";
+    case "cancel_ask_seen":
+      return "The customer asked support to cancel before this charge was taken.";
+    case "three_d_secure":
+      return "The cardholder passed 3-D Secure on this payment.";
+    case "visa_ce3":
+      return "Visa qualifies this dispute for Compelling Evidence 3.0.";
+    case "thin_first_charge":
+      return "This was the customer's first successful payment.";
+    case "thin_low_score":
+      return `The evidence pack is ${d.packScore ?? 0}% complete, under the ${d.minScore}% bar.`;
+    case "thin_unverified":
+      return "Neither this payment nor an earlier one on the same card passed 3-D Secure, CVC or postcode checks.";
+    case "posts_after_charge":
+      return `Published ${plainCount(d.postsAfterCharge, "post", "posts")} between the charge and the dispute.`;
+    case "posts_before_charge":
+      return `Published ${plainCount(d.postsBeforeCharge, "post", "posts")} before the charge.`;
+    case "channels_in_period":
+      return `${plainCount(d.channelsInPeriod, "channel was", "channels were")} connected during the paid period.`;
+    case "queued_posts":
+      return `${plainCount(d.queuedPosts, "post is", "posts are")} queued or scheduled.`;
+    case "support_contact":
+      return `Before the dispute: ${plainCount(d.intercomContacts, "Intercom conversation", "Intercom conversations")}, ${plainCount(d.discordTickets, "Discord ticket", "Discord tickets")}.`;
+    case "cancel_claim_false":
+      return "Claims to have cancelled, but the subscription was not cancelled before the charge and support saw no request.";
+    case "no_signal":
+      return "Nothing on record suggests this dispute can be won.";
+    default:
+      return signalLabel(code);
+  }
+}
+
+const FEED_LABELS: Record<string, string> = {
+  usage: "Postiz usage",
+  support: "support history",
+  history: "payment history",
+};
+
+async function verdictBlock(
+  ctx: DashboardCtx,
+  deps: DisputesDeps,
+  row: StripeDispute,
+  dispute: Stripe.Dispute,
+  pkg: StagedPackage
+): Promise<Block> {
+  const actions: ActionButton[] = [];
+  if (deps.verdicts && deps.evidencePack && !pkg.terminal) {
+    actions.push({ key: "section:disputes.verdict_recompute", label: "Recompute", style: "secondary", params: { disputeId: row.id } });
+  }
+  if (deps.verdicts && !pkg.terminal) {
+    actions.push({
+      key: "section:disputes.verdict_override",
+      label: "Override verdict",
+      style: "secondary",
+      dangerous: true,
+      params: { disputeId: row.id },
+      summary:
+        "Set the verdict by hand. It wins over the rules everywhere: auto-submit fights a Fight, auto-accept concedes an Accept. The reason is kept in the dispute history.",
+      inputs: [
+        {
+          type: "select",
+          key: "verdict",
+          label: "Verdict",
+          value: effectiveVerdict(row) === "fight" ? "accept" : "fight",
+          options: [
+            { value: "fight", label: "Fight" },
+            { value: "accept", label: "Accept" },
+          ],
+        },
+        { type: "text", key: "reason", label: "Why", multiline: true, rows: 3, maxLength: 1000 },
+      ],
+    });
+  }
+
+  const badge = verdictBadge(row);
+  if (!badge) {
+    // A card, not a notice: the page leads with exactly one notice, and a
+    // missing verdict is a fact about the dispute, not its lead state.
+    return {
+      type: "kv",
+      title: "Fight or accept",
+      rows: [
+        { label: "Verdict", cell: text("Not decided yet") },
+        {
+          label: "Next",
+          cell: text(
+            pkg.terminal
+              ? "Closed disputes are evaluated by the backtest (Disputes → Analysis)."
+              : "The disputes looper decides within the hour; Recompute decides now."
+          ),
+        },
+      ],
+      actions,
+    };
+  }
+
+  const detail = isDetail(row.verdictSignals) ? row.verdictSignals : null;
+  const result = detail?.result;
+  const rows: Array<{ label: string; cell: Cell }> = [];
+  rows.push({ label: "Verdict", cell: { t: "flags", badges: [badge] } });
+  if (detail && result) {
+    rows.push({ label: "Decided by", cell: text(signalSentence(ctx, result.decisive, detail)) });
+    const others = result.signals.filter((s) => s !== result.decisive);
+    if (others.length) rows.push({ label: "Also for fighting", cell: text(others.map((s) => signalSentence(ctx, s, detail)).join(" ")) });
+    const thin = result.thin.filter((s) => s !== result.decisive);
+    if (thin.length) rows.push({ label: "Thin data", cell: text(thin.map((s) => signalSentence(ctx, s, detail)).join(" ")) });
+    rows.push({
+      label: "Sources",
+      cell: result.missing.length
+        ? badgeCell("warn", `No answer from ${result.missing.map((m) => FEED_LABELS[m] ?? m).join(", ")}: provisional`)
+        : text("Every source answered."),
+    });
+  }
+  if (row.verdictOverride) {
+    rows.push({
+      label: "Override",
+      cell: text(
+        `${row.verdictOverride === "fight" ? "Fight" : "Accept"}, set by ${row.verdictOverrideBy ?? "a human"}${
+          row.verdictOverrideAt ? ` on ${row.verdictOverrideAt.toISOString().slice(0, 10)}` : ""
+        }: ${row.verdictOverrideReason ?? ""}`
+      ),
+    });
+    if (row.verdict && row.verdict !== row.verdictOverride) {
+      rows.push({ label: "The rules said", cell: text(row.verdict === "fight" ? "Fight" : "Accept") });
+    }
+  }
+  // Context only: a failed count never costs the card.
+  const record = await Promise.resolve()
+    .then(() => ctx.stores.dispute.foughtRecordForReason(dispute.reason))
+    .catch(() => null);
+  if (record && record.won + record.lost > 0) {
+    rows.push({
+      label: `Our record on ${sentence((dispute.reason || "unknown").replace(/_/g, " ")).toLowerCase()}`,
+      cell: text(`won ${record.won}, lost ${record.lost} when fought`),
+    });
+  }
+  if (row.verdictAt) {
+    rows.push({
+      label: "Decided",
+      cell: text(`${row.verdictAt.toISOString().slice(0, 16).replace("T", " ")} UTC, rules ${row.verdictVersion ?? "?"}${row.verdictSource === "backtest" ? ", backtest" : ""}`),
+    });
+  }
+  return { type: "kv", title: "Fight or accept", rows, actions };
 }
 
 // Build the interactive evidence widget from the staged package + catalog.

@@ -2013,6 +2013,12 @@ export class SettingsStore {
     this.settings = await this.prisma.botSettings.update({ where: { id: "global" }, data });
   }
 
+  async updateDisputeVerdict(data: {
+    disputeVerdictMinScore?: number;
+  }): Promise<void> {
+    this.settings = await this.prisma.botSettings.update({ where: { id: "global" }, data });
+  }
+
   // Stamped by the disputes tick once the 6h Stripe sweeps have actually run,
   // so an hourly tick does not re-run them.
   async recordDisputeReconcile(): Promise<void> {

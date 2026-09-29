@@ -7,6 +7,8 @@ import type { EvidenceDocumentStore } from "../../../bot/billing/evidence/Eviden
 import type { BackfillResult, HandProposeResult } from "../../../bot/billing/AutoResolveService";
 import type { TemplateStore } from "../../../bot/billing/evidence/TemplateStore";
 import type { DisputeEventStore } from "../../../bot/billing/DisputeEventStore";
+import type { DisputeVerdictService } from "../../../bot/billing/DisputeVerdictService";
+import { VERDICT_SIGNAL_LABELS, effectiveVerdict, type VerdictSignal } from "../../../bot/billing/disputeVerdict";
 import type { ActionActor } from "../../../bot/billing/actions/BillingActionService";
 import { ActionButton, Badge, Cell, TableBlock } from "../../renderer/contract";
 import { DashboardCtx, SectionPage } from "../types";
@@ -50,6 +52,8 @@ export interface DisputesDeps {
   templateStore?: TemplateStore | null;
   // Per-dispute history, for the detail page's timeline.
   events?: DisputeEventStore | null;
+  // Fight or accept: the verdict card and its override.
+  verdicts?: DisputeVerdictService | null;
 }
 
 export function actionActor(ctx: DashboardCtx): ActionActor {
@@ -94,6 +98,30 @@ export function dueCells(d: { evidenceDueBy: Date | null }): Cell {
   return { t: "flags", badges: [dueBadge(d.evidenceDueBy)] };
 }
 
+// The verdict as one pill: what the rules (or a human) decided, marked when it
+// is still provisional or was overridden. Same pill on every list.
+export function verdictBadge(d: {
+  verdict: string | null;
+  verdictOverride: string | null;
+  verdictComplete: boolean;
+  verdictSource?: string | null;
+}): Badge | null {
+  const v = effectiveVerdict(d);
+  if (!v) return null;
+  const word = v === "fight" ? "Fight" : "Accept";
+  const suffix = d.verdictOverride ? " (override)" : d.verdictSource === "backtest" ? " (backtest)" : !d.verdictComplete ? " (provisional)" : "";
+  return { kind: v === "fight" ? "ok" : "warn", text: `${word}${suffix}` };
+}
+
+export function verdictCell(d: Parameters<typeof verdictBadge>[0]): Cell {
+  const badge = verdictBadge(d);
+  return badge ? { t: "flags", badges: [badge] } : text("Not yet");
+}
+
+export function signalLabel(code: string | null | undefined): string {
+  return (code && VERDICT_SIGNAL_LABELS[code as VerdictSignal]) || (code ?? "unknown").replace(/_/g, " ");
+}
+
 export function disputeRow(ctx: DashboardCtx, d: StripeDispute): TableBlock["rows"][number] {
   return {
     id: d.id,
@@ -101,6 +129,7 @@ export function disputeRow(ctx: DashboardCtx, d: StripeDispute): TableBlock["row
     cells: [
       amount(ctx.stripe, d.amount, d.currency, statusBadgeFor(d.status)),
       text(sentence(d.reason.replace(/_/g, " "))),
+      verdictCell(d),
       d.customerId
         ? ({ t: "link", v: d.customerId, ref: { page: "customers.detail", params: { id: d.customerId } } } as Cell)
         : text("N/A"),
@@ -116,7 +145,15 @@ export function disputeRow(ctx: DashboardCtx, d: StripeDispute): TableBlock["row
 export function eventTone(kind: string): "info" | "ok" | "warn" | "error" {
   if (kind === "resolve_executed" || kind === "evidence_submitted") return "ok";
   if (kind === "resolve_failed" || kind === "escalated" || kind === "auto_submit_refused") return "error";
-  if (kind === "resolve_blocked" || kind === "resolve_vetoed" || kind === "accepted") return "warn";
+  if (
+    kind === "resolve_blocked" ||
+    kind === "resolve_vetoed" ||
+    kind === "accepted" ||
+    kind === "auto_accepted" ||
+    kind === "verdict_overridden"
+  ) {
+    return "warn";
+  }
   return "info";
 }
 

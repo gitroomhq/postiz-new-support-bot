@@ -4,7 +4,7 @@ import { ActionButton, Badge, Block, Cell, StatsBlock, TableBlock } from "../../
 import { DashboardCtx, SectionPage } from "../types";
 import { amount, badgeCell, idCell, isoDateCell, sentence, strong, text } from "../cells";
 import { autoResolveBlocks } from "./proposals";
-import { BOARD_WINDOW, DisputesDeps, PAGE_SIZE, disputeRow, statusBadgeFor } from "./cells";
+import { BOARD_WINDOW, DisputesDeps, PAGE_SIZE, disputeRow, statusBadgeFor, verdictCell } from "./cells";
 
 // The disputes overview. One page, four tabs, in the order the work happens:
 // what is owed a response, everything, what the engine wants to refund, and
@@ -123,6 +123,7 @@ async function boardBlock(ctx: DashboardCtx): Promise<Block> {
     columns: [
       { key: "amount", label: "Amount" },
       { key: "reason", label: "Reason" },
+      { key: "verdict", label: "Verdict" },
       { key: "customer", label: "Customer" },
       { key: "due", label: "Evidence due" },
       { key: "urgency", label: "" },
@@ -131,7 +132,8 @@ async function boardBlock(ctx: DashboardCtx): Promise<Block> {
     rows,
     empty: "No disputes need a response right now.",
     ...(rows.length ? { footer: `${rows.length} item${rows.length === 1 ? "" : "s"}` } : {}),
-    notice: "Sorted by evidence deadline. Open a dispute to build its evidence pack and submit it.",
+    notice:
+      "Sorted by evidence deadline. The verdict says whether a dispute is worth fighting; open one to see why, then submit or accept it.",
   };
 }
 
@@ -145,10 +147,11 @@ async function allBlocks(
   const status = /^[a-z_]{1,32}$/.test(filters.status ?? "") ? filters.status : "";
   const reason = /^[a-z_.]{1,40}$/.test(filters.reason ?? "") ? filters.reason : "";
   const sort = filters.sort === "due" || filters.sort === "amount" ? filters.sort : "new";
+  const verdict = filters.verdict === "fight" || filters.verdict === "accept" || filters.verdict === "none" ? filters.verdict : undefined;
   const offset = /^\d{1,6}$/.test(cursor ?? "") ? Number(cursor) : 0;
 
   const [page, openReasons, closedReasons] = await Promise.all([
-    ctx.stores.dispute.listMirror(offset, PAGE_SIZE, { status: status || undefined, reason: reason || undefined }, sort),
+    ctx.stores.dispute.listMirror(offset, PAGE_SIZE, { status: status || undefined, reason: reason || undefined, verdict }, sort),
     ctx.stores.dispute.openReasons().catch(() => []),
     ctx.stores.dispute.closedReasons().catch(() => []),
   ]);
@@ -161,6 +164,7 @@ async function allBlocks(
     columns: [
       { key: "amount", label: "Amount" },
       { key: "reason", label: "Reason" },
+      { key: "verdict", label: "Verdict" },
       { key: "customer", label: "Customer" },
       { key: "due", label: "Evidence due" },
       { key: "urgency", label: "" },
@@ -185,6 +189,17 @@ async function allBlocks(
         options: reasons.map((r) => ({ value: r, label: sentence(r.replace(/_/g, " ")) })),
       },
       {
+        key: "verdict",
+        label: "Verdict",
+        kind: "select",
+        value: verdict,
+        options: [
+          { value: "fight", label: "Fight" },
+          { value: "accept", label: "Accept" },
+          { value: "none", label: "Not decided yet" },
+        ],
+      },
+      {
         key: "sort",
         label: "Sort",
         kind: "select",
@@ -197,7 +212,7 @@ async function allBlocks(
     ],
     rows: page.rows.map((d) => disputeRow(ctx, d)),
     nextCursor: offset + PAGE_SIZE < page.total ? String(offset + PAGE_SIZE) : null,
-    empty: status || reason ? "No disputes match these filters." : "No disputes mirrored yet.",
+    empty: status || reason || verdict ? "No disputes match these filters." : "No disputes mirrored yet.",
     ...(page.rows.length
       ? { footer: `${page.rows.length} of ${page.total} item${page.total === 1 ? "" : "s"}` }
       : {}),
@@ -270,6 +285,7 @@ async function historyBlocks(ctx: DashboardCtx, cursor: string | null): Promise<
     columns: [
       { key: "amount", label: "Amount" },
       { key: "reason", label: "Reason" },
+      { key: "verdict", label: "Verdict" },
       { key: "customer", label: "Customer" },
       { key: "closed", label: "Closed" },
       { key: "id", label: "ID" },
@@ -280,6 +296,7 @@ async function historyBlocks(ctx: DashboardCtx, cursor: string | null): Promise<
       cells: [
         amount(ctx.stripe, d.amount, d.currency, statusBadgeFor(d.status)),
         text(sentence(d.reason.replace(/_/g, " "))),
+        verdictCell(d),
         d.customerId
           ? ({ t: "link", v: d.customerId, ref: { page: "customers.detail", params: { id: d.customerId } } } as Cell)
           : text("N/A"),

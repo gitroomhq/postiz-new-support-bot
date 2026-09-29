@@ -792,6 +792,7 @@ async function main() {
       autoResolve: autoResolveService,
       templateStore: evidenceTemplateStore,
       events: disputeEvents,
+      verdicts: disputeVerdicts,
     }),
     makeCatalogSection(),
     makeLinksSection(),

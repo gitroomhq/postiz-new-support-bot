@@ -161,6 +161,31 @@ export function makeDisputesHub(deps: DisputesHubDeps): HubModule {
         ],
       };
 
+      const verdict: Section = {
+        key: "verdict",
+        title: "Fight or accept",
+        fields: [
+          {
+            type: "static",
+            key: "verdictRules",
+            label: "Rules, first match wins",
+            value:
+              "1. Refund already issued on the charge: fight. 2. Annual charge: fight. 3. Canceled-subscription claim and support saw a cancel request before the charge: accept. 4. 3-D Secure authenticated or Visa CE 3.0 qualified: fight. 5. Very little data (first charge, pack below the bar, or a card never verified): accept. 6. Postiz usage, support contact before the dispute, or a cancel claim Stripe disproves: fight. 7. Otherwise: accept.",
+            help: "Submitting against an Accept needs a typed reason on every surface. In auto mode, Accept verdicts are accepted as lost in the auto-submit window; inquiries are left to auto-resolve, except annual charges, which it never refunds.",
+          },
+          {
+            type: "number",
+            key: "disputeVerdictMinScore",
+            label: "Thin-data bar (pack completeness)",
+            value: s.disputeVerdictMinScore(),
+            min: 0,
+            max: 100,
+            unit: "%",
+            help: "A pack below this counts as very little data: usage, support contact and a disproved cancel claim no longer make it a fight.",
+          },
+        ],
+      };
+
       const probe = await deps.postizReadSelfTest().catch((e) => ({ ok: false, detail: String(e).slice(0, 160) }));
       const sources: Section = {
         key: "sources",
@@ -190,7 +215,7 @@ export function makeDisputesHub(deps: DisputesHubDeps): HubModule {
         actions: [{ key: "provision_radar", label: "Provision Radar lists", style: "secondary" }],
       };
 
-      return [evidence, resolve, alerts, sources];
+      return [evidence, verdict, resolve, alerts, sources];
     },
 
     async save(ctx: AdminHubContext, req: SaveRequest): Promise<SaveResult> {
@@ -226,6 +251,13 @@ export function makeDisputesHub(deps: DisputesHubDeps): HubModule {
           const parsed = asBoundedInt(v, 0, max);
           if (!parsed.ok) return { ok: false, fieldErrors: { [req.field]: parsed.error } };
           await s.updateDisputeEvidenceAutomation({ [req.field]: parsed.value });
+          await ctx.audit(`set ${req.field} → ${parsed.value}`);
+          return { ok: true };
+        }
+        case "disputeVerdictMinScore": {
+          const parsed = asBoundedInt(v, 0, 100);
+          if (!parsed.ok) return { ok: false, fieldErrors: { [req.field]: parsed.error } };
+          await s.updateDisputeVerdict({ disputeVerdictMinScore: parsed.value });
           await ctx.audit(`set ${req.field} → ${parsed.value}`);
           return { ok: true };
         }
