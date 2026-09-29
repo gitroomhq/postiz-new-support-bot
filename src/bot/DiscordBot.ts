@@ -115,6 +115,7 @@ import { SINGLETONS } from "../temporal/types";
 import { buildIdIsDegenerate } from "../temporal/buildId";
 import { validateCertPair } from "../temporal/certs";
 import { VaultMigrator, COLUMN_LABELS, type MigrateItemResult, type MigrateReport } from "../vault/VaultMigrator";
+import { EMAIL_COMMAND, EMAIL_PREFIX, EmailCommand } from "./EmailCommand";
 import type { EmailDeliverabilityService } from "../resend/EmailDeliverabilityService";
 import type { ResendClient } from "../resend/ResendClient";
 
@@ -175,9 +176,14 @@ export class DiscordBot {
   } | null = null;
   private postizIdentity: PostizIdentityService | null = null;
   private postizClient: PostizClient | null = null;
-  // Resend suppression tooling for the /config panel.
+  // Resend suppression tooling: the /config panel and the /email command.
   private emailDelivery: EmailDeliverabilityService | null = null;
   private resendClient: ResendClient | null = null;
+  private emailCommand = new EmailCommand(
+    () => this.emailDelivery,
+    () => this.postizIdentity,
+    async (interaction) => (await this.requireSupportOrAdmin(interaction)) != null
+  );
   private sentryFeedbackClient: SentryFeedbackClient | null = null;
   // Sentry feedback import ledger — bound late from index.ts; the /config
   // panel reads its counters.
@@ -785,6 +791,8 @@ export class DiscordBot {
       await this.handleDebugAttributeCommand(interaction);
     } else if (interaction.commandName === "postiz") {
       await this.handlePostizCommand(interaction);
+    } else if (interaction.commandName === "email") {
+      await this.emailCommand.handleCommand(interaction);
     }
   }
 
@@ -1351,6 +1359,13 @@ export class DiscordBot {
 
     if (interaction.customId.startsWith("config_")) {
       await this.handleConfigButton(interaction);
+      return;
+    }
+
+    // emailcmd_ is the /email panel (Resend suppression lookups). It re-runs
+    // the support/admin gate itself on every press.
+    if (interaction.customId.startsWith(EMAIL_PREFIX)) {
+      await this.emailCommand.handleButton(interaction);
       return;
     }
 
@@ -7103,6 +7118,10 @@ export class DiscordBot {
           },
         ],
       },
+      // Support role + admins, checked at runtime on the command and on every
+      // button: no default_member_permissions, or the support role could not
+      // see it at all.
+      EMAIL_COMMAND,
       {
         name: "charge",
         description: "Approve or deny a blocked self-service refund (support/admin only)",
