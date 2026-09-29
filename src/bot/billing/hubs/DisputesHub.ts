@@ -1583,8 +1583,15 @@ export class DisputesHub {
     } else {
       refundableText = "no, formal chargeback: Stripe rejects refunds, respond with evidence instead";
     }
-    const eligibility = ed && "enhanced_eligibility_types" in ed && Array.isArray(ed.enhanced_eligibility_types) && ed.enhanced_eligibility_types.length
-      ? ed.enhanced_eligibility_types.join(", ")
+    // enhanced_eligibility_types lives on the dispute itself, not on
+    // evidence_details (reading it there never found anything). Visa's own
+    // qualification verdict for Compelling Evidence 3.0 rides beside it.
+    const types = Array.isArray(dispute.enhanced_eligibility_types) ? dispute.enhanced_eligibility_types : [];
+    const ce3Status = ed?.enhanced_eligibility?.visa_compelling_evidence_3?.status ?? null;
+    const eligibility = types.length
+      ? types
+          .map((t) => (t === "visa_compelling_evidence_3" && ce3Status ? `${t} (${ce3Status.replace(/_/g, " ")})` : t))
+          .join(", ")
       : null;
 
     const statusEmoji = dispute.status === "won" ? "🏆" : dispute.status === "lost" ? "❌" : dispute.status === "prevented" ? "🛑" : "🚩";
