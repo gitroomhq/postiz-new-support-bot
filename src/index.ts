@@ -24,7 +24,7 @@ import { HowToCategory, BugsCategory, BillingCategory } from "./categories";
 import { IntercomClient } from "./intercom/IntercomClient";
 import { IntercomStore } from "./intercom/IntercomStore";
 import { IntercomSyncService } from "./intercom/IntercomSyncService";
-import { IntercomEventExecutor } from "./intercom/IntercomEventExecutor";
+import { IntercomEventExecutor, escapeHtmlText } from "./intercom/IntercomEventExecutor";
 import { IntercomWebhookHandler } from "./intercom/IntercomWebhookHandler";
 import { IntercomInboxApp } from "./intercom/IntercomInboxApp";
 import { ForwardConvertStore } from "./intercom/ForwardConvertStore";
@@ -558,6 +558,18 @@ async function main() {
   // arrives) and take it off. Ships off; /config → Integrations → Resend.
   const resendClient = new ResendClient(settingsStore);
   const emailDelivery = new EmailDeliverabilityService(settingsStore, resendClient, auditLogger);
+  // Internal notes from the sidebar: bridged conversations go through the
+  // executor's echo-safe path so the note is never relayed back into Discord.
+  const intercomNoteWriter = async (conversationId: string, text: string): Promise<void> => {
+    const link = await intercomStore.getLinkByConversationId(conversationId).catch(() => null);
+    if (link) {
+      await intercomExecutor.postPanelNote(link.ticketThreadId, conversationId, text);
+      return;
+    }
+    await intercomExecutor.withAuthor((adminId) =>
+      intercomClient.replyAsAdmin(conversationId, { adminId, body: `<p>${escapeHtmlText(text)}</p>`, note: true })
+    );
+  };
 
   const intercomInboxApp = new IntercomInboxApp(
     settingsStore,
@@ -570,7 +582,9 @@ async function main() {
     panelTokens,
     panelSessions,
     intercomClient,
-    postizIdentity
+    postizIdentity,
+    emailDelivery,
+    intercomNoteWriter
   );
 
   const bot = new DiscordBot(

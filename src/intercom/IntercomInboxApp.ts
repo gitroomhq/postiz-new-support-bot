@@ -11,7 +11,15 @@ import type { ActionActor } from "../bot/billing/actions/ActionRegistry";
 import type { PanelTokens } from "./panel/PanelTokens";
 import type { PanelSessions } from "./panel/PanelSessions";
 import type { PostizIdentityService } from "../postiz/PostizIdentityService";
+import type { PostizAccount } from "../postiz/PostizClient";
 import type { IntercomClient } from "./IntercomClient";
+import {
+  EMAIL_RE,
+  describeSuppression,
+  distinctEmails,
+  type DeliveryStatus,
+  type EmailDeliverabilityService,
+} from "../resend/EmailDeliverabilityService";
 
 // Canvas Kit inbox app: renders a live context card in the Intercom inbox
 // sidebar. Everything is fetched at render time (plan, charges, ticket state)
@@ -47,9 +55,45 @@ interface CanvasRequestBody {
   input_values?: Record<string, unknown>;
 }
 
+// What the email-delivery section is in the middle of. Carried from one
+// submit to the next only through component ids and the prefilled input, so
+// the server re-derives everything that matters (which address, whose) on
+// every press.
+interface EmailView {
+  // Index into this conversation's address list awaiting a "yes, remove".
+  confirm?: number;
+  // The "check another address" input is open, and what it was asked about.
+  checkOpen?: boolean;
+  query?: string;
+  confirmQuery?: boolean;
+  // Offer "resend activation email" for this listed address (or the query).
+  activation?: number | "q";
+}
+
+// Everything the card knows about who this conversation is with, resolved
+// once per render or press.
+interface CanvasContext {
+  link: Awaited<ReturnType<IntercomStore["getLinkByConversationId"]>>;
+  ticket: Awaited<ReturnType<TicketStore["getByThreadId"]>>;
+  session: Awaited<ReturnType<SessionStore["getSession"]>>;
+  nativeContact: { email: string | null; name: string | null; contactId: string | null; sourceLabel: string } | null;
+  account: PostizAccount | null;
+  stripeCustomerId: string | null;
+  // Filled on first use by addressesFor.
+  addresses?: string[];
+}
+
+// How long one resolved context is reused: long enough to span an action and
+// the render that follows it, short enough that Refresh always re-reads.
+const CONTEXT_MEMO_MS = 5_000;
+
+const REMOVE_WARNING =
+  "Postiz mail (activation, password reset, notifications) will be sent to it again. If it still bounces or is reported as spam, Resend suppresses it again, and repeated bounces hurt delivery for every customer.";
+
 export class IntercomInboxApp {
   private client: Client | null = null;
   private log = new Logger("intercom:canvas");
+  private ctxMemo = new Map<string, { at: number; ctx: CanvasContext }>();
 
   constructor(
     private settingsStore: SettingsStore,
@@ -66,7 +110,13 @@ export class IntercomInboxApp {
     private intercomClient?: IntercomClient,
     // Optional: the card degrades to the identity stamped on the ticket when
     // the platform lookup is off or unconfigured.
-    private postizIdentity?: PostizIdentityService
+    private postizIdentity?: PostizIdentityService,
+    // Resend suppression status and removal. Absent or switched off, the
+    // section is simply not rendered.
+    private emailDelivery?: EmailDeliverabilityService | null,
+    // Posts an internal note on a conversation (bridged ones through the
+    // executor's echo-safe path). Best effort: the removal is audited anyway.
+    private noteWriter?: ((conversationId: string, text: string) => Promise<void>) | null
   ) {}
 
   bindClient(client: Client): void {
@@ -114,6 +164,9 @@ export class IntercomInboxApp {
           ACTION_TIMEOUT_MS
         ).catch(() => null);
         return this.buildCanvas(body, this.noticeForRequest(outcome));
+      }
+      if (componentId.startsWith("email_")) {
+        return await this.handleEmailComponent(body, request, componentId, String(conversationId), actor);
       }
       if (componentId.startsWith("appr_ok:") || componentId.startsWith("appr_no:")) {
         const decision = componentId.startsWith("appr_ok:") ? "approve" : "reject";
@@ -194,43 +247,87 @@ export class IntercomInboxApp {
     });
   }
 
-  private async buildCanvas(body: unknown, notice?: string, panelLink?: { label: string; url: string }): Promise<object> {
-    const request = body as CanvasRequestBody;
-    const conversationId = request?.conversation?.id ?? request?.context?.conversation_id;
-    if (conversationId == null) return canvas([text("No conversation context.")]);
+  // Who this conversation is with. A conversation is EITHER Discord-bridged
+  // (this bot opened it and knows the customer from its own link table) or
+  // native: email, website Messenger, or a Sentry feedback import. Native
+  // conversations used to get "not bridged" and nothing else, which is
+  // precisely backwards: they are the ones where nobody knows who the person
+  // is. Their Intercom contact email is the identifier that resolves them
+  // against the platform.
+  private async resolveContext(conversationId: string): Promise<CanvasContext> {
+    // An action resolves the context, acts, then renders: without this the
+    // render would pay for every lookup a second time inside Intercom's short
+    // response window.
+    const memo = this.ctxMemo.get(conversationId);
+    if (memo && Date.now() - memo.at < CONTEXT_MEMO_MS) return memo.ctx;
+    const ctx = await this.resolveContextUncached(conversationId);
+    if (this.ctxMemo.size > 200) this.ctxMemo.clear();
+    this.ctxMemo.set(conversationId, { at: Date.now(), ctx });
+    return ctx;
+  }
 
-    // A conversation is EITHER Discord-bridged (this bot opened it and knows
-    // the customer from its own link table) or native: email, website
-    // Messenger, or a Sentry feedback import. Native conversations used to get
-    // "not bridged" and nothing else, which is precisely backwards — they are
-    // the ones where nobody knows who the person is. Their Intercom contact
-    // email is the identifier that resolves them against the platform.
-    const link = await this.store.getLinkByConversationId(String(conversationId)).catch(() => null);
+  private async resolveContextUncached(conversationId: string): Promise<CanvasContext> {
+    const link = await this.store.getLinkByConversationId(conversationId).catch(() => null);
     const ticket = link ? await this.ticketStore.getByThreadId(link.ticketThreadId).catch(() => null) : null;
     const session = ticket?.customerId
       ? await this.sessionStore.getSession(ticket.customerId).catch(() => null)
       : null;
+    const nativeContact = link ? null : await this.nativeContact(conversationId);
+    const term = ticket?.postizUserId ?? session?.postizUserId ?? nativeContact?.email ?? null;
+    const account = term ? await this.resolveAccount(term) : null;
+    // Stripe customer: from the Discord link, or resolved from the contact
+    // email for a native conversation.
+    const stripeCustomerId =
+      session?.stripeCustomerId ?? (nativeContact?.email ? await this.customerIdForEmail(nativeContact.email) : null);
+    return { link, ticket, session, nativeContact, account, stripeCustomerId };
+  }
 
-    const nativeContact = link
-      ? null
-      : await this.nativeContact(String(conversationId));
+  // The addresses this person is known by, in the order support reads them:
+  // the one they wrote from, the one Postiz sends to, the one Stripe bills.
+  private async addressesFor(ctx: CanvasContext): Promise<string[]> {
+    if (ctx.addresses) return ctx.addresses;
+    const stripeEmail = ctx.stripeCustomerId
+      ? await timeBox(this.stripe.getCustomer(ctx.stripeCustomerId), FETCH_TIMEOUT_MS)
+          .then((c) => c?.email ?? null)
+          .catch(() => null)
+      : null;
+    ctx.addresses = distinctEmails([ctx.nativeContact?.email, ctx.account?.email, stripeEmail]);
+    return ctx.addresses;
+  }
+
+  private async buildCanvas(
+    body: unknown,
+    notice?: string,
+    panelLink?: { label: string; url: string },
+    emailView: EmailView = {}
+  ): Promise<object> {
+    const request = body as CanvasRequestBody;
+    const conversationId = request?.conversation?.id ?? request?.context?.conversation_id;
+    if (conversationId == null) return canvas([text("No conversation context.")]);
+
+    const ctx = await this.resolveContext(String(conversationId));
+    const { link, ticket, session, nativeContact, stripeCustomerId } = ctx;
 
     const components: CanvasComponent[] = [];
     if (notice) components.push(text(notice), divider());
 
     // Identity first: who this is comes before what they pay.
     components.push(
-      ...(await this.postizSection({
-        stampedUserId: ticket?.postizUserId ?? session?.postizUserId ?? null,
-        email: nativeContact?.email ?? null,
-        stamped: ticket,
-      }))
+      ...(await this.postizSection(
+        {
+          stampedUserId: ticket?.postizUserId ?? session?.postizUserId ?? null,
+          email: nativeContact?.email ?? null,
+          stamped: ticket,
+        },
+        { account: ctx.account }
+      ))
     );
 
-    // Stripe customer: from the Discord link, or resolved from the contact
-    // email for a native conversation.
-    const stripeCustomerId =
-      session?.stripeCustomerId ?? (nativeContact?.email ? await this.customerIdForEmail(nativeContact.email) : null);
+    // Then whether our mail reaches them: an "I never got the email" is the
+    // most common reason to be looking at this card at all.
+    if (this.emailDelivery?.enabled()) {
+      components.push(...(await this.emailSection(await this.addressesFor(ctx), emailView)));
+    }
 
     components.push(divider());
     if (stripeCustomerId) {
@@ -401,21 +498,29 @@ export class IntercomInboxApp {
   // names and the CURRENT tier, keeping this card's "fetched at render time"
   // rule. A lookup that is off, slow or failing degrades to whatever the
   // ticket already recorded rather than dropping the section.
-  private async postizSection(input: {
-    stampedUserId: string | null;
-    email: string | null;
-    stamped: { postizOrgId: string | null; postizTier: string | null; postizRole: string | null } | null;
-  }): Promise<CanvasComponent[]> {
+  private async resolveAccount(term: string): Promise<PostizAccount | null> {
+    if (!this.postizIdentity) return null;
+    return timeBox(this.postizIdentity.resolve(term), FETCH_TIMEOUT_MS).catch((e) => {
+      this.log.warn("postiz lookup failed", { error: e instanceof Error ? e.message : String(e) });
+      return null;
+    });
+  }
+
+  // `pre` carries an account the caller already resolved for the same term,
+  // so one render never asks the platform twice.
+  private async postizSection(
+    input: {
+      stampedUserId: string | null;
+      email: string | null;
+      stamped: { postizOrgId: string | null; postizTier: string | null; postizRole: string | null } | null;
+    },
+    pre?: { account: PostizAccount | null }
+  ): Promise<CanvasComponent[]> {
     const term = input.stampedUserId ?? input.email;
     if (!term) return [header("👤 Postiz account"), text("Not identified: no linked account and no contact email.")];
 
     const components: CanvasComponent[] = [header("👤 Postiz account")];
-    const account = this.postizIdentity
-      ? await timeBox(this.postizIdentity.resolve(term), FETCH_TIMEOUT_MS).catch((e) => {
-          this.log.warn("postiz lookup failed", { error: e instanceof Error ? e.message : String(e) });
-          return null;
-        })
-      : null;
+    const account = pre ? pre.account : await this.resolveAccount(term);
 
     if (account) {
       components.push(
@@ -444,6 +549,161 @@ export class IntercomInboxApp {
     }
     components.push(dataRow("Live lookup", this.postizIdentity ? "unavailable" : "not configured"));
     return components;
+  }
+
+  // ---- email delivery (Resend suppression list) ----
+
+  private describeStatus(st: DeliveryStatus): string {
+    if (st.state === "suppressed") return `⛔ ${describeSuppression(st.suppression, st.source)}`;
+    if (st.state === "clear") return "✅ deliverable, not on the suppression list";
+    return `⚠️ unknown (${st.error})`;
+  }
+
+  private async emailSection(addresses: string[], view: EmailView): Promise<CanvasComponent[]> {
+    const svc = this.emailDelivery!;
+    const components: CanvasComponent[] = [divider(), header("📧 Email delivery (Resend)")];
+    const statuses = await svc.statusFor(addresses);
+    if (!statuses.length) components.push(text("No email address is known for this person."));
+    statuses.forEach((st, i) => {
+      components.push(dataRow(st.email, this.describeStatus(st)));
+      if (st.state === "suppressed") {
+        if (view.confirm === i) {
+          components.push(
+            text(`Remove ${st.email} from the suppression list? ${REMOVE_WARNING}`),
+            button(`email_rmx:${i}`, "Yes, remove it", "primary"),
+            button("email_cancel", "Cancel", "secondary")
+          );
+        } else {
+          components.push(button(`email_rm:${i}`, "Remove from suppression list", "secondary"));
+        }
+      }
+      if (view.activation === i) components.push(button(`email_act:${i}`, "Resend activation email", "secondary"));
+    });
+
+    if (!view.checkOpen) {
+      components.push(button("email_check_open", "Check another address", "secondary"));
+      return components;
+    }
+    components.push(
+      {
+        type: "input",
+        id: "email_query",
+        label: "Any email address",
+        placeholder: "customer@example.com",
+        ...(view.query ? { value: view.query } : {}),
+      },
+      button("email_check", "Check", "secondary")
+    );
+    if (view.query) {
+      const st = await svc.statusOf(view.query);
+      components.push(dataRow(st.email, this.describeStatus(st)));
+      if (st.state === "suppressed") {
+        if (view.confirmQuery) {
+          components.push(
+            text(`Remove ${st.email} from the suppression list? ${REMOVE_WARNING}`),
+            button("email_rmx_q", "Yes, remove it", "primary"),
+            button("email_cancel", "Cancel", "secondary")
+          );
+        } else {
+          components.push(button("email_rm_q", "Remove from suppression list", "secondary"));
+        }
+      }
+      if (view.activation === "q") components.push(button("email_act_q", "Resend activation email", "secondary"));
+    }
+    return components;
+  }
+
+  // Every email_* press. Which address a button means is re-derived here from
+  // the conversation (listed addresses) or read from the input the teammate
+  // typed into (checked ones), never trusted from anything else.
+  private async handleEmailComponent(
+    body: unknown,
+    request: CanvasRequestBody,
+    componentId: string,
+    conversationId: string,
+    actor: ActionActor
+  ): Promise<object> {
+    const svc = this.emailDelivery;
+    if (!svc?.enabled()) return this.buildCanvas(body, "⚠️ Resend is not enabled (/config → Integrations → Resend).");
+    const typed = typeof request.input_values?.["email_query"] === "string" ? String(request.input_values["email_query"]).trim() : "";
+    const query = typed && EMAIL_RE.test(typed) ? typed : undefined;
+
+    if (componentId === "email_check_open") return this.buildCanvas(body, undefined, undefined, { checkOpen: true });
+    if (componentId === "email_cancel") return this.buildCanvas(body, undefined, undefined, { checkOpen: !!typed, query });
+    if (componentId === "email_check") {
+      if (!query) return this.buildCanvas(body, "⚠️ That is not an email address.", undefined, { checkOpen: true });
+      return this.buildCanvas(body, undefined, undefined, { checkOpen: true, query });
+    }
+    if (componentId === "email_rm_q") {
+      if (!query) return this.buildCanvas(body, "⚠️ That is not an email address.", undefined, { checkOpen: true });
+      return this.buildCanvas(body, undefined, undefined, { checkOpen: true, query, confirmQuery: true });
+    }
+    if (componentId.startsWith("email_rm:")) {
+      const index = Number(componentId.slice("email_rm:".length));
+      return this.buildCanvas(body, undefined, undefined, { confirm: Number.isInteger(index) ? index : -1 });
+    }
+
+    // The presses that act: resolve who, then which address.
+    const ctx = await this.resolveContext(conversationId);
+    const addresses = await this.addressesFor(ctx);
+    const pick = (id: string, prefix: string): { email: string | undefined; slot: number | "q" } => {
+      if (id === `${prefix}_q`) return { email: query, slot: "q" };
+      const index = Number(id.slice(`${prefix}:`.length));
+      return { email: Number.isInteger(index) ? addresses[index] : undefined, slot: index };
+    };
+    const keepCheck = { checkOpen: !!typed, query };
+
+    if (componentId.startsWith("email_rmx")) {
+      const { email, slot } = pick(componentId, "email_rmx");
+      if (!email) return this.buildCanvas(body, "⚠️ That address is no longer on this card; nothing was removed.", undefined, keepCheck);
+      const result = await timeBox(
+        svc.remove(email, { surface: "intercom", id: actor.id, name: actor.name }, { conversationId }),
+        ACTION_TIMEOUT_MS
+      ).catch(() => null);
+      if (!result) return this.buildCanvas(body, "⏳ Still processing. Press Refresh in a few seconds.", undefined, keepCheck);
+      if (result.kind === "not_suppressed") {
+        return this.buildCanvas(body, `ℹ️ ${email} was not on the suppression list; nothing to remove.`, undefined, keepCheck);
+      }
+      if (result.kind !== "removed") {
+        const why = result.kind === "error" || result.kind === "invalid" ? result.error : "Resend is not enabled.";
+        return this.buildCanvas(body, `⚠️ ${why}`, undefined, keepCheck);
+      }
+      const was = result.previous ? describeSuppression(result.previous, null) : "suppressed";
+      void this.noteWriter?.(
+        conversationId,
+        `${actor.name} removed ${email} from the Resend suppression list (it was ${was}). Postiz emails will be delivered to it again; a new bounce or spam complaint suppresses it again.`
+      ).catch((e) => this.log.warn("suppression note failed", { error: e instanceof Error ? e.message : String(e) }));
+      // The usual reason this mattered: the activation mail never arrived.
+      const account = ctx.account?.email?.toLowerCase() === email.toLowerCase() ? ctx.account : slot === "q" ? await this.resolveAccount(email) : null;
+      const offer = account?.userActivated === false && account.email?.toLowerCase() === email.toLowerCase();
+      return this.buildCanvas(
+        body,
+        `✅ Removed ${email} from the suppression list. New mail from Postiz will be delivered to it.${
+          offer ? " Their Postiz account is not activated yet: resend the activation email below." : ""
+        }`,
+        undefined,
+        { ...keepCheck, ...(offer ? { activation: slot } : {}) }
+      );
+    }
+
+    if (componentId.startsWith("email_act")) {
+      const { email } = pick(componentId, "email_act");
+      if (!email) return this.buildCanvas(body, "⚠️ That address is no longer on this card.", undefined, keepCheck);
+      const sent = await timeBox(
+        svc.resendActivation(email, { surface: "intercom", id: actor.id, name: actor.name }),
+        ACTION_TIMEOUT_MS
+      ).catch(() => ({ ok: false as const, error: "Postiz did not answer in time." }));
+      if (sent.ok) {
+        void this.noteWriter?.(conversationId, `${actor.name} asked Postiz to resend the activation email to ${email}.`).catch(() => {});
+      }
+      return this.buildCanvas(
+        body,
+        sent.ok ? `✅ Postiz is sending a new activation email to ${email}.` : `⚠️ ${sent.error}`,
+        undefined,
+        keepCheck
+      );
+    }
+    return this.buildCanvas(body, undefined, undefined, keepCheck);
   }
 
   private async billingSection(stripeCustomerId: string): Promise<CanvasComponent[]> {
@@ -563,6 +823,12 @@ function dataRow(label: string, value: string): CanvasComponent {
 
 function divider(): CanvasComponent {
   return { type: "divider" };
+}
+
+// Button labels are plain text: no emoji (house rule), the section header
+// carries the icon.
+function button(id: string, label: string, style: "primary" | "secondary"): CanvasComponent {
+  return { type: "button", id, label, style, action: { type: "submit" } };
 }
 
 // Folds identical label/value pairs into one row carrying a count, keeps the
