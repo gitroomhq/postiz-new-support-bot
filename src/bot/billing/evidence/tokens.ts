@@ -160,6 +160,18 @@ export interface CardHistoryFacts {
   sameCard3dsIso: string | null;
 }
 
+// The customer's payment record as the fight-or-accept verdict reads it. Not
+// cited by any template: it answers "is there any history at all", which is a
+// question about whether to fight, not a claim to make to a bank.
+export interface ChargeHistoryFacts {
+  // Successful charges for this customer, on any card, before the disputed one.
+  priorSucceeded: number;
+  // 3-D Secure, a CVC check or a postal check passed on this charge, or on an
+  // earlier charge on the same card. null = not a card payment, or a card with
+  // no fingerprint to follow back.
+  cardVerified: boolean | null;
+}
+
 export interface EvidenceFacts {
   dispute: DisputeFacts;
   charge: ChargeFacts | null;
@@ -171,6 +183,8 @@ export interface EvidenceFacts {
   support: SupportFacts | null;
   usage: UsageFacts | null;
   cards: CardHistoryFacts | null;
+  // Absent or null when the charge list was not fetched or could not be read.
+  history?: ChargeHistoryFacts | null;
   reach: FactReach;
 }
 

@@ -295,6 +295,9 @@ model BotSettings {
   // Intercom lookups cost seconds, so they run on the looper's enrich pass
   // rather than inside the 60s webhook. Switchable for when Intercom is down.
   disputeTemplateIntercomEnabled Boolean @default(true)
+  // Fight-or-accept verdict: a pack completeness below this counts as "very
+  // little data" and turns every weak fight signal into Accept.
+  disputeVerdictMinScore        Int     @default(40)
   // Money-out ledger: every outflow (refunds, disputes, fees, concessions)
   // mirrored from Stripe's balance transactions + the concession webhooks.
   // moneyOutSweepAt is the reconcile cursor (sweeps re-read from it minus an
@@ -904,6 +907,24 @@ model StripeDispute {
   evidenceTouchedBy       String?
   evidenceAutoSubmitAt    DateTime?
   evidenceAutoOptOut      Boolean   @default(false) // a human said "leave this one alone"
+  // ---- fight or accept (src/bot/billing/disputeVerdict.ts) ----
+  // The last verdict the rules produced, the signal that decided it, and every
+  // fact it was decided from (verdictSignals). verdictComplete is false while
+  // any feed that could have produced a fight signal did not answer: the
+  // verdict still shows, but nothing irreversible may act on it.
+  verdict                 String? // fight | accept
+  verdictDecisive         String?
+  verdictSignals          Json?
+  verdictComplete         Boolean   @default(false)
+  verdictVersion          String?
+  verdictSource           String? // live | backtest
+  verdictAt               DateTime?
+  // A human disagreeing with the rules, with the reason they gave. Wins over
+  // `verdict` everywhere the verdict is consulted.
+  verdictOverride         String? // fight | accept
+  verdictOverrideBy       String?
+  verdictOverrideReason   String?
+  verdictOverrideAt       DateTime?
   createdAt           DateTime  @default(now())
   updatedAt           DateTime  @updatedAt
 
@@ -912,6 +933,7 @@ model StripeDispute {
   @@index([chargeId])
   @@index([customerId])
   @@index([closedAt])
+  @@index([verdict])
   @@map("stripe_disputes")
 }
 

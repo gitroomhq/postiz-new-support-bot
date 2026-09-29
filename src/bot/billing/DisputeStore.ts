@@ -641,6 +641,78 @@ export class DisputeStore {
     await this.prisma.stripeDispute.update({ where: { id: disputeId }, data: { evidenceAutoOptOut: optOut } });
   }
 
+  // ---- fight-or-accept verdict ----
+
+  // Writes the rules' latest verdict. The override columns are never touched
+  // here: a recompute must not erase a human's disagreement with the rules.
+  async recordVerdict(
+    disputeId: string,
+    v: {
+      verdict: string;
+      decisive: string;
+      signals: unknown;
+      complete: boolean;
+      version: string;
+      source: "live" | "backtest";
+    },
+    at: Date = new Date()
+  ): Promise<StripeDispute | null> {
+    const updated = await this.prisma.stripeDispute.updateMany({
+      where: { id: disputeId },
+      data: {
+        verdict: v.verdict,
+        verdictDecisive: v.decisive,
+        verdictSignals: v.signals as Prisma.InputJsonValue,
+        verdictComplete: v.complete,
+        verdictVersion: v.version,
+        verdictSource: v.source,
+        verdictAt: at,
+      },
+    });
+    if (updated.count === 0) return null;
+    return this.get(disputeId);
+  }
+
+  async recordVerdictOverride(
+    disputeId: string,
+    o: { verdict: "fight" | "accept"; by: string; reason: string },
+    at: Date = new Date()
+  ): Promise<void> {
+    await this.prisma.stripeDispute.updateMany({
+      where: { id: disputeId },
+      data: {
+        verdictOverride: o.verdict,
+        verdictOverrideBy: o.by.slice(0, 190),
+        verdictOverrideReason: o.reason.slice(0, 1000),
+        verdictOverrideAt: at,
+      },
+    });
+  }
+
+  // Open disputes still waiting on a response whose verdict is missing,
+  // incomplete, from an older rule set, or older than staleBefore. Most urgent
+  // first, so a capped tick spends itself on the deadlines that matter.
+  async listNeedingVerdict(version: string, staleBefore: Date, take: number): Promise<StripeDispute[]> {
+    return this.prisma.stripeDispute.findMany({
+      where: {
+        status: { in: [...RESPONDABLE_DISPUTE_STATUSES] },
+        evidenceSubmittedAt: null,
+        // `not` never matches NULL in SQL, so a missing version is spelled out.
+        OR: [
+          { verdict: null },
+          { verdictComplete: false },
+          { verdictVersion: null },
+          { verdictVersion: { not: version } },
+          { verdictAt: null },
+          { verdictAt: { lt: staleBefore } },
+        ],
+      },
+      orderBy: [{ evidenceDueBy: { sort: "asc", nulls: "last" } }, { disputeCreatedAt: "asc" }],
+      take,
+    });
+  }
+
+
   // Respondable, unsubmitted, not opted out, and inside the auto-submit window.
   // The looper's enrich-and-submit work list.
   async listNeedingAutoEvidence(withinHours: number, now: Date = new Date()): Promise<StripeDispute[]> {

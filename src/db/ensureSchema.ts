@@ -1142,6 +1142,20 @@ export const STATEMENTS: string[] = [
   `ALTER TABLE "stripe_disputes" ADD COLUMN IF NOT EXISTS "evidenceTouchedBy" TEXT`,
   `ALTER TABLE "stripe_disputes" ADD COLUMN IF NOT EXISTS "evidenceAutoSubmitAt" TIMESTAMP(3)`,
   `ALTER TABLE "stripe_disputes" ADD COLUMN IF NOT EXISTS "evidenceAutoOptOut" BOOLEAN NOT NULL DEFAULT false`,
+  // Fight-or-accept verdict, plus a human override that wins over it.
+  `ALTER TABLE "stripe_disputes" ADD COLUMN IF NOT EXISTS "verdict" TEXT`,
+  `ALTER TABLE "stripe_disputes" ADD COLUMN IF NOT EXISTS "verdictDecisive" TEXT`,
+  `ALTER TABLE "stripe_disputes" ADD COLUMN IF NOT EXISTS "verdictSignals" JSONB`,
+  `ALTER TABLE "stripe_disputes" ADD COLUMN IF NOT EXISTS "verdictComplete" BOOLEAN NOT NULL DEFAULT false`,
+  `ALTER TABLE "stripe_disputes" ADD COLUMN IF NOT EXISTS "verdictVersion" TEXT`,
+  `ALTER TABLE "stripe_disputes" ADD COLUMN IF NOT EXISTS "verdictSource" TEXT`,
+  `ALTER TABLE "stripe_disputes" ADD COLUMN IF NOT EXISTS "verdictAt" TIMESTAMP(3)`,
+  `ALTER TABLE "stripe_disputes" ADD COLUMN IF NOT EXISTS "verdictOverride" TEXT`,
+  `ALTER TABLE "stripe_disputes" ADD COLUMN IF NOT EXISTS "verdictOverrideBy" TEXT`,
+  `ALTER TABLE "stripe_disputes" ADD COLUMN IF NOT EXISTS "verdictOverrideReason" TEXT`,
+  `ALTER TABLE "stripe_disputes" ADD COLUMN IF NOT EXISTS "verdictOverrideAt" TIMESTAMP(3)`,
+  `CREATE INDEX IF NOT EXISTS "stripe_disputes_verdict_idx" ON "stripe_disputes"("verdict")`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "disputeVerdictMinScore" INTEGER NOT NULL DEFAULT 40`,
   // Operator overrides for the shipped evidence template corpus.
   `CREATE TABLE IF NOT EXISTS "dispute_evidence_templates" (
     "id" TEXT NOT NULL,

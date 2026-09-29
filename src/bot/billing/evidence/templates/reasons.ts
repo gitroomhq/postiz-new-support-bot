@@ -17,8 +17,10 @@ const cancelledAfterCharge = (f: EvidenceFacts): boolean =>
   !!f.sub?.canceledAtIso && !!f.charge?.dateIso && f.sub.canceledAtIso > f.charge.dateIso;
 
 // "Not cancelled before the charge" is also true of a subscription that was
-// never cancelled at all, so a null cancellation date passes.
-const notCancelledBeforeCharge = (f: EvidenceFacts): boolean =>
+// never cancelled at all, so a null cancellation date passes. Exported because
+// the fight-or-accept verdict asks the same question of the same facts, and
+// two copies of a date comparison is how one of them ends up wrong.
+export const notCancelledBeforeCharge = (f: EvidenceFacts): boolean =>
   !!f.sub && !!f.charge && (!f.sub.canceledAtIso || f.sub.canceledAtIso > f.charge.dateIso);
 
 const siblingPrecedesCharge = (f: EvidenceFacts): boolean =>

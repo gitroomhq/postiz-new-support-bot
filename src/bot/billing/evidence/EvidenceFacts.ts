@@ -5,6 +5,7 @@ import { subPlanLabel } from "../ui";
 import type {
   BillingHistoryFacts,
   CardHistoryFacts,
+  ChargeHistoryFacts,
   UsageFacts,
   ChargeFacts,
   CustomerFacts,
@@ -25,6 +26,10 @@ export interface FactSources {
   // Real product usage. Absent = every usage paragraph is omitted rather than
   // replaced with something vaguer.
   usage?: UsageFacts | null;
+  // Whether the usage feed ANSWERED, which is not the same as having usage: a
+  // platform that looked and found no account for this customer answered.
+  // Defaults to "usage is present" for callers that do not know the difference.
+  usageReached?: boolean;
   postiz?: PostizIdentityService | null;
   // Support facts are gathered by the caller (they are slow, so only the
   // looper's enrich pass supplies them).
@@ -163,6 +168,38 @@ function cardHistory(charges: Stripe.Charge[], charge: Stripe.Charge): CardHisto
     // this account. Close to decisive on an unauthorised-use claim.
     sameCard3dsIso: authenticated ? new Date(authenticated.created * 1000).toISOString() : null,
   };
+}
+
+// Did the cardholder prove they held this card at the time: 3-D Secure, the
+// security code or the billing postcode. "unavailable"/"unchecked" are not a
+// pass, and neither is a 3-D Secure attempt the issuer merely acknowledged.
+function cardCheckPassed(c: Stripe.Charge): boolean {
+  const card = c.payment_method_details?.card;
+  if (!card) return false;
+  return (
+    card.three_d_secure?.result === "authenticated" ||
+    card.checks?.cvc_check === "pass" ||
+    card.checks?.address_postal_code_check === "pass"
+  );
+}
+
+// The verdict's view of the payment record. Renewals are charged off-session,
+// with no security code and no 3-D Secure, so judging a renewal by its own
+// checks alone would call every subscription card unverified; an earlier
+// payment on the same card that passed is the verification that renewal rests on.
+export function chargeHistory(charges: Stripe.Charge[], charge: Stripe.Charge): ChargeHistoryFacts {
+  const prior = charges.filter((c) => c.id !== charge.id && c.status === "succeeded" && c.created < charge.created);
+  const card = charge.payment_method_details?.card ?? null;
+  let cardVerified: boolean | null;
+  if (!card) cardVerified = null;
+  else if (cardCheckPassed(charge)) cardVerified = true;
+  else if (!card.fingerprint) cardVerified = null;
+  else {
+    cardVerified = prior.some(
+      (c) => c.payment_method_details?.card?.fingerprint === card.fingerprint && cardCheckPassed(c)
+    );
+  }
+  return { priorSucceeded: prior.length, cardVerified };
 }
 
 function customerFacts(customer: Stripe.Customer | null, charge: Stripe.Charge): CustomerFacts | null {
@@ -321,6 +358,9 @@ export interface GatherOptions {
   // fingerprint. The fraud-shaped reasons need this even though they are not
   // duplicate claims.
   needCardHistory?: boolean;
+  // Fetch the charge list for the verdict's payment-record facts (history),
+  // without switching on the card paragraphs a reason does not use.
+  needChargeHistory?: boolean;
 }
 
 // One pass over every source. Costs at most five Stripe reads plus one
@@ -340,16 +380,20 @@ export async function gatherFacts(
   // and to its place in the payment history.
   const invoiceIdPromise = stripe.resolveChargeInvoiceId(charge).catch(() => null);
 
-  const [customer, subs, invoices, otherCharges, postiz, invoiceId] = await Promise.all([
+  // null = not fetched or not readable, which the verdict must not mistake for
+  // an empty history.
+  const wantCharges = opts.needDuplicates || opts.needCardHistory || opts.needChargeHistory;
+  const [customer, subs, invoices, chargeList, postiz, invoiceId] = await Promise.all([
     customerId ? stripe.getCustomer(customerId).catch(() => null) : Promise.resolve(null),
     customerId ? stripe.listSubscriptions(customerId).catch(() => [] as Stripe.Subscription[]) : Promise.resolve([]),
     customerId ? stripe.listInvoices(customerId, 12).then((r) => r.invoices).catch(() => [] as Stripe.Invoice[]) : Promise.resolve([]),
-    (opts.needDuplicates || opts.needCardHistory) && customerId
-      ? stripe.listCharges(customerId, 100).then((r) => r.charges).catch(() => [] as Stripe.Charge[])
-      : Promise.resolve([] as Stripe.Charge[]),
+    wantCharges && customerId
+      ? stripe.listCharges(customerId, 100).then((r) => r.charges).catch(() => null)
+      : Promise.resolve(null),
     postizFacts(sources.postiz, customerId),
     invoiceIdPromise,
   ]);
+  const otherCharges = chargeList ?? [];
   const invoice = invoiceId ? (invoices.find((i) => i.id === invoiceId) ?? null) : null;
 
   // What each feed returned, before any quality bar is applied. The bars
@@ -361,7 +405,7 @@ export async function gatherFacts(
     sub: subs.length > 0,
     billing: invoices.length > 0,
     postiz: postiz.reached,
-    usage: sources.usage != null,
+    usage: sources.usageReached ?? sources.usage != null,
     cards: (opts.needCardHistory ?? false) && otherCharges.length > 0,
     support: sources.support != null,
   };
@@ -384,6 +428,7 @@ export async function gatherFacts(
     support: sources.support ?? null,
     usage: sources.usage ?? null,
     cards: opts.needCardHistory ? cardHistory(otherCharges, charge) : null,
+    history: chargeList ? chargeHistory(chargeList, charge) : null,
   };
 }
 

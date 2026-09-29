@@ -11,6 +11,7 @@ import { attachReceiptEvidence } from "./billing/receiptEvidence";
 import type { AutoResolveService } from "./billing/AutoResolveService";
 import type { EvidencePackBuilder } from "./billing/evidence/EvidencePackBuilder";
 import type { DisputeEventStore } from "./billing/DisputeEventStore";
+import type { DisputeVerdictService } from "./billing/DisputeVerdictService";
 import { COLORS } from "../util/embeds";
 import { log } from "../util/logger";
 import { metricCount } from "../util/instrument";
@@ -134,6 +135,15 @@ export class StripeWebhookHandler {
   // Per-dispute history. Best-effort everywhere: a missing timeline entry is a
   // gap in an explanation, never a reason to fail a webhook.
   private events: DisputeEventStore | null = null;
+
+  // Fight or accept. On the webhook it is PROVISIONAL: the fast pack never
+  // calls Intercom, so the support feed has not answered yet and the verdict
+  // stays incomplete until the looper's enriched pass.
+  private verdicts: DisputeVerdictService | null = null;
+
+  setDisputeVerdictService(service: DisputeVerdictService): void {
+    this.verdicts = service;
+  }
 
   setDisputeEventStore(store: DisputeEventStore): void {
     this.events = store;
@@ -587,7 +597,13 @@ export class StripeWebhookHandler {
           const built = await withDeadline(
             (async () => {
               const pack = await this.evidencePack!.build(dispute, charge);
-              return this.evidencePack!.stage(dispute, pack, receiptStaged);
+              const staged = await this.evidencePack!.stage(dispute, pack, receiptStaged);
+              // Best effort: a verdict that cannot be made here is made by the
+              // looper within the hour, and must never fail the webhook.
+              await this.verdicts?.evaluateAndStore(dispute, charge, staged.pack, "live").catch((e) => {
+                hookLog.warn("provisional dispute verdict failed", { "stripe.dispute_id": dispute.id, "error.message": String(e) });
+              });
+              return staged;
             })(),
             PACK_DEADLINE_MS
           );

@@ -171,6 +171,23 @@ export class TicketStore {
     });
   }
 
+  // Every ticket these Discord customers opened before a moment, open or
+  // closed, oldest first. The dispute verdict's view of support contact: a
+  // Discord-only refund ticket never reaches Intercom, so without this a
+  // customer who asked us for their money back would look like a stranger.
+  async listByCustomerIdsBefore(
+    customerIds: string[],
+    before: Date
+  ): Promise<Array<{ createdAt: Date; categoryId: string | null; question: string | null }>> {
+    if (customerIds.length === 0) return [];
+    return this.prisma.ticket.findMany({
+      where: { customerId: { in: customerIds }, createdAt: { lt: before } },
+      orderBy: { createdAt: "asc" },
+      select: { createdAt: true, categoryId: true, question: true },
+      take: 200,
+    });
+  }
+
   // A customer's still-open tickets (used to close them out when the member leaves).
   async listOpenByCustomerId(customerId: string): Promise<TicketWithTag[]> {
     return this.prisma.ticket.findMany({

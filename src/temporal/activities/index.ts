@@ -768,7 +768,9 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
     // reminders, check the ratio thresholds (all idempotent per tick).
     async disputesTick(force) {
       heartbeat();
-      return disputeMonitor.tick(force);
+      // Per-dispute heartbeat: the verdict sweep and the backtest enrich
+      // through Intercom, which can outlast one heartbeat window on its own.
+      return disputeMonitor.tick(force, () => heartbeat());
     },
 
     // Money-out ledger reconcile: walk Stripe's balance transactions forward

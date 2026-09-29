@@ -131,6 +131,7 @@ import { EvidencePackBuilder } from "./bot/billing/evidence/EvidencePackBuilder"
 import { SubscriptionEventStore } from "./bot/billing/SubscriptionEventStore";
 import { SubscriptionEventService } from "./bot/billing/SubscriptionEventService";
 import { DisputeMonitor } from "./bot/billing/DisputeMonitor";
+import { DisputeVerdictService } from "./bot/billing/DisputeVerdictService";
 import { ResendClient } from "./resend/ResendClient";
 import { EmailDeliverabilityService } from "./resend/EmailDeliverabilityService";
 import { TemporalService } from "./temporal/TemporalService";
@@ -292,6 +293,10 @@ async function main() {
   // Per-dispute history: what happened, when, and who or what did it. Declared
   // before the services that write to it.
   const disputeEvents = new DisputeEventStore(prisma);
+  // Fight or accept: decides from the evidence pack's facts (plus the
+  // customer's Discord tickets) whether a dispute is worth answering. The
+  // evidence service enforces it at submit; the looper keeps it current.
+  const disputeVerdicts = new DisputeVerdictService(settingsStore, disputeStore, sessionStore, ticketStore, disputeEvents);
   // Shared dispute-evidence core: /billing → Disputes AND the web dashboard's
   // workbench run this one implementation (catalog, staging, submit claims).
   const disputeEvidenceService = new DisputeEvidenceService(stripeClient, disputeStore, sessionStore, disputeEvents);
@@ -344,7 +349,8 @@ async function main() {
     ratioEngine,
     autoResolveService,
     evidencePackBuilder,
-    disputeEvidenceService
+    disputeEvidenceService,
+    disputeVerdicts
   );
   // Money-out ledger: every outflow (refunds, disputes, fees, concessions)
   // mirrored from Stripe's balance transactions, whatever surface caused it —
@@ -361,6 +367,7 @@ async function main() {
   stripeWebhookHandler.setSubscriptionEventService(subscriptionEventService);
   stripeWebhookHandler.setAutoResolveService(autoResolveService);
   stripeWebhookHandler.setEvidencePackBuilder(evidencePackBuilder);
+  stripeWebhookHandler.setDisputeVerdictService(disputeVerdicts);
   stripeWebhookHandler.setDisputeEventStore(disputeEvents);
   // Full analytics rebuild (/config → Analytics → Rebuild). Reaches across every
   // money mirror, so it is constructed here rather than owned by any one of

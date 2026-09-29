@@ -372,6 +372,8 @@ export interface DisputesTickResult {
   packed: number;
   autoSubmitted: number;
   escalated: number;
+  // Fight-or-accept verdicts refreshed on open disputes.
+  verdicts: number;
 }
 
 export interface MoneyOutTickResult {

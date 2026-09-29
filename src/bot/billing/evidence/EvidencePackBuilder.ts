@@ -7,7 +7,7 @@ import type { DisputeEvidenceService } from "../DisputeEvidenceService";
 import { confirmedOrgFor, type PostizIdentityService } from "../../../postiz/PostizIdentityService";
 import type { IntercomClient } from "../../../intercom/IntercomClient";
 import { FactCache, gatherFacts } from "./EvidenceFacts";
-import { collectSupportFacts } from "./intercomHistory";
+import { probeSupportContact, type SupportProbe } from "./intercomHistory";
 import { renderField, type RenderedField } from "./renderTemplate";
 import { resolveTokens, type EvidenceFacts, type UsageFacts } from "./tokens";
 import type { PostizActivitySource } from "../../../postiz/PostizActivitySource";
@@ -44,6 +44,13 @@ export interface EvidencePack {
   score: number;
   templateVersion: string;
   facts: EvidenceFacts;
+  // For the fight-or-accept verdict, which needs to know whether a feed
+  // ANSWERED, not only what it said. Optional so a hand-made pack in a test or
+  // a cached one from before still reads as "not known".
+  usageReached?: boolean;
+  // The Intercom pass as the verdict sees it. Null on the fast path, which
+  // never calls Intercom.
+  supportProbe?: SupportProbe | null;
 }
 
 export interface StageResult {
@@ -119,21 +126,30 @@ export class EvidencePackBuilder {
     const reason = packReasonFor(dispute.reason);
     const customerId = typeof charge.customer === "string" ? charge.customer : (charge.customer?.id ?? null);
 
-    const support =
-      opts.enrich && this.intercom && this.settings.disputeTemplateIntercomEnabled()
-        ? await collectSupportFacts(
+    // One Intercom pass serves both readers. The verdict runs it whenever the
+    // pass is enriched; the template toggle only decides whether the PACK may
+    // quote what it found.
+    const supportProbe =
+      opts.enrich && this.intercom
+        ? await probeSupportContact(
             { intercom: this.intercom, sessionStore: this.sessionStore, settings: this.settings },
             customerId,
-            typeof charge.billing_details?.email === "string" ? charge.billing_details.email : null
+            typeof charge.billing_details?.email === "string" ? charge.billing_details.email : null,
+            {
+              disputeOpenedAt: new Date(dispute.created * 1000),
+              chargeAt: new Date(charge.created * 1000),
+              scanCancelAsk: dispute.reason === "subscription_canceled",
+            }
           ).catch(() => null)
         : null;
+    const support = supportProbe && this.settings.disputeTemplateIntercomEnabled() ? supportProbe.facts : null;
 
     // The platform org id is what the usage tables are keyed on, so it has to
     // be resolved before the posts can be counted.
-    const usage = await this.usageFor(customerId, dispute, charge).catch(() => null);
+    const usage = await this.usageFor(customerId, dispute, charge).catch(() => ({ usage: null, reached: false }));
 
     const facts = await gatherFacts(
-      { stripe: this.stripe, postiz: this.postiz, support, usage },
+      { stripe: this.stripe, postiz: this.postiz, support, usage: usage.usage, usageReached: usage.reached },
       dispute,
       charge,
       {
@@ -141,10 +157,16 @@ export class EvidencePackBuilder {
         // The fraud-shaped reasons argue from card identity, so they need the
         // charge history even though they are not duplicate claims.
         needCardHistory: reason === "fraudulent" || reason === "unrecognized" || reason === "duplicate",
+        // The verdict reads the payment record on every reason.
+        needChargeHistory: true,
       }
     );
     this.facts.set(dispute.id, facts);
-    return this.render(reason, facts, await this.templates.overrides(), opts.enrich === true);
+    return {
+      ...this.render(reason, facts, await this.templates.overrides(), opts.enrich === true),
+      usageReached: usage.reached,
+      supportProbe,
+    };
   }
 
   // Pure once the facts exist, so a preview can re-render from cache for free.
@@ -173,29 +195,36 @@ export class EvidencePackBuilder {
   }
 
   // Resolves the Stripe customer to a platform organisation, then reads that
-  // organisation's real posting activity. Returns null at every step it cannot
-  // complete: a missing usage feed removes those paragraphs, it never weakens
-  // the ones that remain.
+  // organisation's real posting activity. Returns no usage at every step it
+  // cannot complete: a missing usage feed removes those paragraphs, it never
+  // weakens the ones that remain.
+  //
+  // `reached` is the verdict's question, and it is narrower than "got usage".
+  // A platform that searched and found no account for this customer ANSWERED:
+  // no account means no use. A lookup that was off, timed out, errored, or
+  // returned organisations we cannot prove are this customer's did not.
   private async usageFor(
     customerId: string | null,
     dispute: Stripe.Dispute,
     charge: Stripe.Charge
-  ): Promise<UsageFacts | null> {
-    if (!customerId || !this.activity?.configured() || !this.postiz) return null;
+  ): Promise<{ usage: UsageFacts | null; reached: boolean }> {
+    const none = { usage: null, reached: false };
+    if (!customerId || !this.activity?.configured() || !this.postiz) return none;
     const lookup = await this.postiz.resolveOrgsForCustomer(customerId).catch(() => null);
-    if (!lookup) return null;
+    if (!lookup) return none;
+    if (lookup.state === "none") return { usage: null, reached: true };
     // The same proof the platform paragraphs demand. Counting a stranger's
     // posts and calling them this customer's use of the product is the single
     // most damaging thing this pack could tell a bank.
     const orgId = confirmedOrgFor(lookup)?.orgId;
-    if (!orgId) return null;
+    if (!orgId) return none;
     const activity = await this.activity.forOrganization(
       orgId,
       new Date(charge.created * 1000),
       new Date(dispute.created * 1000)
     );
-    if (!activity) return null;
-    return { ...activity, lastSignInIso: null };
+    if (!activity) return none;
+    return { usage: { ...activity, lastSignInIso: null }, reached: true };
   }
 
   cachedFacts(disputeId: string): EvidenceFacts | null {

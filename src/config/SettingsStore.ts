@@ -1224,6 +1224,14 @@ export class SettingsStore {
     return this.settings.disputeTemplateIntercomEnabled;
   }
 
+  // ---- Fight-or-accept verdict ----
+
+  // Pack completeness below this is "very little data": every weak fight signal
+  // (usage, support contact, a false cancel claim) turns into Accept.
+  disputeVerdictMinScore(): number {
+    return this.settings.disputeVerdictMinScore;
+  }
+
   // ---- Money-out ledger (/config → Billing → Money out) ----
 
   moneyOutEnabled(): boolean {

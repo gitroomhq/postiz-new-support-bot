@@ -28,6 +28,8 @@ export const DISPUTE_EVENT_KINDS = [
   "reminder_sent",
   "escalated",
   "note_added",
+  "verdict_changed",
+  "verdict_overridden",
 ] as const;
 export type DisputeEventKind = (typeof DISPUTE_EVENT_KINDS)[number];
 

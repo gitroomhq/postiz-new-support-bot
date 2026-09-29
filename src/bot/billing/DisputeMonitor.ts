@@ -5,6 +5,8 @@ import { StripeClient } from "../StripeClient";
 import { DisputeStore, OPEN_DISPUTE_STATUSES, RESPONDABLE_DISPUTE_STATUSES, segmentsOfDispute } from "./DisputeStore";
 import type { EvidencePackBuilder } from "./evidence/EvidencePackBuilder";
 import type { DisputeEvidenceService } from "./DisputeEvidenceService";
+import type { DisputeVerdictService } from "./DisputeVerdictService";
+import { VERDICT_VERSION } from "./disputeVerdict";
 import { DISPUTE_PHASES } from "./disputePhase";
 import type { EvidenceFacts } from "./evidence/tokens";
 import type { StripeSegmentResolver } from "./StripeSegmentResolver";
@@ -35,6 +37,17 @@ const RECONCILE_INTERVAL_MS = 6 * 60 * 60_000;
 
 // Evidence packs enrich through Intercom, so a tick handles a bounded number.
 const AUTO_EVIDENCE_LIMIT = 10;
+
+// Verdicts for open disputes outside the auto-submit window. Each costs one
+// enriched build (a handful of Stripe reads, one platform lookup, up to ten
+// Intercom calls), so the sweep is capped, and it stops starting new work
+// once the tick has run this long: the activity allows ten minutes and the
+// ratio sweep still has to fit after it.
+const VERDICT_LIMIT = 10;
+const VERDICT_TIME_BUDGET_MS = 5 * 60_000;
+// An open dispute's verdict is re-evaluated once a day: usage and support
+// contact keep arriving while a dispute waits for its deadline.
+const VERDICT_STALE_MS = 24 * 60 * 60_000;
 
 const RESPONDABLE = new Set<string>(RESPONDABLE_DISPUTE_STATUSES);
 
@@ -268,7 +281,9 @@ export class DisputeMonitor {
     // Optional so an instance without them still reconciles and reminds.
     private autoResolve?: { drain(): Promise<{ executed: number; blocked: number; failed: number }> } | null,
     private evidencePack?: EvidencePackBuilder | null,
-    private evidence?: DisputeEvidenceService | null
+    private evidence?: DisputeEvidenceService | null,
+    // Fight or accept. Absent, packs still build and no verdict is kept.
+    private verdicts?: DisputeVerdictService | null
   ) {}
 
   bindClient(client: Client): void {
@@ -284,7 +299,8 @@ export class DisputeMonitor {
   // Order matters. The auto-resolve drain runs FIRST and unconditionally: it is
   // cheap and time-critical, and a slow reconcile must never push a due refund
   // past the window a human was promised.
-  async tick(force: boolean): Promise<DisputesTickResult> {
+  async tick(force: boolean, beat: () => void = () => {}): Promise<DisputesTickResult> {
+    const startedAt = Date.now();
     // Written every tick so every other dispute panel can be read against what
     // was actually switched on at the time. A change in win rate means nothing
     // without knowing which week evidence went to auto.
@@ -306,9 +322,14 @@ export class DisputeMonitor {
       return 0;
     });
 
-    const evidence = await this.runAutoEvidence().catch((error) => {
+    const evidence = await this.runAutoEvidence(beat).catch((error) => {
       monitorLog.error("dispute auto-evidence failed", error);
-      return { packed: 0, autoSubmitted: 0, escalated: 0 };
+      return { packed: 0, autoSubmitted: 0, escalated: 0, touched: new Set<string>() };
+    });
+
+    const verdicts = await this.runVerdicts(evidence.touched, startedAt, beat).catch((error) => {
+      monitorLog.error("dispute verdict sweep failed", error);
+      return { verdicts: 0 };
     });
 
     const last = this.settings.disputeReconcileAt();
@@ -341,14 +362,20 @@ export class DisputeMonitor {
       packed: evidence.packed,
       autoSubmitted: evidence.autoSubmitted,
       escalated: evidence.escalated,
+      verdicts: verdicts.verdicts,
     };
   }
 
   // Builds (or rebuilds) the templated evidence pack for disputes approaching
   // their deadline, then either submits it or escalates. Capped per tick: this
   // is the expensive path, with Intercom enrichment on every dispute it touches.
-  private async runAutoEvidence(): Promise<{ packed: number; autoSubmitted: number; escalated: number }> {
-    const out = { packed: 0, autoSubmitted: 0, escalated: 0 };
+  private async runAutoEvidence(beat: () => void): Promise<{
+    packed: number;
+    autoSubmitted: number;
+    escalated: number;
+    touched: Set<string>;
+  }> {
+    const out = { packed: 0, autoSubmitted: 0, escalated: 0, touched: new Set<string>() };
     const builder = this.evidencePack;
     if (!builder || !this.settings.disputeAutoPackEnabled()) return out;
 
@@ -356,9 +383,10 @@ export class DisputeMonitor {
     // BEFORE the hour it might be submitted in.
     const windowHours = this.settings.disputeAutoSubmitHours() + 24;
     const rows = await this.disputeStore.listNeedingAutoEvidence(windowHours);
-    for (const row of rows.slice(0, AUTO_EVIDENCE_LIMIT)) {
+    for (const listed of rows.slice(0, AUTO_EVIDENCE_LIMIT)) {
+      beat();
       try {
-        const dispute = await this.stripe.getDispute(row.id);
+        const dispute = await this.stripe.getDispute(listed.id);
         if (!RESPONDABLE.has(dispute.status)) continue;
         const chargeId = typeof dispute.charge === "string" ? dispute.charge : dispute.charge?.id;
         if (!chargeId) continue;
@@ -369,6 +397,14 @@ export class DisputeMonitor {
         // pack this tick made. Counting it would report an hourly stream of
         // work on a dispute nobody has touched since the day it arrived.
         if (!staged.unchanged) out.packed++;
+
+        // The verdict is re-decided from exactly the facts this build used,
+        // then read back with any human override before the gates look at it.
+        out.touched.add(listed.id);
+        await this.verdicts?.evaluateAndStore(dispute, charge, staged.pack, "live").catch((error) => {
+          monitorLog.warn("dispute verdict failed", { "stripe.dispute_id": listed.id, "error.message": String(error) });
+        });
+        const row = (await this.disputeStore.get(listed.id).catch(() => null)) ?? listed;
 
         const decision = await builder.autoSubmitDecision(dispute, row, staged.pack);
         if (decision.kind === "submit") {
@@ -413,10 +449,57 @@ export class DisputeMonitor {
           out.escalated++;
         }
       } catch (error) {
-        monitorLog.error("dispute auto-evidence row failed", error, { "stripe.dispute_id": row.id });
+        monitorLog.error("dispute auto-evidence row failed", error, { "stripe.dispute_id": listed.id });
       }
     }
     return out;
+  }
+
+  // Keeps a current, enriched verdict on every open dispute, not only the ones
+  // already inside the auto-submit window, so the list can be triaged the day
+  // a dispute arrives.
+  private async runVerdicts(
+    skip: Set<string>,
+    startedAt: number,
+    beat: () => void
+  ): Promise<{ verdicts: number }> {
+    const out = { verdicts: 0 };
+    const builder = this.evidencePack;
+    const verdicts = this.verdicts;
+    if (!builder || !verdicts) return out;
+    const overBudget = () => Date.now() - startedAt > VERDICT_TIME_BUDGET_MS;
+
+    const open = await this.disputeStore.listNeedingVerdict(
+      VERDICT_VERSION,
+      new Date(Date.now() - VERDICT_STALE_MS),
+      VERDICT_LIMIT + skip.size
+    );
+    for (const row of open.filter((r) => !skip.has(r.id)).slice(0, VERDICT_LIMIT)) {
+      if (overBudget()) return out;
+      beat();
+      if (await this.verdictFor(row.id, "live")) out.verdicts++;
+    }
+    return out;
+  }
+
+  // One enriched build and verdict. Read-only at Stripe: build() gathers and
+  // renders but never stages, so a closed dispute can be evaluated freely.
+  private async verdictFor(disputeId: string, source: "live" | "backtest"): Promise<boolean> {
+    try {
+      const dispute = await this.stripe.getDispute(disputeId);
+      const chargeId = typeof dispute.charge === "string" ? dispute.charge : dispute.charge?.id;
+      if (!chargeId) return false;
+      const charge = await this.stripe.getCharge(chargeId);
+      const pack = await this.evidencePack!.build(dispute, charge, { enrich: true });
+      return (await this.verdicts!.evaluateAndStore(dispute, charge, pack, source)) != null;
+    } catch (error) {
+      monitorLog.warn("dispute verdict failed", {
+        "stripe.dispute_id": disputeId,
+        "verdict.source": source,
+        "error.message": String(error),
+      });
+      return false;
+    }
   }
 
   // Only a refusal that a human can still act on is worth a ping. "Not due yet"

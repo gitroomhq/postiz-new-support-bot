@@ -75,6 +75,7 @@ export const EXPECTED_COLUMNS: Record<string, string[]> = {
     "disputeReconcileAt",
     "disputeEvidenceMode", "disputeAutoSubmitHours",
     "disputeAutoSubmitMinScore", "disputeAutoSubmitMaxMinor", "disputeTemplateIntercomEnabled",
+    "disputeVerdictMinScore",
     "moneyOutEnabled", "moneyOutSweepAt", "moneyOutBackfillDoneAt",
     "radarListCardId", "radarListEmailId", "radarListCustomerId", "radarListIpId",
     "inactivityEnabled", "inactivityAgentWaitDays", "inactivityCustomerWaitDays", "inactivityNagsBeforeClose",
@@ -127,6 +128,8 @@ export const EXPECTED_COLUMNS: Record<string, string[]> = {
     "evidenceAutoStagedAt", "evidenceAutoScore", "evidenceTemplateVersion", "evidenceAutoFields",
     "evidenceTouchedAt", "evidenceTouchedBy", "evidenceAutoSubmitAt", "evidenceAutoOptOut",
     "closedAtEstimated", "closedAtSource", "usdMinor", "fxRate",
+    "verdict", "verdictDecisive", "verdictSignals", "verdictComplete", "verdictVersion", "verdictSource",
+    "verdictAt", "verdictOverride", "verdictOverrideBy", "verdictOverrideReason", "verdictOverrideAt",
   ],
   stripe_money_out: [
     "id", "kind", "bucket", "category", "amountMinor", "feeMinor", "netMinor", "currency", "source",
