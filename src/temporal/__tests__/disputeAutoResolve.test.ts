@@ -318,6 +318,7 @@ function drainHarness(opts: {
   dispute?: Stripe.Dispute;
   casOk?: boolean;
   mode?: "none" | "manual" | "manualplus" | "auto";
+  annual?: boolean;
 }) {
   const calls: string[] = [];
   const store = {
@@ -370,7 +371,9 @@ function drainHarness(opts: {
     {} as never,
     { claimBillingAction: async () => true, releaseBillingAction: async () => {} } as never,
     alerts as never,
-    { cancelSubscriptions: async () => {}, noteOnCustomer: async () => {} } as never
+    { cancelSubscriptions: async () => {}, noteOnCustomer: async () => {} } as never,
+    null,
+    opts.annual === undefined ? null : { isAnnual: async () => opts.annual === true }
   );
   return { svc, calls };
 }
@@ -491,6 +494,7 @@ function handHarness(opts: {
   openTotal?: number;
   priorDisputes?: number;
   alertFails?: boolean;
+  annual?: boolean | "error";
 }) {
   const writes: string[] = [];
   const store = {
@@ -540,7 +544,17 @@ function handHarness(opts: {
     store as never,
     disputeStore as never,
     undefined,
-    alerts as never
+    alerts as never,
+    undefined,
+    null,
+    opts.annual === undefined
+      ? null
+      : {
+          isAnnual: async () => {
+            if (opts.annual === "error") throw new Error("stripe down");
+            return opts.annual === true;
+          },
+        }
   );
   return { svc, writes };
 }
@@ -643,4 +657,44 @@ test("by hand: an unreachable billing channel leaves the proposal inert, and say
   const b = await swept.svc.backfillOpenInquiries(NOW);
   assert.equal(b.proposed, 1);
   assert.equal(b.unalerted, 1);
+});
+
+// ---- annual charges: fought, never refunded to prevent ----
+
+test("policy: an annual inquiry is declined as annual_charge, and a chargeback stays out of scope", () => {
+  assert.deepEqual(evaluateDispute(dispute({}), charge({}), cfg(), false, NOW, { annual: true }), {
+    kind: "block",
+    guardrail: "annual_charge",
+  });
+  // Named before the reason allowlist, so the decline says why it happened.
+  assert.deepEqual(evaluateDispute(dispute({ reason: "fraudulent" }), charge({}), cfg(), false, NOW, { annual: true }), {
+    kind: "block",
+    guardrail: "annual_charge",
+  });
+  assert.deepEqual(evaluateDispute(dispute({ status: "needs_response" }), charge({}), cfg(), false, NOW, { annual: true }), {
+    kind: "inert",
+  });
+  assert.equal(evaluateDispute(dispute({}), charge({}), cfg(), false, NOW, { annual: false }).kind, "propose");
+});
+
+test("by hand: an annual charge is refused and nothing is written; an unreadable period is unavailable, not a guess", async () => {
+  const annual = handHarness({ annual: true });
+  assert.deepEqual(await annual.svc.proposeByHand("dp_1", NOW), { kind: "blocked", guardrail: "annual_charge" });
+  assert.deepEqual(annual.writes, []);
+
+  const unknown = handHarness({ annual: "error" });
+  assert.equal((await unknown.svc.proposeByHand("dp_1", NOW)).kind, "unavailable");
+  assert.deepEqual(unknown.writes, []);
+
+  const monthly = handHarness({ annual: false });
+  assert.equal((await monthly.svc.proposeByHand("dp_1", NOW)).kind, "proposed");
+});
+
+test("drain: an annual inquiry proposed before the rule existed is blocked at execution, never refunded", async () => {
+  const h = drainHarness({ rows: [row()], annual: true });
+  const out = await h.svc.drain();
+  assert.equal(out.executed, 0);
+  assert.equal(out.blocked, 1);
+  assert.ok(h.calls.includes("blocked:annual_charge"));
+  assert.ok(!h.calls.some((c) => c.startsWith("refund:")));
 });

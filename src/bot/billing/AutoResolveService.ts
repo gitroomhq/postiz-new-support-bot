@@ -125,8 +125,18 @@ export class AutoResolveService {
     private sessionStore?: SessionStore,
     private alerts?: AutoResolveAlerts,
     private sideEffects?: AutoResolveSideEffects,
-    private events?: DisputeEventStore | null
+    private events?: DisputeEventStore | null,
+    // Annual charges are fought, never refunded to prevent. Absent (tests,
+    // older wiring), every charge reads as not annual, which is the old
+    // behaviour.
+    private annual?: { isAnnual(disputeId: string | null, charge: Stripe.Charge): Promise<boolean> } | null
   ) {}
+
+  // Throws on a Stripe error: callers turn that into "unavailable", and a
+  // proposal that could not be evaluated is retried rather than guessed.
+  private async annualFor(disputeId: string | null, charge: Stripe.Charge): Promise<boolean> {
+    return this.annual ? this.annual.isAnnual(disputeId, charge) : false;
+  }
 
   config(): AutoResolveConfig {
     return {
@@ -179,8 +189,15 @@ export class AutoResolveService {
       return { kind: "unavailable", error: String(error) };
     }
 
+    let annual: boolean;
+    try {
+      annual = await this.annualFor(dispute.id, charge);
+    } catch (error) {
+      autoLog.warn("auto-resolve plan period read failed", { "stripe.dispute_id": dispute.id, "error.message": String(error) });
+      return { kind: "unavailable", error: String(error) };
+    }
     const repeat = await this.isRepeatOffender(customerId ?? customerIdOf(charge), dispute.id).catch(() => true);
-    const decision = evaluateDispute(dispute, charge, this.config(), repeat, new Date());
+    const decision = evaluateDispute(dispute, charge, this.config(), repeat, new Date(), { annual });
     return this.record(decision, {
       stage: "inquiry",
       sourceId: dispute.id,
@@ -251,11 +268,17 @@ export class AutoResolveService {
       return { kind: "unavailable", error: String(error) };
     }
 
+    let annual: boolean;
+    try {
+      annual = await this.annualFor(disputeId, charge);
+    } catch (error) {
+      return { kind: "unavailable", error: String(error) };
+    }
     const customerId = customerIdOf(charge);
     const repeat = await this.isRepeatOffender(customerId, disputeId).catch(() => true);
     // enabled:true overrides the phase gate the engine reads, which is the one
     // difference between asking by hand and waiting for a webhook.
-    const decision = evaluateDispute(dispute, charge, { ...this.config(), enabled: true }, repeat, now);
+    const decision = evaluateDispute(dispute, charge, { ...this.config(), enabled: true }, repeat, now, { annual });
 
     if (decision.kind === "inert") return { kind: "out_of_scope", status: dispute.status };
     if (decision.kind === "block") {
@@ -667,6 +690,10 @@ export class AutoResolveService {
       if (dispute.is_charge_refundable === false) return { kind: "block", guardrail: "not_refundable" };
       // A partial refund does not close a dispute as prevented.
       if (remainder < dispute.amount) return { kind: "block", guardrail: "no_remainder" };
+      // Covers proposals recorded before the annual rule existed, too.
+      if (row.stage === "inquiry" && (await this.annualFor(row.disputeId, charge))) {
+        return { kind: "block", guardrail: "annual_charge" };
+      }
     }
     return { kind: "ok", amountMinor: remainder };
   }

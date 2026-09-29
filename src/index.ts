@@ -134,6 +134,7 @@ import { DisputeMonitor } from "./bot/billing/DisputeMonitor";
 import { DisputeVerdictService } from "./bot/billing/DisputeVerdictService";
 import { ResendClient } from "./resend/ResendClient";
 import { EmailDeliverabilityService } from "./resend/EmailDeliverabilityService";
+import { AnnualChargeResolver } from "./bot/billing/annualCharge";
 import { TemporalService } from "./temporal/TemporalService";
 import { TemporalWorkerManager } from "./temporal/TemporalWorkerManager";
 import { TemporalProducers } from "./temporal/producers";
@@ -343,7 +344,8 @@ async function main() {
     sessionStore,
     autoResolveAlerts,
     new StripeIntercomSideEffects(stripeClient, sessionStore, settingsStore, intercomClient),
-    disputeEvents
+    disputeEvents,
+    new AnnualChargeResolver(stripeClient, disputeStore)
   );
   const ratioEngine = new CachedRatioEngine(stripeClient);
   const disputeMonitor = new DisputeMonitor(

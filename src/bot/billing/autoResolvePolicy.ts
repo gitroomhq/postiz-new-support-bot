@@ -30,7 +30,9 @@ export type Guardrail =
   | "over_threshold"
   | "no_customer"
   | "repeat_offender"
-  | "already_claimed";
+  | "already_claimed"
+  // A yearly plan: those are fought, never refunded to prevent (operator rule).
+  | "annual_charge";
 
 // Stripe's dispute reason vocabulary. The /config allowlist field validates
 // against this so a typo comes back as a field error instead of silently
@@ -120,7 +122,10 @@ export function evaluateDispute(
   charge: Stripe.Charge,
   cfg: AutoResolveConfig,
   repeat: boolean,
-  now: Date
+  now: Date,
+  // Facts the policy cannot read off the charge itself. `annual` is resolved by
+  // the caller from the charge's invoice, which costs Stripe reads.
+  extra: { annual?: boolean } = {}
 ): AutoResolveDecision {
   if (!cfg.enabled) return { kind: "inert" };
 
@@ -142,6 +147,11 @@ export function evaluateDispute(
   // remainder short of the dispute amount would spend the money AND still take
   // the chargeback. Refuse instead of half-paying.
   if (remainder < dispute.amount) return { kind: "block", guardrail: "no_remainder" };
+
+  // Annual charges are fought rather than refunded: $278 to $950 is worth the
+  // countered fee even at a low win rate, where a monthly charge is not.
+  // Checked before the reason allowlist so the decline says why it happened.
+  if (extra.annual) return { kind: "block", guardrail: "annual_charge" };
 
   if (!cfg.reasons.has(dispute.reason)) return { kind: "block", guardrail: "reason_not_allowed" };
 
