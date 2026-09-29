@@ -765,7 +765,7 @@ async function main() {
     makeHomeSection({ metrics: dashboardMetrics }),
     makeBalancesSection(),
     makePaymentsSection(),
-    makeCustomersSection({ postiz: postizIdentity }),
+    makeCustomersSection({ postiz: postizIdentity, emailDelivery }),
     makeSubscriptionsSection(),
     makeInvoicesSection(),
     makeDisputesSection({

@@ -8,6 +8,12 @@ import { bookmarkButton, isBookmarkedSafe, toggleBookmarkAction } from "./bookma
 import { isGitroomSub, readPostizMeta } from "../../bot/billing/postizPlan";
 import type { PostizIdentityService, PostizOrgLookup, PostizOrgSummary } from "../../postiz/PostizIdentityService";
 import {
+  describeSuppression,
+  distinctEmails,
+  type DeliveryStatus,
+  type EmailDeliverabilityService,
+} from "../../resend/EmailDeliverabilityService";
+import {
   amount,
   avatarCell,
   badgeCell,
@@ -130,6 +136,8 @@ function registryButton(ctx: DashboardCtx, button: ActionButton): ActionButton {
 // keeps the existing Customer-360 tests honest.
 export interface CustomersDeps {
   postiz?: PostizIdentityService | null;
+  // Resend suppression status for the customer's addresses, and removal.
+  emailDelivery?: EmailDeliverabilityService | null;
 }
 
 export function makeCustomersSection(deps: CustomersDeps = {}): DashboardSectionModule {
@@ -167,7 +175,7 @@ export function makeCustomersSection(deps: CustomersDeps = {}): DashboardSection
     },
 
     async action(ctx: DashboardCtx, req) {
-      return customerAction(ctx, req.key, req.params ?? {}, req.confirmWord);
+      return customerAction(ctx, req.key, req.params ?? {}, req.confirmWord, deps);
     },
   };
 }
@@ -178,7 +186,8 @@ async function customerAction(
   ctx: DashboardCtx,
   key: string,
   p: Record<string, unknown>,
-  confirmWord: string | undefined
+  confirmWord: string | undefined,
+  deps: CustomersDeps = {}
 ): Promise<{
   ok: boolean;
   text?: string;
@@ -212,6 +221,38 @@ async function customerAction(
 
   const customerId = validId("customer", p.customerId);
   if (!customerId) return { ok: false, error: "Bad customer id." };
+
+  // Email delivery. The address is checked against the ones this customer is
+  // actually known by, re-derived here, so the button cannot be pointed at an
+  // arbitrary address by editing the request. Removal is T1; any signed-in
+  // teammate may (operator decision), and the service audits every one.
+  if (key === "section:customers.email_unsuppress" || key === "section:customers.email_activation") {
+    const svc = deps.emailDelivery;
+    if (!svc?.enabled()) return { ok: false, error: "Resend is not enabled (/config → Integrations → Resend)." };
+    const email = str(p.email, 254).trim();
+    const known = await customerEmails(ctx, customerId, deps);
+    const match = known.find((e) => e.toLowerCase() === email.toLowerCase());
+    if (!match) return { ok: false, error: "That address does not belong to this customer." };
+    const actor = { surface: "dashboard" as const, id: ctx.actor.id, name: ctx.actor.name };
+    if (key === "section:customers.email_activation") {
+      const sent = await svc.resendActivation(match, actor);
+      await ctx.audit(`Postiz activation email re-sent for a customer address on ${customerId}${sent.ok ? "" : " (failed)"}`);
+      return sent.ok ? { ok: true, text: `Postiz is sending a new activation email to ${match}.` } : { ok: false, error: sent.error };
+    }
+    if (!confirmed) return { ok: false, error: "Type CONFIRM to run this action." };
+    const result = await svc.remove(match, actor);
+    await ctx.audit(`Resend suppression removal on ${customerId}: ${result.kind}`);
+    switch (result.kind) {
+      case "removed":
+        return { ok: true, text: `${match} is off the suppression list. New mail from Postiz will be delivered to it.` };
+      case "not_suppressed":
+        return { ok: true, text: `${match} was not on the suppression list; nothing was removed.` };
+      case "disabled":
+        return { ok: false, error: "Resend is not enabled." };
+      default:
+        return { ok: false, error: result.error };
+    }
+  }
 
   switch (key) {
     // T0 — mint an off-session SetupIntent for saving a card later. Only the
@@ -614,6 +655,76 @@ async function loadSubsAndPostiz(
     // belt for a client that is broken outright.
     .catch(() => ({ state: "error", orgs: [], via: null }) as PostizOrgLookup);
   return { subs, postiz };
+}
+
+// The addresses a customer is known by: the one Stripe bills, then the owner
+// of each Postiz organisation that is (or may be) theirs. Postiz mails its
+// users at the latter, which is often not the billing address.
+function emailsOf(stripeEmail: string | null, postiz: PostizOrgLookup): string[] {
+  return distinctEmails([
+    stripeEmail,
+    ...postiz.orgs.filter((o) => o.customerMatches !== false && !o.orgDeleted).map((o) => o.ownerEmail),
+  ]);
+}
+
+async function customerEmails(ctx: DashboardCtx, customerId: string, deps: CustomersDeps): Promise<string[]> {
+  const [customer, subs] = await Promise.all([
+    ctx.stripe.getCustomer(customerId).catch(() => null),
+    loadSubsAndPostiz(ctx, customerId, deps).catch(() => null),
+  ]);
+  return emailsOf(customer?.email ?? null, subs?.postiz ?? { state: "off", orgs: [], via: null });
+}
+
+const REMOVE_SUMMARY =
+  "Takes the address off Resend's suppression list, so Postiz mail (activation, password reset, notifications) is delivered to it again. If it still bounces or is reported as spam, Resend suppresses it again.";
+
+function deliveryCell(st: DeliveryStatus): Cell {
+  if (st.state === "suppressed") {
+    return { t: "text", v: describeSuppression(st.suppression, st.source), sub: "Postiz mail to it is dropped" } as Cell;
+  }
+  if (st.state === "clear") return badgeCell("ok", "Deliverable");
+  return badgeCell("warn", `Unknown: ${st.error}`);
+}
+
+async function emailDeliveryCard(
+  svc: EmailDeliverabilityService,
+  customerId: string,
+  stripeEmail: string | null,
+  postiz: PostizOrgLookup
+): Promise<Block> {
+  const statuses = await svc.statusFor(emailsOf(stripeEmail, postiz));
+  const actions: ActionButton[] = [];
+  for (const st of statuses) {
+    if (st.state !== "suppressed") continue;
+    actions.push({
+      key: "section:customers.email_unsuppress",
+      label: `Remove ${st.email} from suppression`.slice(0, 80),
+      dangerous: true,
+      params: { customerId, email: st.email },
+      summary: REMOVE_SUMMARY,
+    });
+  }
+  // The usual reason any of this matters: an account whose activation mail
+  // never arrived cannot log in.
+  for (const org of postiz.orgs) {
+    const email = org.ownerEmail;
+    if (org.ownerActivated !== false || !email || org.customerMatches === false) continue;
+    if (!statuses.some((st) => st.email.toLowerCase() === email.toLowerCase() && st.state === "clear")) continue;
+    actions.push({
+      key: "section:customers.email_activation",
+      label: "Resend activation email",
+      params: { customerId, email },
+      summary: `Asks Postiz to send ${email} a new activation email. The account is not activated yet.`,
+    });
+  }
+  return {
+    type: "kv",
+    title: "Email delivery",
+    rows: statuses.length
+      ? statuses.map((st) => ({ label: st.email, cell: deliveryCell(st) }))
+      : [{ label: "Addresses", cell: text("none known") }],
+    ...(actions.length ? { actions } : {}),
+  };
 }
 
 // One query for the linked Discord sessions instead of one per id.
@@ -1044,6 +1155,11 @@ async function detail(ctx: DashboardCtx, id: string, deps: CustomersDeps = {}): 
     title: "Linked accounts",
     rows: linkRows.length ? linkRows : [{ label: "Discord user", cell: text("not linked") }],
   });
+
+  // ---- rail: Email delivery (Resend suppression list) ----
+  if (deps.emailDelivery?.enabled()) {
+    rail.push(await emailDeliveryCard(deps.emailDelivery, id, customer.email ?? null, postiz));
+  }
 
   // ---- main: Subscriptions ----
   main.push({
