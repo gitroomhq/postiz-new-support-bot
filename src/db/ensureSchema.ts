@@ -307,6 +307,10 @@ export const STATEMENTS: string[] = [
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "postizLookupEnabled" BOOLEAN NOT NULL DEFAULT false`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "postizBaseUrl" TEXT`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "postizApiKey" TEXT`,
+  // Resend suppression lookups for support. Ships off; RESEND_API_KEY in the
+  // environment is the fallback when no key is stored here.
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "resendEnabled" BOOLEAN NOT NULL DEFAULT false`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "resendApiKey" TEXT`,
   // AI models + knowledge-base auto-refresh (paired with /config → AI & Knowledge).
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "aiModel" TEXT NOT NULL DEFAULT 'sonnet'`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "aiModelLight" TEXT NOT NULL DEFAULT 'haiku'`,

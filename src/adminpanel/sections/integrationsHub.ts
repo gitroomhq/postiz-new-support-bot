@@ -4,8 +4,8 @@ import { envPin, envPinNote } from "../../config/env";
 import { AdminHubContext, ActionRequest, HubModule, SaveRequest, asBoundedFloat, asString, oneOf } from "./types";
 
 // Integrations hub (config group): the Intercom CONNECTION (bridge/SLA/automation
-// live in the /intercom hubs) + Sentry + the Postiz platform lookup. Mirrors
-// /config → Integrations.
+// live in the /intercom hubs) + Sentry + the Postiz platform lookup + Resend.
+// Mirrors /config → Integrations.
 
 export interface IntegrationsHubDeps {
   listIntercomAdmins: () => Promise<Array<{ id: string; name: string }>>;
@@ -13,6 +13,9 @@ export interface IntegrationsHubDeps {
   // Probes the platform search endpoint and reports which of its gates
   // (key valid / org has a superadmin / org has a subscription) let us through.
   testPostiz: () => Promise<string>;
+  // Says whether the Resend key is Full access (a sending key cannot read the
+  // suppression list) and which team's sending domains it sees.
+  testResend: () => Promise<string>;
 }
 
 // POSTIZ_ADMIN_TOKEN overrides the stored key (see config/env.ts). The field
@@ -125,7 +128,37 @@ export function makeIntegrationsHub(deps: IntegrationsHubDeps): HubModule {
         ],
         actions: [{ key: "postiz_test", label: "Test connection", style: "secondary" }],
       };
-      return [intercom, sentry, postiz];
+      const resendSource = s.resendKeySource();
+      const resend: Section = {
+        key: "resend",
+        title: "Resend (email suppression)",
+        description:
+          "Postiz sends its mail through Resend. An address that hard-bounced or reported spam is suppressed and silently gets nothing. With this on, the Intercom sidebar, /email and the customer page show it and let support remove it.",
+        fields: [
+          {
+            type: "toggle",
+            key: "resendEnabled",
+            label: "Enabled",
+            value: s.resendEnabled(),
+            help: "Off means no lookups run and nothing can be removed.",
+          },
+          {
+            type: "text",
+            key: "resendApiKey",
+            label: "API key (Full access)",
+            value: "",
+            secret: true,
+            secretState: s.secretState("resendApiKey"),
+            ...(resendSource === "env" ? { badge: { kind: "info", text: "env: RESEND_API_KEY" } as Badge } : {}),
+            help:
+              resendSource === "env"
+                ? "In use: RESEND_API_KEY from the environment. A key saved here takes over. Blank = keep; type 'none' to clear."
+                : "Write-only. A key saved here wins over RESEND_API_KEY. Blank = keep; type 'none' to clear.",
+          },
+        ],
+        actions: [{ key: "resend_test", label: "Test connection", style: "secondary" }],
+      };
+      return [intercom, sentry, postiz, resend];
     },
 
     async save(ctx: AdminHubContext, req: SaveRequest): Promise<SaveResult> {
@@ -202,6 +235,20 @@ export function makeIntegrationsHub(deps: IntegrationsHubDeps): HubModule {
           await ctx.audit(val === "none" ? "cleared postiz api key" : "updated postiz api key");
           return { ok: true };
         }
+        case "resendEnabled":
+          await s.updateResend({ resendEnabled: v === true });
+          await ctx.audit(`set resend suppression lookups → ${v === true ? "on" : "off"}`);
+          return { ok: true };
+        case "resendApiKey": {
+          const val = asString(v);
+          if (!val) return { ok: true }; // blank = keep
+          if (val !== "none" && !/^re_\S{8,}$/.test(val)) {
+            return { ok: false, fieldErrors: { resendApiKey: "That does not look like a Resend key (they start with re_)." } };
+          }
+          await s.updateResend({ resendApiKey: val === "none" ? null : val });
+          await ctx.audit(val === "none" ? "cleared resend api key" : "updated resend api key");
+          return { ok: true };
+        }
         default:
           return { ok: false, error: "Unknown field." };
       }
@@ -214,6 +261,9 @@ export function makeIntegrationsHub(deps: IntegrationsHubDeps): HubModule {
       }
       if (req.key === "postiz_test") {
         return { ok: true, text: await deps.testPostiz() };
+      }
+      if (req.key === "resend_test") {
+        return { ok: true, text: await deps.testResend() };
       }
       return { ok: false, error: "Unknown action." };
     },

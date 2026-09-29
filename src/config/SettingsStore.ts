@@ -4,7 +4,7 @@ import { Prisma, PrismaClient, BotSettings, StatusTag } from "../generated/prism
 import type { SentryRuntimeConfig } from "../util/logger";
 import type { InfluxRuntimeConfig } from "../metrics/InfluxWriter";
 import { decryptSecret, encryptSecret, isVaultKvSentinel, VAULT_KV_SENTINEL } from "../util/crypto";
-import { ENV_PINS, envBool, envPin, envStr } from "./env";
+import { ENV_PINS, RESEND_KEY_VAR, envBool, envPin, envStr } from "./env";
 import type { VaultIntegration, VaultRuntimeConfig, VaultService } from "../vault/VaultService";
 import type { SlaTargetEntry } from "../sla/types";
 import { parseOfficeHours, type OfficeHoursSchedule } from "../sla/businessTime";
@@ -79,7 +79,7 @@ const DEFAULT_TAGS: TagInput[] = [
   { emoji: "📁", label: "Closed", closesThread: true, reminderEnabled: false },
 ];
 
-// The nine global secrets and their Vault KV home (one KV entry per
+// The ten global secrets and their Vault KV home (one KV entry per
 // integration; field names live inside the entry). Shared by the read
 // resolver, the write router, the panel state helper and the migrator.
 export type GlobalSecretColumn =
@@ -91,7 +91,8 @@ export type GlobalSecretColumn =
   | "sentryWebhookSecret"
   | "influxToken"
   | "yubicoApiSecret"
-  | "postizApiKey";
+  | "postizApiKey"
+  | "resendApiKey";
 
 export const GLOBAL_SECRETS: Record<GlobalSecretColumn, { integration: VaultIntegration; field: string }> = {
   intercomAccessToken: { integration: "intercom", field: "accessToken" },
@@ -103,6 +104,7 @@ export const GLOBAL_SECRETS: Record<GlobalSecretColumn, { integration: VaultInte
   influxToken: { integration: "influx", field: "token" },
   yubicoApiSecret: { integration: "yubico", field: "apiSecret" },
   postizApiKey: { integration: "postiz", field: "apiKey" },
+  resendApiKey: { integration: "resend", field: "apiKey" },
 };
 
 // Panel-facing storage state of a global secret column.
@@ -1750,6 +1752,40 @@ export class SettingsStore {
         ...rest,
         ...(postizApiKey !== undefined
           ? { postizApiKey: await this.routeSecretWrite("postizApiKey", postizApiKey) }
+          : {}),
+      },
+    });
+  }
+
+  // ---- Resend (suppression lookups for support) ----
+
+  resendEnabled(): boolean {
+    return this.settings.resendEnabled;
+  }
+
+  // The STORED key wins and RESEND_API_KEY in the environment is the fallback:
+  // the reverse of the Postiz pin, on purpose. The deploy's variable may well
+  // be a sending-only key (the kind Postiz itself uses), which cannot read the
+  // suppression list, and a full-access replacement must be settable from
+  // /config by someone with no access to the environment.
+  resendApiKey(): string | null {
+    return this.resolveSecret(this.settings.resendApiKey, "resendApiKey") || envStr(RESEND_KEY_VAR);
+  }
+
+  // Where the key in use comes from, for the panels (never the key itself).
+  resendKeySource(): "stored" | "env" | "none" {
+    if (this.resolveSecret(this.settings.resendApiKey, "resendApiKey")) return "stored";
+    return envStr(RESEND_KEY_VAR) ? "env" : "none";
+  }
+
+  async updateResend(data: { resendEnabled?: boolean; resendApiKey?: string | null }): Promise<void> {
+    const { resendApiKey, ...rest } = data;
+    this.settings = await this.prisma.botSettings.update({
+      where: { id: "global" },
+      data: {
+        ...rest,
+        ...(resendApiKey !== undefined
+          ? { resendApiKey: await this.routeSecretWrite("resendApiKey", resendApiKey) }
           : {}),
       },
     });

@@ -115,6 +115,8 @@ import { SINGLETONS } from "../temporal/types";
 import { buildIdIsDegenerate } from "../temporal/buildId";
 import { validateCertPair } from "../temporal/certs";
 import { VaultMigrator, COLUMN_LABELS, type MigrateItemResult, type MigrateReport } from "../vault/VaultMigrator";
+import type { EmailDeliverabilityService } from "../resend/EmailDeliverabilityService";
+import type { ResendClient } from "../resend/ResendClient";
 
 type TicketSearchFilters = {
   categoryId?: string;
@@ -173,6 +175,9 @@ export class DiscordBot {
   } | null = null;
   private postizIdentity: PostizIdentityService | null = null;
   private postizClient: PostizClient | null = null;
+  // Resend suppression tooling for the /config panel.
+  private emailDelivery: EmailDeliverabilityService | null = null;
+  private resendClient: ResendClient | null = null;
   private sentryFeedbackClient: SentryFeedbackClient | null = null;
   // Sentry feedback import ledger — bound late from index.ts; the /config
   // panel reads its counters.
@@ -268,6 +273,11 @@ export class DiscordBot {
   setPostizIdentity(service: PostizIdentityService, client: PostizClient): void {
     this.postizIdentity = service;
     this.postizClient = client;
+  }
+
+  setEmailDelivery(service: EmailDeliverabilityService, client: ResendClient): void {
+    this.emailDelivery = service;
+    this.resendClient = client;
   }
 
   // Read-only Sentry access for the per-account error list.
@@ -2097,6 +2107,7 @@ export class DiscordBot {
                   : "enabled ⚠️ incomplete config"
                 : "off"
             }`,
+            `Resend: ${s.resendEnabled() ? (s.resendKeySource() === "none" ? "enabled ⚠️ no key" : "on") : "off"}`,
           ].join("\n"),
           inline: false,
         },
@@ -2240,6 +2251,9 @@ export class DiscordBot {
                 ? "on"
                 : "configured · off"
           }`,
+          `**Resend:** ${
+            s.resendKeySource() === "none" ? "off: no key" : s.resendEnabled() ? "on" : "configured · off"
+          }`,
           "",
           "The Intercom button below holds connection settings only. Bridge behavior, SLA rules, automation and maintenance are managed via **/intercom**.",
         ].join("\n")
@@ -2251,7 +2265,60 @@ export class DiscordBot {
       new ButtonBuilder().setCustomId("config_postiz").setLabel("Postiz Lookup").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("config_back_main").setLabel("Back").setStyle(ButtonStyle.Secondary)
     );
-    return { embeds: [embed], components: [buttons] };
+    // Discord caps a row at five buttons, and the first is full.
+    const more = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId("config_resend").setLabel("Resend").setStyle(ButtonStyle.Primary)
+    );
+    return { embeds: [embed], components: [buttons, more] };
+  }
+
+  // /config → Integrations → Resend: suppression lookups and removals for
+  // support (Intercom sidebar, /email, the web customer page). The key is
+  // write-only here and never echoed back.
+  private buildResendPanel() {
+    const s = this.settingsStore;
+    const stateLabel: Record<SecretState, string> = {
+      none: "_not set_",
+      local: "stored (local encryption)",
+      "local-unreadable": "⚠️ stored but unreadable: re-enter",
+      vault: "stored (Vault)",
+      "vault-unreachable": "stored (Vault) ⚠️ unreachable right now",
+    };
+    const source = s.resendKeySource();
+    const keyLine =
+      source === "stored"
+        ? `${stateLabel[s.secretState("resendApiKey")]}, used instead of \`RESEND_API_KEY\``
+        : source === "env"
+          ? "from `RESEND_API_KEY` in the environment (a key stored here would win)"
+          : `${stateLabel[s.secretState("resendApiKey")]}, and no \`RESEND_API_KEY\` in the environment`;
+    const statusLine =
+      source === "none"
+        ? "**not configured**: set a key below"
+        : s.resendEnabled()
+          ? "**on**: the Intercom sidebar, /email and the web customer page show suppressions"
+          : "**off**: nothing is looked up";
+    const embed = new EmbedBuilder()
+      .setTitle("Resend (email suppression)")
+      .setColor(0x5865f2)
+      .setDescription(
+        [
+          `**Status:** ${statusLine}`,
+          `**API key:** ${keyLine}`,
+          "",
+          "Postiz sends its activation, password-reset and notification mail through Resend. An address that hard-bounced or reported spam lands on Resend's suppression list, and every later email to it is silently dropped. This lets support see that, and remove the address.",
+          "The key must be a **Full access** key from the same Resend team Postiz sends from: a sending-only key cannot read the suppression list. Test Connection says which kind you have and lists the team's sending domains.",
+        ].join("\n")
+      );
+    const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId("config_resend_toggle")
+        .setLabel(`Enabled: ${s.resendEnabled() ? "on" : "off"}`)
+        .setStyle(s.resendEnabled() ? ButtonStyle.Success : ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("config_resend_key").setLabel("API Key").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("config_resend_test").setLabel("Test Connection").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("config_integrations").setLabel("Back").setStyle(ButtonStyle.Secondary)
+    );
+    return { embeds: [embed], components: [row] };
   }
 
   private buildAiAnalyticsHubPanel() {
@@ -4938,6 +5005,48 @@ export class DiscordBot {
       return;
     }
 
+    if (id === "config_resend") {
+      await interaction.update(this.buildResendPanel());
+      return;
+    }
+
+    if (id === "config_resend_toggle") {
+      const enabling = !this.settingsStore.resendEnabled();
+      await this.settingsStore.updateResend({ resendEnabled: enabling });
+      this.auditConfig(interaction, `Resend suppression lookups → ${enabling ? "on" : "off"}`);
+      await interaction.update(this.buildResendPanel());
+      return;
+    }
+
+    if (id === "config_resend_key") {
+      const modal = new ModalBuilder().setCustomId("config_resend_key_modal").setTitle("Resend API key");
+      modal.addComponents(
+        new ActionRowBuilder<TextInputBuilder>().addComponents(
+          new TextInputBuilder()
+            .setCustomId("api_key")
+            .setLabel("Full access key (blank = keep, off = clear)")
+            .setPlaceholder("re_...")
+            .setStyle(TextInputStyle.Short)
+            .setRequired(false)
+        )
+      );
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (id === "config_resend_test") {
+      await interaction.deferReply({ flags: 64 });
+      const client = this.resendClient;
+      if (!client) {
+        await interaction.editReply({ embeds: [makeEmbed("Resend is not available on this instance.", COLORS.warn)] });
+        return;
+      }
+      client.clearCache();
+      const result = await client.selfTest();
+      await interaction.editReply({ embeds: [makeEmbed(result.detail, result.ok ? COLORS.success : COLORS.danger)] });
+      return;
+    }
+
     if (id === "config_postiz_toggle") {
       const enabling = !this.settingsStore.postizLookupEnabled();
       await this.settingsStore.updatePostiz({ postizLookupEnabled: enabling });
@@ -5887,6 +5996,34 @@ export class DiscordBot {
             this.settingsStore.sentryWebhookSecret()
               ? "Sentry feedback credentials saved. Point the internal integration's webhook at `POST <public-url>/sentry/webhook`."
               : "Sentry feedback credentials saved. No webhook secret set; the webhook endpoint rejects everything and the 15-min poll carries imports alone.",
+            COLORS.success
+          ),
+        ],
+        flags: 64,
+      });
+      return;
+    }
+
+    if (interaction.customId === "config_resend_key_modal") {
+      const keyInput = interaction.fields.getTextInputValue("api_key").trim();
+      const clears = /^(off|none|disable|-)$/i.test(keyInput);
+      if (keyInput && !clears && !/^re_\S{8,}$/.test(keyInput)) {
+        // Deliberately does not repeat what was typed: it may be a real key.
+        await interaction.reply({ embeds: [makeEmbed("That does not look like a Resend key (they start with `re_`).", COLORS.warn)], flags: 64 });
+        return;
+      }
+      if (keyInput) {
+        await this.settingsStore.updateResend({ resendApiKey: clears ? null : keyInput });
+        this.resendClient?.clearCache();
+      }
+      // Deliberately no key value in the audit line.
+      this.auditConfig(interaction, `Resend API key ${keyInput ? (clears ? "cleared" : "set") : "unchanged"}`);
+      await interaction.reply({
+        embeds: [
+          makeEmbed(
+            keyInput
+              ? `Resend key ${clears ? "cleared" : "saved"}.${clears ? " `RESEND_API_KEY` from the environment is used again if it is set." : " Use Test Connection to check it is a Full access key before enabling."}`
+              : "Nothing changed.",
             COLORS.success
           ),
         ],

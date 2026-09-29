@@ -18,6 +18,7 @@ export const COLUMN_LABELS: Record<GlobalSecretColumn, string> = {
   influxToken: "InfluxDB token",
   yubicoApiSecret: "Yubico API secret",
   postizApiKey: "Postiz API key",
+  resendApiKey: "Resend API key",
 };
 
 export interface MigrateItemResult {

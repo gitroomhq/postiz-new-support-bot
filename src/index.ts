@@ -131,6 +131,8 @@ import { EvidencePackBuilder } from "./bot/billing/evidence/EvidencePackBuilder"
 import { SubscriptionEventStore } from "./bot/billing/SubscriptionEventStore";
 import { SubscriptionEventService } from "./bot/billing/SubscriptionEventService";
 import { DisputeMonitor } from "./bot/billing/DisputeMonitor";
+import { ResendClient } from "./resend/ResendClient";
+import { EmailDeliverabilityService } from "./resend/EmailDeliverabilityService";
 import { TemporalService } from "./temporal/TemporalService";
 import { TemporalWorkerManager } from "./temporal/TemporalWorkerManager";
 import { TemporalProducers } from "./temporal/producers";
@@ -551,6 +553,12 @@ async function main() {
   const postizIdentity = new PostizIdentityService(postizClient, settingsStore, sessionStore);
   const postizOrgLinks = new PostizOrgLinkStore(prisma);
 
+  // Resend, the provider Postiz sends its mail through: support can see when
+  // an address is on the suppression list (so Postiz mail silently never
+  // arrives) and take it off. Ships off; /config → Integrations → Resend.
+  const resendClient = new ResendClient(settingsStore);
+  const emailDelivery = new EmailDeliverabilityService(settingsStore, resendClient, auditLogger);
+
   const intercomInboxApp = new IntercomInboxApp(
     settingsStore,
     intercomStore,
@@ -594,6 +602,7 @@ async function main() {
   // The client exists as soon as the constructor ran; nothing fires before login.
   bot.setSlaService(slaService);
   bot.setPostizIdentity(postizIdentity, postizClient);
+  bot.setEmailDelivery(emailDelivery, resendClient);
   // Platform account facts for the evidence templates (org name, plan, login
   // method). Bound here because the identity service is built after the
   // billing stack.
@@ -660,6 +669,11 @@ async function main() {
         // probe names which one rejected us.
         const r = await postizClient.selfTest();
         postizClient.clearCache();
+        return r.detail;
+      },
+      testResend: async () => {
+        const r = await resendClient.selfTest();
+        resendClient.clearCache();
         return r.detail;
       },
       reconfigureSentry: async () => {

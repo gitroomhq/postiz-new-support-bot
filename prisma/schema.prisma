@@ -178,6 +178,12 @@ model BotSettings {
   postizLookupEnabled Boolean @default(false)
   postizBaseUrl       String? // backend origin the /public/v1 routes hang off, no trailing slash
   postizApiKey        String?
+  // Resend (the provider Postiz sends its mail through): suppression lookups
+  // and removals for support. The key must be FULL access, because a sending
+  // key cannot read the suppression list. Stored value wins; RESEND_API_KEY in
+  // the environment is the fallback. Encrypted (crypto.ts/Vault).
+  resendEnabled       Boolean @default(false)
+  resendApiKey        String?
   // Forwarded-email conversion (lite-seat teammate forwards a customer email to
   // support@ → recreate the conversation for the original sender; edited via
   // /intercom → Automation). Replicates Intercom's "Detect customers in

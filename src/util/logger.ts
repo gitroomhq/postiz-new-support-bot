@@ -264,8 +264,11 @@ const SECRET_KEY_RE =
   /(^|[._-])(secret|secrets|token|password|passwd|passcode|api[_-]?key|apikey|authorization|cookie|dsn|bearer|credential|credentials|client[_-]?secret|access[_-]?token|refresh[_-]?token|private[_-]?key|signature|vault[_-]?token)($|[._-])/i;
 
 // Credential-shaped substrings, redacted wherever they appear (messages/stacks).
+// A Resend key is re_<id>_<secret>: the second underscore is what tells it
+// apart from a Stripe refund id (re_ plus one run of letters and digits), which
+// shows up in logs constantly and must stay readable.
 const SECRET_VALUE_RE =
-  /(?:sk|rk|pk)_(?:live|test)_[A-Za-z0-9]{6,}|whsec_[A-Za-z0-9]{6,}|xox[baprs]-[A-Za-z0-9-]{6,}|Bearer\s+[A-Za-z0-9._~+/-]{8,}=*/g;
+  /(?:sk|rk|pk)_(?:live|test)_[A-Za-z0-9]{6,}|whsec_[A-Za-z0-9]{6,}|re_[A-Za-z0-9]{6,}_[A-Za-z0-9]{12,}|xox[baprs]-[A-Za-z0-9-]{6,}|Bearer\s+[A-Za-z0-9._~+/-]{8,}=*/g;
 
 const REDACTED = "[redacted]";
 

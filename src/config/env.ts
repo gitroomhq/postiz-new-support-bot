@@ -46,6 +46,11 @@ export const ENV_PINS = {
 
 export type EnvPinnedField = keyof typeof ENV_PINS;
 
+// Not a pin: the Resend key in the environment is only a FALLBACK, used while
+// /config holds no key of its own. See SettingsStore.resendApiKey for why this
+// one points the other way from POSTIZ_ADMIN_TOKEN.
+export const RESEND_KEY_VAR = "RESEND_API_KEY";
+
 // The boolean-valued pins; everything else in ENV_PINS is a string.
 const BOOLEAN_PINS = new Set<EnvPinnedField>(["vaultEnabled", "temporalEnabled", "temporalTlsEnabled"]);
 
