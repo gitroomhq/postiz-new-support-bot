@@ -100,23 +100,34 @@ Setup (`/config → Integrations → Sentry Feedback`):
 
 Imported conversations are tagged `sentry-feedback`, carry an internal metadata note (submitter, page URL, Sentry link — the conversation itself is backdated to the submission time), get agent-idle reminder notes (once — the ticket sweep skips converted imports), and are **never** customer-nagged, auto-closed or SLA-clocked.
 
-### Resend email suppression
+### Resend: email suppression and the delivery log
 
-Postiz sends its activation, password-reset and notification mail through [Resend](https://resend.com). An address that hard-bounces or files a spam complaint lands on the Resend team's suppression list, and every later email to it is silently dropped: that is how a customer ends up never receiving the mail that would let them log in. Support can see a suppression and remove it from three places:
+Postiz sends its activation, password-reset and notification mail through [Resend](https://resend.com). Two things decide whether a customer gets it:
 
-- the **Intercom inbox sidebar** (*Email delivery* section): the conversation's contact email, the Postiz account email and the Stripe billing email, plus a *Check another address* input;
-- **`/email <address>`** in Discord: support role and admins only, checked at runtime on the command and on every button, with ephemeral replies;
-- the **web customer page** (*Email delivery* card): the Stripe email and the owner of each Postiz organisation linked to the customer. Removal there takes a typed CONFIRM.
+- **the suppression list**: an address that hard-bounces or files a spam complaint lands on the Resend team's suppression list, and every later email to it is silently dropped. That is how a customer ends up never receiving the mail that would let them log in.
+- **the delivery log**: what happened to each email Resend sent (sent, delivered, delayed, bounced, failed, marked as spam, suppressed), with the receiving server's reason. Resend's API cannot list emails by recipient, so the bot keeps its own log, fed by a Resend webhook, and keeps it for 180 days. Opens and clicks are not tracked. Postiz sends without Resend tags, so each email is classified by its subject (activation, password reset, team invite, login changed, other).
+
+Where support sees them:
+
+- the **Intercom inbox sidebar**: the main card shows one identity line (name, email, Postiz plan, Stripe subscription status) and only the warnings that are true right now (email suppressed, last email bounced/failed/spam/delayed, delinquent, blocked, open dispute, refund review or approvals pending). Everything else sits behind buttons: **Postiz Account**, **E-Mail Deliverability** (suppression status and removal for the contact, Postiz and Stripe addresses, *Check another address*, and the delivery log ten to a page, each email openable for its event timeline), **Billing** (subscriptions, charges, the refund review and approvals) and **Discord Ticket** (only for bridged conversations). The old *Open Stripe Panel* link and its web page are gone;
+- **`/email [address]`** in Discord: support role and admins only, checked at runtime on the command and on every button, menu and modal, with ephemeral replies. With an address it opens that address (suppression, Postiz account, delivery log with a menu to open each email); without one it opens a hub with *Look up address*;
+- the **web customer page**, *Postiz & Email* tab: linked accounts, the *Email delivery* card (the Stripe email and the owner of each linked Postiz organisation; removal takes a typed CONFIRM) and the *Delivery log* table. The customer page now has tabs (Overview, Billing, Postiz & Email, Details); the rail keeps only Insights and Manage.
 
 Any teammate on those surfaces may remove an address. Every removal goes to the audit channel (who, from which surface, what the address was suppressed for), and the sidebar also leaves an internal note on the conversation. When the address belongs to a Postiz account that was never activated, each surface offers **Resend activation email**, which calls Postiz's own `/auth/resend-activation` route.
 
+Admin-only tools (Discord Administrator permission in `/email`, the dashboard admin role on the web, re-checked on every press):
+
+- **Share link**: on any logged email (`/email` email view, web *Delivery log* rows). Resend returns a link that shows the email exactly as sent, body included, valid for **2 hours**. A reset or activation email carries a live link, so the link is shown only to the admin who asked and the audit entry records who shared which email, never the link. The web action also checks that the email went to that customer.
+- **Suppression list** (the `/email` hub): browse the list with a filter (origin any/bounce/complaint/manual, recipient domain, date range), ten to a page, and **Remove all N** matches. The removal re-scans with the same filter instead of trusting the preview, removes in batches of 100, needs `REMOVE <n>` typed, and audits one summary entry. A scan stops after 20,000 entries.
+
 Setup (`/config → Integrations → Resend`, or the Integrations hub of the web panel):
 
-1. In the Resend team Postiz sends from, create a **Full access** API key (a sending-only key cannot read the suppression list) and paste it via **API Key**. It is stored like every global secret (Vault KV entry `resend`, or local encryption) and never echoed back. Without one, `RESEND_API_KEY` from the environment is used.
+1. In the Resend team Postiz sends from, create a **Full access** API key (a sending-only key cannot read the suppression list or register a webhook) and paste it via **API Key**. It is stored like every global secret (Vault KV entry `resend`, or local encryption) and never echoed back. Without one, `RESEND_API_KEY` from the environment is used.
 2. **Test Connection** must answer *Full access* and list that team's sending domains.
 3. Toggle **Enabled: on** (ships off).
+4. **Register Webhook** (needs the public URL from Billing → Stripe Webhooks): creates a webhook on the Resend team pointing at `POST <public-url>/resend/webhook` for the seven delivery events, and stores its Svix signing secret as the global secret `resendWebhookSecret` (Vault KV entry `resend`). It then imports the last month from Resend's history (a Temporal workflow, or in process when Temporal is down; each imported email carries only its last status). Pressing it again replaces the webhook. **Remove Webhook** deletes it; the log keeps what it has. Unsigned or stale deliveries get 403.
 
-Lookups are throttled to about four requests a second and cached for a minute, because Resend's limit of 10 requests a second is per team and Postiz's own sending draws on it too.
+Lookups are throttled to about four requests a second and cached for a minute, because Resend's limit of 10 requests a second is per team and Postiz's own sending draws on it too. The webhook uses none of that budget.
 
 ### Dispute verdict: fight or accept
 
@@ -169,7 +180,7 @@ src/
 ├── dashboard/          # web billing console (customers, disputes, payments, ...)
 ├── metrics/            # InfluxDB writer + exporters + snapshot scheduler
 ├── postiz/             # Postiz platform lookups (identity, usage feed)
-├── resend/             # Resend suppression client + email deliverability service
+├── resend/             # Resend client, suppression tooling, delivery log (webhook, backfill)
 ├── sentry/             # Sentry feedback → Intercom import
 ├── sla/                # SLA clocks, balanced assignment, office hours
 ├── server/             # Express callback + webhook server
