@@ -46,10 +46,10 @@ function command(opts: { allowed: boolean }) {
   return { cmd, looked, removed };
 }
 
-test("/email: registered without default permissions, with one required address", () => {
+test("/email: registered without default permissions; the address is optional (no address = the hub)", () => {
   assert.equal(EMAIL_COMMAND.name, "email");
   assert.ok(!("default_member_permissions" in EMAIL_COMMAND), "the support role must be able to see it");
-  assert.equal(EMAIL_COMMAND.options[0].required, true);
+  assert.equal(EMAIL_COMMAND.options[0].required, false);
 });
 
 test("/email: a refused invoker gets nothing looked up", async () => {
@@ -93,4 +93,57 @@ test("/email: buttons are bound to the user who ran it and re-check the gate", a
     editReply: async (p: unknown) => void edits.push(p),
   } as never);
   assert.deepEqual(allowed.removed, ["gone@example.com"]);
+});
+
+test("/email: the suppression list, batch removal and share links are Administrator-only on every press", async () => {
+  let scans = 0;
+  let shares = 0;
+  const delivery = {
+    enabled: () => true,
+    scanSuppressions: async () => {
+      scans++;
+      return { matches: [], scanned: 0, truncated: false };
+    },
+  };
+  const log = { webhookRegistered: () => true, share: async () => (shares++, { ok: true, url: "https://x" }) };
+  let admin = false;
+  const cmd = new EmailCommand(
+    () => delivery as never,
+    () => null,
+    async () => true,
+    () => log as never,
+    () => admin
+  );
+  const { interaction, replies } = commandInteraction("");
+  await cmd.handleCommand(interaction as never);
+  const hub = replies.at(-1) as { components: Array<{ components: Array<{ data: { custom_id: string } }> }> };
+  const hubIds = hub.components.flatMap((r) => r.components.map((c) => c.data.custom_id));
+  assert.equal(hubIds.length, 1, "a non-admin hub offers only the lookup");
+  const token = hubIds[0].split(":")[1];
+
+  const pressed: unknown[] = [];
+  const press = (customId: string) =>
+    cmd.handleButton({
+      customId,
+      user: { id: "u1", username: "sam" },
+      reply: async (p: unknown) => void pressed.push(p),
+      deferUpdate: async () => {},
+      deferReply: async () => {},
+      editReply: async (p: unknown) => void pressed.push(p),
+      showModal: async () => void pressed.push("modal"),
+    } as never);
+
+  // Hand-crafted ids from a non-admin do nothing.
+  await press(`emailcmd_list:${token}`);
+  await press(`emailcmd_share:${token}`);
+  await press(`emailcmd_bconfirm:${token}`);
+  await press(`emailcmd_filter:${token}`);
+  assert.equal(scans, 0);
+  assert.equal(shares, 0);
+  assert.ok(!pressed.includes("modal"), "no admin modal opens");
+
+  // An admin gets the list.
+  admin = true;
+  await press(`emailcmd_list:${token}`);
+  assert.equal(scans, 1);
 });

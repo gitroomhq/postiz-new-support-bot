@@ -184,7 +184,9 @@ export class DiscordBot {
   private emailCommand = new EmailCommand(
     () => this.emailDelivery,
     () => this.postizIdentity,
-    async (interaction) => (await this.requireSupportOrAdmin(interaction)) != null
+    async (interaction) => (await this.requireSupportOrAdmin(interaction)) != null,
+    () => this.deliveryLog,
+    (interaction) => this.isAdmin(interaction)
   );
   private sentryFeedbackClient: SentryFeedbackClient | null = null;
   // Sentry feedback import ledger — bound late from index.ts; the /config
@@ -1666,6 +1668,11 @@ export class DiscordBot {
       return;
     }
 
+    if (interaction.customId.startsWith(EMAIL_PREFIX)) {
+      await this.emailCommand.handleSelectMenu(interaction);
+      return;
+    }
+
     if (interaction.customId.startsWith("billadmin_")) {
       await this.billingAdmin.handleSelectMenu(interaction);
       return;
@@ -1715,6 +1722,11 @@ export class DiscordBot {
 
     if (interaction.customId === "dashpanel_activate_modal") {
       await this.dashboardDiscord?.handleModal(interaction);
+      return;
+    }
+
+    if (interaction.customId.startsWith(EMAIL_PREFIX)) {
+      await this.emailCommand.handleModal(interaction);
       return;
     }
 
@@ -2006,7 +2018,7 @@ export class DiscordBot {
   }
 
   private async requireSupportOrAdmin(
-    interaction: ChatInputCommandInteraction | StringSelectMenuInteraction | ButtonInteraction
+    interaction: ChatInputCommandInteraction | StringSelectMenuInteraction | ButtonInteraction | ModalSubmitInteraction
   ): Promise<GuildMember | null> {
     const member = await this.fetchMember(interaction);
     const ok = !!member && this.isStaffMember(member);

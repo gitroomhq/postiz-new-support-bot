@@ -4,6 +4,7 @@ import { createHmac } from "node:crypto";
 import { classifySubject, eventRank, parseWebhookEvent, svixSignatureValid } from "../DeliveryLogStore";
 import { DeliveryLogService } from "../DeliveryLogService";
 import { matchesFilter } from "../EmailDeliverabilityService";
+import { parseFilter } from "../../bot/EmailCommand";
 
 // The delivery log is fed by a webhook anyone on the internet can POST to, so
 // the signature check is the whole gate; and the backfill walks a list that
@@ -153,4 +154,18 @@ test("backfill: pages newest first and stops at the first email older than a mon
   assert.deepEqual(h.backfilled, ["e1", "e2", "e3"]);
   assert.deepEqual(h.afters, [null, "e2"], "the third page is never fetched");
   assert.equal(r.created, 3);
+});
+
+test("suppression filter: origin, domain and a day range", () => {
+  const parsed = parseFilter("bounce", "@Gmail.com", "2026-09-01", "2026-09-10");
+  assert.ok(parsed.ok);
+  const f = parsed.filter;
+  const s = (email: string, origin: string, iso: string) => ({ id: "x", email, origin, sourceId: null, createdAt: new Date(iso) });
+  assert.equal(matchesFilter(s("a@gmail.com", "bounce", "2026-09-10T23:00:00Z"), f), true, "the end day is inclusive");
+  assert.equal(matchesFilter(s("a@gmail.com", "complaint", "2026-09-05T00:00:00Z"), f), false);
+  assert.equal(matchesFilter(s("a@yahoo.com", "bounce", "2026-09-05T00:00:00Z"), f), false);
+  assert.equal(matchesFilter(s("a@gmail.com", "bounce", "2026-08-31T23:59:00Z"), f), false);
+  assert.equal(parseFilter("everything", "", "", "").ok, false);
+  assert.equal(parseFilter("any", "", "2026-09-10", "2026-09-01").ok, false);
+  assert.equal(parseFilter("any", "", "10.09.2026", "").ok, false);
 });
