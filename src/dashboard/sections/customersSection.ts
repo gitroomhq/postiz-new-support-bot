@@ -13,6 +13,8 @@ import {
   type DeliveryStatus,
   type EmailDeliverabilityService,
 } from "../../resend/EmailDeliverabilityService";
+import { PROBLEM_EVENTS, categoryLabel, eventLabel } from "../../resend/DeliveryLogStore";
+import { SHARE_TTL_LABEL, type DeliveryLogService } from "../../resend/DeliveryLogService";
 import {
   amount,
   avatarCell,
@@ -138,6 +140,9 @@ export interface CustomersDeps {
   postiz?: PostizIdentityService | null;
   // Resend suppression status for the customer's addresses, and removal.
   emailDelivery?: EmailDeliverabilityService | null;
+  // The Resend delivery log (every email sent to those addresses), and the
+  // admin-only share link.
+  deliveryLog?: DeliveryLogService | null;
 }
 
 export function makeCustomersSection(deps: CustomersDeps = {}): DashboardSectionModule {
@@ -171,7 +176,7 @@ export function makeCustomersSection(deps: CustomersDeps = {}): DashboardSection
       const id = validId("customer", req.params?.id);
       if (!id) return notFound("That customer id is not valid.");
       if (req.page === "customers.portal") return portalLinkPage(ctx, id);
-      return detail(ctx, id, deps);
+      return detail(ctx, id, deps, { ...(req.filters ?? {}), ...(req.cursor ? { logcursor: req.cursor } : {}) });
     },
 
     async action(ctx: DashboardCtx, req) {
@@ -195,6 +200,7 @@ async function customerAction(
   fieldErrors?: Record<string, string>;
   needsReverse?: boolean;
   needsStepUp?: boolean;
+  link?: { href: string; label: string };
 }> {
   const confirmed = confirmWord === "CONFIRM";
 
@@ -252,6 +258,30 @@ async function customerAction(
       default:
         return { ok: false, error: result.error };
     }
+  }
+
+  // Admin-only: a share link for one logged email. Re-checks the admin role
+  // server-side and that the email went to one of THIS customer's addresses,
+  // so an edited request cannot mint a link to someone else's mail.
+  if (key === "section:customers.email_share") {
+    if (!ctx.actor.isAdmin) return { ok: false, error: "Only dashboard admins can share an email." };
+    const log = deps.deliveryLog;
+    if (!log) return { ok: false, error: "The delivery log is not available." };
+    const emailId = str(p.emailId, 80).trim();
+    if (!/^[A-Za-z0-9-]{8,80}$/.test(emailId)) return { ok: false, error: "Bad email id." };
+    const found = await log.email(emailId).catch(() => null);
+    const known = await customerEmails(ctx, customerId, deps);
+    if (!found || !known.some((e) => e.toLowerCase() === found.email.recipient)) {
+      return { ok: false, error: "That email was not sent to this customer." };
+    }
+    const r = await log.share(emailId, { surface: "dashboard", id: ctx.actor.id, name: ctx.actor.name });
+    await ctx.audit(`Resend share link created for an email to ${customerId}${r.ok ? "" : " (failed)"}`);
+    if (!r.ok) return { ok: false, error: r.error };
+    return {
+      ok: true,
+      text: `Link created, valid for ${SHARE_TTL_LABEL}. Anyone with it sees the whole email.`,
+      link: { href: r.url, label: "Open the email as sent" },
+    };
   }
 
   switch (key) {
@@ -727,6 +757,64 @@ async function emailDeliveryCard(
   };
 }
 
+const LOG_PAGE_SIZE = 10;
+
+// Every email Resend sent to this customer's addresses, newest first, ten to
+// a page (the cursor is the page number). Admins get a Share action per row.
+async function deliveryLogTable(
+  ctx: DashboardCtx,
+  log: DeliveryLogService,
+  customerId: string,
+  addresses: string[],
+  cursor: string | undefined
+): Promise<TableBlock> {
+  const page = cursor && /^\d{1,5}$/.test(cursor) ? Number(cursor) : 0;
+  const history = await log.historyForMany(addresses, page, LOG_PAGE_SIZE).catch(() => null);
+  const pages = history ? Math.ceil(history.total / LOG_PAGE_SIZE) : 0;
+  return {
+    type: "table",
+    key: "emaillog",
+    title: history ? `Delivery log (${history.total})` : "Delivery log",
+    columns: [
+      { key: "sent", label: "Sent" },
+      { key: "kind", label: "Email" },
+      { key: "status", label: "Status" },
+      { key: "to", label: "To / reason" },
+    ],
+    rows: (history?.rows ?? []).map((r) => ({
+      id: r.id,
+      cells: [
+        isoDateCell(r.sentAt),
+        text(categoryLabel(r.category), r.subject ?? undefined),
+        badgeCell(
+          PROBLEM_EVENTS.has(r.lastEvent) ? (r.lastEvent === "delivery_delayed" ? "warn" : "error") : r.lastEvent === "delivered" ? "ok" : "info",
+          eventLabel(r.lastEvent)
+        ),
+        text(r.recipient, r.detail ? r.detail.slice(0, 160) : undefined),
+      ],
+      ...(ctx.actor.isAdmin
+        ? {
+            actions: [
+              {
+                key: "section:customers.email_share",
+                label: `Share link (${SHARE_TTL_LABEL})`,
+                params: { customerId, emailId: r.id },
+                summary: `Creates a link that shows this email exactly as sent, body included, valid for ${SHARE_TTL_LABEL}. A reset or activation email carries a live link: do not paste it where others can read it.`,
+              },
+            ],
+          }
+        : {}),
+    })),
+    empty: history
+      ? log.webhookRegistered()
+        ? "No email to these addresses in the last 180 days."
+        : "Nothing logged: the Resend webhook is not registered (/config → Integrations → Resend)."
+      : "The delivery log is unavailable right now.",
+    nextCursor: page + 1 < pages ? String(page + 1) : null,
+    ...(history && history.total > 0 ? { footer: `${history.total} email${history.total === 1 ? "" : "s"} · 180 days kept` } : {}),
+  };
+}
+
 // One query for the linked Discord sessions instead of one per id.
 async function loadDiscordLinks(
   ctx: DashboardCtx,
@@ -740,7 +828,27 @@ async function loadDiscordLinks(
   return { discordIds, postizUserId: linked };
 }
 
-async function detail(ctx: DashboardCtx, id: string, deps: CustomersDeps = {}): Promise<SectionPage> {
+// The page's tabs. The rail keeps only Insights and Manage; everything that
+// used to stack under them lives on a tab, so nothing needs a long scroll.
+const TAB_ITEMS = [
+  { value: "", label: "Overview" },
+  { value: "billing", label: "Billing" },
+  { value: "email", label: "Postiz & Email" },
+  { value: "details", label: "Details" },
+] as const;
+type CustomerTab = "overview" | "billing" | "email" | "details";
+
+function tabOf(raw: string | undefined): CustomerTab {
+  return raw === "billing" || raw === "email" || raw === "details" ? raw : "overview";
+}
+
+async function detail(
+  ctx: DashboardCtx,
+  id: string,
+  deps: CustomersDeps = {},
+  filters: Record<string, string> = {}
+): Promise<SectionPage> {
+  const tab = tabOf(filters.tab);
   const customer = await ctx.stripe.getCustomer(id).catch(() => null);
   if (!customer) {
     return notFound("This customer does not exist (or was deleted).");
@@ -774,6 +882,7 @@ async function detail(ctx: DashboardCtx, id: string, deps: CustomersDeps = {}): 
 
   const main: Block[] = [];
   const rail: Block[] = [];
+  const tabs: Record<CustomerTab, Block[]> = { overview: [], billing: [], email: [], details: [] };
 
   // Header: big name, email subline, status pills (Stripe detail archetype).
   const headBadges: Badge[] = [];
@@ -878,7 +987,7 @@ async function detail(ctx: DashboardCtx, id: string, deps: CustomersDeps = {}): 
       ? customer.invoice_settings.default_payment_method
       : (customer.invoice_settings?.default_payment_method as Stripe.PaymentMethod | null)?.id ?? null;
   const defaultPmObj = defaultPm ? methods.find((m) => m.id === defaultPm) ?? null : null;
-  rail.push({
+  tabs.details.push({
     type: "kv",
     title: "Details",
     rows: [
@@ -971,7 +1080,7 @@ async function detail(ctx: DashboardCtx, id: string, deps: CustomersDeps = {}): 
   // ---- rail: Metadata (moved from the removed edit page) ----
   const metaEntries = Object.entries(customer.metadata ?? {});
   if (metaEntries.length > 0) {
-    rail.push({
+    tabs.details.push({
       type: "kv",
       title: `Metadata (${metaEntries.length})`,
       rows: metaEntries.slice(0, 20).map(([k, v]) => ({ label: k, cell: text(String(v).slice(0, 120)) })),
@@ -979,7 +1088,7 @@ async function detail(ctx: DashboardCtx, id: string, deps: CustomersDeps = {}): 
   }
 
   // ---- rail: Tax IDs (print on every invoice → both actions T1) ----
-  rail.push({
+  tabs.details.push({
     type: "kv",
     title: taxIds.length ? `Tax IDs (${taxIds.length})` : "Tax IDs",
     rows: taxIds.length
@@ -1025,7 +1134,7 @@ async function detail(ctx: DashboardCtx, id: string, deps: CustomersDeps = {}): 
   // ---- rail: Addresses ----
   const billAddr = fmtAddress(customer.address);
   const shipAddr = fmtAddress(customer.shipping?.address ?? null);
-  rail.push({
+  tabs.details.push({
     type: "kv",
     title: "Addresses",
     rows: [
@@ -1150,19 +1259,25 @@ async function detail(ctx: DashboardCtx, id: string, deps: CustomersDeps = {}): 
     linkRows.push({ label: "Postiz org", cell: text(miss) });
   }
 
-  rail.push({
+  tabs.email.push({
     type: "kv",
     title: "Linked accounts",
     rows: linkRows.length ? linkRows : [{ label: "Discord user", cell: text("not linked") }],
   });
 
   // ---- rail: Email delivery (Resend suppression list) ----
-  if (deps.emailDelivery?.enabled()) {
-    rail.push(await emailDeliveryCard(deps.emailDelivery, id, customer.email ?? null, postiz));
+  // Only the tab that shows them pays for the Resend lookups and the log read.
+  if (tab === "email" && deps.emailDelivery?.enabled()) {
+    tabs.email.push(await emailDeliveryCard(deps.emailDelivery, id, customer.email ?? null, postiz));
+    if (deps.deliveryLog) {
+      tabs.email.push(
+        await deliveryLogTable(ctx, deps.deliveryLog, id, emailsOf(customer.email ?? null, postiz), filters.logcursor)
+      );
+    }
   }
 
   // ---- main: Subscriptions ----
-  main.push({
+  tabs.overview.push({
     type: "table",
     key: "subs",
     title: "Subscriptions",
@@ -1217,7 +1332,7 @@ async function detail(ctx: DashboardCtx, id: string, deps: CustomersDeps = {}): 
 
   // ---- main: Payments (from the lifetime-spend fetch — no extra API call) ----
   const recentCharges = chargesPage.charges.slice(0, 10);
-  main.push({
+  tabs.overview.push({
     type: "table",
     key: "charges",
     title: "Payments",
@@ -1247,7 +1362,7 @@ async function detail(ctx: DashboardCtx, id: string, deps: CustomersDeps = {}): 
   });
 
   // ---- main: Payment methods ----
-  main.push({
+  tabs.billing.push({
     type: "table",
     key: "pms",
     title: "Payment methods",
@@ -1306,7 +1421,7 @@ async function detail(ctx: DashboardCtx, id: string, deps: CustomersDeps = {}): 
   });
 
   // ---- main: Invoices ----
-  main.push({
+  tabs.billing.push({
     type: "table",
     key: "invoices",
     title: "Invoices",
@@ -1345,7 +1460,7 @@ async function detail(ctx: DashboardCtx, id: string, deps: CustomersDeps = {}): 
         : g.expires_at && g.expires_at < now
           ? { kind: "neutral", text: "Expired" }
           : { kind: "ok", text: "Active" };
-    main.push({
+    tabs.billing.push({
       type: "table",
       key: "creditgrants",
       title: "Credit grants",
@@ -1387,7 +1502,7 @@ async function detail(ctx: DashboardCtx, id: string, deps: CustomersDeps = {}): 
 
   // ---- main: balance-transaction history (glance, not a ledger) ----
   if (balanceTxns.length > 0) {
-    main.push({
+    tabs.billing.push({
       type: "table",
       key: "balancehistory",
       title: "Balance history",
@@ -1413,7 +1528,7 @@ async function detail(ctx: DashboardCtx, id: string, deps: CustomersDeps = {}): 
 
   // ---- main: dispute mirror rows ----
   if (disputes.length > 0) {
-    main.push({
+    tabs.billing.push({
       type: "table",
       key: "disputes",
       title: "Disputes",
@@ -1442,7 +1557,7 @@ async function detail(ctx: DashboardCtx, id: string, deps: CustomersDeps = {}): 
 
   // ---- main: team notes (read-only) ----
   if (notes.rows.length > 0) {
-    main.push({
+    tabs.overview.push({
       type: "timeline",
       title: `Team notes (${notes.total})`,
       items: notes.rows.map((n) => ({
@@ -1546,6 +1661,21 @@ async function detail(ctx: DashboardCtx, id: string, deps: CustomersDeps = {}): 
       },
     ],
   });
+
+  main.push(
+    {
+      type: "tabs",
+      key: "tab",
+      value: tab === "overview" ? undefined : tab,
+      items: TAB_ITEMS.map((t) => ({
+        value: t.value,
+        label: t.label,
+        ...(t.value === "billing" && disputes.length ? { badge: String(disputes.length) } : {}),
+      })),
+    },
+    ...tabs[tab]
+  );
+  if (!tabs[tab].length) main.push({ type: "empty", title: "Nothing here", hint: "This customer has nothing to show on this tab." });
 
   return {
     title,

@@ -91,12 +91,13 @@ async function linkedCard(subs: unknown[], deps?: CustomersDeps): Promise<KeyVal
   const page = await makeCustomersSection(deps).buildPage(fakeCtx(subs), {
     page: "customers.detail",
     params: { id: CUSTOMER_ID },
+    filters: { tab: "email" },
   });
   assert.ok(page, "expected a customer detail page");
-  const card = page!.rail!.find(
+  const card = page!.blocks.find(
     (b) => b.type === "kv" && (b as KeyValueBlock).title === "Linked accounts"
   ) as KeyValueBlock;
-  assert.ok(card, "expected a Linked accounts rail card");
+  assert.ok(card, "expected a Linked accounts card on the Postiz & Email tab");
   return card;
 }
 

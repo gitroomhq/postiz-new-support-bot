@@ -6,7 +6,7 @@ import { makeCustomersSection, type CustomersDeps } from "../sections/customersS
 import type { DeliveryStatus } from "../../resend/EmailDeliverabilityService";
 import type { PostizOrgLookup } from "../../postiz/PostizIdentityService";
 
-// The Email delivery rail card on the web customer page: which of the
+// The Email delivery card on the web customer page (Postiz & Email tab): which of the
 // customer's addresses Postiz mail cannot reach, and the two repairs.
 
 const CUSTOMER_ID = "cus_mail1";
@@ -101,8 +101,8 @@ function deps(statuses: Record<string, DeliveryStatus["state"]>) {
 
 test("customer page: every known address with its state; Remove for the suppressed, activation for the unactivated owner", async () => {
   const { d } = deps({ "billing@acme.com": "suppressed", "jane@acme.com": "clear" });
-  const page = await makeCustomersSection(d).buildPage(ctx(), { page: "customers.detail", params: { id: CUSTOMER_ID } });
-  const card = page!.rail!.find((b) => (b as KeyValueBlock).title === "Email delivery") as KeyValueBlock;
+  const page = await makeCustomersSection(d).buildPage(ctx(), { page: "customers.detail", params: { id: CUSTOMER_ID }, filters: { tab: "email" } });
+  const card = page!.blocks.find((b) => (b as KeyValueBlock).title === "Email delivery") as KeyValueBlock;
   assert.deepEqual(card.rows.map((r) => r.label), ["billing@acme.com", "jane@acme.com"]);
   assert.match((card.rows[0].cell as { v: string }).v, /suppressed since 2026-09-01 \(spam complaint\)/);
   const keys = card.actions!.map((a) => `${a.key}:${(a.params as { email: string }).email}`);
@@ -135,4 +135,68 @@ test("customer page: removal needs CONFIRM, only reaches this customer's own add
   });
   assert.equal(act.ok, true);
   assert.deepEqual(activated, ["jane@acme.com"]);
+});
+
+test("delivery log: the tab lists the customer's emails; Share is admin-only and bound to this customer", async () => {
+  const { d } = deps({});
+  const shared: string[] = [];
+  const row = (id: string, recipient: string) => ({
+    id,
+    recipient,
+    fromAddress: null,
+    subject: "Reset your password",
+    category: "password_reset",
+    sentAt: new Date("2026-09-20T10:00:00Z"),
+    lastEvent: "bounced",
+    lastEventAt: new Date("2026-09-20T10:00:05Z"),
+    detail: "Permanent: mailbox does not exist",
+    source: "webhook",
+  });
+  const logged: Record<string, ReturnType<typeof row>> = {
+    "0f9a1c2e-0000-4000-8000-000000000001": row("0f9a1c2e-0000-4000-8000-000000000001", "jane@acme.com"),
+    "0f9a1c2e-0000-4000-8000-000000000002": row("0f9a1c2e-0000-4000-8000-000000000002", "someone@else.com"),
+  };
+  d.deliveryLog = {
+    webhookRegistered: () => true,
+    historyForMany: async (addresses: string[]) => {
+      const rows = Object.values(logged).filter((r) => addresses.map((a) => a.toLowerCase()).includes(r.recipient));
+      return { rows, total: rows.length };
+    },
+    email: async (id: string) => (logged[id] ? { email: logged[id], events: [] } : null),
+    share: async (id: string) => {
+      shared.push(id);
+      return { ok: true, url: "https://resend.com/shared?token=t" };
+    },
+  } as never;
+  const section = makeCustomersSection(d);
+
+  const operatorPage = await section.buildPage(ctx(), { page: "customers.detail", params: { id: CUSTOMER_ID }, filters: { tab: "email" } });
+  const table = operatorPage!.blocks.find((b) => b.type === "table" && (b as { key: string }).key === "emaillog") as {
+    rows: Array<{ id: string; actions?: unknown[] }>;
+  };
+  assert.deepEqual(table.rows.map((r) => r.id), ["0f9a1c2e-0000-4000-8000-000000000001"]);
+  assert.equal(table.rows[0].actions, undefined, "no Share for a non-admin");
+
+  // A non-admin posting the action anyway is refused.
+  const refused = await section.action!(ctx(), {
+    key: "section:customers.email_share",
+    params: { customerId: CUSTOMER_ID, emailId: "0f9a1c2e-0000-4000-8000-000000000001" },
+  });
+  assert.equal(refused.ok, false);
+
+  const admin = ctx();
+  (admin as { actor: { isAdmin: boolean } }).actor.isAdmin = true;
+  // An admin pointing it at someone else's email is refused too.
+  const foreign = await section.action!(admin, {
+    key: "section:customers.email_share",
+    params: { customerId: CUSTOMER_ID, emailId: "0f9a1c2e-0000-4000-8000-000000000002" },
+  });
+  assert.equal(foreign.ok, false);
+  const ok = await section.action!(admin, {
+    key: "section:customers.email_share",
+    params: { customerId: CUSTOMER_ID, emailId: "0f9a1c2e-0000-4000-8000-000000000001" },
+  });
+  assert.equal(ok.ok, true);
+  assert.equal((ok as { link?: { href: string } }).link?.href, "https://resend.com/shared?token=t");
+  assert.deepEqual(shared, ["0f9a1c2e-0000-4000-8000-000000000001"]);
 });

@@ -345,7 +345,29 @@ test("charge badges are sentence-case with refund/dispute precedence", () => {
   assert.equal(sentence("past_due"), "Past due");
 });
 
-// ---- Customer 360 renders the Stripe rail (Insights / Details / Linked accounts) ----
+// ---- Customer 360: Insights + Manage in the rail, everything else on tabs ----
+
+// The page spreads its cards over four tabs. Assertions written against the
+// whole page read every tab at once: the first tab's page, with the other
+// tabs' blocks (minus their repeated header and tab strip) appended.
+async function customer360(
+  section: DashboardSectionModule,
+  ctx: DashboardCtx,
+  id = "cus_test1"
+): Promise<{ blocks: Block[]; rail: Block[] }> {
+  const tabs = ["", "billing", "email", "details"];
+  const pages = await Promise.all(
+    tabs.map((t) => section.buildPage(ctx, { page: "customers.detail", params: { id }, ...(t ? { filters: { tab: t } } : {}) }))
+  );
+  const [first, ...rest] = pages;
+  return {
+    blocks: [
+      ...first!.blocks.filter((b) => b.type !== "tabs" && b.type !== "empty"),
+      ...rest.flatMap((p) => p!.blocks.slice(1).filter((b) => b.type !== "tabs" && b.type !== "empty" && b.type !== "notice")),
+    ],
+    rail: first!.rail ?? [],
+  };
+}
 
 function fakeCustomerCtx(): DashboardCtx {
   const fmt = (a: number, c: string) => `${(a / 100).toFixed(2)} ${c.toUpperCase()}`;
@@ -439,12 +461,14 @@ function fakeCustomerCtx(): DashboardCtx {
 
 test("customer 360: Insights/Details/Linked accounts in the rail, atoms in the main tables", async () => {
   const section = makeCustomersSection();
-  const page = await section.buildPage(fakeCustomerCtx(), { page: "customers.detail", params: { id: "cus_test1" } });
-  assert.ok(page);
-  // Rail: Insights/Details/Tax IDs/Addresses/Linked + Manage.
+  const first = await section.buildPage(fakeCustomerCtx(), { page: "customers.detail", params: { id: "cus_test1" } });
+  const tabStrip = first!.blocks.find((b) => b.type === "tabs") as { items: Array<{ label: string }> };
+  assert.deepEqual(tabStrip.items.map((t) => t.label), ["Overview", "Billing", "Postiz & Email", "Details"]);
+  const page = await customer360(section, fakeCustomerCtx());
+  // Rail: Insights + Manage only; Details/Tax IDs/Addresses/Linked moved to tabs.
   const railCard = (title: string) =>
-    page!.rail!.find((b) => b.type === "kv" && (b as KeyValueBlock).title?.startsWith(title)) as KeyValueBlock;
-  assert.ok(page!.rail && page!.rail.length === 6, "expected a 6-card rail");
+    [...page.rail, ...page.blocks].find((b) => b.type === "kv" && (b as KeyValueBlock).title?.startsWith(title)) as KeyValueBlock;
+  assert.ok(page.rail.length === 2, "expected a 2-card rail");
   const manage = railCard("Manage");
   assert.equal(manage.title, "Manage");
   // Act-from-customer entries carry the customer into the composers.
@@ -460,7 +484,8 @@ test("customer 360: Insights/Details/Linked accounts in the rail, atoms in the m
     "section:customers.delete",
   ]);
   assert.equal(manage.actions![0].stepUp, true);
-  const [insights, details] = page!.rail as KeyValueBlock[];
+  const insights = page.rail[0] as KeyValueBlock;
+  const details = railCard("Details");
   const linked = railCard("Linked accounts");
   assert.equal(insights.title, "Insights");
   assert.equal(insights.big, true);
@@ -3759,7 +3784,7 @@ test("catalog: coupon restrictions (max redemptions / redeem-by / applies-to) an
 
 test("customer 360: attach-PM + SetupIntent header actions; per-card Charge/Set-default/Detach ride the registry", async () => {
   const section = makeCustomersSection();
-  const page = await section.buildPage(fakeCustomerCtx(), { page: "customers.detail", params: { id: "cus_test1" } });
+  const page = await customer360(section, fakeCustomerCtx());
   const header = page!.blocks[0] as HeaderBlock;
   const attach = header.actions!.find((a) => a.key === "customer.payment_method")!;
   assert.equal(attach.dangerous, true);
@@ -5129,9 +5154,9 @@ test("customer 360: tax IDs + addresses rail cards, balance history, cash balanc
     ],
   });
   (ctx.stripe as unknown as Record<string, unknown>).getCashBalance = async () => ({ available: { eur: 5000 } });
-  const page = await section.buildPage(ctx, { page: "customers.detail", params: { id: "cus_test1" } });
+  const page = await customer360(section, ctx);
   const card = (title: string) =>
-    page!.rail!.find((b) => b.type === "kv" && (b as KeyValueBlock).title?.startsWith(title)) as KeyValueBlock;
+    page.blocks.find((b) => b.type === "kv" && (b as KeyValueBlock).title?.startsWith(title)) as KeyValueBlock;
 
   const taxCard = card("Tax IDs");
   assert.equal(taxCard.rows.length, 2);
@@ -5152,7 +5177,7 @@ test("customer 360: tax IDs + addresses rail cards, balance history, cash balanc
   assert.equal((cashRow!.cell as { v: string }).v, "50.00 EUR");
 
   // Without any of it: no history table, no cash row, tax card shows "none".
-  const bare = await section.buildPage(fakeCustomerCtx(), { page: "customers.detail", params: { id: "cus_test1" } });
+  const bare = await customer360(section, fakeCustomerCtx());
   assert.ok(!bare!.blocks.some((b) => b.type === "table" && (b as TableBlock).key === "balancehistory"));
   assert.ok(!(bare!.rail![0] as KeyValueBlock).rows.some((r) => r.label === "Cash balance"));
 });
@@ -5708,10 +5733,10 @@ test("customer 360: inline edit on the Details card, row actions on subs/invoice
       voided_at: 1_700_100_000,
     },
   ];
-  const page = await section.buildPage(ctx, { page: "customers.detail", params: { id: "cus_test1" } });
+  const page = await customer360(section, ctx);
 
-  // Inline edit: the Details rail card carries the three edit modals.
-  const details = page!.rail!.find((b) => b.type === "kv" && (b as KeyValueBlock).title === "Details") as KeyValueBlock;
+  // Inline edit: the Details card (Details tab) carries the three edit modals.
+  const details = page.blocks.find((b) => b.type === "kv" && (b as KeyValueBlock).title === "Details") as KeyValueBlock;
   assert.deepEqual(
     (details.actions ?? []).map((a) => a.key),
     ["section:customers.update", "section:customers.tax_locale", "section:customers.metadata"]
@@ -6774,7 +6799,7 @@ test("PM fingerprint: the 360 payment-methods table exposes the fingerprint and 
     { id: "pm_2", type: "link", link: { email: "ada@example.com" } },
     { id: "pm_3", type: "sepa_debit", sepa_debit: { last4: "3000", fingerprint: "SepaFp123" } },
   ];
-  const page = await makeCustomersSection().buildPage(ctx, { page: "customers.detail", params: { id: "cus_test1" } });
+  const page = await customer360(makeCustomersSection(), ctx);
   const pms = page!.blocks.find((b) => b.type === "table" && (b as TableBlock).key === "pms") as TableBlock;
   assert.equal(pms.columns.some((c) => c.label === "Identity"), true);
   const fpCell = pms.rows[0].cells[3] as { t: string; v: string; ref?: { page: string; filters?: Record<string, string> } };
