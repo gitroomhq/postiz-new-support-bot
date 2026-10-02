@@ -86,6 +86,25 @@ The Intercom workspace runs on the **Advanced** plan, which has no native SLAs, 
 
 Alerts stay **inside Intercom** (agent Discord pings were retired): at-risk flips the `SLA Status` attribute; a breach also adds the `sla-breached` tag and one internal note per breached clock. Rules are priority-ordered (first enabled match wins, conditions AND-ed) over ticket basics, Stripe customer state, Intercom data and keywords; no match writes the default target. Target evaluation fires on ticket creation, status changes, customer replies, assignee changes, Stripe events and the native webhooks (30-min `sla-sweep` safety net); the clocks + assignment stray-sweep run every 5 min (`sla-enforce`).
 
+### Customer responded ticket state
+
+When a customer replies, the Intercom ticket moves into a "Customer responded" state, so the inbox shows at a glance which tickets wait on the team. When a teammate replies, the ticket goes back to the state it had before the customer wrote. Intercom can't do the second half itself (it has no memory of the previous state, and its Workflows never see the bridge's API-created conversations), so the bot does both.
+
+- **Triggers**: a customer reply on a ticket in **Submitted**, **In progress** or **Waiting on customer** (any custom state in those categories). Resolved tickets keep Intercom's own reopen behavior. Only Customer-category ticket types; plain conversations have no ticket state and are skipped.
+- **What counts as our reply**: a person replying in the Intercom inbox, or a staff message in a bridged Discord thread. Fin, bots, the bot's own automated messages and internal notes never count.
+- **Where it goes back to**: the exact state from before the customer's reply. Two exceptions land on Waiting on customer instead: a ticket that was still Submitted, and a ticket in Customer responded with no record of where it came from (set by hand, or before this shipped) whose ticket history doesn't say either.
+- **Intercom's own move**: Intercom itself moves Waiting on customer to In progress the moment a customer replies. The bot reads the ticket history to see through that, so the restore still returns to Waiting on customer.
+- **Manual changes win**: if someone changes the state by hand (or replies and sets a state in one go) while the ticket is in Customer responded, the pending restore is dropped. Closed or snoozed conversations are never written to (a ticket write would reopen them).
+- **Bridged Discord tickets**: the change rides the ticket's outbox, behind the message that caused it. On our reply the Discord status goes back too (for example Waiting for Developer back to Waiting for Customer, so customer reminders and auto-close keep working), and the Intercom state follows the tag mapping.
+
+Setup (`/intercom → Automation`, mirrored in the web panel's Automation hub):
+
+1. In Intercom, create the state (Settings → Tickets → ticket states), preferably in the **In progress** category, and enable it on every Customer ticket type you use. Tickets whose type lacks it are skipped. In progress is the safe category: Intercom's own automatic move only starts from Waiting on customer and Resolved, so it never fights this one.
+2. **Pick State**, then switch **Customer Responded: on**. Nothing changes until both are set.
+3. Optional: **Sync Now** moves every open ticket whose customer spoke last into the state (one pass, results shown when it finishes).
+
+No new webhook subscriptions: it uses `conversation.admin.replied` (the bridge's topic list) and `conversation.user.replied` (the SLA setup above). Flips are silent (no notes, no audit entries); the Discord status changes on bridged tickets are ordinary status changes. Restore rows older than 90 days are dropped by the cleanup tick.
+
 ### Sentry feedback → Intercom import
 
 Sentry's User Feedback widget is write-only for users — nobody can answer them there. The `sentry-feedback-sync` looper (15 min, plus a webhook accelerator) turns each **widget** feedback item into an Intercom conversation authored by an email contact matching the submitter: agents reply in Intercom, Intercom's email fallback delivers the reply (imported contacts never have Messenger sessions), and the submitter's email answer threads back into the same conversation. Sentry itself is strictly read-only; anonymous submissions are skipped (counted on the panel); there is **no backfill** — the first enable stamps an import floor.
