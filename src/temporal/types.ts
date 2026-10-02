@@ -154,7 +154,10 @@ export type IcEventType =
   // delivery time from the then-current rules, so stale queued events
   // converge. Riding the outbox gives conversation-before-sla ordering for
   // free (ensure-head synthesis) and the delivery retry machinery.
-  | "sla";
+  | "sla"
+  // Customer-responded ticket state (customer message in / staff reply out),
+  // ordered behind the message it reacts to.
+  | "reply_state";
 
 export interface IcEvent {
   seq: number;

@@ -4,7 +4,7 @@ import { SettingsStore } from "../config/SettingsStore";
 import { SessionStore } from "../auth/SessionStore";
 import { IntercomStore } from "./IntercomStore";
 import type { IntercomEventExecutor } from "./IntercomEventExecutor";
-import { EnsurePayload, MessageAttachmentRef, OutboxEventType, OutboxPayload } from "./types";
+import { EnsurePayload, MessageAttachmentRef, OutboxEventType, OutboxPayload, ReplyStatePayload } from "./types";
 import { log } from "../util/logger";
 import type { TemporalProducers } from "../temporal/producers";
 
@@ -400,6 +400,19 @@ export class IntercomSyncService {
     return true;
   }
 
+  // Customer-responded state for a bridged ticket (ReplyStateService decides
+  // at delivery time). Rides the per-ticket outbox so it lands after the
+  // message, and the status flip, it reacts to.
+  async onReplyState(threadId: string, payload: ReplyStatePayload): Promise<void> {
+    if (!this.enabled() || !this.settingsStore.replyStateActive()) return;
+    const ticket = await this.ticketStore.getByThreadId(threadId);
+    if (!ticket || !this.mirrorable(ticket)) return;
+    await this.chained(ticket.threadId, async () => {
+      await this.ensureLink(ticket);
+      await this.emit(ticket.threadId, "reply_state", payload);
+    });
+  }
+
   // Newest relayed-agent-reply stamp for a thread (IntercomMessageMap "in"
   // rows). Agent replies land in Discord as BOT messages, invisible to the
   // human-message scans — checkTicketTimers folds this in so an agent who
@@ -753,7 +766,7 @@ export function externalIdFor(payload: EnsurePayload, threadId: string): string 
 // events. Matched by the ✅ convention OR by label — the emoji-only convention
 // silently stopped closing conversations the moment a Resolved tag was
 // re-emojied.
-function isResolvedTag(tag: StatusTag): boolean {
+export function isResolvedTag(tag: StatusTag): boolean {
   return tag.emoji === "✅" || /\b(resolved|solved)\b/i.test(tag.label);
 }
 

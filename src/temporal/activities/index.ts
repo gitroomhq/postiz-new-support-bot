@@ -23,6 +23,7 @@ import type { SlaEnforcer } from "../../intercom/SlaEnforcer";
 import { IntercomHttpError } from "../../intercom/IntercomClient";
 import { DeferEchoError, type IntercomWebhookHandler } from "../../intercom/IntercomWebhookHandler";
 import type { EnsurePayload } from "../../intercom/types";
+import { CUSTOMER_REPLY_ACTOR } from "../../intercom/replyState";
 import type { SentryFeedbackImporter } from "../../sentry/SentryFeedbackImporter";
 import type { SnapshotScheduler } from "../../metrics/SnapshotScheduler";
 import {
@@ -48,6 +49,9 @@ const INTERCOM_CALL_SPACING_MS = 300;
 // Retention sweeps folded into the cleanup loop (legacy outbox-scheduler values).
 const ECHO_RETENTION_MS = 14 * DAY_MS;
 const PENDING_POST_RETENTION_MS = 60 * 60 * 1000;
+// Customer-responded restore rows outlive any real wait for a reply; older
+// ones belong to tickets closed or abandoned while in the state.
+const REPLY_STATE_RETENTION_MS = 90 * DAY_MS;
 
 // Default reminder copy; per-tag overrides ({days} placeholder) replace these.
 const DEFAULT_CUSTOMER_REMINDER =
@@ -391,7 +395,7 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
                   const prevTag = ticket.prevStatusTagId ? settingsStore.tagById(ticket.prevStatusTagId) : undefined;
                   const flip = usable(replyTarget) ? replyTarget : usable(prevTag) ? prevTag : settingsStore.initialTag();
                   if (flip && flip.id !== ticket.statusTagId) {
-                    statusChange = { tagId: flip.id, actorName: "Customer reply" };
+                    statusChange = { tagId: flip.id, actorName: CUSTOMER_REPLY_ACTOR };
                     void auditLogger.log({
                       title: "⏭️ Auto-close skipped",
                       severity: "warn",
@@ -733,6 +737,7 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
       await sessionStore.cleanOldStripeEvents().catch((e) => actLog.error("clean stripe events failed", e));
       await intercomStore.cleanupEchoParts(new Date(Date.now() - ECHO_RETENTION_MS)).catch(() => {});
       await intercomStore.cleanupPendingPosts(new Date(Date.now() - PENDING_POST_RETENTION_MS)).catch(() => {});
+      await intercomStore.cleanupReplyStates(new Date(Date.now() - REPLY_STATE_RETENTION_MS)).catch(() => {});
       await deliveryLog?.purge().catch((e) => actLog.error("resend log purge failed", e));
     },
 

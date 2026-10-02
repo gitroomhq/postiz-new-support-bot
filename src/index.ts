@@ -60,6 +60,7 @@ import { SentryFeedbackImporter } from "./sentry/SentryFeedbackImporter";
 import { SlaSweeper } from "./intercom/SlaSweeper";
 import { SlaEnforcer } from "./intercom/SlaEnforcer";
 import { AssignmentService } from "./intercom/AssignmentService";
+import { ReplyStateService, formatReplySyncReport } from "./intercom/ReplyStateService";
 import { IntercomAdmin } from "./bot/IntercomAdmin";
 import { AdminPanelTokens } from "./adminpanel/AdminPanelTokens";
 import { AdminPanelSessions } from "./adminpanel/AdminPanelSessions";
@@ -518,6 +519,18 @@ async function main() {
     sentryFeedbackStore
   );
   intercomWebhookHandler.setSlaEnforcer(slaEnforcer);
+  // Customer-responded ticket state (/intercom → Automation): native tickets
+  // from the inbound webhooks, bridged ones through the ticket outbox.
+  const replyStateService = new ReplyStateService(
+    intercomClient,
+    intercomStore,
+    settingsStore,
+    ticketStore,
+    intercomSync,
+    (fn) => intercomExecutor.withAuthor(fn)
+  );
+  intercomExecutor.setReplyStates(replyStateService);
+  intercomWebhookHandler.setReplyStates(replyStateService);
 
   // /intercom admin panel (bridge/SLA/automation/maintenance hubs).
   const intercomAdmin = new IntercomAdmin(
@@ -533,7 +546,8 @@ async function main() {
     temporalProducers,
     slaRuleStore,
     slaService,
-    assignmentService
+    assignmentService,
+    replyStateService
   );
 
   // The bridge resolves category ids to their human labels via the registry
@@ -639,6 +653,20 @@ async function main() {
   stripeWebhookHandler.bindClient(bot.client);
   disputeMonitor.bindClient(bot.client);
   autoResolveAlerts.bindClient(bot.client);
+  // Bridged customer-responded restore: moves the Discord status back. A
+  // signal into the ticket workflow when Temporal is configured (never blocks
+  // the outbox delivery that asks for it), the direct path otherwise.
+  replyStateService.setDiscordStatusRequester(async (threadId, tagId, actorName) => {
+    if (temporalProducers.routable()) {
+      const r = await temporalProducers.requestStatusChange(threadId, { tagId, actorName });
+      if (r.ok || r.buffered) return;
+    }
+    const ticket = await ticketStore.getByThreadId(threadId);
+    const tag = settingsStore.tagById(tagId);
+    const channel = await bot.client.channels.fetch(threadId).catch(() => null);
+    if (!ticket || !tag || !channel?.isThread()) return;
+    await statusService.applyStatus(channel, ticket, tag, { actorName });
+  });
   // Thread URLs need the guild id, only known once the client is ready —
   // resolved lazily per call.
   intercomSync.setThreadUrlBuilder((threadId) => {
@@ -741,7 +769,11 @@ async function main() {
     makeBridgeHub({ listTeams: () => intercomClient.listTeams(), listTags: () => intercomClient.listTags() }),
     makeSlaHub({ ruleStore: slaRuleStore }),
     makeAssignmentHub({ listTeams: () => intercomClient.listTeams(), listIntercomAdmins, runSlaNow }),
-    makeAutomationHub({ runInactivityNow }),
+    makeAutomationHub({
+      runInactivityNow,
+      listTicketStates: () => replyStateService.listStates(true),
+      syncReplyStates: async () => formatReplySyncReport(await replyStateService.syncNow()),
+    }),
     makeMaintenanceHub({
       resetBridgeData: async () => fmtReport(await intercomStore.resetAll()),
       runSlaNow,

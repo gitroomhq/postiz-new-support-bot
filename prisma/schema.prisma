@@ -138,6 +138,11 @@ model BotSettings {
   inactivityNagsBeforeClose  Int     @default(2) // unanswered customer nags before the sweeper closes
   inactivityNagText          String? // sweeper customer nag override ({days} supported); null = built-in default
   inactivityAgentNoteText    String? // sweeper agent-idle note override ({days} supported); null = built-in default
+  // Customer-responded ticket state (edited via /intercom → Automation): a
+  // customer reply moves the Intercom ticket into the picked state, the next
+  // teammate reply moves it back. Ships OFF; inert until a state is picked.
+  replyStateEnabled          Boolean @default(false)
+  replyStateCustomerStateId  String?
   // One-time agent-rip migration stamp (resolved-tag flip + thread sweeps) —
   // temporalImportDoneAt precedent: machinery removed later, column stays.
   agentRipMigratedAt DateTime?
@@ -830,6 +835,23 @@ model IntercomSweepState {
   updatedAt           DateTime  @updatedAt
 
   @@map("intercom_sweep_state")
+}
+
+// One row per ticket the bot moved into the customer-responded state: where it
+// came from, so the next teammate reply can put it back. Deleted on restore,
+// when someone else moved the ticket on, and by the retention sweep.
+model IntercomReplyState {
+  ticketId       String   @id // Intercom ticket id (customer tickets share it with their conversation)
+  conversationId String
+  threadId       String? // bridged Discord ticket; null = native Intercom ticket
+  baseStateId    String? // state the ticket left; null when only its category is known
+  baseCategory   String? // submitted | in_progress | waiting_on_customer
+  baseTagId      String? // bridged: Discord status tag before the customer's message
+  enteredAt      DateTime @default(now())
+
+  @@index([threadId])
+  @@index([enteredAt])
+  @@map("intercom_reply_states")
 }
 
 // Dedup ledger for incoming Stripe webhook events (Stripe redelivers on non-2xx

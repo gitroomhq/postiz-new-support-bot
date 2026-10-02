@@ -19,6 +19,7 @@ import type { TemporalProducers } from "../temporal/producers";
 import type { SlaRuleStore } from "../sla/SlaRuleStore";
 import type { SlaService } from "../sla/SlaService";
 import type { AssignmentService } from "../intercom/AssignmentService";
+import type { ReplyStateService } from "../intercom/ReplyStateService";
 import { RouteTable, type AdminGateInteraction, type Panel, type RouteEntry } from "./intercomadmin/types";
 import { SessionManager } from "./intercomadmin/SessionManager";
 import { btn, buttonRow, panelEmbed } from "./intercomadmin/ui";
@@ -61,7 +62,8 @@ export class IntercomAdmin {
     producers: TemporalProducers,
     private slaRules: SlaRuleStore,
     slaService: SlaService,
-    assignmentService: AssignmentService
+    assignmentService: AssignmentService,
+    replyStates: ReplyStateService
   ) {
     const ctx: HubContext = {
       settingsStore,
@@ -76,6 +78,7 @@ export class IntercomAdmin {
       slaRules,
       slaService,
       assignmentService,
+      replyStates,
       sessions: this.sessions,
       auditLogger,
       auditConfig: (interaction, change) => this.auditConfig(interaction, change),
@@ -198,12 +201,12 @@ export class IntercomAdmin {
         `**Bridge mode:** ${mode}${s.intercomConfigured() ? "" : " · ⚠️ setup incomplete (/config → Integrations → Intercom)"}`,
         `**Bridged tickets:** ${links}/${total}`,
         `**SLA:** ${s.slaEnabled() ? "on" : "off"} · ${this.slaRules.count()} rule(s), ${this.slaRules.enabledCount()} enabled → default ${s.slaDefaultTarget() ? `\`${s.slaDefaultTarget()}\`` : "none"}`,
-        `**Assignment:** ${s.assignEnabled() ? "on" : "off"}${s.assignExcludedAdmins().length ? `, ${s.assignExcludedAdmins().length} excluded` : ""} · **Inactivity sweeper:** ${s.inactivityEnabled() ? "on" : "off"}`,
+        `**Assignment:** ${s.assignEnabled() ? "on" : "off"}${s.assignExcludedAdmins().length ? `, ${s.assignExcludedAdmins().length} excluded` : ""} · **Inactivity sweeper:** ${s.inactivityEnabled() ? "on" : "off"} · **Customer responded:** ${s.replyStateActive() ? "on" : "off"}`,
         "",
         "**Bridge**: mode, ticket-type & state maps, team routing, snooze tag.",
         "**SLA Manager**: rules, target clocks (first-reply/next-reply/resolution), office hours; the bot runs the SLAs natively now.",
         "**Assignment**: balanced (hybrid round-robin) assignment across the routing team, exclusions, stray sweep.",
-        "**Automation**: inactivity sweeper + per-tag reminder texts.",
+        "**Automation**: inactivity sweeper, customer-responded ticket state, forwarded-email conversion, per-tag reminder texts.",
         "**Maintenance**: backfill, heal, re-sync, reset/wipe, panel-link revocation.",
         "**Intercom Admins / Actions**: who counts as admin for canvas/panel billing actions, and each action's access level.",
       ].join("\n")

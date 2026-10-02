@@ -25,7 +25,10 @@ export type OutboxEventType =
   | "message_delete"
   // SLA re-evaluation (payload always null — target computed at delivery
   // time by SlaService.applyForBridged).
-  | "sla";
+  | "sla"
+  // Customer-responded ticket state: the customer's message moves the ticket
+  // into the configured state, a staff reply moves it back (ReplyStateService).
+  | "reply_state";
 
 // Creates (or adopts) the contact, conversation and converted ticket, and
 // writes the IntercomLink. Always the first event for a ticket; later events
@@ -146,6 +149,15 @@ export interface MessageDeletePayload {
   authorName: string | null; // null when the deleted message wasn't cached
 }
 
+// Customer-responded state for a bridged ticket. Decided at delivery time
+// against the live Intercom ticket state; the only thing captured at enqueue
+// time is the Discord status the ticket had BEFORE the customer's message (the
+// reply flip may already have moved it by the time this runs).
+export interface ReplyStatePayload {
+  kind: "customer" | "agent";
+  baseTagId?: string | null; // customer only
+}
+
 export type OutboxPayload =
   | EnsurePayload
   | MessagePayload
@@ -154,7 +166,8 @@ export type OutboxPayload =
   | CsatPayload
   | AgentReminderPayload
   | MessageEditPayload
-  | MessageDeletePayload;
+  | MessageDeletePayload
+  | ReplyStatePayload;
 
 // ---- Inactivity sweeper shapes (native/unbridged workspace objects) ----
 
@@ -213,6 +226,29 @@ export interface IntercomTicketState {
   archived: boolean;
 }
 
+// One state transition from a ticket's parts. Intercom only records the
+// CATEGORY on both sides (never the custom state id).
+export interface IntercomTicketStateChange {
+  previous: string | null;
+  current: string | null;
+  createdAt: number; // unix seconds
+  authorType: string | null;
+  authorId: string | null;
+  appPackageCode: string | null; // set when an API app (this bot) made the change
+}
+
+// What the customer-responded flow reads from GET /tickets/{id}.
+export interface IntercomTicketStateView {
+  id: string;
+  open: boolean;
+  stateId: string | null;
+  stateCategory: string | null;
+  typeCategory: string | null; // "Customer" | "Back-office" | "Tracker"
+  // States the ticket's type allows; null when the payload omitted them.
+  typeStates: IntercomTicketState[] | null;
+  stateChanges: IntercomTicketStateChange[];
+}
+
 // ---- Webhook payloads (subset) ----
 
 export interface IntercomWebhookAuthor {
@@ -233,6 +269,8 @@ export interface IntercomWebhookPart {
   // True once an agent deleted the part — set both in conversation_part.redacted
   // payloads and on parts fetched via the conversation GET.
   redacted?: boolean;
+  // Set on parts an API app created (this bot's own writes); null otherwise.
+  app_package_code?: string | null;
 }
 
 // data.item for conversation.* topics.

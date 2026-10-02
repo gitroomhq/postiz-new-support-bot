@@ -1217,6 +1217,21 @@ export const STATEMENTS: string[] = [
   )`,
   `CREATE INDEX IF NOT EXISTS "resend_email_events_emailId_occurredAt_idx" ON "resend_email_events"("emailId", "occurredAt")`,
   `CREATE INDEX IF NOT EXISTS "resend_email_events_occurredAt_idx" ON "resend_email_events"("occurredAt")`,
+  // Customer-responded ticket state: settings + the per-ticket restore ledger.
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "replyStateEnabled" BOOLEAN NOT NULL DEFAULT false`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "replyStateCustomerStateId" TEXT`,
+  `CREATE TABLE IF NOT EXISTS "intercom_reply_states" (
+    "ticketId" TEXT NOT NULL,
+    "conversationId" TEXT NOT NULL,
+    "threadId" TEXT,
+    "baseStateId" TEXT,
+    "baseCategory" TEXT,
+    "baseTagId" TEXT,
+    "enteredAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT "intercom_reply_states_pkey" PRIMARY KEY ("ticketId")
+  )`,
+  `CREATE INDEX IF NOT EXISTS "intercom_reply_states_threadId_idx" ON "intercom_reply_states"("threadId")`,
+  `CREATE INDEX IF NOT EXISTS "intercom_reply_states_enteredAt_idx" ON "intercom_reply_states"("enteredAt")`,
 ];
 
 export async function ensureSchema(prisma: PrismaClient): Promise<void> {

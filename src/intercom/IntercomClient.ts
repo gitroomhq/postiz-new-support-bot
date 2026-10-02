@@ -5,6 +5,8 @@ import {
   IntercomSweepConversation,
   IntercomSweepTicket,
   IntercomTicketState,
+  IntercomTicketStateChange,
+  IntercomTicketStateView,
   IntercomTicketType,
   IntercomWebhookPart,
 } from "./types";
@@ -495,6 +497,93 @@ export class IntercomClient {
       "conversation get"
     );
     return data.ticket?.id != null ? String(data.ticket.id) : null;
+  }
+
+  // Customer-responded flow, conversation side: the linked ticket, whether the
+  // conversation is open (a ticket write reopens a closed or snoozed one), and
+  // the raw parts. Null when the conversation is gone.
+  async getConversationReplyView(conversationId: string): Promise<{
+    ticketId: string | null;
+    state: string | null;
+    parts: IntercomWebhookPart[];
+  } | null> {
+    try {
+      const data = await this.json<{
+        state?: string;
+        ticket?: { id?: string | number } | null;
+        conversation_parts?: { conversation_parts?: IntercomWebhookPart[] };
+      }>(`/conversations/${encodeURIComponent(conversationId)}`, "GET", undefined, "conversation get");
+      return {
+        ticketId: data.ticket?.id != null ? String(data.ticket.id) : null,
+        state: data.state ?? null,
+        parts: data.conversation_parts?.conversation_parts ?? [],
+      };
+    } catch (e) {
+      if (e instanceof IntercomHttpError && e.status === 404) return null;
+      throw e;
+    }
+  }
+
+  // Customer-responded flow, ticket side: the live state (custom id +
+  // category), the states the ticket's type allows, and the state-change
+  // history from the ticket parts. Null when the ticket is gone.
+  async getTicketStateView(ticketId: string): Promise<IntercomTicketStateView | null> {
+    type RawState = { id?: string | number; category?: string; internal_label?: string; external_label?: string; archived?: boolean };
+    type RawPartState = string | { category?: string } | null | undefined;
+    let data: {
+      id?: string | number;
+      open?: boolean;
+      ticket_state?: RawState | string | null;
+      ticket_type?: { category?: string; ticket_states?: { data?: RawState[] } | RawState[] | null } | null;
+      ticket_parts?: {
+        ticket_parts?: Array<{
+          previous_ticket_state?: RawPartState;
+          ticket_state?: RawPartState;
+          created_at?: number;
+          author?: { type?: string; id?: string | number } | null;
+          app_package_code?: string | null;
+        }>;
+      };
+    };
+    try {
+      data = await this.json(`/tickets/${encodeURIComponent(ticketId)}`, "GET", undefined, "ticket get");
+    } catch (e) {
+      if (e instanceof IntercomHttpError && e.status === 404) return null;
+      throw e;
+    }
+    const category = (v: RawPartState): string | null =>
+      typeof v === "string" ? v : v && typeof v === "object" && typeof v.category === "string" ? v.category : null;
+    const state = data.ticket_state;
+    const rawTypeStates = data.ticket_type?.ticket_states;
+    const typeStateList = Array.isArray(rawTypeStates) ? rawTypeStates : rawTypeStates?.data ?? null;
+    const changes: IntercomTicketStateChange[] = (data.ticket_parts?.ticket_parts ?? [])
+      .map((p) => ({
+        previous: category(p.previous_ticket_state),
+        current: category(p.ticket_state),
+        createdAt: p.created_at ?? 0,
+        authorType: p.author?.type ?? null,
+        authorId: p.author?.id != null ? String(p.author.id) : null,
+        appPackageCode: p.app_package_code ?? null,
+      }))
+      .filter((c) => c.current != null && c.previous != null);
+    return {
+      id: data.id != null ? String(data.id) : ticketId,
+      open: data.open !== false,
+      stateId: state && typeof state === "object" && state.id != null ? String(state.id) : null,
+      stateCategory: typeof state === "string" ? state : state && typeof state === "object" ? state.category ?? null : null,
+      typeCategory: data.ticket_type?.category ?? null,
+      typeStates: typeStateList
+        ? typeStateList
+            .filter((s) => s.id != null)
+            .map((s) => ({
+              id: String(s.id),
+              category: s.category ?? null,
+              internalLabel: s.internal_label ?? s.external_label ?? `State ${s.id}`,
+              archived: s.archived === true,
+            }))
+        : null,
+      stateChanges: changes,
+    };
   }
 
   // Raw conversation parts (HTML bodies, author ids, attachments) newer than

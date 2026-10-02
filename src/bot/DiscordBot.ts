@@ -81,6 +81,7 @@ import type { SubscriptionEventService } from "./billing/SubscriptionEventServic
 import type { StripeSegmentResolver } from "./billing/StripeSegmentResolver";
 import type { BlockKind } from "./billing/BlockStore";
 import { TICKET_ATTR_CSAT, TICKET_ATTR_CSAT_COMMENT, TICKET_ATTR_THREAD } from "../intercom/IntercomEventExecutor";
+import { CUSTOMER_REPLY_ACTOR } from "../intercom/replyState";
 import { IntercomMode, IntercomRegion } from "../config/SettingsStore";
 import {
   buildActionLevelsPanel,
@@ -604,6 +605,21 @@ export class DiscordBot {
       return;
     }
 
+    // Customer-responded state (bridged): the customer's message moves the Intercom
+    // ticket into the configured state, a staff reply moves it back. Queued behind this
+    // message's mirror; the base is the status BEFORE the reply flip below.
+    const isCustomer = message.author.id === ticket.customerId;
+    if (!ticket.closed && (isCustomer || isStaff)) {
+      safe(
+        this.intercomSync.onReplyState(
+          ticket.threadId,
+          isCustomer ? { kind: "customer", baseTagId: ticket.statusTagId } : { kind: "agent" }
+        ),
+        "intercom-sync",
+        { "ticket.thread_id": ticket.threadId, "sync.event": "reply_state" }
+      );
+    }
+
     // The customer answered a Waiting-for-Customer ticket: move it back into the team's
     // active queue instead of idling until a reminder fires. Preferred destination is
     // the configured customer-reply target tag (default "Waiting for Developer", set via
@@ -622,7 +638,7 @@ export class DiscordBot {
       const target = usable(replyTarget) ? replyTarget : usable(prevTag) ? prevTag : this.settingsStore.initialTag();
       if (target && target.id !== ticket.statusTagId) {
         await this.statusService.applyStatus(message.channel as ThreadChannel, ticket, target, {
-          actorName: "Customer reply",
+          actorName: CUSTOMER_REPLY_ACTOR,
         });
       }
     }

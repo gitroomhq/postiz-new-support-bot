@@ -512,6 +512,27 @@ export class SettingsStore {
     this.settings = await this.prisma.botSettings.update({ where: { id: "global" }, data });
   }
 
+  // ---- Customer-responded ticket state (/intercom → Automation) ----
+
+  replyStateEnabled(): boolean {
+    return this.settings.replyStateEnabled;
+  }
+
+  // The Intercom ticket state a customer reply moves a ticket into.
+  replyStateCustomerStateId(): string | null {
+    return this.settings.replyStateCustomerStateId;
+  }
+
+  // Switched on, a state picked and Intercom reachable: the one gate every
+  // reply-state code path checks.
+  replyStateActive(): boolean {
+    return this.settings.replyStateEnabled && !!this.settings.replyStateCustomerStateId && this.intercomConfigured();
+  }
+
+  async updateReplyState(data: { replyStateEnabled?: boolean; replyStateCustomerStateId?: string | null }): Promise<void> {
+    this.settings = await this.prisma.botSettings.update({ where: { id: "global" }, data });
+  }
+
   // ---- One-time agent-rip migration stamp ----
 
   agentRipMigratedAt(): Date | null {

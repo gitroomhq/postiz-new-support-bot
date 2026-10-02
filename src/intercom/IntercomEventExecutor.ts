@@ -17,8 +17,10 @@ import {
   MessagePayload,
   NotePayload,
   OutboxEventType,
+  ReplyStatePayload,
   StatusPayload,
 } from "./types";
+import type { ReplyStateService } from "./ReplyStateService";
 
 // Intercom accepts at most 10 attachment URLs per message.
 const MAX_ATTACHMENT_URLS = 10;
@@ -90,6 +92,14 @@ export class IntercomEventExecutor {
     maybeAssignOnCreate(conversationId: string, teamId: string | null, threadId: string | null, ticketId: string | null): Promise<void>;
   }): void {
     this.assignmentService = service;
+  }
+
+  // Customer-responded ticket state: executes the "reply_state" event and
+  // guards the status push (late-bound like the SLA service).
+  private replyStates: Pick<ReplyStateService, "executeBridged" | "holdsState" | "onBridgedStatePushed"> | null = null;
+
+  setReplyStates(service: Pick<ReplyStateService, "executeBridged" | "holdsState" | "onBridgedStatePushed">): void {
+    this.replyStates = service;
   }
 
   // ---- Author resolution ----
@@ -188,6 +198,12 @@ export class IntercomEventExecutor {
         // throw IntercomHttpError → normal delivery retry machinery.
         if (this.slaService) await this.slaService.applyForBridged(threadId, "outbox");
         else this.execLog.warn("sla event with no SlaService bound, skipped", { "ticket.thread_id": threadId });
+        return;
+      case "reply_state":
+        // Decided against the live Intercom state at delivery time. Permanent
+        // rejections are logged inside and never dead-letter; transient
+        // failures throw into the normal delivery retry.
+        if (this.replyStates) await this.replyStates.executeBridged(threadId, payload as ReplyStatePayload);
         return;
       default:
         throw new IntercomHttpError(400, `Unknown outbox event type: ${type}`);
@@ -892,7 +908,10 @@ export class IntercomEventExecutor {
     let statePutHappened = false;
     const tag = payload.statusTagId ? this.settingsStore.tagById(payload.statusTagId) : undefined;
     const stateId = tag?.intercomTicketStateId ?? null;
-    if (link.ticketId && stateId && link.lastSyncedStateId !== stateId) {
+    // The customer-reply flip may arrive after the customer-responded state
+    // was written: the ticket keeps that state instead of the flip's mapping.
+    const heldForReply = this.replyStates?.holdsState(link, payload) ?? false;
+    if (link.ticketId && stateId && link.lastSyncedStateId !== stateId && !heldForReply) {
       try {
         await this.withAuthor((a) => this.client.updateTicket(link.ticketId!, { stateId, adminId: a }));
         statePutHappened = true;
@@ -903,6 +922,9 @@ export class IntercomEventExecutor {
         if (!isSameStateError(e)) throw e;
       }
       await this.store.setLastSyncedStateId(threadId, stateId);
+      // Another state reached Intercom: a pending customer-responded restore
+      // is moot (a manual status change wins over it).
+      await this.replyStates?.onBridgedStatePushed(threadId, stateId);
     }
 
     // Conversation open/close parity (closing statuses close the conversation),
@@ -1037,7 +1059,7 @@ export function isPermanent4xx(e: unknown): boolean {
 
 // Intercom rejects a transition to the ticket's current state with a 400 —
 // for the bridge that outcome IS the desired end state.
-function isSameStateError(e: unknown): boolean {
+export function isSameStateError(e: unknown): boolean {
   return e instanceof IntercomHttpError && e.status === 400 && /same state/i.test(e.message);
 }
 

@@ -14,12 +14,24 @@ import { isLikelyEmail } from "../../../intercom/forwardedEmailParse";
 import { btn, buttonRow, backRow, selectRow, panelEmbed, textInput } from "../ui";
 import type { Panel, RouteEntry } from "../types";
 import type { HubContext } from "./HubContext";
+import { formatReplySyncReport } from "../../../intercom/ReplyStateService";
+import type { IntercomTicketState } from "../../../intercom/types";
+
+const STATE_PAGE_SIZE = 10;
+const CATEGORY_ORDER = ["submitted", "in_progress", "waiting_on_customer", "resolved"];
+const CATEGORY_LABELS: Record<string, string> = {
+  submitted: "Submitted",
+  in_progress: "In progress",
+  waiting_on_customer: "Waiting on customer",
+  resolved: "Resolved",
+};
 
 // /intercom → Automation: the workspace customer-idle sweeper (native/unbridged
-// conversations) and the per-tag customer reminder texts (moved here from
-// /config → Workflow → Manage Tags). Agent nags are no longer here — the SLA
-// enforcer owns them (SLA Manager → Nag Cadence). Structural tag settings
-// (emoji, label, delays, target, closes-thread) stay with the tags in /config.
+// conversations), the customer-responded ticket state, and the per-tag
+// customer reminder texts (moved here from /config → Workflow → Manage Tags).
+// Agent nags are no longer here: the SLA enforcer owns them (SLA Manager → Nag
+// Cadence). Structural tag settings (emoji, label, delays, target,
+// closes-thread) stay with the tags in /config.
 export class AutomationHub {
   constructor(private ctx: HubContext) {}
 
@@ -34,15 +46,33 @@ export class AutomationHub {
     { kind: "button", id: "icadmin_auto_fwd_detach", match: "exact", handler: (i) => this.handleFwdDetachToggle(i) },
     { kind: "button", id: "icadmin_auto_fwd_opts", match: "exact", handler: (i) => this.handleFwdOptsOpen(i) },
     { kind: "button", id: "icadmin_auto_fwd_list", match: "exact", handler: (i) => this.handleFwdList(i) },
+    { kind: "button", id: "icadmin_auto_reply_toggle", match: "exact", handler: (i) => this.handleReplyToggle(i) },
+    { kind: "button", id: "icadmin_auto_reply_pick", match: "exact", handler: (i) => this.handleReplyPickOpen(i, 0) },
+    {
+      kind: "button",
+      id: "icadmin_auto_reply_pg:",
+      match: "prefix",
+      handler: (i) => this.handleReplyPickOpen(i, Number(i.customId.split(":")[1]) || 0),
+    },
+    { kind: "button", id: "icadmin_auto_reply_sync", match: "exact", handler: (i) => this.handleReplySync(i) },
+    { kind: "select", id: "icadmin_auto_reply_state", match: "exact", handler: (i) => this.handleReplyStatePick(i) },
     { kind: "modal", id: "icadmin_auto_sweep_opts_m", match: "exact", handler: (i) => this.handleSweepOptsSubmit(i) },
     { kind: "modal", id: "icadmin_auto_sweep_texts_m", match: "exact", handler: (i) => this.handleSweepTextsSubmit(i) },
     { kind: "modal", id: "icadmin_auto_tag_m:", match: "prefix", handler: (i) => this.handleTagTextsSubmit(i) },
     { kind: "modal", id: "icadmin_auto_fwd_opts_m", match: "exact", handler: (i) => this.handleFwdOptsSubmit(i) },
   ];
 
-  buildPanel(): Panel {
+  async buildPanel(): Promise<Panel> {
     const s = this.ctx.settingsStore;
     const customTags = s.tags().filter((t) => t.reminderTextCustomer || t.autoCloseMessage);
+    const replyStateId = s.replyStateCustomerStateId();
+    const replyState = await this.ctx.replyStates.stateById(replyStateId).catch(() => null);
+    const waiting = await this.ctx.replyStates.countActive().catch(() => 0);
+    const replyStateLine = replyState
+      ? `${replyState.internalLabel} (${CATEGORY_LABELS[replyState.category ?? ""] ?? replyState.category ?? "?"})`
+      : replyStateId
+        ? `id ${replyStateId} (not found in Intercom, pick again)`
+        : "not picked";
     const embed = panelEmbed(
       "Intercom Automation",
       [
@@ -67,6 +97,10 @@ export class AutomationHub {
         "",
         `**Detach forwarder:** ${s.forwardDetachForwarder() ? "**on**" : "**off**"}`,
         "The other half: where Intercom's OWN forward detection ran, it attaches the real customer but leaves the forwarding address attached as well, so every reply also emails the person who forwarded it. This removes them, using the same forwarder list above. It never removes the last participant, and it posts an internal note saying what it detached. Runs on inbound webhooks plus the SLA sweep, since Intercom attaches the customer asynchronously.",
+        "",
+        "**Customer responded state** (Intercom tickets, native and Discord-bridged):",
+        `**Status:** ${s.replyStateEnabled() ? "**on**" : "**off**"} · **state:** ${replyStateLine} · **awaiting our reply:** ${waiting}`,
+        "A customer reply on a ticket in Submitted, In progress or Waiting on customer moves it to this state. The next teammate reply (Intercom inbox, or a staff message in the Discord thread) moves it back where it was; Submitted goes to Waiting on customer. Fin, bots and internal notes never count, and a state changed by hand wins over the restore. Bridged tickets also get their Discord status back. **Sync Now** moves every open ticket whose customer spoke last.",
       ].join("\n")
     );
 
@@ -103,11 +137,23 @@ export class AutomationHub {
       btn("icadmin_auto_fwd_list", "List Forwarders", ButtonStyle.Secondary)
     );
 
-    return { embeds: [embed], components: [sweeperRow, fwdRow, selectRow(tagSelect), backRow()] };
+    const replyRow = buttonRow(
+      btn(
+        "icadmin_auto_reply_toggle",
+        `Customer Responded: ${s.replyStateEnabled() ? "on" : "off"}`,
+        s.replyStateEnabled() ? ButtonStyle.Success : ButtonStyle.Secondary
+      ),
+      btn("icadmin_auto_reply_pick", "Pick State", ButtonStyle.Primary),
+      btn("icadmin_auto_reply_sync", "Sync Now", ButtonStyle.Secondary, !s.replyStateActive())
+    );
+
+    return { embeds: [embed], components: [sweeperRow, fwdRow, replyRow, selectRow(tagSelect), backRow()] };
   }
 
+  // Deferred: the panel reads the ticket-state label from Intercom (cached).
   private async renderPanel(interaction: ButtonInteraction | StringSelectMenuInteraction): Promise<void> {
-    await interaction.update(this.buildPanel());
+    await interaction.deferUpdate();
+    await interaction.editReply(await this.buildPanel());
   }
 
   // ---- sweeper (verbatim ports) ----
@@ -402,6 +448,127 @@ export class AutomationHub {
             COLORS.danger
           ),
         ],
+      });
+    }
+  }
+
+  // ---- customer-responded ticket state ----
+
+  private async handleReplyToggle(interaction: ButtonInteraction): Promise<void> {
+    const s = this.ctx.settingsStore;
+    const next = !s.replyStateEnabled();
+    if (next && !s.replyStateCustomerStateId()) {
+      await interaction.reply({
+        embeds: [makeEmbed("Pick the Customer responded state first (Pick State).", COLORS.warn)],
+        flags: 64,
+      });
+      return;
+    }
+    await s.updateReplyState({ replyStateEnabled: next });
+    this.ctx.auditConfig(interaction, `Customer-responded state → ${next ? "on" : "off"}`);
+    await this.renderPanel(interaction);
+  }
+
+  private async pickableStates(): Promise<IntercomTicketState[]> {
+    const states = await this.ctx.replyStates.listStates(true);
+    return states
+      .filter((st) => !st.archived && st.category !== "resolved")
+      .sort(
+        (a, b) =>
+          CATEGORY_ORDER.indexOf(a.category ?? "") - CATEGORY_ORDER.indexOf(b.category ?? "") ||
+          a.internalLabel.localeCompare(b.internalLabel)
+      );
+  }
+
+  private async handleReplyPickOpen(interaction: ButtonInteraction, page: number): Promise<void> {
+    await interaction.deferUpdate();
+    let states: IntercomTicketState[];
+    try {
+      states = await this.pickableStates();
+    } catch (e) {
+      await interaction.followUp({
+        embeds: [makeEmbed(`Could not list ticket states: ${e instanceof Error ? e.message : String(e)}`, COLORS.danger)],
+        flags: 64,
+      });
+      return;
+    }
+    if (states.length === 0) {
+      await interaction.followUp({
+        embeds: [makeEmbed("Intercom returned no ticket states. Create the state in Intercom first (Settings → Tickets).", COLORS.warn)],
+        flags: 64,
+      });
+      return;
+    }
+    const totalPages = Math.max(1, Math.ceil(states.length / STATE_PAGE_SIZE));
+    const clamped = Math.min(Math.max(0, page), totalPages - 1);
+    const slice = states.slice(clamped * STATE_PAGE_SIZE, (clamped + 1) * STATE_PAGE_SIZE);
+    const current = this.ctx.settingsStore.replyStateCustomerStateId();
+    const select = new StringSelectMenuBuilder()
+      .setCustomId("icadmin_auto_reply_state")
+      .setPlaceholder("Customer responded state")
+      .addOptions(
+        slice.map((st) => ({
+          label: st.internalLabel.slice(0, 100),
+          value: st.id,
+          description: `${CATEGORY_LABELS[st.category ?? ""] ?? st.category ?? "?"} · id ${st.id}`.slice(0, 100),
+          default: st.id === current,
+        }))
+      );
+    const nav = [btn("icadmin_hub:automation", "Back", ButtonStyle.Secondary)];
+    if (totalPages > 1) {
+      nav.unshift(
+        btn(`icadmin_auto_reply_pg:${clamped - 1}`, "Prev", ButtonStyle.Secondary, clamped === 0),
+        btn(`icadmin_auto_reply_pg:${clamped + 1}`, "Next", ButtonStyle.Secondary, clamped >= totalPages - 1)
+      );
+    }
+    await interaction.editReply({
+      embeds: [
+        makeEmbed(
+          [
+            "Pick the Intercom ticket state a customer reply moves a ticket into" +
+              (totalPages > 1 ? ` (page ${clamped + 1}/${totalPages}).` : "."),
+            "It must be enabled on every ticket type you use (Intercom → Settings → Tickets), or those tickets are skipped.",
+            "An **In progress** state is the safe choice: Intercom's own automatic move on a customer reply only starts from Waiting on customer and Resolved, so it never fights this one.",
+          ].join("\n"),
+          COLORS.neutral
+        ),
+      ],
+      components: [selectRow(select), buttonRow(...nav)],
+    });
+  }
+
+  private async handleReplyStatePick(interaction: StringSelectMenuInteraction): Promise<void> {
+    const value = interaction.values[0];
+    // The menu only offered listed states, but never trust the value: it must
+    // still exist, be live and not be a resolved state.
+    const state = (await this.pickableStates().catch(() => [] as IntercomTicketState[])).find((st) => st.id === value);
+    if (!state) {
+      await interaction.reply({
+        embeds: [makeEmbed("That state is no longer available in Intercom. Open Pick State again.", COLORS.warn)],
+        flags: 64,
+      });
+      return;
+    }
+    await this.ctx.settingsStore.updateReplyState({ replyStateCustomerStateId: state.id });
+    this.ctx.auditConfig(interaction, `Customer-responded state → ${state.internalLabel} (${state.id})`);
+    await this.renderPanel(interaction);
+  }
+
+  private async handleReplySync(interaction: ButtonInteraction): Promise<void> {
+    await interaction.deferReply({ flags: 64 });
+    if (!this.ctx.settingsStore.replyStateActive()) {
+      await interaction.editReply({
+        embeds: [makeEmbed("Turn Customer Responded on and pick its state first.", COLORS.warn)],
+      });
+      return;
+    }
+    this.ctx.auditConfig(interaction, "Customer-responded sync run");
+    try {
+      const report = await this.ctx.replyStates.syncNow();
+      await interaction.editReply({ embeds: [makeEmbed(formatReplySyncReport(report), COLORS.success)] });
+    } catch (e) {
+      await interaction.editReply({
+        embeds: [makeEmbed(`Sync failed: ${e instanceof Error ? e.message : String(e)}`, COLORS.danger)],
       });
     }
   }

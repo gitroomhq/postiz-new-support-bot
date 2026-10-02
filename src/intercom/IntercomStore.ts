@@ -1,4 +1,4 @@
-import { PrismaClient, IntercomLink, IntercomMessageMap } from "../generated/prisma/client";
+import { PrismaClient, IntercomLink, IntercomMessageMap, IntercomReplyState } from "../generated/prisma/client";
 
 // Relay body-hash dedup rides the echo-part table under this kind (partId =
 // "<threadId>:<bodyHash>"). Fresh window: same body seen twice within it is a
@@ -425,6 +425,52 @@ export class IntercomStore {
     });
   }
 
+  // ---- Customer-responded state ledger ----
+
+  async getReplyState(ticketId: string): Promise<IntercomReplyState | null> {
+    return this.prisma.intercomReplyState.findUnique({ where: { ticketId } });
+  }
+
+  async getReplyStateByThread(threadId: string): Promise<IntercomReplyState | null> {
+    return this.prisma.intercomReplyState.findFirst({ where: { threadId } });
+  }
+
+  // Re-entering the state (a later cycle) restarts the row: the new base wins.
+  async upsertReplyState(row: {
+    ticketId: string;
+    conversationId: string;
+    threadId: string | null;
+    baseStateId: string | null;
+    baseCategory: string | null;
+    baseTagId: string | null;
+  }): Promise<void> {
+    const { ticketId, ...data } = row;
+    await this.prisma.intercomReplyState.upsert({
+      where: { ticketId },
+      create: { ticketId, ...data },
+      update: { ...data, enteredAt: new Date() },
+    });
+  }
+
+  async deleteReplyState(ticketId: string): Promise<void> {
+    await this.prisma.intercomReplyState.deleteMany({ where: { ticketId } });
+  }
+
+  async deleteReplyStateByThread(threadId: string): Promise<void> {
+    await this.prisma.intercomReplyState.deleteMany({ where: { threadId } });
+  }
+
+  async countReplyStates(): Promise<number> {
+    return this.prisma.intercomReplyState.count();
+  }
+
+  // Rows for tickets that were closed or abandoned while in the state never
+  // see a restore; the cleanup tick drops them after the retention window.
+  async cleanupReplyStates(olderThan: Date): Promise<number> {
+    const r = await this.prisma.intercomReplyState.deleteMany({ where: { enteredAt: { lt: olderThan } } });
+    return r.count;
+  }
+
   // Full bridge-state wipe (links + echo/pending ledgers). Touches NOTHING in
   // Intercom itself — use when the Intercom side was cleared/recreated and the
   // local bookkeeping is stale; the next backfill rebuilds everything.
@@ -435,6 +481,7 @@ export class IntercomStore {
       this.prisma.intercomPendingPost.deleteMany(),
       this.prisma.intercomMessageMap.deleteMany(),
       this.prisma.intercomSweepState.deleteMany(),
+      this.prisma.intercomReplyState.deleteMany(),
     ]);
     return { links: links.count, parts: parts.count };
   }

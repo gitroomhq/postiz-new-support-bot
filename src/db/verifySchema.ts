@@ -80,7 +80,7 @@ export const EXPECTED_COLUMNS: Record<string, string[]> = {
     "moneyOutEnabled", "moneyOutSweepAt", "moneyOutBackfillDoneAt",
     "radarListCardId", "radarListEmailId", "radarListCustomerId", "radarListIpId",
     "inactivityEnabled", "inactivityAgentWaitDays", "inactivityCustomerWaitDays", "inactivityNagsBeforeClose",
-    "inactivityNagText", "inactivityAgentNoteText", "refundMaxChargeAgeDays",
+    "inactivityNagText", "inactivityAgentNoteText", "replyStateEnabled", "replyStateCustomerStateId", "refundMaxChargeAgeDays",
     "agentRipMigratedAt", "intercomPanelAdminsJson", "billingActionLevelsJson", "panelTokenSecret",
     "panelTokenEpoch", "adminPanelEpoch", "dashboardEnabled", "dashboardAdminsJson", "dashboardTokenSecret", "dashboardEpoch",
     "yubicoClientId", "yubicoApiSecret", "yubicoValidationUrl",
@@ -119,6 +119,9 @@ export const EXPECTED_COLUMNS: Record<string, string[]> = {
   ],
   intercom_sweep_state: [
     "id", "kind", "lastAgentRemindedAt", "customerNagCount", "lastCustomerNagAt", "sweepClosedAt", "updatedAt",
+  ],
+  intercom_reply_states: [
+    "ticketId", "conversationId", "threadId", "baseStateId", "baseCategory", "baseTagId", "enteredAt",
   ],
   stripe_webhook_events: ["id", "type", "createdAt"],
   stripe_disputes: [

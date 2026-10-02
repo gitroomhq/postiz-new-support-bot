@@ -229,6 +229,17 @@ export class IntercomWebhookHandler {
     this.temporalProducers = producers;
   }
 
+  // Customer-responded ticket state for NATIVE tickets (bridged ones ride the
+  // ticket outbox via IntercomSyncService.onReplyState). Bound late.
+  private replyStates: {
+    onNativeCustomerReply(conversationId: string, item: IntercomConversationItem | undefined): Promise<void>;
+    onNativeAgentReply(conversationId: string, item: IntercomConversationItem | undefined): Promise<void>;
+  } | null = null;
+
+  setReplyStates(service: NonNullable<IntercomWebhookHandler["replyStates"]>): void {
+    this.replyStates = service;
+  }
+
   // HTTP-route half: durably queue the event and return. Never relays inline
   // while Temporal is configured. Returns false for duplicate deliveries.
   async accept(body: unknown): Promise<boolean> {
@@ -389,8 +400,12 @@ export class IntercomWebhookHandler {
       }
     }
     if (link) return; // bridged — Discord-side SLA hooks own it
-    if (!this.slaService) return;
-    await this.slaService.applyForNative(conversationId, topic);
+    if (this.slaService) await this.slaService.applyForNative(conversationId, topic);
+    // Customer-responded state. Last, so a transient failure here retries
+    // only work that is idempotent anyway.
+    if (topic === "conversation.user.replied" && this.replyStates) {
+      await this.replyStates.onNativeCustomerReply(conversationId, item);
+    }
   }
 
   // Opportunistic forwarder cleanup. Never throws and never adds a request:
@@ -563,8 +578,11 @@ export class IntercomWebhookHandler {
   }
 
   private async handleConversationReply(item: IntercomConversationItem | undefined, attempt: number): Promise<void> {
+    if (!item || item.id == null) return;
     const mode = this.settingsStore.intercomMode();
-    if (mode === "none" || !item || item.id == null) return;
+    // Native conversations matter even with the bridge off: the
+    // customer-responded restore runs on every teammate reply.
+    if (mode === "none" && !this.replyStates) return;
 
     const link = await this.store.getLinkByConversationId(String(item.id));
     if (!link) {
@@ -572,9 +590,11 @@ export class IntercomWebhookHandler {
       // point where a teammate's first reply proves Intercom's native forward
       // detection has finished attaching the customer, so this is the most
       // reliable moment to detach the forwarder.
-      await this.maybeDetachForwarder(String(item.id), item);
+      if (mode !== "none") await this.maybeDetachForwarder(String(item.id), item);
+      if (this.replyStates) await this.replyStates.onNativeAgentReply(String(item.id), item);
       return;
     }
+    if (mode === "none") return;
 
     const parts = item.conversation_parts?.conversation_parts ?? [];
     await this.relayReplyParts("c", "conversation.admin.replied", String(item.id), link, parts, attempt);
@@ -873,6 +893,13 @@ export class IntercomWebhookHandler {
           .catch(() => {});
       } finally {
         if (wasArchived) await thread.setArchived(true).catch(() => {});
+      }
+      // A teammate answered: queue the customer-responded restore behind
+      // anything already in this ticket's outbox. Fin and the bridge's own
+      // identities never count. Must not throw: the relay already landed, and
+      // a retry from here would post it twice.
+      if (part.author?.type === "admin" && !bridgeAuthor) {
+        await this.sync.onReplyState(threadId, { kind: "agent" }).catch(() => {});
       }
     } catch (e) {
       await this.releaseClaim(kind, String(part.id));
