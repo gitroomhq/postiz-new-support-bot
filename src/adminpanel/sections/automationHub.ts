@@ -3,8 +3,9 @@ import { AdminHubContext, ActionRequest, HubModule, SaveRequest, asBoundedInt, a
 import type { IntercomTicketState } from "../../intercom/types";
 
 // Automation hub (intercom group): the workspace customer-idle sweeper for
-// native / unbridged conversations (outbound nag + auto-close) and the
-// customer-responded ticket state. Mirrors /intercom → Automation. Agent nags
+// native / unbridged conversations (outbound nag + auto-close), the
+// customer-responded ticket state and resolve on close. Mirrors /intercom →
+// Automation. Agent nags
 // are SLA-driven (SLA Manager → Nag Cadence). (Per-tag customer reminder TEXT
 // overrides are edited on each tag in Workflow.)
 
@@ -18,11 +19,15 @@ export function makeAutomationHub(deps: {
   runInactivityNow: () => Promise<string>;
   listTicketStates: () => Promise<IntercomTicketState[]>;
   syncReplyStates: () => Promise<string>;
+  lastCloseSweep: () => string;
 }): HubModule {
   // Live, non-resolved states: a resolved one would close tickets on every
   // customer reply.
   const pickable = async (): Promise<IntercomTicketState[]> =>
     (await deps.listTicketStates()).filter((st) => !st.archived && st.category !== "resolved");
+  // Resolve on close: live Resolved-category states only.
+  const resolvedStates = async (): Promise<IntercomTicketState[]> =>
+    (await deps.listTicketStates()).filter((st) => !st.archived && st.category === "resolved");
 
   return {
     hub: "automation",
@@ -32,15 +37,18 @@ export function makeAutomationHub(deps: {
     async buildSections(ctx): Promise<Section[]> {
       const s = ctx.settings;
       let stateOpts: Opt[] = [];
+      let closeStateOpts: Opt[] = [];
       let statesError: string | null = null;
       try {
         stateOpts = (await pickable()).map((st) => ({
           value: st.id,
           label: `${st.internalLabel} (${CATEGORY_LABELS[st.category ?? ""] ?? st.category ?? "?"})`,
         }));
+        closeStateOpts = (await resolvedStates()).map((st) => ({ value: st.id, label: st.internalLabel }));
       } catch (e) {
         statesError = e instanceof Error ? e.message : String(e);
       }
+      const backfilledAt = s.resolveOnCloseBackfilledAt();
       return [
         {
           key: "inactivity",
@@ -72,6 +80,31 @@ export function makeAutomationHub(deps: {
             },
           ],
           actions: [{ key: "sync_reply_states", label: "Sync now", style: "secondary" }],
+        },
+        {
+          key: "resolveOnClose",
+          title: "Resolve on close",
+          description:
+            "An Intercom Customer ticket closed outside the Resolved category (Fin's idle close, a Workflow, the customer-idle sweep, a teammate) is moved to this Resolved state; any Resolved state already set is kept. Discord-bridged tickets whose closing status maps elsewhere are resolved too. Runs on every close plus the 5-minute SLA tick; the first sweeps after switching it on resolve the backlog.",
+          ...(statesError ? { notice: { kind: "error" as const, text: `Could not list Intercom ticket states: ${statesError}` } } : {}),
+          fields: [
+            { type: "toggle", key: "resolveOnCloseEnabled", label: "Enabled", value: s.resolveOnCloseEnabled() },
+            {
+              type: "select",
+              key: "resolveOnCloseStateId",
+              label: "State for closed tickets",
+              value: s.resolveOnCloseStateId(),
+              options: closeStateOpts,
+              nullable: true,
+              help: "(none) = each ticket type's own Resolved state. A type that does not have the picked state enabled also gets its own.",
+            },
+            {
+              type: "static",
+              key: "resolveOnCloseStatus",
+              label: "Backfill and last sweep",
+              value: `Backfill ${backfilledAt ? `done ${backfilledAt.toISOString().slice(0, 10)}` : "pending"} · last sweep ${deps.lastCloseSweep()}`,
+            },
+          ],
         },
       ];
     },
@@ -126,6 +159,28 @@ export function makeAutomationHub(deps: {
           if (!state) return { ok: false, fieldErrors: { replyStateCustomerStateId: "Not a live, non-resolved Intercom ticket state." } };
           await s.updateReplyState({ replyStateCustomerStateId: state.id });
           await ctx.audit(`customer-responded state → ${state.internalLabel} (${state.id})`);
+          return { ok: true };
+        }
+        case "resolveOnCloseEnabled":
+          await s.updateResolveOnClose({ resolveOnCloseEnabled: v === true });
+          await ctx.audit(`resolve on close → ${v === true}`);
+          return { ok: true };
+        case "resolveOnCloseStateId": {
+          const id = asOptionalId(v);
+          if (id == null) {
+            await s.updateResolveOnClose({ resolveOnCloseStateId: null });
+            await ctx.audit("resolve-on-close state → auto");
+            return { ok: true };
+          }
+          let state: IntercomTicketState | undefined;
+          try {
+            state = (await resolvedStates()).find((st) => st.id === id);
+          } catch (e) {
+            return { ok: false, error: `Could not list Intercom ticket states: ${e instanceof Error ? e.message : String(e)}` };
+          }
+          if (!state) return { ok: false, fieldErrors: { resolveOnCloseStateId: "Not a live, Resolved-category Intercom ticket state." } };
+          await s.updateResolveOnClose({ resolveOnCloseStateId: state.id });
+          await ctx.audit(`resolve-on-close state → ${state.internalLabel} (${state.id})`);
           return { ok: true };
         }
         default:

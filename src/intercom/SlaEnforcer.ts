@@ -4,6 +4,7 @@ import { IntercomClient, IntercomHttpError } from "./IntercomClient";
 import type { IntercomStore } from "./IntercomStore";
 import type { IntercomSweepConversation } from "./types";
 import type { AssignmentService, WithAuthor } from "./AssignmentService";
+import type { CloseStateService } from "./CloseStateService";
 import type { SentryFeedbackStore } from "../sentry/SentryFeedbackStore";
 import type { SlaEnforceResult } from "../temporal/types";
 import { evaluateClocks, CLOCK_LABELS, type ClockEvaluation, type ClockInput, type ClockKind, type ClockMarkers } from "../sla/clocks";
@@ -81,6 +82,12 @@ interface StateRow {
 // and every item is best-effort. The three passes share one write budget.
 export class SlaEnforcer {
   private tagIdCache: { name: string; id: string } | null = null;
+  // Resolve on close: the auto-close resolves the ticket first. Bound late.
+  private closeStates: Pick<CloseStateService, "resolveBeforeClose"> | null = null;
+
+  setCloseStates(service: Pick<CloseStateService, "resolveBeforeClose">): void {
+    this.closeStates = service;
+  }
 
   constructor(
     private prisma: PrismaClient,
@@ -603,9 +610,15 @@ export class SlaEnforcer {
           }
           return;
         }
+        const nativeTicketId = await this.client.getConversationTicketId(conv.id).catch(() => null);
+        // Resolve on close: the state goes in while the conversation is still
+        // open (a ticket write on a closed one can reopen it).
+        if (nativeTicketId && this.closeStates) {
+          const wrote = await this.closeStates.resolveBeforeClose(nativeTicketId, adminId).catch(() => false);
+          if (wrote) await ctx.paced();
+        }
         await this.client.setConversationOpen(conv.id, false, adminId);
         await ctx.paced();
-        const nativeTicketId = await this.client.getConversationTicketId(conv.id).catch(() => null);
         if (nativeTicketId && ctx.budget()) {
           // Second Intercom write of this close — pace and count it too, so a
           // close burst can't defeat the spacing or the sweep-wide write cap.

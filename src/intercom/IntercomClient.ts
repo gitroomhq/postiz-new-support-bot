@@ -528,61 +528,46 @@ export class IntercomClient {
   // category), the states the ticket's type allows, and the state-change
   // history from the ticket parts. Null when the ticket is gone.
   async getTicketStateView(ticketId: string): Promise<IntercomTicketStateView | null> {
-    type RawState = { id?: string | number; category?: string; internal_label?: string; external_label?: string; archived?: boolean };
-    type RawPartState = string | { category?: string } | null | undefined;
-    let data: {
-      id?: string | number;
-      open?: boolean;
-      ticket_state?: RawState | string | null;
-      ticket_type?: { category?: string; ticket_states?: { data?: RawState[] } | RawState[] | null } | null;
-      ticket_parts?: {
-        ticket_parts?: Array<{
-          previous_ticket_state?: RawPartState;
-          ticket_state?: RawPartState;
-          created_at?: number;
-          author?: { type?: string; id?: string | number } | null;
-          app_package_code?: string | null;
-        }>;
-      };
-    };
+    let data: RawTicket;
     try {
       data = await this.json(`/tickets/${encodeURIComponent(ticketId)}`, "GET", undefined, "ticket get");
     } catch (e) {
       if (e instanceof IntercomHttpError && e.status === 404) return null;
       throw e;
     }
-    const category = (v: RawPartState): string | null =>
-      typeof v === "string" ? v : v && typeof v === "object" && typeof v.category === "string" ? v.category : null;
-    const state = data.ticket_state;
-    const rawTypeStates = data.ticket_type?.ticket_states;
-    const typeStateList = Array.isArray(rawTypeStates) ? rawTypeStates : rawTypeStates?.data ?? null;
-    const changes: IntercomTicketStateChange[] = (data.ticket_parts?.ticket_parts ?? [])
-      .map((p) => ({
-        previous: category(p.previous_ticket_state),
-        current: category(p.ticket_state),
-        createdAt: p.created_at ?? 0,
-        authorType: p.author?.type ?? null,
-        authorId: p.author?.id != null ? String(p.author.id) : null,
-        appPackageCode: p.app_package_code ?? null,
-      }))
-      .filter((c) => c.current != null && c.previous != null);
+    return parseTicketStateView(data, ticketId);
+  }
+
+  // Resolve-on-close sweep: one page of closed Customer tickets whose state is
+  // not in the Resolved category. updatedSinceSec null walks the whole history
+  // (the one-time backfill); otherwise only tickets touched since then.
+  async searchClosedUnresolvedTickets(
+    updatedSinceSec: number | null,
+    startingAfter?: string | null
+  ): Promise<{ items: IntercomTicketStateView[]; nextStartingAfter: string | null }> {
+    const data = await this.json<{
+      tickets?: RawTicket[];
+      pages?: { next?: { starting_after?: string } | null };
+    }>(
+      "/tickets/search",
+      "POST",
+      {
+        query: {
+          operator: "AND",
+          value: [
+            { field: "open", operator: "=", value: false },
+            { field: "category", operator: "=", value: "Customer" },
+            { field: "state", operator: "!=", value: "resolved" },
+            ...(updatedSinceSec != null ? [{ field: "updated_at", operator: ">", value: updatedSinceSec }] : []),
+          ],
+        },
+        pagination: { per_page: 150, ...(startingAfter ? { starting_after: startingAfter } : {}) },
+      },
+      "ticket search (resolve on close)"
+    );
     return {
-      id: data.id != null ? String(data.id) : ticketId,
-      open: data.open !== false,
-      stateId: state && typeof state === "object" && state.id != null ? String(state.id) : null,
-      stateCategory: typeof state === "string" ? state : state && typeof state === "object" ? state.category ?? null : null,
-      typeCategory: data.ticket_type?.category ?? null,
-      typeStates: typeStateList
-        ? typeStateList
-            .filter((s) => s.id != null)
-            .map((s) => ({
-              id: String(s.id),
-              category: s.category ?? null,
-              internalLabel: s.internal_label ?? s.external_label ?? `State ${s.id}`,
-              archived: s.archived === true,
-            }))
-        : null,
-      stateChanges: changes,
+      items: (data.tickets ?? []).filter((t) => t.id != null).map((t) => parseTicketStateView(t, String(t.id))),
+      nextStartingAfter: data.pages?.next?.starting_after ?? null,
     };
   }
 
@@ -942,9 +927,11 @@ export class IntercomClient {
       // the ticket (state alone leaves it listed as an open ticket).
       open?: boolean;
     }
-  ): Promise<void> {
+  ): Promise<{ open: boolean | null }> {
     const adminIdNum = input.adminId != null ? Number(input.adminId) : NaN;
-    await this.json(
+    // The response is the updated ticket; its open flag tells the
+    // resolve-on-close flow whether the write reopened the conversation.
+    const data = await this.json<{ open?: boolean } | null>(
       `/tickets/${encodeURIComponent(ticketId)}`,
       "PUT",
       {
@@ -957,6 +944,7 @@ export class IntercomClient {
       },
       "ticket update"
     );
+    return { open: typeof data?.open === "boolean" ? data.open : null };
   }
 
   async ticketExists(ticketId: string): Promise<boolean> {
@@ -1313,6 +1301,62 @@ export class IntercomClient {
       throw e;
     }
   }
+}
+
+type RawTicketState = { id?: string | number; category?: string; internal_label?: string; external_label?: string; archived?: boolean };
+type RawPartState = string | { category?: string } | null | undefined;
+type RawTicket = {
+  id?: string | number;
+  open?: boolean;
+  ticket_state?: RawTicketState | string | null;
+  ticket_type?: { category?: string; ticket_states?: { data?: RawTicketState[] } | RawTicketState[] | null } | null;
+  ticket_parts?: {
+    ticket_parts?: Array<{
+      previous_ticket_state?: RawPartState;
+      ticket_state?: RawPartState;
+      created_at?: number;
+      author?: { type?: string; id?: string | number } | null;
+      app_package_code?: string | null;
+    }>;
+  };
+};
+
+// One ticket object (GET /tickets/{id} or a search hit) as the ticket-state
+// flows read it: live state, the type's allowed states, the change history.
+function parseTicketStateView(data: RawTicket, fallbackId: string): IntercomTicketStateView {
+  const category = (v: RawPartState): string | null =>
+    typeof v === "string" ? v : v && typeof v === "object" && typeof v.category === "string" ? v.category : null;
+  const state = data.ticket_state;
+  const rawTypeStates = data.ticket_type?.ticket_states;
+  const typeStateList = Array.isArray(rawTypeStates) ? rawTypeStates : rawTypeStates?.data ?? null;
+  const changes: IntercomTicketStateChange[] = (data.ticket_parts?.ticket_parts ?? [])
+    .map((p) => ({
+      previous: category(p.previous_ticket_state),
+      current: category(p.ticket_state),
+      createdAt: p.created_at ?? 0,
+      authorType: p.author?.type ?? null,
+      authorId: p.author?.id != null ? String(p.author.id) : null,
+      appPackageCode: p.app_package_code ?? null,
+    }))
+    .filter((c) => c.current != null && c.previous != null);
+  return {
+    id: data.id != null ? String(data.id) : fallbackId,
+    open: data.open !== false,
+    stateId: state && typeof state === "object" && state.id != null ? String(state.id) : null,
+    stateCategory: typeof state === "string" ? state : state && typeof state === "object" ? state.category ?? null : null,
+    typeCategory: data.ticket_type?.category ?? null,
+    typeStates: typeStateList
+      ? typeStateList
+          .filter((s) => s.id != null)
+          .map((s) => ({
+            id: String(s.id),
+            category: s.category ?? null,
+            internalLabel: s.internal_label ?? s.external_label ?? `State ${s.id}`,
+            archived: s.archived === true,
+          }))
+      : null,
+    stateChanges: changes,
+  };
 }
 
 function toUnix(iso: string): number {

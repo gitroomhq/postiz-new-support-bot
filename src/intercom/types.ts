@@ -292,6 +292,10 @@ export interface IntercomConversationItem {
   // Native priority level (none/low/medium/high/urgent) — READ-only via the
   // public API; older payloads may carry the legacy "priority"/"not_priority".
   priority?: string | null;
+  // The ticket this conversation is, when it is one. state is the category
+  // (submitted | in_progress | waiting_on_customer | resolved): resolve on
+  // close skips a resolved one without an API call.
+  ticket?: { id?: string | number; state?: string | null } | null;
 }
 
 // data.item for ticket.* topics.

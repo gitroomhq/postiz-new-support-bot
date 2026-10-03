@@ -1232,6 +1232,10 @@ export const STATEMENTS: string[] = [
   )`,
   `CREATE INDEX IF NOT EXISTS "intercom_reply_states_threadId_idx" ON "intercom_reply_states"("threadId")`,
   `CREATE INDEX IF NOT EXISTS "intercom_reply_states_enteredAt_idx" ON "intercom_reply_states"("enteredAt")`,
+  // Resolve on close: ships ON (the existing settings row takes the default).
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "resolveOnCloseEnabled" BOOLEAN NOT NULL DEFAULT true`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "resolveOnCloseStateId" TEXT`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "resolveOnCloseBackfilledAt" TIMESTAMP(3)`,
 ];
 
 export async function ensureSchema(prisma: PrismaClient): Promise<void> {

@@ -20,6 +20,7 @@ import type { SlaRuleStore } from "../sla/SlaRuleStore";
 import type { SlaService } from "../sla/SlaService";
 import type { AssignmentService } from "../intercom/AssignmentService";
 import type { ReplyStateService } from "../intercom/ReplyStateService";
+import type { CloseStateService } from "../intercom/CloseStateService";
 import { RouteTable, type AdminGateInteraction, type Panel, type RouteEntry } from "./intercomadmin/types";
 import { SessionManager } from "./intercomadmin/SessionManager";
 import { btn, buttonRow, panelEmbed } from "./intercomadmin/ui";
@@ -63,7 +64,8 @@ export class IntercomAdmin {
     private slaRules: SlaRuleStore,
     slaService: SlaService,
     assignmentService: AssignmentService,
-    replyStates: ReplyStateService
+    replyStates: ReplyStateService,
+    closeStates: CloseStateService
   ) {
     const ctx: HubContext = {
       settingsStore,
@@ -79,6 +81,7 @@ export class IntercomAdmin {
       slaService,
       assignmentService,
       replyStates,
+      closeStates,
       sessions: this.sessions,
       auditLogger,
       auditConfig: (interaction, change) => this.auditConfig(interaction, change),

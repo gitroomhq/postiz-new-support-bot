@@ -21,6 +21,7 @@ import {
   StatusPayload,
 } from "./types";
 import type { ReplyStateService } from "./ReplyStateService";
+import type { CloseStateService } from "./CloseStateService";
 
 // Intercom accepts at most 10 attachment URLs per message.
 const MAX_ATTACHMENT_URLS = 10;
@@ -100,6 +101,14 @@ export class IntercomEventExecutor {
 
   setReplyStates(service: Pick<ReplyStateService, "executeBridged" | "holdsState" | "onBridgedStatePushed">): void {
     this.replyStates = service;
+  }
+
+  // Resolve on close: a closing status pushes a Resolved-category state even
+  // when the tag maps to something else (late-bound like the SLA service).
+  private closeStates: Pick<CloseStateService, "closingStateFor"> | null = null;
+
+  setCloseStates(service: Pick<CloseStateService, "closingStateFor">): void {
+    this.closeStates = service;
   }
 
   // ---- Author resolution ----
@@ -326,12 +335,18 @@ export class IntercomEventExecutor {
     // the mapped state (the type's default) — Intercom rejects that with
     // 400 "Cannot transition ticket to the same state", which for the bridge
     // means: already done.
-    const stateId = payload.statusTagId
+    let stateId = payload.statusTagId
       ? this.settingsStore.tagById(payload.statusTagId)?.intercomTicketStateId ?? null
       : null;
+    // A ticket mirrored already closed (backfill) is created resolved, so the
+    // close below needs no second state write.
+    if ((payload.closed || payload.resolved) && this.closeStates) {
+      stateId = await this.closeStates.closingStateFor(ticketId, stateId);
+    }
     if (stateId) {
+      const initialStateId = stateId;
       try {
-        await this.withAuthor((a) => this.client.updateTicket(ticketId, { stateId, adminId: a }));
+        await this.withAuthor((a) => this.client.updateTicket(ticketId, { stateId: initialStateId, adminId: a }));
       } catch (e) {
         if (!isSameStateError(e)) throw e;
       }
@@ -907,7 +922,12 @@ export class IntercomEventExecutor {
     // becomes a no-op here.
     let statePutHappened = false;
     const tag = payload.statusTagId ? this.settingsStore.tagById(payload.statusTagId) : undefined;
-    const stateId = tag?.intercomTicketStateId ?? null;
+    let stateId = tag?.intercomTicketStateId ?? null;
+    // A closing status lands the ticket in a Resolved-category state (resolve
+    // on close), written before the close below so it never reopens anything.
+    if ((payload.closed || payload.resolved) && link.ticketId && this.closeStates) {
+      stateId = await this.closeStates.closingStateFor(link.ticketId, stateId);
+    }
     // The customer-reply flip may arrive after the customer-responded state
     // was written: the ticket keeps that state instead of the flip's mapping.
     const heldForReply = this.replyStates?.holdsState(link, payload) ?? false;

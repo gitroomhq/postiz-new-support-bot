@@ -12,6 +12,7 @@ import type { SlaRuleStore } from "../../../sla/SlaRuleStore";
 import type { SlaService } from "../../../sla/SlaService";
 import type { AssignmentService } from "../../../intercom/AssignmentService";
 import type { ReplyStateService } from "../../../intercom/ReplyStateService";
+import type { CloseStateService } from "../../../intercom/CloseStateService";
 import type { BridgeSourceMessage } from "../../../intercom/IntercomSyncService";
 import type { SessionManager } from "../SessionManager";
 
@@ -37,6 +38,7 @@ export interface HubContext {
   slaService: SlaService;
   assignmentService: AssignmentService;
   replyStates: ReplyStateService;
+  closeStates: CloseStateService;
   sessions: SessionManager;
   auditLogger: AuditLogger;
   // "⚙️ Config updated" embed, same shape as DiscordBot.auditConfig.

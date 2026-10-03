@@ -61,6 +61,7 @@ import { SlaSweeper } from "./intercom/SlaSweeper";
 import { SlaEnforcer } from "./intercom/SlaEnforcer";
 import { AssignmentService } from "./intercom/AssignmentService";
 import { ReplyStateService, formatReplySyncReport } from "./intercom/ReplyStateService";
+import { CloseStateService, formatCloseSweep } from "./intercom/CloseStateService";
 import { IntercomAdmin } from "./bot/IntercomAdmin";
 import { AdminPanelTokens } from "./adminpanel/AdminPanelTokens";
 import { AdminPanelSessions } from "./adminpanel/AdminPanelSessions";
@@ -531,6 +532,21 @@ async function main() {
   );
   intercomExecutor.setReplyStates(replyStateService);
   intercomWebhookHandler.setReplyStates(replyStateService);
+  // Resolve on close (/intercom → Automation, ON by default): a closed ticket
+  // left outside Resolved (Fin, Workflows, the customer-idle sweep) is moved
+  // there, inline from the close webhook and the bridged closing push, with a
+  // sweep on the SLA enforce tick as the backstop and one-time backfill.
+  const closeStateService = new CloseStateService(
+    intercomClient,
+    intercomStore,
+    settingsStore,
+    ticketStore,
+    () => replyStateService.listStates(),
+    (fn) => intercomExecutor.withAuthor(fn)
+  );
+  intercomExecutor.setCloseStates(closeStateService);
+  intercomWebhookHandler.setCloseStates(closeStateService);
+  slaEnforcer.setCloseStates(closeStateService);
 
   // /intercom admin panel (bridge/SLA/automation/maintenance hubs).
   const intercomAdmin = new IntercomAdmin(
@@ -547,7 +563,8 @@ async function main() {
     slaRuleStore,
     slaService,
     assignmentService,
-    replyStateService
+    replyStateService,
+    closeStateService
   );
 
   // The bridge resolves category ids to their human labels via the registry
@@ -773,6 +790,7 @@ async function main() {
       runInactivityNow,
       listTicketStates: () => replyStateService.listStates(true),
       syncReplyStates: async () => formatReplySyncReport(await replyStateService.syncNow()),
+      lastCloseSweep: () => formatCloseSweep(closeStateService.lastSweep()),
     }),
     makeMaintenanceHub({
       resetBridgeData: async () => fmtReport(await intercomStore.resetAll()),
@@ -906,6 +924,7 @@ async function main() {
     intercomWebhookHandler,
     slaSweeper,
     slaEnforcer,
+    closeStates: closeStateService,
     sentryFeedbackImporter,
     kbScheduler,
     snapshotScheduler,

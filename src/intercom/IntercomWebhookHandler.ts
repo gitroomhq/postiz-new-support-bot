@@ -240,6 +240,16 @@ export class IntercomWebhookHandler {
     this.replyStates = service;
   }
 
+  // Resolve on close for NATIVE tickets (bridged closes pick their state in
+  // the ticket outbox). Bound late.
+  private closeStates: {
+    onConversationClosed(item: IntercomConversationItem | undefined): Promise<void>;
+  } | null = null;
+
+  setCloseStates(service: NonNullable<IntercomWebhookHandler["closeStates"]>): void {
+    this.closeStates = service;
+  }
+
   // HTTP-route half: durably queue the event and return. Never relays inline
   // while Temporal is configured. Returns false for duplicate deliveries.
   async accept(body: unknown): Promise<boolean> {
@@ -300,6 +310,10 @@ export class IntercomWebhookHandler {
         return;
       case "conversation.admin.closed":
         await this.handleConversationOpenState(item as IntercomConversationItem, "closed", attempt);
+        // Any closer (teammate, Fin, a Workflow, the bot's own sweep): a closed
+        // ticket left outside Resolved is moved there. Runs in every bridge
+        // mode: native tickets do not depend on the bridge.
+        if (this.closeStates) await this.closeStates.onConversationClosed(item as IntercomConversationItem);
         return;
       case "conversation.admin.opened":
         await this.handleConversationOpenState(item as IntercomConversationItem, "open", attempt);

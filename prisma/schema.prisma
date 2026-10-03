@@ -143,6 +143,13 @@ model BotSettings {
   // teammate reply moves it back. Ships OFF; inert until a state is picked.
   replyStateEnabled          Boolean @default(false)
   replyStateCustomerStateId  String?
+  // Resolve on close (/intercom → Automation): a closed Customer ticket whose
+  // state is not Resolved-category is moved to the picked Resolved state (null
+  // = each type's own). Ships ON; the first sweeps backfill the history, then
+  // stamp resolveOnCloseBackfilledAt.
+  resolveOnCloseEnabled      Boolean   @default(true)
+  resolveOnCloseStateId      String?
+  resolveOnCloseBackfilledAt DateTime?
   // One-time agent-rip migration stamp (resolved-tag flip + thread sweeps) —
   // temporalImportDoneAt precedent: machinery removed later, column stays.
   agentRipMigratedAt DateTime?

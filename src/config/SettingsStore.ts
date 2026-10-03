@@ -533,6 +533,43 @@ export class SettingsStore {
     this.settings = await this.prisma.botSettings.update({ where: { id: "global" }, data });
   }
 
+  // ---- Resolve on close (/intercom → Automation) ----
+
+  resolveOnCloseEnabled(): boolean {
+    return this.settings.resolveOnCloseEnabled;
+  }
+
+  // The picked Resolved-category state; null = each ticket type's own.
+  resolveOnCloseStateId(): string | null {
+    return this.settings.resolveOnCloseStateId;
+  }
+
+  // Set once a full pass over closed tickets found nothing left to resolve.
+  resolveOnCloseBackfilledAt(): Date | null {
+    return this.settings.resolveOnCloseBackfilledAt;
+  }
+
+  resolveOnCloseActive(): boolean {
+    return this.settings.resolveOnCloseEnabled && this.intercomConfigured();
+  }
+
+  // Switching it on again clears the backfill stamp: closes while it was off
+  // are caught up by the next sweep.
+  async updateResolveOnClose(data: { resolveOnCloseEnabled?: boolean; resolveOnCloseStateId?: string | null }): Promise<void> {
+    const reenabled = data.resolveOnCloseEnabled === true && !this.settings.resolveOnCloseEnabled;
+    this.settings = await this.prisma.botSettings.update({
+      where: { id: "global" },
+      data: { ...data, ...(reenabled ? { resolveOnCloseBackfilledAt: null } : {}) },
+    });
+  }
+
+  async recordResolveOnCloseBackfill(): Promise<void> {
+    this.settings = await this.prisma.botSettings.update({
+      where: { id: "global" },
+      data: { resolveOnCloseBackfilledAt: new Date() },
+    });
+  }
+
   // ---- One-time agent-rip migration stamp ----
 
   agentRipMigratedAt(): Date | null {

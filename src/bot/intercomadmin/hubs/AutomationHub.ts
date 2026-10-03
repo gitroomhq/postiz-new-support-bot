@@ -15,9 +15,12 @@ import { btn, buttonRow, backRow, selectRow, panelEmbed, textInput } from "../ui
 import type { Panel, RouteEntry } from "../types";
 import type { HubContext } from "./HubContext";
 import { formatReplySyncReport } from "../../../intercom/ReplyStateService";
+import { formatCloseSweep } from "../../../intercom/CloseStateService";
 import type { IntercomTicketState } from "../../../intercom/types";
 
 const STATE_PAGE_SIZE = 10;
+// Select value for "no pick": each ticket type's own Resolved state.
+const AUTO_CLOSE_STATE = "__auto__";
 const CATEGORY_ORDER = ["submitted", "in_progress", "waiting_on_customer", "resolved"];
 const CATEGORY_LABELS: Record<string, string> = {
   submitted: "Submitted",
@@ -27,7 +30,7 @@ const CATEGORY_LABELS: Record<string, string> = {
 };
 
 // /intercom → Automation: the workspace customer-idle sweeper (native/unbridged
-// conversations), the customer-responded ticket state, and the per-tag
+// conversations), the customer-responded ticket state, resolve on close, and the per-tag
 // customer reminder texts (moved here from /config → Workflow → Manage Tags).
 // Agent nags are no longer here: the SLA enforcer owns them (SLA Manager → Nag
 // Cadence). Structural tag settings (emoji, label, delays, target,
@@ -56,6 +59,15 @@ export class AutomationHub {
     },
     { kind: "button", id: "icadmin_auto_reply_sync", match: "exact", handler: (i) => this.handleReplySync(i) },
     { kind: "select", id: "icadmin_auto_reply_state", match: "exact", handler: (i) => this.handleReplyStatePick(i) },
+    { kind: "button", id: "icadmin_auto_close_toggle", match: "exact", handler: (i) => this.handleCloseToggle(i) },
+    { kind: "button", id: "icadmin_auto_close_pick", match: "exact", handler: (i) => this.handleClosePickOpen(i, 0) },
+    {
+      kind: "button",
+      id: "icadmin_auto_close_pg:",
+      match: "prefix",
+      handler: (i) => this.handleClosePickOpen(i, Number(i.customId.split(":")[1]) || 0),
+    },
+    { kind: "select", id: "icadmin_auto_close_state", match: "exact", handler: (i) => this.handleCloseStatePick(i) },
     { kind: "modal", id: "icadmin_auto_sweep_opts_m", match: "exact", handler: (i) => this.handleSweepOptsSubmit(i) },
     { kind: "modal", id: "icadmin_auto_sweep_texts_m", match: "exact", handler: (i) => this.handleSweepTextsSubmit(i) },
     { kind: "modal", id: "icadmin_auto_tag_m:", match: "prefix", handler: (i) => this.handleTagTextsSubmit(i) },
@@ -73,6 +85,14 @@ export class AutomationHub {
       : replyStateId
         ? `id ${replyStateId} (not found in Intercom, pick again)`
         : "not picked";
+    const closeStateId = s.resolveOnCloseStateId();
+    const closeState = await this.ctx.replyStates.stateById(closeStateId).catch(() => null);
+    const closeStateLine = closeState
+      ? closeState.internalLabel
+      : closeStateId
+        ? `id ${closeStateId} (not found in Intercom, each type's own is used)`
+        : "auto (each ticket type's own Resolved state)";
+    const backfilledAt = s.resolveOnCloseBackfilledAt();
     const embed = panelEmbed(
       "Intercom Automation",
       [
@@ -101,6 +121,11 @@ export class AutomationHub {
         "**Customer responded state** (Intercom tickets, native and Discord-bridged):",
         `**Status:** ${s.replyStateEnabled() ? "**on**" : "**off**"} · **state:** ${replyStateLine} · **awaiting our reply:** ${waiting}`,
         "A customer reply on a ticket in Submitted, In progress or Waiting on customer moves it to this state. The next teammate reply (Intercom inbox, or a staff message in the Discord thread) moves it back where it was; Submitted goes to Waiting on customer. Fin, bots and internal notes never count, and a state changed by hand wins over the restore. Bridged tickets also get their Discord status back. **Sync Now** moves every open ticket whose customer spoke last.",
+        "",
+        "**Resolve on close** (Intercom Customer tickets, native and Discord-bridged):",
+        `**Status:** ${s.resolveOnCloseEnabled() ? "**on**" : "**off**"} · **state:** ${closeStateLine} · **backfill:** ${backfilledAt ? `done ${backfilledAt.toISOString().slice(0, 10)}` : "pending"}`,
+        `**Last sweep:** ${formatCloseSweep(this.ctx.closeStates.lastSweep())}`,
+        "A ticket closed outside the Resolved category (Fin's idle close, a Workflow, the customer-idle sweep, a teammate) is moved to this state; any Resolved state already set is kept. Bridged tickets whose closing status maps elsewhere are resolved too. Runs on every close plus the 5-minute SLA tick; the first sweeps after switching it on resolve the backlog.",
       ].join("\n")
     );
 
@@ -137,17 +162,24 @@ export class AutomationHub {
       btn("icadmin_auto_fwd_list", "List Forwarders", ButtonStyle.Secondary)
     );
 
-    const replyRow = buttonRow(
+    // Ticket-state automations share a row: a message holds five rows at most.
+    const stateRow = buttonRow(
       btn(
         "icadmin_auto_reply_toggle",
         `Customer Responded: ${s.replyStateEnabled() ? "on" : "off"}`,
         s.replyStateEnabled() ? ButtonStyle.Success : ButtonStyle.Secondary
       ),
       btn("icadmin_auto_reply_pick", "Pick State", ButtonStyle.Primary),
-      btn("icadmin_auto_reply_sync", "Sync Now", ButtonStyle.Secondary, !s.replyStateActive())
+      btn("icadmin_auto_reply_sync", "Sync Now", ButtonStyle.Secondary, !s.replyStateActive()),
+      btn(
+        "icadmin_auto_close_toggle",
+        `Resolve On Close: ${s.resolveOnCloseEnabled() ? "on" : "off"}`,
+        s.resolveOnCloseEnabled() ? ButtonStyle.Success : ButtonStyle.Secondary
+      ),
+      btn("icadmin_auto_close_pick", "Close State", ButtonStyle.Primary)
     );
 
-    return { embeds: [embed], components: [sweeperRow, fwdRow, replyRow, selectRow(tagSelect), backRow()] };
+    return { embeds: [embed], components: [sweeperRow, fwdRow, stateRow, selectRow(tagSelect), backRow()] };
   }
 
   // Deferred: the panel reads the ticket-state label from Intercom (cached).
@@ -571,5 +603,97 @@ export class AutomationHub {
         embeds: [makeEmbed(`Sync failed: ${e instanceof Error ? e.message : String(e)}`, COLORS.danger)],
       });
     }
+  }
+
+  // ---- resolve on close ----
+
+  private async handleCloseToggle(interaction: ButtonInteraction): Promise<void> {
+    const next = !this.ctx.settingsStore.resolveOnCloseEnabled();
+    await this.ctx.settingsStore.updateResolveOnClose({ resolveOnCloseEnabled: next });
+    this.ctx.auditConfig(interaction, `Resolve on close → ${next ? "on" : "off"}`);
+    await this.renderPanel(interaction);
+  }
+
+  private async resolvedStates(): Promise<IntercomTicketState[]> {
+    const states = await this.ctx.replyStates.listStates(true);
+    return states
+      .filter((st) => !st.archived && st.category === "resolved")
+      .sort((a, b) => a.internalLabel.localeCompare(b.internalLabel));
+  }
+
+  private async handleClosePickOpen(interaction: ButtonInteraction, page: number): Promise<void> {
+    await interaction.deferUpdate();
+    let states: IntercomTicketState[];
+    try {
+      states = await this.resolvedStates();
+    } catch (e) {
+      await interaction.followUp({
+        embeds: [makeEmbed(`Could not list ticket states: ${e instanceof Error ? e.message : String(e)}`, COLORS.danger)],
+        flags: 64,
+      });
+      return;
+    }
+    const totalPages = Math.max(1, Math.ceil(states.length / STATE_PAGE_SIZE));
+    const clamped = Math.min(Math.max(0, page), totalPages - 1);
+    const slice = states.slice(clamped * STATE_PAGE_SIZE, (clamped + 1) * STATE_PAGE_SIZE);
+    const current = this.ctx.settingsStore.resolveOnCloseStateId();
+    const select = new StringSelectMenuBuilder()
+      .setCustomId("icadmin_auto_close_state")
+      .setPlaceholder("State for closed tickets")
+      .addOptions([
+        {
+          label: "Auto",
+          value: AUTO_CLOSE_STATE,
+          description: "Each ticket type's own Resolved state",
+          default: current === null,
+        },
+        ...slice.map((st) => ({
+          label: st.internalLabel.slice(0, 100),
+          value: st.id,
+          description: `Resolved · id ${st.id}`.slice(0, 100),
+          default: st.id === current,
+        })),
+      ]);
+    const nav = [btn("icadmin_hub:automation", "Back", ButtonStyle.Secondary)];
+    if (totalPages > 1) {
+      nav.unshift(
+        btn(`icadmin_auto_close_pg:${clamped - 1}`, "Prev", ButtonStyle.Secondary, clamped === 0),
+        btn(`icadmin_auto_close_pg:${clamped + 1}`, "Next", ButtonStyle.Secondary, clamped >= totalPages - 1)
+      );
+    }
+    await interaction.editReply({
+      embeds: [
+        makeEmbed(
+          [
+            "Pick the Resolved state a closed ticket is moved to" + (totalPages > 1 ? ` (page ${clamped + 1}/${totalPages}).` : "."),
+            "Only Resolved-category states are offered. A ticket type that does not have the picked state enabled gets its own Resolved state instead; **Auto** uses that for every type.",
+          ].join("\n"),
+          COLORS.neutral
+        ),
+      ],
+      components: [selectRow(select), buttonRow(...nav)],
+    });
+  }
+
+  private async handleCloseStatePick(interaction: StringSelectMenuInteraction): Promise<void> {
+    const value = interaction.values[0];
+    if (value === AUTO_CLOSE_STATE) {
+      await this.ctx.settingsStore.updateResolveOnClose({ resolveOnCloseStateId: null });
+      this.ctx.auditConfig(interaction, "Resolve-on-close state → auto");
+      await this.renderPanel(interaction);
+      return;
+    }
+    // Never trust the value: it must still exist, be live and be resolved.
+    const state = (await this.resolvedStates().catch(() => [] as IntercomTicketState[])).find((st) => st.id === value);
+    if (!state) {
+      await interaction.reply({
+        embeds: [makeEmbed("That state is no longer available in Intercom. Open Close State again.", COLORS.warn)],
+        flags: 64,
+      });
+      return;
+    }
+    await this.ctx.settingsStore.updateResolveOnClose({ resolveOnCloseStateId: state.id });
+    this.ctx.auditConfig(interaction, `Resolve-on-close state → ${state.internalLabel} (${state.id})`);
+    await this.renderPanel(interaction);
   }
 }

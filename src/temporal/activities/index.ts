@@ -20,6 +20,7 @@ import { isIntercomExempt, type IntercomSyncService } from "../../intercom/Inter
 import type { IntercomEventExecutor } from "../../intercom/IntercomEventExecutor";
 import type { SlaSweeper } from "../../intercom/SlaSweeper";
 import type { SlaEnforcer } from "../../intercom/SlaEnforcer";
+import type { CloseStateService } from "../../intercom/CloseStateService";
 import { IntercomHttpError } from "../../intercom/IntercomClient";
 import { DeferEchoError, type IntercomWebhookHandler } from "../../intercom/IntercomWebhookHandler";
 import type { EnsurePayload } from "../../intercom/types";
@@ -71,6 +72,8 @@ export interface ActivityDeps {
   intercomWebhookHandler: IntercomWebhookHandler;
   slaSweeper: SlaSweeper;
   slaEnforcer: SlaEnforcer;
+  // Resolve-on-close sweep, run after the SLA enforce sweep on the same tick.
+  closeStates?: CloseStateService | null;
   sentryFeedbackImporter: SentryFeedbackImporter;
   kbScheduler: KnowledgeBaseScheduler;
   snapshotScheduler: SnapshotScheduler;
@@ -107,6 +110,7 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
     intercomWebhookHandler,
     slaSweeper,
     slaEnforcer,
+    closeStates,
     sentryFeedbackImporter,
     kbScheduler,
     snapshotScheduler,
@@ -694,7 +698,11 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
         }
       }, 30_000);
       try {
-        return await slaEnforcer.sweep(force);
+        const result = await slaEnforcer.sweep(force);
+        // Resolve on close rides the same 5-minute cadence; it never fails
+        // the SLA tick.
+        await closeStates?.sweep().catch((e) => actLog.error("resolve-on-close sweep failed", e));
+        return result;
       } finally {
         clearInterval(keepalive);
       }
