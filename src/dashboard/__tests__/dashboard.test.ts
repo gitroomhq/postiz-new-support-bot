@@ -1845,6 +1845,9 @@ test("api belts: off-session invoice pay demands a fresh factor; send does not",
 test("HomeMetrics: daily bucketing, truncation notes, TTL cache + singleflight, dispute-ratio bands", async () => {
   const { HomeMetrics } = await import("../metrics/HomeMetrics");
   const now = Math.floor(Date.now() / 1000);
+  // An hour ago, but never before today's UTC midnight: buckets are UTC days,
+  // and a plain now - 3600 lands in yesterday's bucket between 00:00 and 01:00.
+  const recent = Math.max(now - 3600, Math.floor(now / 86400) * 86400);
   let txCalls = 0;
   let subsCalls = 0;
   const stripe = {
@@ -1854,21 +1857,21 @@ test("HomeMetrics: daily bucketing, truncation notes, TTL cache + singleflight, 
       txCalls++;
       return {
         transactions: [
-          { id: "txn_1", amount: 2900, currency: "eur", created: now - 3600, type: "charge" },
+          { id: "txn_1", amount: 2900, currency: "eur", created: recent, type: "charge" },
           { id: "txn_2", amount: 1100, currency: "eur", created: now - 90000, type: "charge" },
-          { id: "txn_3", amount: 500, currency: "usd", created: now - 3600, type: "charge" },
+          { id: "txn_3", amount: 500, currency: "usd", created: recent, type: "charge" },
         ],
         hasMore: false,
       };
     },
     listAllCharges: async () => ({
       charges: [
-        { id: "ch_1", status: "failed", created: now - 3600 },
-        { id: "ch_2", status: "succeeded", created: now - 3600 },
+        { id: "ch_1", status: "failed", created: recent },
+        { id: "ch_2", status: "succeeded", created: recent },
       ],
       hasMore: false,
     }),
-    listCustomersPage: async () => ({ customers: [{ id: "cus_1", created: now - 3600 }], hasMore: false }),
+    listCustomersPage: async () => ({ customers: [{ id: "cus_1", created: recent }], hasMore: false }),
     listAllSubscriptions: async () => {
       subsCalls++;
       return {
