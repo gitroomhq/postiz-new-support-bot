@@ -105,6 +105,20 @@ Setup (`/intercom → Automation`, mirrored in the web panel's Automation hub):
 
 No new webhook subscriptions: it uses `conversation.admin.replied` (the bridge's topic list) and `conversation.user.replied` (the SLA setup above). Flips are silent (no notes, no audit entries); the Discord status changes on bridged tickets are ordinary status changes. Restore rows older than 90 days are dropped by the cleanup tick.
 
+### Resolve on close
+
+Fin closes a conversation when the customer goes idle but leaves its ticket in In progress or Waiting on customer, and Workflows, the customer-idle sweep and teammates can do the same. The bot moves every closed ticket whose state is outside the Resolved category into a Resolved state. **On by default**; nothing to set up.
+
+- **Which tickets**: Customer-category tickets that are closed and in Submitted, In progress or Waiting on customer (any custom state in those categories). Any Resolved-category state already set is kept, so a teammate's deliberate custom resolved state is never overwritten. Back-office and Tracker tickets are left alone (a Tracker's state change reaches every linked customer).
+- **Which state**: the one picked under **Close State**, or with **Auto** (the default) each ticket type's own Resolved state. A type that does not have the picked state enabled also gets its own.
+- **When**: inline on `conversation.admin.closed` (already in the bridge's topic list, works in every bridge mode), plus a sweep on the 5-minute SLA enforce tick as the backstop for closes whose webhook never arrives. The bot's own customer-idle auto-close writes the state just before it closes.
+- **Backfill**: the first sweeps after it is switched on walk every closed, unresolved ticket (60 writes per tick) until a full pass finds nothing left, then stamp the backfill as done and only look at tickets touched in the last two hours. Switching it off and on again repeats the backfill, so closes made while it was off are caught up.
+- **Bridged Discord tickets**: a closing status pushes the Resolved state even when the closing tag is unmapped or mapped to another state (a tag mapped to a Resolved state keeps its mapping). A bridged ticket closed in Intercom while its Discord thread is still open is left to the bridge's open/close parity.
+- **Reopen guard**: a ticket write on a closed conversation can reopen it, so the write carries `open: false`, and a ticket that still comes back open is closed again (logged as `state write reopened the ticket`).
+- **Customer responded**: resolving a ticket drops its pending Customer responded restore.
+
+Writes are silent (`skip_notifications`, no notes). `/intercom → Automation` shows the status, the backfill and the last sweep; the web panel's Automation hub mirrors it.
+
 ### Sentry feedback → Intercom import
 
 Sentry's User Feedback widget is write-only for users — nobody can answer them there. The `sentry-feedback-sync` looper (15 min, plus a webhook accelerator) turns each **widget** feedback item into an Intercom conversation authored by an email contact matching the submitter: agents reply in Intercom, Intercom's email fallback delivers the reply (imported contacts never have Messenger sessions), and the submitter's email answer threads back into the same conversation. Sentry itself is strictly read-only; anonymous submissions are skipped (counted on the panel); there is **no backfill** — the first enable stamps an import floor.
