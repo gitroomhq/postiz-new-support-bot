@@ -56,7 +56,7 @@ model BillingApproval {
   paramsJson       Json
   summary          String // human-readable summary rendered at queue time
   conversationId   String? // Intercom conversation the request came from (null for dashboard-origin)
-  origin           String    @default("intercom") // "intercom" | "dashboard" — decides ctx rebuild at approval time
+  origin           String    @default("intercom") // "intercom" | "dashboard": decides ctx rebuild at approval time
   ticketThreadId   String?
   stripeCustomerId String?
   requestedById    String // Intercom teammate id (or Discord id for dashboard-origin)
@@ -64,7 +64,7 @@ model BillingApproval {
   status           String    @default("PENDING") // PENDING | EXECUTING | EXECUTED | REJECTED | EXPIRED | FAILED
   reviewerId       String? // "intercom:<id>" or "discord:<id>"
   reviewerName     String?
-  claimedAt        DateTime? // last claimForExecution stamp — stale-EXECUTING reclaim window
+  claimedAt        DateTime? // last claimForExecution stamp: stale-EXECUTING reclaim window
   resultText       String?
   errorText        String?
   expiresAt        DateTime // createdAt + 7 days; lazily flipped to EXPIRED
@@ -119,15 +119,15 @@ model BotSettings {
   intercomMode          String  @default("none") // "none" | "push" | "bi"
   intercomRegion        String  @default("us")   // "us" | "eu" | "au"
   intercomAccessToken   String?
-  intercomClientSecret  String?                  // app client secret — webhook HMAC
+  intercomClientSecret  String?                  // app client secret: webhook HMAC
   intercomAdminId       String?                  // configured authoring admin (fallback)
   intercomOperatorAdminId String?                // auto-detected Operator/Fin; null = rejected/not found
   intercomTicketTypeMap Json?                    // { "<categoryId>"|"_default": "<ticketTypeId>" }
   intercomTeamId        String?                  // team the bridge assigns new conversations/tickets to (null = unassigned)
   // Status tag applied in Discord when an agent snoozes the conversation in Intercom.
   intercomSnoozeStatusTagId String?
-  intercomLastInboundAt DateTime? // last verified inbound webhook — /config health line
-  intercomModeChangedAt DateTime? // last mode flip — none→bi gap heal reads parts newer than this
+  intercomLastInboundAt DateTime? // last verified inbound webhook: /config health line
+  intercomModeChangedAt DateTime? // last mode flip: none→bi gap heal reads parts newer than this
   // Workspace inactivity sweeper (native/unbridged conversations + tickets):
   // the bot runs the reminder/auto-close automation Intercom can't apply to
   // API-created conversations. Ships OFF; edited via /config → Intercom →
@@ -150,7 +150,7 @@ model BotSettings {
   resolveOnCloseEnabled      Boolean   @default(true)
   resolveOnCloseStateId      String?
   resolveOnCloseBackfilledAt DateTime?
-  // One-time agent-rip migration stamp (resolved-tag flip + thread sweeps) —
+  // One-time agent-rip migration stamp (resolved-tag flip + thread sweeps),
   // temporalImportDoneAt precedent: machinery removed later, column stays.
   agentRipMigratedAt DateTime?
   // Sentry DSN (set via /config; deploy has no .env access). Null = Sentry disabled.
@@ -162,8 +162,8 @@ model BotSettings {
   sentryLogsEnabled        Boolean @default(true) // Sentry Logs product + console.* capture
   sentryDebug              Boolean @default(false) // SDK debug to stdout; restart to apply
   sentrySendDefaultPii     Boolean @default(false)
-  sentryAiRecordContent    Boolean @default(false) // AI prompts/responses/tool I/O on gen_ai spans — off by default (customer PII); opt in via /config
-  // Sentry READ access — separate from the write-only DSN above. Feeds the
+  sentryAiRecordContent    Boolean @default(false) // AI prompts/responses/tool I/O on gen_ai spans: off by default (customer PII); opt in via /config
+  // Sentry READ access, separate from the write-only DSN above. Feeds the
   // feedback import (Sentry User Feedback widget → Intercom conversations).
   // Token is encrypted at rest (crypto.ts/Vault); needs an org auth token
   // (org:read, project:read, event:read). Off by default.
@@ -171,19 +171,19 @@ model BotSettings {
   sentryReadToken          String?
   sentryOrgSlug            String?
   sentryProjectSlug        String? // comma-separated project slugs to import from; null/empty = all projects
-  sentryReadRegion         String  @default("us") // "us" | "eu" — org tokens don't auto-route to EU (de.sentry.io)
+  sentryReadRegion         String  @default("us") // "us" | "eu": org tokens don't auto-route to EU (de.sentry.io)
   // Sentry feedback → Intercom import (edited via /config → Integrations → Sentry Feedback).
   sentryFeedbackTeamId       String?   // Intercom team imported conversations are assigned to; null = unassigned
   sentryFeedbackWatermarkAt  DateTime? // stamped at FIRST enable; only feedback newer than this ever imports (no backfill)
-  sentryFeedbackLastSyncAt   DateTime? // last COMPLETED sync tick — /config status line
+  sentryFeedbackLastSyncAt   DateTime? // last COMPLETED sync tick: /config status line
   // Every tick attempt, completed or not, plus why the last one did not
   // complete (null = healthy). Without these a throwing tick was invisible:
   // the looper swallows activity failures and lastSyncAt simply froze.
   sentryFeedbackLastAttemptAt DateTime?
   sentryFeedbackLastError     String?
-  sentryWebhookSecret        String?   // Sentry internal-integration client secret — encrypted (crypto.ts/Vault)
+  sentryWebhookSecret        String?   // Sentry internal-integration client secret: encrypted (crypto.ts/Vault)
   sentryFeedbackTicketTypeId String?   // convert imports into customer tickets of this type; null = plain conversations
-  // Postiz platform lookup (GET /public/v1/users?name= — superadmin search).
+  // Postiz platform lookup (GET /public/v1/users?name=, superadmin search).
   // The key's org must contain a superadmin user AND hold a subscription, or
   // every call 401s. POSTIZ_ADMIN_TOKEN in the environment overrides the
   // column (see config/env.ts); the column is encrypted (crypto.ts/Vault).
@@ -244,10 +244,10 @@ model BotSettings {
   // registered programmatically; the signing secret is stored encrypted at rest.
   stripeWebhookEnabled    Boolean @default(false)
   stripeWebhookEndpointId String?
-  stripeWebhookSecret     String? // whsec_… — encrypted (see src/util/crypto.ts)
+  stripeWebhookSecret     String? // whsec_…: encrypted (see src/util/crypto.ts)
   // Stripe account API key (sk_…): managed copy of the STRIPE_SECRET_KEY env
   // var (auto-seeded on boot, rotatable at runtime). The env var itself never
-  // goes away — it feeds the crypto.ts key derivation and is the read fallback.
+  // goes away: it feeds the crypto.ts key derivation and is the read fallback.
   stripeSecretKey         String?
   // Bot's public origin for programmatic webhook registration; falls back to
   // new URL(POSTIZ_CALLBACK_URL).origin when unset.
@@ -264,7 +264,7 @@ model BotSettings {
   disputeReminderDays     Int     @default(3)
   disputeRatioWarnPct     Float   @default(0.5)
   disputeRatioCriticalPct Float   @default(0.9)
-  disputeRatioLastLevel   String  @default("ok") // ok | warn | critical — alert-on-transition state
+  disputeRatioLastLevel   String  @default("ok") // ok | warn | critical: alert-on-transition state
   // Urgent reminder tier: respondable + unsubmitted + due within this many
   // hours escalates the reminder (red embed + role mention). Role unset =
   // urgent styling without a mention, so the deploy ships inert.
@@ -371,7 +371,7 @@ model BotSettings {
   scoringBackfillPending    Boolean   @default(false)
   // Evaluation escalation: tickets the scoring model flags as beyond its reliable
   // evaluation are re-scored by a stronger model in a daily batch (~12x cost per
-  // ticket — off by default; also inert while scoringEnabled is off). Model is
+  // ticket; off by default, also inert while scoringEnabled is off). Model is
   // free-text but must be a real model id (the scoring path resolves no aliases).
   scoringEscalationEnabled            Boolean   @default(false)
   scoringEscalationModel              String    @default("claude-sonnet-4-6")
@@ -379,7 +379,7 @@ model BotSettings {
   scoringEscalationMaxTicketsPerBatch Int       @default(25)
   scoringEscalationLastRunAt          DateTime?
   // HashiCorp Vault connection (edited via /config → Vault; no .env on deploy).
-  // vaultToken is encrypted at rest with the LOCAL crypto.ts key — it is the
+  // vaultToken is encrypted at rest with the LOCAL crypto.ts key: it is the
   // bootstrap credential, Vault can't wrap its own token. vaultMigratedAt is the
   // storage cutover: null = secrets live in Postgres columns; set = the global
   // secrets live in Vault KV (columns hold the vault:kv sentinel) and user
@@ -411,42 +411,42 @@ model BotSettings {
   // TLS fails the handshake outright. ON = mTLS with the Vault-held client
   // cert. Certs stay stored either way; they are simply unused while off.
   temporalTlsEnabled     Boolean   @default(false)
-  // TLS SNI / server-name override — needed when dialing by IP while the
+  // TLS SNI / server-name override, needed when dialing by IP while the
   // server cert carries a hostname. Null = derive from the address. Ignored
   // while temporalTlsEnabled is off.
   temporalTlsServerName  String?
   temporalImportDoneAt DateTime?
   // Intercom teammates who count as billing admins for canvas/panel actions
   // (edited via /config → Billing → Intercom Admins). JSON array of
-  // { id, name } — names snapshotted for display.
+  // { id, name }: names snapshotted for display.
   intercomPanelAdminsJson Json?
   // Per-action access levels for the canvas/panel billing actions:
   // { "<actionKey>": "none" | "approval" | "all" }. Missing key = the
   // action's registry default. Edited via /config → Billing → Intercom Actions.
   billingActionLevelsJson Json?
   // Auto-generated HMAC key for Stripe-panel URL/API tokens (encrypted at
-  // rest via crypto.ts; seeded on first use — never user-entered or shown).
+  // rest via crypto.ts; seeded on first use, never user-entered or shown).
   panelTokenSecret        String?
   // Stripe-panel token epoch: minted links/sessions embed it; bumping it
   // ("Revoke Stripe Panel Links" in /intercom → Maintenance) invalidates every
   // outstanding link and session instantly.
   panelTokenEpoch         Int     @default(0)
-  // Admin web-panel (/config + /intercom) token epoch — a SEPARATE lever from
+  // Admin web-panel (/config + /intercom) token epoch: a SEPARATE lever from
   // panelTokenEpoch so "Revoke Admin Panel Links" doesn't kill Stripe-panel
   // links (and vice versa). Admin tokens reuse panelTokenSecret as HMAC key.
   adminPanelEpoch         Int     @default(0)
-  // Stripe dashboard (account-wide web surface at /dashboard). Default OFF —
+  // Stripe dashboard (account-wide web surface at /dashboard). Default OFF:
   // routes answer 404 until an admin enables it from the Dashboard hub.
   dashboardEnabled        Boolean @default(false)
   // Who may open/enroll into the dashboard: JSON array of { id, name, role }
   // (Discord user ids are the authority, names snapshotted, role
-  // "admin" | "operator" — default admin). Re-checked on EVERY request.
+  // "admin" | "operator", default admin). Re-checked on EVERY request.
   dashboardAdminsJson     Json?
-  // Dashboard token HMAC key — SEPARATE from panelTokenSecret: d1 tokens
+  // Dashboard token HMAC key, SEPARATE from panelTokenSecret: d1 tokens
   // include enroll links (credential-planting class), so the dashboard gets an
   // independent secret + rotation lever. Encrypted at rest via crypto.ts.
   dashboardTokenSecret    String?
-  // Dashboard token/session epoch — bumping it ("Revoke dashboard links" /
+  // Dashboard token/session epoch: bumping it ("Revoke dashboard links" /
   // LOCKDOWN) kills every outstanding dashboard link and session instantly,
   // independent of the other two panels.
   dashboardEpoch          Int     @default(0)
@@ -465,7 +465,7 @@ model BotSettings {
   // visibility + Workflow/view branching), and the 5-min enforcement looper
   // runs the clocks and posts breach signals.
   slaEnabled       Boolean @default(false)
-  slaNativeEnabled Boolean @default(false) // orphaned (kick-note rip 2026-07-17) — native conversations are covered whenever slaEnabled
+  slaNativeEnabled Boolean @default(false) // orphaned (kick-note rip 2026-07-17): native conversations are covered whenever slaEnabled
   slaDefaultTarget String?                 // no-match target; null = clear a previously-written value
   slaAttributeName String  @default("SLA Target")
   slaNoteKickEnabled Boolean @default(true) // orphaned (kick-note rip 2026-07-17)
@@ -477,7 +477,7 @@ model BotSettings {
   slaTargetsJson   Json?
   // Bot-native SLA engine (Expert-tier replacement). The enforcement looper
   // writes ok | at_risk | breached to this List conversation attribute
-  // (created manually in Intercom — the API can't create conversation attrs).
+  // (created manually in Intercom; the API can't create conversation attrs).
   slaStatusAttributeName String  @default("SLA Status")
   slaBreachTagName       String  @default("sla-breached") // tagged on breach, untagged on recovery
   slaWarnPct             Int     @default(80)             // at_risk threshold, % of target (per-target override in slaTargetsJson)
@@ -489,7 +489,7 @@ model BotSettings {
   slaNagNoteText         String?
   // WORKSPACE-DEFAULT office hours + balanced assignment. Per-team overrides
   // (teamSettingsJson) layer on top per-field; a team with no override inherits
-  // these. Office hours: SLA clocks count business time only while enabled —
+  // these. Office hours: SLA clocks count business time only while enabled:
   // JSON { tz, week: { mon..sun: [{ start, end }] }, holidays: ["YYYY-MM-DD"] }.
   officeHoursEnabled Boolean @default(false)
   officeHoursJson    Json?
@@ -497,8 +497,8 @@ model BotSettings {
   // team's members (hybrid round-robin); excluded admins never receive bot
   // assignments. Edited via /intercom → Assignment.
   assignEnabled            Boolean @default(false)
-  assignExcludedAdminsJson Json?   // [{ id, name }] — names snapshotted for display
-  assignRotationCursorsJson Json?  // { [teamId]: adminId } — per-team round-robin cursor
+  assignExcludedAdminsJson Json?   // [{ id, name }]: names snapshotted for display
+  assignRotationCursorsJson Json?  // { [teamId]: adminId }: per-team round-robin cursor
   // Per-team overrides of the assignment + office-hours defaults above:
   // { [teamId]: { teamName?, assignEnabled?, assignExcludedAdmins?, officeHoursEnabled?, officeHoursJson? } }.
   // Any field absent = inherit the workspace default; a team with no entry
@@ -509,7 +509,7 @@ model BotSettings {
   @@map("bot_settings")
 }
 
-// One row per AI run — both interactive Claude Code CLI runs and Batch API scoring
+// One row per AI run: both interactive Claude Code CLI runs and Batch API scoring
 // runs (one aggregated row per batch). Feeds cost dashboards + the scoring budget cap.
 model AiRun {
   id                  String   @id @default(cuid())
@@ -555,7 +555,7 @@ model TicketAiRun {
   @@map("ticket_ai_runs")
 }
 
-// AI quality evaluation of a closed ticket (one row per ticket — the unique
+// AI quality evaluation of a closed ticket (one row per ticket; the unique
 // ticketThreadId is the double-scoring guard). Reopened tickets get their row
 // deleted so the next batch after re-close re-scores the fuller transcript.
 model TicketScore {
@@ -579,13 +579,13 @@ model TicketScore {
   rootCause        String?
   summary          String?
   staffScores      Json?     // [{ name, tone, clarity, correctness }]
-  staffNames       Json?     // string[]: STAFF display names seen in the transcript at submit time — the allowlist the model's staff[] output is reconciled against (null on rows from before this column existed)
+  staffNames       Json?     // string[]: STAFF display names seen in the transcript at submit time, the allowlist the model's staff[] output is reconciled against (null on rows from before this column existed)
   // Evaluation escalation: escalated=true from the moment the scoring model's
   // eval_escalation flag is honored, kept through the re-score as provenance
   // (a SCORED row with escalated=true was scored by the escalation model).
   escalated        Boolean   @default(false)
   escalationReason String?   // the flagging model's one-sentence eval_escalation_reason
-  // Complexity snapshot taken at submit time (transcriptChars is pre-truncation) —
+  // Complexity snapshot taken at submit time (transcriptChars is pre-truncation):
   // the objective veto that gates the model's escalation flag at result time.
   customerMessages Int?
   transcriptChars  Int?
@@ -659,7 +659,7 @@ model Ticket {
   // Discord-only ticket: not mirrored to Intercom (no conversation, no
   // ticket, no events). Set at creation by the self-service refund flow.
   // The exemption lifts when the customer sends their first typed message
-  // in the thread (a human needs to see it) — see flipRefundTicket.
+  // in the thread (a human needs to see it); see flipRefundTicket.
   intercomExempt      Boolean    @default(false)
   // Stamped when the customer's first typed message flipped a refund ticket
   // from Discord-only to mirrored. Guards the boot backfill (ensureSchema)
@@ -667,7 +667,7 @@ model Ticket {
   intercomExemptLiftedAt DateTime?
   statusTagId         String?
   statusTag           StatusTag? @relation(fields: [statusTagId], references: [id])
-  // Status the ticket had before the last status change (plain id, no FK — resolved via
+  // Status the ticket had before the last status change (plain id, no FK; resolved via
   // the SettingsStore cache). Used to restore a "Waiting for Customer" ticket when the
   // customer replies.
   prevStatusTagId     String?
@@ -687,7 +687,7 @@ model Ticket {
   question            String?
   // Resolved Postiz account for this ticket's customer, stamped best-effort at
   // creation from the platform's superadmin search. All null = never resolved
-  // (lookup off, no match, or the call failed) — never treated as "no account".
+  // (lookup off, no match, or the call failed), never treated as "no account".
   postizUserId        String?
   postizOrgId         String?
   postizTier          String? // STANDARD | TEAM | PRO | ULTIMATE, as the platform reports it
@@ -723,7 +723,7 @@ model TicketNote {
 model TicketTagChange {
   id             String   @id @default(cuid())
   ticketThreadId String
-  kind           String   // "STATUS" (legacy rows may carry "PRIORITY" — inert history)
+  kind           String   // "STATUS" (legacy rows may carry "PRIORITY", inert history)
   fromEmoji      String?
   fromLabel      String?
   toEmoji        String
@@ -774,8 +774,8 @@ model IntercomLink {
   ticketId          String?   @unique // Intercom ticket API id (NOT the human ticket_id)
   agentWarnedAt     DateTime? // push mode: one-time "replies don't reach the customer" note
   lastSyncedStateId String? // last ticket_state_id the bridge pushed (echo damper)
-  lastSyncedOpen    String? // "open" | "closed" — conversation open/close parity damper
-  // Last-seen Intercom tag name set (JSON string[]) — inbound tag-diff damper.
+  lastSyncedOpen    String? // "open" | "closed": conversation open/close parity damper
+  // Last-seen Intercom tag name set (JSON string[]): inbound tag-diff damper.
   lastTagsJson      Json?
   lastAssigneeId    String? // last Intercom admin assignee relayed to Discord (damper)
   createdAt         DateTime  @default(now())
@@ -785,12 +785,12 @@ model IntercomLink {
 
 // Part-id ledger for echo suppression (Intercom has no writable content stamp).
 // The bridge records every conversation/ticket part it creates; the webhook
-// handler atomically claims each part it sees — a conflict means it's either
+// handler atomically claims each part it sees: a conflict means it's either
 // the bridge's own echo or a duplicate delivery, and gets dropped.
 model IntercomEchoPart {
   id             String   @id @default(cuid())
   // "c" = conversation part, "t" = ticket part, "r" = relay body-hash dedup,
-  // "m" = outbound delivery ledger (partId = discordMessageId — retry dedup),
+  // "m" = outbound delivery ledger (partId = discordMessageId, retry dedup),
   // "b" = backfill-enqueued marker (partId = threadId).
   kind           String
   partId         String
@@ -806,7 +806,7 @@ model IntercomEchoPart {
   @@map("intercom_echo_parts")
 }
 
-// Discord message ↔ Intercom conversation part mapping, both directions —
+// Discord message ↔ Intercom conversation part mapping, both directions:
 // powers true delete/edit reflection (redact API outbound, the
 // conversation_part.redacted webhook inbound). Rows carry indefinite-lifetime
 // semantics like the "m" delivery ledger: a message can be deleted years later.
@@ -819,8 +819,8 @@ model IntercomMessageMap {
   direction        String
   discordMessageId String
   partId           String    @unique
-  via              String? // "in" rows: how the relay was sent — "webhook" | "bot"
-  redactedAt       DateTime? // either side already deleted — echo damper for the redact webhook
+  via              String? // "in" rows: how the relay was sent ("webhook" | "bot")
+  redactedAt       DateTime? // either side already deleted: echo damper for the redact webhook
   createdAt        DateTime  @default(now())
 
   @@unique([direction, discordMessageId])
@@ -829,7 +829,7 @@ model IntercomMessageMap {
 }
 
 // Inactivity-sweeper damper state for NATIVE (unbridged) Intercom
-// conversations/tickets — bridged tickets keep their reminder counters on the
+// conversations/tickets; bridged tickets keep their reminder counters on the
 // tickets row. One row per swept object; the nag counter resets when the
 // customer replies between sweeps.
 model IntercomSweepState {
@@ -863,7 +863,7 @@ model IntercomReplyState {
 
 // Dedup ledger for incoming Stripe webhook events (Stripe redelivers on non-2xx
 // and occasionally at-least-once). The event id is globally unique, so it is the
-// primary key — an insert conflict means "already handled → drop".
+// primary key: an insert conflict means "already handled → drop".
 model StripeWebhookEvent {
   id        String   @id // Stripe event id (evt_…)
   type      String
@@ -876,7 +876,7 @@ model StripeWebhookEvent {
 // Reserve→call→confirm echo records: the outbox writes a row (normalized body
 // hash) BEFORE posting to Intercom and deletes it after recording the created
 // part id in the echo ledger. The webhook handler treats a matching row as
-// "this part is our own in-flight post" — replaces the old fixed-sleep race.
+// "this part is our own in-flight post", replacing the old fixed-sleep race.
 model IntercomPendingPost {
   id             String   @id @default(cuid())
   ticketThreadId String
@@ -903,7 +903,7 @@ model StripeDispute {
   status              String // needs_response | under_review | warning_* | won | lost | prevented
   evidenceDueBy       DateTime?
   evidenceDraft       Json? // local staff/AI evidence draft ({ field: text })
-  evidenceFinal       Json? // text evidence as last seen at Stripe once submitted ({ field: text }) — won-dispute exemplars for AI drafting
+  evidenceFinal       Json? // text evidence as last seen at Stripe once submitted ({ field: text }): won-dispute exemplars for AI drafting
   evidenceSubmittedAt DateTime?
   lastReminderAt      DateTime? // evidence-due reminder damper (≤1 ping / 24h / dispute)
   lastUrgentReminderAt DateTime? // urgent-tier damper (≤1 urgent ping / 24h / dispute)
@@ -911,8 +911,8 @@ model StripeDispute {
   closedAt            DateTime?
   // Stripe exposes no closed-at timestamp on a dispute, so closedAt is often a
   // best-available ESTIMATE (the latest balance transaction, else an elapsed
-  // evidence deadline, else creation). True until something authoritative — a
-  // Stripe event inside its 30-day retention — replaces it. Exported as a field
+  // evidence deadline, else creation). True until something authoritative (a
+  // Stripe event inside its 30-day retention) replaces it. Exported as a field
   // so a panel can say "estimated" instead of implying precision it has not got.
   closedAtEstimated   Boolean   @default(true)
   // Where closedAt came from, so the estimate can be improved rather than
@@ -1140,7 +1140,7 @@ model StripeMoneyOut {
   currency       String
   source         String // webhook | sweep | backfill | action
   reason         String?
-  stripeObjectId String? // re_ / dp_ / cn_ / di_ / in_ — the object behind the row
+  stripeObjectId String? // re_ / dp_ / cn_ / di_ / in_: the object behind the row
   chargeId       String?
   customerId     String?
   occurredAt     DateTime
@@ -1171,14 +1171,14 @@ model StripeMoneyOut {
   // used and fxRatesAt stamps which revision of the table it came from, so
   // revising fx.ts next year restates nothing that already happened.
   //
-  // Null for a currency fx.ts has no rate for — an unconvertible amount charts
+  // Null for a currency fx.ts has no rate for: an unconvertible amount charts
   // as absent rather than as zero.
   usdMinor       Int?
   feeUsdMinor    Int?
   netUsdMinor    Int?
   fxRate         Float?
   fxRatesAt      String? // RATES_SAMPLED_AT of the table that produced fxRate
-  // A row superseded by a better measurement of the same money — currently only
+  // A row superseded by a better measurement of the same money, currently only
   // the one-per-coupon discount ESTIMATES replaced by invoice-derived actuals.
   // Retired rather than deleted: this is a money ledger, and an operator asking
   // "why did the concession total move" deserves an answer. Every read excludes
@@ -1223,7 +1223,7 @@ model StripeMoneyOut {
 // Subscription lifecycle movements: signups, plan changes, cancellations.
 //
 // Deliberately NOT part of stripe_money_out. A cancellation moves no money on
-// the day it happens — it removes FUTURE revenue — so folding it into the
+// the day it happens (it removes FUTURE revenue), so folding it into the
 // outflow ledger would count a refund-and-cancel as two separate losses.
 //
 // Keyed on the Stripe EVENT id, which makes the 30-day replay idempotent: a
@@ -1258,7 +1258,7 @@ model StripeSubscriptionEvent {
   comment         String? // scrubbed + truncated customer free text
   cardCountry     String?
   source          String // webhook | replay
-  // Frozen USD conversion of the two MRR figures — same rule as the ledger's:
+  // Frozen USD conversion of the two MRR figures, same rule as the ledger's:
   // converted once at ingest, rate stored, never re-converted. Null when fx.ts
   // has no rate for the currency.
   mrrDeltaUsdMinor  Int?
@@ -1278,7 +1278,7 @@ model StripeSubscriptionEvent {
 // Billing blocklist: one row per blocked identifier, mirrored into a Stripe
 // Radar value list (radarItemId) so future payments are blocked at Stripe,
 // while the bot denies self-service billing and flags staff panels. Unblock
-// hard-deletes the row — action history lives in the audit channel + Influx.
+// hard-deletes the row; action history lives in the audit channel + Influx.
 model BlockedEntity {
   id          String   @id @default(cuid())
   kind        String // card_fingerprint | email | customer_id | ip_address
@@ -1289,7 +1289,7 @@ model BlockedEntity {
   actorName   String?
   customerId  String? // related cus_… for BLOCKED-banner lookups
   disputeId   String?
-  radarItemId String? // rli_… — needed to remove the Radar item on unblock
+  radarItemId String? // rli_…: needed to remove the Radar item on unblock
   createdAt   DateTime @default(now())
 
   @@unique([kind, value])
@@ -1297,7 +1297,7 @@ model BlockedEntity {
   @@map("blocked_entities")
 }
 
-// Team-visible staff notes on billing objects (dispute/customer/charge) — the
+// Team-visible staff notes on billing objects (dispute/customer/charge), the
 // billing-panel counterpart of ticket_notes.
 model BillingNote {
   id         String   @id @default(cuid())
@@ -1312,7 +1312,7 @@ model BillingNote {
   @@map("billing_notes")
 }
 
-// Shared team bookmark board for billing objects (one row per object — a
+// Shared team bookmark board for billing objects (one row per object: a
 // pinned watchlist every admin sees and edits, not per-user lists).
 model BillingBookmark {
   id          String   @id @default(cuid())
@@ -1327,7 +1327,7 @@ model BillingBookmark {
   @@map("billing_bookmarks")
 }
 
-// Per-admin dispute watch subscriptions — watchers get a DM when the dispute's
+// Per-admin dispute watch subscriptions: watchers get a DM when the dispute's
 // status changes or funds move.
 model DisputeWatch {
   id        String   @id @default(cuid())
@@ -1342,7 +1342,7 @@ model DisputeWatch {
 // Ordered SLA rules (position = priority, 0 = highest; first enabled match
 // wins; conditions are AND-ed). `conditions` is the structured form
 // (SlaCondition[], zod-validated); `expression` is the canonical text form,
-// regenerated on every save — the two round-trip. `target` is the value the
+// regenerated on every save; the two round-trip. `target` is the value the
 // bot writes to the SLA Target conversation attribute (must exist in
 // BotSettings.slaTargetsJson). Edited via /intercom → SLA Manager.
 model SlaRule {
@@ -1361,7 +1361,7 @@ model SlaRule {
 
 // Per-subject SLA state: write-dedup damper + manual pin. One row per subject,
 // id = "t:<threadId>" (bridged ticket) or "c:<conversationId>" (native
-// conversation) — pins live here rather than on Ticket so native conversations
+// conversation). Pins live here rather than on Ticket so native conversations
 // get the same treatment. lastWrittenTarget is the last value actually PUT to
 // Intercom (writes are skipped while the computed target matches it).
 model SlaState {
@@ -1372,7 +1372,7 @@ model SlaState {
   lastWrittenTarget String?
   lastRuleId        String?
   lastEvaluatedAt   DateTime?
-  lastWriteError    String? // last permanent write failure — surfaced in the SLA hub
+  lastWriteError    String? // last permanent write failure: surfaced in the SLA hub
   lastKickPartId    String? // orphaned (kick-note rip 2026-07-17)
   pinnedTarget      String? // non-null = rules skipped for this subject
   pinnedById        String?
@@ -1439,7 +1439,7 @@ model DashboardCredential {
 }
 
 // DB-backed standing sessions (survive deploys). id = SHA-256 hex of the
-// cookie token — a DB dump yields no usable session. 7d idle / 30d absolute.
+// cookie token: a DB dump yields no usable session. 7d idle / 30d absolute.
 model DashboardSession {
   id                 String    @id
   discordUserId      String
@@ -1464,7 +1464,7 @@ model DashboardSession {
   @@map("dashboard_sessions")
 }
 
-// Append-only dashboard audit trail (auth lifecycle + actions) — doubles as
+// Append-only dashboard audit trail (auth lifecycle + actions), doubles as
 // the Security page's recent-activity feed and a forensic record independent
 // of Discord channel retention.
 model DashboardAuditLog {
@@ -1488,7 +1488,7 @@ model DashboardAuditLog {
 // Sentry User Feedback → Intercom import ledger: one row per TERMINAL outcome
 // ("imported" | "skipped_no_email"). Dedup key = Sentry issue id (widget
 // feedback is 1:1 issue↔submission); the conversation id powers the
-// inactivity-sweeper/SLA exemption lookups. Failed items get NO row — the
+// inactivity-sweeper/SLA exemption lookups. Failed items get NO row: the
 // sync watermark freezes at them and the next tick retries.
 model SentryFeedbackImport {
   id                     String   @id @default(cuid())
@@ -1520,7 +1520,7 @@ model SentryFeedbackImport {
   // parks it (visible in /config, never retried again).
   attempts               Int      @default(0)
   lastError              String?
-  feedbackAt             DateTime // Sentry issue firstSeen — watermark math + audit
+  feedbackAt             DateTime // Sentry issue firstSeen: watermark math + audit
   importedAt             DateTime @default(now())
 
   @@index([importedAt])
@@ -1564,7 +1564,7 @@ model ForwardedEmailConvert {
   customerEmail          String
   customerName           String?
   intercomContactId      String?
-  contactRole            String? // "user" | "lead" — decides the attachment re-upload author
+  contactRole            String? // "user" | "lead": decides the attachment re-upload author
   trigger                String // "auto" | "manual"
   actorLabel             String? // manual trigger: the acting teammate
   attachmentsCount       Int      @default(0)

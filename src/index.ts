@@ -160,7 +160,7 @@ async function main() {
   await ensureSchema(prisma);
   bootLog.info("schema ensured");
 
-  // One-time agent-rip migration, DB phase — BEFORE settingsStore.load() so
+  // One-time agent-rip migration, DB phase, BEFORE settingsStore.load() so
   // the tag cache (closingTag, tagById) sees the resolved→closing flip from
   // the first instruction. Idempotent; re-runs until the Discord phase stamps
   // the flag after bot.start().
@@ -192,8 +192,8 @@ async function main() {
   const vaultMigrator = new VaultMigrator(prisma, settingsStore, sessionStore, vaultService);
   // Temporal connection layer: certs come from the Vault KV cache (the
   // "temporal" integration entry), address/namespace from BotSettings via
-  // /config → Temporal → Connection (env vars are first-boot fallbacks only —
-  // the deploy has no .env access). init() is a bounded warm-up like Vault's —
+  // /config → Temporal → Connection (env vars are first-boot fallbacks only;
+  // the deploy has no .env access). init() is a bounded warm-up like Vault's:
   // a down/unconfigured Temporal means the probe loop keeps trying, never a
   // dead boot.
   const temporalService = new TemporalService(settingsStore, vaultService, auditLogger);
@@ -286,7 +286,7 @@ async function main() {
   const stripeClient = new StripeClient(config, settingsStore);
   // Descriptive segments for the money analytics: which plan, which card, which
   // country, how long the customer had been paying. ONE instance shared by
-  // everything that needs it, because its whole cost model is the cache — the
+  // everything that needs it, because its whole cost model is the cache: the
   // webhook path and the reconcile sweep touch the same charge within seconds
   // and must not each pay for it. Never carries PII: see segments.ts.
   const segmentResolver = new StripeSegmentResolver(stripeClient);
@@ -364,12 +364,12 @@ async function main() {
     disputeVerdicts
   );
   // Money-out ledger: every outflow (refunds, disputes, fees, concessions)
-  // mirrored from Stripe's balance transactions, whatever surface caused it —
+  // mirrored from Stripe's balance transactions, whatever surface caused it,
   // the Stripe Dashboard included.
   const moneyOutStore = new MoneyOutStore(prisma);
   const moneyOutService = new MoneyOutService(settingsStore, stripeClient, moneyOutStore, segmentResolver);
   // Churn analytics: subscription lifecycle movements as counts and signed MRR.
-  // Separate from the money-out ledger on purpose — a cancellation moves no
+  // Separate from the money-out ledger on purpose: a cancellation moves no
   // money on the day it happens, it removes future revenue.
   const subscriptionEventStore = new SubscriptionEventStore(prisma);
   const subscriptionEventService = new SubscriptionEventService(settingsStore, stripeClient, subscriptionEventStore);
@@ -446,7 +446,7 @@ async function main() {
   billingCategory.setTemporalProducers(temporalProducers);
 
   // ---- SLA manager (rules → "SLA Target" conversation attribute; the
-  // bot-native SlaEnforcer looper runs the clocks — Advanced tier has no
+  // bot-native SlaEnforcer looper runs the clocks; Advanced tier has no
   // native SLAs) ----
   const slaRuleStore = new SlaRuleStore(prisma, settingsStore, () =>
     categoryRegistry.getAll().map((c) => ({ id: c.id, label: c.label }))
@@ -461,7 +461,7 @@ async function main() {
     stripeClient,
     settingsStore
   );
-  // Sentry feedback import ledger — also the exemption source for the
+  // Sentry feedback import ledger, also the exemption source for the
   // inactivity sweeper (notes-only) and the SLA engines (fully exempt).
   const sentryFeedbackStore = new SentryFeedbackStore(prisma);
   // Forwarded-email conversion (lite-seat forwards → conversation recreated
@@ -479,7 +479,7 @@ async function main() {
     forwarderRoster
   );
   // The other half: Intercom's NATIVE forward detection attaches the customer
-  // but leaves the forwarder attached too — this removes them.
+  // but leaves the forwarder attached too; this removes them.
   const forwarderDetacher = new ForwarderDetacher(settingsStore, intercomClient, forwarderRoster, auditLogger);
   const slaService = new SlaService(
     prisma,
@@ -506,7 +506,7 @@ async function main() {
   sessionStore.setSlaHook((threadId) => slaService.onTicketTrigger(threadId, "refund_review"));
 
   // ---- Balanced assignment + bot-native SLA enforcement (Advanced tier:
-  // native SLAs/workload management are gone — the bot owns both) ----
+  // native SLAs/workload management are gone, the bot owns both) ----
   const assignmentService = new AssignmentService(intercomClient, intercomStore, settingsStore, (fn) =>
     intercomExecutor.withAuthor(fn)
   );
@@ -690,14 +690,14 @@ async function main() {
     if (!ticket || !tag || !channel?.isThread()) return;
     await statusService.applyStatus(channel, ticket, tag, { actorName });
   });
-  // Thread URLs need the guild id, only known once the client is ready —
-  // resolved lazily per call.
+  // Thread URLs need the guild id, only known once the client is ready,
+  // so it is resolved lazily per call.
   intercomSync.setThreadUrlBuilder((threadId) => {
     const guild = bot.client.guilds.cache.first();
     return guild ? `https://discord.com/channels/${guild.id}/${threadId}` : null;
   });
   // Current Discord identity for the Intercom contact refresh (name drift,
-  // avatar) — resolved lazily per ensure.
+  // avatar), resolved lazily per ensure.
   intercomSync.setCustomerInfoResolver(async (userId) => {
     const user = await bot.client.users.fetch(userId).catch(() => null);
     if (!user) return null;
@@ -708,7 +708,7 @@ async function main() {
       avatarUrl: user.displayAvatarURL({ extension: "png", size: 128 }),
     };
   });
-  // Admin web panel (/config + /intercom) — mirrors the Stripe-panel pattern.
+  // Admin web panel (/config + /intercom): mirrors the Stripe-panel pattern.
   // Built after `bot` because the guild snapshot reads bot.client (created in the
   // DiscordBot constructor). Bound in before start() so CallbackServer gets the
   // route and the adminpanel_* interactions dispatch.
@@ -721,7 +721,7 @@ async function main() {
     setEnabled: ((on: boolean) => Promise<void>) | null;
     tlsSource: (() => "vault" | "env-files" | null) | null;
   } = { setEnabled: null, tlsSource: null };
-  // Dashboard credential reset is defined after the dashboard stack below —
+  // Dashboard credential reset is defined after the dashboard stack below,
   // held late-bound so the Dashboard hub's action can reach it at request time.
   const dashboardOps: { resetCredentials: ((userId: string) => Promise<number>) | null } = { resetCredentials: null };
   const fmtReport = (r: unknown): string =>
@@ -807,7 +807,7 @@ async function main() {
   const adminPanelDiscord = new AdminPanelDiscord(settingsStore, adminPanelTokens, adminPanelSessions);
   bot.bindAdminPanel({ panel: adminPanel, discord: adminPanelDiscord });
 
-  // Stripe dashboard (/dashboard) — the account-wide web surface replacing
+  // Stripe dashboard (/dashboard): the account-wide web surface replacing
   // /billing over time. Third panel on the panelMount substrate. Standing auth:
   // passkey → passphrase → Discord DM activation, DB-backed 7d/30d sessions;
   // the Discord-minted link + passcode stays as break-glass/bootstrap.
@@ -948,8 +948,8 @@ async function main() {
 
   // Worker pause switch (also the /config toggle handler). ON: reconcile
   // looper generations + ensure the baseline singletons BEFORE the worker
-  // polls — a stale-generation terminate landing first means a bump deploy
-  // never surfaces nondeterminism task failures — then start the worker.
+  // polls (a stale-generation terminate landing first means a bump deploy
+  // never surfaces nondeterminism task failures), then start the worker.
   // OFF: drain the worker; background work pauses (fire-and-forget signals
   // keep landing server-side and process on resume; sync seams fall back to
   // their direct in-process paths).
@@ -1020,7 +1020,7 @@ async function main() {
   const shutdown = async () => {
     bootLog.info("shutting down");
     // Drain in-flight activities before tearing down the Discord client and
-    // Prisma — activities use both.
+    // Prisma: activities use both.
     await workerManager.shutdown(15_000);
     await temporalService.shutdown();
     vaultService.stop();

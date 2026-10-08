@@ -113,7 +113,7 @@ export const STATEMENTS: string[] = [
     "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT "canned_responses_pkey" PRIMARY KEY ("id")
   )`,
-  // Columns added after the tables already existed in production — additive, idempotent.
+  // Columns added after the tables already existed in production: additive, idempotent.
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "reportChannelId" TEXT`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "reportEnabled" BOOLEAN NOT NULL DEFAULT false`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "reportIntervalHours" INTEGER NOT NULL DEFAULT 24`,
@@ -182,7 +182,7 @@ export const STATEMENTS: string[] = [
   END
   $$`,
   // (The priority axis is removed: existing deployments keep an orphaned
-  // "priority_tags" table + "tickets"."priorityTagId" column — dropping them
+  // "priority_tags" table + "tickets"."priorityTagId" column; dropping them
   // while an older build is still live would break it; fresh installs never
   // create them.)
   // Append-only status change history (emoji+label snapshotted as text).
@@ -202,8 +202,8 @@ export const STATEMENTS: string[] = [
   `CREATE INDEX IF NOT EXISTS "ticket_tag_changes_ticketThreadId_kind_idx" ON "ticket_tag_changes"("ticketThreadId", "kind")`,
   // Cleanup of the removed Chatwoot bridge (replaced by Intercom): drops the
   // bridge tables and bot_settings columns from deployments that ran it. These
-  // have no counterpart in schema.prisma — they exist only to converge old DBs
-  // — and are idempotent no-ops everywhere else.
+  // have no counterpart in schema.prisma (they exist only to converge old DBs)
+  // and are idempotent no-ops everywhere else.
   `DROP TABLE IF EXISTS "chatwoot_outbox"`,
   `DROP TABLE IF EXISTS "chatwoot_links"`,
   `ALTER TABLE "bot_settings" DROP COLUMN IF EXISTS "chatwootMode"`,
@@ -259,7 +259,7 @@ export const STATEMENTS: string[] = [
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "intercomTeamId" TEXT`,
   `ALTER TABLE "status_tags" ADD COLUMN IF NOT EXISTS "intercomTicketStateId" TEXT`,
   // Customer-reply target flag. Added + backfilled together in a single guarded
-  // block so it runs exactly once — on the boot that first introduces the column.
+  // block so it runs exactly once: on the boot that first introduces the column.
   // Existing installs adopt the documented default ("Waiting for Developer"); a
   // later operator toggle (including clearing it) is never re-applied on reboot.
   `DO $$
@@ -332,7 +332,7 @@ export const STATEMENTS: string[] = [
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "stripeWebhookEnabled" BOOLEAN NOT NULL DEFAULT false`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "stripeWebhookEndpointId" TEXT`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "stripeWebhookSecret" TEXT`,
-  // Stripe account API key — managed copy of the env var (encrypted/vault-held).
+  // Stripe account API key: managed copy of the env var (encrypted/vault-held).
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "stripeSecretKey" TEXT`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "publicBaseUrl" TEXT`,
   // Verbatim final AI answer, persisted for GitHub-issue bodies.
@@ -362,7 +362,7 @@ export const STATEMENTS: string[] = [
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "scoringMaxBudgetUsdPerDay" DOUBLE PRECISION NOT NULL DEFAULT 5.0`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "scoringLastRunAt" TIMESTAMP(3)`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "scoringBackfillPending" BOOLEAN NOT NULL DEFAULT false`,
-  // Per-run AI usage ledger (CLI + Batch runs) — feeds cost dashboards and the
+  // Per-run AI usage ledger (CLI + Batch runs), feeds cost dashboards and the
   // scoring daily-budget cap.
   `CREATE TABLE IF NOT EXISTS "ai_runs" (
     "id" TEXT NOT NULL,
@@ -451,7 +451,7 @@ export const STATEMENTS: string[] = [
   `ALTER TABLE "ticket_scores" ADD COLUMN IF NOT EXISTS "escalationReason" TEXT`,
   `ALTER TABLE "ticket_scores" ADD COLUMN IF NOT EXISTS "customerMessages" INTEGER`,
   `ALTER TABLE "ticket_scores" ADD COLUMN IF NOT EXISTS "transcriptChars" INTEGER`,
-  // Submitted Anthropic Message Batches — persisted so polling survives restarts.
+  // Submitted Anthropic Message Batches, persisted so polling survives restarts.
   `CREATE TABLE IF NOT EXISTS "scoring_batches" (
     "id" TEXT NOT NULL,
     "anthropicBatchId" TEXT NOT NULL,
@@ -479,7 +479,7 @@ export const STATEMENTS: string[] = [
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "scoringEscalationMaxTicketsPerBatch" INTEGER NOT NULL DEFAULT 25`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "scoringEscalationLastRunAt" TIMESTAMP(3)`,
   // HashiCorp Vault connection (paired with /config → Vault). vaultToken is
-  // encrypted with the LOCAL crypto.ts key — the bootstrap credential Vault
+  // encrypted with the LOCAL crypto.ts key: the bootstrap credential Vault
   // itself can't wrap. vaultMigratedAt = storage cutover (null = Postgres).
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "vaultEnabled" BOOLEAN NOT NULL DEFAULT false`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "vaultAddr" TEXT`,
@@ -491,7 +491,7 @@ export const STATEMENTS: string[] = [
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "vaultMigratedAt" TIMESTAMP(3)`,
   // Temporal migration kill switch + connection + one-time import stamp
   // (paired with /config → Temporal; TEMPORAL_* env vars are first-boot
-  // fallbacks only — the deploy has no .env access). The mTLS client cert
+  // fallbacks only; the deploy has no .env access). The mTLS client cert
   // lives in Vault KV under the "temporal" integration entry.
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "temporalEnabled" BOOLEAN NOT NULL DEFAULT false`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "temporalAddress" TEXT`,
@@ -635,10 +635,10 @@ export const STATEMENTS: string[] = [
   )`,
   // Refund-scope fix: the Intercom unmirror gate moves from the whole billing
   // category to this per-ticket flag (only refund-flow threads stay
-  // Discord-only). The UPDATE backfills pre-flag refund threads — the refund
-  // flow always stamps question 'Refund request' — and converges to a no-op.
+  // Discord-only). The UPDATE backfills pre-flag refund threads (the refund
+  // flow always stamps question 'Refund request') and converges to a no-op.
   `ALTER TABLE "tickets" ADD COLUMN IF NOT EXISTS "intercomExempt" BOOLEAN NOT NULL DEFAULT false`,
-  // Flip stamp — must exist BEFORE the guarded backfill UPDATE below. The
+  // Flip stamp: must exist BEFORE the guarded backfill UPDATE below. The
   // IS NULL guard keeps flipped tickets (customer typed → mirrored) from
   // being re-exempted on every boot.
   `ALTER TABLE "tickets" ADD COLUMN IF NOT EXISTS "intercomExemptLiftedAt" TIMESTAMP(3)`,
@@ -698,7 +698,7 @@ export const STATEMENTS: string[] = [
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "panelTokenSecret" TEXT`,
   // Stripe-panel link/session revocation epoch. Retired with the Stripe panel; the column stays.
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "panelTokenEpoch" INTEGER NOT NULL DEFAULT 0`,
-  // Admin web-panel (/config + /intercom) revocation epoch — independent of the
+  // Admin web-panel (/config + /intercom) revocation epoch, independent of the
   // Stripe-panel epoch above ("Revoke Admin Panel Links").
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "adminPanelEpoch" INTEGER NOT NULL DEFAULT 0`,
   // Stripe dashboard (/dashboard): kill switch (default OFF), allowlist,
@@ -845,7 +845,7 @@ export const STATEMENTS: string[] = [
   `ALTER TABLE "sla_states" ADD COLUMN IF NOT EXISTS "breachTagged" BOOLEAN NOT NULL DEFAULT false`,
   `ALTER TABLE "sla_states" ADD COLUMN IF NOT EXISTS "lastEnforcedAt" TIMESTAMP(3)`,
   // Sentry feedback → Intercom import: dedup/exemption ledger + the /config
-  // knobs (team routing, no-backfill watermark, webhook secret — 7th global).
+  // knobs (team routing, no-backfill watermark, webhook secret; 7th global).
   `CREATE TABLE IF NOT EXISTS "sentry_feedback_imports" (
     "id" TEXT NOT NULL,
     "sentryIssueId" TEXT NOT NULL,
@@ -951,7 +951,7 @@ export const STATEMENTS: string[] = [
   `CREATE INDEX IF NOT EXISTS "stripe_money_out_chargeId_idx" ON "stripe_money_out"("chargeId")`,
   `CREATE INDEX IF NOT EXISTS "stripe_money_out_stripeObjectId_idx" ON "stripe_money_out"("stripeObjectId")`,
   // Descriptive segments on the dispute mirror: which plan, which card, which
-  // country, how long they had been a customer. Same rule as the ledger — ALTER
+  // country, how long they had been a customer. Same rule as the ledger: ALTER
   // rather than CREATE, because production has the table already.
   `ALTER TABLE "stripe_disputes" ADD COLUMN IF NOT EXISTS "planTier" TEXT`,
   `ALTER TABLE "stripe_disputes" ADD COLUMN IF NOT EXISTS "planPeriod" TEXT`,
@@ -978,7 +978,7 @@ export const STATEMENTS: string[] = [
   `CREATE INDEX IF NOT EXISTS "stripe_money_out_planTier_occurredAt_idx" ON "stripe_money_out"("planTier", "occurredAt")`,
   `CREATE INDEX IF NOT EXISTS "stripe_money_out_cardCountry_occurredAt_idx" ON "stripe_money_out"("cardCountry", "occurredAt")`,
   // Frozen USD conversion of the ledger amounts. The original amountMinor and
-  // currency stay exactly as they were — these are the same money in one
+  // currency stay exactly as they were; these are the same money in one
   // comparable unit, converted once at ingest with the rate kept alongside, so
   // a later revision of fx.ts cannot restate history.
   `ALTER TABLE "stripe_money_out" ADD COLUMN IF NOT EXISTS "usdMinor" INTEGER`,
@@ -1009,7 +1009,7 @@ export const STATEMENTS: string[] = [
   `ALTER TABLE "stripe_disputes" ADD COLUMN IF NOT EXISTS "fxRate" DOUBLE PRECISION`,
   `ALTER TABLE "stripe_disputes" ADD COLUMN IF NOT EXISTS "closedAtEstimated" BOOLEAN NOT NULL DEFAULT true`,
   `ALTER TABLE "stripe_disputes" ADD COLUMN IF NOT EXISTS "closedAtSource" TEXT`,
-  // Subscription lifecycle mirror — the churn half of the money analytics.
+  // Subscription lifecycle mirror: the churn half of the money analytics.
   // Keyed on the Stripe event id so the 30-day replay is idempotent.
   `CREATE TABLE IF NOT EXISTS "stripe_subscription_events" (
     "id" TEXT NOT NULL,
