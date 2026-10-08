@@ -1009,10 +1009,6 @@ export const STATEMENTS: string[] = [
   `ALTER TABLE "stripe_disputes" ADD COLUMN IF NOT EXISTS "fxRate" DOUBLE PRECISION`,
   `ALTER TABLE "stripe_disputes" ADD COLUMN IF NOT EXISTS "closedAtEstimated" BOOLEAN NOT NULL DEFAULT true`,
   `ALTER TABLE "stripe_disputes" ADD COLUMN IF NOT EXISTS "closedAtSource" TEXT`,
-  // BLOCKED / FAILED transition stamps — updatedAt is also bumped by retries, so
-  // it cannot place those outcomes in time.
-  `ALTER TABLE "dispute_auto_resolves" ADD COLUMN IF NOT EXISTS "blockedAt" TIMESTAMP(3)`,
-  `ALTER TABLE "dispute_auto_resolves" ADD COLUMN IF NOT EXISTS "failedAt" TIMESTAMP(3)`,
   // Subscription lifecycle mirror — the churn half of the money analytics.
   // Keyed on the Stripe event id so the 30-day replay is idempotent.
   `CREATE TABLE IF NOT EXISTS "stripe_subscription_events" (
@@ -1119,6 +1115,11 @@ export const STATEMENTS: string[] = [
   `CREATE INDEX IF NOT EXISTS "dispute_auto_resolves_customerId_createdAt_idx" ON "dispute_auto_resolves"("customerId", "createdAt")`,
   `CREATE INDEX IF NOT EXISTS "dispute_auto_resolves_chargeId_idx" ON "dispute_auto_resolves"("chargeId")`,
   `CREATE INDEX IF NOT EXISTS "dispute_auto_resolves_disputeId_idx" ON "dispute_auto_resolves"("disputeId")`,
+  // BLOCKED / FAILED transition stamps: updatedAt is also bumped by retries, so
+  // it cannot place those outcomes in time. After the CREATE above, or a fresh
+  // database fails here before the table exists.
+  `ALTER TABLE "dispute_auto_resolves" ADD COLUMN IF NOT EXISTS "blockedAt" TIMESTAMP(3)`,
+  `ALTER TABLE "dispute_auto_resolves" ADD COLUMN IF NOT EXISTS "failedAt" TIMESTAMP(3)`,
   // Auto-resolve knobs. Every one that can move money ships OFF.
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "disputeResolveMode" TEXT NOT NULL DEFAULT 'none'`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "disputeAutoResolveEfw" BOOLEAN NOT NULL DEFAULT false`,

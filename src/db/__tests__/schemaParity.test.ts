@@ -199,3 +199,25 @@ test("ensureSchema is idempotent by construction: every statement is re-runnable
     "every ensureSchema statement must survive being re-run on the next boot"
   );
 });
+
+test("ensureSchema never touches a table before creating it (a fresh database boots)", () => {
+  // Production's tables already exist, so an ALTER placed above its table's
+  // CREATE passes there and only fails on a fresh database, at boot, where
+  // nothing else would notice.
+  const created = new Set<string>();
+  const early: string[] = [];
+  for (const statement of STATEMENTS) {
+    const sql = statement.trim();
+    const create = /^CREATE TABLE IF NOT EXISTS "([^"]+)"/.exec(sql);
+    if (create) {
+      created.add(create[1]);
+      continue;
+    }
+    const target =
+      /^ALTER TABLE "([^"]+)"/.exec(sql)?.[1] ??
+      /^CREATE (?:UNIQUE )?INDEX IF NOT EXISTS "[^"]+" ON "([^"]+)"/.exec(sql)?.[1] ??
+      /^UPDATE "([^"]+)"/.exec(sql)?.[1];
+    if (target && !created.has(target)) early.push(sql.replace(/\s+/g, " ").slice(0, 120));
+  }
+  assert.deepEqual(early, [], "these statements run before their table's CREATE TABLE, so a fresh database fails at boot");
+});
