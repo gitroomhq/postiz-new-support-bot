@@ -142,7 +142,7 @@ Postiz sends its activation, password-reset and notification mail through [Resen
 
 Where support sees them:
 
-- the **Intercom inbox sidebar**: the main card shows one identity line (name, email, Postiz plan, Stripe subscription status) and only the warnings that are true right now (email suppressed, last email bounced/failed/spam/delayed, delinquent, blocked, open dispute, refund review or approvals pending). Everything else sits behind buttons: **Postiz Account**, **E-Mail Deliverability** (suppression status and removal for the contact, Postiz and Stripe addresses, *Check another address*, and the delivery log ten to a page, each email openable for its event timeline), **Billing** (subscriptions, charges, the refund review and approvals) and **Discord Ticket** (only for bridged conversations). The old *Open Stripe Panel* link and its web page are gone;
+- the **Intercom inbox sidebar**: the main card shows one identity line (name, email, Postiz plan, Stripe subscription status) and only the warnings that are true right now (email suppressed, last email bounced/failed/spam/delayed, delinquent, blocked, open dispute, refund review or approvals pending). Everything else sits behind buttons: **Postiz Account** (with the [AI credit reset](#ai-credit-reset)), **E-Mail Deliverability** (suppression status and removal for the contact, Postiz and Stripe addresses, *Check another address*, and the delivery log ten to a page, each email openable for its event timeline), **Billing** (subscriptions, charges, the refund review and approvals) and **Discord Ticket** (only for bridged conversations). The old *Open Stripe Panel* link and its web page are gone;
 - **`/email [address]`** in Discord: support role and admins only, checked at runtime on the command and on every button, menu and modal, with ephemeral replies. With an address it opens that address (suppression, Postiz account, delivery log with a menu to open each email); without one it opens a hub with *Look up address*;
 - the **web customer page**, *Postiz & Email* tab: linked accounts, the *Email delivery* card (the Stripe email and the owner of each linked Postiz organisation; removal takes a typed CONFIRM) and the *Delivery log* table. The customer page now has tabs (Overview, Billing, Postiz & Email, Details); the rail keeps only Insights and Manage.
 
@@ -161,6 +161,16 @@ Setup (`/config → Integrations → Resend`, or the Integrations hub of the web
 4. **Register Webhook** (needs the public URL from Billing → Stripe Webhooks): creates a webhook on the Resend team pointing at `POST <public-url>/resend/webhook` for the seven delivery events, and stores its Svix signing secret as the global secret `resendWebhookSecret` (Vault KV entry `resend`). It then imports the last month from Resend's history (a Temporal workflow, or in process when Temporal is down; each imported email carries only its last status). Pressing it again replaces the webhook. **Remove Webhook** deletes it; the log keeps what it has. Unsigned or stale deliveries get 403.
 
 Lookups are throttled to about four requests a second and cached for a minute, because Resend's limit of 10 requests a second is per team and Postiz's own sending draws on it too. The webhook uses none of that budget.
+
+### AI credit reset
+
+The sidebar's **Postiz Account** view can give an organization its AI images or AI videos for the current billing period back, through the platform's superadmin `POST /public/v1/credits/reset` (postiz-app `4c5d42a`). The platform deletes the period's usage rows, so the organization gets its full monthly allowance again; nothing undoes it.
+
+- **Who**: any teammate who can open the card.
+- **Which organization**: the *Postiz account email* field starts with the conversation's Postiz account (or the contact's email) and can be changed to any address. On every press the bot resolves the address on the platform: only accounts whose email is exactly that address count, deleted users and organizations are skipped, and an address in more than one organization is refused rather than guessed. The confirm step names the organization (name and id); the reset itself re-resolves the address and refuses when it no longer points at the organization that was confirmed. The request names the organization in `x-postiz-org`; without it the route would reset the bot's own organization.
+- **Repeats**: every reset is recorded (`postiz_credit_resets`: organization, kind, the email entered, how many credits came back, who, which conversation). The confirm step shows the last reset of the same kind for that organization and flags it with a warning when it is under 31 days old, but still allows the reset.
+- **Trail**: an internal note on the conversation, an audit channel entry, and the record above.
+- **Needs**: the Postiz lookup (`/config → Integrations → Postiz`: base URL, superadmin API key, Enabled). With it off the section is not shown. A platform older than `4c5d42a` answers 404, which the card reports as needing a platform update; an organization without a subscription is reported as having no plan credits to reset.
 
 ### Dispute verdict: fight or accept
 
