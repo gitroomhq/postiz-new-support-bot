@@ -53,6 +53,8 @@ import { SlaService } from "./sla/SlaService";
 import { PostizClient } from "./postiz/PostizClient";
 import { PostizIdentityService } from "./postiz/PostizIdentityService";
 import { PostizOrgLinkStore } from "./postiz/PostizOrgLinkStore";
+import { PostizCreditService } from "./postiz/PostizCreditService";
+import { PostizCreditResetStore } from "./postiz/PostizCreditResetStore";
 import { PostizDriftService } from "./postiz/PostizDriftService";
 import { SentryFeedbackClient } from "./sentry/SentryFeedbackClient";
 import { SentryFeedbackStore } from "./sentry/SentryFeedbackStore";
@@ -583,6 +585,9 @@ async function main() {
   const postizClient = new PostizClient(settingsStore);
   const postizIdentity = new PostizIdentityService(postizClient, settingsStore, sessionStore);
   const postizOrgLinks = new PostizOrgLinkStore(prisma);
+  // AI credit reset from the sidebar's Postiz view (superadmin platform route,
+  // recorded so the next reset shows the last).
+  const postizCredits = new PostizCreditService(postizClient, settingsStore, new PostizCreditResetStore(prisma), auditLogger);
 
   // Resend, the provider Postiz sends its mail through: support can see when
   // an address is on the suppression list (so Postiz mail silently never
@@ -622,7 +627,8 @@ async function main() {
     postizIdentity,
     emailDelivery,
     intercomNoteWriter,
-    deliveryLog
+    deliveryLog,
+    postizCredits
   );
   intercomInboxApp.bindBadgeSources({ disputes: disputeStore, blocks: blockStore });
 

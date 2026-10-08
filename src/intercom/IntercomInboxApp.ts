@@ -9,7 +9,9 @@ import { IntercomStore } from "./IntercomStore";
 import type { BillingActionService } from "../bot/billing/actions/BillingActionService";
 import type { ActionActor } from "../bot/billing/actions/ActionRegistry";
 import type { PostizIdentityService } from "../postiz/PostizIdentityService";
-import type { PostizAccount } from "../postiz/PostizClient";
+import { isPostizCreditType, type PostizAccount, type PostizCreditType } from "../postiz/PostizClient";
+import { CREDIT_LABELS, describeTarget, orgLabel, type PostizCreditService } from "../postiz/PostizCreditService";
+import type { PostizCreditResetRow } from "../postiz/PostizCreditResetStore";
 import type { IntercomClient } from "./IntercomClient";
 import {
   EMAIL_RE,
@@ -24,8 +26,8 @@ import type { DisputeStore } from "../bot/billing/DisputeStore";
 import type { BlockStore } from "../bot/billing/BlockStore";
 
 // Canvas Kit inbox app: renders a live context card in the Intercom inbox
-// sidebar. Everything is fetched at render time (plan, charges, ticket state)
-// — nothing can go stale. Intercom's canvas response window is short, so each
+// sidebar. Everything is fetched at render time (plan, charges, ticket state),
+// so nothing can go stale. Intercom's canvas response window is short, so each
 // external fetch is time-boxed; degraded rows say "unavailable" instead of
 // failing the whole card.
 //
@@ -33,8 +35,8 @@ import type { BlockStore } from "../bot/billing/BlockStore";
 // identity line) and warnings that are true right now (email suppressed or
 // bouncing, delinquent, blocked, open dispute, refund review or approvals
 // waiting). Everything else sits behind a button, each opening its own view
-// with a Back: Postiz Account, E-Mail Deliverability (suppression status and
-// removal, the delivery log), Billing (subscriptions, charges, the refund
+// with a Back: Postiz Account (plus the AI credit reset), E-Mail
+// Deliverability (suppression status and removal, the delivery log), Billing (subscriptions, charges, the refund
 // review and approvals), Discord Ticket. Which view is open travels in the
 // component ids only; the server re-derives everything else on every press.
 // The submit body's `admin` object is the authentic clicker.
@@ -85,6 +87,19 @@ interface EmailView {
   openEmailId?: string;
 }
 
+// The AI credit reset in the Postiz view. Like EmailView it travels only in
+// component ids and the email input: the organization is re-resolved from the
+// typed address on every press, never read back from the client.
+interface CreditsView {
+  // What the email field shows; absent means "prefill from the conversation".
+  email?: string;
+  // A reset awaiting "yes": which kind, for which resolved organization.
+  confirm?: { type: PostizCreditType; orgId: string; orgName: string | null; last: PostizCreditResetRow | null };
+}
+
+// A reset of the same kind this recent is called out on the confirm step.
+const RECENT_RESET_DAYS = 31;
+
 // Everything the card knows about who this conversation is with, resolved
 // once per render or press.
 interface CanvasContext {
@@ -120,7 +135,7 @@ export class IntercomInboxApp {
     private categoryLabelResolver: (id: string | null) => string | null,
     private billingActions: BillingActionService,
     // Reads the contact behind a conversation this bot did not create (email,
-    // website, Sentry feedback) — those have no Discord link to read from.
+    // website, Sentry feedback): those have no Discord link to read from.
     private intercomClient?: IntercomClient,
     // Optional: the card degrades to the identity stamped on the ticket when
     // the platform lookup is off or unconfigured.
@@ -132,7 +147,10 @@ export class IntercomInboxApp {
     // executor's echo-safe path). Best effort: the removal is audited anyway.
     private noteWriter?: ((conversationId: string, text: string) => Promise<void>) | null,
     // The Resend delivery log (what happened to each email sent to them).
-    private deliveryLog?: DeliveryLogService | null
+    private deliveryLog?: DeliveryLogService | null,
+    // The AI credit reset. Absent, or the Postiz lookup off, the section is
+    // simply not rendered.
+    private postizCredits?: PostizCreditService | null
   ) {}
 
   // Local mirrors behind the main view's "open dispute" and "blocked" warnings.
@@ -180,6 +198,9 @@ export class IntercomInboxApp {
       }
       if (componentId.startsWith("email_")) {
         return await this.handleEmailComponent(body, request, componentId, String(conversationId), actor);
+      }
+      if (componentId.startsWith("credits_")) {
+        return await this.handleCreditsComponent(body, request, componentId, String(conversationId), actor);
       }
       if (componentId.startsWith("appr_ok:") || componentId.startsWith("appr_no:")) {
         const decision = componentId.startsWith("appr_ok:") ? "approve" : "reject";
@@ -288,7 +309,13 @@ export class IntercomInboxApp {
     return ctx.addresses;
   }
 
-  private async buildCanvas(body: unknown, notice?: string, emailView: EmailView = {}, view: View = "home"): Promise<object> {
+  private async buildCanvas(
+    body: unknown,
+    notice?: string,
+    emailView: EmailView = {},
+    view: View = "home",
+    creditsView: CreditsView = {}
+  ): Promise<object> {
     const request = body as CanvasRequestBody;
     const conversationId = request?.conversation?.id ?? request?.context?.conversation_id;
     if (conversationId == null) return canvas([text("No conversation context.")]);
@@ -299,7 +326,7 @@ export class IntercomInboxApp {
 
     switch (view) {
       case "postiz":
-        components.push(...(await this.postizView(ctx)));
+        components.push(...(await this.postizView(ctx)), ...this.creditsSection(ctx, creditsView));
         break;
       case "email":
         components.push(...(await this.emailView(ctx, emailView)));
@@ -444,7 +471,7 @@ export class IntercomInboxApp {
 
   // Guardrail-blocked refund awaiting review: amount/charge/reason rows +
   // Approve/Deny. Agents route through the approval queue; configured admins
-  // execute directly (BillingActionService decides — these buttons only
+  // execute directly (BillingActionService decides; these buttons only
   // render the entry point).
   private async chargeReviewSection(ticketThreadId: string): Promise<CanvasComponent[]> {
     const review = await this.sessionStore.getPendingChargeReview(ticketThreadId).catch(() => null);
@@ -473,7 +500,7 @@ export class IntercomInboxApp {
   }
 
   // Pending billing-action approvals for THIS conversation (max 3 rendered;
-  // the panel shows the rest). Approve/Reject act via BillingActionService —
+  // the panel shows the rest). Approve/Reject act via BillingActionService:
   // non-admin clicks come back with a clear refusal notice.
   private async approvalsSection(conversationId: string): Promise<CanvasComponent[]> {
     const pending = await this.billingActions.pendingForConversation(conversationId, 4).catch(() => []);
@@ -594,6 +621,98 @@ export class IntercomInboxApp {
     }
     components.push(dataRow("Live lookup", this.postizIdentity ? "unavailable" : "not configured"));
     return components;
+  }
+
+  // ---- AI credit reset (Postiz platform) ----
+
+  // Prefilled with who this conversation resolved to; the teammate can point
+  // it at any other account. What the reset will hit is only ever shown after
+  // the server resolved the typed address (the confirm step).
+  private creditsSection(ctx: CanvasContext, view: CreditsView): CanvasComponent[] {
+    if (!this.postizCredits?.enabled()) return [];
+    const email = view.email ?? ctx.account?.email ?? ctx.nativeContact?.email ?? "";
+    const components: CanvasComponent[] = [
+      divider(),
+      header("✨ AI credits"),
+      text("Gives the organization its AI images or videos for this billing period back. It cannot be undone."),
+      {
+        type: "input",
+        id: "credits_email",
+        label: "Postiz account email",
+        placeholder: "customer@example.com",
+        ...(email ? { value: email } : {}),
+      },
+    ];
+    if (!view.confirm) {
+      components.push(
+        button("credits_ask:ai_images", "Reset AI image credits", "secondary"),
+        button("credits_ask:ai_videos", "Reset AI video credits", "secondary")
+      );
+      return components;
+    }
+    const { type, orgId, orgName, last } = view.confirm;
+    const label = CREDIT_LABELS[type];
+    components.push(
+      text(`Reset ${label} credits for ${orgLabel({ orgId, orgName })}? Everything generated this billing period stops counting against the plan.`),
+      last ? lastResetLine(last) : text(`No earlier ${label} credit reset is recorded for this organization.`),
+      button(`credits_do:${type}:${orgId}`, `Yes, reset ${label} credits`, "primary"),
+      button("credits_cancel", "Cancel", "secondary")
+    );
+    return components;
+  }
+
+  // Every credits_* press. Which organization is re-derived from the typed
+  // address on every press; the id in "credits_do" is only what the teammate
+  // confirmed, and the reset refuses when the address resolves elsewhere now.
+  private async handleCreditsComponent(
+    body: unknown,
+    request: CanvasRequestBody,
+    componentId: string,
+    conversationId: string,
+    actor: ActionActor
+  ): Promise<object> {
+    const svc = this.postizCredits;
+    const typed = typeof request.input_values?.["credits_email"] === "string" ? String(request.input_values["credits_email"]).trim() : "";
+    const inPostiz = (notice: string | undefined, view: CreditsView = { email: typed }) =>
+      this.buildCanvas(body, notice, {}, "postiz", view);
+    if (!svc?.enabled()) return inPostiz("⚠️ The Postiz lookup is off or not configured (/config → Integrations → Postiz).");
+
+    if (componentId.startsWith("credits_ask:")) {
+      const type = componentId.slice("credits_ask:".length);
+      if (!isPostizCreditType(type)) return inPostiz(undefined);
+      const target = await timeBox(svc.target(typed), FETCH_TIMEOUT_MS).catch(() => null);
+      if (!target) return inPostiz("⏳ Postiz did not answer in time. Try again.");
+      if (target.kind !== "one") return inPostiz(`⚠️ ${describeTarget(target, typed)}`);
+      const last = await svc.lastReset(target.orgId, type);
+      return inPostiz(undefined, { email: typed, confirm: { type, orgId: target.orgId, orgName: target.orgName, last } });
+    }
+
+    if (componentId.startsWith("credits_do:")) {
+      const rest = componentId.slice("credits_do:".length);
+      const split = rest.indexOf(":");
+      const type = split > 0 ? rest.slice(0, split) : "";
+      const orgId = split > 0 ? rest.slice(split + 1) : "";
+      if (!isPostizCreditType(type) || !orgId) return inPostiz(undefined);
+      const label = CREDIT_LABELS[type];
+      // The note is chained to the reset itself, not to this wait: a reset
+      // that outlives the response window still leaves its note.
+      const run = svc.reset({ email: typed, type, expectOrgId: orgId, actor: { id: actor.id, name: actor.name }, conversationId }).then((outcome) => {
+        if (outcome.ok) {
+          void this.noteWriter?.(
+            conversationId,
+            `${actor.name} reset the ${label} credits of ${orgLabel(outcome)} for this billing period${restoredText(outcome.restored)}.`
+          ).catch((e) => this.log.warn("credit reset note failed", { error: e instanceof Error ? e.message : String(e) }));
+        }
+        return outcome;
+      });
+      const outcome = await timeBox(run, ACTION_TIMEOUT_MS).catch(() => null);
+      if (!outcome) return inPostiz("⏳ Still processing. Press Refresh in a few seconds.");
+      if (!outcome.ok) return inPostiz(`⚠️ ${outcome.error}`);
+      return inPostiz(`✅ Reset the ${label} credits of ${orgLabel(outcome)}${restoredText(outcome.restored)}.`);
+    }
+
+    // credits_cancel, and any stale id: back to the buttons, field kept.
+    return inPostiz(undefined);
   }
 
   // ---- email delivery (Resend suppression list) ----
@@ -911,6 +1030,21 @@ function subscriptionSummary(subs: Stripe.Subscription[]): string {
   return [...counts.entries()].map(([status, n]) => (n > 1 ? `${n} ${status}` : status)).join(", ");
 }
 
+// ": 14 credits restored", or nothing when the platform did not say.
+function restoredText(restored: number | null): string {
+  if (restored == null) return "";
+  return `: ${restored} credit${restored === 1 ? "" : "s"} restored`;
+}
+
+// The confirm step's record of the last reset of the same kind, flagged when
+// it is recent enough that this one is probably a repeat.
+function lastResetLine(last: PostizCreditResetRow): CanvasComponent {
+  const days = Math.max(0, Math.floor((Date.now() - last.createdAt.getTime()) / (24 * 60 * 60 * 1000)));
+  const when = days === 0 ? "today" : days === 1 ? "yesterday" : `${days} days ago`;
+  const line = `Last reset ${when} (${logWhen(last.createdAt)} UTC) by ${last.actorName}${restoredText(last.restored)}.`;
+  return days < RECENT_RESET_DAYS ? { type: "text", text: `⚠️ ${line}`, style: "paragraph" } : text(line);
+}
+
 function logWhen(d: Date): string {
   return d.toISOString().slice(0, 16).replace("T", " ");
 }
@@ -935,7 +1069,7 @@ function text(textValue: string): CanvasComponent {
 }
 
 function dataRow(label: string, value: string): CanvasComponent {
-  // Canvas Kit bold is SINGLE-asterisk (like header() above) — `**x**` renders
+  // Canvas Kit bold is SINGLE-asterisk (like header() above): `**x**` renders
   // as a bold x wrapped in literal asterisks.
   return { type: "text", text: `*${label}:* ${value}`, style: "paragraph" };
 }
