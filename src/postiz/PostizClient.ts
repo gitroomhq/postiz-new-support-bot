@@ -20,7 +20,11 @@ export class PostizHttpError extends Error {
   constructor(
     public status: number,
     message: string,
-    public retryAfterSeconds?: number
+    public retryAfterSeconds?: number,
+    // The platform's own answer, trimmed. Several distinct failures share a
+    // status (a 404 can mean "no subscription", "no such organization" or "no
+    // such route"), and only the body tells them apart.
+    public body?: string
   ) {
     super(message);
   }
@@ -29,6 +33,15 @@ export class PostizHttpError extends Error {
 // Thrown before any request goes out, for input the endpoint would happily
 // answer with far too much data.
 export class PostizQueryError extends Error {}
+
+// The AI credit kinds the platform meters per billing period, spelled as its
+// ResetCreditsDto accepts them.
+export const POSTIZ_CREDIT_TYPES = ["ai_images", "ai_videos"] as const;
+export type PostizCreditType = (typeof POSTIZ_CREDIT_TYPES)[number];
+
+export function isPostizCreditType(v: unknown): v is PostizCreditType {
+  return typeof v === "string" && (POSTIZ_CREDIT_TYPES as readonly string[]).includes(v);
+}
 
 // One user's membership of one organization. The platform returns a
 // userOrganization row, so a user in two orgs comes back twice.
@@ -57,7 +70,7 @@ export interface PostizAccount {
   orgDeletedAt: string | null;
   userDeletedAt: string | null;
   userActivated: boolean | null;
-  // Login provider ("LOCAL", "GOOGLE", …) — support context for "I can't sign in".
+  // Login provider ("LOCAL", "GOOGLE", …): support context for "I can't sign in".
   userProvider: string | null;
   // Platform-side subscription facts, for cross-checking against Stripe.
   subIdentifier: string | null;
@@ -108,9 +121,10 @@ function nullableBool(v: boolean | undefined): boolean | null {
   return typeof v === "boolean" ? v : null;
 }
 
-// Read-only client for the Postiz platform's superadmin search
-// (GET /public/v1/users?name=…). Auth is the raw org API key in the
-// Authorization header — no "Bearer" prefix — and the platform additionally
+// Client for the Postiz platform's superadmin routes: the user search
+// (GET /public/v1/users?name=…), read-only, and the AI credit reset, its one
+// write (POST /public/v1/credits/reset). Auth is the raw org API key in the
+// Authorization header (no "Bearer" prefix), and the platform additionally
 // requires that org to contain a superadmin user and to hold a subscription.
 // Both of those failures surface as 401/403, so `configured` and `reachable`
 // are deliberately different questions.
@@ -136,7 +150,7 @@ export class PostizClient {
     return key;
   }
 
-  /** Drop cached answers — call after the key or base URL changes. */
+  /** Drop cached answers. Call after the key or base URL changes. */
   clearCache(): void {
     this.cache.clear();
   }
@@ -144,8 +158,8 @@ export class PostizClient {
   // Cache key. Case is PRESERVED on purpose: the endpoint's name/email branches
   // match case-insensitively, but its id branches (Stripe customer id,
   // subscription identifier, channel id, post id) match with `equals`, which is
-  // case-sensitive. Folding case would let two different ids — a base62
-  // uniqueId differing only in capitalisation, say — collide on one entry and
+  // case-sensitive. Folding case would let two different ids (a base62
+  // uniqueId differing only in capitalisation, say) collide on one entry and
   // hand back the wrong organisation. The only cost of keeping case is a
   // duplicate entry for a differently-typed email, which is never a wrong answer.
   private static normalize(query: string): string {
@@ -216,6 +230,27 @@ export class PostizClient {
     return accounts[0];
   }
 
+  // Gives an organization its AI credits of one kind back for the current
+  // billing period (POST /public/v1/credits/reset). The platform deletes the
+  // period's usage rows and answers how many it deleted; null when it does not
+  // say.
+  //
+  // The endpoint acts on the CALLING organization unless `x-postiz-org` names
+  // another, so the header is not optional here: without it the reset would
+  // land on the bot's own superadmin org and still report success.
+  async resetCredits(orgId: string, type: PostizCreditType): Promise<{ deleted: number | null }> {
+    const target = orgId.trim();
+    if (!target) throw new PostizQueryError("No organization to reset credits for.");
+    if (!isPostizCreditType(type)) throw new PostizQueryError(`Unknown credit type: ${String(type)}`);
+    const out = await this.request<{ deleted?: unknown } | null>("/public/v1/credits/reset", "credit reset", {
+      method: "POST",
+      headers: { "x-postiz-org": target, "Content-Type": "application/json" },
+      body: JSON.stringify({ type }),
+    });
+    const deleted = out?.deleted;
+    return { deleted: typeof deleted === "number" && Number.isSafeInteger(deleted) && deleted >= 0 ? deleted : null };
+  }
+
   // Connectivity self-test for the /config panel: distinguishes the three gates
   // that all otherwise fail silently (key valid, org has a superadmin, org has
   // a subscription).
@@ -251,14 +286,21 @@ export class PostizClient {
     this.cache.set(key, { at: Date.now(), result });
   }
 
-  private async request<T>(pathAndQuery: string, what: string): Promise<T> {
+  private async request<T>(
+    pathAndQuery: string,
+    what: string,
+    init: { method?: "GET" | "POST"; headers?: Record<string, string>; body?: string } = {}
+  ): Promise<T> {
     const res = await fetch(`${this.baseUrl()}${pathAndQuery}`, {
+      method: init.method ?? "GET",
       headers: {
-        // The platform's public auth middleware reads the key RAW — a "Bearer "
+        // The platform's public auth middleware reads the key RAW: a "Bearer "
         // prefix makes it look like an unknown key and 401s.
         Authorization: this.apiKey(),
         Accept: "application/json",
+        ...init.headers,
       },
+      ...(init.body !== undefined ? { body: init.body } : {}),
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
     if (!res.ok) {
@@ -267,7 +309,8 @@ export class PostizClient {
       throw new PostizHttpError(
         res.status,
         `Postiz ${what}: HTTP ${res.status}${text ? `: ${text.slice(0, 300)}` : ""}`,
-        retryAfter
+        retryAfter,
+        text.slice(0, 300)
       );
     }
     return (await res.json()) as T;

@@ -1611,3 +1611,22 @@ model ResendEmailEvent {
   @@index([occurredAt])
   @@map("resend_email_events")
 }
+
+// AI credit resets support made from the Intercom sidebar. The platform keeps
+// no trace of a reset (it deletes the period's usage rows), so this ledger is
+// how the next teammate sees the last one before resetting again.
+model PostizCreditReset {
+  id             String   @id @default(cuid())
+  orgId          String
+  orgName        String?
+  creditType     String // "ai_images" | "ai_videos"
+  email          String // the address the teammate entered
+  restored       Int? // usage rows the platform deleted; null when it did not say
+  actorId        String
+  actorName      String
+  conversationId String?
+  createdAt      DateTime @default(now())
+
+  @@index([orgId, creditType, createdAt])
+  @@map("postiz_credit_resets")
+}

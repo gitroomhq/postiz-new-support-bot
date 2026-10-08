@@ -6,7 +6,7 @@ const schemaLog = log.child("schema");
 
 // Expected columns per table (DB table name → column names), hand-maintained to
 // mirror prisma/schema.prisma + src/db/ensureSchema.ts. This is the third place a
-// reviewer touches when adding a Prisma field — and that is the point: a column
+// reviewer touches when adding a Prisma field, and that is the point: a column
 // listed here but MISSING from the live database means an ensureSchema mirror was
 // forgotten, which would break the no-CLI deploy at runtime. The check runs after
 // ensureSchema on boot and is non-fatal by default (see verifySchema).
@@ -182,6 +182,9 @@ export const EXPECTED_COLUMNS: Record<string, string[]> = {
   ],
   resend_email_events: ["id", "emailId", "type", "occurredAt", "detail"],
   postiz_org_links: ["id", "orgId", "stripeCustomerId", "firstSeenAt", "lastSeenAt", "observations"],
+  postiz_credit_resets: [
+    "id", "orgId", "orgName", "creditType", "email", "restored", "actorId", "actorName", "conversationId", "createdAt",
+  ],
   forwarded_email_converts: [
     "id", "originalConversationId", "newConversationId", "forwarderAdminId", "forwarderEmail", "customerEmail",
     "customerName", "intercomContactId", "contactRole", "trigger", "actorLabel", "attachmentsCount",

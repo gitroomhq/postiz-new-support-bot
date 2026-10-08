@@ -1237,6 +1237,22 @@ export const STATEMENTS: string[] = [
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "resolveOnCloseEnabled" BOOLEAN NOT NULL DEFAULT true`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "resolveOnCloseStateId" TEXT`,
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "resolveOnCloseBackfilledAt" TIMESTAMP(3)`,
+  // AI credit resets from the Intercom sidebar (the record behind the
+  // confirm step's "last reset" line).
+  `CREATE TABLE IF NOT EXISTS "postiz_credit_resets" (
+    "id" TEXT NOT NULL,
+    "orgId" TEXT NOT NULL,
+    "orgName" TEXT,
+    "creditType" TEXT NOT NULL,
+    "email" TEXT NOT NULL,
+    "restored" INTEGER,
+    "actorId" TEXT NOT NULL,
+    "actorName" TEXT NOT NULL,
+    "conversationId" TEXT,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT "postiz_credit_resets_pkey" PRIMARY KEY ("id")
+  )`,
+  `CREATE INDEX IF NOT EXISTS "postiz_credit_resets_orgId_creditType_createdAt_idx" ON "postiz_credit_resets"("orgId", "creditType", "createdAt")`,
 ];
 
 export async function ensureSchema(prisma: PrismaClient): Promise<void> {
