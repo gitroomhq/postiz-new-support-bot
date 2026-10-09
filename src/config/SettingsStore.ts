@@ -314,6 +314,11 @@ export class SettingsStore {
     return this.settings.ticketCooldownMinutes;
   }
 
+  // Roles that stop their holders opening tickets from the Discord panel.
+  ticketBlockRoleIds(): string[] {
+    return (this.settings.ticketBlockRoleIds ?? "").split(",").filter(Boolean);
+  }
+
   billingAuditChannelId(): string | null {
     return this.settings.billingAuditChannelId;
   }
@@ -2038,6 +2043,13 @@ export class SettingsStore {
           ? { stripeWebhookSecret: await this.routeSecretWrite("stripeWebhookSecret", stripeWebhookSecret) }
           : {}),
       },
+    });
+  }
+
+  async updateTicketBlockRoleIds(roleIds: string[]): Promise<void> {
+    this.settings = await this.prisma.botSettings.update({
+      where: { id: "global" },
+      data: { ticketBlockRoleIds: roleIds.join(",") },
     });
   }
 

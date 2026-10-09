@@ -82,6 +82,19 @@ import type { StripeSegmentResolver } from "./billing/StripeSegmentResolver";
 import type { BlockKind } from "./billing/BlockStore";
 import { TICKET_ATTR_CSAT, TICKET_ATTR_CSAT_COMMENT, TICKET_ATTR_THREAD } from "../intercom/IntercomEventExecutor";
 import { CUSTOMER_REPLY_ACTOR } from "../intercom/replyState";
+import {
+  MAX_TICKET_BLOCK_ROLES,
+  TICKET_BLOCKED_MESSAGE,
+  TICKET_BLOCK_ACTOR,
+  TICKET_BLOCK_CLOSE_NOTE,
+  TICKET_BLOCK_UNVERIFIED_MESSAGE,
+  TICKET_UNBLOCK_ACTOR,
+  TICKET_UNBLOCK_REOPEN_NOTE,
+  auditShowsBlockRoleAdded,
+  blockTransition,
+  isTicketBlocked,
+  validateBlockRoleSelection,
+} from "./ticketBlock";
 import { IntercomMode, IntercomRegion } from "../config/SettingsStore";
 import {
   buildActionLevelsPanel,
@@ -346,6 +359,18 @@ export class DiscordBot {
       this.handleMemberLeave(member).catch((e) => this.reportHandlerError("guildMemberRemove", e));
     });
 
+    // Ticket blocks: a block role added closes the member's open tickets, its
+    // removal reopens the ones the block closed. An uncached member's update
+    // arrives as guildMemberAvailable, with no earlier roles to compare.
+    this.client.on("guildMemberUpdate", (oldMember, newMember) => {
+      this.handleMemberBlockChange(oldMember, newMember).catch((e) => this.reportHandlerError("guildMemberUpdate", e));
+    });
+
+    this.client.on("guildMemberAvailable", (member) => {
+      if (member.partial) return; // the GuildMember partial is off, so never in practice
+      this.handleMemberBlockChange(null, member).catch((e) => this.reportHandlerError("guildMemberAvailable", e));
+    });
+
     this.client.on("messageCreate", (message) => {
       this.handleMessage(message).catch((e) => this.reportHandlerError("messageCreate", e));
     });
@@ -427,6 +452,136 @@ export class DiscordBot {
       safe(this.intercomSync.onTicketNote(ticket.threadId, MEMBER_LEFT_NOTE), "intercom-sync", {
         "ticket.thread_id": ticket.threadId,
         "sync.event": "member_left_note",
+      });
+    }
+  }
+
+  // ---- Ticket blocks ----
+
+  // Getting a block role closes the member's open tickets, losing it reopens the
+  // tickets the block closed. Only role changes count: picking a role in
+  // /config closes nothing by itself.
+  private async handleMemberBlockChange(
+    before: GuildMember | PartialGuildMember | null,
+    member: GuildMember
+  ): Promise<void> {
+    const blockRoleIds = this.settingsStore.ticketBlockRoleIds();
+    if (blockRoleIds.length === 0 || member.user.bot) return;
+    // Role ids are global, so a guild holding none of the block roles is not the
+    // support server, and an "unblock" there must not reopen anything.
+    if (!blockRoleIds.some((id) => member.guild.roles.cache.has(id))) return;
+
+    const after = this.isMemberTicketBlocked(member, blockRoleIds);
+    const prior = before && !before.partial ? this.isMemberTicketBlocked(before, blockRoleIds) : null;
+    const roleJustAdded = prior === null && after ? await this.blockRoleJustAdded(member, blockRoleIds) : false;
+    const transition = blockTransition(prior, after, roleJustAdded);
+    if (transition === "none") return;
+
+    if (transition === "block") {
+      const closingTag = this.settingsStore.closingTag();
+      if (!closingTag) return;
+      const tickets = await this.ticketStore.listOpenByCustomerId(member.id);
+      if (tickets.length === 0) return;
+      await withDiscordSpan(
+        {
+          op: "discord.event",
+          name: "member.ticket_block",
+          userId: member.id,
+          guildId: member.guild.id,
+          attributes: { "tickets.count": tickets.length },
+        },
+        () => this.closeTicketsForBlocked(tickets, closingTag)
+      );
+      return;
+    }
+
+    const initialTag = this.settingsStore.initialTag();
+    if (!initialTag) return;
+    const tickets = await this.ticketStore.listBlockClosedByCustomerId(member.id);
+    if (tickets.length === 0) return;
+    await withDiscordSpan(
+      {
+        op: "discord.event",
+        name: "member.ticket_unblock",
+        userId: member.id,
+        guildId: member.guild.id,
+        attributes: { "tickets.count": tickets.length },
+      },
+      () => this.reopenTicketsForUnblocked(tickets, initialTag)
+    );
+  }
+
+  private isMemberTicketBlocked(member: GuildMember, blockRoleIds: string[]): boolean {
+    return isTicketBlocked(member.roles.cache.keys(), blockRoleIds, this.isStaffMember(member));
+  }
+
+  // An uncached member's update carries no earlier roles, so the audit log says
+  // whether a block role was the change. Unreadable (no View Audit Log): treated
+  // as not added, because closing tickets is the visible, disruptive side.
+  private async blockRoleJustAdded(member: GuildMember, blockRoleIds: string[]): Promise<boolean> {
+    // The audit entry can land a moment after the gateway event.
+    await new Promise((resolve) => setTimeout(resolve, 2_000));
+    try {
+      const logs = await member.guild.fetchAuditLogs({ type: AuditLogEvent.MemberRoleUpdate, limit: 50 });
+      return auditShowsBlockRoleAdded(logs.entries.values(), member.id, blockRoleIds, Date.now());
+    } catch (error) {
+      this.discordLog.warn("ticket block: could not read audit log, leaving open tickets alone", {
+        "discord.user_id": member.id,
+        "error.message": error instanceof Error ? error.message : String(error),
+      });
+      return false;
+    }
+  }
+
+  // Same shape as the member-leave close: silent (no notice, no CSAT), with an
+  // Intercom note saying why. Each ticket is stamped first (single-winner), so
+  // lifting the block reopens exactly these.
+  private async closeTicketsForBlocked(tickets: TicketWithTag[], closingTag: StatusTag): Promise<void> {
+    for (const ticket of tickets) {
+      if (!(await this.ticketStore.claimBlockClose(ticket.threadId))) continue;
+      try {
+        const channel = await this.client.channels.fetch(ticket.threadId).catch(() => null);
+        if (channel?.isThread()) {
+          await this.statusService.applyStatus(channel as ThreadChannel, ticket, closingTag, {
+            actorName: TICKET_BLOCK_ACTOR,
+            silent: true,
+          });
+        } else {
+          // Thread is gone/unreachable: still reconcile the DB, with the Intercom
+          // push StatusService would have made.
+          await this.ticketStore.close(ticket.threadId);
+          safe(
+            this.intercomSync.onStatusChanged(ticket.threadId, ticket.statusTag ?? null, closingTag, TICKET_BLOCK_ACTOR),
+            "intercom-sync",
+            { "ticket.thread_id": ticket.threadId, "sync.event": "status_changed" }
+          );
+        }
+      } catch (error) {
+        await this.ticketStore.releaseBlockClose(ticket.threadId).catch(() => {});
+        this.discordLog.error("ticket block close failed", error, { "ticket.thread_id": ticket.threadId });
+        continue;
+      }
+      safe(this.intercomSync.onTicketNote(ticket.threadId, TICKET_BLOCK_CLOSE_NOTE), "intercom-sync", {
+        "ticket.thread_id": ticket.threadId,
+        "sync.event": "ticket_block_note",
+      });
+    }
+  }
+
+  // Reopens to the initial status, silently, with an Intercom note. A ticket
+  // whose thread is gone can't be reopened: its stamp is just dropped.
+  private async reopenTicketsForUnblocked(tickets: TicketWithTag[], initialTag: StatusTag): Promise<void> {
+    for (const ticket of tickets) {
+      if (!(await this.ticketStore.releaseBlockClose(ticket.threadId))) continue;
+      const channel = await this.client.channels.fetch(ticket.threadId).catch(() => null);
+      if (!channel?.isThread()) continue;
+      await this.statusService.applyStatus(channel as ThreadChannel, ticket, initialTag, {
+        actorName: TICKET_UNBLOCK_ACTOR,
+        silent: true,
+      });
+      safe(this.intercomSync.onTicketNote(ticket.threadId, TICKET_UNBLOCK_REOPEN_NOTE), "intercom-sync", {
+        "ticket.thread_id": ticket.threadId,
+        "sync.event": "ticket_unblock_note",
       });
     }
   }
@@ -1447,6 +1602,14 @@ export class DiscordBot {
 
     if (interaction.customId !== "start_here") return;
 
+    // Ticket blocks are checked before the Postiz login, so a blocked member is
+    // not sent through OAuth for nothing. Ticket creation checks again.
+    const blocked = await this.ticketBlockReason(interaction.user.id, interaction.guild, "start");
+    if (blocked) {
+      await interaction.reply({ embeds: [makeEmbed(blocked, COLORS.warn)], flags: 64 });
+      return;
+    }
+
     // Not logged in → prompt login
     if (!(await this.sessionStore.isAuthenticated(interaction.user.id))) {
       const authUrl = await this.oauthManager.generateAuthUrl(
@@ -1575,9 +1738,27 @@ export class DiscordBot {
     };
   }
 
-  // Per-user ticket rate limits: open-ticket cap + creation cooldown, both configurable
-  // (0 = off). Staff are exempt. Returns the customer-facing rejection, or null to allow.
+  // Ticket blocks: the customer-facing refusal for a member holding a block role
+  // (staff exempt), or null. Runs at Start Here and again right before a ticket
+  // is created, so a role added mid-flow still stops it.
+  private async ticketBlockReason(userId: string, guild: Guild | null, stage: "start" | "create"): Promise<string | null> {
+    const blockRoleIds = this.settingsStore.ticketBlockRoleIds();
+    if (blockRoleIds.length === 0) return null;
+    const member = guild ? await guild.members.fetch(userId).catch(() => null) : null;
+    if (!member) return TICKET_BLOCK_UNVERIFIED_MESSAGE;
+    if (!this.isMemberTicketBlocked(member, blockRoleIds)) return null;
+    log.child("ticket").info("ticket.blocked", { "ticket.customer_id": userId, "ticket.block_stage": stage });
+    metricCount("tickets.blocked", 1, { stage });
+    return TICKET_BLOCKED_MESSAGE;
+  }
+
+  // Per-user ticket gates: ticket blocks first, then the rate limits (open-ticket
+  // cap + creation cooldown, both configurable, 0 = off). Staff are exempt from
+  // all of them. Returns the customer-facing rejection, or null to allow.
   private async ticketCreationBlockReason(userId: string, guild: Guild | null): Promise<string | null> {
+    const blocked = await this.ticketBlockReason(userId, guild, "create");
+    if (blocked) return blocked;
+
     const max = this.settingsStore.maxOpenTicketsPerUser();
     const cooldownMin = this.settingsStore.ticketCooldownMinutes();
     if (max <= 0 && cooldownMin <= 0) return null;
@@ -2109,6 +2290,7 @@ export class DiscordBot {
             `Threads channel: ${s.threadsChannelId() ? `<#${s.threadsChannelId()}>` : "_not set_"}`,
             `GitHub repo: ${s.githubRepo() ? `\`${s.githubRepo()}\`` : "_not set_"}`,
             `Ticket limits: ${s.maxOpenTicketsPerUser() > 0 ? `max ${s.maxOpenTicketsPerUser()} open` : "no cap"} · ${s.ticketCooldownMinutes() > 0 ? `${s.ticketCooldownMinutes()}m cooldown` : "no cooldown"}`,
+            `Ticket blocks: ${s.ticketBlockRoleIds().length ? `${s.ticketBlockRoleIds().length} role(s)` : "none"}`,
           ].join("\n"),
           inline: true,
         },
@@ -4304,6 +4486,7 @@ export class DiscordBot {
           `**Threads channel:** ${s.threadsChannelId() ? `<#${s.threadsChannelId()}>` : "_not set_"}`,
           `**GitHub repo:** ${s.githubRepo() ? `\`${s.githubRepo()}\`` : "_not set_"}`,
           `**Ticket limits:** ${s.maxOpenTicketsPerUser() > 0 ? `max ${s.maxOpenTicketsPerUser()} open` : "no cap"} · ${s.ticketCooldownMinutes() > 0 ? `${s.ticketCooldownMinutes()}m cooldown` : "no cooldown"}`,
+          `**Ticket blocks:** ${s.ticketBlockRoleIds().length ? s.ticketBlockRoleIds().map((id) => `<@&${id}>`).join(", ") : "_none_"}`,
           "",
           "Staff roles are managed under Workflow → Staff Roles.",
         ].join("\n")
@@ -4318,6 +4501,7 @@ export class DiscordBot {
     const buttons = new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder().setCustomId("config_set_repo").setLabel("Set GitHub Repo").setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId("config_limits").setLabel("Ticket Limits").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("config_ticketblock").setLabel("Ticket Blocks").setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId("config_back_main").setLabel("Back").setStyle(ButtonStyle.Secondary)
     );
 
@@ -4327,6 +4511,44 @@ export class DiscordBot {
         new ActionRowBuilder<ChannelSelectMenuBuilder>().addComponents(channelSelect),
         buttons,
       ],
+    };
+  }
+
+  // General → Ticket Blocks. Set here only: the web admin panel doesn't carry it.
+  private buildTicketBlockPanel() {
+    const roleIds = this.settingsStore.ticketBlockRoleIds();
+    const embed = new EmbedBuilder()
+      .setTitle("Ticket Blocks")
+      .setColor(0x5865f2)
+      .setDescription(
+        [
+          "Members with any of these roles can't open tickets from the Discord support panel. Staff are never blocked. Intercom Messenger and email are not affected.",
+          "",
+          "Getting a block role closes the member's open tickets silently (Intercom gets a note). Losing it reopens the tickets the block closed. Picking a role here closes nothing by itself.",
+          "",
+          `**Block roles (${roleIds.length}/${MAX_TICKET_BLOCK_ROLES}):** ${roleIds.length ? roleIds.map((id) => `<@&${id}>`).join(", ") : "_none_"}`,
+        ].join("\n")
+      );
+
+    const roleSelect = new RoleSelectMenuBuilder()
+      .setCustomId("config_ticketblock_roles")
+      .setPlaceholder("Roles that can't open tickets")
+      .setMinValues(0)
+      .setMaxValues(MAX_TICKET_BLOCK_ROLES);
+    if (roleIds.length) roleSelect.setDefaultRoles(...roleIds);
+
+    const buttons = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId("config_ticketblock_clear")
+        .setLabel("Clear Roles")
+        .setStyle(ButtonStyle.Secondary)
+        .setDisabled(roleIds.length === 0),
+      new ButtonBuilder().setCustomId("config_general").setLabel("Back").setStyle(ButtonStyle.Secondary)
+    );
+
+    return {
+      embeds: [embed],
+      components: [new ActionRowBuilder<RoleSelectMenuBuilder>().addComponents(roleSelect), buttons],
     };
   }
 
@@ -4513,6 +4735,16 @@ export class DiscordBot {
 
     if (id === "config_general") {
       await interaction.update(this.buildGeneralPanel());
+      return;
+    }
+    if (id === "config_ticketblock") {
+      await interaction.update(this.buildTicketBlockPanel());
+      return;
+    }
+    if (id === "config_ticketblock_clear") {
+      await this.settingsStore.updateTicketBlockRoleIds([]);
+      this.auditConfig(interaction, "Ticket block roles cleared");
+      await interaction.update(this.buildTicketBlockPanel());
       return;
     }
     if (id === "config_workflow") {
@@ -6800,9 +7032,33 @@ export class DiscordBot {
   }
 
   private async handleRoleSelect(interaction: RoleSelectMenuInteraction): Promise<void> {
-    if (interaction.customId !== "config_tier_add_role" && interaction.customId !== "config_disputes_urgent_role") return;
+    if (
+      interaction.customId !== "config_tier_add_role" &&
+      interaction.customId !== "config_disputes_urgent_role" &&
+      interaction.customId !== "config_ticketblock_roles"
+    )
+      return;
     if (!this.isAdmin(interaction)) {
       await interaction.reply({ embeds: [makeEmbed("Administrator permission required.", COLORS.danger)], flags: 64 });
+      return;
+    }
+    if (interaction.customId === "config_ticketblock_roles") {
+      const result = validateBlockRoleSelection(interaction.values, {
+        guildId: interaction.guildId,
+        staffRoleIds: this.tierStore.staffRoleIds(this.settingsStore.supportRoleId()),
+      });
+      if (!result.ok) {
+        // Re-render first so the menu drops the refused pick, then say why.
+        await interaction.update(this.buildTicketBlockPanel());
+        await interaction.followUp({ embeds: [makeEmbed(result.error, COLORS.danger)], flags: 64 });
+        return;
+      }
+      await this.settingsStore.updateTicketBlockRoleIds(result.roleIds);
+      this.auditConfig(
+        interaction,
+        `Ticket block roles → ${result.roleIds.length ? result.roleIds.map((id) => `<@&${id}>`).join(", ") : "none"}`
+      );
+      await interaction.update(this.buildTicketBlockPanel());
       return;
     }
     const roleId = interaction.values[0];

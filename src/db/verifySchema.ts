@@ -39,6 +39,7 @@ export const EXPECTED_COLUMNS: Record<string, string[]> = {
     "id", "threadsChannelId", "supportRoleId", "githubRepo", "aiSolveEnabled", "aiCommandsEnabled", "backfillDone",
     "reportChannelId", "reportEnabled", "reportIntervalHours", "reportHour", "reportMinute", "reportTimezone",
     "reportLastRunAt", "reportLastSnapshot", "overdueThresholdDays", "maxOpenTicketsPerUser", "ticketCooldownMinutes",
+    "ticketBlockRoleIds",
     "billingAuditChannelId", "refundMaxAmount", "refundMaxAmountCurrency", "refundMaxPer24h", "refundMinMemberAgeDays",
     "allowedPriceIds", "auditLogChannelId", "intercomMode", "intercomRegion", "intercomAccessToken",
     "intercomClientSecret", "intercomAdminId", "intercomOperatorAdminId", "intercomTicketTypeMap", "intercomTeamId",
@@ -101,7 +102,7 @@ export const EXPECTED_COLUMNS: Record<string, string[]> = {
     "escalationTierId", "lastStatusChangeAt", "lastReminderAt", "reminderCount", "remindersPaused", "closed", "closedAt",
     "recloseAt", "question", "aiAnswer", "firstResponseAt", "csatScore", "csatComment", "csatPromptedAt", "csatRatedAt",
     "createdAt", "intercomExempt", "intercomExemptLiftedAt",
-    "postizUserId", "postizOrgId", "postizTier", "postizRole", "postizLinkedAt",
+    "postizUserId", "postizOrgId", "postizTier", "postizRole", "postizLinkedAt", "blockClosedAt",
   ],
   ticket_notes: ["id", "ticketThreadId", "authorId", "authorName", "text", "createdAt"],
   ticket_tag_changes: [

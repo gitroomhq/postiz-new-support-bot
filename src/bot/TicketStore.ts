@@ -97,7 +97,11 @@ export class TicketStore {
     if (changes.closed !== undefined) data.closed = changes.closed;
     if (changes.closedAt !== undefined) data.closedAt = changes.closedAt;
     if (Object.keys(data).length === 0) return;
-    await this.prisma.ticket.update({ where: { threadId }, data });
+    // A thread found open again was reopened by hand: the block's claim on it ends.
+    await this.prisma.ticket.update({
+      where: { threadId },
+      data: { ...data, ...(changes.closed === false ? { blockClosedAt: null } : {}) },
+    });
   }
 
   // isDone: the new status closes the thread or marks it resolved. We stamp closedAt
@@ -126,7 +130,41 @@ export class TicketStore {
         // Any real status change supersedes a pending re-close: reopening cancels it,
         // closing locks the thread right away anyway.
         recloseAt: null,
+        // Any reopen ends a ticket-block close: lifting the block later must not
+        // reopen a ticket someone already handled.
+        ...(isDone ? {} : { blockClosedAt: null }),
       },
+    });
+  }
+
+  // ---- Ticket blocks ----
+
+  // Stamps an open ticket as closed by a ticket block before the close runs.
+  // Single-winner (only an open, unstamped row matches), so two role events
+  // racing for the same member close each ticket once.
+  async claimBlockClose(threadId: string): Promise<boolean> {
+    const result = await this.prisma.ticket.updateMany({
+      where: { threadId, closed: false, blockClosedAt: null },
+      data: { blockClosedAt: new Date() },
+    });
+    return result.count > 0;
+  }
+
+  // Clears the stamp: before the unblock reopen (single-winner the same way) and
+  // to undo a claim whose close failed. True when this caller cleared it.
+  async releaseBlockClose(threadId: string): Promise<boolean> {
+    const result = await this.prisma.ticket.updateMany({
+      where: { threadId, blockClosedAt: { not: null } },
+      data: { blockClosedAt: null },
+    });
+    return result.count > 0;
+  }
+
+  // A customer's tickets still closed by a ticket block (reopened when it lifts).
+  async listBlockClosedByCustomerId(customerId: string): Promise<TicketWithTag[]> {
+    return this.prisma.ticket.findMany({
+      where: { customerId, closed: true, blockClosedAt: { not: null } },
+      include: { statusTag: true },
     });
   }
 
@@ -188,7 +226,7 @@ export class TicketStore {
     });
   }
 
-  // A customer's still-open tickets (used to close them out when the member leaves).
+  // A customer's still-open tickets (closed out when the member leaves or is blocked).
   async listOpenByCustomerId(customerId: string): Promise<TicketWithTag[]> {
     return this.prisma.ticket.findMany({
       where: { customerId, closed: false },

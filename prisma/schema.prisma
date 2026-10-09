@@ -106,6 +106,10 @@ model BotSettings {
   overdueThresholdDays Int      @default(7)
   maxOpenTicketsPerUser Int     @default(3)
   ticketCooldownMinutes Int     @default(5)
+  // Discord roles whose holders can't open tickets from the Discord panel
+  // (comma-joined, the allowedPriceIds idiom; at most 10). Staff are exempt.
+  // Set in /config only: deliberately not on the web admin panel.
+  ticketBlockRoleIds  String    @default("")
   billingAuditChannelId String?
   refundMaxAmount     Int?
   refundMaxAmountCurrency String @default("usd")
@@ -701,8 +705,13 @@ model Ticket {
   csatComment         String?
   csatPromptedAt      DateTime?
   csatRatedAt         DateTime?
+  // Stamped when the bot closed this ticket because its customer got a ticket
+  // block role. Lifting the block reopens exactly these; any reopen clears it,
+  // so a ticket staff handled by hand in between is never touched again.
+  blockClosedAt       DateTime?
   createdAt           DateTime   @default(now())
 
+  @@index([customerId])
   @@map("tickets")
 }
 

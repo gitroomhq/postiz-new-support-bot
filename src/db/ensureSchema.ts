@@ -1253,6 +1253,12 @@ export const STATEMENTS: string[] = [
     CONSTRAINT "postiz_credit_resets_pkey" PRIMARY KEY ("id")
   )`,
   `CREATE INDEX IF NOT EXISTS "postiz_credit_resets_orgId_creditType_createdAt_idx" ON "postiz_credit_resets"("orgId", "creditType", "createdAt")`,
+  // Ticket blocks: the Discord roles whose holders can't open tickets, and the
+  // stamp on tickets the block closed (lifting the block reopens those). The
+  // customerId index serves the per-member lookups the role events run.
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "ticketBlockRoleIds" TEXT NOT NULL DEFAULT ''`,
+  `ALTER TABLE "tickets" ADD COLUMN IF NOT EXISTS "blockClosedAt" TIMESTAMP(3)`,
+  `CREATE INDEX IF NOT EXISTS "tickets_customerId_idx" ON "tickets"("customerId")`,
 ];
 
 export async function ensureSchema(prisma: PrismaClient): Promise<void> {

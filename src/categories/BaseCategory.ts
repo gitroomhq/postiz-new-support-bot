@@ -16,8 +16,9 @@ import { log } from "../util/logger";
 const ticketLog = log.child("ticket");
 
 export interface TicketContext {
-  // Per-user rate limiting. Returns a customer-facing rejection message, or null when
-  // the user may open a ticket. Must run before any thread is created.
+  // Per-user gates (ticket blocks, rate limits). Returns a customer-facing rejection
+  // message, or null when the user may open a ticket. Must run before any thread
+  // is created.
   guardTicketCreate: (userId: string, guild: Guild | null) => Promise<string | null>;
   onTicketCreated: (
     thread: ThreadChannel,
