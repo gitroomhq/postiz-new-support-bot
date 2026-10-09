@@ -172,6 +172,16 @@ The sidebar's **Postiz Account** view can give an organization its AI images or 
 - **Trail**: an internal note on the conversation, an audit channel entry, and the record above.
 - **Needs**: the Postiz lookup (`/config → Integrations → Postiz`: base URL, superadmin API key, Enabled). With it off the section is not shown. A platform older than `4c5d42a` answers 404, which the card reports as needing a platform update; an organization without a subscription is reported as having no plan credits to reset.
 
+### Ticket blocks
+
+Members holding a **ticket block role** can't open tickets from the Discord support panel. It only covers Discord: Intercom Messenger, email and the Sentry feedback import are not affected, and the setting lives in `/config → General Settings → Ticket Blocks` only (the web admin panel doesn't carry it).
+
+- **Roles**: up to 10, picked in one role select; holding any of them blocks. @everyone and staff roles are refused. **Clear Roles** empties the list. Every change is an audit channel entry.
+- **Staff**: Administrators and staff-tier roles are never blocked, the same exemption as the ticket limits.
+- **Where it's checked**: on **Start Here** (before the Postiz login) and again right before the ticket is created, so a role added mid-flow still stops it. The member sees a fixed message with no role name or reason. Refusals are logged (`ticket.blocked`) and counted (`tickets.blocked`, by stage), with no audit channel post.
+- **Getting a block role**: the member's open tickets are closed with the closing tag, silently (no notice, no rating prompt), like when a member leaves. Intercom gets an internal note saying why. Picking a role in `/config` closes nothing by itself: only a role added to a member from then on does. For a member the bot hasn't cached, the role add is confirmed in the audit log (needs View Audit Log); without it the tickets are left open.
+- **Losing it**: the tickets the block closed reopen to the initial status, silently, with an Intercom note. A ticket that was reopened by hand in between (Discord, Intercom or Re-Verify) is no longer counted as block-closed and stays as it is.
+
 ### Dispute verdict: fight or accept
 
 A complete evidence pack is not a winning one, and fighting a case that cannot be won costs the countered-dispute fee on top of the loss. So every dispute carries a **verdict**, Fight or Accept, from fixed rules in `src/bot/billing/disputeVerdict.ts`. First match wins:
