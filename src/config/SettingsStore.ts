@@ -30,7 +30,7 @@ export type IntercomRegion = "us" | "eu" | "au";
 // Access level for one canvas/panel billing action: "none" disables it for
 // EVERYONE (admins included), "approval" lets agents queue it for admin
 // approval (admins execute directly), "admin" lets ONLY admins execute
-// (agents get nothing — not even a queue request), "all" lets agents execute
+// (agents get nothing, not even a queue request), "all" lets agents execute
 // directly too.
 export type BillingActionLevel = "none" | "approval" | "admin" | "all";
 
@@ -130,7 +130,7 @@ export class SettingsStore {
 
   // Late-bound (same idiom as AuditLogger.bindClient): SettingsStore is
   // constructed before the VaultService that depends on it. Until bound,
-  // vault-held secrets resolve to null — identical to Vault-down degradation.
+  // vault-held secrets resolve to null, identical to Vault-down degradation.
   bindVault(vault: VaultService): void {
     this.vault = vault;
   }
@@ -151,7 +151,7 @@ export class SettingsStore {
   }
 
   // Write path: vault-first with local fallback. Returns the value to store in
-  // the column — the sentinel after a successful KV write, or a local enc:v1
+  // the column: the sentinel after a successful KV write, or a local enc:v1
   // ciphertext when Vault storage isn't active/reachable (the migrator's
   // background job upgrades those on recovery). Clearing (null/"") clears the
   // column and best-effort deletes the KV field; a delete missed while Vault
@@ -164,7 +164,7 @@ export class SettingsStore {
       if (vaultActive && isVaultKvSentinel(this.settings[column] ?? "")) {
         await vault.setKvFields(integration, { [field]: null });
       }
-      // null → NULL, "" → "" — preserves the existing "empty string blocks the
+      // null → NULL, "" → ""; preserves the existing "empty string blocks the
       // env fallback" semantics of the Intercom columns.
       return plaintext;
     }
@@ -172,7 +172,7 @@ export class SettingsStore {
       if (await vault.setKvFields(integration, { [field]: plaintext })) {
         return VAULT_KV_SENTINEL;
       }
-      // The failed write flipped the state to down — fall through to local.
+      // The failed write flipped the state to down; fall through to local.
     }
     return encryptSecret(plaintext);
   }
@@ -190,7 +190,7 @@ export class SettingsStore {
   }
 
   // Migrator plumbing: raw column access bypassing resolve/encrypt. This is
-  // the ONLY legal way to write the vault:kv sentinel — encryptSecret would
+  // the ONLY legal way to write the vault:kv sentinel: encryptSecret would
   // double-wrap it (it only skips enc:v1-prefixed values).
   getSecretColumnRaw(column: GlobalSecretColumn): string | null {
     return this.settings[column];
@@ -207,7 +207,7 @@ export class SettingsStore {
     let settings = await this.prisma.botSettings.findUnique({ where: { id: "global" } });
     if (!settings) {
       // intercomRegion is NOT NULL DEFAULT 'us', so the getter's `?? process.env`
-      // fallback is dead — an env-only EU/AU deploy would silently stay on 'us'.
+      // fallback is dead: an env-only EU/AU deploy would silently stay on 'us'.
       // Seed it here on first run (the documented env path) instead.
       const seedRegion = process.env.INTERCOM_REGION;
       settings = await this.prisma.botSettings.create({
@@ -388,7 +388,7 @@ export class SettingsStore {
   }
 
   // ---- Intercom bridge ----
-  // Credentials can come from the DB (/config panel, wins) or from env vars —
+  // Credentials can come from the DB (/config panel, wins) or from env vars:
   // the deploy may provide either; the panel edits the DB copy live.
 
   intercomMode(): IntercomMode {
@@ -473,7 +473,7 @@ export class SettingsStore {
     });
   }
 
-  // Last mode flip — the none→bi gap heal reads Intercom parts newer than this.
+  // Last mode flip: the none→bi gap heal reads Intercom parts newer than this.
   intercomModeChangedAt(): Date | null {
     return this.settings.intercomModeChangedAt;
   }
@@ -600,7 +600,7 @@ export class SettingsStore {
   }
 
   // Routes vault-first with local fallback (used by the boot seed; a /config
-  // modal will reuse it). null clears the managed copy — reads fall back to env.
+  // modal will reuse it). null clears the managed copy; reads fall back to env.
   async updateStripeSecretKey(value: string | null): Promise<void> {
     this.settings = await this.prisma.botSettings.update({
       where: { id: "global" },
@@ -625,7 +625,7 @@ export class SettingsStore {
 
   // Configured-ness by the RAW column (a vault:kv sentinel counts): the boot
   // reconciliation in StripeWebhookHandler.ensureEndpoint must not read "in
-  // Vault but Vault is down" as "no secret" — that would recreate the endpoint
+  // Vault but Vault is down" as "no secret"; that would recreate the endpoint
   // and rotate the signing secret on every boot during an outage.
   stripeWebhookSecretConfigured(): boolean {
     return !!this.settings.stripeWebhookSecret;
@@ -694,7 +694,7 @@ export class SettingsStore {
   }
 
   async updateBillingActionLevel(key: string, level: BillingActionLevel): Promise<void> {
-    // Read-modify-write of the single-row JSON map — contention-free in
+    // Read-modify-write of the single-row JSON map, contention-free in
     // practice (config edits are admin-manual).
     const map = { ...this.billingActionLevels(), [key]: level };
     this.settings = await this.prisma.botSettings.update({
@@ -704,7 +704,7 @@ export class SettingsStore {
   }
 
   // Panel-token HMAC key: machine-generated, encrypted with the LOCAL crypto
-  // key (deliberately NOT vault-routed — it signs short-lived links, and
+  // key (deliberately NOT vault-routed: it signs short-lived links, and
   // rotation is just clearing the column). Never displayed or echoed.
   panelTokenSecret(): string | null {
     const raw = this.settings.panelTokenSecret;
@@ -738,7 +738,7 @@ export class SettingsStore {
 
   // ---- Stripe dashboard (/dashboard) ----
 
-  // Kill switch: the /dashboard routes answer 404 while off. Default OFF —
+  // Kill switch: the /dashboard routes answer 404 while off. Default OFF:
   // enabling is a deliberate Discord-side act (Dashboard hub). The web surface
   // itself may only ever DISABLE (ratchet asymmetry: a compromised session can
   // reduce its own privilege but never restore it).
@@ -755,7 +755,7 @@ export class SettingsStore {
 
   // Dashboard allowlist: Discord user ids are the authority (names snapshotted
   // for display, role defaults to "admin"). Checked at mint AND re-checked on
-  // every authenticated request — removal applies to live sessions immediately.
+  // every authenticated request; removal applies to live sessions immediately.
   dashboardAdmins(): Array<{ id: string; name: string; role: DashboardAdminRole }> {
     const raw = this.settings.dashboardAdminsJson as unknown;
     if (!Array.isArray(raw)) return [];
@@ -787,7 +787,7 @@ export class SettingsStore {
     });
   }
 
-  // Dashboard token HMAC key — separate column from panelTokenSecret so the
+  // Dashboard token HMAC key, separate column from panelTokenSecret so the
   // dashboard's links (which later include ENROLL links) have an independent
   // blast radius and rotation lever. Same local-crypto storage idiom.
   dashboardTokenSecret(): string | null {
@@ -878,7 +878,7 @@ export class SettingsStore {
 
   // List conversation attribute the enforcement looper writes ok | at_risk |
   // breached to. Created manually in Intercom (the API can't create
-  // conversation attributes) — Verify Setup checks it exists.
+  // conversation attributes); Verify Setup checks it exists.
   slaStatusAttributeName(): string {
     return this.settings.slaStatusAttributeName || "SLA Status";
   }
@@ -1163,7 +1163,7 @@ export class SettingsStore {
     return this.settings.disputeRatioCriticalPct;
   }
 
-  // Last alerted ratio level — threshold alerts fire on transitions only.
+  // Last alerted ratio level: threshold alerts fire on transitions only.
   disputeRatioLastLevel(): "ok" | "warn" | "critical" {
     const v = this.settings.disputeRatioLastLevel;
     return v === "warn" || v === "critical" ? v : "ok";
@@ -1377,7 +1377,7 @@ export class SettingsStore {
     this.settings = await this.prisma.botSettings.update({ where: { id: "global" }, data });
   }
 
-  // Provisioned Radar value-list ids (not secrets — plain rsl_… ids).
+  // Provisioned Radar value-list ids (not secrets, plain rsl_… ids).
   radarListId(kind: "card_fingerprint" | "email" | "customer_id" | "ip_address"): string | null {
     switch (kind) {
       case "card_fingerprint":
@@ -1392,7 +1392,7 @@ export class SettingsStore {
   }
 
   // Sentry DSN (null = disabled). DB-first with env fallback: the deploy has no
-  // editable .env. `||` not `??` — an empty string stored in the DB must fall
+  // editable .env. `||` not `??`: an empty string stored in the DB must fall
   // through to the env var instead of silently disabling Sentry.
   sentryDsn(): string | null {
     return this.settings.sentryDsn?.trim() || process.env.SENTRY_DSN?.trim() || null;
@@ -1451,7 +1451,7 @@ export class SettingsStore {
   }
 
   // True only when the DB holds a LOCAL ciphertext that no longer decrypts
-  // (rotated key source) — the panel asks for re-entry. A vault:kv sentinel
+  // (rotated key source); the panel asks for re-entry. A vault:kv sentinel
   // with Vault unreachable is a different state (secretState →
   // "vault-unreachable"), not a re-enter situation.
   influxTokenUnreadable(): boolean {
@@ -1472,7 +1472,7 @@ export class SettingsStore {
   // ---- HashiCorp Vault connection (paired with /config → Vault) ----
   // Connection settings only; the secret routing itself lives in
   // resolveSecret/routeSecretWrite above. The Vault token is the bootstrap
-  // credential and is always encrypted with the LOCAL key (crypto.ts) — Vault
+  // credential and is always encrypted with the LOCAL key (crypto.ts); Vault
   // can't wrap its own token.
 
   // The VAULT_* env vars OVERRIDE the stored values (config/env.ts explains
@@ -1493,7 +1493,7 @@ export class SettingsStore {
     return raw != null ? decryptSecret(raw) : null;
   }
 
-  // Local ciphertext present but no longer decryptable (rotated key source) —
+  // Local ciphertext present but no longer decryptable (rotated key source):
   // the panel asks for re-entry. An env-pinned token means there IS a working
   // token, so the re-entry nag stays off.
   vaultTokenUnreadable(): boolean {
@@ -1594,7 +1594,7 @@ export class SettingsStore {
   }
 
   // Connection values live in BotSettings and are edited via /config, but a set
-  // TEMPORAL_* env var OVERRIDES the stored value — same rule as the VAULT_*
+  // TEMPORAL_* env var OVERRIDES the stored value, same rule as the VAULT_*
   // getters above, and unlike the INTERCOM_* fallbacks, which /config still
   // wins over. The mTLS material is the one exception (Vault KV stays
   // authoritative; see certs.ts).
@@ -1615,7 +1615,7 @@ export class SettingsStore {
   }
 
   // Transport security for the frontend connection. OFF (the default) dials
-  // plaintext gRPC — a private-network frontend (Railway internal DNS, a
+  // plaintext gRPC: a private-network frontend (Railway internal DNS, a
   // service mesh) listens without TLS, and speaking TLS at it dies in the
   // handshake with a rustls InvalidContentType. ON requires the Vault-held
   // mTLS material; the certs stay stored while off, just unused.
@@ -1693,7 +1693,7 @@ export class SettingsStore {
     return this.resolveSecret(this.settings.sentryReadToken, "sentryReadToken");
   }
 
-  // Sentry internal-integration client secret — verifies sentry-hook-signature
+  // Sentry internal-integration client secret: verifies sentry-hook-signature
   // on POST /sentry/webhook. Unset = the endpoint rejects everything and the
   // polling looper carries delivery alone.
   sentryWebhookSecret(): string | null {
@@ -1724,7 +1724,7 @@ export class SettingsStore {
     return this.settings.sentryFeedbackTicketTypeId;
   }
 
-  // No-backfill floor, stamped at FIRST enable. Null = never enabled — a hard
+  // No-backfill floor, stamped at FIRST enable. Null = never enabled: a hard
   // gate independent of the toggle (Sync Now force bypasses the toggle, never
   // this). Deliberately not reset on disable: a re-enable imports the gap.
   sentryFeedbackWatermarkAt(): Date | null {
@@ -1793,7 +1793,7 @@ export class SettingsStore {
   // Org API key for the platform's public API. The calling org must contain a
   // superadmin user (SuperAdminGuard) and hold a subscription, or every lookup
   // comes back 401/403. POSTIZ_ADMIN_TOKEN in the environment WINS over the
-  // stored column — the deploy already carries the key, and a second copy in
+  // stored column: the deploy already carries the key, and a second copy in
   // the database would only drift.
   postizApiKey(): string | null {
     return envStr(ENV_PINS.postizApiKey) ?? this.resolveSecret(this.settings.postizApiKey, "postizApiKey");

@@ -30,7 +30,7 @@ export interface TicketContext {
 }
 
 // Customer ticket categories. Agent-facing extras (auto-answer, staff pings,
-// thread membership, title emojis) were retired with the Intercom migration —
+// thread membership, title emojis) were retired with the Intercom migration:
 // a new ticket is just: private thread, customer added, question embed,
 // bridged to Intercom where agents work it.
 export abstract class BaseCategory {
@@ -87,7 +87,7 @@ export abstract class BaseCategory {
       // The trailing " — {label}" is load-bearing: deriveCategoryId parses it
       // during Re-Verify/adoption, so truncation (100-char thread-name cap)
       // may only eat into the display name, never the suffix. No emoji
-      // prefixes — titles no longer encode status.
+      // prefixes: titles no longer encode status.
       const suffix = ` — ${this.label}`;
       thread = await threadsChannel.threads.create({
         name: `${interaction.user.displayName.slice(0, 100 - suffix.length)}${suffix}`,
@@ -122,7 +122,7 @@ export abstract class BaseCategory {
       });
     } catch (error) {
       // Thread creation or post-creation setup (member add, ticket row,
-      // question embed) failed — keep the customer-facing fallback, but the
+      // question embed) failed: keep the customer-facing fallback, but the
       // failure itself must be debuggable.
       ticketLog.error("ticket creation failed", error, {
         "ticket.category": this.id,

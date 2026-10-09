@@ -146,7 +146,7 @@ type TicketSearchFilters = {
 
 // /config customId prefixes whose flows moved into the /intercom command
 // (Bridge/SLA/Automation/Maintenance hubs). Old ephemeral /config panels keep
-// their live buttons — these answer with a pointer instead of dead-ending.
+// their live buttons: these answer with a pointer instead of dead-ending.
 const MOVED_TO_INTERCOM = [
   "config_intercom_mode",
   "config_intercom_reset",
@@ -183,7 +183,7 @@ export class DiscordBot {
   private adminPanelDiscord?: AdminPanelDiscord;
   private dashboard?: Dashboard;
   private dashboardDiscord?: DashboardDiscord;
-  // SLA manager — bound late from index.ts; hooks fire-and-forget on ticket
+  // SLA manager, bound late from index.ts; hooks fire-and-forget on ticket
   // creation and customer replies.
   private slaService: {
     onTicketTrigger(threadId: string, reason: "created" | "customer_reply"): Promise<void>;
@@ -202,7 +202,7 @@ export class DiscordBot {
     (interaction) => this.isAdmin(interaction)
   );
   private sentryFeedbackClient: SentryFeedbackClient | null = null;
-  // Sentry feedback import ledger — bound late from index.ts; the /config
+  // Sentry feedback import ledger, bound late from index.ts; the /config
   // panel reads its counters.
   private sentryFeedback: SentryFeedbackStore | null = null;
 
@@ -252,7 +252,7 @@ export class DiscordBot {
     private subscriptionEventService?: SubscriptionEventService
   ) {
     this.client = new Client({
-      // MessageContent is privileged (enable it in the Dev Portal too) — without it
+      // MessageContent is privileged (enable it in the Dev Portal too): without it
       // message bodies/attachments of other users are empty, and the Intercom
       // mirror would push blanks.
       intents: [
@@ -266,7 +266,7 @@ export class DiscordBot {
     this.rest = new REST({ version: "10" }).setToken(config.discord.token);
     this.setupEventHandlers();
     // Hubs that need Discord surface (backfill/heal thread history, preflight
-    // permission checks) get it late-bound — the client exists from here on.
+    // permission checks) get it late-bound; the client exists from here on.
     this.intercomAdmin?.bindDiscord({
       client: this.client,
       fetchAllThreadMessages: (t) => this.fetchAllThreadMessages(t),
@@ -393,7 +393,7 @@ export class DiscordBot {
 
   // Outermost error boundary for Discord gateway handlers. Errors thrown inside
   // a withDiscordSpan wrapper were already captured there with full interaction
-  // context — only log those; capture everything else.
+  // context: only log those; capture everything else.
   private reportHandlerError(event: string, e: unknown): void {
     if (wasCaptured(e)) {
       this.discordLog.warn("handler failed (captured in span)", {
@@ -438,7 +438,7 @@ export class DiscordBot {
           silent: true,
         });
       } else {
-        // Thread is gone/unreachable — still reconcile the DB. This path bypasses
+        // Thread is gone/unreachable: still reconcile the DB. This path bypasses
         // StatusService, so the Intercom push needs its own hook.
         await this.ticketStore.close(ticket.threadId).catch(() => {});
         safe(
@@ -447,7 +447,7 @@ export class DiscordBot {
           { "ticket.thread_id": ticket.threadId, "sync.event": "status_changed" }
         );
       }
-      // WHY the close happened, for agents reading the Intercom inbox — the
+      // WHY the close happened, for agents reading the Intercom inbox; the
       // thread itself stays silent (the customer is gone; no notice, no CSAT).
       safe(this.intercomSync.onTicketNote(ticket.threadId, MEMBER_LEFT_NOTE), "intercom-sync", {
         "ticket.thread_id": ticket.threadId,
@@ -589,7 +589,7 @@ export class DiscordBot {
   // Reduces a discord.js message to the bridge shape (also used by the backfill
   // walker). Embed-only messages (historical AI answers, the "Your question"
   // embed) are flattened to text so they don't mirror as blanks. Mentions are
-  // resolved to real names HERE — the renderer downstream only has generic
+  // resolved to real names HERE: the renderer downstream only has generic
   // fallbacks (@user/@role/#channel).
   private toBridgeMessage(message: Message, member: GuildMember | null): BridgeSourceMessage {
     const embedText = message.embeds
@@ -654,7 +654,7 @@ export class DiscordBot {
 
   // Human edit in a tracked ticket thread → appended "✏️ edited" part in
   // Intercom. editedAt gate: Discord also fires messageUpdate for embed/link-
-  // preview attachment with unchanged content — those carry no editedTimestamp.
+  // preview attachment with unchanged content; those carry no editedTimestamp.
   private async handleMessageEdit(newMessage: Message | PartialMessage): Promise<void> {
     const message = newMessage.partial ? await newMessage.fetch().catch(() => null) : newMessage;
     if (!message || message.author.bot) return;
@@ -673,7 +673,7 @@ export class DiscordBot {
   }
 
   // Human delete in a tracked ticket thread → appended "🗑️ deleted" part.
-  // Deleted messages can't be fetched — partials still carry id + channel; an
+  // Deleted messages can't be fetched; partials still carry id + channel; an
   // unknown author is safe because the executor only mirrors deletions of
   // messages its delivery ledger confirms were mirrored (bot messages never
   // carry their Discord id there).
@@ -696,7 +696,7 @@ export class DiscordBot {
   }
 
   private async processTicketMessage(message: Message, ticket: TicketWithTag): Promise<void> {
-    // Mirror every human message to Intercom (before the early returns below —
+    // Mirror every human message to Intercom (before the early returns below:
     // chatter in closed tickets must mirror too). Fire-and-forget: an Intercom
     // problem never touches the Discord flow.
     const member = message.member ?? (await message.guild?.members.fetch(message.author.id).catch(() => null)) ?? null;
@@ -731,8 +731,8 @@ export class DiscordBot {
     }
 
     // Nudge the ticket workflow (re-close deadline push, retention
-    // freshness) whenever Temporal is configured — a paused worker just
-    // processes the parked signals on resume. The DB stamps below stay —
+    // freshness) whenever Temporal is configured; a paused worker just
+    // processes the parked signals on resume. The DB stamps below stay:
     // they are the rehydration source when a completed workflow restarts.
     if (this.temporalProducers?.routable()) {
       void this.temporalProducers
@@ -745,7 +745,7 @@ export class DiscordBot {
     }
 
     // SLA manager: customer messages re-run the rules (keyword rules, reopen
-    // scenarios — and the refund exempt→mirrored flip: this same message
+    // scenarios, and the refund exempt→mirrored flip: this same message
     // triggered the flip above, and the FIFO outbox delivers the "sla" event
     // after the flip's ensure).
     if (message.author.id === ticket.customerId) {
@@ -753,8 +753,8 @@ export class DiscordBot {
     }
 
     // Activity in a Closed ticket (staff can post into locked threads; posting un-archives
-    // them): don't reopen, just re-close after 30 quiet minutes. Every message — customer
-    // or support — pushes the deadline back.
+    // them): don't reopen, just re-close after 30 quiet minutes. Every message, customer
+    // or support, pushes the deadline back.
     if (ticket.closed && ticket.statusTag?.closesThread) {
       await this.ticketStore.scheduleReclose(ticket.threadId, new Date(Date.now() + RECLOSE_DELAY_MS));
       return;
@@ -799,11 +799,11 @@ export class DiscordBot {
     }
   }
 
-  // Refund-flip trigger: the ticket's CUSTOMER (never staff — user decision),
+  // Refund-flip trigger: the ticket's CUSTOMER (never staff: user decision),
   // a non-empty TYPED text (attachment-only doesn't count), an open
   // refund-shaped ticket, bridge enabled. Two true-branches: the normal
   // exempt→flip, and the crash-heal retrigger (exemption lifted but the
-  // transcript enqueue never happened — process died between lift and
+  // transcript enqueue never happened: process died between lift and
   // enqueue). The category/question check short-circuits everything else, so
   // the two DB probes only ever run inside that tiny crash-heal window.
   private async isRefundFlipCandidate(ticket: TicketWithTag, message: Message): Promise<boolean> {
@@ -838,7 +838,7 @@ export class DiscordBot {
     if (!target) return;
 
     // Idempotency backstop: applyStatus persists the status BEFORE it locks/archives, so
-    // the bot's own edits re-fire this event already at the target status — skip them.
+    // the bot's own edits re-fire this event already at the target status: skip them.
     if (ticket.statusTagId === target.id) return;
 
     await withDiscordSpan(
@@ -1484,7 +1484,7 @@ export class DiscordBot {
     await interaction.reply({ embeds: [embed], components: [row] });
   }
 
-  // Old messages permanently carry components of retired agent features —
+  // Old messages permanently carry components of retired agent features:
   // answer them with a notice instead of Discord's generic "interaction
   // failed". (csat: and create_issue: stay live: legacy customer surfaces.)
   private static readonly DEAD_BUTTON_PREFIXES = [
@@ -1523,7 +1523,7 @@ export class DiscordBot {
     }
 
     // dashpanel_ is the Stripe dashboard's Discord surface (link minter +
-    // passcode handshake). Runs before billadmin_ — the entry button lives on
+    // passcode handshake). Runs before billadmin_: the entry button lives on
     // the /billing root panel.
     if (interaction.customId.startsWith("dashpanel_")) {
       await this.dashboardDiscord?.handleButton(interaction);
@@ -1542,7 +1542,7 @@ export class DiscordBot {
       return;
     }
 
-    // billadmin_ is the /billing admin panel — distinct from the customer-facing
+    // billadmin_ is the /billing admin panel, distinct from the customer-facing
     // billing_ prefix owned by BillingCategory.
     if (interaction.customId.startsWith("billadmin_")) {
       await this.billingAdmin.handleButton(interaction);
@@ -1711,7 +1711,7 @@ export class DiscordBot {
           ],
         });
         if (this.temporalProducers?.routable()) {
-          // One signal-with-start births the ticket workflow — it enqueues the
+          // One signal-with-start births the ticket workflow: it enqueues the
           // Intercom ensure and owns the ticket's timers. aiSolve is always
           // false: the auto-answer was retired with the agent-rip (the
           // workflow branch stays dormant for old-history replays).
@@ -1730,7 +1730,7 @@ export class DiscordBot {
             "sync.event": "ticket_created",
           });
         }
-        // SLA manager: evaluate rules for the new ticket. Ordering is safe —
+        // SLA manager: evaluate rules for the new ticket. Ordering is safe:
         // the "sla" outbox event delivers after the creation ensure (FIFO +
         // ensure-head synthesis); exempt refund tickets come back "skipped".
         void this.slaService?.onTicketTrigger(thread.id, "created");
@@ -1993,7 +1993,7 @@ export class DiscordBot {
 
       // Prefer the DB-stored verbatim question (nothing else from the thread,
       // so no incidental customer PII lands in the public repo). The AI answer
-      // comes from the legacy embed scan — this button only exists on old
+      // comes from the legacy embed scan; this button only exists on old
       // auto-answer messages (the auto-answer itself was retired).
       const ticket = await this.ticketStore.getByThreadId(thread.id).catch(() => null);
       let userQuestion = ticket?.question ?? "";
@@ -2082,7 +2082,7 @@ export class DiscordBot {
   // ---- CSAT (1-5 star rating on ticket close, usually via DM) ----
 
   // customId: csat:{threadId}:{customerId}:{score}. The owner check is a pure string
-  // comparison and showModal is the FIRST response — no DB work before the ack, because
+  // comparison and showModal is the FIRST response: no DB work before the ack, because
   // showModal can't follow a defer and the token window is ~3s.
   private async handleCsatRating(interaction: ButtonInteraction): Promise<void> {
     const [, threadId, customerId, scoreRaw] = interaction.customId.split(":");
@@ -2252,7 +2252,7 @@ export class DiscordBot {
   // The category from the thread name's trailing label (after the LAST " — ", matching
   // BaseCategory's "{emoji} {name} — {label}" convention), matched case-insensitively against a
   // registered category. Returns undefined when it can't be determined so callers leave the
-  // stored categoryId untouched — we never clobber a good value back to null / "Other".
+  // stored categoryId untouched: we never clobber a good value back to null / "Other".
   private deriveCategoryId(threadName: string): string | undefined {
     const SEP = " — ";
     const idx = threadName.lastIndexOf(SEP);
@@ -2446,7 +2446,7 @@ export class DiscordBot {
     return { embeds: [embed], components: [buttons] };
   }
 
-  // The three right-hand hub panels — same pattern as Workflow / Reporting &
+  // The three right-hand hub panels: same pattern as Workflow / Reporting &
   // Audit: live status lines, one button per sub-panel, Back to main.
   // Sub-panels opened from a hub route their own Back button to the hub.
   private buildIntegrationsHubPanel() {
@@ -2712,7 +2712,7 @@ export class DiscordBot {
       `• Ledger: scanned **${n("moneyScanned")}**, **${n("moneyCreated")}** new, **${n("moneyRepaired")}** corrected`,
       `• Segments resolved on **${n("segmentsEnriched")}** row(s)` +
         (n("segmentsEnriched") === 0
-          ? " — ⚠️ **nothing was enriched**, so every plan/card/region axis is still `unknown`"
+          ? ": ⚠️ **nothing was enriched**, so every plan/card/region axis is still `unknown`"
           : ""),
       `• Concessions: **${n("creditNotes")}** credit note(s), **${n("writeOffs")}** write-off(s), **${n("discountRows")}** discount(s) across **${n("invoicesScanned")}** paid invoice(s)`,
       `• Retired **${n("retiredEstimates")}** superseded coupon estimate(s)`,
@@ -2722,7 +2722,7 @@ export class DiscordBot {
     ];
     if (n("droppedLines") > 0) {
       lines.push(
-        `• ⚠️ Dropped **${n("droppedLines")}** buffered line(s) that Influx had refused earlier — a sign it was unhealthy during the run`
+        `• ⚠️ Dropped **${n("droppedLines")}** buffered line(s) that Influx had refused earlier, a sign it was unhealthy during the run`
       );
     }
     if (s.truncated) {
@@ -2734,7 +2734,7 @@ export class DiscordBot {
       // rest of the numbers look perfectly healthy when it happens.
       lines.push(
         "• ⚠️ The Stripe lookup budget ran out before the walk finished, so some rows are still `unknown`. " +
-          "**Run it again** — each run picks up where the last one left off, because rows that already have segments are skipped."
+          "**Run it again**: each run picks up where the last one left off, because rows that already have segments are skipped."
       );
     }
 
@@ -2778,7 +2778,7 @@ export class DiscordBot {
     // today means the mirror is complete and the gap is in the Influx points
     // (re-emit); one that stops early means the sweep stopped early (re-run).
     const cov = await this.moneyOutService?.coverage().catch(() => null);
-    const day = (d: Date | null | undefined) => (d ? `<t:${Math.floor(d.getTime() / 1000)}:d>` : "—");
+    const day = (d: Date | null | undefined) => (d ? `<t:${Math.floor(d.getTime() / 1000)}:d>` : "-");
     const embed = new EmbedBuilder()
       .setTitle("💸 Money Out")
       .setColor(0x5865f2)
@@ -2796,9 +2796,9 @@ export class DiscordBot {
           }`,
           "",
           "Mirrors **every outflow** from the Stripe account into `/billing → Money out` and the Grafana **Money Out** dashboard:",
-          "• **Cash reversed** — refunds (full and partial), dispute withdrawals, minus anything that came back",
-          "• **Fees lost** — the per-chargeback fee, and fees Stripe keeps on money we handed back",
-          "• **Concessions** — credit notes, discounts, write-offs, credit grants, balance credits",
+          "• **Cash reversed**: refunds (full and partial), dispute withdrawals, minus anything that came back",
+          "• **Fees lost**: the per-chargeback fee, and fees Stripe keeps on money we handed back",
+          "• **Concessions**: credit notes, discounts, write-offs, credit grants, balance credits",
           "",
           `**Segments:** ${s.moneyOutEnrichEnabled() ? "on" : "off"}. Tags each refund and dispute with the plan, the card brand and funding type, the issuing country, the refund reason, how old the charge was and how long the customer had been paying, so Grafana can answer **which** plans we refund and **who** disputes us. Bounded values only, never anything that identifies a person. Costs a few extra Stripe reads per outflow, capped per sweep page and cached; turn it off if Stripe rate limits ever bite. History imported by a backfill is deliberately **not** segmented, so older rows read \"unknown\".`,
           "",
@@ -2861,7 +2861,7 @@ export class DiscordBot {
     const s = this.settingsStore;
     const replayAt = s.subscriptionReplayDoneAt();
     const cov = await this.subscriptionEventService?.coverage().catch(() => null);
-    const day = (d: Date | null | undefined) => (d ? `<t:${Math.floor(d.getTime() / 1000)}:d>` : "—");
+    const day = (d: Date | null | undefined) => (d ? `<t:${Math.floor(d.getTime() / 1000)}:d>` : "-");
     const on = s.subscriptionEventsEnabled();
     const embed = new EmbedBuilder()
       .setTitle("📉 Churn Analytics")
@@ -2888,7 +2888,7 @@ export class DiscordBot {
           "",
           "Cancellation **comments are customer-written free text**. They are scrubbed of emails, links, phone numbers and Stripe ids and truncated before they are stored, and they are never used as a metric label.",
           "",
-          "**Replay is limited to 30 days** — that is Stripe's entire event retention, not a setting. It is idempotent, so re-running it never double-counts.",
+          "**Replay is limited to 30 days**: that is Stripe's entire event retention, not a setting. It is idempotent, so re-running it never double-counts.",
         ].join("\n")
       );
     const row1 = new ActionRowBuilder<ButtonBuilder>().addComponents(
@@ -3059,7 +3059,7 @@ export class DiscordBot {
     };
   }
 
-  // Slimmed to connection basics — bridge behavior, SLA rules, automation and
+  // Slimmed to connection basics: bridge behavior, SLA rules, automation and
   // maintenance moved to the /intercom command (icadmin_ hubs).
   private async buildIntercomPanel() {
     const s = this.settingsStore;
@@ -3112,7 +3112,7 @@ export class DiscordBot {
   }
 
   // /config → Intercom → Inactivity: the workspace sweeper for NATIVE
-  // (unbridged) conversations/tickets — Intercom's own workflow triggers never
+  // (unbridged) conversations/tickets: Intercom's own workflow triggers never
   // fire on API-created objects, so the bot is the automation engine. Bridged
   // tickets keep their per-ticket timers (tag reminder settings).
   private buildAiPanel() {
@@ -3217,7 +3217,7 @@ export class DiscordBot {
   }
 
   // /config → Integrations → Sentry Feedback: User Feedback widget → Intercom
-  // import (agents reply in Intercom; Intercom emails the submitter). Async —
+  // import (agents reply in Intercom; Intercom emails the submitter). Async:
   // shows live ledger counters and the resolved team name.
   private async buildSentryFeedbackPanel() {
     const s = this.settingsStore;
@@ -3467,7 +3467,7 @@ export class DiscordBot {
   // did.
   //
   // The counters are here rather than only in the audit-channel embed because
-  // the first real run posted no embed at all — the billing audit channel is
+  // the first real run posted no embed at all: the billing audit channel is
   // optional and postBillingAuditEmbed returns silently when it is unset, so a
   // completed rebuild was indistinguishable from one that never ran. A result
   // nobody can see is the same as no result.
@@ -3477,7 +3477,7 @@ export class DiscordBot {
     if (phase) {
       const since = s.analyticsRebuildStartedAt();
       const mins = since ? Math.round((Date.now() - since.getTime()) / 60_000) : 0;
-      return `**running** — ${phase} (${mins}m)`;
+      return `**running**: ${phase} (${mins}m)`;
     }
     const done = s.analyticsRebuildDoneAt();
     if (!done) return "never run";
@@ -3486,7 +3486,7 @@ export class DiscordBot {
     const stats = s.analyticsRebuildStats();
     if (!stats) return `last run ${when}`;
     if (typeof stats.error === "string" && stats.error) {
-      return `last run ${when} ⚠️ **failed** — ${String(stats.error).slice(0, 140)}`;
+      return `last run ${when} ⚠️ **failed**: ${String(stats.error).slice(0, 140)}`;
     }
 
     const n = (k: string): number => (typeof stats[k] === "number" ? (stats[k] as number) : 0);
@@ -3496,7 +3496,7 @@ export class DiscordBot {
       `↳ ${n("moneyScanned")} scanned · ${n("moneyCreated")} new · ${n("moneyRepaired")} repaired · ` +
         `${n("discountRows")} discount row(s) · ${n("retiredEstimates")} estimate(s) retired`,
       `↳ **${points}** point(s) written to InfluxDB` +
-        (points === 0 ? " — ⚠️ nothing was emitted, so the bucket is empty" : ""),
+        (points === 0 ? ": ⚠️ nothing was emitted, so the bucket is empty" : ""),
     ].join("\n");
   }
 
@@ -3521,7 +3521,7 @@ export class DiscordBot {
   // migrate/reverse actions. Async for the session-token envelope census.
   // ---- /config → Temporal (connection status, kill switch, deployment
   // version, schedules, migration import). The only ops window besides the
-  // Temporal Web UI — prod has no terminal. ----
+  // Temporal Web UI; prod has no terminal. ----
 
 
   private async buildTemporalPanel() {
@@ -3556,7 +3556,7 @@ export class DiscordBot {
       if (pinnedConn.length) lines.push(`> _pinned by the environment: ${pinnedConn.map((n) => `\`${n}\``).join(", ")}_`);
       const cert = svc.certInfo();
       const certSource = svc.tlsSource();
-      // Certs stay stored while TLS is off, so the row stays — flagged unused
+      // Certs stay stored while TLS is off, so the row stays, flagged unused
       // rather than hidden, which keeps re-enabling a one-button move.
       lines.push(
         `**Client cert:** ${
@@ -3566,7 +3566,7 @@ export class DiscordBot {
               }${cfg.tlsEnabled ? "" : " · _unused while TLS is off_"}`
             : cfg.tlsEnabled
               ? "_not entered (Certificates below, stored in Vault KV; `TEMPORAL_TLS_CERT_FILE`/`KEY_FILE` is the offline fallback)_"
-              : "_none stored — not needed while TLS is off_"
+              : "_none stored, not needed while TLS is off_"
         }`
       );
       const buf = svc.bufferStats();
@@ -3583,7 +3583,7 @@ export class DiscordBot {
         }`
       );
 
-      // Live readouts, best-effort with a short budget — a down server must
+      // Live readouts, best-effort with a short budget: a down server must
       // not wedge the panel.
       try {
         const report = await Promise.race([
@@ -3845,7 +3845,7 @@ export class DiscordBot {
     }
 
     if (id === "config_temporal_certs") {
-      // Never prefilled — cert/key material must not round-trip through Discord.
+      // Never prefilled: cert/key material must not round-trip through Discord.
       const modal = new ModalBuilder().setCustomId("config_temporal_certs_modal").setTitle("Temporal mTLS Certificates");
       modal.addComponents(
         new ActionRowBuilder<TextInputBuilder>().addComponents(
@@ -3928,7 +3928,7 @@ export class DiscordBot {
   }
 
   // Certificates modal: validate before storing (Vault KV "temporal" entry);
-  // the reply shows fingerprint + expiry ONLY — never any PEM/key material.
+  // the reply shows fingerprint + expiry ONLY, never any PEM/key material.
   private async handleTemporalCertsModal(interaction: ModalSubmitInteraction): Promise<void> {
     if (!this.isAdmin(interaction)) {
       await interaction.reply({ embeds: [makeEmbed("You don't have permission to do that.", COLORS.danger)], flags: 64 });
@@ -4395,7 +4395,7 @@ export class DiscordBot {
         ...(token ? { vaultToken: token } : {}),
       });
       await this.vault.service.reconfigure();
-      // The Influx token may be vault-held — a now-working connection revives it.
+      // The Influx token may be vault-held; a now-working connection revives it.
       await reconfigureInflux(s.influxConfig());
       // Deliberately no token value in the audit line.
       this.auditConfig(interaction, `Vault connection updated (addr ${addr || "N/A"}${token ? ", token set" : ""})`);
@@ -4724,7 +4724,7 @@ export class DiscordBot {
 
     // Everything behavioral moved to /intercom (Bridge/SLA/Automation/
     // Maintenance hubs). Old ephemeral /config panels can sit open for a long
-    // time — answer their buttons with a pointer instead of dead-ending.
+    // time: answer their buttons with a pointer instead of dead-ending.
     if (MOVED_TO_INTERCOM.some((prefix) => id.startsWith(prefix))) {
       await interaction.reply({
         embeds: [makeEmbed("This setting moved to **/intercom**. Run /intercom and open the matching hub.", COLORS.neutral)],
@@ -4789,7 +4789,7 @@ export class DiscordBot {
     }
 
     if (id === "config_kb_refresh_now") {
-      // git pull can take a moment — defer, then report the outcome ephemerally.
+      // git pull can take a moment: defer, then report the outcome ephemerally.
       await interaction.deferReply({ flags: 64 });
       const { ok, failed } = await this.kbScheduler.refreshNow();
       this.auditConfig(interaction, `KB manual refresh → ${ok} ok, ${failed} failed`);
@@ -4840,7 +4840,7 @@ export class DiscordBot {
     // Intercom billing admins (teammate picker).
     if (id === "config_badm" || id.startsWith("config_badm_page:")) {
       const page = id === "config_badm" ? 0 : parseInt(id.split(":")[1], 10) || 0;
-      // The teammate list comes from the Intercom API — defer, then render.
+      // The teammate list comes from the Intercom API: defer, then render.
       await interaction.deferUpdate();
       const teammates = await this.intercomClient.listAdmins().catch(() => null);
       await interaction.editReply(buildIntercomAdminsPanel(this.settingsStore, teammates, page));
@@ -4972,7 +4972,7 @@ export class DiscordBot {
           .sort((a, b) => b.subscriptions - a.subscriptions)
           .map(
             (p) =>
-              `• **${p.planTier}** ${p.planPeriod.toLowerCase()} — ${p.subscriptions} sub(s), ${(p.mrrMinor / 100).toFixed(2)}/mo`
+              `• **${p.planTier}** ${p.planPeriod.toLowerCase()}: ${p.subscriptions} sub(s), ${(p.mrrMinor / 100).toFixed(2)}/mo`
           );
         this.auditConfig(interaction, `Plan-mix snapshot → ${mix.scanned} active subscription(s)`);
         await interaction.editReply({
@@ -5033,7 +5033,7 @@ export class DiscordBot {
                 const r = await service.replayHistory();
                 return (
                   `scanned **${r.scanned}** Stripe event(s), recorded **${r.created}** new movement(s)` +
-                  (r.truncated ? " — hit the page cap, run it again to continue" : "")
+                  (r.truncated ? "; hit the page cap, run it again to continue" : "")
                 );
               })();
           const secs = Math.round((Date.now() - startedAt) / 1000);
@@ -5090,7 +5090,7 @@ export class DiscordBot {
       if (!this.moneyOutService) return;
       // Signal the looper when Temporal is up; otherwise run the tick right
       // here. Without the fallback this button silently does nothing on a
-      // Temporal-less deploy — and the reconcile is the ONLY way Stripe fees
+      // Temporal-less deploy, and the reconcile is the ONLY way Stripe fees
       // and dispute fees ever reach the ledger, so "nothing happened" would be
       // indistinguishable from "there was nothing to find".
       const signalled = await this.temporalProducers?.moneyOutRunNow().catch(() => null);
@@ -5115,7 +5115,7 @@ export class DiscordBot {
                 ? "The money-out ledger is switched off, so there was nothing to reconcile."
                 : `✅ Reconciled in-process (the looper was unreachable): scanned **${r.scanned}** balance transaction(s), recorded **${r.created}** new row(s).` +
                     (r.truncated ? "\n⚠️ Hit the page cap; run it again to continue." : "") +
-                    (r.errors ? `\n⚠️ ${r.errors} error(s) — check the logs.` : ""),
+                    (r.errors ? `\n⚠️ ${r.errors} error(s); check the logs.` : ""),
               r.skipped ? COLORS.warn : COLORS.success
             ),
           ],
@@ -5248,7 +5248,7 @@ export class DiscordBot {
     if (id === "config_disputes_radar") {
       await interaction.deferUpdate();
       if (!this.disputes) return;
-      // List ids are plain rsl_… identifiers, not secrets — safe to display.
+      // List ids are plain rsl_… identifiers, not secrets: safe to display.
       const results = await this.disputes.blockService.ensureRadarLists();
       const summary = results
         .map((r) => `${r.kind}: ${r.listId ? `${r.created ? "created" : "ok"} (\`${r.listId}\`)` : `FAILED: ${r.error?.slice(0, 100)}`}`)
@@ -5270,7 +5270,7 @@ export class DiscordBot {
     }
 
     if (id === "config_billing_plans") {
-      // Plan allowlist for the /billing subscription pickers — the panel and
+      // Plan allowlist for the /billing subscription pickers: the panel and
       // its flows live in the billing admin; its Back returns to config_billing.
       await this.billingAdmin.openPlanSettings(interaction);
       return;
@@ -5660,7 +5660,7 @@ export class DiscordBot {
         new ActionRowBuilder<TextInputBuilder>().addComponents(
           new TextInputBuilder()
             .setCustomId("traces_rate")
-            .setLabel("Traces sample rate (0.0 – 1.0)")
+            .setLabel("Traces sample rate (0.0-1.0)")
             .setStyle(TextInputStyle.Short)
             .setRequired(true)
             .setValue(String(this.settingsStore.sentryTracesSampleRate()))
@@ -5668,7 +5668,7 @@ export class DiscordBot {
         new ActionRowBuilder<TextInputBuilder>().addComponents(
           new TextInputBuilder()
             .setCustomId("profiles_rate")
-            .setLabel("Profiles sample rate (0.0 – 1.0)")
+            .setLabel("Profiles sample rate (0.0-1.0)")
             .setStyle(TextInputStyle.Short)
             .setRequired(true)
             .setValue(String(this.settingsStore.sentryProfilesSampleRate()))
@@ -5792,7 +5792,7 @@ export class DiscordBot {
     if (id === "config_analytics_rebuild") {
       // Confirm step, even though the run itself is one press.
       //
-      // This is not a dry run — it is the only defense against a misclick, and
+      // This is not a dry run: it is the only defense against a misclick, and
       // against a staging instance that has been pointed at the production
       // bucket. Naming the BUCKET is the part that matters: an operator who
       // reads the wrong name here is the one person who can still stop it.
@@ -5823,7 +5823,7 @@ export class DiscordBot {
               `⚠️ This **permanently deletes** analytics data from bucket \`${st.influxBucket()}\` at \`${st.influxUrl()}\`.`,
               "",
               "**Deleted and rebuilt** from Postgres: money_out, dispute_outcomes, subscription_events, dispute_event, dispute_auto_resolve, ai_runs.",
-              "**Left alone**: billing_events and every gauge — nothing can regenerate those, so they are never touched.",
+              "**Left alone**: billing_events and every gauge: nothing can regenerate those, so they are never touched.",
               "",
               "It re-walks all of Stripe first and only wipes once that succeeds, so a failure part-way leaves the bucket as it is.",
               "Expect **minutes to hours**. Progress and the result post to the billing audit channel.",
@@ -6274,7 +6274,7 @@ export class DiscordBot {
     return modal;
   }
 
-  // Per-tag reminder/close overrides — a separate modal because buildTagModal
+  // Per-tag reminder/close overrides: a separate modal because buildTagModal
   // is at Discord's 5-input ceiling. Blank input = clear back to the default.
   private async handleConfigModal(interaction: ModalSubmitInteraction): Promise<void> {
     if (!this.isAdmin(interaction)) {
@@ -7157,7 +7157,7 @@ export class DiscordBot {
   }
 
   // Intercom backfill: enqueue a full historical replay (ALL tickets, open and
-  // closed) into the outbox. Idempotent — tickets that already have a link or a
+  // closed) into the outbox. Idempotent: tickets that already have a link or a
   // pending ensure are skipped, so re-runs and crash-recovery are safe.
   // Enqueueing is DB-only and fast; the actual pushing happens in the outbox
   // drainer at its own pace. Runs after the mode switch none→push/bi and from
@@ -7169,7 +7169,7 @@ export class DiscordBot {
   // none→bi gap heal: agent replies posted in Intercom during the off window
   // were dropped by the webhook handler (and Intercom does not redeliver).
   // Re-fetch parts newer than the off-window start for open bridged tickets and
-  // feed them through the normal relay path — the part-id ledger makes anything
+  // feed them through the normal relay path; the part-id ledger makes anything
   // already relayed a no-op.
   // Reset/wipe: queued Intercom events live in workflow state and survive
   // IntercomStore.resetAll(), so they must be cleared by signal. Two phases:
@@ -7177,27 +7177,27 @@ export class DiscordBot {
   // AFTER resetAll (a signal-with-started workflow's state load must see the
   // post-reset DB, or it re-latches hasIntercomLink from a stale link row).
   // Targets: linked threads + backfill-enqueued threads (deepest queues, often
-  // link-less) + open tickets (live outboxes) — closed unlinked tickets can't
+  // link-less) + open tickets (live outboxes); closed unlinked tickets can't
   // hold meaningful queues.
   // "Heal Message Gaps": outage repair over OPEN tickets only (closed ones
   // are Backfill's job). Bridged → healMessageGaps re-enqueues human messages
   // missing from the delivered ledger, THEN the ticket's full Intercom part
   // history is re-fed through the inbound relay path (repairs agent replies
-  // whose webhook relay was dropped — e.g. reply-and-assign shipping the body
+  // whose webhook relay was dropped, e.g. reply-and-assign shipping the body
   // on an `assignment` part). Unbridged mirrorable → backfillTicket (creates
-  // the link + transcript — this is what un-wedges tickets whose creation
+  // the link + transcript: this is what un-wedges tickets whose creation
   // ensure was short-circuited by the old billing-wide gate). Idempotent end
   // to end: ledgers dedup messages, part-id claims dedup inbound relays,
   // claimBackfill dedups transcripts, so re-running after a partial failure
   // is safe.
   // Remote wipe: hard-deletes bridge-created tickets and conversations, and
   // ARCHIVES contacts (Intercom's DELETE /contacts is a permanent delete that
-  // locks the external_id for a 7-day grace — that would block the next
+  // locks the external_id for a 7-day grace; that would block the next
   // backfill; archiving stays reusable, unarchived on re-backfill). Clears the
   // local bridge state too.
   // Local state goes FIRST so the outbox drainer can't race the wipe (an
   // in-flight event would otherwise 404-self-heal and recreate objects).
-  // Failures are collected and reported, never fatal — leftovers can be
+  // Failures are collected and reported, never fatal: leftovers can be
   // removed by hand in Intercom.
   // Full history of a thread, oldest first (paged; works on archived threads).
   private async fetchAllThreadMessages(thread: ThreadChannel): Promise<BridgeSourceMessage[]> {
@@ -7216,7 +7216,7 @@ export class DiscordBot {
   }
 
   // Re-runnable reconciliation: walk every tracked ticket and repair its DB status/type/closed
-  // state to match the live Discord thread. DB-only — never renames threads, posts audit lines,
+  // state to match the live Discord thread. DB-only: never renames threads, posts audit lines,
   // or pings customers (so it's safe to run over old/migrated tickets whose categoryId defaulted
   // to null → "Other"). Idempotent: a second run over an unchanged guild writes ~nothing.
   private async handleReVerify(interaction: ButtonInteraction): Promise<void> {
@@ -7295,7 +7295,7 @@ export class DiscordBot {
           fixedType++;
         }
 
-        // Closed state — use the derived tag if known, else the ticket's current tag so a stale
+        // Closed state: use the derived tag if known, else the ticket's current tag so a stale
         // closed flag can still be repaired on an unknown-emoji thread.
         const effectiveTag = derivedTag ?? ticket.statusTag;
         const desiredClosed = thread.archived || thread.locked || (effectiveTag?.closesThread ?? false);
@@ -7527,7 +7527,7 @@ export class DiscordBot {
 
     // Bulk overwrite with retry, NON-FATAL on exhaustion: Discord's API
     // intermittently 500s this PUT, and the commands from the last successful
-    // registration stay live regardless — a transient Discord failure must
+    // registration stay live regardless; a transient Discord failure must
     // not take the whole bot down with it.
     const delays = [0, 2_000, 10_000];
     for (let attempt = 0; attempt < delays.length; attempt++) {
@@ -7554,7 +7554,7 @@ export class DiscordBot {
   async start(options?: { workerOnly?: boolean }): Promise<void> {
     // --worker-only: log in (Temporal activities need a live Discord client)
     // but leave slash-command registration and the HTTP surface to the main
-    // bot process — this is the future split-deployment topology.
+    // bot process: this is the future split-deployment topology.
     if (options?.workerOnly) {
       await this.client.login(this.config.discord.token);
       return;
@@ -7617,7 +7617,7 @@ export class DiscordBot {
         // Secret is read per request (BotSettings/Vault, changes live).
         getSecret: () => this.settingsStore.sentryWebhookSecret(),
         // Verified webhook → nudge the feedback-sync looper. The 20s debounce
-        // only bounds Temporal signal chatter under a delivery burst — the
+        // only bounds Temporal signal chatter under a delivery burst; the
         // looper's runNow flag coalesces anyway, and the 15-min poll is the
         // delivery guarantee when Temporal is paused/unreachable.
         onEvent: (() => {

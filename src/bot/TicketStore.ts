@@ -12,7 +12,7 @@ export interface CreateTicketInput {
   customerDisplayName?: string | null;
   categoryId?: string | null;
   question?: string | null;
-  // Discord-only ticket — never mirrored to Intercom (refund-flow threads).
+  // Discord-only ticket: never mirrored to Intercom (refund-flow threads).
   intercomExempt?: boolean;
 }
 
@@ -109,7 +109,7 @@ export class TicketStore {
   // clear them when a ticket is moved back to an active status.
   async setStatus(threadId: string, statusTagId: string, isDone: boolean): Promise<void> {
     // Remember where the ticket came from (skipped when re-applying the same status, so
-    // the real previous status survives) — restores Waiting-for-Customer on reply.
+    // the real previous status survives): restores Waiting-for-Customer on reply.
     const current = await this.prisma.ticket.findUnique({
       where: { threadId },
       select: { statusTagId: true },
@@ -337,7 +337,7 @@ export class TicketStore {
   }
 
   // Re-arm the rating prompt when a ticket reopens, so the next resolve/close
-  // prompts again. Only for unrated tickets — a recorded score is final
+  // prompts again. Only for unrated tickets: a recorded score is final
   // (recordCsat is single-winner), so re-prompting a rated customer is noise.
   async resetCsatPrompt(threadId: string): Promise<void> {
     await this.prisma.ticket.updateMany({
@@ -367,7 +367,7 @@ export class TicketStore {
 
   // ---- Status change history ----
   // Emoji+label are snapshotted as text so history survives tag edits and
-  // deletions. Legacy rows may carry kind "PRIORITY" — inert history from the
+  // deletions. Legacy rows may carry kind "PRIORITY": inert history from the
   // removed priority axis; nothing reads them.
 
   async addTagChange(input: {
