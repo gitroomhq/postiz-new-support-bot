@@ -1,9 +1,10 @@
 import { PrismaClient, SentryFeedbackImport } from "../generated/prisma/client";
 
-// Attempts before a failing submission is parked. Five 15-minute ticks is ~an
-// hour of transient-outage tolerance; past that the failure is structural and
-// re-running it every tick only costs Intercom calls.
+// Attempts before a failing submission is parked. Retries are spaced by 15
+// minutes even while new feedback is polled each minute. Past that budget the
+// failure is structural and re-running it every tick only costs Intercom calls.
 export const MAX_ITEM_ATTEMPTS = 5;
+const FAILURE_RETRY_INTERVAL_MS = 15 * 60_000;
 
 // Ledger accessors for sentry_feedback_imports: dedup by Sentry issue id,
 // exemption lookups by Intercom conversation id, and the /config counters.
@@ -86,21 +87,29 @@ export class SentryFeedbackStore {
     error: string;
   }): Promise<void> {
     const { sentryIssueId, error, ...rest } = data;
+    // For failed rows importedAt is the ledger write time, not a delivery.
+    // Move it on each failure so retries keep their 15-minute cooldown.
+    const importedAt = new Date();
     await this.prisma.sentryFeedbackImport.upsert({
       where: { sentryIssueId },
-      create: { sentryIssueId, ...rest, status: "failed", attempts: 1, lastError: error },
+      create: { sentryIssueId, ...rest, status: "failed", attempts: 1, lastError: error, importedAt },
       // status is deliberately NOT written here: a decoration that failed
       // after a successful import must never downgrade an imported row.
-      update: { attempts: { increment: 1 }, lastError: error },
+      update: { attempts: { increment: 1 }, lastError: error, importedAt },
     });
   }
 
   // Failed rows that still have attempts left, oldest first. The walk never
   // retries them (they are behind the watermark by then) — this drain owns
-  // every retry, so an item is attempted exactly once per tick.
+  // every retry. The cooldown preserves outage tolerance under a faster poll
+  // and prevents a fresh failure being attempted again in the same tick.
   listFailedForRetry(limit: number): Promise<SentryFeedbackImport[]> {
     return this.prisma.sentryFeedbackImport.findMany({
-      where: { status: "failed", attempts: { lt: MAX_ITEM_ATTEMPTS } },
+      where: {
+        status: "failed",
+        attempts: { lt: MAX_ITEM_ATTEMPTS },
+        importedAt: { lte: new Date(Date.now() - FAILURE_RETRY_INTERVAL_MS) },
+      },
       orderBy: { feedbackAt: "asc" },
       take: limit,
     });

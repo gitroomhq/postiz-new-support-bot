@@ -130,9 +130,10 @@ export async function slaEnforceWorkflow(): Promise<void> {
 
 // Sentry feedback → Intercom import: poll for new User Feedback widget
 // submissions and create Intercom conversations (agents reply there; Intercom
-// emails the submitter). 15-minute safety-net cadence — the POST
-// /sentry/webhook endpoint fires the runNow signal for near-real-time
-// imports. Gates (enabled/configured/watermark) re-read inside the activity,
+// emails the submitter). Sentry's issue.created subscription does not emit
+// widget feedback, so the one-minute poll owns timely delivery. Verified
+// POST /sentry/webhook requests can still accelerate a poll.
+// Gates (enabled/configured/watermark) re-read inside the activity,
 // so /config changes apply on the next tick.
 export async function sentryFeedbackWorkflow(): Promise<void> {
   let runNow = false;
@@ -150,7 +151,7 @@ export async function sentryFeedbackWorkflow(): Promise<void> {
       await light.sentryFeedbackTickFailed(describeActivityFailure(e)).catch(() => {});
     });
     await canIfDue(() => continueWithMemo<typeof sentryFeedbackWorkflow>());
-    await condition(() => runNow, 15 * 60_000);
+    await condition(() => runNow, 60_000);
   }
 }
 

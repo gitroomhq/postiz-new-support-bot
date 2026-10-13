@@ -50,7 +50,7 @@ export interface StripeWebhookRoute {
 
 // Inbound Sentry webhook (internal integration) — a pure accelerator for the
 // feedback-sync looper: after signature verification the payload is DISCARDED
-// and onEvent() just fires the looper's run-now signal (the 15-min poll is
+// and onEvent() just fires the looper's run-now signal (the 1-min poll is
 // the delivery guarantee). Secret lives in BotSettings/Vault; unset = the
 // endpoint rejects everything.
 export interface SentryWebhookRoute {

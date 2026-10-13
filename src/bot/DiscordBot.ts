@@ -3280,7 +3280,7 @@ export class DiscordBot {
           : s.sentryReadEnabled()
             ? lastError || looper?.wedged || (looper != null && looper.status !== "RUNNING")
               ? "⚠️ **degraded**: the poll is not importing cleanly (see Looper, Last attempt and Failed below)"
-              : "**on**: webhook accelerator + 15-min poll"
+              : "**on**: 1-min poll (Sentry issue webhooks do not emit widget feedback)"
             : "**off** (Sync Now still runs a one-shot test)";
 
     const embed = new EmbedBuilder()
@@ -3314,7 +3314,7 @@ export class DiscordBot {
           `**Last import:** ${lastImport ? `<t:${Math.floor(lastImport.getTime() / 1000)}:R>` : "_never_"}`,
           `**Webhook URL:** ${base ? `\`${base}/sentry/webhook\`` : "⚠️ _no public URL: set one via Billing → Stripe Webhooks_"}`,
           "",
-          "Each User Feedback widget item becomes an Intercom conversation authored by the submitter (email contact): replies are emailed to them and their answers thread back. Feedback with no resolvable identity is parked and re-examined once (Awaiting replay). Create a Sentry **internal integration** (token scopes `org:read project:read event:read`), point its webhook at the URL above and paste its client secret here; unsigned posts are rejected and the 15-min poll covers delivery.",
+          "Each User Feedback widget item becomes an Intercom conversation authored by the submitter (email contact): replies are emailed to them and their answers thread back. Feedback with no resolvable identity is parked and re-examined once (Awaiting replay). Create a Sentry **internal integration** (token scopes `org:read project:read event:read`). The 1-min poll owns delivery: Sentry's `issue.created` webhook does not emit widget feedback. A webhook is optional; verified posts accelerate a poll and unsigned posts are rejected. Feedback Sentry marks as spam is excluded: move a legitimate submission to Sentry's feedback Inbox, then Sync Now.",
           "Feedback conversations get agent-idle notes but are never nagged, auto-closed or SLA-clocked. Disabling keeps the import floor: a re-enable imports the gap. **Import Floor** moves that line by hand: forward to write off a backlog (skipped for good), back to re-examine it (already-imported feedback is deduped).",
         ].join("\n")
       );
@@ -6331,7 +6331,7 @@ export class DiscordBot {
           makeEmbed(
             this.settingsStore.sentryWebhookSecret()
               ? "Sentry feedback credentials saved. Point the internal integration's webhook at `POST <public-url>/sentry/webhook`."
-              : "Sentry feedback credentials saved. No webhook secret set; the webhook endpoint rejects everything and the 15-min poll carries imports alone.",
+              : "Sentry feedback credentials saved. No webhook secret set; the webhook endpoint rejects everything and the 1-min poll carries imports alone.",
             COLORS.success
           ),
         ],
@@ -7626,7 +7626,7 @@ export class DiscordBot {
         getSecret: () => this.settingsStore.sentryWebhookSecret(),
         // Verified webhook → nudge the feedback-sync looper. The 20s debounce
         // only bounds Temporal signal chatter under a delivery burst; the
-        // looper's runNow flag coalesces anyway, and the 15-min poll is the
+        // looper's runNow flag coalesces anyway, and the 1-min poll is the
         // delivery guarantee when Temporal is paused/unreachable.
         onEvent: (() => {
           let lastSignalAt = 0;

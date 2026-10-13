@@ -55,6 +55,40 @@ test("workflow suite (time-skipping)", { skip: !ENABLED && "set TEMPORAL_TEST=1 
       activities,
     });
 
+  await t.test("sentry feedback polls each minute without a webhook and signals bypass the wait", async () => {
+    const forces: boolean[] = [];
+    const worker = await makeWorker({
+      sentryFeedbackTick: async (force: boolean) => {
+        forces.push(force);
+        return {};
+      },
+    });
+    await worker.runUntil(async () => {
+      const handle = await env.client.workflow.start("sentryFeedbackWorkflow", {
+        taskQueue,
+        workflowId: "feedback-minute-poll",
+      });
+      const waitForTicks = async (count: number) => {
+        const deadline = Date.now() + 10_000;
+        while (forces.length < count && Date.now() < deadline) {
+          await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+        assert.equal(forces.length, count);
+      };
+      try {
+        await waitForTicks(1);
+        await env.sleep("61 seconds");
+        await waitForTicks(2);
+        assert.deepEqual(forces, [false, false]);
+        await handle.signal("sentryFeedbackRunNow");
+        await waitForTicks(3);
+        assert.deepEqual(forces, [false, false, true]);
+      } finally {
+        await handle.terminate();
+      }
+    });
+  });
+
   await t.test("ticketWorkflow evaluates timers on the 30-minute scan and runs auto-close as a child", async () => {
     const calls: string[] = [];
     let checks = 0;

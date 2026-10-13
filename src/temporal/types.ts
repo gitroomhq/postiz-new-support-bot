@@ -83,7 +83,8 @@ export const LOOPER_GENERATIONS: Record<string, number> = {
   // activity was timing out). 3: the loop body gained the
   // sentryFeedbackTickFailed stamp on the tick's failure path, which is a new
   // activity call, so the gen-2 runs now in flight cannot replay this bundle.
-  [SINGLETONS.sentryFeedback]: 3,
+  // 4: one-minute polling, since issue.created does not emit widget feedback.
+  [SINGLETONS.sentryFeedback]: 4,
   [SINGLETONS.moneyOut]: 1,
 };
 

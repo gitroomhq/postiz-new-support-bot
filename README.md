@@ -122,15 +122,17 @@ Writes are silent (`skip_notifications`, no notes). `/intercom → Automation` s
 
 ### Sentry feedback → Intercom import
 
-Sentry's User Feedback widget is write-only for users: nobody can answer them there. The `sentry-feedback-sync` looper (15 min, plus a webhook accelerator) turns each **widget** feedback item into an Intercom conversation authored by an email contact matching the submitter: agents reply in Intercom, Intercom's email fallback delivers the reply (imported contacts never have Messenger sessions), and the submitter's email answer threads back into the same conversation. Sentry itself is strictly read-only; anonymous submissions are skipped (counted on the panel); there is **no backfill**: the first enable stamps an import floor.
+Sentry's User Feedback widget is write-only for users: nobody can answer them there. The `sentry-feedback-sync` looper polls every **1 minute** and turns each **widget** feedback item into an Intercom conversation authored by an email contact matching the submitter: agents reply in Intercom, Intercom's email fallback delivers the reply (imported contacts never have Messenger sessions), and the submitter's email answer threads back into the same conversation. Sentry itself is strictly read-only; anonymous submissions are skipped (counted on the panel); there is **no backfill**: the first enable stamps an import floor. Failed imports retain a 15-minute retry cooldown and five-attempt budget.
 
 Setup (`/config → Integrations → Sentry Feedback`):
 
 1. In Sentry, create an **org auth token** with `org:read`, `project:read`, `event:read` and paste it via **Credentials** (Vault-routed like every global secret).
 2. Set **Org & Projects** (org slug required; project slugs optional allowlist; region `us`/`eu`).
-3. Optional real-time trigger: Sentry → Settings → Developer Settings → **internal integration** → webhook URL `POST <public-url>/sentry/webhook` (Issue events on), paste its **client secret** via Credentials. Unsigned/unverified posts get 403; the poll alone also works.
+3. Optional webhook: Sentry → Settings → Developer Settings → **internal integration** → webhook URL `POST <public-url>/sentry/webhook`, paste its **client secret** via Credentials. Verified posts accelerate a poll; unsigned/unverified posts get 403. **Sentry's `issue.created` subscription does not emit widget feedback** ([upstream issue](https://github.com/getsentry/sentry/issues/89436)), so the one-minute poll owns timely delivery.
 4. Optional **Ticket Type**: when set, every new import is immediately converted into a ticket of that type (Customer category recommended: one unified inbox object, same convert path as the bridge; conversion is best-effort, a failure leaves the plain conversation standing). Optional **Team Routing**: imported conversations (and their converted tickets) get team-assigned on creation, and thereby balanced by the assignment engine if that team has it enabled.
 5. Toggle **Enabled: on** (stamps the import floor on first enable); **Sync Now** forces a one-shot test run.
+
+Sentry's issue listing excludes feedback marked as spam. For a legitimate submission misclassified as spam, open Sentry → User Feedback → Spam, select it and **Move to Inbox**, then **Sync Now**. A completed sync with no errors means the listing was processed, not that a specific spam-filtered submission was imported.
 
 Imported conversations are tagged `sentry-feedback`, carry an internal metadata note (submitter, page URL, Sentry link; the conversation itself is backdated to the submission time), get agent-idle reminder notes (once; the ticket sweep skips converted imports), and are **never** customer-nagged, auto-closed or SLA-clocked.
 
