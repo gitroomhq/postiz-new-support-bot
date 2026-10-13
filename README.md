@@ -185,6 +185,8 @@ Members holding a **ticket block role** can't open tickets from the Discord supp
 
 ### Intercom Queue
 
+Queue OAuth navigation uses an HTTP 200 page with an immediate browser redirect and a Continue link. This preserves the Intercom sign-in destination and the return to `/queue` when a proxy replaces response `Location` headers. OAuth cookies, single-use state checks, no-store caching and no-referrer protection still apply.
+
 A web page at `/queue` that lists the Intercom tickets waiting on a reply from the team. It is separate from `/panel`: its own sign-in (Intercom OAuth), its own cookie, its own sidebar, the same look. **Ships off.**
 
 - **Who**: any teammate of the bridge's Intercom workspace with an inbox seat. Sign-in goes through a dedicated Developer Hub OAuth app; the token Intercom returns is used once for `GET /me` and dropped. A sign-in is refused when the email is unverified, the account is in another workspace, or the teammate has no inbox seat (Operator/Fin and the bridge's own admin are never people). Refused sign-ins post to the audit channel; successful ones do not.

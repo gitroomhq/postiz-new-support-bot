@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { QueuePanel, viewRequest } from "../QueuePanel";
 import { renderQueueShell } from "../html/queueShell";
+import { renderQueueNavigation } from "../html/queueNavigation";
 import { queueReadiness } from "../queueConfig";
 import { makeQueueHub } from "../../adminpanel/sections/queueHub";
 import type { QueueAuth, QueueActor } from "../QueueAuth";
@@ -11,6 +12,14 @@ import type { QueueExclusions } from "../../config/SettingsStore";
 
 // The /queue route object (kill switch, the session gate, request shaping),
 // the shell, readiness, and the web Queue hub's validation.
+
+test("OAuth navigation escapes destinations in the refresh and fallback link without running scripts", () => {
+  const html = renderQueueNavigation('/queue?e=error&x="/><script>alert(1)</script>', "nonce1");
+  assert.ok(!html.includes("<script>"));
+  assert.ok(html.includes('content="0;url=/queue?e=error&amp;x=&quot;/&gt;&lt;script&gt;alert(1)&lt;/script&gt;"'));
+  assert.ok(html.includes('href="/queue?e=error&amp;x=&quot;/&gt;&lt;script&gt;alert(1)&lt;/script&gt;"'));
+  assert.ok(html.includes('<meta name="referrer" content="no-referrer">'));
+});
 
 function readinessSettings(over: Partial<Record<string, unknown>> = {}) {
   return {

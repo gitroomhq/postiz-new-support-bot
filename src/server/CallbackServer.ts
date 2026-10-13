@@ -1,6 +1,6 @@
 import express, { type Express, type Request } from "express";
 import * as Sentry from "@sentry/node";
-import { createHash, createHmac, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import type Stripe from "stripe";
 import { BotConfig } from "../config";
 import { OAuthManager } from "../auth/OAuthManager";
@@ -11,6 +11,7 @@ import { TemporalBufferedError } from "../temporal/producers";
 import { mountPanel, parseCookies, PANEL_SECURITY_HEADERS, type MountedPanelRoute } from "./panelMount";
 import type { QueueRoute } from "../queue/QueuePanel";
 import type { QueueRedirect } from "../queue/QueueAuth";
+import { renderQueueNavigation } from "../queue/html/queueNavigation";
 
 const httpLog = log.child("http");
 
@@ -321,16 +322,19 @@ export class CallbackServer {
         res.status(404).set({ "Cache-Control": "no-store", ...PANEL_SECURITY_HEADERS }).send("Not found");
         return;
       }
-      res.status(302).set({
-        Location: r.location,
+      const nonce = randomBytes(16).toString("base64");
+      res.status(200).set({
+        "Content-Type": "text/html; charset=utf-8",
         "Cache-Control": "no-store",
+        "X-Frame-Options": "DENY",
+        "Content-Security-Policy": `default-src 'none'; style-src 'nonce-${nonce}'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; object-src 'none'`,
         // The callback URL carries the authorization code: never leak it
         // onward in a Referer.
         "Referrer-Policy": "no-referrer",
         ...PANEL_SECURITY_HEADERS,
       });
       if (r.setCookies.length) res.setHeader("Set-Cookie", r.setCookies);
-      res.end();
+      res.send(renderQueueNavigation(r.location, nonce));
     };
     this.app.get("/queue/oauth/start", (req, res) => {
       const queue = this.queue;

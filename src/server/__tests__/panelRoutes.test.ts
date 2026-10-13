@@ -1,6 +1,6 @@
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
-import type { Express } from "express";
+import express, { type Express } from "express";
 import type { AddressInfo } from "node:net";
 import type { Server } from "node:http";
 import { CallbackServer } from "../CallbackServer";
@@ -194,7 +194,10 @@ const queueServer = new CallbackServer(
     oauthCallback: async (query, oauthCookie) => ({
       status: 302,
       location: `/queue?code=${String(query.code)}&cookie=${oauthCookie}`,
-      setCookies: [],
+      setCookies: [
+        "__Host-queue-oauth=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0",
+        "__Host-queue=session1; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=3600",
+      ],
     }),
   }
 );
@@ -206,8 +209,9 @@ test("/queue/oauth/* reach the OAuth handlers, not the /queue shell; /queue deep
   const at = `http://127.0.0.1:${(s.address() as AddressInfo).port}`;
   try {
     const start = await fetch(`${at}/queue/oauth/start`, { redirect: "manual" });
-    assert.equal(start.status, 302);
-    assert.equal(start.headers.get("location"), "https://app.intercom.com/oauth?state=s");
+    assert.equal(start.status, 200);
+    assert.equal(start.headers.get("location"), null);
+    assert.match(await start.text(), /<meta http-equiv="refresh" content="0;url=https:\/\/app.intercom.com\/oauth\?state=s">/);
     assert.match(start.headers.get("set-cookie") ?? "", /__Host-queue-oauth=n/);
     assert.equal(start.headers.get("referrer-policy"), "no-referrer");
 
@@ -215,8 +219,11 @@ test("/queue/oauth/* reach the OAuth handlers, not the /queue shell; /queue deep
       redirect: "manual",
       headers: { Cookie: "__Host-queue-oauth=nonce1; __Host-queue=other" },
     });
-    assert.equal(cb.status, 302);
-    assert.equal(cb.headers.get("location"), "/queue?code=abc&cookie=nonce1");
+    assert.equal(cb.status, 200);
+    assert.equal(cb.headers.get("location"), null);
+    assert.match(await cb.text(), /content="0;url=\/queue\?code=abc&amp;cookie=nonce1"/);
+    assert.equal(cb.headers.getSetCookie().length, 2);
+    assert.match(cb.headers.get("set-cookie") ?? "", /__Host-queue=session1/);
 
     const root = await fetch(`${at}/queue`);
     assert.match(await root.text(), /<title>queue<\/title>/);
@@ -229,6 +236,40 @@ test("/queue/oauth/* reach the OAuth handlers, not the /queue shell; /queue deep
       body: "{}",
     });
     assert.deepEqual(await api.json(), { shell: "queue", endpoint: "status", sessionId: "sess1" });
+  } finally {
+    s.close();
+  }
+});
+
+test("queue OAuth navigation survives a proxy replacing Location on every response", async () => {
+  const edge = express();
+  edge.use((_req, res, next) => {
+    res.setHeader("Location", "https://postiz.com/api/success");
+    next();
+  });
+  edge.use(queueApp);
+  const s = edge.listen(0, "127.0.0.1");
+  await new Promise<void>((resolve) => s.once("listening", resolve));
+  const at = `http://127.0.0.1:${(s.address() as AddressInfo).port}`;
+  try {
+    for (const [path, destination] of [
+      ["/queue/oauth/start", "https://app.intercom.com/oauth?state=s"],
+      ["/queue/oauth/callback?code=abc&state=s", "/queue?code=abc&amp;cookie=nonce1"],
+    ]) {
+      const response = await fetch(`${at}${path}`, { redirect: "manual", headers: { Cookie: "__Host-queue-oauth=nonce1" } });
+      assert.equal(response.status, 200, "a 200 ignores the proxy's Location header");
+      assert.equal(response.headers.get("location"), "https://postiz.com/api/success");
+      assert.equal(response.headers.get("cache-control"), "no-store");
+      assert.equal(response.headers.get("referrer-policy"), "no-referrer");
+      const html = await response.text();
+      assert.ok(html.includes(`content="0;url=${destination}"`));
+      assert.ok(html.includes(`href="${destination}"`), "manual continuation uses the same destination");
+      assert.ok(!html.includes("postiz.com/api/success"));
+      const nonce = /<style nonce="([^"]+)">/.exec(html)?.[1];
+      assert.ok(nonce);
+      assert.ok(response.headers.get("content-security-policy")?.includes(`style-src 'nonce-${nonce}'`));
+      assert.ok(response.headers.getSetCookie().length > 0);
+    }
   } finally {
     s.close();
   }
