@@ -127,6 +127,7 @@ import { describeSaResult } from "../temporal/searchAttributes";
 import { SINGLETONS } from "../temporal/types";
 import { buildIdIsDegenerate } from "../temporal/buildId";
 import { validateCertPair } from "../temporal/certs";
+import type { QueueRoute } from "../queue/QueuePanel";
 import { VaultMigrator, COLUMN_LABELS, type MigrateItemResult, type MigrateReport } from "../vault/VaultMigrator";
 import { EMAIL_COMMAND, EMAIL_PREFIX, EmailCommand } from "./EmailCommand";
 import type { EmailDeliverabilityService } from "../resend/EmailDeliverabilityService";
@@ -183,6 +184,7 @@ export class DiscordBot {
   private adminPanelDiscord?: AdminPanelDiscord;
   private dashboard?: Dashboard;
   private dashboardDiscord?: DashboardDiscord;
+  private queuePanel?: QueueRoute;
   // SLA manager, bound late from index.ts; hooks fire-and-forget on ticket
   // creation and customer replies.
   private slaService: {
@@ -343,6 +345,12 @@ export class DiscordBot {
   bindDashboard(deps: { panel: Dashboard; discord: DashboardDiscord }): void {
     this.dashboard = deps.panel;
     this.dashboardDiscord = deps.discord;
+  }
+
+  // Late-bound from index.ts: the Intercom Queue (/queue). Used by start()
+  // (CallbackServer route) only; its settings live in /intercom → Queue.
+  bindQueue(route: QueueRoute): void {
+    this.queuePanel = route;
   }
 
   private setupEventHandlers(): void {
@@ -7632,7 +7640,8 @@ export class DiscordBot {
       },
       this.deliveryLog
         ? { handle: (raw, headers) => this.deliveryLog!.handleWebhook(raw, headers) }
-        : undefined
+        : undefined,
+      this.queuePanel
     );
     callbackServer.start();
   }

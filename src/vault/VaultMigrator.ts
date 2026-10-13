@@ -20,6 +20,7 @@ export const COLUMN_LABELS: Record<GlobalSecretColumn, string> = {
   postizApiKey: "Postiz API key",
   resendApiKey: "Resend API key",
   resendWebhookSecret: "Resend webhook signing secret",
+  queueOauthClientSecret: "Intercom Queue OAuth client secret",
 };
 
 export interface MigrateItemResult {

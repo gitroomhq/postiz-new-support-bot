@@ -1259,6 +1259,31 @@ export const STATEMENTS: string[] = [
   `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "ticketBlockRoleIds" TEXT NOT NULL DEFAULT ''`,
   `ALTER TABLE "tickets" ADD COLUMN IF NOT EXISTS "blockClosedAt" TIMESTAMP(3)`,
   `CREATE INDEX IF NOT EXISTS "tickets_customerId_idx" ON "tickets"("customerId")`,
+  // Intercom Queue (/queue): settings (ships OFF) and its Intercom OAuth
+  // sign-ins.
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "queueEnabled" BOOLEAN NOT NULL DEFAULT false`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "queueOauthClientId" TEXT`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "queueOauthClientSecret" TEXT`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "queueEpoch" INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "queueFinCountsAsReply" BOOLEAN NOT NULL DEFAULT false`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "queueNotesCountAsReply" BOOLEAN NOT NULL DEFAULT false`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "queueExclusionsJson" JSONB`,
+  `CREATE TABLE IF NOT EXISTS "queue_sessions" (
+    "id" TEXT NOT NULL,
+    "adminId" TEXT NOT NULL,
+    "adminName" TEXT NOT NULL,
+    "epoch" INTEGER NOT NULL,
+    "uaFirst" TEXT,
+    "ipFirst" TEXT,
+    "ipLast" TEXT,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "lastSeenAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "lastVerifiedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "absoluteExpiresAt" TIMESTAMP(3) NOT NULL,
+    CONSTRAINT "queue_sessions_pkey" PRIMARY KEY ("id")
+  )`,
+  `CREATE INDEX IF NOT EXISTS "queue_sessions_adminId_idx" ON "queue_sessions"("adminId")`,
+  `CREATE INDEX IF NOT EXISTS "queue_sessions_absoluteExpiresAt_idx" ON "queue_sessions"("absoluteExpiresAt")`,
 ];
 
 export async function ensureSchema(prisma: PrismaClient): Promise<void> {

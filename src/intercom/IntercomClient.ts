@@ -99,15 +99,29 @@ export class IntercomClient {
 
   // ---- Identity ----
 
-  async getMe(): Promise<{ id: string; name?: string | null; email?: string | null; region?: string | null }> {
-    const data = await this.json<{ id?: string | number; name?: string; email?: string; app?: { region?: string } }>(
-      "/me",
-      "GET",
-      undefined,
-      "me"
-    );
+  async getMe(): Promise<{
+    id: string;
+    name?: string | null;
+    email?: string | null;
+    region?: string | null;
+    appIdCode?: string | null;
+  }> {
+    const data = await this.json<{
+      id?: string | number;
+      name?: string;
+      email?: string;
+      app?: { region?: string; id_code?: string };
+    }>("/me", "GET", undefined, "me");
     if (data.id == null) throw new IntercomHttpError(500, "Intercom me: missing id in response");
-    return { id: String(data.id), name: data.name ?? null, email: data.email ?? null, region: data.app?.region ?? null };
+    return {
+      id: String(data.id),
+      name: data.name ?? null,
+      email: data.email ?? null,
+      region: data.app?.region ?? null,
+      // The workspace id ("d7n4qsa4"): inbox links carry it, and the Intercom
+      // Queue sign-in compares it with the teammate's own workspace.
+      appIdCode: data.app?.id_code ?? null,
+    };
   }
 
   async listAdmins(): Promise<IntercomAdmin[]> {
@@ -1095,6 +1109,45 @@ export class IntercomClient {
         })),
       nextStartingAfter: data.pages?.next?.starting_after ?? null,
     };
+  }
+
+  // ---- Intercom Queue reads (src/queue): raw pages, parsed by queueModel ----
+
+  // One page of open conversations (snoozed included: open stays true while
+  // snoozed). Raw objects, because the queue reads a wider projection than
+  // the sweeper (source author, title, tags, the linked ticket).
+  async searchOpenConversationsRaw(startingAfter?: string | null): Promise<{ items: unknown[]; nextStartingAfter: string | null }> {
+    const data = await this.json<{ conversations?: unknown[]; pages?: { next?: { starting_after?: string } | null } }>(
+      "/conversations/search",
+      "POST",
+      {
+        query: { field: "open", operator: "=", value: true },
+        pagination: { per_page: 150, ...(startingAfter ? { starting_after: startingAfter } : {}) },
+      },
+      "conversation search (queue)"
+    );
+    return { items: data.conversations ?? [], nextStartingAfter: data.pages?.next?.starting_after ?? null };
+  }
+
+  // One page of open Customer tickets: the state (custom id, category, label)
+  // and type the queue joins onto its conversations.
+  async searchOpenCustomerTicketsRaw(startingAfter?: string | null): Promise<{ items: unknown[]; nextStartingAfter: string | null }> {
+    const data = await this.json<{ tickets?: unknown[]; pages?: { next?: { starting_after?: string } | null } }>(
+      "/tickets/search",
+      "POST",
+      {
+        query: {
+          operator: "AND",
+          value: [
+            { field: "open", operator: "=", value: true },
+            { field: "category", operator: "=", value: "Customer" },
+          ],
+        },
+        pagination: { per_page: 150, ...(startingAfter ? { starting_after: startingAfter } : {}) },
+      },
+      "ticket search (queue)"
+    );
+    return { items: data.tickets ?? [], nextStartingAfter: data.pages?.next?.starting_after ?? null };
   }
 
   // Admin note on a ticket (the sweeper's agent-idle nag for native tickets —

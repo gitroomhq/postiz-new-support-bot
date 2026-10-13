@@ -8,7 +8,9 @@ import { log } from "../util/logger";
 import { metricCount } from "../util/instrument";
 import { exportIntercomWebhook } from "../metrics/MetricsExporter";
 import { TemporalBufferedError } from "../temporal/producers";
-import { mountPanel, type MountedPanelRoute } from "./panelMount";
+import { mountPanel, parseCookies, PANEL_SECURITY_HEADERS, type MountedPanelRoute } from "./panelMount";
+import type { QueueRoute } from "../queue/QueuePanel";
+import type { QueueRedirect } from "../queue/QueueAuth";
 
 const httpLog = log.child("http");
 
@@ -99,7 +101,8 @@ export class CallbackServer {
     private adminPanel?: AdminPanelRoute,
     private dashboard?: DashboardRoute,
     private sentryWebhook?: SentryWebhookRoute,
-    private resendWebhook?: ResendWebhookRoute
+    private resendWebhook?: ResendWebhookRoute,
+    private queue?: QueueRoute
   ) {
     this.app = express();
     // req.ip drives the panel per-IP throttle. Without this, req.ip is the
@@ -307,6 +310,71 @@ export class CallbackServer {
       // copied links deep-load; the client router owns the path from there.
       spaWildcard: true,
       route: () => this.dashboard,
+    });
+
+    // Intercom Queue (/queue): its own shell, cookie and Intercom OAuth
+    // sign-in, nothing shared with /panel. The two OAuth routes register
+    // BEFORE the mount: its spaWildcard GET /queue/*splat would otherwise
+    // answer them with the shell (covered by __tests__/panelRoutes.test.ts).
+    const sendRedirect = (res: express.Response, r: QueueRedirect) => {
+      if (r.status === 404) {
+        res.status(404).set({ "Cache-Control": "no-store", ...PANEL_SECURITY_HEADERS }).send("Not found");
+        return;
+      }
+      res.status(302).set({
+        Location: r.location,
+        "Cache-Control": "no-store",
+        // The callback URL carries the authorization code: never leak it
+        // onward in a Referer.
+        "Referrer-Policy": "no-referrer",
+        ...PANEL_SECURITY_HEADERS,
+      });
+      if (r.setCookies.length) res.setHeader("Set-Cookie", r.setCookies);
+      res.end();
+    };
+    this.app.get("/queue/oauth/start", (req, res) => {
+      const queue = this.queue;
+      if (!queue) {
+        res.status(404).send("Not found");
+        return;
+      }
+      if (!allowIp(req.ip)) {
+        res.status(429).set("Cache-Control", "no-store").send("Too many requests.");
+        return;
+      }
+      sendRedirect(res, queue.oauthStart());
+    });
+    this.app.get("/queue/oauth/callback", async (req, res) => {
+      const queue = this.queue;
+      if (!queue) {
+        res.status(404).send("Not found");
+        return;
+      }
+      if (!allowIp(req.ip)) {
+        res.status(429).set("Cache-Control", "no-store").send("Too many requests.");
+        return;
+      }
+      try {
+        const r = await queue.oauthCallback(
+          { code: req.query.code, state: req.query.state, error: req.query.error },
+          parseCookies(req.headers.cookie)["__Host-queue-oauth"] ?? "",
+          { ip: req.ip, ua: req.header("user-agent") }
+        );
+        sendRedirect(res, r);
+      } catch (e) {
+        httpLog.error("queue oauth callback failed", e);
+        sendRedirect(res, { status: 302, location: "/queue?e=error", setCookies: [] });
+      }
+    });
+    mountPanel(this.app, allowIp, {
+      pagePath: "/queue",
+      apiPath: "/queue/api/:endpoint",
+      cookieName: "__Host-queue",
+      metricName: "queue.auth_failures",
+      logLabel: "intercom queue",
+      jsonLimit: "32kb",
+      spaWildcard: true,
+      route: () => this.queue,
     });
 
     // Stripe webhook. Stripe signs with `Stripe-Signature` over the RAW body;

@@ -454,6 +454,22 @@ model BotSettings {
   // LOCKDOWN) kills every outstanding dashboard link and session instantly,
   // independent of the other two panels.
   dashboardEpoch          Int     @default(0)
+  // Intercom Queue (/queue, edited via /intercom → Queue): a standalone web
+  // view of the tickets waiting on a teammate reply, signed in with Intercom
+  // OAuth instead of the dashboard login. Ships OFF (routes answer 404).
+  // The OAuth app is its own Developer Hub app: client id here, client secret
+  // encrypted (crypto.ts/Vault). Bumping queueEpoch signs everyone out.
+  queueEnabled            Boolean @default(false)
+  queueOauthClientId      String?
+  queueOauthClientSecret  String?
+  queueEpoch              Int     @default(0)
+  // What counts as our reply on top of a human teammate's message (both off:
+  // only people count, like the customer-responded state).
+  queueFinCountsAsReply   Boolean @default(false)
+  queueNotesCountAsReply  Boolean @default(false)
+  // { teams: [{id,name}], tags: [{id,name}], ticketTypes: [{id,name}] }: never
+  // listed in the queue. Names are snapshots for display; ids are the authority.
+  queueExclusionsJson     Json?
   // YubiKey OTP sign-in (Yubico validation protocol). Client ID from
   // upgrade.yubico.com/getapikey; blank disables the yubikey login path.
   yubicoClientId          String?
@@ -1638,4 +1654,26 @@ model PostizCreditReset {
 
   @@index([orgId, creditType, createdAt])
   @@map("postiz_credit_resets")
+}
+
+// Intercom Queue sign-ins (/queue). Same shape as dashboard_sessions: id =
+// SHA-256 hex of the cookie token, 7d idle / 30d absolute. The teammate is an
+// Intercom admin id; lastVerifiedAt is the last time they were confirmed to
+// still be a seated teammate of the workspace.
+model QueueSession {
+  id                String   @id
+  adminId           String
+  adminName         String
+  epoch             Int
+  uaFirst           String?
+  ipFirst           String?
+  ipLast            String?
+  createdAt         DateTime @default(now())
+  lastSeenAt        DateTime @default(now())
+  lastVerifiedAt    DateTime @default(now())
+  absoluteExpiresAt DateTime
+
+  @@index([adminId])
+  @@index([absoluteExpiresAt])
+  @@map("queue_sessions")
 }

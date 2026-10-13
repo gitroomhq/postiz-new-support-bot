@@ -7,6 +7,7 @@ A Discord-first customer support bot for [Postiz](https://github.com/gitroomhq/p
 - **Discord** (`discord.js` v14): the customer UI + the Stripe-side staff tooling Intercom doesn't cover. Customers open tickets from a panel; the slash commands are `/setup`, `/config`, `/intercom`, `/search-tickets`, `/postiz`, `/email`, `/charge`, `/billing` (plus the `/debug-attribute` diagnostic). All other agent actions (status, notes, reminders, escalation, canned replies, AI assist, reports) were retired in the **agent-rip** release: agents work tickets in Intercom.
 - **Dispute evidence** (`src/bot/billing/evidence/`): `/billing → Disputes` and the web panel build evidence packs from a deterministic template corpus (operator overrides live in the panel's template editor), filled in with real Stripe, Postiz-usage and support facts. No model writes evidence: the `claude` CLI runner and `LightAiRunner` are orphaned (constructed, never called) until a follow-up removes them together with the knowledge-base refresh of `search/`, the cloned Postiz source and docs the template wording was written against. Every dispute also carries a fight-or-accept **verdict** (see [Dispute verdict](#dispute-verdict-fight-or-accept)).
 - **InfluxDB export** (`src/metrics/`): optional InfluxDB 2.x exporter for billing events (refunds/discounts/charge reviews/disputes/fraud warnings), dispute gauges, the dispute automation surface (auto-resolve outcomes, evidence-pack strength, fact-source coverage, per-dispute history events and the two cutover phases), money-out with segment tags, subscription churn, Intercom bridge health (queue depths, webhook outcomes, inactivity sweeps) and a bot-health heartbeat. Connection (url/org/bucket/token; token encrypted at rest) is set in `/config → Analytics`. Grafana dashboards live in `grafana/dashboards/` (user-managed).
+- **Intercom Queue** (`src/queue/`): a standalone `/queue` web page of the tickets waiting on a teammate reply (per inbox, per teammate, global; All, Longest waiting, Randomizer), signed in with Intercom OAuth. See [Intercom Queue](#intercom-queue).
 - **Intercom bridge** (`src/intercom/`): optional two-way sync (`none` / `push` / `bi`) of each Discord ticket to an Intercom conversation + customer ticket, with a durable outbox/inbox, echo-suppression, and a Canvas Kit inbox sidebar. HMAC-verified webhooks.
 - **Stripe** (`src/bot/StripeClient.ts`, `BillingAdmin`, `src/bot/billing/`): customer self-service "refund & cancel" with guardrails (amount cap, per-24h velocity global + per-user, min membership age), plus a large staff `/billing` admin console. Dispute / early-fraud-warning **webhooks** are registered programmatically (no dashboard access needed) and alert staff.
 - **Observability** (`@sentry/node`): errors, gen_ai spans, wide-event logs, and metrics. DSN and all knobs are set at runtime via `/config → Sentry`. The Sentry release is the 6-char git SHA, the same id as the Temporal worker deployment version.
@@ -182,6 +183,26 @@ Members holding a **ticket block role** can't open tickets from the Discord supp
 - **Getting a block role**: the member's open tickets are closed with the closing tag, silently (no notice, no rating prompt), like when a member leaves. Intercom gets an internal note saying why. Picking a role in `/config` closes nothing by itself: only a role added to a member from then on does. For a member the bot hasn't cached, the role add is confirmed in the audit log (needs View Audit Log); without it the tickets are left open.
 - **Losing it**: the tickets the block closed reopen to the initial status, silently, with an Intercom note. A ticket that was reopened by hand in between (Discord, Intercom or Re-Verify) is no longer counted as block-closed and stays as it is.
 
+### Intercom Queue
+
+A web page at `/queue` that lists the Intercom tickets waiting on a reply from the team. It is separate from `/panel`: its own sign-in (Intercom OAuth), its own cookie, its own sidebar, the same look. **Ships off.**
+
+- **Who**: any teammate of the bridge's Intercom workspace with an inbox seat. Sign-in goes through a dedicated Developer Hub OAuth app; the token Intercom returns is used once for `GET /me` and dropped. A sign-in is refused when the email is unverified, the account is in another workspace, or the teammate has no inbox seat (Operator/Fin and the bridge's own admin are never people). Refused sign-ins post to the audit channel; successful ones do not.
+- **Sessions**: `queue_sessions`, 7 days idle / 30 days absolute, cookie `__Host-queue`. The teammate is re-checked against Intercom every 5 minutes, so removing or unseating them ends the session (while Intercom is unreachable a session keeps working for 30 minutes). **Sign Everyone Out** ends every session at once.
+- **What it lists**: open conversations (Customer tickets and conversations never converted) where the customer spoke last. Waiting on customer and Resolved tickets are never listed; snoozed ones only behind the page's Snoozed filter. A teammate's message counts as a reply, and so does a Discord staff message on a bridged ticket. Fin replies and internal notes count only when their toggles are on (both off by default); with a toggle on, the parts of each candidate are read (cached per conversation version, at most 200 reads a minute) and only notes by people count. Each ticket is a **First reply** (no teammate reply yet) or a **Follow-up** (the customer wrote again). The wait runs from the customer's oldest unanswered message, in real time.
+- **Scopes**: Mine (the landing page), Global, every team inbox plus Unassigned, every seated teammate plus "No person". The sidebar shows the busiest inboxes and people with live counts; *All inboxes* and *All people* list every one, 25 to a page.
+- **Views** (tabs on every scope): **All** (longest waiting first, 25 to a page, counts for First reply / Follow-up, filters for Priority, SLA status and Snoozed), **Longest waiting** (one card for the oldest ticket with the customer's latest message, stepping through the top ten), **Randomizer** (a pick weighted by wait time, only from unassigned tickets and your own, reserved for you for 10 minutes so nobody else rolls it; *Roll again*, *Release*). The page is read-only: every ticket has *Open in Intercom*.
+- **Freshness**: one shared Intercom scan a minute (conversation search plus open Customer ticket search, 150 per page, capped at 6,000 conversations), whatever the number of viewers. The page refreshes every 60 seconds and the wait times tick. A failed refresh keeps the last list and says so.
+- **Exclusions**: teams, tags and Customer ticket types never listed.
+
+Setup (`/intercom → Queue`, mirrored in the web panel's Queue hub under Intercom):
+
+1. In Intercom, signed in to the workspace the bridge uses: Settings → Integrations → Developer Hub → **New app** (name it e.g. *Postiz Intercom Queue*). An unpublished OAuth app can only be installed on the workspace it was created in.
+2. **Authentication**: tick **Use OAuth** and add the redirect URL the panel shows, `https://<public url>/queue/oauth/callback` (the public URL is the one `/panel` runs on; `/config → Billing → Webhooks → Set Public URL`).
+3. **Permissions**: **Read admins** only (`GET /me` needs it). The queue reads its data with the bridge's token, not this app's.
+4. **Basic information → App credentials**: paste the client ID and client secret via **OAuth App** (the secret is stored like every global secret: Vault KV entry `intercom`, or local encryption, and never shown back).
+5. Toggle **Queue: on**, then open `/queue` and sign in.
+
 ### Dispute verdict: fight or accept
 
 A complete evidence pack is not a winning one, and fighting a case that cannot be won costs the countered-dispute fee on top of the loss. So every dispute carries a **verdict**, Fight or Accept, from fixed rules in `src/bot/billing/disputeVerdict.ts`. First match wins:
@@ -233,6 +254,7 @@ src/
 ├── dashboard/          # web billing console (customers, disputes, payments, ...)
 ├── metrics/            # InfluxDB writer + exporters + snapshot scheduler
 ├── postiz/             # Postiz platform lookups (identity, usage feed)
+├── queue/              # Intercom Queue (/queue): OAuth sign-in, snapshot, pages
 ├── resend/             # Resend client, suppression tooling, delivery log (webhook, backfill)
 ├── sentry/             # Sentry feedback → Intercom import
 ├── sla/                # SLA clocks, balanced assignment, office hours

@@ -85,6 +85,8 @@ export const EXPECTED_COLUMNS: Record<string, string[]> = {
     "resolveOnCloseEnabled", "resolveOnCloseStateId", "resolveOnCloseBackfilledAt", "refundMaxChargeAgeDays",
     "agentRipMigratedAt", "intercomPanelAdminsJson", "billingActionLevelsJson", "panelTokenSecret",
     "panelTokenEpoch", "adminPanelEpoch", "dashboardEnabled", "dashboardAdminsJson", "dashboardTokenSecret", "dashboardEpoch",
+    "queueEnabled", "queueOauthClientId", "queueOauthClientSecret", "queueEpoch", "queueFinCountsAsReply",
+    "queueNotesCountAsReply", "queueExclusionsJson",
     "yubicoClientId", "yubicoApiSecret", "yubicoValidationUrl",
     "slaEnabled", "slaNativeEnabled", "slaDefaultTarget", "slaAttributeName", "slaTargetsJson", "slaNoteKickEnabled", "slaNoteAdminId",
     "slaStatusAttributeName", "slaBreachTagName", "slaWarnPct", "slaNagRepeatMins", "slaNagNoteText",
@@ -185,6 +187,10 @@ export const EXPECTED_COLUMNS: Record<string, string[]> = {
   postiz_org_links: ["id", "orgId", "stripeCustomerId", "firstSeenAt", "lastSeenAt", "observations"],
   postiz_credit_resets: [
     "id", "orgId", "orgName", "creditType", "email", "restored", "actorId", "actorName", "conversationId", "createdAt",
+  ],
+  queue_sessions: [
+    "id", "adminId", "adminName", "epoch", "uaFirst", "ipFirst", "ipLast", "createdAt", "lastSeenAt", "lastVerifiedAt",
+    "absoluteExpiresAt",
   ],
   forwarded_email_converts: [
     "id", "originalConversationId", "newConversationId", "forwarderAdminId", "forwarderEmail", "customerEmail",
