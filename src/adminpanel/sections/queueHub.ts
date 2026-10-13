@@ -1,6 +1,6 @@
 import { ActionResult, Opt, SaveResult, Section } from "../renderer/contract";
 import { AdminHubContext, ActionRequest, HubModule, SaveRequest, asString } from "./types";
-import type { QueueExclusions } from "../../config/SettingsStore";
+import { QUEUE_EXCLUSION_MAX, type QueueExclusions } from "../../config/SettingsStore";
 import { queueReadiness, QUEUE_CLIENT_ID_RE, QUEUE_CLIENT_SECRET_RE, type QueueExclusionKind } from "../../queue/queueConfig";
 
 // Queue hub (intercom group): the Intercom Queue web page (/queue). Mirrors
@@ -162,11 +162,12 @@ export function makeQueueHub(deps: {
         case "queueOauthClientSecret": {
           const val = asString(v).trim();
           if (!val) return { ok: true }; // blank = keep
-          if (val !== "none" && !QUEUE_CLIENT_SECRET_RE.test(val)) {
+          const clears = val.toLowerCase() === "none";
+          if (!clears && !QUEUE_CLIENT_SECRET_RE.test(val)) {
             return { ok: false, fieldErrors: { queueOauthClientSecret: "That does not look like an Intercom client secret." } };
           }
-          await s.updateQueue({ queueOauthClientSecret: val === "none" ? null : val });
-          await ctx.audit(val === "none" ? "cleared intercom queue oauth client secret" : "updated intercom queue oauth client secret");
+          await s.updateQueue({ queueOauthClientSecret: clears ? null : val });
+          await ctx.audit(clears ? "cleared intercom queue oauth client secret" : "updated intercom queue oauth client secret");
           return { ok: true };
         }
         default: {
@@ -185,6 +186,9 @@ export function makeQueueHub(deps: {
           // Only ids Intercom lists (or already saved) are accepted.
           const byId = new Map([...current[kind], ...known].map((o) => [o.id, o.name]));
           const picked = [...new Set(wanted)].filter((id) => byId.has(id)).map((id) => ({ id, name: byId.get(id)! }));
+          if (picked.length > QUEUE_EXCLUSION_MAX) {
+            return { ok: false, fieldErrors: { [req.field!]: `At most ${QUEUE_EXCLUSION_MAX} can be excluded.` } };
+          }
           const next: QueueExclusions = { ...current, [kind]: picked };
           await s.updateQueue({ queueExclusions: next });
           await ctx.audit(`intercom queue excluded ${kind} → ${picked.length ? picked.map((p) => p.name).join(", ").slice(0, 500) : "none"}`);

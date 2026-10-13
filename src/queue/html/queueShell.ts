@@ -52,7 +52,7 @@ ${queueCss()}
     <header class="topbar">
       <button class="btn sm" id="menubtn" type="button" aria-label="Menu" aria-expanded="false">☰</button>
       <span class="who" id="who"></span>
-      <button class="btn sm" id="refreshbtn" type="button" title="Read the queue again">Refresh</button>
+      <button class="btn sm" id="refreshbtn" type="button" title="Reload this page (Intercom is read at most once a minute)">Refresh</button>
       <button class="btn sm" id="themebtn" type="button" title="Color theme: click to switch">Auto</button>
       <button class="btn sm" id="logout" type="button">Sign out</button>
     </header>

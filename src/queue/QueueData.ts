@@ -39,6 +39,8 @@ export interface QueueSettingsView {
   intercomAdminId(): string | null;
   intercomRegion(): IntercomRegion;
   intercomConfigured(): boolean;
+  slaStatusAttributeName(): string;
+  slaAttributeName(): string;
 }
 
 export interface QueueSnapshot {
@@ -67,6 +69,9 @@ export interface QueueDirectory {
 }
 
 const SNAPSHOT_TTL_MS = 60_000;
+// After a failed scan, wait this long before asking Intercom again (the
+// bridge shares the token).
+const FAILURE_BACKOFF_MS = 30_000;
 const MAX_PAGES = 40; // 6,000 open conversations; the rest is reported as truncated
 const PARTS_BUDGET = 200; // toggle checks per refresh
 const PARTS_CONCURRENCY = 4;
@@ -75,12 +80,16 @@ const TEAMS_TTL_MS = 5 * 60_000;
 const WORKSPACE_TTL_MS = 60 * 60_000;
 const MESSAGE_TTL_MS = 5 * 60_000;
 export const RESERVATION_MS = 10 * 60_000;
-const FIN_NAME_RE = /^(operator|fin)(\s|$)/i;
+// Only when no Operator id is configured: an admin named exactly like Intercom's
+// bot identities. Never a prefix match, so a teammate called "Fin Murphy" is a
+// person.
+const BOT_NAME_RE = /^(operator|fin)$/i;
 
 export class QueueData {
   private snap: QueueSnapshot | null = null;
   private snapKey = "";
   private inflight: Promise<QueueSnapshot> | null = null;
+  private lastFailure: { at: number; message: string } | null = null;
   private partsCache = new Map<string, { updatedAt: number; parts: IntercomWebhookPart[] }>();
   private messageCache = new Map<string, { updatedAt: number; at: number; text: string | null }>();
   private admins: { at: number; list: IntercomAdmin[] } | null = null;
@@ -102,18 +111,34 @@ export class QueueData {
   // ---- snapshot ----
 
   // Cached for a minute and shared by every viewer, so the Intercom cost is
-  // one scan a minute however many tabs are open. A settings change (toggles,
-  // exclusions) invalidates it. A failed refresh keeps the previous items and
-  // says so.
+  // one scan a minute however many tabs are open. Past the minute the last
+  // snapshot is still served while a fresh one is read in the background; a
+  // settings change (toggles, exclusions) waits for the new one instead. A
+  // failed scan keeps the previous items, says so, and is not retried for 30
+  // seconds.
   async snapshot(): Promise<QueueSnapshot> {
     const key = this.settingsKey();
-    if (this.snap && this.snapKey === key && this.now() - this.snap.builtAt < SNAPSHOT_TTL_MS) return this.snap;
-    if (!this.inflight) {
-      this.inflight = this.build(key).finally(() => {
-        this.inflight = null;
-      });
+    const now = this.now();
+    const backingOff = this.lastFailure != null && now - this.lastFailure.at < FAILURE_BACKOFF_MS;
+    if (this.snap && this.snapKey === key) {
+      if (now - this.snap.builtAt >= SNAPSHOT_TTL_MS && !this.inflight && !backingOff) this.refresh(key).catch(() => undefined);
+      return this.withFailure(this.snap);
     }
+    if (this.inflight) return this.inflight;
+    if (backingOff) return this.withFailure(this.snap ?? emptySnapshot(now));
+    return this.refresh(key);
+  }
+
+  private refresh(key: string): Promise<QueueSnapshot> {
+    this.inflight = this.build(key).finally(() => {
+      this.inflight = null;
+    });
     return this.inflight;
+  }
+
+  // A failure newer than the snapshot is reported on it.
+  private withFailure(snap: QueueSnapshot): QueueSnapshot {
+    return this.lastFailure && this.lastFailure.at >= snap.builtAt ? { ...snap, error: this.lastFailure.message } : snap;
   }
 
   private settingsKey(): string {
@@ -126,6 +151,8 @@ export class QueueData {
       x.ticketTypes.map((t) => t.id),
       this.settings.intercomOperatorAdminId(),
       this.settings.intercomAdminId(),
+      this.settings.slaStatusAttributeName(),
+      this.settings.slaAttributeName(),
     ]);
   }
 
@@ -142,10 +169,11 @@ export class QueueData {
         if (t) tickets.set(t.id, t);
       }
       const opts = this.classifyOptions(directory);
+      const sla = { status: this.settings.slaStatusAttributeName(), target: this.settings.slaAttributeName() };
       const candidates: Array<{ item: QueueItem; lastContactStat: number }> = [];
       let scanned = 0;
       for (const raw of convPages.items) {
-        const conv = parseConversation(raw);
+        const conv = parseConversation(raw, sla);
         if (!conv) continue;
         scanned++;
         const item = classify(conv, resolveTicket(conv, tickets), opts);
@@ -177,13 +205,14 @@ export class QueueData {
       };
       this.snap = snap;
       this.snapKey = key;
+      this.lastFailure = null;
       return snap;
     } catch (e) {
       const message = e instanceof Error ? e.message : String(e);
       queueLog.warn("queue snapshot refresh failed", { "error.message": message });
       // The raw message stays in the logs; the page only learns that it failed.
-      if (this.snap) return { ...this.snap, error: "Intercom did not answer the last refresh." };
-      return { builtAt: this.now(), items: [], scanned: 0, truncated: false, partsSkipped: 0, error: "Intercom did not answer." };
+      this.lastFailure = { at: this.now(), message: this.snap ? "Intercom did not answer the last refresh." : "Intercom did not answer." };
+      return this.withFailure(this.snap ?? emptySnapshot(this.now()));
     }
   }
 
@@ -229,7 +258,7 @@ export class QueueData {
     const ids = new Set<string>();
     const op = this.settings.intercomOperatorAdminId();
     if (op) ids.add(op);
-    for (const t of directory?.teammates.values() ?? []) if (FIN_NAME_RE.test(t.name)) ids.add(t.id);
+    for (const t of directory?.teammates.values() ?? []) if (t.bot && t.id !== this.settings.intercomAdminId()) ids.add(t.id);
     return ids;
   }
 
@@ -306,7 +335,7 @@ export class QueueData {
         name,
         seated: a.hasInboxSeat !== false,
         away: a.awayModeEnabled === true,
-        bot: a.id === op || a.id === bridge || FIN_NAME_RE.test(name),
+        bot: a.id === op || a.id === bridge || (!op && BOT_NAME_RE.test(name)),
       });
     }
     return { teammates, teams: new Map(this.teams.list.map((t) => [t.id, t.name])) };
@@ -389,9 +418,11 @@ export class QueueData {
     const previous = this.picks.get(key)?.conversationId ?? null;
     this.picks.delete(key);
     const now = this.now();
+    // A teammate's own ticket is always theirs to roll, even while someone
+    // who rolled it before it was assigned still holds a reservation.
     const free = pool.filter((i) => {
       const holder = this.reservedBy(i.id);
-      return !holder || holder.adminId === adminId;
+      return !holder || holder.adminId === adminId || i.assigneeId === adminId;
     });
     // Re-rolling never hands back the same ticket while there is another.
     const fresh = free.length > 1 ? free.filter((i) => i.id !== previous) : free;
@@ -419,4 +450,8 @@ export class QueueData {
       this.picks.delete(oldest);
     }
   }
+}
+
+function emptySnapshot(now: number): QueueSnapshot {
+  return { builtAt: now, items: [], scanned: 0, truncated: false, partsSkipped: 0, error: null };
 }

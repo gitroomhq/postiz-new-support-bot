@@ -478,14 +478,16 @@ export class QueueViews {
         { type: "notice", badge: { kind: "neutral", text: "No pick" }, text: "You have no pick in this view right now.", actions: [{ ...roll, label: "Roll", style: "primary" }] },
       ];
     }
-    const item = ctx.snap.items.find((i) => i.id === pick!.conversationId);
+    // Looked up in the pool, not the whole list: a pick since assigned to a
+    // colleague, or no longer matching the filters, is no longer yours here.
+    const item = pool.find((i) => i.id === pick!.conversationId);
     if (!item) {
       return [
         explain,
         {
           type: "notice",
           badge: { kind: "ok", text: "Done" },
-          text: "Your last pick no longer waits on a reply (answered, closed or moved out of this view).",
+          text: "Your last pick no longer waits on you here (answered, closed, assigned to a colleague or outside these filters).",
           actions: pool.length ? [{ ...roll, style: "primary" }] : [],
         },
         ...(pool.length ? [] : [this.emptyPool(ctx, scope)]),

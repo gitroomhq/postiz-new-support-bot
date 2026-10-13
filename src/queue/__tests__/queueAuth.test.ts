@@ -167,20 +167,39 @@ test("callback: a verified teammate of our workspace gets a session; the OAuth t
   assert.equal(actor?.name, "Ada");
 });
 
-test("callback: a replayed or foreign state is refused and audited", async () => {
-  const { auth, audits } = setup();
+test("callback: a replayed or foreign state is refused, and only logged (it names nobody)", async () => {
+  const { auth, audits, calls } = setup();
   const { state, nonce } = startFlow(auth);
   const first = await auth.callback({ code: "c1", state }, nonce, {});
   assert.equal(first.status === 302 && first.location, "/queue");
+  const exchanges = calls.length;
   const replay = await auth.callback({ code: "c1", state }, nonce, {});
   assert.equal(replay.status === 302 && replay.location, "/queue?e=expired");
-  assert.equal(audits.length, 1);
 
   // A state started in another browser (no matching cookie).
   const other = startFlow(auth);
   const csrf = await auth.callback({ code: "c2", state: other.state }, "attacker-nonce", { ip: "9.9.9.9" });
   assert.equal(csrf.status === 302 && csrf.location, "/queue?e=expired");
-  assert.equal(audits[1].ip, "9.9.9.9");
+  // A bare callback with nothing at all.
+  const bare = await auth.callback({}, "", {});
+  assert.equal(bare.status === 302 && bare.location, "/queue?e=expired");
+  assert.equal(audits.length, 0, "anonymous junk never reaches the audit channel");
+  assert.equal(calls.length, exchanges, "and never reaches Intercom");
+});
+
+test("callback: audit posts are capped per minute, the rest counted into the next post", async () => {
+  const me = { id: 11, name: "Ada", email: "a@x.test", email_verified: false, app: { id_code: "abcd1234" } };
+  const { auth, audits, advance } = setup({ me });
+  for (let k = 0; k < 8; k++) {
+    const { state, nonce } = startFlow(auth);
+    await auth.callback({ code: "c", state }, nonce, {});
+  }
+  assert.equal(audits.length, 5);
+  advance(61_000);
+  const { state, nonce } = startFlow(auth);
+  await auth.callback({ code: "c", state }, nonce, {});
+  assert.equal(audits.length, 6);
+  assert.equal(audits[5].suppressed, 3);
 });
 
 test("callback: an expired state is refused", async () => {

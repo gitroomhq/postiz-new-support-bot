@@ -88,8 +88,14 @@ export interface ClassifyOptions {
 const CONTACT_TYPES = new Set(["user", "lead", "contact"]);
 const EXCLUDED_CATEGORIES = new Set(["waiting_on_customer", "resolved"]);
 const SLA_VALUES = new Set<QueueSla>(["ok", "at_risk", "breached"]);
-const SLA_STATUS_ATTRIBUTE = "SLA Status";
-const SLA_TARGET_ATTRIBUTE = "SLA Target";
+
+// The conversation attributes the SLA engine writes (their names are set in
+// /intercom → SLA Manager; these are the defaults).
+export interface SlaAttributeNames {
+  status: string;
+  target: string;
+}
+const DEFAULT_SLA_ATTRIBUTES: SlaAttributeNames = { status: "SLA Status", target: "SLA Target" };
 
 // ---- parsing (hostile-shaped input: every field is checked) ----
 
@@ -165,7 +171,7 @@ export function parseTicket(raw: unknown): QueueTicketInfo | null {
 }
 
 // A conversation search hit (POST /conversations/search).
-export function parseConversation(raw: unknown): QueueConversation | null {
+export function parseConversation(raw: unknown, sla: SlaAttributeNames = DEFAULT_SLA_ATTRIBUTES): QueueConversation | null {
   const o = obj(raw);
   const id = idOf(o?.id);
   if (!o || !id) return null;
@@ -199,7 +205,7 @@ export function parseConversation(raw: unknown): QueueConversation | null {
   const ticketTitle = str(obj(ticketAttrs?.["_default_title_"])?.value);
   const title = clip(plainText(titleRaw) || subject || plainText(ticketTitle) || clip(body, 80) || `Conversation ${id}`, 140);
 
-  const slaRaw = str(custom[SLA_STATUS_ATTRIBUTE]);
+  const slaRaw = str(custom[sla.status]);
   const authorType = str(author?.type);
   const contactAuthored = authorType != null && CONTACT_TYPES.has(authorType);
 
@@ -226,7 +232,7 @@ export function parseConversation(raw: unknown): QueueConversation | null {
     lastContactReplyAt: unix(stats?.last_contact_reply_at),
     lastAdminReplyAt: unix(stats?.last_admin_reply_at),
     slaStatus: slaRaw && SLA_VALUES.has(slaRaw as QueueSla) ? (slaRaw as QueueSla) : null,
-    slaTarget: str(custom[SLA_TARGET_ATTRIBUTE]),
+    slaTarget: str(custom[sla.target]),
   };
 }
 

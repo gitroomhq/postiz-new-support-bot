@@ -82,6 +82,11 @@ export type DashboardRoute = MountedPanelRoute;
 type RawBodyRequest = Request & { rawBody?: Buffer };
 
 const PANEL_IP_LIMIT_PER_MIN = 60;
+// The Intercom Queue is a team page that refreshes itself every minute, often
+// many teammates behind one office address: its own, wider bucket, so it can
+// neither starve nor be starved by the admin panels. Sessions are 256-bit
+// tokens; the bucket only bounds bursts.
+const QUEUE_IP_LIMIT_PER_MIN = 300;
 const PANEL_IP_WINDOW_MS = 60_000;
 const PANEL_IP_MAX_KEYS = 2000;
 
@@ -90,6 +95,7 @@ export class CallbackServer {
   // Pre-authentication throttle for the panel routes: bounds token-guessing /
   // log-replay bursts before any HMAC or session work happens.
   private panelIpHits = new Map<string, number[]>();
+  private queueIpHits = new Map<string, number[]>();
 
   constructor(
     private config: BotConfig,
@@ -316,6 +322,7 @@ export class CallbackServer {
     // sign-in, nothing shared with /panel. The two OAuth routes register
     // BEFORE the mount: its spaWildcard GET /queue/*splat would otherwise
     // answer them with the shell (covered by __tests__/panelRoutes.test.ts).
+    const allowQueueIp = (ip: string | undefined) => this.allowIpIn(this.queueIpHits, QUEUE_IP_LIMIT_PER_MIN, ip);
     const sendRedirect = (res: express.Response, r: QueueRedirect) => {
       if (r.status === 404) {
         res.status(404).set({ "Cache-Control": "no-store", ...PANEL_SECURITY_HEADERS }).send("Not found");
@@ -338,7 +345,7 @@ export class CallbackServer {
         res.status(404).send("Not found");
         return;
       }
-      if (!allowIp(req.ip)) {
+      if (!allowQueueIp(req.ip)) {
         res.status(429).set("Cache-Control", "no-store").send("Too many requests.");
         return;
       }
@@ -350,7 +357,7 @@ export class CallbackServer {
         res.status(404).send("Not found");
         return;
       }
-      if (!allowIp(req.ip)) {
+      if (!allowQueueIp(req.ip)) {
         res.status(429).set("Cache-Control", "no-store").send("Too many requests.");
         return;
       }
@@ -366,7 +373,7 @@ export class CallbackServer {
         sendRedirect(res, { status: 302, location: "/queue?e=error", setCookies: [] });
       }
     });
-    mountPanel(this.app, allowIp, {
+    mountPanel(this.app, allowQueueIp, {
       pagePath: "/queue",
       apiPath: "/queue/api/:endpoint",
       cookieName: "__Host-queue",
@@ -503,16 +510,20 @@ export class CallbackServer {
   }
 
   private allowPanelIp(ip: string | undefined): boolean {
+    return this.allowIpIn(this.panelIpHits, PANEL_IP_LIMIT_PER_MIN, ip);
+  }
+
+  private allowIpIn(bucket: Map<string, number[]>, limit: number, ip: string | undefined): boolean {
     const key = ip ?? "unknown";
     const now = Date.now();
-    if (this.panelIpHits.size > PANEL_IP_MAX_KEYS) this.panelIpHits.clear(); // crude cap — throttle state, not audit data
-    const hits = (this.panelIpHits.get(key) ?? []).filter((t) => now - t < PANEL_IP_WINDOW_MS);
-    if (hits.length >= PANEL_IP_LIMIT_PER_MIN) {
-      this.panelIpHits.set(key, hits);
+    if (bucket.size > PANEL_IP_MAX_KEYS) bucket.clear(); // crude cap: throttle state, not audit data
+    const hits = (bucket.get(key) ?? []).filter((t) => now - t < PANEL_IP_WINDOW_MS);
+    if (hits.length >= limit) {
+      bucket.set(key, hits);
       return false;
     }
     hits.push(now);
-    this.panelIpHits.set(key, hits);
+    bucket.set(key, hits);
     return true;
   }
 

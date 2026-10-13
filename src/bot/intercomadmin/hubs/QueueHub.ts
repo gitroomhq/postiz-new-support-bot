@@ -14,7 +14,7 @@ import { embed as makeEmbed, COLORS } from "../../../util/embeds";
 import { btn, buttonRow, backRow, selectRow, panelEmbed, textInput } from "../ui";
 import type { Panel, RouteEntry } from "../types";
 import type { HubContext } from "./HubContext";
-import type { QueueExclusions, SecretState } from "../../../config/SettingsStore";
+import { QUEUE_EXCLUSION_MAX, type QueueExclusions, type SecretState } from "../../../config/SettingsStore";
 import {
   queueReadiness,
   QUEUE_CLIENT_ID_RE,
@@ -282,6 +282,13 @@ export class QueueHub {
     const kept = current[kind].filter((e) => !pageIds.has(e.id));
     const added = interaction.values.filter((v) => pageIds.has(v)).map((id) => ({ id, name: byId.get(id) ?? id }));
     const next: QueueExclusions = { ...current, [kind]: [...kept, ...added] };
+    if (next[kind].length > QUEUE_EXCLUSION_MAX) {
+      await interaction.followUp({
+        embeds: [makeEmbed(`At most ${QUEUE_EXCLUSION_MAX} ${KIND_LABEL[kind].toLowerCase()} can be excluded; nothing was saved.`, COLORS.warn)],
+        flags: 64,
+      });
+      return;
+    }
     await this.ctx.settingsStore.updateQueue({ queueExclusions: next });
     this.ctx.auditConfig(
       interaction,
@@ -308,9 +315,24 @@ export class QueueHub {
 
   private async handleSignOut(interaction: ButtonInteraction): Promise<void> {
     await interaction.deferUpdate();
-    const n = (await this.ctx.queue?.signOutAll().catch(() => null)) ?? null;
-    this.ctx.auditConfig(interaction, `Intercom Queue: everyone signed out${n != null ? ` (${n} session(s))` : ""}`);
+    let n: number | null = null;
+    let failure: string | null = null;
+    if (!this.ctx.queue) failure = "the queue is not wired on this instance";
+    else {
+      try {
+        n = await this.ctx.queue.signOutAll();
+      } catch (e) {
+        failure = e instanceof Error ? e.message : String(e);
+      }
+    }
+    if (failure != null) {
+      this.ctx.auditConfig(interaction, "Intercom Queue: sign everyone out FAILED");
+      await this.refresh(interaction);
+      await interaction.followUp({ embeds: [makeEmbed(`Could not sign everyone out: ${failure.slice(0, 300)}`, COLORS.danger)], flags: 64 });
+      return;
+    }
+    this.ctx.auditConfig(interaction, `Intercom Queue: everyone signed out (${n} session(s))`);
     await this.refresh(interaction);
-    await interaction.followUp({ embeds: [makeEmbed("Everyone is signed out of the Intercom Queue.", COLORS.success)], flags: 64 });
+    await interaction.followUp({ embeds: [makeEmbed(`Everyone is signed out of the Intercom Queue (${n} session(s) ended).`, COLORS.success)], flags: 64 });
   }
 }

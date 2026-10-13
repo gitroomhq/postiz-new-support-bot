@@ -562,11 +562,9 @@ async function main() {
   const queueData = new QueueData(intercomClient, settingsStore);
   const queueSessions = new QueueSessions(prisma);
   const queueAuth = new QueueAuth(settingsStore, queueData, queueSessions, (event) => {
-    const who = event.teammate
-      ? [event.teammate.name ?? "unknown", event.teammate.email ? `(${event.teammate.email})` : "", event.teammate.id ? `· admin ${event.teammate.id}` : ""]
-          .filter(Boolean)
-          .join(" ")
-      : "unknown (Intercom never named them)";
+    const who = [event.teammate.name ?? "unknown", event.teammate.email ? `(${event.teammate.email})` : "", event.teammate.id ? `· admin ${event.teammate.id}` : ""]
+      .filter(Boolean)
+      .join(" ");
     void auditLogger.log({
       title: "🚫 Intercom Queue sign-in refused",
       severity: "warn",
@@ -574,6 +572,7 @@ async function main() {
         { name: "Teammate", value: who },
         { name: "Reason", value: event.reason },
         ...(event.ip ? [{ name: "IP", value: event.ip, inline: true }] : []),
+        ...(event.suppressed ? [{ name: "Not posted", value: `${event.suppressed} earlier refusal(s) in the last minute`, inline: true }] : []),
       ],
     });
   });

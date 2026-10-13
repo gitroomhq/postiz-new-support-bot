@@ -34,6 +34,9 @@ const VERIFY_EVERY_MS = 5 * 60_000;
 // Intercom down: a session keeps working this long past its last check.
 const VERIFY_GRACE_MS = 30 * 60_000;
 const HTTP_TIMEOUT_MS = 15_000;
+// Refused sign-ins posted to the audit channel per minute; the rest are
+// counted into the next post.
+const AUDITS_PER_MINUTE = 5;
 const API_VERSION = "2.15";
 
 // Why a sign-in was turned away. The page maps the code to fixed text; nothing
@@ -63,8 +66,9 @@ export interface QueueDirectoryView {
 
 export interface QueueRefusalAudit {
   reason: string;
-  teammate?: { id: string | null; name: string | null; email: string | null };
+  teammate: { id: string | null; name: string | null; email: string | null };
   ip?: string;
+  suppressed?: number; // refusals since the last post that were not posted
 }
 
 type FetchFn = (url: string, init: RequestInit) => Promise<Response>;
@@ -73,6 +77,7 @@ export type QueueRedirect = { status: 302; location: string; setCookies: string[
 
 export class QueueAuth {
   private pending = new Map<string, { nonceHash: string; at: number }>();
+  private auditWindow = { start: 0, posted: 0, suppressed: 0 };
 
   constructor(
     private settings: QueueAuthSettings,
@@ -114,9 +119,13 @@ export class QueueAuth {
   ): Promise<QueueRedirect> {
     if (!this.settings.queueEnabled()) return { status: 404 };
     const clear = `${QUEUE_OAUTH_COOKIE}=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0`;
-    const refuse = (reason: QueueRefusal, audit?: QueueRefusalAudit): QueueRedirect => {
+    // Only refusals Intercom attached a teammate to reach the audit channel:
+    // a stale or forged callback names nobody and costs an attacker nothing,
+    // so it only goes to the log.
+    const refuse = (reason: QueueRefusal, why?: string, teammate?: QueueRefusalAudit["teammate"]): QueueRedirect => {
       metricCount("queue.signin", 1, { outcome: reason });
-      if (audit) this.auditRefusal({ ...audit, ip: meta.ip });
+      if (teammate && why) this.audit({ reason: why, teammate, ip: meta.ip });
+      else if (why) authLog.warn("queue sign-in refused", { "queue.refusal": reason, "queue.reason": why });
       const r = this.toPage(reason);
       return r.status === 302 ? { ...r, setCookies: [clear] } : r;
     };
@@ -128,11 +137,11 @@ export class QueueAuth {
     const pending = state ? this.pending.get(state) : undefined;
     if (state) this.pending.delete(state); // single use, whatever happens next
     if (!pending || this.now() - pending.at > STATE_TTL_MS || !oauthCookie || !ctEqual(sha256(oauthCookie), pending.nonceHash)) {
-      return refuse("expired", { reason: "The sign-in link was expired, already used, or opened in another browser." });
+      return refuse("expired", "The sign-in link was expired, already used, or opened in another browser.");
     }
     const code = typeof query.code === "string" ? query.code : "";
     if (!code || code.length > 1024 || !/^[A-Za-z0-9._~+/=-]+$/.test(code)) {
-      return refuse("error", { reason: "Intercom returned no usable authorization code." });
+      return refuse("error", "Intercom returned no usable authorization code.");
     }
     const clientId = this.settings.queueOauthClientId();
     const clientSecret = this.settings.queueOauthClientSecret();
@@ -144,12 +153,12 @@ export class QueueAuth {
       me = await this.identify(token);
     } catch (e) {
       authLog.warn("queue sign-in: intercom exchange failed", { "error.message": e instanceof Error ? e.message : String(e) });
-      return refuse("error", { reason: "Intercom did not confirm the sign-in (token exchange or identity lookup failed)." });
+      return refuse("error", "Intercom did not confirm the sign-in (token exchange or identity lookup failed).");
     }
     const who = { id: me.id, name: me.name, email: me.email };
 
     if (me.emailVerified !== true) {
-      return refuse("unverified", { reason: "The Intercom account's email address is not verified.", teammate: who });
+      return refuse("unverified", "The Intercom account's email address is not verified.", who);
     }
     let workspace: string | null;
     try {
@@ -157,18 +166,18 @@ export class QueueAuth {
     } catch {
       workspace = null;
     }
-    if (!workspace) return refuse("error", { reason: "The bridge's own Intercom workspace could not be confirmed.", teammate: who });
+    if (!workspace) return refuse("error", "The bridge's own Intercom workspace could not be confirmed.", who);
     if (!me.workspaceIdCode || me.workspaceIdCode !== workspace) {
-      return refuse("workspace", { reason: "The Intercom account belongs to a different workspace.", teammate: who });
+      return refuse("workspace", "The Intercom account belongs to a different workspace.", who);
     }
     let teammate: QueueTeammate | null;
     try {
       teammate = me.id ? await this.directory.seatedTeammate(me.id) : null;
     } catch {
-      return refuse("error", { reason: "The teammate list could not be read from Intercom.", teammate: who });
+      return refuse("error", "The teammate list could not be read from Intercom.", who);
     }
     if (!teammate) {
-      return refuse("seat", { reason: "Not a teammate with an inbox seat (or an Operator/bot identity).", teammate: who });
+      return refuse("seat", "Not a teammate with an inbox seat (or an Operator/bot identity).", who);
     }
 
     const token = await this.sessions.create({
@@ -225,6 +234,20 @@ export class QueueAuth {
   }
 
   // ---- internals ----
+
+  // At most a few audit posts a minute; the rest are counted into the next.
+  private audit(event: QueueRefusalAudit): void {
+    const now = this.now();
+    if (now - this.auditWindow.start >= 60_000) this.auditWindow = { start: now, posted: 0, suppressed: this.auditWindow.suppressed };
+    if (this.auditWindow.posted >= AUDITS_PER_MINUTE) {
+      this.auditWindow.suppressed++;
+      return;
+    }
+    this.auditWindow.posted++;
+    const suppressed = this.auditWindow.suppressed;
+    this.auditWindow.suppressed = 0;
+    this.auditRefusal(suppressed ? { ...event, suppressed } : event);
+  }
 
   private toPage(reason: QueueRefusal): QueueRedirect {
     return { status: 302, location: `${QUEUE_BASE_PATH}?e=${reason}`, setCookies: [] };

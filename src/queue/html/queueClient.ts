@@ -330,7 +330,7 @@ D.showLogin = function (j) {
   var m = /(?:^|[?&])e=([a-z]+)/.exec(location.search || "");
   if (m) code = m[1];
   var err = D.q("loginErr");
-  var msg = D.LOGIN_ERRORS[code] || "";
+  var msg = Object.prototype.hasOwnProperty.call(D.LOGIN_ERRORS, code) ? D.LOGIN_ERRORS[code] : "";
   err.textContent = msg; err.hidden = !msg;
   if (m) { try { history.replaceState({}, "", location.pathname); } catch (e) {} }
   var ready = !!(j && j.ready);
@@ -364,13 +364,24 @@ D.startApp = function () {
   }, 60000);
 };
 
+// A busy or failing server is not a sign-out: say so and try again.
+D.showRetry = function () {
+  D.q("app").hidden = true; D.q("expired").hidden = true;
+  D.q("login").hidden = false;
+  D.q("loginGo").hidden = true; D.q("loginNotReady").hidden = true;
+  var err = D.q("loginErr");
+  err.textContent = "Could not reach the queue. Trying again in a few seconds.";
+  err.hidden = false;
+  setTimeout(D.boot, 5000);
+};
 D.boot = function () {
   D.api("status", {}).then(function (res) {
     var j = res.j || {};
+    if (res.status !== 200 || j.error === "rate limited") { D.showRetry(); return; }
     if (j.state === "active") { D.startApp(); return; }
     if (j.state === "login") { D.showLogin(j); return; }
     D.showExpired();
-  }).catch(function () { setTimeout(D.boot, 5000); });
+  }).catch(function () { D.showRetry(); });
 };
 
 document.getElementById("expiredReload").addEventListener("click", function () { location.href = D.BASE; });

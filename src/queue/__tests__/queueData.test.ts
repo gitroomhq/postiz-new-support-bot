@@ -11,6 +11,9 @@ import type { QueueKvBlock, QueueTableBlock } from "../contract";
 
 const NOW = 2_000_000_000_000; // ms
 
+// Lets a background refresh (fake source: immediate promises) finish.
+const settle = () => new Promise<void>((resolve) => setImmediate(() => setImmediate(resolve)));
+
 function rawConv(id: string, over: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     id,
@@ -105,6 +108,8 @@ function settings(over: Partial<{ fin: boolean; notes: boolean; exclusions: Queu
     intercomAdminId: () => "900",
     intercomRegion: () => "us",
     intercomConfigured: () => true,
+    slaStatusAttributeName: () => "SLA Status",
+    slaAttributeName: () => "SLA Target",
   };
 }
 
@@ -123,8 +128,12 @@ test("the snapshot is one shared scan a minute, longest waiting first", async ()
   await data.snapshot();
   assert.equal(src.calls.conv, 2, "cached inside the minute");
   now += 61_000;
-  await data.snapshot();
-  assert.equal(src.calls.conv, 4, "refreshed after a minute");
+  src.conversations.push(rawConv("4", { waiting_since: Math.floor(NOW / 1000) - 2000 }));
+  const stale = await data.snapshot();
+  assert.deepEqual(stale.items.map((i) => i.id), ["2", "1"], "past the minute the last list is served at once");
+  await settle();
+  assert.equal(src.calls.conv, 4, "while a fresh one is read in the background");
+  assert.deepEqual((await data.snapshot()).items.map((i) => i.id), ["4", "2", "1"]);
 });
 
 test("concurrent viewers share one refresh", async () => {
@@ -141,10 +150,66 @@ test("a failed refresh keeps the last list and says so without the raw error", a
   await data.snapshot();
   src.fail = true;
   now += 61_000;
+  await data.snapshot();
+  await settle();
   const stale = await data.snapshot();
   assert.deepEqual(stale.items.map((i) => i.id), ["1"]);
   assert.ok(stale.error);
   assert.doesNotMatch(stale.error, /secret detail/);
+  // Backing off: no new scan for 30 seconds after a failure.
+  const calls = src.calls.conv;
+  now += 10_000;
+  await data.snapshot();
+  await settle();
+  assert.equal(src.calls.conv, calls);
+  now += 25_000;
+  src.fail = false;
+  await data.snapshot();
+  await settle();
+  assert.equal(src.calls.conv, calls + 1);
+  assert.equal((await data.snapshot()).error, null, "a good scan clears the error");
+});
+
+test("a first scan that fails reports an empty, errored list and backs off", async () => {
+  const src = fakeSource([rawConv("1")]);
+  src.fail = true;
+  const data = new QueueData(src, settings(), () => NOW);
+  const snap = await data.snapshot();
+  assert.deepEqual(snap.items, []);
+  assert.ok(snap.error);
+  await data.snapshot();
+  assert.equal(src.calls.conv, 1);
+});
+
+test("SLA status is read from the attribute names the SLA Manager uses", async () => {
+  const s = { ...settings(), slaStatusAttributeName: () => "Custom SLA State", slaAttributeName: () => "Custom Target" };
+  const src = fakeSource([rawConv("1", { custom_attributes: { "Custom SLA State": "breached", "Custom Target": "VIP", "SLA Status": "ok" } })]);
+  const item = (await new QueueData(src, s, () => NOW).snapshot()).items[0];
+  assert.equal(item.slaStatus, "breached");
+  assert.equal(item.slaTarget, "VIP");
+});
+
+test("a teammate named like Fin is a person; the exact name only counts without an Operator id", async () => {
+  const src = fakeSource();
+  const base = src.listAdmins;
+  src.listAdmins = async () => [...(await base()), { id: "15", name: "Fin Murphy", hasInboxSeat: true }, { id: "16", name: "Fin", hasInboxSeat: true }];
+  const withOp = new QueueData(src, settings(), () => NOW);
+  assert.equal((await withOp.seatedTeammate("15"))?.name, "Fin Murphy");
+  assert.equal((await withOp.seatedTeammate("16"))?.name, "Fin", "the configured Operator id decides");
+  const noOp = new QueueData(src, { ...settings(), intercomOperatorAdminId: () => null }, () => NOW);
+  assert.equal((await noOp.seatedTeammate("15"))?.name, "Fin Murphy");
+  assert.equal(await noOp.seatedTeammate("16"), null);
+  assert.equal(await noOp.seatedTeammate("800"), null, "Operator by its exact name");
+});
+
+test("randomizer: your own ticket is yours to roll even while a colleague still holds it", async () => {
+  const src = fakeSource([rawConv("1", { admin_assignee_id: null })]);
+  const data = new QueueData(src, settings(), () => NOW, () => 0);
+  const unassigned = (await data.snapshot()).items;
+  assert.equal(data.roll("12", "global", unassigned)?.id, "1");
+  // It gets assigned to Ada while Grace's reservation lasts.
+  const mine = unassigned.map((i) => ({ ...i, assigneeId: "11" }));
+  assert.equal(data.roll("11", "mine", mine)?.id, "1");
 });
 
 test("a settings change invalidates the cache", async () => {
@@ -288,6 +353,23 @@ test("Randomizer rolls once by itself, only from unassigned and own tickets; rol
   assert.equal(roll.ok, true);
   assert.equal((await v.action(actor, "section:queue.roll", { scope: "evil" })).ok, false);
   assert.equal((await v.action(actor, "section:queue.nope", { scope: "global" })).ok, false);
+});
+
+test("a pick since assigned to a colleague is no longer shown as yours", async () => {
+  const src = fakeSource([rawConv("1", { admin_assignee_id: null })]);
+  const s = settings();
+  let now = NOW;
+  const data = new QueueData(src, s, () => now, () => 0);
+  const v = new QueueViews(data, { intercomConfigured: () => true, queueExclusions: () => s.state.exclusions }, () => now);
+  const first = await v.build(actor, { page: "global", params: {}, filters: { view: "random" }, cursor: null });
+  assert.ok(first!.blocks.some((b) => b.type === "kv"));
+  (src.conversations[0] as Record<string, unknown>).admin_assignee_id = 12;
+  now += 61_000;
+  await data.snapshot();
+  await settle();
+  const after = await v.build(actor, { page: "global", params: {}, filters: { view: "random" }, cursor: null });
+  assert.ok(!after!.blocks.some((b) => b.type === "kv"));
+  assert.ok(after!.blocks.some((b) => b.type === "notice" && /no longer waits on you/.test(b.text)));
 });
 
 test("a colleague's queue has nothing to roll", async () => {
