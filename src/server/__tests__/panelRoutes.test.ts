@@ -174,3 +174,62 @@ test("a dashboard cookie opens the real config panel, rendered for the mount it 
     s.close();
   }
 });
+
+// The Intercom Queue mounts with spaWildcard too: its OAuth routes must be
+// registered first or GET /queue/*splat answers them with the shell.
+const queueServer = new CallbackServer(
+  { server: { port: 0 } } as never,
+  {} as never,
+  undefined,
+  undefined,
+  undefined,
+  undefined,
+  undefined,
+  undefined,
+  undefined,
+  undefined,
+  {
+    ...shell("queue"),
+    oauthStart: () => ({ status: 302, location: "https://app.intercom.com/oauth?state=s", setCookies: ["__Host-queue-oauth=n; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=600"] }),
+    oauthCallback: async (query, oauthCookie) => ({
+      status: 302,
+      location: `/queue?code=${String(query.code)}&cookie=${oauthCookie}`,
+      setCookies: [],
+    }),
+  }
+);
+const queueApp = (queueServer as unknown as { app: Express }).app;
+
+test("/queue/oauth/* reach the OAuth handlers, not the /queue shell; /queue deep links get the shell", async () => {
+  const s = queueApp.listen(0, "127.0.0.1");
+  await new Promise<void>((resolve) => s.once("listening", resolve));
+  const at = `http://127.0.0.1:${(s.address() as AddressInfo).port}`;
+  try {
+    const start = await fetch(`${at}/queue/oauth/start`, { redirect: "manual" });
+    assert.equal(start.status, 302);
+    assert.equal(start.headers.get("location"), "https://app.intercom.com/oauth?state=s");
+    assert.match(start.headers.get("set-cookie") ?? "", /__Host-queue-oauth=n/);
+    assert.equal(start.headers.get("referrer-policy"), "no-referrer");
+
+    const cb = await fetch(`${at}/queue/oauth/callback?code=abc&state=s`, {
+      redirect: "manual",
+      headers: { Cookie: "__Host-queue-oauth=nonce1; __Host-queue=other" },
+    });
+    assert.equal(cb.status, 302);
+    assert.equal(cb.headers.get("location"), "/queue?code=abc&cookie=nonce1");
+
+    const root = await fetch(`${at}/queue`);
+    assert.match(await root.text(), /<title>queue<\/title>/);
+    const deep = await fetch(`${at}/queue/inbox/123?f_view=random`);
+    assert.match(await deep.text(), /<title>queue<\/title>/);
+
+    const api = await fetch(`${at}/queue/api/status`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Panel-Request": "1", Cookie: "__Host-queue=sess1; __Host-billing=dash" },
+      body: "{}",
+    });
+    assert.deepEqual(await api.json(), { shell: "queue", endpoint: "status", sessionId: "sess1" });
+  } finally {
+    s.close();
+  }
+});

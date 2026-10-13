@@ -38,6 +38,14 @@ export type BillingActionLevel = "none" | "approval" | "admin" | "all";
 // apply), "operator" = read-only + registry actions at their configured level.
 export type DashboardAdminRole = "admin" | "operator";
 
+// Intercom Queue exclusions: teams, tags and ticket types never listed.
+export interface QueueExclusions {
+  teams: Array<{ id: string; name: string }>;
+  tags: Array<{ id: string; name: string }>;
+  ticketTypes: Array<{ id: string; name: string }>;
+}
+export const QUEUE_EXCLUSION_MAX = 50;
+
 // `--effort` levels accepted by the Claude CLI. Stored free-text in BotSettings
 // but coerced on read so a bad /config value can never break the spawn.
 export type AiEffort = "low" | "medium" | "high" | "max";
@@ -79,7 +87,7 @@ const DEFAULT_TAGS: TagInput[] = [
   { emoji: "📁", label: "Closed", closesThread: true, reminderEnabled: false },
 ];
 
-// The eleven global secrets and their Vault KV home (one KV entry per
+// The twelve global secrets and their Vault KV home (one KV entry per
 // integration; field names live inside the entry). Shared by the read
 // resolver, the write router, the panel state helper and the migrator.
 export type GlobalSecretColumn =
@@ -93,7 +101,8 @@ export type GlobalSecretColumn =
   | "yubicoApiSecret"
   | "postizApiKey"
   | "resendApiKey"
-  | "resendWebhookSecret";
+  | "resendWebhookSecret"
+  | "queueOauthClientSecret";
 
 export const GLOBAL_SECRETS: Record<GlobalSecretColumn, { integration: VaultIntegration; field: string }> = {
   intercomAccessToken: { integration: "intercom", field: "accessToken" },
@@ -107,6 +116,9 @@ export const GLOBAL_SECRETS: Record<GlobalSecretColumn, { integration: VaultInte
   postizApiKey: { integration: "postiz", field: "apiKey" },
   resendApiKey: { integration: "resend", field: "apiKey" },
   resendWebhookSecret: { integration: "resend", field: "webhookSecret" },
+  // The Intercom Queue's OAuth app is a second Developer Hub app on the same
+  // workspace, so its secret lives in the intercom entry beside the bridge's.
+  queueOauthClientSecret: { integration: "intercom", field: "queueOauthClientSecret" },
 };
 
 // Panel-facing storage state of a global secret column.
@@ -818,6 +830,94 @@ export class SettingsStore {
       data: { dashboardEpoch: { increment: 1 } },
     });
     return this.settings.dashboardEpoch;
+  }
+
+  // ---- Intercom Queue (/queue, edited via /intercom → Queue) ----
+
+  // Kill switch: off = every /queue route answers 404.
+  queueEnabled(): boolean {
+    return this.settings.queueEnabled;
+  }
+
+  queueOauthClientId(): string | null {
+    return this.settings.queueOauthClientId?.trim() || null;
+  }
+
+  queueOauthClientSecret(): string | null {
+    return this.resolveSecret(this.settings.queueOauthClientSecret, "queueOauthClientSecret");
+  }
+
+  // Sign-in works only with both halves of the OAuth app and the bridge's own
+  // Intercom token (the queue reads its data with that token).
+  queueReady(): boolean {
+    return this.queueEnabled() && this.queueOauthClientId() != null && this.queueOauthClientSecret() != null && this.intercomConfigured();
+  }
+
+  queueEpoch(): number {
+    return this.settings.queueEpoch;
+  }
+
+  async bumpQueueEpoch(): Promise<number> {
+    this.settings = await this.prisma.botSettings.update({
+      where: { id: "global" },
+      data: { queueEpoch: { increment: 1 } },
+    });
+    return this.settings.queueEpoch;
+  }
+
+  queueFinCountsAsReply(): boolean {
+    return this.settings.queueFinCountsAsReply;
+  }
+
+  queueNotesCountAsReply(): boolean {
+    return this.settings.queueNotesCountAsReply;
+  }
+
+  queueExclusions(): QueueExclusions {
+    const raw = this.settings.queueExclusionsJson as unknown;
+    const list = (v: unknown): Array<{ id: string; name: string }> => {
+      if (!Array.isArray(v)) return [];
+      const out: Array<{ id: string; name: string }> = [];
+      for (const entry of v) {
+        if (!entry || typeof entry !== "object") continue;
+        const id = (entry as { id?: unknown }).id;
+        const name = (entry as { name?: unknown }).name;
+        if (typeof id !== "string" || !id) continue;
+        out.push({ id, name: typeof name === "string" && name ? name : id });
+      }
+      return out;
+    };
+    const obj = raw && typeof raw === "object" && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {};
+    return { teams: list(obj.teams), tags: list(obj.tags), ticketTypes: list(obj.ticketTypes) };
+  }
+
+  async updateQueue(data: {
+    queueEnabled?: boolean;
+    queueOauthClientId?: string | null;
+    queueOauthClientSecret?: string | null;
+    queueFinCountsAsReply?: boolean;
+    queueNotesCountAsReply?: boolean;
+    queueExclusions?: QueueExclusions;
+  }): Promise<void> {
+    const { queueOauthClientSecret, queueExclusions, ...rest } = data;
+    this.settings = await this.prisma.botSettings.update({
+      where: { id: "global" },
+      data: {
+        ...rest,
+        ...(queueOauthClientSecret !== undefined
+          ? { queueOauthClientSecret: await this.routeSecretWrite("queueOauthClientSecret", queueOauthClientSecret) }
+          : {}),
+        ...(queueExclusions !== undefined
+          ? {
+              queueExclusionsJson: {
+                teams: queueExclusions.teams.slice(0, QUEUE_EXCLUSION_MAX),
+                tags: queueExclusions.tags.slice(0, QUEUE_EXCLUSION_MAX),
+                ticketTypes: queueExclusions.ticketTypes.slice(0, QUEUE_EXCLUSION_MAX),
+              },
+            }
+          : {}),
+      },
+    });
   }
 
   // ---- YubiKey OTP sign-in (dashboard) ----

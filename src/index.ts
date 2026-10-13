@@ -116,6 +116,12 @@ import { makeBridgeHub } from "./adminpanel/sections/bridgeHub";
 import { makeMaintenanceHub } from "./adminpanel/sections/maintenanceHub";
 import { makeSlaHub } from "./adminpanel/sections/slaHub";
 import { makeAssignmentHub } from "./adminpanel/sections/assignmentHub";
+import { makeQueueHub } from "./adminpanel/sections/queueHub";
+import { QueueData } from "./queue/QueueData";
+import { QueueSessions } from "./queue/QueueSessions";
+import { QueueAuth } from "./queue/QueueAuth";
+import { QueueViews } from "./queue/queueViews";
+import { QueuePanel } from "./queue/QueuePanel";
 import { CachedRatioEngine } from "./bot/billing/disputeRatio";
 import { MoneyOutStore } from "./bot/billing/MoneyOutStore";
 import { MoneyOutService } from "./bot/billing/MoneyOutService";
@@ -550,6 +556,36 @@ async function main() {
   intercomWebhookHandler.setCloseStates(closeStateService);
   slaEnforcer.setCloseStates(closeStateService);
 
+  // Intercom Queue (/queue): the tickets waiting on a teammate reply, signed
+  // in with Intercom OAuth (its own Developer Hub app), data read with the
+  // bridge's token. Ships off; configured in /intercom → Queue.
+  const queueData = new QueueData(intercomClient, settingsStore);
+  const queueSessions = new QueueSessions(prisma);
+  const queueAuth = new QueueAuth(settingsStore, queueData, queueSessions, (event) => {
+    const who = event.teammate
+      ? [event.teammate.name ?? "unknown", event.teammate.email ? `(${event.teammate.email})` : "", event.teammate.id ? `· admin ${event.teammate.id}` : ""]
+          .filter(Boolean)
+          .join(" ")
+      : "unknown (Intercom never named them)";
+    void auditLogger.log({
+      title: "🚫 Intercom Queue sign-in refused",
+      severity: "warn",
+      fields: [
+        { name: "Teammate", value: who },
+        { name: "Reason", value: event.reason },
+        ...(event.ip ? [{ name: "IP", value: event.ip, inline: true }] : []),
+      ],
+    });
+  });
+  const queuePanel = new QueuePanel(settingsStore, queueAuth, new QueueViews(queueData, settingsStore));
+  const queueOps = {
+    liveSessions: () => queueSessions.countLive(settingsStore.queueEpoch()),
+    signOutAll: async () => {
+      await settingsStore.bumpQueueEpoch();
+      return queueSessions.deleteAll();
+    },
+  };
+
   // /intercom admin panel (bridge/SLA/automation/maintenance hubs).
   const intercomAdmin = new IntercomAdmin(
     settingsStore,
@@ -566,7 +602,8 @@ async function main() {
     slaService,
     assignmentService,
     replyStateService,
-    closeStateService
+    closeStateService,
+    queueOps
   );
 
   // The bridge resolves category ids to their human labels via the registry
@@ -802,6 +839,12 @@ async function main() {
       resetBridgeData: async () => fmtReport(await intercomStore.resetAll()),
       runSlaNow,
     }),
+    makeQueueHub({
+      listTeams: () => intercomClient.listTeams(),
+      listTags: () => intercomClient.listTags(),
+      listTicketTypes: () => intercomClient.listTicketTypes(),
+      ...queueOps,
+    }),
   ];
   const adminPanel = new AdminPanel(settingsStore, adminPanelTokens, adminPanelSessions, guildSnapshot, adminHubs);
   const adminPanelDiscord = new AdminPanelDiscord(settingsStore, adminPanelTokens, adminPanelSessions);
@@ -880,6 +923,7 @@ async function main() {
   dashboardAuth.bindNotifier(dashboardDiscord);
   dashboardDiscord.bindClient(bot.client);
   bot.bindDashboard({ panel: dashboard, discord: dashboardDiscord });
+  bot.bindQueue(queuePanel);
 
   // --worker-only: log the Discord client in (activities need it) but skip
   // slash-command registration + the HTTP surface; the Temporal worker always

@@ -44,4 +44,12 @@ export interface HubContext {
   // "⚙️ Config updated" embed, same shape as DiscordBot.auditConfig.
   auditConfig: (interaction: { user: { displayName: string; displayAvatarURL(): string } }, change: string) => void;
   discord: () => DiscordBinding | null;
+  // Intercom Queue session controls (/intercom → Queue). Optional so the
+  // hub degrades to "unknown" when the queue stack is not wired.
+  queue?: QueueOps;
+}
+
+export interface QueueOps {
+  liveSessions: () => Promise<number>;
+  signOutAll: () => Promise<number>;
 }
