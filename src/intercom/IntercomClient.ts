@@ -570,7 +570,8 @@ export class IntercomClient {
           operator: "AND",
           value: [
             { field: "open", operator: "=", value: false },
-            { field: "category", operator: "=", value: "Customer" },
+            // Search uses "request" even though returned tickets say "Customer".
+            { field: "category", operator: "=", value: "request" },
             { field: "state", operator: "!=", value: "resolved" },
             ...(updatedSinceSec != null ? [{ field: "updated_at", operator: ">", value: updatedSinceSec }] : []),
           ],
@@ -1140,7 +1141,8 @@ export class IntercomClient {
           operator: "AND",
           value: [
             { field: "open", operator: "=", value: true },
-            { field: "category", operator: "=", value: "Customer" },
+            // Search uses "request" even though returned tickets say "Customer".
+            { field: "category", operator: "=", value: "request" },
           ],
         },
         pagination: { per_page: 150, ...(startingAfter ? { starting_after: startingAfter } : {}) },

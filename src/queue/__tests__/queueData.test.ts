@@ -134,6 +134,66 @@ test("concurrent viewers share one refresh", async () => {
   assert.equal(src.calls.conv, 1);
 });
 
+test("browser views return immediately during a slow cold scan, then use its shared result", async () => {
+  const src = fakeSource([rawConv("1")]);
+  let complete!: (page: { items: unknown[]; nextStartingAfter: null }) => void;
+  src.searchOpenConversationsRaw = async () => {
+    src.calls.conv++;
+    return new Promise((resolve) => { complete = resolve; });
+  };
+  const s = settings();
+  const data = new QueueData(src, s, () => NOW);
+  const views = new QueueViews(data, { intercomConfigured: () => true, queueExclusions: () => s.state.exclusions }, () => NOW);
+  const actor = { adminId: "11", name: "Ada", sessionIdHash: "hash" };
+  const req = { page: "global", params: {}, filters: {}, cursor: null };
+  const loading = await views.build(actor, req, { waitForSnapshot: false });
+  assert.equal(loading?.refreshing, true);
+  assert.equal(loading?.actorLabel, "Ada");
+  assert.ok(!loading?.blocks.some((b) => b.type === "table"), "an incomplete scan must not look like an empty queue");
+  await views.build(actor, req, { waitForSnapshot: false });
+  assert.equal(src.calls.conv, 1, "polling shares the pending scan");
+  complete({ items: [rawConv("1")], nextStartingAfter: null });
+  await data.snapshot();
+  const loaded = await views.build(actor, req, { waitForSnapshot: false });
+  assert.equal(loaded?.refreshing, undefined);
+  assert.ok(loaded?.blocks.some((b) => b.type === "table"));
+});
+
+test("browser reads keep the old list while a refresh is pending, but discard it after policy changes", async () => {
+  let now = NOW;
+  const src = fakeSource([rawConv("1")]);
+  const s = settings();
+  const data = new QueueData(src, s, () => now);
+  await data.snapshot();
+  now += 61_000;
+  let complete!: (page: { items: unknown[]; nextStartingAfter: null }) => void;
+  src.searchOpenConversationsRaw = async () => new Promise((resolve) => { complete = resolve; });
+  const stale = data.readySnapshot();
+  assert.equal(stale?.refreshing, true);
+  assert.deepEqual(stale?.items.map((i) => i.id), ["1"]);
+  s.state.exclusions = { teams: [{ id: "22", name: "Support Team" }], tags: [], ticketTypes: [] };
+  assert.equal(data.readySnapshot(), null, "never serve data from the old policy");
+  complete({ items: [rawConv("1")], nextStartingAfter: null });
+  await data.snapshot();
+  now += 5_000;
+  assert.equal(data.readySnapshot(), null);
+  complete({ items: [rawConv("1")], nextStartingAfter: null });
+  await data.snapshot();
+  assert.deepEqual(data.readySnapshot()?.items, []);
+});
+
+test("a failed first browser scan becomes a visible error, not endless warming", async () => {
+  const src = fakeSource();
+  src.fail = true;
+  const data = new QueueData(src, settings(), () => NOW);
+  assert.equal(data.readySnapshot(), null);
+  await data.snapshot();
+  const failed = data.readySnapshot();
+  assert.ok(failed?.error);
+  assert.equal(failed?.refreshing, false);
+  assert.equal(src.calls.conv, 1, "the failed cold scan is cached rather than retried on every request");
+});
+
 test("a failed refresh keeps the last list and says so without the raw error", async () => {
   let now = NOW;
   const src = fakeSource([rawConv("1")]);

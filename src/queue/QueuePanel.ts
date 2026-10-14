@@ -55,7 +55,7 @@ export class QueuePanel implements QueueRoute {
         case "view": {
           const req = viewRequest(request);
           if (!req) return { status: 400, json: { error: "bad request" } };
-          const view = await this.views.build(actor, req);
+          const view = await this.views.build(actor, req, { waitForSnapshot: false });
           if (!view) return { status: 404, json: { error: "unknown page" } };
           return { status: 200, json: view };
         }

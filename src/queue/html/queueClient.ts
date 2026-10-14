@@ -110,7 +110,11 @@ D.bindLinks = function () {
 
 // silent = the 60-second refresh: keep the page (and the scroll position)
 // until the new one is in, and stay quiet on a failed poll.
+D.loadSeq = 0;
+D.refreshTimer = null;
 D.loadPage = function (silent) {
+  var seq = ++D.loadSeq;
+  if (D.refreshTimer) { clearTimeout(D.refreshTimer); D.refreshTimer = null; }
   var content = D.q("content");
   if (!silent) {
     D.clearFlash();
@@ -120,6 +124,7 @@ D.loadPage = function (silent) {
   var scrollY = window.scrollY;
   D.api("view", { page: D.state.page, params: D.state.params, filters: D.state.filters, cursor: D.state.cursor })
     .then(function (res) {
+      if (seq !== D.loadSeq) return;
       var v = D.handle(res); if (!v) return;
       if (v.error) {
         if (silent) return;
@@ -142,8 +147,12 @@ D.loadPage = function (silent) {
       D.renderBlocks(wrap, blocks);
       content.appendChild(wrap);
       if (silent) window.scrollTo(0, scrollY);
+      if (v.refreshing) {
+        D.refreshTimer = setTimeout(function () { D.refreshTimer = null; D.loadPage(true); }, 5000);
+      }
     })
     .catch(function () {
+      if (seq !== D.loadSeq) return;
       if (silent) return;
       content.textContent = "";
       content.appendChild(D.el("p", "error", "Could not reach the server. Try again."));

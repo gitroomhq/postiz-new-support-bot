@@ -67,6 +67,7 @@ export interface QueueDirectory {
 }
 
 const SNAPSHOT_TTL_MS = 60_000;
+const REFRESH_RETRY_MS = 5_000;
 const MAX_PAGES = 40; // 6,000 open conversations; the rest is reported as truncated
 const PARTS_BUDGET = 200; // toggle checks per refresh
 const PARTS_CONCURRENCY = 4;
@@ -81,6 +82,7 @@ export class QueueData {
   private snap: QueueSnapshot | null = null;
   private snapKey = "";
   private inflight: Promise<QueueSnapshot> | null = null;
+  private lastRefreshAttemptAt = -Infinity;
   private partsCache = new Map<string, { updatedAt: number; parts: IntercomWebhookPart[] }>();
   private messageCache = new Map<string, { updatedAt: number; at: number; text: string | null }>();
   private admins: { at: number; list: IntercomAdmin[] } | null = null;
@@ -109,11 +111,25 @@ export class QueueData {
     const key = this.settingsKey();
     if (this.snap && this.snapKey === key && this.now() - this.snap.builtAt < SNAPSHOT_TTL_MS) return this.snap;
     if (!this.inflight) {
+      this.lastRefreshAttemptAt = this.now();
       this.inflight = this.build(key).finally(() => {
         this.inflight = null;
       });
     }
     return this.inflight;
+  }
+
+  // Browser reads never wait for the whole Intercom scan. Keep serving the
+  // previous list while refreshing, or let the page show its initial scan.
+  // A changed exclusion/reply policy cannot reuse the old list.
+  readySnapshot(): (QueueSnapshot & { refreshing: boolean }) | null {
+    const key = this.settingsKey();
+    const current = this.snap && this.snapKey === key ? this.snap : null;
+    const now = this.now();
+    if ((!current || now - current.builtAt >= SNAPSHOT_TTL_MS) && !this.inflight && now - this.lastRefreshAttemptAt >= REFRESH_RETRY_MS) {
+      void this.snapshot();
+    }
+    return current ? { ...current, refreshing: this.inflight != null } : null;
   }
 
   private settingsKey(): string {
@@ -182,8 +198,13 @@ export class QueueData {
       const message = e instanceof Error ? e.message : String(e);
       queueLog.warn("queue snapshot refresh failed", { "error.message": message });
       // The raw message stays in the logs; the page only learns that it failed.
-      if (this.snap) return { ...this.snap, error: "Intercom did not answer the last refresh." };
-      return { builtAt: this.now(), items: [], scanned: 0, truncated: false, partsSkipped: 0, error: "Intercom did not answer." };
+      if (this.snap && this.snapKey === key) {
+        this.snap = { ...this.snap, error: "Intercom did not answer the last refresh." };
+      } else {
+        this.snap = { builtAt: this.now(), items: [], scanned: 0, truncated: false, partsSkipped: 0, error: "Intercom did not answer." };
+        this.snapKey = key;
+      }
+      return this.snap;
     }
   }
 

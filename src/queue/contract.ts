@@ -71,6 +71,7 @@ export interface QueuePageView {
   blocks: QueueBlock[];
   actorLabel: string;
   updatedAt: string; // ISO: when the data was read from Intercom
+  refreshing?: boolean;
 }
 
 export interface QueueViewRequest {

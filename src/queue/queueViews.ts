@@ -67,11 +67,33 @@ export class QueueViews {
     private now: () => number = Date.now
   ) {}
 
-  async build(actor: QueueActor, req: QueueViewRequest): Promise<QueuePageView | null> {
+  async build(actor: QueueActor, req: QueueViewRequest, options?: { waitForSnapshot: boolean }): Promise<QueuePageView | null> {
     const scope = this.scopeFor(req);
     if (!scope && req.page !== "inboxes" && req.page !== "people") return null;
+    const ready = options?.waitForSnapshot === false ? this.data.readySnapshot() : undefined;
+    if (ready === null) {
+      return {
+        page: req.page,
+        title: "Intercom Queue",
+        crumbs: [],
+        nav: [
+          { key: "mine", label: "Mine", page: "mine" },
+          { key: "global", label: "Global", page: "global" },
+          { key: "inboxes", label: "All inboxes", page: "inboxes" },
+          { key: "people", label: "All people", page: "people" },
+        ],
+        activeNav: req.page,
+        blocks: [
+          { type: "header", title: "Reading tickets from Intercom" },
+          { type: "notice", badge: { kind: "info", text: "Updating" }, text: "The first scan is running. Tickets will appear here automatically when it finishes." },
+        ],
+        actorLabel: actor.name,
+        updatedAt: new Date(this.now()).toISOString(),
+        refreshing: true,
+      };
+    }
     const [snap, dir, workspace] = await Promise.all([
-      this.data.snapshot(),
+      ready ?? this.data.snapshot(),
       this.data.directory().catch((): QueueDirectory => ({ teammates: new Map(), teams: new Map() })),
       this.data.workspaceIdCode().catch(() => null),
     ]);
@@ -81,6 +103,9 @@ export class QueueViews {
     if (req.page === "inboxes") built = this.inboxesPage(ctx, req);
     else if (req.page === "people") built = this.peoplePage(ctx, req);
     else built = await this.scopePage(ctx, scope!, req);
+    if (ready?.refreshing) {
+      built.blocks.splice(1, 0, { type: "notice", badge: { kind: "info", text: "Updating" }, text: "Refreshing from Intercom. Showing the last list while it updates." });
+    }
     return {
       page: req.page,
       title: built.title,
@@ -90,6 +115,7 @@ export class QueueViews {
       blocks: built.blocks,
       actorLabel: actor.name,
       updatedAt: new Date(snap.builtAt).toISOString(),
+      ...(ready?.refreshing ? { refreshing: true } : {}),
     };
   }
 
