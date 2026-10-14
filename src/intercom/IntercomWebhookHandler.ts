@@ -21,7 +21,7 @@ import {
 } from "./types";
 
 // Thrown while the thread still has in-flight outbound content that could be
-// the origin of this part — the inbox workflow retries shortly instead of
+// the origin of this part: the inbox workflow retries shortly instead of
 // risking a double-post. Bounded: after MAX_DEFER_ATTEMPTS the part is relayed
 // anyway (a rare duplicate beats a lost agent reply).
 export class DeferEchoError extends Error {
@@ -31,13 +31,13 @@ export class DeferEchoError extends Error {
   }
 }
 
-// The webhook topics the bridge handles — the SINGLE source for every place
+// The webhook topics the bridge handles: the SINGLE source for every place
 // that instructs the operator what to subscribe in the Developer Hub (panel,
 // secrets-modal follow-up). Subscriptions are Developer-Hub-only (no public
 // API), so drift between instruction texts silently disables features.
 // Over-subscribing is harmless: accept() drops anything not in this list
 // BEFORE it reaches Temporal, so "click everything" costs only the HTTP
-// delivery itself (conversation.user.replied is the noisiest extra — it fires
+// delivery itself (conversation.user.replied is the noisiest extra: it fires
 // once per customer message the bridge mirrors).
 export const INTERCOM_WEBHOOK_TOPICS = [
   "conversation.admin.replied",
@@ -48,14 +48,14 @@ export const INTERCOM_WEBHOOK_TOPICS = [
   "conversation.admin.snoozed",
   "conversation.admin.unsnoozed",
   // conversation.priority.updated left this list with the priority axis
-  // (agent-rip) — unsubscribe it in the Developer Hub; deliveries drop at the
+  // (agent-rip): unsubscribe it in the Developer Hub; deliveries drop at the
   // door until then.
   "ticket.state.updated",
   "ticket.admin.replied",
   "ticket.note.created",
   // SLA manager triggers for NATIVE (unbridged) conversations: creation and
   // customer replies re-run the SLA rules. Bridged conversations return early
-  // (one indexed link lookup) — the Discord-side hooks own them. Requires the
+  // (one indexed link lookup): the Discord-side hooks own them. Requires the
   // manual Developer Hub subscription like every other topic here.
   "conversation.user.created",
   "conversation.user.replied",
@@ -66,20 +66,20 @@ export const INTERCOM_WEBHOOK_TOPICS = [
   "conversation.admin.assigned",
 ] as const;
 
-// Shared with intercomInboxWorkflow's defer loop — see INTERCOM_MAX_ECHO_DEFERS.
+// Shared with intercomInboxWorkflow's defer loop: see INTERCOM_MAX_ECHO_DEFERS.
 const MAX_DEFER_ATTEMPTS = INTERCOM_MAX_ECHO_DEFERS;
 
 // Handled but deliberately NOT in INTERCOM_WEBHOOK_TOPICS: that const feeds the
 // operator-facing subscription instructions, which stay unchanged by operator
-// choice — the topic is accepted at the door and simply never fires until it
+// choice: the topic is accepted at the door and simply never fires until it
 // is subscribed manually in the Developer Hub.
 const EXTRA_HANDLED_TOPICS = ["conversation_part.redacted"] as const;
 
 const HANDLED_TOPICS: ReadonlySet<string> = new Set([...INTERCOM_WEBHOOK_TOPICS, ...EXTRA_HANDLED_TOPICS]);
 
-// Discord "Unknown Message" — the relayed/origin message is already gone.
+// Discord "Unknown Message": the relayed/origin message is already gone.
 const DISCORD_UNKNOWN_MESSAGE = 10008;
-// Discord "Missing Permissions" — bot lacks Manage Messages for the origin delete.
+// Discord "Missing Permissions": bot lacks Manage Messages for the origin delete.
 const DISCORD_MISSING_PERMISSIONS = 50013;
 
 // Native re-upload cap for relayed Intercom attachments: Discord's baseline
@@ -87,14 +87,14 @@ const DISCORD_MISSING_PERMISSIONS = 50013;
 const MAX_RELAY_UPLOAD_BYTES = 8 * 1024 * 1024;
 const MAX_RELAY_FILES = 10;
 // Per-file and TOTAL download deadlines. The total must stay well inside the
-// inbound activity's 1-minute startToCloseTimeout — a relay that dawdles past
+// inbound activity's 1-minute startToCloseTimeout: a relay that dawdles past
 // it re-runs as a Temporal retry (the part-id claim drops it, losing the reply).
 const RELAY_DOWNLOAD_TIMEOUT_MS = 10_000;
 const RELAY_DOWNLOAD_BUDGET_MS = 30_000;
 
 // Intercom's attachment / inline-image CDN hosts (suffix match). Relay
 // downloads are restricted to these; an unlisted host degrades to a masked 📎
-// link (safe fallback) rather than a server-side fetch — see safeFetch.
+// link (safe fallback) rather than a server-side fetch: see safeFetch.
 const INTERCOM_CDN_HOSTS = [
   ".intercomcdn.com",
   ".intercomcdn.eu",
@@ -112,13 +112,13 @@ const INTERCOM_CDN_HOSTS = [
   ".intercom-attachments-9.com",
 ];
 
-// Discord "Unknown Channel" — the thread was deleted, not a transient failure.
+// Discord "Unknown Channel": the thread was deleted, not a transient failure.
 const DISCORD_UNKNOWN_CHANNEL = 10003;
 
 // Handles inbound Intercom webhooks. The HTTP route only calls accept()
 // (a signal into the per-conversation workflow); the processInboundEvent
 // activity drives process(), which THROWS on transient failures so the
-// workflow retries — nothing is lost to a crash mid-handle.
+// workflow retries: nothing is lost to a crash mid-handle.
 //
 // Echo suppression is layered: part-id ledger (claimPart) → pending-post
 // body-hash match (reserve→confirm handshake with the outbox) → bounded defer
@@ -150,12 +150,12 @@ export class IntercomWebhookHandler {
 
   // Temporal seam: inbound events are signalled into the per-conversation
   // intercomInboxWorkflow (dedup via its deliveryId ring) whenever Temporal is
-  // configured — even while the worker is paused, the signal parks server-side
+  // configured, even while the worker is paused, the signal parks server-side
   // and processes on resume. A buffered signal (Temporal down) throws so the
   // route answers 500 and Intercom's single retry redelivers.
   private temporalProducers: TemporalProducers | null = null;
 
-  // SLA manager — bound late from index.ts; handles the native-conversation
+  // SLA manager: bound late from index.ts; handles the native-conversation
   // trigger topics (conversation.user.created / .replied) and the bridged
   // assignee-change re-eval (the intercom.assignee rule dim).
   private slaService: {
@@ -170,7 +170,7 @@ export class IntercomWebhookHandler {
     this.slaService = service;
   }
 
-  // Balanced assignment — bound late from index.ts.
+  // Balanced assignment: bound late from index.ts.
   private assignmentService: {
     maybeAssignOnCreate(conversationId: string, teamId: string | null, threadId: string | null, ticketId: string | null): Promise<void>;
     maybeReassignOnCustomerReply(
@@ -186,7 +186,7 @@ export class IntercomWebhookHandler {
     this.assignmentService = service;
   }
 
-  // Sentry feedback import ledger — bound late. Creation-time balanced
+  // Sentry feedback import ledger: bound late. Creation-time balanced
   // assignment must not race the importer's own paced decoration writes.
   private sentryFeedbackStore: { getByConversationId(conversationId: string): Promise<unknown> } | null = null;
 
@@ -205,7 +205,7 @@ export class IntercomWebhookHandler {
     this.forwardedEmailConverter = converter;
   }
 
-  // Cleanup for Intercom's NATIVE forward detection — bound late like the
+  // Cleanup for Intercom's NATIVE forward detection: bound late like the
   // converter. Best-effort: it never throws, so it can never make a delivery
   // retry.
   private forwarderDetacher: {
@@ -217,7 +217,7 @@ export class IntercomWebhookHandler {
     this.forwarderDetacher = detacher;
   }
 
-  // SLA enforcement engine — bound late; owns the unsnooze re-anchor for the
+  // SLA enforcement engine: bound late; owns the unsnooze re-anchor for the
   // next-reply clock.
   private slaEnforcer: { reanchorAfterUnsnooze(conversationId: string): Promise<void> } | null = null;
 
@@ -250,6 +250,15 @@ export class IntercomWebhookHandler {
     this.closeStates = service;
   }
 
+  // Intercom Queue (/queue): told about every verified conversation and
+  // ticket delivery so its list stays live. Bound late. Synchronous and
+  // never throws into the webhook route.
+  private queueListener: ((topic: string, itemId: string) => void) | null = null;
+
+  setQueueListener(listener: (topic: string, itemId: string) => void): void {
+    this.queueListener = listener;
+  }
+
   // HTTP-route half: durably queue the event and return. Never relays inline
   // while Temporal is configured. Returns false for duplicate deliveries.
   async accept(body: unknown): Promise<boolean> {
@@ -263,7 +272,10 @@ export class IntercomWebhookHandler {
     const event = body as IntercomWebhookEvent;
     const topic = event?.topic;
     if (!topic || topic === "ping") return true;
-    // Door filter: operators may subscribe every topic in the Developer Hub —
+    // Before the door filter: the queue also uses topics the bridge drops
+    // (a tag or priority change, when subscribed).
+    this.notifyQueue(topic, event);
+    // Door filter: operators may subscribe every topic in the Developer Hub:
     // anything the bridge doesn't handle is dropped HERE, before it costs a
     // Temporal signal / inbox workflow (conversation.user.replied alone would
     // otherwise fire once per mirrored customer message). process() keeps its
@@ -271,11 +283,11 @@ export class IntercomWebhookHandler {
     if (!HANDLED_TOPICS.has(topic)) return true;
     if (this.temporalProducers?.routable()) {
       // Per-item serialization key: conversation id for conversation.* topics,
-      // ticket id for ticket.* — handlers are convergent/damped, so distinct
+      // ticket id for ticket.*: handlers are convergent/damped, so distinct
       // workflows per kind are fine (matches the old durable queue's guarantees).
       const itemId = (event?.data?.item as { id?: unknown } | undefined)?.id;
       const key = itemId != null ? String(itemId) : null;
-      if (!key) return true; // nothing to key on — same as an unknown topic: drop
+      if (!key) return true; // nothing to key on, same as an unknown topic: drop
       const r = await this.temporalProducers.inboundIntercomEvent(key, {
         deliveryId: event.id ?? null,
         topic,
@@ -286,13 +298,24 @@ export class IntercomWebhookHandler {
       }
       return r.ok;
     }
-    // Direct fallback (Temporal unconfigured — bootstrap state): best-effort
+    // Direct fallback (Temporal unconfigured: bootstrap state): best-effort
     // inline handling with no durable queue. Echo decisions can't defer here,
     // so process with the defer budget exhausted (a rare duplicate beats a
     // lost agent reply); a transient throw becomes a 500 and Intercom's single
     // retry redelivers.
     await this.process(topic, body, MAX_DEFER_ATTEMPTS);
     return true;
+  }
+
+  private notifyQueue(topic: string, event: IntercomWebhookEvent): void {
+    if (!this.queueListener || !(topic.startsWith("conversation") || topic.startsWith("ticket."))) return;
+    const itemId = (event.data?.item as { id?: unknown } | undefined)?.id;
+    if (typeof itemId !== "string" && typeof itemId !== "number") return;
+    try {
+      this.queueListener(topic, String(itemId));
+    } catch (e) {
+      this.wbLog.warn("queue webhook listener failed", { "webhook.topic": topic, "error.message": e instanceof Error ? e.message : String(e) });
+    }
   }
 
   // Scheduler half: dispatch one queued event. Throws on transient failure
@@ -344,16 +367,16 @@ export class IntercomWebhookHandler {
         await this.handleAdminAssigned(item as IntercomConversationItem | undefined);
         return;
       default:
-        return; // unknown topic — drop
+        return; // unknown topic: drop
     }
   }
 
   // Inbound customer activity. Two jobs:
   //  - assignment: creation assigns natives to the pool (bridged creation is
   //    hooked in ensureBridge); a customer reply landing on an away/gone
-  //    assignee re-routes (bridged AND native — covers reopens).
-  //  - SLA rules for NATIVE conversations. Bridged conversations return early
-  //    — their Discord-side hooks fire in the same flow that mirrored the
+  //    assignee re-routes (bridged AND native, covers reopens).
+  //  - SLA rules for NATIVE conversations. Bridged conversations return early:
+  //    their Discord-side hooks fire in the same flow that mirrored the
   //    message, and the per-ticket outbox owns ordering.
   // Transient SlaService failures rethrow → the inbox scheduler's retry
   // machinery redelivers. Assignment is best-effort by construction.
@@ -365,7 +388,7 @@ export class IntercomWebhookHandler {
     if (!conversationId) return;
     const link = await this.store.getLinkByConversationId(conversationId).catch(() => null);
     // Forwarded-email conversion: a lite-seat teammate's forward gets recreated
-    // for the original sender and THIS conversation closed — the balancer and
+    // for the original sender and THIS conversation closed: the balancer and
     // SLA below must not touch the husk. "converted" also covers retried
     // deliveries of an already-converted original (ledger hit). Throws ride the
     // inbox activity's retry like every other transient failure here.
@@ -375,7 +398,7 @@ export class IntercomWebhookHandler {
     }
     // Intercom's NATIVE forward detection attaches the real customer but leaves
     // the forwarder attached too. It does that ASYNCHRONOUSLY, so creation is
-    // often too early — hence the replied topics as well, and the SLA sweep as
+    // often too early, hence the replied topics as well, and the SLA sweep as
     // the convergence backstop. Both topics are already subscribed, so this
     // needs no new Developer Hub subscription (which is manual-only, and an
     // unsubscribed topic silently disables the feature).
@@ -394,7 +417,7 @@ export class IntercomWebhookHandler {
       if (topic === "conversation.user.created" && !link) {
         // Sentry feedback imports skip the creation balancer: Intercom builds
         // this payload at DELIVERY time, so it can already carry the team the
-        // importer routed mid-decoration — balancing here races the importer's
+        // importer routed mid-decoration: balancing here races the importer's
         // remaining team-routing writes (observed assign→unassign churn). The
         // enforcer's stray sweep balances imports once the dust settles and
         // mirrors the pick onto the converted ticket.
@@ -413,7 +436,7 @@ export class IntercomWebhookHandler {
           .catch(() => undefined);
       }
     }
-    if (link) return; // bridged — Discord-side SLA hooks own it
+    if (link) return; // bridged: Discord-side SLA hooks own it
     if (this.slaService) await this.slaService.applyForNative(conversationId, topic);
     // Customer-responded state. Last, so a transient failure here retries
     // only work that is idempotent anyway.
@@ -434,7 +457,7 @@ export class IntercomWebhookHandler {
   }
 
   // Assignee changed (bot or human). Bridged: refresh the lastAssigneeId
-  // damper and — only for HUMAN (non-echo) changes — re-run the SLA rules
+  // damper and, only for HUMAN (non-echo) changes, re-run the SLA rules
   // (the intercom.assignee dim can flip the target). Native: re-run rules
   // directly. Never moves the rotation cursor: fairness comes from live load
   // counts, and a human grab shouldn't skip anyone's turn.
@@ -459,7 +482,7 @@ export class IntercomWebhookHandler {
   //  - "in":   a relayed agent reply → delete the relayed Discord message;
   //  - "out":  a mirrored Discord message (customer/staff) → delete the ORIGIN
   //            Discord message (leaked-secret parity; Manage Messages needed).
-  // ("note"-direction rows are historical only — inbound note storage was
+  // ("note"-direction rows are historical only: inbound note storage was
   // removed with the agent-rip; their delete below no-ops on Unknown Message.)
   // The bridge's own redactions (Discord delete/edit → redact) pre-stamp
   // redactedAt on the map row, so their webhook echo drops here.
@@ -467,7 +490,7 @@ export class IntercomWebhookHandler {
   // Payload shape: Intercom ships data.item as the CONVERSATION for this topic
   // (the Developer Hub webhook reference lists its item type as Conversation),
   // with the affected part(s) flagged `redacted: true` inside
-  // conversation_parts — and deletion payloads can be minimal, carrying no
+  // conversation_parts, and deletion payloads can be minimal, carrying no
   // parts at all, so an API fetch of the full part list is the reliable
   // fallback. A part-shaped item is still accepted in case older payload
   // versions deliver the part directly.
@@ -486,14 +509,14 @@ export class IntercomWebhookHandler {
 
     const conversationId = String(item.id);
     const link = await this.store.getLinkByConversationId(conversationId);
-    if (!link) return; // Intercom-native conversation — not ours
+    if (!link) return; // Intercom-native conversation, not ours
 
     const redactedOf = (parts?: IntercomWebhookPart[]) =>
       (parts ?? []).filter((p) => p.redacted === true && p.id != null);
 
     let redactedParts = redactedOf(item.conversation_parts?.conversation_parts);
     if (redactedParts.length === 0) {
-      // Minimal payload — pull every part and reflect all redacted ones.
+      // Minimal payload: pull every part and reflect all redacted ones.
       // Convergent: already-reflected parts drop on their redactedAt stamp,
       // never-bridged ones only tombstone. A permanent 4xx (conversation
       // deleted) leaves nothing to reflect; transient errors throw so the
@@ -517,7 +540,7 @@ export class IntercomWebhookHandler {
       // Unknown part: never relayed/mirrored, or pre-feature. Claim the id so
       // an in-flight relay racing this redaction can't post deleted content
       // (the reply relay claims the same key first in the normal order). The
-      // thread id is unknown here — the claim row is purely a tombstone.
+      // thread id is unknown here: the claim row is purely a tombstone.
       await this.store.claimPart("c", partId, "").catch(() => {});
       return;
     }
@@ -536,7 +559,7 @@ export class IntercomWebhookHandler {
 
   // Delete the Discord half of a redacted part. Relayed replies ("in") go
   // through the relay webhook when possible; origin messages ("out") need
-  // Manage Messages — a permission rejection degrades to an audit warning
+  // Manage Messages: a permission rejection degrades to an audit warning
   // instead of retrying forever.
   private async deleteDiscordMessageForRedaction(map: {
     ticketThreadId: string;
@@ -545,7 +568,7 @@ export class IntercomWebhookHandler {
     via: string | null;
   }): Promise<void> {
     const thread = await this.requireThread(map.ticketThreadId);
-    if (!thread) return; // thread permanently gone — nothing left to delete
+    if (!thread) return; // thread permanently gone: nothing left to delete
 
     if (map.direction === "in" && map.via === "webhook") {
       const webhook = await this.getRelayWebhook(thread);
@@ -555,7 +578,7 @@ export class IntercomWebhookHandler {
           return;
         } catch (e) {
           if ((e as { code?: number }).code === DISCORD_UNKNOWN_MESSAGE) return; // already gone
-          // Webhook rotated/deleted — fall through to the bot-side delete.
+          // Webhook rotated/deleted: fall through to the bot-side delete.
         }
       }
     }
@@ -565,7 +588,7 @@ export class IntercomWebhookHandler {
       message = await thread.messages.fetch(map.discordMessageId);
     } catch (e) {
       if ((e as { code?: number }).code === DISCORD_UNKNOWN_MESSAGE) return; // already gone
-      throw e; // transient — retried by the inbox workflow
+      throw e; // transient: retried by the inbox workflow
     }
     try {
       await message.delete();
@@ -586,7 +609,7 @@ export class IntercomWebhookHandler {
       }
       throw e;
     }
-    // Successful reflections are deliberately silent (user request) — only the
+    // Successful reflections are deliberately silent (user request), only the
     // Missing Permissions degradation above is audit-worthy, since it needs a
     // manual delete.
   }
@@ -600,7 +623,7 @@ export class IntercomWebhookHandler {
 
     const link = await this.store.getLinkByConversationId(String(item.id));
     if (!link) {
-      // Intercom-native conversation — not ours to mirror. It IS, however, the
+      // Intercom-native conversation, not ours to mirror. It IS, however, the
       // point where a teammate's first reply proves Intercom's native forward
       // detection has finished attaching the customer, so this is the most
       // reliable moment to detach the forwarder.
@@ -629,7 +652,7 @@ export class IntercomWebhookHandler {
   // Reply-topic relay with an API fallback: Intercom's reply payload sometimes
   // carries only a side-effect part and NOT the comment itself. When the agent
   // replies and assigns/closes/reopens in ONE composer action, the reply body
-  // rides ON that state part and no comment part exists anywhere — the
+  // rides ON that state part and no comment part exists anywhere: the
   // candidate filter relays those directly. When the payload still has no
   // relayable content (e.g. a bare assignment while the comment rides another
   // delivery), pull the recent parts from the API and run them through the
@@ -652,7 +675,7 @@ export class IntercomWebhookHandler {
       return;
     }
 
-    // No comment in the payload — fetch the conversation's recent parts.
+    // No comment in the payload: fetch the conversation's recent parts.
     const sinceUnix = Math.floor(Date.now() / 1000) - 15 * 60;
     const fetched = await this.intercomClient.getConversationPartsSince(link.conversationId, sinceUnix).catch(() => []);
     const fetchedRelayable = relayable(fetched);
@@ -664,7 +687,7 @@ export class IntercomWebhookHandler {
       return;
     }
 
-    // Still nothing — surface it (Discord-visible; prod has no log access):
+    // Still nothing: surface it (Discord-visible; prod has no log access):
     // an agent reply may be vanishing and this is the only trace.
     const shape =
       parts.length === 0
@@ -687,12 +710,12 @@ export class IntercomWebhookHandler {
   }
 
   // Manual-heal entry (Heal Message Gaps button): feed API-fetched
-  // conversation parts straight through the normal relay path — repairs agent
+  // conversation parts straight through the normal relay path: repairs agent
   // replies whose webhook relay was dropped (e.g. the reply-and-assign
   // `assignment` shape before the candidate filter covered it). Deliberately
   // NO API fallback and NO "not relayable" audit: most healed tickets have no
   // new agent content, which is the expected case, not a warning. Returns the
-  // number of candidate parts fed through — already-relayed and bridge-created
+  // number of candidate parts fed through: already-relayed and bridge-created
   // ones no-op on the part-id claim, so the count is "re-checked", not
   // "reposted". bi-only: relaying is meaningless in push/none, and a heal in
   // push mode must not blast agent warnings across every conversation.
@@ -712,18 +735,18 @@ export class IntercomWebhookHandler {
 
   // Filter for parts that may carry a customer-facing agent message.
   // Contact-authored parts can only be our own mirror (customers have no
-  // Intercom access) — only admin/bot/team authors pass. `comment` and
+  // Intercom access), only admin/bot/team authors pass. `comment` and
   // `quick_reply` ARE replies; `assignment`/`close`/`open` are state parts
   // that carry the reply body when the agent replied-and-assigned,
   // replied-and-closed, or replied on a closed conversation in ONE composer
-  // action — Intercom ships NO separate comment part for those (observed live
+  // action: Intercom ships NO separate comment part for those (observed live
   // 2026-07-16: reply-and-auto-assign delivered only a body-bearing
   // `assignment` part, so the old comment-only filter dropped the reply and
   // the API fallback found nothing either). State parts qualify only when
   // they actually carry content: a bare assignment/open/close is a pure state
   // event, and counting it as relayable would short-circuit the API fallback
   // that hunts for the real comment. `note`-typed parts stay excluded on
-  // every path — notes are internal-only (they surface via the noted topics
+  // every path: notes are internal-only (they surface via the noted topics
   // as staff-note audit embeds, never in the customer thread). Redacted parts
   // never relay: full-history heal fetches see agent-deleted parts, and their
   // tombstone must not reach the customer.
@@ -744,7 +767,7 @@ export class IntercomWebhookHandler {
   private async processAgentPart(kind: "c" | "t", threadId: string, part: IntercomWebhookPart, attempt: number): Promise<void> {
     if (!this.isRelayCandidate(part)) return;
 
-    // Layer 1 — part-id ledger: false = the bridge created this part (recorded
+    // Layer 1 (part-id ledger): false = the bridge created this part (recorded
     // at post time) or another delivery already claimed it.
     if (!(await this.store.claimPart(kind, String(part.id), threadId))) return;
 
@@ -758,7 +781,7 @@ export class IntercomWebhookHandler {
       const bridgeAuthor = this.isBridgeAuthor(part);
 
       if (bridgeAuthor) {
-        // Layer 2 — reserve→confirm handshake: a matching pending-post row means
+        // Layer 2 (reserve→confirm handshake): a matching pending-post row means
         // this is our own in-flight post whose confirm hasn't landed yet. Record
         // the part id so a duplicate delivery is also caught, then drop.
         if (await this.store.matchAndDeletePendingPost(threadId, partHash)) {
@@ -767,7 +790,7 @@ export class IntercomWebhookHandler {
         }
         // Operator/Fin-authored parts are AMBIGUOUS, not always ours: the
         // bridge authors its posts as the Operator (withAuthor, no seat
-        // cost), but a live Fin answers customers under the same identity —
+        // cost), but a live Fin answers customers under the same identity:
         // the old unconditional identity drop here silently swallowed every
         // genuine Fin reply. Echo suppression stays layered and deterministic
         // instead: the part-id claim (layer 1) kills everything the confirm
@@ -775,7 +798,7 @@ export class IntercomWebhookHandler {
         // and the defer below holds the reserve→confirm race window. The one
         // Operator-specific guard left is content-shaped: 🤖-prefixed text is
         // backfill-mirrored bot output (composeMessage stamps it, nobody
-        // hand-types it) — the exact shape that once echoed back into Discord
+        // hand-types it): the exact shape that once echoed back into Discord
         // as "Fin" under backfill load.
         const operatorId = this.settingsStore.intercomOperatorAdminId();
         const partAuthorId = part.author?.id != null ? String(part.author.id) : null;
@@ -787,9 +810,9 @@ export class IntercomWebhookHandler {
           await this.store.recordEchoPart(kind, String(part.id), threadId).catch(() => {});
           return;
         }
-        // Layer 3 — bounded defer (every bridge-capable author, Operator
+        // Layer 3: bounded defer (every bridge-capable author, Operator
         // included): outbound content still queued for this thread could
-        // produce this exact part — hold until the confirm lands, then the
+        // produce this exact part: hold until the confirm lands, then the
         // retried claim collides. The catch below rolls the claim back so the
         // retry can claim again. `attempt` is the echo-defer count (tracked
         // separately from real-failure attempts), so deferral can't exhaust
@@ -816,14 +839,14 @@ export class IntercomWebhookHandler {
           .map((a) => ({ url: a.url, name: a.name ?? null })),
         ...inlineImages,
       ]);
-      if (!bodyText && attachmentRefs.length === 0) return; // genuinely empty part — nothing to relay, keep the claim
+      if (!bodyText && attachmentRefs.length === 0) return; // genuinely empty part: nothing to relay, keep the claim
 
-      // Layer 4 — cross-topic duplicate guard (same reply arriving on another
+      // Layer 4: cross-topic duplicate guard (same reply arriving on another
       // topic with a different part id). DB-backed: survives restarts. The
       // duplicate pair keeps its author and created_at across topics, so both
       // scope the key: body hash alone collapsed DISTINCT replies with the
       // same normalized text ("test" then "Test") inside the freshness window
-      // into one relay — silent loss, hit live 2026-07-15 once customer-type
+      // into one relay: silent loss, hit live 2026-07-15 once customer-type
       // converts made both topics fire for every reply.
       relayKey = `reply:${part.author?.id ?? "a?"}:${part.created_at ?? "t?"}:${bodyHash(
         [part.body ?? "", ...attachmentRefs.map((a) => a.url)].join("\n")
@@ -831,12 +854,12 @@ export class IntercomWebhookHandler {
       if (!(await this.store.claimRelay(threadId, relayKey))) return;
 
       const thread = await this.requireThread(threadId);
-      if (!thread) return; // thread permanently deleted — link disconnected
+      if (!thread) return; // thread permanently deleted: link disconnected
 
       const avatar = part.author?.avatar;
       let avatarUrl = typeof avatar === "string" ? avatar : avatar?.image_url ?? null;
       if (!avatarUrl && part.author?.id != null) {
-        // Payloads don't always carry the author avatar — the /admins cache does.
+        // Payloads don't always carry the author avatar: the /admins cache does.
         const admin = await this.lookupAdmin(String(part.author.id));
         avatarUrl = admin?.avatarUrl ?? null;
         if (!avatarUrl) {
@@ -861,11 +884,11 @@ export class IntercomWebhookHandler {
       if (wasArchived) await thread.setArchived(false).catch(() => {});
       const ticket = await this.ticketStore.getByThreadId(threadId);
       try {
-        // Preferred: webhook impersonation — the reply renders as if the agent
+        // Preferred: webhook impersonation; the reply renders as if the agent
         // wrote natively in Discord (their name + Intercom avatar as the
         // message author). Falls back to the neutral embed when the bot lacks
         // Manage Webhooks or the webhook send fails.
-        // Ping cadence: cm → am(ping) → am(no ping) → cm → am(ping) — mention
+        // Ping cadence: cm → am(ping) → am(no ping) → cm → am(ping): mention
         // the customer only on the FIRST agent reply of each exchange turn, so
         // an agent sending several messages in a row pings once, and the next
         // ping arrives only after the customer has spoken again.
@@ -894,7 +917,7 @@ export class IntercomWebhookHandler {
           messageId = sent.id;
         }
         // Message map: lets an Intercom-side redaction of this part delete the
-        // relayed Discord message again. Best-effort — a lost row only means
+        // relayed Discord message again. Best-effort: a lost row only means
         // that one reply can't be auto-removed later.
         await this.store
           .recordMessageMap({
@@ -936,13 +959,13 @@ export class IntercomWebhookHandler {
   private static readonly RELAY_PING_SUPPRESSION_MS = 3 * 60 * 60 * 1000;
 
   // True when the customer has been active since the last relayed agent
-  // message — i.e. this relay is the first agent reply of the current exchange
-  // turn — OR the previous relay is older than the 3h suppression window (a
+  // message, i.e. this relay is the first agent reply of the current exchange
+  // turn, OR the previous relay is older than the 3h suppression window (a
   // stale turn re-pings). Customer activity = their newest in-thread message,
   // floored at the ticket's creation (the modal question is customer activity
   // even though the "Your question" embed is bot-authored). The last-relay
   // side comes from the message map's "in" rows, which cover both webhook and
-  // embed-fallback relays. Fails open to true — a duplicate ping beats a
+  // embed-fallback relays. Fails open to true: a duplicate ping beats a
   // missed one.
   private async shouldPingCustomer(
     thread: ThreadChannel,
@@ -954,8 +977,8 @@ export class IntercomWebhookHandler {
     if (Date.now() - lastRelayAt.getTime() >= IntercomWebhookHandler.RELAY_PING_SUPPRESSION_MS) return true;
     let lastCustomerAt = ticket.createdAt.getTime();
     const messages = await thread.messages.fetch({ limit: 25 }).catch(() => null);
-    // Window miss (customer's last message >25 back) means a long agent chain
-    // — exactly the no-ping case, so the floor result is already right.
+    // Window miss (customer's last message >25 back) means a long agent chain,
+    // exactly the no-ping case, so the floor result is already right.
     for (const message of messages?.values() ?? []) {
       if (message.author.id === ticket.customerId && message.createdTimestamp > lastCustomerAt) {
         lastCustomerAt = message.createdTimestamp;
@@ -970,7 +993,7 @@ export class IntercomWebhookHandler {
   // definition the bridge's own mirror (customers have no Intercom access; the
   // forwarded-email converter also posts contact parts, but only on native
   // conversations, and every caller here is link-gated), bot/workflow and
-  // unattributed parts are Intercom reacting to bridge activity — none of
+  // unattributed parts are Intercom reacting to bridge activity: none of
   // those may boot a closed ticket. Better to drop a rare ambiguous agent
   // action (they can reopen in Discord) than to mass-reopen on every replay.
   private attributedToRealAgent(parts: IntercomWebhookPart[] | undefined): boolean {
@@ -995,7 +1018,7 @@ export class IntercomWebhookHandler {
 
   // Intercom internal notes → the existing staff-note store (visible via
   // /note list + the staff-only audit channel; never in the customer-visible
-  // thread). These rows must never mirror back to Intercom — Discord→Intercom
+  // thread). These rows must never mirror back to Intercom: Discord→Intercom
   // note mirroring no longer exists, keep it that way.
   private async handleConversationNoted(item: IntercomConversationItem | undefined): Promise<void> {
     if (!item || item.id == null) return;
@@ -1031,13 +1054,13 @@ export class IntercomWebhookHandler {
         await this.store.recordEchoPart(kind, String(part.id), threadId).catch(() => {});
         return;
       }
-      // (No unconditional Operator drop here: the bridge's own notes —
-      // context card, agent warning, corrective note — are recorded at post
+      // (No unconditional Operator drop here: the bridge's own notes
+      // (context card, agent warning, corrective note) are recorded at post
       // time and die on the claim above or the pending match. An
       // Operator-authored note that survives both is a genuine Fin note and
       // surfaces like any staff note; see processAgentPart.)
       if (this.settingsStore.intercomMode() !== "bi") {
-        // Not relayed in push/none — release so a real agent note isn't
+        // Not relayed in push/none: release so a real agent note isn't
         // permanently consumed while the mode is off. Bridge-authored notes
         // (agent warning, context card) stay claimed: a redelivery landing
         // after a flip to bi must never relay the bridge's own note as a
@@ -1049,14 +1072,14 @@ export class IntercomWebhookHandler {
       const text = truncateEmbedText(htmlToDiscordText(part.body ?? ""), 1900);
       if (!text) return;
       // The same note can surface on both the conversation and the ticket topic.
-      // Distinct key space from replies ("note:" vs "reply:") — identical text
+      // Distinct key space from replies ("note:" vs "reply:"): identical text
       // in a note and a reply must not collide. Author + created_at scope the
       // key so two distinct same-text notes don't collapse (see processAgentPart).
       relayKey = `note:${part.author?.id ?? "a?"}:${part.created_at ?? "t?"}:${bodyHash(part.body ?? "")}`;
       if (!(await this.store.claimRelay(threadId, relayKey))) return;
 
       // Notes are not stored locally anymore (agent-rip: /note is gone and
-      // agents read their own notes in Intercom) — the audit embed is the only
+      // agents read their own notes in Intercom): the audit embed is the only
       // Discord-side record; the claims above still dedup redeliveries.
       const authorName = part.author?.name || "Intercom agent";
       void this.audit.log({
@@ -1081,15 +1104,15 @@ export class IntercomWebhookHandler {
 
     const state = item.ticket_state;
     const stateId = state && typeof state === "object" && state.id != null ? String(state.id) : null;
-    if (!stateId) return; // system enum only — nothing to map
+    if (!stateId) return; // system enum only: nothing to map
 
     const link = await this.store.getLinkByTicketId(String(item.id));
     if (!link) return;
-    // Our own PUT echoes back as this topic — the pushed state id marks it.
+    // Our own PUT echoes back as this topic: the pushed state id marks it.
     if (link.lastSyncedStateId === stateId) return;
 
     // Resolving the ticket in Intercom (resolved-category state) also closes
-    // the conversation — agents expect resolve to clear it from the inbox,
+    // the conversation: agents expect resolve to clear it from the inbox,
     // and Intercom itself leaves it open. Damper-first so the close's own
     // webhook echo is suppressed; safe for any author (closing is never the
     // boot-a-ticket-open failure mode).
@@ -1109,13 +1132,13 @@ export class IntercomWebhookHandler {
     }
 
     const tag = this.settingsStore.tags().find((t) => t.intercomTicketStateId === stateId);
-    if (!tag) return; // unmapped state — Intercom-only concept, ignore
+    if (!tag) return; // unmapped state: Intercom-only concept, ignore
 
     const ticket = await this.ticketStore.getByThreadId(link.ticketThreadId);
     if (!ticket) return;
     if (ticket.statusTagId === tag.id) return; // already there (echo or no-op)
 
-    // Intercom auto-transitions ticket states on conversation activity —
+    // Intercom auto-transitions ticket states on conversation activity:
     // INCLUDING every message the bridge itself mirrors (customer reply →
     // in_progress, staff reply → waiting_on_customer). Those must never drive
     // the Discord status: the bot owns its own waiting-for-customer/team
@@ -1133,7 +1156,7 @@ export class IntercomWebhookHandler {
 
     // Pre-mark the synced state so the push-back triggered by applyStatus
     // skips its ticket update (Intercom already has this state). Rolled back on
-    // failure — otherwise the retry short-circuits on the damper above and the
+    // failure, otherwise the retry short-circuits on the damper above and the
     // Intercom-side state change is silently lost.
     const prevStateId = link.lastSyncedStateId;
     await this.store.setLastSyncedStateId(link.ticketThreadId, stateId);
@@ -1148,7 +1171,7 @@ export class IntercomWebhookHandler {
   }
 
   // Conversation closed/reopened in Intercom (bi): minimum close/reopen parity.
-  // Converges with ticket.state.updated — whichever arrives first wins, the
+  // Converges with ticket.state.updated: whichever arrives first wins, the
   // other becomes a no-op via the statusTagId damper.
   private async handleConversationOpenState(
     item: IntercomConversationItem | undefined,
@@ -1162,7 +1185,7 @@ export class IntercomWebhookHandler {
     if (!link) return;
 
     // Reply-and-close / reply-on-closed ship the agent's message ON the
-    // close/open part of THIS topic — admin.replied may not fire at all, and
+    // close/open part of THIS topic: admin.replied may not fire at all, and
     // when it does, the part-id claim makes the second arrival a no-op. Relay
     // content-bearing parts BEFORE any state damping: the bridge's own state
     // pushes produce bare parts, which the candidate filter drops anyway.
@@ -1200,10 +1223,10 @@ export class IntercomWebhookHandler {
 
     // target === "open": Intercom auto-reopens conversations on all kinds of
     // activity the bridge itself causes (mirrored contact replies, ticket
-    // state/attribute writes) — and payload shapes vary, so the rule is
+    // state/attribute writes), and payload shapes vary, so the rule is
     // POSITIVE ATTRIBUTION: only a reopen provably authored by a real,
     // non-bridge agent may touch the Discord status. Everything else is the
-    // bridge's own echo or ambiguous — drop it (and if it was our own admin
+    // bridge's own echo or ambiguous: drop it (and if it was our own admin
     // write that reopened a closed conversation, restore the close).
     const openParts = item.conversation_parts?.conversation_parts ?? [];
     const openPart = openParts.find((p) => p.part_type === "open") ?? openParts[openParts.length - 1];
@@ -1243,7 +1266,7 @@ export class IntercomWebhookHandler {
   // Agent snoozed in Intercom → configurable snooze status tag in Discord.
   // TicketStore.setStatus persists prevStatusTagId, which unsnooze restores.
   // The snooze tag must be reminder-free, non-closing and unmapped to an
-  // Intercom state (the /config picker enforces/warns) — that keeps the
+  // Intercom state (the /config picker enforces/warns): that keeps the
   // reminder scheduler quiet and the executeStatus echo a no-op.
   private async handleConversationSnoozed(item: IntercomConversationItem | undefined): Promise<void> {
     if (this.settingsStore.intercomMode() !== "bi") return;
@@ -1282,7 +1305,7 @@ export class IntercomWebhookHandler {
     if (!item || item.id == null) return;
 
     // SLA next-reply re-anchor (bridged AND native, any mode): a snooze is a
-    // deliberate park — the clock restarts from the unsnooze, not from the
+    // deliberate park: the clock restarts from the unsnooze, not from the
     // customer's original waiting_since.
     await this.slaEnforcer?.reanchorAfterUnsnooze(String(item.id)).catch(() => undefined);
 
@@ -1312,7 +1335,7 @@ export class IntercomWebhookHandler {
       .catch(() => {});
   }
 
-  // (Native Intercom priority is agents' own tool — never synced to Discord.
+  // (Native Intercom priority is agents' own tool: never synced to Discord.
   // conversation.priority.updated left the topic list and drops at the door
   // until unsubscribed in the Developer Hub.)
 
@@ -1338,7 +1361,7 @@ export class IntercomWebhookHandler {
 
     // Managed tags never narrate into the thread: "Discord" (bridge marker)
     // and the SLA breach tag (the enforcer pre-stamps lastTagsJson, this is
-    // the second belt — SLA alerts are Intercom-only by design).
+    // the second belt: SLA alerts are Intercom-only by design).
     const isManaged = (name: string) => name === "Discord" || name === this.settingsStore.slaBreachTagName();
     const added = current.filter((t) => !previous.includes(t) && !isManaged(t));
     const removed = previous.filter((t) => !current.includes(t) && !isManaged(t));
@@ -1359,13 +1382,13 @@ export class IntercomWebhookHandler {
   // ---- Agent-reply webhook impersonation ----
   // One bot-owned webhook per parent channel (cached; threads post through the
   // parent with threadId). Webhook messages carry author.bot=true, so the
-  // messageCreate mirror skips them — same loop safety as the embed path.
+  // messageCreate mirror skips them: same loop safety as the embed path.
 
   private static readonly RELAY_WEBHOOK_NAME = "Intercom Agent Relay";
   private relayWebhooks = new Map<string, Webhook>();
 
   // Returns the sent message's id (recorded in the message map for redaction
-  // reflection), or null when the webhook path is unavailable — the caller's
+  // reflection), or null when the webhook path is unavailable: the caller's
   // embed fallback owns failure.
   private async relayViaWebhook(
     thread: ThreadChannel,
@@ -1390,7 +1413,7 @@ export class IntercomWebhookHandler {
       if (!webhook) return null;
       return await send(webhook);
     } catch {
-      // Stale cache (webhook deleted by a mod) — refetch once, then give up to
+      // Stale cache (webhook deleted by a mod): refetch once, then give up to
       // the embed fallback. Never throw: the caller's fallback owns failure.
       this.relayWebhooks.delete(thread.parentId ?? "");
       try {
@@ -1403,7 +1426,7 @@ export class IntercomWebhookHandler {
     }
   }
 
-  // Download Intercom attachments (signed CDN URLs — fetch them NOW, they
+  // Download Intercom attachments (signed CDN URLs: fetch them NOW, they
   // expire) for native re-upload. Failures and files past the upload cap fall
   // back to 📎 masked links; never throws.
   private async downloadRelayAttachments(
@@ -1472,7 +1495,7 @@ export class IntercomWebhookHandler {
       this.relayWebhooks.set(parentId, mine);
       return mine;
     } catch {
-      return null; // Missing Manage Webhooks — embed fallback
+      return null; // Missing Manage Webhooks: embed fallback
     }
   }
 
@@ -1506,8 +1529,8 @@ export class IntercomWebhookHandler {
 
   // Strict thread fetch for relay/state handlers: throws on transient Discord
   // failures (the inbox workflow retries); a permanently-deleted thread
-  // (Unknown Channel) disconnects the link and returns null so the event —
-  // and every future event on this conversation — stops dead-lettering.
+  // (Unknown Channel) disconnects the link and returns null so the event,
+  // and every future event on this conversation, stops dead-lettering.
   private async requireThread(threadId: string): Promise<ThreadChannel | null> {
     if (!this.client) throw new Error("Discord client not bound yet");
     let channel;
@@ -1560,7 +1583,7 @@ export class IntercomWebhookHandler {
 // Intercom part bodies are HTML → readable Discord text for embeds/notes.
 // Block boundaries become SINGLE newlines so the Discord message mirrors the
 // agent's line layout exactly (Intercom's composer emits one <p>/<div> per
-// Enter, rendered single-spaced — a "\n\n" join reads as extra blank lines,
+// Enter, rendered single-spaced: a "\n\n" join reads as extra blank lines,
 // and unhandled <div> boundaries used to collapse everything into one
 // paragraph).
 function htmlToDiscordText(html: string): string {
@@ -1575,7 +1598,7 @@ function htmlToDiscordText(html: string): string {
       .replace(/<(b|strong)>([\s\S]*?)<\/\1>/gi, "**$2**")
       .replace(/<(i|em)>([\s\S]*?)<\/\1>/gi, "*$2*")
       // Inline-pasted screenshots live in the body as <img>, not in
-      // `attachments` — without this an image-only agent reply renders empty
+      // `attachments`: without this an image-only agent reply renders empty
       // and the customer receives nothing.
       .replace(/<img[^>]*src="([^"]+)"[^>]*\/?>/gi, (_m, src) => `📷 [image](${src})`)
       .replace(/<a[^>]*href="([^"]+)"[^>]*>(.*?)<\/a>/gi, (_m, url, text) => (url === text ? url : `[${text}](${url})`))
@@ -1595,7 +1618,7 @@ function htmlToDiscordText(html: string): string {
 // Agent reply body → Discord text + the inline images it embeds. Inline <img>
 // tags are pulled OUT of the text (they re-upload natively alongside
 // `attachments`); Intercom's literal "[Image]" / '[Image "name.png"]' body
-// placeholders (attachment-only replies) are stripped — the file itself
+// placeholders (attachment-only replies) are stripped: the file itself
 // arrives separately, so the placeholder is pure noise in Discord.
 function extractAgentBody(html: string): { text: string; images: Array<{ url: string; name: string | null }> } {
   const images: Array<{ url: string; name: string | null }> = [];

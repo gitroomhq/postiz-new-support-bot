@@ -192,6 +192,7 @@ export const EXPECTED_COLUMNS: Record<string, string[]> = {
     "id", "adminId", "adminName", "epoch", "uaFirst", "ipFirst", "ipLast", "createdAt", "lastSeenAt", "lastVerifiedAt",
     "absoluteExpiresAt",
   ],
+  queue_cache: ["id", "data", "savedAt"],
   forwarded_email_converts: [
     "id", "originalConversationId", "newConversationId", "forwarderAdminId", "forwarderEmail", "customerEmail",
     "customerName", "intercomContactId", "contactRole", "trigger", "actorLabel", "attachmentsCount",

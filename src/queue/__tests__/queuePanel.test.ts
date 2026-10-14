@@ -44,8 +44,14 @@ function panel(opts: { enabled?: boolean; actor?: QueueActor | null } = {}) {
   const views = {
     build: async (_a: QueueActor, req: { page: string }) => (req.page === "global" ? { page: "global", blocks: [] } : null),
     action: async () => ({ ok: true, text: "done" }),
+    // The list sits at version "abcd0123.7".
+    waitForChange: async (since: string, ms: number) => {
+      seen.push(`wait:${since}:${ms}`);
+      return since !== "abcd0123.7";
+    },
+    refresh: () => void seen.push("refresh"),
   } as unknown as QueueViews;
-  return { p: new QueuePanel(settings, auth, views), seen };
+  return { p: new QueuePanel(settings, auth, views, 50), seen };
 }
 
 const ADA: QueueActor = { adminId: "11", name: "Ada", sessionIdHash: "h" };
@@ -84,8 +90,20 @@ test("viewRequest drops anything a hostile client might send", () => {
     filters: { view: "longest", __proto__: "x" },
     cursor: "25; drop",
   });
-  assert.deepEqual(req, { page: "inbox.detail", params: { id: "123" }, filters: { view: "longest" }, cursor: null });
+  assert.deepEqual(req, { page: "inbox.detail", params: { id: "123" }, filters: { view: "longest" }, cursor: null, since: null });
   assert.equal(viewRequest({ page: "global", cursor: "50" })?.cursor, "50");
+  assert.equal(viewRequest({ page: "global", since: "abcd0123.7" })?.since, "abcd0123.7");
+  assert.equal(viewRequest({ page: "global", since: "x".repeat(400) })?.since, null);
+  assert.equal(viewRequest({ page: "global", since: 7 })?.since, null);
+});
+
+test("live updates: since waits for a change, unchanged answers small, refresh asks for a read", async () => {
+  const { p, seen } = panel({ actor: ADA });
+  assert.deepEqual((await p.api("view", "c", { page: "global", since: "abcd0123.7" })).json, { unchanged: true });
+  assert.deepEqual((await p.api("view", "c", { page: "global", since: "abcd0123.6" })).json, { page: "global", blocks: [] });
+  assert.deepEqual(seen, ["wait:abcd0123.7:50", "wait:abcd0123.6:50"]);
+  await p.api("view", "c", { page: "global", refresh: true });
+  assert.deepEqual(seen.slice(2), ["refresh"], "no since: answers at once");
 });
 
 test("the shell parses, carries the nonce on both tags and has no leftover template holes", () => {

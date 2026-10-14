@@ -1,21 +1,27 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { QueueData, type QueueSettingsView, type QueueSource } from "../QueueData";
+import { QueueData, type QueueCache, type QueueSaved, type QueueSettingsView, type QueueSource } from "../QueueData";
 import { QueueViews } from "../queueViews";
+import { parseConversation } from "../queueModel";
+import { restoreSaved } from "../QueueCacheStore";
 import type { QueueExclusions } from "../../config/SettingsStore";
 import type { IntercomAdmin, IntercomWebhookPart } from "../../intercom/types";
+import type { QueueCreatedRange } from "../../intercom/IntercomClient";
 import type { QueueKvBlock, QueueTableBlock } from "../contract";
 
-// The snapshot (one shared Intercom scan a minute), the randomizer's
-// reservations, and the pages built from it. Intercom is a fake.
+// The live list (a sliced full scan, catch-up reads, webhook re-reads, the
+// saved copy for restarts), the randomizer's reservations, and the pages
+// built from it. Intercom is a fake.
 
 const NOW = 2_000_000_000_000; // ms
+const NOW_SEC = Math.floor(NOW / 1000);
+const DAY = 86_400;
 
 function rawConv(id: string, over: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     id,
-    created_at: Math.floor(NOW / 1000) - 3600,
-    updated_at: Math.floor(NOW / 1000) - 60,
+    created_at: NOW_SEC - 3600,
+    updated_at: NOW_SEC - 60,
     state: "open",
     priority: "not_priority",
     source: { subject: `Subject ${id}`, body: `Body ${id}`, author: { type: "user", id: `c${id}`, name: `Customer ${id}` } },
@@ -24,21 +30,33 @@ function rawConv(id: string, over: Record<string, unknown> = {}): Record<string,
     tags: { tags: [] },
     // The customer's latest message: a minute ago (waiting_since, when a
     // fixture sets one, is never later than this, as in Intercom).
-    statistics: { last_contact_reply_at: Math.floor(NOW / 1000) - 60, last_admin_reply_at: null },
+    statistics: { last_contact_reply_at: NOW_SEC - 60, last_admin_reply_at: null },
     custom_attributes: {},
     ...over,
   };
 }
 
 interface FakeSource extends QueueSource {
-  calls: { conv: number; tickets: number; parts: string[]; transcript: string[] };
-  conversations: unknown[];
-  tickets: unknown[];
+  calls: { conv: number; tickets: number; catchUp: number; ranges: string[]; get: string[]; ticketGet: string[]; transcript: string[] };
+  conversations: Array<Record<string, unknown>>;
+  tickets: Array<Record<string, unknown>>;
   parts: Map<string, IntercomWebhookPart[]>;
   fail: boolean;
 }
 
-function fakeSource(conversations: unknown[] = [], tickets: unknown[] = []): FakeSource {
+function inRange(raw: Record<string, unknown>, range?: QueueCreatedRange): boolean {
+  const created = Number(raw.created_at);
+  return (range?.after == null || created >= range.after) && (range?.before == null || created < range.before);
+}
+
+// Two pages when a slice holds more than two items, to exercise paging.
+function paged(list: unknown[], after: string | null | undefined) {
+  if (!after && list.length > 2) return { items: list.slice(0, 2), nextStartingAfter: "p2" };
+  if (after === "p2") return { items: list.slice(2), nextStartingAfter: null };
+  return { items: list, nextStartingAfter: null };
+}
+
+function fakeSource(conversations: Array<Record<string, unknown>> = [], tickets: Array<Record<string, unknown>> = []): FakeSource {
   const admins: IntercomAdmin[] = [
     { id: "11", name: "Ada", hasInboxSeat: true },
     { id: "12", name: "Grace", hasInboxSeat: true, awayModeEnabled: true },
@@ -46,27 +64,39 @@ function fakeSource(conversations: unknown[] = [], tickets: unknown[] = []): Fak
     { id: "800", name: "Operator", hasInboxSeat: true },
   ];
   const src: FakeSource = {
-    calls: { conv: 0, tickets: 0, parts: [], transcript: [] },
+    calls: { conv: 0, tickets: 0, catchUp: 0, ranges: [], get: [], ticketGet: [], transcript: [] },
     conversations,
     tickets,
     parts: new Map(),
     fail: false,
-    async searchOpenConversationsRaw(after) {
+    async searchOpenConversationsRaw(after, range) {
       src.calls.conv++;
+      src.calls.ranges.push(`${range?.after ?? ""}..${range?.before ?? ""}`);
       if (src.fail) throw new Error("Intercom conversation search 500: secret detail");
-      // Two pages when there are more than two items, to exercise paging.
-      if (!after && src.conversations.length > 2) return { items: src.conversations.slice(0, 2), nextStartingAfter: "p2" };
-      if (after === "p2") return { items: src.conversations.slice(2), nextStartingAfter: null };
-      return { items: src.conversations, nextStartingAfter: null };
+      return paged(src.conversations.filter((c) => c.state !== "closed" && inRange(c, range)), after);
     },
-    async searchOpenCustomerTicketsRaw() {
+    async searchOpenCustomerTicketsRaw(_after, range) {
       src.calls.tickets++;
       if (src.fail) throw new Error("down");
-      return { items: src.tickets, nextStartingAfter: null };
+      return { items: src.tickets.filter((t) => inRange(t, range)), nextStartingAfter: null };
     },
-    async getConversationReplyView(id) {
-      src.calls.parts.push(id);
-      return { parts: src.parts.get(id) ?? [] };
+    async searchConversationsUpdatedRaw(since) {
+      src.calls.catchUp++;
+      if (src.fail) throw new Error("Intercom conversation search 500: secret detail");
+      return { items: src.conversations.filter((c) => Number(c.updated_at) > since), nextStartingAfter: null };
+    },
+    async searchCustomerTicketsUpdatedRaw(since) {
+      if (src.fail) throw new Error("down");
+      return { items: src.tickets.filter((t) => Number(t.updated_at ?? 0) > since), nextStartingAfter: null };
+    },
+    async getConversationRaw(id) {
+      src.calls.get.push(id);
+      const c = src.conversations.find((x) => x.id === id);
+      return c ? { ...c, conversation_parts: { conversation_parts: src.parts.get(id) ?? [] } } : null;
+    },
+    async getTicketRaw(id) {
+      src.calls.ticketGet.push(id);
+      return src.tickets.find((t) => t.id === id) ?? null;
     },
     async getConversationTranscript(id) {
       src.calls.transcript.push(id);
@@ -92,12 +122,30 @@ function fakeSource(conversations: unknown[] = [], tickets: unknown[] = []): Fak
   return src;
 }
 
+// Holds every conversation search until release(), each answering with what
+// the fake held when the search was asked (an older page than a webhook read
+// that lands meanwhile).
+function gateScans(src: FakeSource): { entered: () => number; release: () => void } {
+  let entered = 0;
+  let open!: () => void;
+  const gate = new Promise<void>((r) => (open = r));
+  const original = src.searchOpenConversationsRaw.bind(src);
+  src.searchOpenConversationsRaw = async (after, range) => {
+    entered++;
+    const page = original(after, range);
+    await gate;
+    return page;
+  };
+  return { entered: () => entered, release: () => open() };
+}
+
 function settings(over: Partial<{ fin: boolean; notes: boolean; exclusions: QueueExclusions }> = {}): QueueSettingsView & {
-  state: { fin: boolean; notes: boolean; exclusions: QueueExclusions };
+  state: { fin: boolean; notes: boolean; exclusions: QueueExclusions; enabled: boolean };
 } {
-  const state = { fin: false, notes: false, exclusions: { teams: [], tags: [], ticketTypes: [] } as QueueExclusions, ...over };
+  const state = { fin: false, notes: false, enabled: true, exclusions: { teams: [], tags: [], ticketTypes: [] } as QueueExclusions, ...over };
   return {
     state,
+    queueEnabled: () => state.enabled,
     queueFinCountsAsReply: () => state.fin,
     queueNotesCountAsReply: () => state.notes,
     queueExclusions: () => state.exclusions,
@@ -108,81 +156,87 @@ function settings(over: Partial<{ fin: boolean; notes: boolean; exclusions: Queu
   };
 }
 
-test("the snapshot is one shared scan a minute, longest waiting first", async () => {
+const ids = (snap: { items: Array<{ id: string }> } | null | undefined) => snap?.items.map((i) => i.id);
+
+test("the first read walks five created_at slices at once; later reads catch up on what changed", async () => {
   let now = NOW;
   const src = fakeSource([
-    rawConv("1", { waiting_since: Math.floor(NOW / 1000) - 100 }),
-    rawConv("2", { waiting_since: Math.floor(NOW / 1000) - 900 }),
+    rawConv("1", { waiting_since: NOW_SEC - 100 }),
+    rawConv("2", { waiting_since: NOW_SEC - 900 }),
     rawConv("3", { statistics: { last_contact_reply_at: 1, last_admin_reply_at: 2 } }), // we spoke last
+    rawConv("4", { created_at: NOW_SEC - 40 * DAY, waiting_since: NOW_SEC - 40 * DAY }),
   ]);
   const data = new QueueData(src, settings(), () => now);
   const a = await data.snapshot();
-  assert.deepEqual(a.items.map((i) => i.id), ["2", "1"]);
-  assert.equal(a.scanned, 3);
-  assert.equal(src.calls.conv, 2, "two pages");
+  assert.deepEqual(ids(a), ["4", "2", "1"]);
+  assert.equal(a.scanned, 4);
+  assert.equal(new Set(src.calls.ranges).size, 5, "five slices");
+  assert.ok(src.calls.ranges.includes(`${NOW_SEC - DAY}..`), "the newest slice has no upper end");
+  assert.ok(src.calls.ranges.includes(`..${NOW_SEC - 90 * DAY}`), "the oldest slice has no lower end");
+  assert.equal(src.calls.conv, 6, "the newest slice took two pages");
   await data.snapshot();
-  assert.equal(src.calls.conv, 2, "cached inside the minute");
+  assert.equal(src.calls.conv, 6, "nothing new inside the minute");
+
+  // A minute later: one catch-up read. Conversation 2 was closed meanwhile.
+  src.conversations[1] = rawConv("2", { state: "closed", updated_at: NOW_SEC + 30 });
   now += 61_000;
-  await data.snapshot();
-  assert.equal(src.calls.conv, 4, "refreshed after a minute");
+  data.readySnapshot();
+  await data.idle();
+  assert.equal(src.calls.catchUp, 1);
+  assert.equal(src.calls.conv, 6, "a catch-up, not a full scan");
+  assert.deepEqual(ids(data.readySnapshot()), ["4", "1"]);
+
+  // Fifteen minutes on: the full scan, the backstop.
+  now += 15 * 60_000;
+  data.readySnapshot();
+  await data.idle();
+  assert.equal(src.calls.conv, 11);
 });
 
-test("concurrent viewers share one refresh", async () => {
+test("concurrent viewers share one read", async () => {
   const src = fakeSource([rawConv("1")]);
   const data = new QueueData(src, settings(), () => NOW);
   await Promise.all([data.snapshot(), data.snapshot(), data.snapshot()]);
-  assert.equal(src.calls.conv, 1);
+  assert.equal(src.calls.conv, 5, "one request per slice");
 });
 
-test("browser views return immediately during a slow cold scan, then use its shared result", async () => {
+test("browser views return at once during a slow first scan, then show its result", async () => {
   const src = fakeSource([rawConv("1")]);
-  let complete!: (page: { items: unknown[]; nextStartingAfter: null }) => void;
-  src.searchOpenConversationsRaw = async () => {
-    src.calls.conv++;
-    return new Promise((resolve) => { complete = resolve; });
-  };
+  const gate = gateScans(src);
   const s = settings();
   const data = new QueueData(src, s, () => NOW);
   const views = new QueueViews(data, { intercomConfigured: () => true, queueExclusions: () => s.state.exclusions }, () => NOW);
   const actor = { adminId: "11", name: "Ada", sessionIdHash: "hash" };
   const req = { page: "global", params: {}, filters: {}, cursor: null };
   const loading = await views.build(actor, req, { waitForSnapshot: false });
-  assert.equal(loading?.refreshing, true);
   assert.equal(loading?.actorLabel, "Ada");
   assert.ok(!loading?.blocks.some((b) => b.type === "table"), "an incomplete scan must not look like an empty queue");
   await views.build(actor, req, { waitForSnapshot: false });
-  assert.equal(src.calls.conv, 1, "polling shares the pending scan");
-  complete({ items: [rawConv("1")], nextStartingAfter: null });
-  await data.snapshot();
+  assert.equal(gate.entered(), 5, "polling shares the pending scan");
+  const changed = data.waitForChange(loading!.version, 5_000);
+  gate.release();
+  assert.equal(await changed, true, "the waiting page is woken by the finished scan");
+  await data.idle();
   const loaded = await views.build(actor, req, { waitForSnapshot: false });
-  assert.equal(loaded?.refreshing, undefined);
   assert.ok(loaded?.blocks.some((b) => b.type === "table"));
+  assert.notEqual(loaded?.version, loading?.version);
 });
 
-test("browser reads keep the old list while a refresh is pending, but discard it after policy changes", async () => {
-  let now = NOW;
-  const src = fakeSource([rawConv("1")]);
+test("a policy change re-derives the stored list without reading Intercom again", async () => {
   const s = settings();
-  const data = new QueueData(src, s, () => now);
-  await data.snapshot();
-  now += 61_000;
-  let complete!: (page: { items: unknown[]; nextStartingAfter: null }) => void;
-  src.searchOpenConversationsRaw = async () => new Promise((resolve) => { complete = resolve; });
-  const stale = data.readySnapshot();
-  assert.equal(stale?.refreshing, true);
-  assert.deepEqual(stale?.items.map((i) => i.id), ["1"]);
-  s.state.exclusions = { teams: [{ id: "22", name: "Support Team" }], tags: [], ticketTypes: [] };
-  assert.equal(data.readySnapshot(), null, "never serve data from the old policy");
-  complete({ items: [rawConv("1")], nextStartingAfter: null });
-  await data.snapshot();
-  now += 5_000;
-  assert.equal(data.readySnapshot(), null);
-  complete({ items: [rawConv("1")], nextStartingAfter: null });
-  await data.snapshot();
-  assert.deepEqual(data.readySnapshot()?.items, []);
+  const src = fakeSource([rawConv("1"), rawConv("2", { team_assignee_id: 23 })]);
+  const data = new QueueData(src, s, () => NOW);
+  assert.equal((await data.snapshot()).items.length, 2);
+  const reads = src.calls.conv;
+  s.state.exclusions = { teams: [{ id: "23", name: "Billing Team" }], tags: [], ticketTypes: [] };
+  assert.equal(data.readySnapshot(), null, "never serve a list built under the old policy");
+  await data.idle();
+  assert.deepEqual(ids(data.readySnapshot()), ["1"]);
+  assert.deepEqual(ids(await data.snapshot()), ["1"]);
+  assert.equal(src.calls.conv, reads, "no new scan");
 });
 
-test("a failed first browser scan becomes a visible error, not endless warming", async () => {
+test("a failed first scan becomes a visible error, not endless warming", async () => {
   const src = fakeSource();
   src.fail = true;
   const data = new QueueData(src, settings(), () => NOW);
@@ -190,8 +244,10 @@ test("a failed first browser scan becomes a visible error, not endless warming",
   await data.snapshot();
   const failed = data.readySnapshot();
   assert.ok(failed?.error);
-  assert.equal(failed?.refreshing, false);
-  assert.equal(src.calls.conv, 1, "the failed cold scan is cached rather than retried on every request");
+  const reads = src.calls.conv;
+  data.readySnapshot();
+  await data.idle();
+  assert.equal(src.calls.conv, reads, "the failed scan is not retried on every request");
 });
 
 test("a failed refresh keeps the last list and says so without the raw error", async () => {
@@ -201,42 +257,180 @@ test("a failed refresh keeps the last list and says so without the raw error", a
   await data.snapshot();
   src.fail = true;
   now += 61_000;
+  data.readySnapshot();
+  await data.idle();
   const stale = await data.snapshot();
-  assert.deepEqual(stale.items.map((i) => i.id), ["1"]);
+  assert.deepEqual(ids(stale), ["1"]);
   assert.ok(stale.error);
   assert.doesNotMatch(stale.error, /secret detail/);
-});
-
-test("a settings change invalidates the cache", async () => {
-  const s = settings();
-  const src = fakeSource([rawConv("1"), rawConv("2", { team_assignee_id: 23 })]);
-  const data = new QueueData(src, s, () => NOW);
-  assert.equal((await data.snapshot()).items.length, 2);
-  s.state.exclusions = { teams: [{ id: "23", name: "Billing Team" }], tags: [], ticketTypes: [] };
-  const after = await data.snapshot();
-  assert.deepEqual(after.items.map((i) => i.id), ["1"]);
 });
 
 test("ticket states come from the ticket search: Waiting on customer drops out", async () => {
   const src = fakeSource(
     [rawConv("1"), rawConv("2")],
-    [{ id: "2", ticket_state: { id: "5", category: "waiting_on_customer", internal_label: "Waiting on Customer" }, ticket_type: { id: "8", name: "Billing" } }]
+    [{ id: "2", created_at: NOW_SEC - 3600, ticket_state: { id: "5", category: "waiting_on_customer", internal_label: "Waiting on Customer" }, ticket_type: { id: "8", name: "Billing" } }]
   );
   const data = new QueueData(src, settings(), () => NOW);
-  assert.deepEqual((await data.snapshot()).items.map((i) => i.id), ["1"]);
+  assert.deepEqual(ids(await data.snapshot()), ["1"]);
 });
 
 test("Fin counts only when switched on, checked from the parts and cached per version", async () => {
   const s = settings();
   const src = fakeSource([rawConv("1")]);
-  const custAt = Math.floor(NOW / 1000) - 60;
-  src.parts.set("1", [{ part_type: "comment", body: "Fin here", created_at: custAt + 10, author: { type: "bot", id: "b" } }]);
+  src.parts.set("1", [{ part_type: "comment", body: "Fin here", created_at: NOW_SEC - 50, author: { type: "bot", id: "b" } }]);
   const data = new QueueData(src, s, () => NOW);
   assert.equal((await data.snapshot()).items.length, 1, "off: Fin is not a reply");
-  assert.equal(src.calls.parts.length, 0, "no parts fetched while both toggles are off");
+  assert.equal(src.calls.get.length, 0, "no parts fetched while both toggles are off");
   s.state.fin = true;
   assert.equal((await data.snapshot()).items.length, 0, "on: Fin answered");
-  assert.equal(src.calls.parts.length, 1);
+  assert.equal(src.calls.get.length, 1);
+});
+
+// ---- live updates ----
+
+test("a webhook re-reads its one conversation and wakes the waiting pages", async () => {
+  const src = fakeSource([rawConv("1")]);
+  const data = new QueueData(src, settings(), () => NOW);
+  await data.snapshot();
+  const before = data.version();
+  const waiting = data.waitForChange(before, 5_000);
+
+  // A new conversation arrives.
+  src.conversations.push(rawConv("2", { updated_at: NOW_SEC }));
+  data.noteWebhook("conversation.user.created", "2");
+  await data.flushWebhooks();
+  assert.equal(await waiting, true);
+  assert.notEqual(data.version(), before);
+  assert.deepEqual(ids(data.readySnapshot())?.sort(), ["1", "2"]);
+
+  // A teammate answers 1; the burst of events for it becomes one read.
+  src.conversations[0] = rawConv("1", { updated_at: NOW_SEC + 5, statistics: { last_contact_reply_at: NOW_SEC - 60, last_admin_reply_at: NOW_SEC + 5 } });
+  data.noteWebhook("conversation.admin.replied", "1");
+  data.noteWebhook("conversation.admin.assigned", "1");
+  await data.flushWebhooks();
+  assert.deepEqual(ids(data.readySnapshot()), ["2"]);
+  assert.deepEqual(src.calls.get, ["2", "1"]);
+  assert.equal(src.calls.conv, 5, "no new scan");
+
+  data.noteWebhook("contact.created", "not-an-id");
+  await data.flushWebhooks();
+  assert.equal(src.calls.get.length, 2, "an id that is not a conversation id is ignored");
+});
+
+test("a ticket state webhook re-reads the ticket: Waiting on customer leaves at once", async () => {
+  const ticket = { id: "1", created_at: NOW_SEC - 3600, updated_at: NOW_SEC - 60, ticket_state: { id: "4", category: "in_progress" }, ticket_type: { id: "8", name: "Billing" } };
+  const src = fakeSource([rawConv("1", { ticket: { id: 1, state: "in_progress" } })], [ticket]);
+  const data = new QueueData(src, settings(), () => NOW);
+  assert.deepEqual(ids(await data.snapshot()), ["1"]);
+  src.tickets[0] = { ...ticket, updated_at: NOW_SEC, ticket_state: { id: "5", category: "waiting_on_customer" } };
+  data.noteWebhook("ticket.state.updated", "1");
+  await data.flushWebhooks();
+  assert.deepEqual(ids(data.readySnapshot()), []);
+  assert.deepEqual(src.calls.ticketGet, ["1"]);
+});
+
+test("a webhook read during a full scan is not undone by the scan's older page", async () => {
+  const src = fakeSource([rawConv("1")]);
+  const gate = gateScans(src);
+  const data = new QueueData(src, settings(), () => NOW);
+  data.readySnapshot();
+  assert.equal(gate.entered(), 5);
+  // Answered while the scan is in flight; its webhook read lands first.
+  src.conversations[0] = rawConv("1", { updated_at: NOW_SEC + 10, statistics: { last_contact_reply_at: NOW_SEC - 60, last_admin_reply_at: NOW_SEC + 10 } });
+  data.noteWebhook("conversation.admin.replied", "1");
+  await data.flushWebhooks();
+  gate.release();
+  await data.idle();
+  assert.deepEqual(ids(data.readySnapshot()), []);
+});
+
+test("a long-poll without a change answers false after its wait", async () => {
+  const data = new QueueData(fakeSource([rawConv("1")]), settings(), () => NOW);
+  await data.snapshot();
+  assert.equal(await data.waitForChange(data.version(), 20), false);
+  assert.equal(await data.waitForChange("00000000.0", 20), true, "an old version answers at once");
+});
+
+// ---- the saved list ----
+
+function memoryCache(saved: QueueSaved | null): QueueCache & { writes: QueueSaved[] } {
+  const writes: QueueSaved[] = [];
+  return {
+    writes,
+    load: async () => saved,
+    save: async (state) => void writes.push(state),
+  };
+}
+
+test("after a restart the saved list shows at once, marked as catching up, until the boot scan lands", async () => {
+  const src = fakeSource([rawConv("1")]);
+  const gate = gateScans(src);
+  const s = settings();
+  const cache = memoryCache({ savedAt: NOW - 120_000, truncated: false, conversations: [parseConversation(rawConv("9"))!], tickets: [] });
+  const data = new QueueData(src, s, () => NOW);
+  data.setCache(cache);
+  const before = data.version();
+  data.start();
+  assert.equal(await data.waitForChange(before, 5_000), true);
+  const restored = data.readySnapshot();
+  assert.deepEqual(ids(restored), ["9"]);
+  assert.equal(restored?.restored, true);
+  const views = new QueueViews(data, { intercomConfigured: () => true, queueExclusions: () => s.state.exclusions }, () => NOW);
+  const page = await views.build({ adminId: "11", name: "Ada", sessionIdHash: "h" }, { page: "global", params: {}, filters: {}, cursor: null }, { waitForSnapshot: false });
+  assert.ok(page?.blocks.some((b) => b.type === "notice" && /after a restart/.test(b.text)));
+  await data.saveNow();
+  assert.equal(cache.writes.length, 0, "nothing new to save while the restored list shows");
+
+  gate.release();
+  await data.idle();
+  const live = data.readySnapshot();
+  assert.deepEqual(ids(live), ["1"], "the scan replaces the saved list");
+  assert.equal(live?.restored, false);
+  await data.saveNow();
+  assert.deepEqual(cache.writes[0]?.conversations.map((c) => c.id), ["1"]);
+});
+
+test("a saved list older than a day, or switched off, is not restored", async () => {
+  const src = fakeSource([]);
+  const old = memoryCache({ savedAt: NOW - 25 * 60 * 60_000, truncated: false, conversations: [parseConversation(rawConv("9"))!], tickets: [] });
+  const data = new QueueData(src, settings(), () => NOW);
+  data.setCache(old);
+  data.start();
+  await data.idle();
+  assert.deepEqual(ids(data.readySnapshot()), []);
+
+  const off = settings();
+  off.state.enabled = false;
+  const idle = new QueueData(src, off, () => NOW);
+  idle.setCache(memoryCache(null));
+  const reads = src.calls.conv;
+  idle.start();
+  idle.noteWebhook("conversation.user.created", "5");
+  await idle.flushWebhooks();
+  assert.equal(src.calls.conv, reads, "off: no scan at boot");
+  assert.equal(src.calls.get.length, 0, "off: webhooks are ignored");
+});
+
+test("restoreSaved keeps well-formed entries and drops the rest", () => {
+  const good = parseConversation(rawConv("1"))!;
+  const restored = restoreSaved(
+    {
+      v: 1,
+      truncated: true,
+      conversations: [good, { ...good, id: 7 }, { ...good, tagIds: "x" }, { ...good, slaStatus: "nope" }, null],
+      tickets: [
+        { ticket: { id: "1", stateId: null, stateCategory: "submitted", stateLabel: null, typeId: "8", typeName: "Billing" }, updatedAt: 5 },
+        { ticket: { id: "2", stateId: 3 }, updatedAt: 5 },
+      ],
+    },
+    NOW
+  );
+  assert.deepEqual(restored?.conversations, [good]);
+  assert.deepEqual(restored?.tickets.map((t) => t.ticket.id), ["1"]);
+  assert.equal(restored?.truncated, true);
+  assert.equal(restored?.savedAt, NOW);
+  assert.equal(restoreSaved({ v: 2, conversations: [], tickets: [] }, NOW), null, "another format");
+  assert.equal(restoreSaved("garbage", NOW), null);
 });
 
 test("the directory marks bots and unseated teammates, and seatedTeammate refuses them", async () => {

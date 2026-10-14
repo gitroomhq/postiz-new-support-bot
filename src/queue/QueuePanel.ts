@@ -11,6 +11,10 @@ const panelLog = log.child("queue");
 
 const RATE_LIMIT_PER_MIN = 120;
 const RATE_WINDOW_MS = 60_000;
+// How long a live-update request waits for a change before it answers
+// "unchanged" (well inside proxy idle timeouts).
+const WATCH_MS = 25_000;
+const VERSION_RE = /^[0-9a-f]{8}\.\d{1,12}$/;
 
 // The Intercom Queue's web surface: GET /queue (shell) + POST /queue/api/:ep
 // on the shared panelMount transport (per-IP throttle, CSP nonce, CSRF
@@ -28,7 +32,8 @@ export class QueuePanel implements QueueRoute {
   constructor(
     private settings: QueuePanelSettings,
     private auth: QueueAuth,
-    private views: QueueViews
+    private views: QueueViews,
+    private watchMs = WATCH_MS
   ) {}
 
   // The shell is the same for everyone; the client asks `status` whether to
@@ -55,6 +60,11 @@ export class QueuePanel implements QueueRoute {
         case "view": {
           const req = viewRequest(request);
           if (!req) return { status: 400, json: { error: "bad request" } };
+          if (request.refresh === true) this.views.refresh();
+          // Live updates: a long-poll that answers as soon as the list changes.
+          if (req.since && !(await this.views.waitForChange(req.since, this.watchMs))) {
+            return { status: 200, json: { unchanged: true } };
+          }
           const view = await this.views.build(actor, req, { waitForSnapshot: false });
           if (!view) return { status: 404, json: { error: "unknown page" } };
           return { status: 200, json: view };
@@ -115,5 +125,6 @@ export function viewRequest(request: Record<string, unknown>): QueueViewRequest 
     return out;
   };
   const cursor = typeof request.cursor === "string" && /^\d{1,6}$/.test(request.cursor) ? request.cursor : null;
-  return { page, params: pick(request.params, 32), filters: pick(request.filters, 32), cursor };
+  const since = typeof request.since === "string" && VERSION_RE.test(request.since) ? request.since : null;
+  return { page, params: pick(request.params, 32), filters: pick(request.filters, 32), cursor, since };
 }

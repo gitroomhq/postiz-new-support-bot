@@ -1677,3 +1677,14 @@ model QueueSession {
   @@index([absoluteExpiresAt])
   @@map("queue_sessions")
 }
+
+// The Intercom Queue's last list (/queue), one row (id 1): the open
+// conversations and Customer tickets as parsed from Intercom, so a restart
+// shows the previous list at once while the boot scan catches up.
+model QueueCache {
+  id      Int      @id
+  data    Json
+  savedAt DateTime
+
+  @@map("queue_cache")
+}

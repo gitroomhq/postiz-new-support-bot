@@ -122,6 +122,7 @@ import { QueueSessions } from "./queue/QueueSessions";
 import { QueueAuth } from "./queue/QueueAuth";
 import { QueueViews } from "./queue/queueViews";
 import { QueuePanel } from "./queue/QueuePanel";
+import { QueueCacheStore } from "./queue/QueueCacheStore";
 import { CachedRatioEngine } from "./bot/billing/disputeRatio";
 import { MoneyOutStore } from "./bot/billing/MoneyOutStore";
 import { MoneyOutService } from "./bot/billing/MoneyOutService";
@@ -558,8 +559,11 @@ async function main() {
 
   // Intercom Queue (/queue): the tickets waiting on a teammate reply, signed
   // in with Intercom OAuth (its own Developer Hub app), data read with the
-  // bridge's token. Ships off; configured in /intercom → Queue.
+  // bridge's token. Ships off; configured in /intercom → Queue. The list is
+  // kept live from the Intercom webhooks and saved for restarts.
   const queueData = new QueueData(intercomClient, settingsStore);
+  queueData.setCache(new QueueCacheStore(prisma));
+  intercomWebhookHandler.setQueueListener((topic, itemId) => queueData.noteWebhook(topic, itemId));
   const queueSessions = new QueueSessions(prisma);
   const queueAuth = new QueueAuth(settingsStore, queueData, queueSessions, (event) => {
     const who = event.teammate
@@ -935,6 +939,9 @@ async function main() {
   // endpoint can point at a reachable URL. Idempotent + non-fatal.
   if (!workerOnly) {
     stripeWebhookHandler.ensureEndpoint().catch((e) => bootLog.error("stripe webhook registration failed", e));
+    // Restore the saved queue list and start its first scan before anyone
+    // opens /queue.
+    queueData.start();
   }
 
   // ---- Activity tick-providers (bodies driven by the Temporal loopers) ----
@@ -1071,6 +1078,8 @@ async function main() {
     bot.client.destroy();
     // Flush the buffered Influx points before the DB/Sentry teardown.
     await shutdownInflux(2000);
+    // The queue's latest list, so the next boot starts from it.
+    await queueData.saveNow();
     await prisma.$disconnect();
     // Flush buffered events/spans/logs before the process dies.
     await shutdownSentry(2000);

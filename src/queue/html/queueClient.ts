@@ -1,5 +1,6 @@
 // Client module for the Intercom Queue (/queue): router, sidebar, sign-in
-// screen, the 60-second refresh and the live wait timers. It runs on top of
+// screen, live updates (a long-poll on the list's version) and the ticking
+// wait timers. It runs on top of
 // the dashboard's clientCore + clientBlocks + clientModal (same `D`
 // namespace, same block renderer), so the two pages look and behave alike.
 // Plain vanilla JS as a string (no build step). No backticks or ${} inside:
@@ -108,55 +109,114 @@ D.bindLinks = function () {
   });
 };
 
-// silent = the 60-second refresh: keep the page (and the scroll position)
-// until the new one is in, and stay quiet on a failed poll.
+// silent = a live update or the Refresh button: keep the page (and the
+// scroll position) until the new one is in, and stay quiet on a failure.
+// refresh = also ask the server to read Intercom now.
 D.loadSeq = 0;
-D.refreshTimer = null;
-D.loadPage = function (silent) {
+D.loadPage = function (silent, refresh) {
   var seq = ++D.loadSeq;
-  if (D.refreshTimer) { clearTimeout(D.refreshTimer); D.refreshTimer = null; }
+  D.stopWatch();
   var content = D.q("content");
   if (!silent) {
     D.clearFlash();
     content.textContent = "";
     content.appendChild(D.el("p", "note", "Loading\\u2026"));
   }
-  var scrollY = window.scrollY;
-  D.api("view", { page: D.state.page, params: D.state.params, filters: D.state.filters, cursor: D.state.cursor })
+  var body = { page: D.state.page, params: D.state.params, filters: D.state.filters, cursor: D.state.cursor };
+  if (refresh) body.refresh = true;
+  D.api("view", body)
     .then(function (res) {
       if (seq !== D.loadSeq) return;
       var v = D.handle(res); if (!v) return;
       if (v.error) {
-        if (silent) return;
+        if (silent) { D.watchLater(seq, 10000); return; }
         content.textContent = "";
         content.appendChild(D.el("p", "error", v.error === "unknown page" ? "This page does not exist." : (v.error === "rate limited" ? "Too many requests. Give it a few seconds." : "Something went wrong. Try again.")));
         return;
       }
-      D.state.view = v;
-      document.title = v.title + " \\u00b7 Intercom Queue";
-      D.q("who").textContent = v.actorLabel;
-      D.renderNav(v);
-      D.renderCrumbs(v);
-      var blocks = (v.blocks || []).slice();
-      var headerBlock = null;
-      if (blocks.length && blocks[0].type === "header") headerBlock = blocks.shift();
-      else headerBlock = { type: "header", title: v.title };
-      content.textContent = "";
-      D.renderBlocks(content, [headerBlock]);
-      var wrap = D.el("div", null);
-      D.renderBlocks(wrap, blocks);
-      content.appendChild(wrap);
-      if (silent) window.scrollTo(0, scrollY);
-      if (v.refreshing) {
-        D.refreshTimer = setTimeout(function () { D.refreshTimer = null; D.loadPage(true); }, 5000);
-      }
+      D.renderView(v, silent);
+      D.watch(seq);
     })
     .catch(function () {
       if (seq !== D.loadSeq) return;
-      if (silent) return;
+      if (silent) { D.watchLater(seq, 10000); return; }
       content.textContent = "";
       content.appendChild(D.el("p", "error", "Could not reach the server. Try again."));
     });
+};
+
+D.renderView = function (v, silent) {
+  var content = D.q("content");
+  var scrollY = window.scrollY;
+  D.state.view = v;
+  D.version = v.version || null;
+  document.title = v.title + " \\u00b7 Intercom Queue";
+  D.q("who").textContent = v.actorLabel;
+  D.renderNav(v);
+  D.renderCrumbs(v);
+  var blocks = (v.blocks || []).slice();
+  var headerBlock = null;
+  if (blocks.length && blocks[0].type === "header") headerBlock = blocks.shift();
+  else headerBlock = { type: "header", title: v.title };
+  content.textContent = "";
+  D.renderBlocks(content, [headerBlock]);
+  var wrap = D.el("div", null);
+  D.renderBlocks(wrap, blocks);
+  content.appendChild(wrap);
+  if (silent) window.scrollTo(0, scrollY);
+};
+
+// ---- live updates ----
+// A long-poll on the list's version: the server answers as soon as the list
+// changes (a webhook, a read from Intercom, a randomizer pick) or after about
+// 25 seconds with "unchanged". One request waits per open page, and a hidden
+// tab stops asking until it is shown again.
+D.version = null;
+D.watchTimer = null;
+D.watchCtl = null;
+D.watchPaused = false;
+D.watch = function (seq) {
+  if (seq !== D.loadSeq || !D.version) return;
+  if (document.hidden) { D.watchPaused = true; return; }
+  var ctl = null;
+  try { ctl = new AbortController(); } catch (e) {}
+  D.watchCtl = ctl;
+  var started = Date.now();
+  D.api("view", { page: D.state.page, params: D.state.params, filters: D.state.filters, cursor: D.state.cursor, since: D.version }, ctl ? ctl.signal : null)
+    .then(function (res) {
+      if (seq !== D.loadSeq) return;
+      D.watchCtl = null;
+      var v = D.handle(res); if (!v) return;
+      // An answer that came back at once without a change (a busy server):
+      // wait a little before asking again.
+      if (v.unchanged) { D.watchLater(seq, Date.now() - started < 2000 ? 5000 : 0); return; }
+      if (v.error) { D.watchLater(seq, 10000); return; }
+      D.renderWhenIdle(seq, v);
+    })
+    .catch(function () {
+      if (seq !== D.loadSeq) return;
+      D.watchCtl = null;
+      D.watchLater(seq, 10000);
+    });
+};
+D.watchLater = function (seq, ms) {
+  if (D.watchTimer) clearTimeout(D.watchTimer);
+  D.watchTimer = setTimeout(function () { D.watchTimer = null; D.watch(seq); }, ms);
+};
+D.stopWatch = function () {
+  if (D.watchTimer) { clearTimeout(D.watchTimer); D.watchTimer = null; }
+  if (D.watchCtl) { try { D.watchCtl.abort(); } catch (e) {} D.watchCtl = null; }
+};
+// Never redraw under an open dialog, menu or filter popover: hold the new
+// page until it closes. A burst of changes redraws at most every 2 seconds.
+D.renderWhenIdle = function (seq, v) {
+  if (seq !== D.loadSeq) return;
+  if (document.querySelector("dialog[open], .fpop.open, .morepop.open")) {
+    D.watchTimer = setTimeout(function () { D.watchTimer = null; D.renderWhenIdle(seq, v); }, 1000);
+    return;
+  }
+  D.renderView(v, true);
+  D.watchLater(seq, 2000);
 };
 
 // ---- wait times: "3h 12m", ticking while the page is open ----
@@ -360,17 +420,16 @@ D.startApp = function () {
   D.q("logout").addEventListener("click", function () {
     D.api("logout", {}).then(function () { location.href = D.BASE; }, function () { location.href = D.BASE; });
   });
-  D.q("refreshbtn").addEventListener("click", function () { D.loadPage(true); });
+  D.q("refreshbtn").addEventListener("click", function () { D.loadPage(true, true); });
   window.addEventListener("popstate", D.onRouteChange);
+  // Back in a hidden tab: catch up at once, then keep watching.
+  document.addEventListener("visibilitychange", function () {
+    if (document.hidden || !D.watchPaused) return;
+    D.watchPaused = false;
+    D.loadPage(true);
+  });
   D.onRouteChange();
   setInterval(D.tickAges, 30000);
-  // The data behind the page is a one-minute snapshot: refresh as often,
-  // but never under an open dialog, menu or filter popover, or in a hidden tab.
-  setInterval(function () {
-    if (document.hidden) return;
-    if (document.querySelector("dialog[open], .fpop.open, .morepop.open")) return;
-    D.loadPage(true);
-  }, 60000);
 };
 
 D.boot = function () {

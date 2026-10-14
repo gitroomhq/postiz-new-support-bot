@@ -96,3 +96,28 @@ test("bridged conversations never enter the gate", async () => {
   await h.handler.process("conversation.user.created", createdEvent, 0);
   assert.ok(!h.ops.some((o) => o.startsWith("convert:")));
 });
+
+test("every verified conversation or ticket delivery reaches the queue, even topics the bridge drops", async () => {
+  const handler = new IntercomWebhookHandler(
+    { setIntercomLastInboundAt: async () => {} } as unknown as SettingsStore,
+    {} as unknown as TicketStore,
+    {} as unknown as StatusService,
+    {} as unknown as IntercomStore,
+    {} as unknown as IntercomSyncService,
+    {} as unknown as AuditLogger,
+    {} as unknown as IntercomClient
+  );
+  const seen: string[] = [];
+  handler.setQueueListener((topic, id) => {
+    seen.push(`${topic}:${id}`);
+    if (id === "boom") throw new Error("listener bug");
+  });
+  // Temporal unbound: handled topics are processed inline (stubbed here).
+  (handler as unknown as { process: () => Promise<void> }).process = async () => {};
+  await handler.accept({ topic: "conversation_part.tag.created", data: { item: { id: 41 } } });
+  await handler.accept({ topic: "ticket.state.updated", data: { item: { id: "42" } } });
+  await handler.accept({ topic: "contact.created", data: { item: { id: "43" } } });
+  await handler.accept({ topic: "conversation.admin.replied", data: { item: {} } });
+  assert.equal(await handler.accept({ topic: "conversation.user.replied", data: { item: { id: "boom" } } }), true, "a listener bug never fails the delivery");
+  assert.deepEqual(seen, ["conversation_part.tag.created:41", "ticket.state.updated:42", "conversation.user.replied:boom"]);
+});

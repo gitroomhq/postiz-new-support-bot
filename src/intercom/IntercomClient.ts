@@ -29,7 +29,7 @@ const API_VERSION = "2.15";
 // Single-credential client: one access token (Bearer) for everything, pinned
 // to a fixed API version. Contact-authored posts use the reply endpoint's
 // `type:"user"` variant; admin-side actions carry an explicit admin_id (the
-// author resolution — Operator first, configured admin fallback — lives in the
+// author resolution (Operator first, configured admin fallback) lives in the
 // outbox scheduler, not here).
 //
 // Settings come from SettingsStore (edited live via /config), so every call
@@ -150,7 +150,7 @@ export class IntercomClient {
       }));
   }
 
-  // Team membership (admin_ids) — the assignment-pool source.
+  // Team membership (admin_ids): the assignment-pool source.
   async getTeam(teamId: string): Promise<{ id: string; name: string; adminIds: string[] } | null> {
     try {
       const data = await this.json<{ id?: string | number; name?: string; admin_ids?: Array<string | number> }>(
@@ -186,7 +186,7 @@ export class IntercomClient {
   private teamNameCache: { fetchedAt: number; byId: Map<string, string> } | null = null;
 
   // Team id → name via one cached /teams fetch (~5 min TTL, so a team created
-  // or renamed mid-window resolves late). Never throws — team names only
+  // or renamed mid-window resolves late). Never throws: team names only
   // decorate reminder notes and must not fail them.
   async getTeamNameCached(teamId: string): Promise<string | null> {
     const TTL_MS = 5 * 60_000;
@@ -245,7 +245,7 @@ export class IntercomClient {
     return hit?.id != null ? { id: String(hit.id) } : null;
   }
 
-  // role "user" + external_id, deliberately NO email — the customer lives in
+  // role "user" + external_id, deliberately NO email: the customer lives in
   // Discord and Intercom must never gain an email channel to them (delivery is
   // the webhook → Discord relay).
   async createContact(input: {
@@ -272,12 +272,12 @@ export class IntercomClient {
     return { id: String(data.id) };
   }
 
-  // Email-identified contact for the Sentry feedback import — the ONE create
+  // Email-identified contact for the Sentry feedback import: the ONE create
   // path that deliberately gives Intercom an email channel: agent replies to
   // these conversations fall back to email, and the submitter's email reply
   // threads back in. Role "user" (not "lead") so a returning submitter matches
   // the same record instead of accreting lead/user duplicate pairs. No
-  // external_id — these are not Discord customers.
+  // external_id: these are not Discord customers.
   async createEmailContact(input: { email: string; name?: string | null }): Promise<{ id: string }> {
     const data = await this.json<{ id?: string | number }>(
       "/contacts",
@@ -292,7 +292,7 @@ export class IntercomClient {
   // Intercom's "delete contact" only ARCHIVES; find/search are blind to
   // archived records, so a re-created contact 409s ("...archived contact...
   // id=X"). Reactivating by id lets the contact author conversations again.
-  // Idempotent for retries — unarchiving a live contact returns it, not an error.
+  // Idempotent for retries: unarchiving a live contact returns it, not an error.
   async unarchiveContact(contactId: string): Promise<void> {
     await this.json(`/contacts/${encodeURIComponent(contactId)}/unarchive`, "POST", undefined, "contact unarchive");
   }
@@ -356,8 +356,8 @@ export class IntercomClient {
 
   // EVERY contact attached to a conversation, not just the primary one.
   // Intercom's native "detect customers in forwarded emails" attaches the real
-  // sender alongside the forwarder, so a forwarded thread legitimately has two
-  // — this is the read that makes the extra one visible.
+  // sender alongside the forwarder, so a forwarded thread legitimately has two:
+  // this is the read that makes the extra one visible.
   async listConversationParticipants(
     conversationId: string
   ): Promise<Array<{ id: string; email: string | null }>> {
@@ -370,7 +370,7 @@ export class IntercomClient {
   }
 
   // Detach one contact from a conversation. Intercom refuses to remove the last
-  // participant, and so does the caller — but the API is the backstop.
+  // participant, and so does the caller, but the API is the backstop.
   //
   // Returns "unsupported" instead of throwing on 404/405: the endpoint's
   // availability varies by API version, and a caller that retries every sweep
@@ -434,7 +434,7 @@ export class IntercomClient {
 
   // ---- Conversations ----
 
-  // Newest conversations a contact participates in — the dispute-evidence
+  // Newest conversations a contact participates in: the dispute-evidence
   // context pulls their transcripts as customer_communication material.
   async searchConversationsByContact(
     contactId: string,
@@ -460,7 +460,7 @@ export class IntercomClient {
 
   // Full conversation rendered as plaintext (display_as=plaintext strips
   // Intercom's HTML bodies): the opening message plus every human-authored
-  // comment, in order. Notes and bot parts are skipped — evidence needs the
+  // comment, in order. Notes and bot parts are skipped: evidence needs the
   // actual customer/agent exchange.
   async getConversationTranscript(
     conversationId: string
@@ -587,7 +587,7 @@ export class IntercomClient {
   }
 
   // Raw conversation parts (HTML bodies, author ids, attachments) newer than
-  // `sinceUnixSeconds` — the none→bi gap heal feeds these through the normal
+  // `sinceUnixSeconds`: the none→bi gap heal feeds these through the normal
   // webhook relay path.
   async getConversationPartsSince(
     conversationId: string,
@@ -602,10 +602,10 @@ export class IntercomClient {
   }
 
   // Source-level view of one conversation for the forwarded-email converter:
-  // plaintext bodies (display_as=plaintext — no HTML stripping needed), the
+  // plaintext bodies (display_as=plaintext: no HTML stripping needed), the
   // opening message's author identity, attachments (signed URLs expire, so
   // fetch fresh right before re-uploading), and whether a human teammate
-  // already engaged (comment/note part authored by admin/team — assignment and
+  // already engaged (comment/note part authored by admin/team: assignment and
   // state parts don't count as engagement).
   async getConversationSource(conversationId: string): Promise<{
     createdAt: Date | null;
@@ -658,7 +658,7 @@ export class IntercomClient {
 
   // Contact-initiated conversation. The response is a Message object; the
   // conversation id lives in its conversation_id field. fromType must match
-  // the contact's role — Intercom rejects type "user" with a lead id (the
+  // the contact's role: Intercom rejects type "user" with a lead id (the
   // feedback import passes "lead" when reusing a lead-role email match).
   async createConversation(contactId: string, body: string, createdAtIso?: string, fromType: "user" | "lead" = "user"): Promise<string> {
     const data = await this.json<{ conversation_id?: string | number }>(
@@ -724,7 +724,7 @@ export class IntercomClient {
     return { partId: null };
   }
 
-  // Redacts (deletes) a conversation part — Intercom replaces the content with
+  // Redacts (deletes) a conversation part: Intercom replaces the content with
   // a native "This message was deleted" tombstone. 404 = part/conversation
   // gone, 403 = token lacks the redact permission; both are the caller's cue
   // to fall back to the appended-note mirror.
@@ -745,7 +745,7 @@ export class IntercomClient {
   // caller can record it in the echo ledger. Resolution: newest part authored
   // by this admin whose normalized body matches what we sent (per-ticket FIFO
   // means the bridge never has two in-flight posts per conversation, so
-  // ambiguity only arises with a same-admin human — the body match resolves
+  // ambiguity only arises with a same-admin human: the body match resolves
   // it); falls back to the newest same-author part.
   async replyAsAdmin(
     conversationId: string,
@@ -803,7 +803,7 @@ export class IntercomClient {
   }
 
   // The DELETE variant requires the acting admin in the body. 404 = the tag is
-  // already gone — that IS the desired end state, so it's swallowed.
+  // already gone: that IS the desired end state, so it's swallowed.
   async untagConversation(conversationId: string, tagId: string, adminId: string): Promise<void> {
     try {
       await this.json(
@@ -819,7 +819,7 @@ export class IntercomClient {
   }
 
   // Conversation custom attributes must be predefined in Intercom's UI
-  // (Settings → Data → Conversations) — the data_attributes API only covers
+  // (Settings → Data → Conversations): the data_attributes API only covers
   // contact/company models, so writes 4xx until the definitions exist.
   async setConversationAttributes(conversationId: string, attributes: Record<string, unknown>): Promise<void> {
     await this.json(
@@ -832,7 +832,7 @@ export class IntercomClient {
 
   // Manage endpoint: route the conversation to a team inbox. Posting an
   // assignment part that re-routes to the team it is already on is rejected
-  // with 422 "already assigned to the specified assignee" — but that IS the
+  // with 422 "already assigned to the specified assignee", but that IS the
   // desired end state (idempotent re-run of the creation-time assignment), so
   // it's swallowed as success rather than surfaced as a failure.
   async assignConversationToTeam(conversationId: string, teamId: string, adminId: string): Promise<void> {
@@ -902,7 +902,7 @@ export class IntercomClient {
 
   // Fallback when convert is rejected. conversationToLinkId is valid for
   // back-office/tracker ticket types only (conversation↔customer-ticket links
-  // can only be made by convert) — callers retry without it on rejection, and
+  // can only be made by convert): callers retry without it on rejection, and
   // the link then only exists in our DB, cross-referenced via notes.
   async createTicket(input: {
     ticketTypeId: string;
@@ -938,7 +938,7 @@ export class IntercomClient {
       attributes?: Record<string, unknown>;
       adminId?: string;
       assigneeId?: string;
-      // Ticket open/closed flag — separate from the state; false fully closes
+      // Ticket open/closed flag: separate from the state; false fully closes
       // the ticket (state alone leaves it listed as an open ticket).
       open?: boolean;
     }
@@ -974,7 +974,7 @@ export class IntercomClient {
 
   // ---- Inactivity sweeper reads/writes (native/unbridged objects) ----
 
-  // Fresh idle-detection fields for ONE conversation — the sweeper's pre-close
+  // Fresh idle-detection fields for ONE conversation: the sweeper's pre-close
   // re-check (its page snapshot can be minutes stale by the time a close
   // fires). Null on 404 (conversation deleted meanwhile).
   async getConversationIdleStats(conversationId: string): Promise<{
@@ -1065,7 +1065,7 @@ export class IntercomClient {
           teamAssigneeId: c.team_assignee_id != null ? String(c.team_assignee_id) : null,
           adminAssigneeId: c.admin_assignee_id != null ? String(c.admin_assignee_id) : null,
           customAttributes: c.custom_attributes ?? {},
-          // Ids only — the search projection carries no emails. Two or more is
+          // Ids only: the search projection carries no emails. Two or more is
           // the cheap pre-filter that keeps the forwarder-detach check off the
           // overwhelming majority of conversations.
           participantIds: (c.contacts?.contacts ?? []).filter((p) => p.id != null).map((p) => String(p.id)),
@@ -1116,43 +1116,100 @@ export class IntercomClient {
 
   // One page of open conversations (snoozed included: open stays true while
   // snoozed). Raw objects, because the queue reads a wider projection than
-  // the sweeper (source author, title, tags, the linked ticket).
-  async searchOpenConversationsRaw(startingAfter?: string | null): Promise<{ items: unknown[]; nextStartingAfter: string | null }> {
-    const data = await this.json<{ conversations?: unknown[]; pages?: { next?: { starting_after?: string } | null } }>(
+  // the sweeper (source author, title, tags, the linked ticket). `created`
+  // narrows it to one created_at slice, so the queue can walk several slices
+  // at once instead of one long cursor.
+  async searchOpenConversationsRaw(startingAfter?: string | null, created?: QueueCreatedRange): Promise<QueueRawPage> {
+    return this.queueSearch(
       "/conversations/search",
-      "POST",
-      {
-        query: { field: "open", operator: "=", value: true },
-        pagination: { per_page: 150, ...(startingAfter ? { starting_after: startingAfter } : {}) },
-      },
+      "conversations",
+      queueQuery([{ field: "open", operator: "=", value: true }, ...createdFilters(created)]),
+      startingAfter,
       "conversation search (queue)"
     );
-    return { items: data.conversations ?? [], nextStartingAfter: data.pages?.next?.starting_after ?? null };
   }
 
   // One page of open Customer tickets: the state (custom id, category, label)
   // and type the queue joins onto its conversations.
-  async searchOpenCustomerTicketsRaw(startingAfter?: string | null): Promise<{ items: unknown[]; nextStartingAfter: string | null }> {
-    const data = await this.json<{ tickets?: unknown[]; pages?: { next?: { starting_after?: string } | null } }>(
+  async searchOpenCustomerTicketsRaw(startingAfter?: string | null, created?: QueueCreatedRange): Promise<QueueRawPage> {
+    return this.queueSearch(
       "/tickets/search",
-      "POST",
-      {
-        query: {
-          operator: "AND",
-          value: [
-            { field: "open", operator: "=", value: true },
-            // Search uses "request" even though returned tickets say "Customer".
-            { field: "category", operator: "=", value: "request" },
-          ],
-        },
-        pagination: { per_page: 150, ...(startingAfter ? { starting_after: startingAfter } : {}) },
-      },
+      "tickets",
+      queueQuery([
+        { field: "open", operator: "=", value: true },
+        // Search uses "request" even though returned tickets say "Customer".
+        { field: "category", operator: "=", value: "request" },
+        ...createdFilters(created),
+      ]),
+      startingAfter,
       "ticket search (queue)"
     );
-    return { items: data.tickets ?? [], nextStartingAfter: data.pages?.next?.starting_after ?? null };
   }
 
-  // Admin note on a ticket (the sweeper's agent-idle nag for native tickets —
+  // The queue's catch-up read: every conversation touched after sinceSec,
+  // closed ones included (that is how a close leaves the list).
+  async searchConversationsUpdatedRaw(sinceSec: number, startingAfter?: string | null): Promise<QueueRawPage> {
+    return this.queueSearch(
+      "/conversations/search",
+      "conversations",
+      queueQuery([{ field: "updated_at", operator: ">", value: sinceSec }]),
+      startingAfter,
+      "conversation search (queue catch-up)"
+    );
+  }
+
+  // Customer tickets touched after sinceSec, open or not.
+  async searchCustomerTicketsUpdatedRaw(sinceSec: number, startingAfter?: string | null): Promise<QueueRawPage> {
+    return this.queueSearch(
+      "/tickets/search",
+      "tickets",
+      queueQuery([
+        { field: "category", operator: "=", value: "request" },
+        { field: "updated_at", operator: ">", value: sinceSec },
+      ]),
+      startingAfter,
+      "ticket search (queue catch-up)"
+    );
+  }
+
+  // One conversation as the queue reads it (the search projection plus its
+  // parts). null when it is gone.
+  async getConversationRaw(conversationId: string): Promise<unknown | null> {
+    try {
+      return await this.json<unknown>(`/conversations/${encodeURIComponent(conversationId)}`, "GET", undefined, "conversation get (queue)");
+    } catch (e) {
+      if (e instanceof IntercomHttpError && e.status === 404) return null;
+      throw e;
+    }
+  }
+
+  // One ticket as the queue reads it (state and type). null when it is gone.
+  async getTicketRaw(ticketId: string): Promise<unknown | null> {
+    try {
+      return await this.json<unknown>(`/tickets/${encodeURIComponent(ticketId)}`, "GET", undefined, "ticket get (queue)");
+    } catch (e) {
+      if (e instanceof IntercomHttpError && e.status === 404) return null;
+      throw e;
+    }
+  }
+
+  private async queueSearch(
+    path: string,
+    listKey: "conversations" | "tickets",
+    query: object,
+    startingAfter: string | null | undefined,
+    what: string
+  ): Promise<QueueRawPage> {
+    const data = await this.json<{ conversations?: unknown[]; tickets?: unknown[]; pages?: { next?: { starting_after?: string } | null } }>(
+      path,
+      "POST",
+      { query, pagination: { per_page: 150, ...(startingAfter ? { starting_after: startingAfter } : {}) } },
+      what
+    );
+    return { items: data[listKey] ?? [], nextStartingAfter: data.pages?.next?.starting_after ?? null };
+  }
+
+  // Admin note on a ticket (the sweeper's agent-idle nag for native tickets:
   // notes never notify the contact).
   async replyTicketAsAdmin(ticketId: string, input: { adminId: string; body: string; note?: boolean }): Promise<void> {
     await this.json(
@@ -1169,7 +1226,7 @@ export class IntercomClient {
   }
 
   // ---- Deletion (the /config "Wipe Intercom data" button) ----
-  // Conversations and tickets are hard-deleted — they aren't keyed by
+  // Conversations and tickets are hard-deleted: they aren't keyed by
   // external_id, so they recreate cleanly on the next backfill. Contacts are
   // ARCHIVED, not deleted: DELETE /contacts is a *permanent* delete with a
   // 7-day grace during which the external_id can't be reused, which would block
@@ -1265,7 +1322,7 @@ export class IntercomClient {
       .map((t) => ({ id: String(t.id), name: t.name as string }));
   }
 
-  // Conversation-model data attributes (read-only — the API can list but NOT
+  // Conversation-model data attributes (read-only: the API can list but NOT
   // create conversation attributes; creation is a manual Settings → Data →
   // Conversations step). Powers SlaService.verifySetup().
   async listConversationDataAttributes(): Promise<Array<{ name: string; archived: boolean; dataType: string | null }>> {
@@ -1299,7 +1356,7 @@ export class IntercomClient {
   }
 
   // Everything the SLA rule evaluator needs about a (native) conversation in
-  // one GET: team, tags, source body, attributes, linked ticket, state — plus
+  // one GET: team, tags, source body, attributes, linked ticket, state, plus
   // the currently applied SLA (read-only, preview display only).
   async getConversationSlaFacts(conversationId: string): Promise<{
     state: string;
@@ -1378,6 +1435,33 @@ type RawTicket = {
 
 // One ticket object (GET /tickets/{id} or a search hit) as the ticket-state
 // flows read it: live state, the type's allowed states, the change history.
+// One page of a queue search: raw objects, parsed by src/queue/queueModel.
+export interface QueueRawPage {
+  items: unknown[];
+  nextStartingAfter: string | null;
+}
+
+// A created_at slice in unix seconds: after <= created_at < before, either
+// end open.
+export interface QueueCreatedRange {
+  after?: number;
+  before?: number;
+}
+
+type SearchFilter = { field: string; operator: string; value: unknown };
+
+function queueQuery(filters: SearchFilter[]): object {
+  return filters.length === 1 ? filters[0] : { operator: "AND", value: filters };
+}
+
+// Search compares with > and <, so the inclusive lower end is after - 1.
+function createdFilters(range?: QueueCreatedRange): SearchFilter[] {
+  const out: SearchFilter[] = [];
+  if (range?.after != null) out.push({ field: "created_at", operator: ">", value: range.after - 1 });
+  if (range?.before != null) out.push({ field: "created_at", operator: "<", value: range.before });
+  return out;
+}
+
 function parseTicketStateView(data: RawTicket, fallbackId: string): IntercomTicketStateView {
   const category = (v: RawPartState): string | null =>
     typeof v === "string" ? v : v && typeof v === "object" && typeof v.category === "string" ? v.category : null;

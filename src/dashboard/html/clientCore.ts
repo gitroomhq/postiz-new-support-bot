@@ -1,5 +1,5 @@
 // Client module: namespace, api wrapper, DOM + formatting helpers, flash.
-// Plain vanilla JS as a string (no build step). No backticks / ${} inside —
+// Plain vanilla JS as a string (no build step). No backticks / ${} inside:
 // the shell embeds these fragments in a template literal. All dynamic text is
 // set via textContent, never innerHTML.
 
@@ -11,12 +11,14 @@ var D = {
 
 D.q = function (id) { return document.getElementById(id); };
 
-D.api = function (endpoint, body) {
+// signal: an optional AbortSignal (the queue's live-update long-poll).
+D.api = function (endpoint, body, signal) {
   return fetch((D.BASE || "/panel") + "/api/" + endpoint, {
     method: "POST",
     credentials: "same-origin",
     headers: { "Content-Type": "application/json", "X-Panel-Request": "1" },
-    body: JSON.stringify(body || {})
+    body: JSON.stringify(body || {}),
+    signal: signal || undefined
   }).then(function (r) {
     return r.json().then(function (j) { return { status: r.status, j: j }; },
       function () { return { status: r.status, j: {} }; });
@@ -78,7 +80,7 @@ D.fmtRel = function (iso) {
   return { rel: future ? "in " + rel : rel + " ago", abs: abs };
 };
 
-// Quiet copy-icon affordance (Stripe's little glyph after every mono id) —
+// Quiet copy-icon affordance (Stripe's little glyph after every mono id):
 // an inline SVG, no border, no text.
 D.copyBtn = function (value) {
   var b = document.createElement("button");
@@ -117,7 +119,7 @@ D.clearFlash = function () {
   f.textContent = ""; f.className = "flash"; f.onclick = null; f.removeAttribute("title");
 };
 // Optional link: an anchor appended as a CHILD NODE (textContent label,
-// rel=noopener — never innerHTML). Link flashes don't auto-clear: the URL may
+// rel=noopener, never innerHTML). Link flashes don't auto-clear: the URL may
 // be short-lived (report downloads) and must stay clickable until navigation.
 D.flashOk = function (msg, link) {
   var f = D.q("flash"); f.textContent = msg; f.className = "flash ok";

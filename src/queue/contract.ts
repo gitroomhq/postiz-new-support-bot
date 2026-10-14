@@ -71,7 +71,9 @@ export interface QueuePageView {
   blocks: QueueBlock[];
   actorLabel: string;
   updatedAt: string; // ISO: when the data was read from Intercom
-  refreshing?: boolean;
+  // The list's version this page was built from. The page sends it back as
+  // `since` to long-poll for the next change.
+  version: string;
 }
 
 export interface QueueViewRequest {
@@ -79,6 +81,7 @@ export interface QueueViewRequest {
   params: Record<string, string>;
   filters: Record<string, string>;
   cursor: string | null;
+  since?: string | null; // a version: wait until the list moves past it
 }
 
 export interface QueueActionResult {

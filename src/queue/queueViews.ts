@@ -30,7 +30,7 @@ import type {
 
 // Server-built pages for the Intercom Queue (the dashboard's server-driven
 // pattern: the client draws exactly what it is handed). Every view reads the
-// shared one-minute snapshot; nothing here calls Intercom except the big
+// shared live list (QueueData); nothing here calls Intercom except the big
 // cards' latest customer message.
 
 export const QUEUE_PAGE_SIZE = 25;
@@ -70,6 +70,9 @@ export class QueueViews {
   async build(actor: QueueActor, req: QueueViewRequest, options?: { waitForSnapshot: boolean }): Promise<QueuePageView | null> {
     const scope = this.scopeFor(req);
     if (!scope && req.page !== "inboxes" && req.page !== "people") return null;
+    // Read before the list: a change while this page builds wakes the next
+    // long-poll at once instead of being missed.
+    const version = this.data.version();
     const ready = options?.waitForSnapshot === false ? this.data.readySnapshot() : undefined;
     if (ready === null) {
       return {
@@ -89,7 +92,7 @@ export class QueueViews {
         ],
         actorLabel: actor.name,
         updatedAt: new Date(this.now()).toISOString(),
-        refreshing: true,
+        version,
       };
     }
     const [snap, dir, workspace] = await Promise.all([
@@ -103,9 +106,6 @@ export class QueueViews {
     if (req.page === "inboxes") built = this.inboxesPage(ctx, req);
     else if (req.page === "people") built = this.peoplePage(ctx, req);
     else built = await this.scopePage(ctx, scope!, req);
-    if (ready?.refreshing) {
-      built.blocks.splice(1, 0, { type: "notice", badge: { kind: "info", text: "Updating" }, text: "Refreshing from Intercom. Showing the last list while it updates." });
-    }
     return {
       page: req.page,
       title: built.title,
@@ -115,8 +115,18 @@ export class QueueViews {
       blocks: built.blocks,
       actorLabel: actor.name,
       updatedAt: new Date(snap.builtAt).toISOString(),
-      ...(ready?.refreshing ? { refreshing: true } : {}),
+      version,
     };
+  }
+
+  // Long-poll for the page: true once the list moved past `since`.
+  waitForChange(since: string, timeoutMs: number): Promise<boolean> {
+    return this.data.waitForChange(since, timeoutMs);
+  }
+
+  // The Refresh button.
+  refresh(): void {
+    this.data.requestRefresh();
   }
 
   // Randomizer buttons. The scope and the filters the page showed are baked
@@ -311,6 +321,14 @@ export class QueueViews {
       });
     }
     if (ctx.snap.error) out.push({ type: "notice", badge: { kind: "warn", text: "Stale" }, text: `${ctx.snap.error} Showing the last list read.` });
+    else if (ctx.snap.restored) {
+      const age = Math.max(0, ctx.nowSec - Math.floor(ctx.snap.builtAt / 1000));
+      out.push({
+        type: "notice",
+        badge: { kind: "info", text: "Updating" },
+        text: `Catching up with Intercom after a restart. Showing the list saved ${age < 60 ? "just now" : `${waitLabel(age)} ago`}.`,
+      });
+    }
     if (ctx.snap.truncated) {
       out.push({ type: "notice", badge: { kind: "warn", text: "Partial" }, text: "Only the first 6,000 open conversations were read; older ones may be missing." });
     }

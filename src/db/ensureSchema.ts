@@ -1284,6 +1284,12 @@ export const STATEMENTS: string[] = [
   )`,
   `CREATE INDEX IF NOT EXISTS "queue_sessions_adminId_idx" ON "queue_sessions"("adminId")`,
   `CREATE INDEX IF NOT EXISTS "queue_sessions_absoluteExpiresAt_idx" ON "queue_sessions"("absoluteExpiresAt")`,
+  `CREATE TABLE IF NOT EXISTS "queue_cache" (
+    "id" INTEGER NOT NULL,
+    "data" JSONB NOT NULL,
+    "savedAt" TIMESTAMP(3) NOT NULL,
+    CONSTRAINT "queue_cache_pkey" PRIMARY KEY ("id")
+  )`,
 ];
 
 export async function ensureSchema(prisma: PrismaClient): Promise<void> {

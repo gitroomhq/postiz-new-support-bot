@@ -164,7 +164,21 @@ export function parseTicket(raw: unknown): QueueTicketInfo | null {
   return { id, stateId: state.id, stateCategory: state.category, stateLabel: state.label, typeId: type.id, typeName: type.name };
 }
 
-// A conversation search hit (POST /conversations/search).
+// When a ticket last changed (unix seconds; 0 when it does not say). Newer
+// copies win when a webhook read and a search read race.
+export function ticketUpdatedAt(raw: unknown): number {
+  const o = obj(raw);
+  return unix(o?.updated_at) ?? unix(o?.created_at) ?? 0;
+}
+
+// The parts a conversation GET carries (the Fin / notes toggles read them).
+export function partsOf(raw: unknown): IntercomWebhookPart[] {
+  const list = obj(obj(raw)?.conversation_parts)?.conversation_parts;
+  return Array.isArray(list) ? list.filter((p): p is IntercomWebhookPart => obj(p) != null) : [];
+}
+
+// A conversation search hit (POST /conversations/search) or a conversation
+// GET: both are the same conversation object.
 export function parseConversation(raw: unknown): QueueConversation | null {
   const o = obj(raw);
   const id = idOf(o?.id);
