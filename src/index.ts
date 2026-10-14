@@ -964,6 +964,7 @@ async function main() {
     settingsStore,
     postizOrgLinks
   );
+  sentryFeedbackImporter.setAssignmentService(assignmentService);
 
   // ---- Temporal worker (all background work lives in workflows) ----
 

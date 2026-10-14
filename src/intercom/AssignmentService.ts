@@ -30,6 +30,7 @@ export class AssignmentService {
   private adminsCache: { fetchedAt: number; admins: IntercomAdmin[] } | null = null;
   private teamCache = new Map<string, { fetchedAt: number; adminIds: string[] }>();
   private openCounts: { computedAt: number; counts: Map<string, number> } | null = null;
+  private teamAssignments = new Map<string, Promise<unknown>>();
 
   constructor(
     private client: IntercomClient,
@@ -101,13 +102,41 @@ export class AssignmentService {
   async assignConversation(
     conversationId: string,
     teamId: string | null,
-    opts: { threadId?: string | null; ticketId?: string | null; bumpCount?: boolean } = {}
+    opts: { threadId?: string | null; ticketId?: string | null; bumpCount?: boolean; reassignFrom?: string } = {}
   ): Promise<string | null> {
     if (!teamId) return null; // no team → no pool → cannot balance
+    // Conversation inbox workflows run concurrently. Serialize each team's
+    // live check, pick and cursor update, including the recovery sweep.
+    const previous = this.teamAssignments.get(teamId) ?? Promise.resolve();
+    const pending = previous.catch(() => undefined).then(() => this.assignWithinTeam(conversationId, teamId, opts));
+    this.teamAssignments.set(teamId, pending);
+    try {
+      return await pending;
+    } finally {
+      if (this.teamAssignments.get(teamId) === pending) this.teamAssignments.delete(teamId);
+    }
+  }
+
+  private async assignWithinTeam(
+    conversationId: string,
+    teamId: string,
+    opts: { threadId?: string | null; ticketId?: string | null; bumpCount?: boolean; reassignFrom?: string }
+  ): Promise<string | null> {
     if (!this.settingsStore.resolveAssignEnabled(teamId)) return null;
     try {
       const members = await this.poolForTeam(teamId);
       if (!members || members.length === 0) return null;
+      // Webhook payloads and sweep snapshots can predate a human grab, close
+      // or routing change. Only replace the exact away/gone assignee observed
+      // on a customer reply; every other path requires an unassigned inbox.
+      const live = await this.client.getConversationSlaFacts(conversationId);
+      if (!live || !live.open || live.state !== "open" ||
+          (live.snoozedUntil && live.snoozedUntil.getTime() > Date.now()) || live.teamAssigneeId !== teamId) return null;
+      if (live.adminAssigneeId && live.adminAssigneeId !== opts.reassignFrom) return null;
+      if (live.adminAssigneeId) {
+        const current = members.find((m) => m.id === live.adminAssigneeId);
+        if (current && !current.away && !current.excluded) return null;
+      }
       const pick = pickAssignee(members, this.settingsStore.teamRotationCursor(teamId));
       if (!pick) return null;
       // Damper BEFORE the API call: the conversation.admin.assigned webhook can
@@ -135,6 +164,9 @@ export class AssignmentService {
       // Keep this tick's counts honest so a burst of strays spreads out.
       if (opts.bumpCount !== false && this.openCounts) {
         this.openCounts.counts.set(pick.adminId, (this.openCounts.counts.get(pick.adminId) ?? 0) + 1);
+        if (live.adminAssigneeId) {
+          this.openCounts.counts.set(live.adminAssigneeId, Math.max(0, (this.openCounts.counts.get(live.adminAssigneeId) ?? 0) - 1));
+        }
       }
       assignLog.info("conversation assigned", {
         "intercom.conversation_id": conversationId,
@@ -154,15 +186,19 @@ export class AssignmentService {
 
   // Creation-time hook (bridge ensure = the routing team; native
   // conversation.user.created = the conversation's team from the webhook):
-  // the conversation is definitionally unassigned, no pre-read needed.
+  // Live state is checked inside the team's serialized assignment.
   async maybeAssignOnCreate(conversationId: string, teamId: string | null, threadId: string | null, ticketId: string | null): Promise<void> {
-    if (!teamId) return;
+    if (!teamId) {
+      // Native routing can happen after the creation payload was built.
+      const live = await this.client.getConversationSlaFacts(conversationId);
+      teamId = live?.teamAssigneeId ?? null;
+    }
     await this.assignConversation(conversationId, teamId, { threadId, ticketId });
   }
 
   // Customer replied while the current assignee is away or no longer in the
   // conversation's team pool (covers reopens): re-route within that team. A
-  // conversation with NO assignee is left to the stray sweep.
+  // conversation with NO assignee is assigned immediately too.
   async maybeReassignOnCustomerReply(
     conversationId: string,
     currentAssigneeId: string | null,
@@ -170,7 +206,10 @@ export class AssignmentService {
     threadId: string | null,
     ticketId: string | null
   ): Promise<void> {
-    if (!teamId || !currentAssigneeId) return;
+    if (!teamId || !currentAssigneeId) {
+      await this.maybeAssignOnCreate(conversationId, teamId, threadId, ticketId);
+      return;
+    }
     if (!this.settingsStore.resolveAssignEnabled(teamId)) return;
     const members = await this.poolForTeam(teamId);
     if (!members) return;
@@ -182,6 +221,6 @@ export class AssignmentService {
       "intercom.team_id": teamId,
       "intercom.previous_assignee_id": currentAssigneeId,
     });
-    await this.assignConversation(conversationId, teamId, { threadId, ticketId });
+    await this.assignConversation(conversationId, teamId, { threadId, ticketId, reassignFrom: currentAssigneeId });
   }
 }

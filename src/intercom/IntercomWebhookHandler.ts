@@ -467,13 +467,28 @@ export class IntercomWebhookHandler {
     const assigneeId =
       item?.admin_assignee_id != null && String(item.admin_assignee_id) !== "0" ? String(item.admin_assignee_id) : null;
     const link = await this.store.getLinkByConversationId(conversationId).catch(() => null);
-    if (link) {
-      const previous = link.lastAssigneeId ?? null;
-      if (previous === assigneeId) return; // our own assignment echoing back
+    // A team-only routing event often follows user.created. Route it now,
+    // rather than leaving it for the five-minute stray sweep. Imports still
+    // wait for their importer to finish all team/ticket decoration writes.
+    if (link && (link.lastAssigneeId ?? null) !== assigneeId) {
+      // Record the delivered state before balancing so this stale team-only
+      // event cannot clear the new bot-assignment echo damper afterwards.
       await this.store.setLastAssigneeId(link.ticketThreadId, assigneeId).catch(() => undefined);
       await this.slaService?.onTicketTrigger(link.ticketThreadId, "assignee").catch(() => undefined);
-      return;
     }
+    if (!assigneeId && this.assignmentService) {
+      const feedback = this.sentryFeedbackStore
+        ? await this.sentryFeedbackStore.getByConversationId(conversationId)
+        : null;
+      if (!feedback) {
+        const teamId = item?.team_assignee_id != null && String(item.team_assignee_id) !== "0"
+          ? String(item.team_assignee_id) : null;
+        await this.assignmentService.maybeAssignOnCreate(
+          conversationId, teamId, link?.ticketThreadId ?? null, link?.ticketId ?? null
+        );
+      }
+    }
+    if (link) return;
     await this.slaService?.applyForNative(conversationId, "conversation.admin.assigned").catch(() => undefined);
   }
 

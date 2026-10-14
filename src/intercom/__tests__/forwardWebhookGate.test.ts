@@ -25,7 +25,10 @@ function makeHarness(link: object | null = null): Harness {
     {} as unknown as SettingsStore,
     {} as unknown as TicketStore,
     {} as unknown as StatusService,
-    { getLinkByConversationId: async () => link } as unknown as IntercomStore,
+    {
+      getLinkByConversationId: async () => link,
+      setLastAssigneeId: async (_thread: string, adminId: string | null) => { ops.push(`damper:${adminId}`); },
+    } as unknown as IntercomStore,
     {} as unknown as IntercomSyncService,
     {} as unknown as AuditLogger,
     {} as unknown as IntercomClient
@@ -61,6 +64,28 @@ function makeHarness(link: object | null = null): Harness {
 }
 
 const createdEvent = { data: { item: { id: "c1", team_assignee_id: 7, source: { subject: "Fwd: x" } } } };
+
+test("late team routing triggers immediate assignment; human assignment does not", async () => {
+  const h = makeHarness();
+  await h.handler.process("conversation.admin.assigned", { data: { item: { id: "c1", team_assignee_id: 7, admin_assignee_id: 0 } } }, 0);
+  assert.deepEqual(h.ops, ["assign.create:c1:7", "sla:c1:conversation.admin.assigned"]);
+  h.ops.length = 0;
+  await h.handler.process("conversation.admin.assigned", { data: { item: { id: "c1", team_assignee_id: 7, admin_assignee_id: 42 } } }, 0);
+  assert.deepEqual(h.ops, ["sla:c1:conversation.admin.assigned"]);
+});
+
+test("late team routing on feedback imports waits for importer completion", async () => {
+  const h = makeHarness();
+  h.handler.setSentryFeedbackStore({ getByConversationId: async () => ({ status: "imported" }) });
+  await h.handler.process("conversation.admin.assigned", { data: { item: { id: "c1", team_assignee_id: 7 } } }, 0);
+  assert.deepEqual(h.ops, ["sla:c1:conversation.admin.assigned"]);
+});
+
+test("bridged routing clears the old damper before making the new balanced pick", async () => {
+  const h = makeHarness({ ticketThreadId: "t1", ticketId: "ticket1", lastAssigneeId: "old" });
+  await h.handler.process("conversation.admin.assigned", { data: { item: { id: "c1", team_assignee_id: 7, admin_assignee_id: 0 } } }, 0);
+  assert.deepEqual(h.ops, ["damper:null", "sla.ticket", "assign.create:c1:7"]);
+});
 
 test("converted original: balancer and SLA are skipped", async () => {
   const h = makeHarness();

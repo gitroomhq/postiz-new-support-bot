@@ -231,6 +231,29 @@ test("unconfigured or disabled ticks skip without touching Sentry or Intercom", 
   assert.deepEqual(disabled.ops, []);
 });
 
+test("feedback assignment runs after every decoration and carries the converted ticket", async () => {
+  const h = makeHarness({
+    issues: [issue("1", "2026-07-20T11:00:00Z")], contexts: { "1": context("user@example.com") },
+    teamId: "team-1", ticketTypeId: "type-1",
+  });
+  h.importer.setAssignmentService({ maybeAssignOnCreate: async (id, team, thread, ticket) => {
+    assert.equal(thread, null);
+    h.ops.push(`balance:${id}:${team}:${ticket}`);
+  } });
+  assert.equal((await h.importer.tick(false)).imported, 1);
+  assert.equal(h.ops.at(-1), "balance:conv-contact-1:team-1:ticket-conv-contact-1");
+  assert.ok(h.ops.indexOf("ic.ticketAssign:ticket-conv-contact-1:team-1") < h.ops.indexOf(h.ops.at(-1)!));
+});
+
+test("failed feedback assignment keeps the successful import for sweep recovery", async () => {
+  const h = makeHarness({ issues: [issue("1", "2026-07-20T11:00:00Z")], contexts: { "1": context("user@example.com") }, teamId: "team-1" });
+  h.importer.setAssignmentService({ maybeAssignOnCreate: async () => { throw new Error("assignment unavailable"); } });
+  const result = await h.importer.tick(false);
+  assert.equal(result.imported, 1);
+  assert.equal(result.failed, 0);
+  assert.equal(h.ledger.get("1")?.status, "imported");
+});
+
 test("a gated tick stamps the attempt with its reason; a switched-off one stamps nothing", async () => {
   const gated = makeHarness({ configured: false });
   const result = await gated.importer.tick(false);

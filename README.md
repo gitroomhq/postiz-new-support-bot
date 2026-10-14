@@ -87,6 +87,8 @@ The Intercom workspace runs on the **Advanced** plan, which has no native SLAs, 
 
 Alerts stay **inside Intercom** (agent Discord pings were retired): at-risk flips the `SLA Status` attribute; a breach also adds the `sla-breached` tag and one internal note per breached clock. Rules are priority-ordered (first enabled match wins, conditions AND-ed) over ticket basics, Stripe customer state, Intercom data and keywords; no match writes the default target. Target evaluation fires on ticket creation, status changes, customer replies, assignee changes, Stripe events and the native webhooks (30-min `sla-sweep` safety net); the clocks + assignment stray-sweep run every 5 min (`sla-enforce`).
 
+Balanced assignment runs on creation, customer replies to unassigned or away-owned conversations, and team-only routing events. Sentry imports request a balanced pick after their team/ticket decorations finish. Picks are serialized per team and check live conversation state to preserve human assignments, closed conversations and snoozes. Intercom's zero assignee IDs are treated as unassigned. The five-minute enforcement sweep recovers missed events and failed picks.
+
 ### Customer responded ticket state
 
 When a customer replies, the Intercom ticket moves into a "Customer responded" state, so the inbox shows at a glance which tickets wait on the team. When a teammate replies, the ticket goes back to the state it had before the customer wrote. Intercom can't do the second half itself (it has no memory of the previous state, and its Workflows never see the bridge's API-created conversations), so the bot does both.

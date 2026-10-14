@@ -135,6 +135,7 @@ export function isUnicodeEmoji(input: string): boolean {
 
 export class SettingsStore {
   private settings!: BotSettings;
+  private rotationCursorUpdates: Promise<void> = Promise.resolve();
   private tagList: StatusTag[] = [];
   private vault: VaultService | null = null;
 
@@ -1148,13 +1149,19 @@ export class SettingsStore {
   // Engine-written (every bot assignment advances it). Merges into the map so
   // the hot path only touches one team's cursor.
   async setTeamRotationCursor(teamId: string, adminId: string | null): Promise<void> {
-    const map = this.rotationCursors();
-    if (adminId == null) delete map[teamId];
-    else map[teamId] = adminId;
-    this.settings = await this.prisma.botSettings.update({
-      where: { id: "global" },
-      data: { assignRotationCursorsJson: map as unknown as Prisma.InputJsonValue },
+    // Different teams can finish assignments together. Merge after the prior
+    // cursor write completes so one team's map cannot erase another's turn.
+    const update = this.rotationCursorUpdates.then(async () => {
+      const map = this.rotationCursors();
+      if (adminId == null) delete map[teamId];
+      else map[teamId] = adminId;
+      this.settings = await this.prisma.botSettings.update({
+        where: { id: "global" },
+        data: { assignRotationCursorsJson: map as unknown as Prisma.InputJsonValue },
+      });
     });
+    this.rotationCursorUpdates = update.catch(() => undefined);
+    await update;
   }
 
   // ---- scoped updaters (scope = DEFAULT_SETTINGS_SCOPE or a real team id) ----

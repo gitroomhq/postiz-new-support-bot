@@ -72,6 +72,14 @@ interface WalkContext {
 // Intercom's email fallback. Sentry is strictly read-only. Anonymous
 // submissions (no contact_email) are skipped into the ledger for audit.
 export class SentryFeedbackImporter {
+  private assignmentService: {
+    maybeAssignOnCreate(conversationId: string, teamId: string | null, threadId: string | null, ticketId: string | null): Promise<void>;
+  } | null = null;
+
+  setAssignmentService(service: NonNullable<SentryFeedbackImporter["assignmentService"]>): void {
+    this.assignmentService = service;
+  }
+
   constructor(
     private sentry: SentryFeedbackClient,
     private intercom: IntercomClient,
@@ -522,9 +530,8 @@ export class SentryFeedbackImporter {
       }
     }
     // Team routing directly after conversion (before note/tag): all
-    // assignment-relevant writes land as early as possible — the balanced
-    // admin pick itself is deliberately left to the enforcer's stray
-    // sweep (the creation webhook skips imports to avoid churn).
+    // assignment-relevant writes land as early as possible. The balanced
+    // admin pick runs after decoration, so team writes cannot undo it.
     const teamId = this.settingsStore.sentryFeedbackTeamId();
     if (teamId) {
       try {
@@ -576,6 +583,17 @@ export class SentryFeedbackImporter {
         "intercom.conversation_id": conversationId,
         "error.message": e instanceof Error ? e.message : String(e),
       });
+    }
+    if (this.assignmentService) {
+      try {
+        await ctx.paceWrite();
+        await this.assignmentService.maybeAssignOnCreate(conversationId, teamId, null, ticketId);
+      } catch (e) {
+        syncLog.warn("sentry feedback import: balanced assignment failed, sweep will retry", {
+          "intercom.conversation_id": conversationId,
+          "error.message": e instanceof Error ? e.message : String(e),
+        });
+      }
     }
     return "imported";
   }

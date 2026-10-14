@@ -1062,8 +1062,8 @@ export class IntercomClient {
           lastAdminReplyAt: c.statistics?.last_admin_reply_at
             ? new Date(c.statistics.last_admin_reply_at * 1000)
             : null,
-          teamAssigneeId: c.team_assignee_id != null ? String(c.team_assignee_id) : null,
-          adminAssigneeId: c.admin_assignee_id != null ? String(c.admin_assignee_id) : null,
+          teamAssigneeId: c.team_assignee_id != null && String(c.team_assignee_id) !== "0" ? String(c.team_assignee_id) : null,
+          adminAssigneeId: c.admin_assignee_id != null && String(c.admin_assignee_id) !== "0" ? String(c.admin_assignee_id) : null,
           customAttributes: c.custom_attributes ?? {},
           // Ids only: the search projection carries no emails. Two or more is
           // the cheap pre-filter that keeps the forwarder-detach check off the
@@ -1398,8 +1398,8 @@ export class IntercomClient {
         firstAdminReplyAt: data.statistics?.first_admin_reply_at
           ? new Date(data.statistics.first_admin_reply_at * 1000)
           : null,
-        teamAssigneeId: data.team_assignee_id != null ? String(data.team_assignee_id) : null,
-        adminAssigneeId: data.admin_assignee_id != null ? String(data.admin_assignee_id) : null,
+        teamAssigneeId: data.team_assignee_id != null && String(data.team_assignee_id) !== "0" ? String(data.team_assignee_id) : null,
+        adminAssigneeId: data.admin_assignee_id != null && String(data.admin_assignee_id) !== "0" ? String(data.admin_assignee_id) : null,
         tags: (data.tags?.tags ?? []).map((t) => t.name ?? "").filter(Boolean),
         sourceBody: data.source?.body ?? null,
         customAttributes: data.custom_attributes ?? {},

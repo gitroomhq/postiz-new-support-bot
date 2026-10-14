@@ -158,7 +158,7 @@ export class SlaEnforcer {
     // Per-admin open workload from the same snapshot (snoozed excluded).
     const openCounts = new Map<string, number>();
     for (const c of items) {
-      if (c.state !== "open" || !c.adminAssigneeId) continue;
+      if (!notSnoozed(c) || !c.adminAssigneeId) continue;
       openCounts.set(c.adminAssigneeId, (openCounts.get(c.adminAssigneeId) ?? 0) + 1);
     }
     this.assignment.setOpenCounts(openCounts);
@@ -220,7 +220,7 @@ export class SlaEnforcer {
           const live = await this.client.getConversationSlaFacts(stray.id);
           if (!live || !live.open || live.adminAssigneeId) continue;
           const link = linkByConv.get(stray.id) ?? null;
-          const assignee = await this.assignment.assignConversation(stray.id, stray.teamAssigneeId, {
+          const assignee = await this.assignment.assignConversation(stray.id, live.teamAssigneeId, {
             threadId: link?.ticketThreadId ?? null,
             ticketId: link?.ticketId ?? feedbackByConv.get(stray.id) ?? null,
           });
