@@ -65,6 +65,30 @@ export interface QueueCache {
   save(state: QueueSaved): Promise<void>;
 }
 
+// A ticket a teammate marked resolved on the queue: hidden from every page
+// for everyone. untilReply: back on the customer's next message (after
+// lastContactAt, unix seconds); otherwise hidden until restored. resolvedAt
+// is in ms.
+export interface QueueResolution {
+  conversationId: string;
+  untilReply: boolean;
+  lastContactAt: number | null;
+  note: string | null;
+  title: string;
+  ticketNumber: string | null;
+  customer: string | null;
+  resolvedById: string;
+  resolvedByName: string;
+  resolvedAt: number;
+}
+
+// Where they are kept (QueueResolutionStore; a fake in tests).
+export interface QueueResolutions {
+  list(): Promise<QueueResolution[]>;
+  put(r: QueueResolution): Promise<void>;
+  remove(conversationIds: string[]): Promise<void>;
+}
+
 export interface QueueSnapshot {
   builtAt: number; // ms: the last read of the whole list (scan or catch-up)
   items: QueueItem[]; // longest waiting first
@@ -159,6 +183,11 @@ export class QueueData {
 
   private cache: QueueCache | null = null;
   private restoreTried = false;
+
+  // Marked resolved on the queue, loaded once at boot.
+  private resolutions = new Map<string, QueueResolution>();
+  private resolutionStore: QueueResolutions | null = null;
+  private resolutionsLoad: Promise<void> | null = null;
   private unsaved = false;
   private saveTimer: NodeJS.Timeout | null = null;
 
@@ -187,6 +216,20 @@ export class QueueData {
 
   setCache(cache: QueueCache): void {
     this.cache = cache;
+  }
+
+  // Loads the resolved marks at once; every derive waits for them, so a
+  // restart never shows a resolved ticket for a moment.
+  setResolutions(store: QueueResolutions): void {
+    this.resolutionStore = store;
+    this.resolutionsLoad = store
+      .list()
+      .then((rows) => {
+        for (const r of rows) if (!this.resolutions.has(r.conversationId)) this.resolutions.set(r.conversationId, r);
+      })
+      .catch((e) => {
+        queueLog.warn("queue resolutions load failed", { "error.message": e instanceof Error ? e.message : String(e) });
+      });
   }
 
   // Boot: restore the saved list and start the first scan, so the page is
@@ -642,6 +685,7 @@ export class QueueData {
   }
 
   private async deriveOnce(): Promise<void> {
+    if (this.resolutionsLoad) await this.resolutionsLoad;
     const key = this.settingsKey();
     if (!this.loaded) {
       if (this.syncError) {
@@ -671,6 +715,7 @@ export class QueueData {
       items = checked.items;
       partsSkipped = checked.skipped;
     }
+    items = this.withoutResolved(items);
     // Bounded caches. The parts stay for every candidate, the ones a toggle
     // took out included: they are checked again on every derive, and
     // re-reading them each time multiplied the Intercom calls.
@@ -689,6 +734,38 @@ export class QueueData {
       error: this.syncError,
       restored: this.restored,
     });
+  }
+
+  // Hides what was marked resolved. An until-reply mark ends with the
+  // customer's next message (the ticket is back), or once the conversation
+  // is closed; a never mark stays until someone restores it.
+  private withoutResolved(items: QueueItem[]): QueueItem[] {
+    if (!this.resolutions.size) return items;
+    const ended: string[] = [];
+    const kept = items.filter((i) => {
+      const r = this.resolutions.get(i.id);
+      if (!r) return true;
+      if (r.untilReply && i.lastContactAt > (r.lastContactAt ?? 0)) {
+        ended.push(i.id);
+        return true;
+      }
+      return false;
+    });
+    // A truncated scan may simply not have reached a conversation.
+    if (!this.truncated) {
+      for (const [id, r] of this.resolutions) {
+        const c = this.convs.get(id);
+        if (r.untilReply && (!c || c.state === "closed")) ended.push(id);
+      }
+    }
+    if (ended.length) {
+      for (const id of ended) this.resolutions.delete(id);
+      this.bump();
+      void this.resolutionStore?.remove(ended).catch((e) => {
+        queueLog.warn("queue resolutions remove failed", { "error.message": e instanceof Error ? e.message : String(e) });
+      });
+    }
+    return kept;
   }
 
   // A new list wakes the long-polls only when something in it changed.
@@ -864,6 +941,51 @@ export class QueueData {
     } catch {
       return cached?.text ?? null;
     }
+  }
+
+  // ---- marked resolved ----
+
+  // Hides a waiting ticket for everyone. Stored first: a failed write throws
+  // and changes nothing.
+  async resolve(by: { adminId: string; name: string }, item: QueueItem, opts: { untilReply: boolean; note: string | null }): Promise<void> {
+    if (this.resolutionsLoad) await this.resolutionsLoad;
+    const r: QueueResolution = {
+      conversationId: item.id,
+      untilReply: opts.untilReply,
+      lastContactAt: item.lastContactAt,
+      note: opts.note,
+      title: item.title,
+      ticketNumber: item.ticket?.number ?? null,
+      customer: item.customerName ?? item.customerEmail,
+      resolvedById: by.adminId,
+      resolvedByName: by.name,
+      resolvedAt: this.now(),
+    };
+    if (this.resolutionStore) await this.resolutionStore.put(r);
+    this.resolutions.set(item.id, r);
+    await this.derive();
+    // The Resolved list changed even when the derived list did not.
+    this.bump();
+  }
+
+  // Restore: false = it was not marked resolved (restored by someone else
+  // meanwhile).
+  async unresolve(conversationId: string): Promise<boolean> {
+    if (this.resolutionsLoad) await this.resolutionsLoad;
+    if (!this.resolutions.has(conversationId)) return false;
+    if (this.resolutionStore) await this.resolutionStore.remove([conversationId]);
+    this.resolutions.delete(conversationId);
+    await this.derive();
+    this.bump();
+    return true;
+  }
+
+  // Newest first.
+  async resolvedList(): Promise<QueueResolution[]> {
+    if (this.resolutionsLoad) await this.resolutionsLoad;
+    return [...this.resolutions.values()].sort(
+      (a, b) => b.resolvedAt - a.resolvedAt || (a.conversationId < b.conversationId ? -1 : a.conversationId > b.conversationId ? 1 : 0)
+    );
   }
 
   // ---- randomizer ----

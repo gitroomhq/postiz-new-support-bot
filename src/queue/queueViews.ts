@@ -1,7 +1,7 @@
 import type { Badge, ObjectRef } from "../dashboard/renderer/contract";
 import type { QueueExclusions } from "../config/SettingsStore";
 import type { QueueActor } from "./QueueAuth";
-import type { QueueData, QueueDirectory, QueueSnapshot } from "./QueueData";
+import type { QueueData, QueueDirectory, QueueResolution, QueueSnapshot } from "./QueueData";
 import {
   NO_PERSON,
   QUERY_MAX,
@@ -39,6 +39,7 @@ const LONGEST_TOP = 10;
 const NAV_TOP = 6;
 const OFFSET_RE = /^\d{1,6}$/;
 const ID_RE = /^\d{1,20}$/;
+const NOTE_MAX = 300;
 
 const CATEGORY_LABELS: Record<string, string> = {
   submitted: "Submitted",
@@ -70,7 +71,7 @@ export class QueueViews {
 
   async build(actor: QueueActor, req: QueueViewRequest, options?: { waitForSnapshot: boolean }): Promise<QueuePageView | null> {
     const scope = this.scopeFor(req);
-    if (!scope && req.page !== "inboxes" && req.page !== "people") return null;
+    if (!scope && req.page !== "inboxes" && req.page !== "people" && req.page !== "resolved") return null;
     // Read before the list: a change while this page builds wakes the next
     // long-poll at once instead of being missed.
     const version = this.data.version();
@@ -83,6 +84,7 @@ export class QueueViews {
         nav: [
           { key: "mine", label: "Mine", page: "mine" },
           { key: "global", label: "Global", page: "global" },
+          { key: "resolved", label: "Resolved", page: "resolved" },
           { key: "inboxes", label: "All inboxes", page: "inboxes" },
           { key: "people", label: "All people", page: "people" },
         ],
@@ -106,6 +108,7 @@ export class QueueViews {
     let built: { title: string; crumbs: QueuePageView["crumbs"]; blocks: QueueBlock[]; active: string };
     if (req.page === "inboxes") built = this.inboxesPage(ctx, req);
     else if (req.page === "people") built = this.peoplePage(ctx, req);
+    else if (req.page === "resolved") built = await this.resolvedPage(ctx, req);
     else built = await this.scopePage(ctx, scope!, req);
     return {
       page: req.page,
@@ -130,9 +133,12 @@ export class QueueViews {
     this.data.requestRefresh();
   }
 
-  // Randomizer buttons. The scope and the filters the page showed are baked
-  // into the button; both are validated again here.
+  // Resolve and Restore, and the randomizer buttons. The scope and the
+  // filters the page showed are baked into a randomizer button; everything
+  // is validated again here.
   async action(actor: QueueActor, key: string, params: Record<string, unknown>): Promise<QueueActionResult> {
+    if (key === "section:queue.resolve") return this.resolveTicket(actor, params);
+    if (key === "section:queue.restore") return this.restoreTicket(params);
     const scope = parseScopeKey(params.scope);
     if (!scope) return { ok: false, error: "Unknown view." };
     const sk = scopeKey(scope);
@@ -147,6 +153,56 @@ export class QueueViews {
       return pick ? { ok: true, text: "New pick, reserved for you for 10 minutes." } : { ok: false, error: "Nothing left to roll in this view." };
     }
     return { ok: false, error: "Unknown action." };
+  }
+
+  // Any signed-in teammate may resolve a ticket that waits on a reply; it is
+  // hidden for everyone, and Intercom is not changed.
+  private async resolveTicket(actor: QueueActor, params: Record<string, unknown>): Promise<QueueActionResult> {
+    const id = typeof params.conversationId === "string" && ID_RE.test(params.conversationId) ? params.conversationId : null;
+    if (!id) return { ok: false, error: "Unknown ticket." };
+    const untilReply = params.comesBack === "reply" ? true : params.comesBack === "never" ? false : null;
+    if (untilReply === null) return { ok: false, error: "Pick whether it comes back." };
+    const note = cleanNote(params.note);
+    if (note === undefined) return { ok: false, error: `Keep the note under ${NOTE_MAX} characters.` };
+    const item = (await this.data.snapshot()).items.find((i) => i.id === id);
+    if (!item) return { ok: false, error: "This ticket no longer waits on a reply." };
+    await this.data.resolve({ adminId: actor.adminId, name: actor.name }, item, { untilReply, note });
+    return {
+      ok: true,
+      text: untilReply ? "Resolved. It comes back when the customer writes again." : "Resolved. It stays hidden until someone restores it.",
+    };
+  }
+
+  private async restoreTicket(params: Record<string, unknown>): Promise<QueueActionResult> {
+    const id = typeof params.conversationId === "string" && ID_RE.test(params.conversationId) ? params.conversationId : null;
+    if (!id) return { ok: false, error: "Unknown ticket." };
+    return (await this.data.unresolve(id))
+      ? { ok: true, text: "Restored. It is back in the queue while it waits on a reply." }
+      : { ok: false, error: "It is not marked resolved any more." };
+  }
+
+  // The Resolve dialog: whether it comes back, and an optional note for the
+  // Resolved list.
+  private resolveAction(i: QueueItem): QueueAction {
+    return {
+      key: "section:queue.resolve",
+      label: "Resolve",
+      params: { conversationId: i.id },
+      summary: `Hide "${i.title}" from the queue for everyone. Intercom is not changed; Restore it from Resolved in the sidebar.`,
+      inputs: [
+        {
+          type: "select",
+          key: "comesBack",
+          label: "Comes back",
+          options: [
+            { value: "reply", label: "When the customer writes again" },
+            { value: "never", label: "Never, until someone restores it" },
+          ],
+          value: "reply",
+        },
+        { type: "text", key: "note", label: "Note (optional)", placeholder: "Handled in Discord, duplicate, tracked as a bug...", maxLength: NOTE_MAX },
+      ],
+    };
   }
 
   // ---- scopes ----
@@ -201,6 +257,7 @@ export class QueueViews {
     const nav: QueueNavItem[] = [
       { key: "mine", label: "Mine", page: "mine", ...badge(visible.filter((i) => i.assigneeId === ctx.actor.adminId).length) },
       { key: "global", label: "Global", page: "global", ...badge(visible.length) },
+      { key: "resolved", label: "Resolved", page: "resolved" },
     ];
     const inboxes = this.groupCounts(visible, (i) => i.teamId ?? UNASSIGNED_INBOX);
     for (const [id, n] of this.top(inboxes, (id) => this.teamName(ctx, id))) {
@@ -374,6 +431,7 @@ export class QueueViews {
           { t: "flags", badges: this.flags(ctx, i) },
           { t: "external", v: "Open", href: this.data.inboxUrl(i.id, ctx.workspace) },
         ],
+        actions: [this.resolveAction(i)],
       })),
       counts: {
         key: "kind",
@@ -456,7 +514,12 @@ export class QueueViews {
       ...extra,
       { label: "Latest customer message", cell: { t: "text", v: latest ?? (i.excerpt || "(no text)"), pre: true } },
     ];
-    return { type: "kv", title, rows, actions: [{ key: "nav:open", label: "Open in Intercom", style: "primary", href: this.data.inboxUrl(i.id, ctx.workspace) }, ...actions] };
+    return {
+      type: "kv",
+      title,
+      rows,
+      actions: [{ key: "nav:open", label: "Open in Intercom", style: "primary", href: this.data.inboxUrl(i.id, ctx.workspace) }, ...actions, this.resolveAction(i)],
+    };
   }
 
   // ---- Longest waiting ----
@@ -560,6 +623,63 @@ export class QueueViews {
       hint: colleague
         ? "The randomizer only hands out unassigned tickets and your own, so it never picks from a colleague's queue."
         : "No unassigned ticket, and none of yours, waits on a reply in this view.",
+    };
+  }
+
+  // ---- Resolved: what teammates marked resolved here ----
+
+  private async resolvedPage(ctx: Ctx, req: QueueViewRequest): Promise<{ title: string; crumbs: QueuePageView["crumbs"]; blocks: QueueBlock[]; active: string }> {
+    const all = await this.data.resolvedList();
+    const query = parseFilters(req.filters).query;
+    const list = query ? all.filter((r) => resolvedMatches(r, query)) : all;
+    const offset = req.cursor && OFFSET_RE.test(req.cursor) ? Math.min(Number(req.cursor), Math.max(0, list.length - 1)) : 0;
+    const page = list.slice(offset, offset + QUEUE_PAGE_SIZE);
+    const table: QueueTableBlock = {
+      type: "table",
+      key: "resolved",
+      columns: [
+        { key: "ticket", label: "Ticket" },
+        { key: "customer", label: "Customer" },
+        { key: "by", label: "Resolved by" },
+        { key: "when", label: "When" },
+        { key: "back", label: "Comes back" },
+        { key: "note", label: "Note" },
+        { key: "open", label: "" },
+      ],
+      rows: page.map((r) => {
+        const at = new Date(r.resolvedAt).toISOString();
+        return {
+          id: r.conversationId,
+          cells: [
+            { t: "text", v: r.title, strong: true, ...(r.ticketNumber ? { sub: `#${r.ticketNumber}` } : {}) },
+            { t: "text", v: r.customer ?? "Unknown customer" },
+            { t: "text", v: r.resolvedByName },
+            { t: "date", v: at, iso: at },
+            { t: "badge", b: r.untilReply ? { kind: "info", text: "On reply" } : { kind: "neutral", text: "Never" } },
+            { t: "text", v: r.note ?? "" },
+            { t: "external", v: "Open", href: this.data.inboxUrl(r.conversationId, ctx.workspace) },
+          ],
+          actions: [{ key: "section:queue.restore", label: "Restore", params: { conversationId: r.conversationId } }],
+        };
+      }),
+      filters: [{ key: "q", label: "Search", kind: "search", placeholder: "Search ticket #, customer, note or teammate", value: query ?? "" }],
+      nextCursor: offset + QUEUE_PAGE_SIZE < list.length ? String(offset + QUEUE_PAGE_SIZE) : null,
+      empty: query ? "No resolved ticket matches." : "Nothing is marked resolved.",
+      ...(list.length > QUEUE_PAGE_SIZE ? { footer: `${offset + 1} to ${Math.min(offset + QUEUE_PAGE_SIZE, list.length)} of ${list.length}` } : {}),
+    };
+    return {
+      title: "Resolved",
+      crumbs: [{ label: "Resolved" }],
+      blocks: [
+        { type: "header", title: "Resolved", sub: all.length ? `${all.length} marked resolved in the queue` : "Nothing is marked resolved" },
+        {
+          type: "notice",
+          badge: { kind: "info", text: "Queue only" },
+          text: "Hidden from the queue for everyone; Intercom is not changed. On reply: back when the customer writes again, and gone from this list once the conversation closes. Never: hidden until restored.",
+        },
+        table,
+      ],
+      active: "resolved",
     };
   }
 
@@ -714,6 +834,27 @@ function activeFilterLabels(f: QueueFilters): string[] {
   if (f.includeSnoozed) out.push("including snoozed");
   if (f.query) out.push(`matching "${f.query}"`);
   return out;
+}
+
+// A Resolve note: plain text on one line. undefined = too long or not text.
+function cleanNote(v: unknown): string | null | undefined {
+  if (v == null) return null;
+  if (typeof v !== "string") return undefined;
+  const text = v.replace(/[\u0000-\u001f\u007f]+/g, " ").trim();
+  if (text.length > NOTE_MAX) return undefined;
+  return text || null;
+}
+
+// The Resolved list's search: the ticket number (with or without #), the
+// conversation id, or text from the title, customer, note and teammate.
+function resolvedMatches(r: QueueResolution, query: string): boolean {
+  const q = query.trim().toLowerCase();
+  const bare = q.replace(/^#/, "");
+  if (bare && (r.ticketNumber === bare || r.conversationId === bare)) return true;
+  return [r.title, r.customer ?? "", r.note ?? "", r.resolvedByName, r.ticketNumber ? `#${r.ticketNumber}` : "", r.conversationId]
+    .join("\n")
+    .toLowerCase()
+    .includes(q);
 }
 
 // The filters as the randomizer buttons carry them (string params, the same

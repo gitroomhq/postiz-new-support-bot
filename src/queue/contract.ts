@@ -44,7 +44,7 @@ export interface QueueTableBlock {
   key: string;
   title?: string;
   columns: Array<{ key: string; label: string; align?: "left" | "right" }>;
-  rows: Array<{ id: string; cells: QueueCell[]; ref?: ObjectRef }>;
+  rows: Array<{ id: string; cells: QueueCell[]; ref?: ObjectRef; actions?: QueueAction[] }>;
   counts?: { key: string; items: Array<{ value: string; label: string; count: number | string }> };
   filters?: FilterDef[];
   nextCursor?: string | null;

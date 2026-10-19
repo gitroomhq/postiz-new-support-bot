@@ -12,6 +12,7 @@
 //   /queue/global          page "global"
 //   /queue/inboxes         page "inboxes"
 //   /queue/people          page "people"
+//   /queue/resolved        page "resolved"
 //   /queue/inbox/<id>      page "inbox.detail", params { id }
 //   /queue/person/<id>     page "person.detail", params { id }
 // Filters ride the query string as f_<key>=<value>; cursors stay in memory.
@@ -299,6 +300,7 @@ D.actionBtn = function (a) {
 D.NAV_ICONS = {
   mine: "M8 8.2a2.4 2.4 0 1 0 0-4.8 2.4 2.4 0 0 0 0 4.8ZM3.6 13.4a4.4 4.4 0 0 1 8.8 0",
   global: "M8 14.3A6.3 6.3 0 1 0 8 1.7a6.3 6.3 0 0 0 0 12.6ZM1.9 8h12.2M8 1.7c1.7 1.8 2.5 3.9 2.5 6.3S9.7 12.5 8 14.3C6.3 12.5 5.5 10.4 5.5 8S6.3 3.5 8 1.7",
+  resolved: "M8 14.3A6.3 6.3 0 1 0 8 1.7a6.3 6.3 0 0 0 0 12.6ZM5.3 8.2l1.8 1.8 3.6-3.9",
   inbox: "M2.4 8.6 4 3.4h8l1.6 5.2v4H2.4ZM2.4 8.6h3.2l.8 1.6h3.2l.8-1.6h3.2",
   inboxes: "M2.4 8.6 4 3.4h8l1.6 5.2v4H2.4ZM2.4 8.6h3.2l.8 1.6h3.2l.8-1.6h3.2",
   person: "M8 8.2a2.4 2.4 0 1 0 0-4.8 2.4 2.4 0 0 0 0 4.8ZM3.6 13.4a4.4 4.4 0 0 1 8.8 0",

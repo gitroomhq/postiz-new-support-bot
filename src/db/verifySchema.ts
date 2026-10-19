@@ -193,6 +193,10 @@ export const EXPECTED_COLUMNS: Record<string, string[]> = {
     "absoluteExpiresAt",
   ],
   queue_cache: ["id", "data", "savedAt"],
+  queue_resolutions: [
+    "conversationId", "untilReply", "lastContactAt", "note", "title", "ticketNumber", "customer", "resolvedById",
+    "resolvedByName", "resolvedAt",
+  ],
   forwarded_email_converts: [
     "id", "originalConversationId", "newConversationId", "forwarderAdminId", "forwarderEmail", "customerEmail",
     "customerName", "intercomContactId", "contactRole", "trigger", "actorLabel", "attachmentsCount",

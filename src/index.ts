@@ -123,6 +123,7 @@ import { QueueAuth } from "./queue/QueueAuth";
 import { QueueViews } from "./queue/queueViews";
 import { QueuePanel } from "./queue/QueuePanel";
 import { QueueCacheStore } from "./queue/QueueCacheStore";
+import { QueueResolutionStore } from "./queue/QueueResolutionStore";
 import { CachedRatioEngine } from "./bot/billing/disputeRatio";
 import { MoneyOutStore } from "./bot/billing/MoneyOutStore";
 import { MoneyOutService } from "./bot/billing/MoneyOutService";
@@ -563,6 +564,7 @@ async function main() {
   // kept live from the Intercom webhooks and saved for restarts.
   const queueData = new QueueData(intercomClient, settingsStore);
   queueData.setCache(new QueueCacheStore(prisma));
+  queueData.setResolutions(new QueueResolutionStore(prisma));
   intercomWebhookHandler.setQueueListener((topic, itemId) => queueData.noteWebhook(topic, itemId));
   const queueSessions = new QueueSessions(prisma);
   const queueAuth = new QueueAuth(settingsStore, queueData, queueSessions, (event) => {

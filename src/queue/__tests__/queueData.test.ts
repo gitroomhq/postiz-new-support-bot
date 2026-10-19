@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { QueueData, type QueueCache, type QueueSaved, type QueueSettingsView, type QueueSource } from "../QueueData";
+import { QueueData, type QueueCache, type QueueResolution, type QueueResolutions, type QueueSaved, type QueueSettingsView, type QueueSource } from "../QueueData";
 import { QueueViews } from "../queueViews";
 import { parseConversation } from "../queueModel";
 import { restoreSaved } from "../QueueCacheStore";
@@ -651,4 +651,164 @@ test("the overviews list every inbox and seated person, paginated", async () => 
   assert.ok(ids.includes("none"));
   assert.ok(!ids.includes("13"), "no inbox seat");
   assert.ok(!ids.includes("800"), "Operator");
+});
+
+// ---- marked resolved ----
+
+function fakeResolutions(initial: QueueResolution[] = []): QueueResolutions & { rows: Map<string, QueueResolution>; removed: string[][]; failPut: boolean } {
+  const store = {
+    rows: new Map(initial.map((r) => [r.conversationId, r] as const)),
+    removed: [] as string[][],
+    failPut: false,
+    async list() {
+      return [...store.rows.values()];
+    },
+    async put(r: QueueResolution) {
+      if (store.failPut) throw new Error("db down");
+      store.rows.set(r.conversationId, r);
+    },
+    async remove(ids: string[]) {
+      store.removed.push(ids);
+      for (const id of ids) store.rows.delete(id);
+    },
+  };
+  return store;
+}
+
+function mark(id: string, over: Partial<QueueResolution> = {}): QueueResolution {
+  return {
+    conversationId: id,
+    untilReply: false,
+    lastContactAt: NOW_SEC - 60,
+    note: null,
+    title: `Subject ${id}`,
+    ticketNumber: null,
+    customer: `Customer ${id}`,
+    resolvedById: "11",
+    resolvedByName: "Ada",
+    resolvedAt: NOW - 1000,
+    ...over,
+  };
+}
+
+const ada = { adminId: "11", name: "Ada" };
+
+test("Resolve hides a ticket for everyone; an until-reply mark ends with the customer's next message", async () => {
+  const src = fakeSource([rawConv("1"), rawConv("2")]);
+  const store = fakeResolutions();
+  const data = new QueueData(src, settings(), () => NOW);
+  data.setResolutions(store);
+  const item = (await data.snapshot()).items.find((i) => i.id === "1")!;
+  await data.resolve(ada, item, { untilReply: true, note: "handled in Discord" });
+  assert.deepEqual(ids(data.readySnapshot()), ["2"]);
+  assert.equal(store.rows.get("1")?.note, "handled in Discord");
+  assert.equal(store.rows.get("1")?.lastContactAt, NOW_SEC - 60);
+  assert.deepEqual((await data.resolvedList()).map((r) => r.conversationId), ["1"]);
+
+  // Other activity (an assignment) does not bring it back...
+  src.conversations[0] = rawConv("1", { updated_at: NOW_SEC + 5, admin_assignee_id: 11 });
+  data.noteWebhook("conversation.admin.assigned", "1");
+  await data.flushWebhooks();
+  assert.deepEqual(ids(data.readySnapshot()), ["2"]);
+  // ...the customer's next message does, and the mark is gone.
+  src.conversations[0] = rawConv("1", { updated_at: NOW_SEC + 10, statistics: { last_contact_reply_at: NOW_SEC + 10, last_admin_reply_at: null } });
+  data.noteWebhook("conversation.user.replied", "1");
+  await data.flushWebhooks();
+  assert.deepEqual(ids(data.readySnapshot())?.sort(), ["1", "2"]);
+  assert.deepEqual(await data.resolvedList(), []);
+  assert.deepEqual(store.removed, [["1"]]);
+});
+
+test("a never mark stays through new customer messages until it is restored", async () => {
+  const src = fakeSource([rawConv("1")]);
+  const store = fakeResolutions();
+  const data = new QueueData(src, settings(), () => NOW);
+  data.setResolutions(store);
+  await data.resolve(ada, (await data.snapshot()).items[0], { untilReply: false, note: null });
+  src.conversations[0] = rawConv("1", { updated_at: NOW_SEC + 10, statistics: { last_contact_reply_at: NOW_SEC + 10, last_admin_reply_at: null } });
+  data.noteWebhook("conversation.user.replied", "1");
+  await data.flushWebhooks();
+  assert.deepEqual(ids(data.readySnapshot()), []);
+  const before = data.version();
+  assert.equal(await data.unresolve("1"), true);
+  assert.notEqual(data.version(), before, "open pages redraw");
+  assert.deepEqual(ids(data.readySnapshot()), ["1"]);
+  assert.equal(store.rows.size, 0);
+  assert.equal(await data.unresolve("1"), false, "already restored");
+});
+
+test("marks are loaded before the first list, a failed write changes nothing, and an until-reply mark ends when the conversation closes", async () => {
+  const src = fakeSource([rawConv("1"), rawConv("2"), rawConv("3")]);
+  const store = fakeResolutions([mark("1"), mark("2", { untilReply: true })]);
+  const data = new QueueData(src, settings(), () => NOW);
+  data.setResolutions(store);
+  assert.deepEqual(ids(await data.snapshot()), ["3"], "a restart never shows a resolved ticket");
+
+  store.failPut = true;
+  const three = data.readySnapshot()!.items[0];
+  await assert.rejects(data.resolve(ada, three, { untilReply: true, note: null }), /db down/);
+  assert.deepEqual(ids(data.readySnapshot()), ["3"]);
+  assert.equal((await data.resolvedList()).length, 2);
+
+  src.conversations[1] = rawConv("2", { state: "closed", updated_at: NOW_SEC + 10 });
+  data.noteWebhook("conversation.admin.closed", "2");
+  await data.flushWebhooks();
+  assert.deepEqual((await data.resolvedList()).map((r) => r.conversationId), ["1"], "a never mark stays");
+});
+
+test("rows and cards carry the Resolve dialog; resolve and restore through the actions are validated", async () => {
+  const src = fakeSource([rawConv("1"), rawConv("2", { waiting_since: NOW_SEC - 900 })]);
+  const { data, v } = views(src);
+  data.setResolutions(fakeResolutions());
+  const global = async () => (await v.build(actor, { page: "global", params: {}, filters: {}, cursor: null }))!;
+  const table = (await global()).blocks.find((b) => b.type === "table") as QueueTableBlock;
+  const resolve = table.rows[0].actions?.[0];
+  assert.equal(resolve?.key, "section:queue.resolve");
+  assert.equal(resolve?.label, "Resolve");
+  assert.deepEqual(resolve?.params, { conversationId: table.rows[0].id });
+  const comesBack = resolve?.inputs?.find((i) => i.key === "comesBack");
+  assert.equal(comesBack?.type === "select" && comesBack.value, "reply", "comes back is preselected");
+  assert.ok(resolve?.inputs?.some((i) => i.key === "note"));
+  const card = (await v.build(actor, { page: "global", params: {}, filters: { view: "longest" }, cursor: null }))!.blocks.find((b) => b.type === "kv") as QueueKvBlock;
+  assert.ok(card.actions?.some((a) => a.key === "section:queue.resolve"));
+
+  const act = (params: Record<string, unknown>) => v.action(actor, "section:queue.resolve", params);
+  assert.equal((await act({ conversationId: "x", comesBack: "reply" })).ok, false);
+  assert.equal((await act({ conversationId: "1" })).error, "Pick whether it comes back.");
+  assert.equal((await act({ conversationId: "1", comesBack: "reply", note: "n".repeat(301) })).ok, false);
+  assert.equal((await act({ conversationId: "99", comesBack: "reply" })).error, "This ticket no longer waits on a reply.");
+  const done = await act({ conversationId: "1", comesBack: "never", note: "  tracked\nas a bug  " });
+  assert.equal(done.ok, true);
+  assert.match(done.text ?? "", /until someone restores it/);
+  const after = (await global()).blocks.find((b) => b.type === "table") as QueueTableBlock;
+  assert.deepEqual(after.rows.map((r) => r.id), ["2"]);
+
+  const resolved = await v.build(actor, { page: "resolved", params: {}, filters: {}, cursor: null });
+  assert.equal(resolved?.activeNav, "resolved");
+  assert.ok(resolved?.nav.some((n) => n.key === "resolved"));
+  const list = resolved!.blocks.find((b) => b.type === "table") as QueueTableBlock;
+  assert.deepEqual(list.rows.map((r) => r.id), ["1"]);
+  assert.equal((list.rows[0].cells[2] as { v: string }).v, "Ada");
+  assert.deepEqual((list.rows[0].cells[4] as { b: { text: string } }).b.text, "Never");
+  assert.equal((list.rows[0].cells[5] as { v: string }).v, "tracked as a bug", "one line, trimmed");
+  assert.equal(list.rows[0].actions?.[0].key, "section:queue.restore");
+
+  assert.equal((await v.action(actor, "section:queue.restore", { conversationId: "1" })).ok, true);
+  assert.equal((await v.action(actor, "section:queue.restore", { conversationId: "1" })).ok, false);
+  assert.deepEqual(((await global()).blocks.find((b) => b.type === "table") as QueueTableBlock).rows.map((r) => r.id).sort(), ["1", "2"]);
+});
+
+test("the Resolved page: newest first, searchable, 25 to a page", async () => {
+  const marks = Array.from({ length: 30 }, (_, k) => mark(String(100 + k), { resolvedAt: NOW - k * 1000, ticketNumber: String(500 + k), note: k === 7 ? "duplicate of 146041426" : null }));
+  const { data, v } = views(fakeSource([]));
+  data.setResolutions(fakeResolutions(marks));
+  const page = async (filters: Record<string, string>, cursor: string | null = null) =>
+    (await v.build(actor, { page: "resolved", params: {}, filters, cursor }))!.blocks.find((b) => b.type === "table") as QueueTableBlock;
+  const first = await page({});
+  assert.equal(first.rows.length, 25);
+  assert.equal(first.rows[0].id, "100", "newest first");
+  assert.equal(first.nextCursor, "25");
+  assert.equal((await page({}, "25")).rows.length, 5);
+  assert.deepEqual((await page({ q: "#512" })).rows.map((r) => r.id), ["112"]);
+  assert.deepEqual((await page({ q: "duplicate" })).rows.map((r) => r.id), ["107"]);
 });

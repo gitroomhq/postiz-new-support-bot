@@ -1290,6 +1290,20 @@ export const STATEMENTS: string[] = [
     "savedAt" TIMESTAMP(3) NOT NULL,
     CONSTRAINT "queue_cache_pkey" PRIMARY KEY ("id")
   )`,
+  `CREATE TABLE IF NOT EXISTS "queue_resolutions" (
+    "conversationId" TEXT NOT NULL,
+    "untilReply" BOOLEAN NOT NULL,
+    "lastContactAt" INTEGER,
+    "note" TEXT,
+    "title" TEXT NOT NULL,
+    "ticketNumber" TEXT,
+    "customer" TEXT,
+    "resolvedById" TEXT NOT NULL,
+    "resolvedByName" TEXT NOT NULL,
+    "resolvedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT "queue_resolutions_pkey" PRIMARY KEY ("conversationId")
+  )`,
+  `CREATE INDEX IF NOT EXISTS "queue_resolutions_resolvedAt_idx" ON "queue_resolutions"("resolvedAt")`,
 ];
 
 export async function ensureSchema(prisma: PrismaClient): Promise<void> {

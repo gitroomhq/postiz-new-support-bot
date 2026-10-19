@@ -1688,3 +1688,25 @@ model QueueCache {
 
   @@map("queue_cache")
 }
+
+// Tickets a teammate marked resolved on the Intercom Queue (/queue). The
+// queue hides them for everyone; Intercom is not changed. untilReply: back on
+// the customer's next message (lastContactAt, unix seconds, is their newest
+// message when it was resolved); otherwise hidden until restored. Title,
+// number and customer are kept for the Resolved list, which outlives the
+// open list.
+model QueueResolution {
+  conversationId String   @id
+  untilReply     Boolean
+  lastContactAt  Int?
+  note           String?
+  title          String
+  ticketNumber   String?
+  customer       String?
+  resolvedById   String
+  resolvedByName String
+  resolvedAt     DateTime @default(now())
+
+  @@index([resolvedAt])
+  @@map("queue_resolutions")
+}
