@@ -13,12 +13,14 @@ import {
   compareWaiting,
   extraReplyAfter,
   intercomAppHost,
+  mergeReplyTimes,
   parseConversation,
   parseTicket,
   partsOf,
   resolveTicket,
   ticketUpdatedAt,
   weightedPick,
+  withParts,
 } from "./queueModel";
 
 const queueLog = log.child("queue");
@@ -93,6 +95,9 @@ export interface QueueDirectory {
 
 type DirtyKind = "conversation" | "ticket";
 
+// A conversation that waits on us by the statistics, before the toggles.
+type Candidate = { item: QueueItem; lastContactStat: number; finHandedOff: boolean };
+
 const SYNC_TTL_MS = 60_000; // catch-up read while someone is looking
 const FULL_TTL_MS = 15 * 60_000; // whole-list read, the backstop for anything a catch-up misses
 const REFRESH_RETRY_MS = 5_000;
@@ -106,6 +111,9 @@ const PARTS_CONCURRENCY = 8;
 const WEBHOOK_DEBOUNCE_MS = 750;
 const WEBHOOK_CONCURRENCY = 4;
 const MAX_DIRTY = 500;
+// Intercom settles a conversation's statistics, ticket and search copy behind
+// the write a webhook reports: every webhook read is read once more after this.
+const SETTLE_MS = 20_000;
 // Each save rewrites the whole list (a few hundred KB): at most every two
 // minutes, plus once at shutdown.
 const SAVE_DEBOUNCE_MS = 2 * 60_000;
@@ -143,6 +151,9 @@ export class QueueData {
 
   // Webhook items waiting to be read again.
   private dirty = new Map<string, DirtyKind>();
+  // Of those, the ones queued only by their settle read (no second settle).
+  private settleReads = new Set<string>();
+  private settles = new Map<string, { kind: DirtyKind; timer: NodeJS.Timeout }>();
   private webhookTimer: NodeJS.Timeout | null = null;
   private patching: Promise<void> | null = null;
 
@@ -400,13 +411,15 @@ export class QueueData {
   }
 
   // Newer wins: a search page can be older than a webhook read that landed
-  // while it was in flight. A closed conversation the list never had is not
-  // worth keeping.
+  // while it was in flight. Reply times only move forward, whichever read
+  // carries them (see mergeReplyTimes). A closed conversation the list never
+  // had is not worth keeping.
   private putConversation(c: QueueConversation): boolean {
     const cur = this.convs.get(c.id);
-    if (cur ? cur.updatedAt > c.updatedAt : c.state === "closed") return false;
-    if (cur && JSON.stringify(cur) === JSON.stringify(c)) return false;
-    this.convs.set(c.id, c);
+    if (!cur && c.state === "closed") return false;
+    const next = !cur ? c : cur.updatedAt > c.updatedAt ? mergeReplyTimes(c, cur) : mergeReplyTimes(cur, c);
+    if (cur && JSON.stringify(cur) === JSON.stringify(next)) return false;
+    this.convs.set(c.id, next);
     this.unsaved = true;
     return true;
   }
@@ -436,17 +449,47 @@ export class QueueData {
   // item again shortly. A burst of events for one ticket becomes one read.
   noteWebhook(topic: string, itemId: string): void {
     if (!this.settings.queueEnabled() || !/^\d{1,20}$/.test(itemId)) return;
-    const kind: DirtyKind = topic.startsWith("ticket.") ? "ticket" : "conversation";
-    // Past the cap the next catch-up read covers the rest.
-    if (!this.dirty.has(itemId) && this.dirty.size >= MAX_DIRTY) return;
-    if (this.dirty.get(itemId) !== "ticket") this.dirty.set(itemId, kind);
+    this.queueRead(itemId, topic.startsWith("ticket.") ? "ticket" : "conversation", false);
     // Nobody opened the page since boot (the queue was switched on later):
     // start the first scan, so the list is ready when they do.
     if (!this.loaded) this.ensureFresh();
+  }
+
+  private queueRead(itemId: string, kind: DirtyKind, settle: boolean): void {
+    // Past the cap the next catch-up read covers the rest.
+    if (!this.dirty.has(itemId) && this.dirty.size >= MAX_DIRTY) return;
+    if (!settle) this.settleReads.delete(itemId);
+    else if (!this.dirty.has(itemId)) this.settleReads.add(itemId);
+    if (this.dirty.get(itemId) !== "ticket") this.dirty.set(itemId, kind);
     if (!this.webhookTimer && !this.patching) {
       this.webhookTimer = setTimeout(() => void this.flushWebhooks(), WEBHOOK_DEBOUNCE_MS);
       this.webhookTimer.unref?.();
     }
+  }
+
+  // One more read SETTLE_MS after the last webhook read of an item; a newer
+  // webhook pushes it back.
+  private scheduleSettle(itemId: string, kind: DirtyKind): void {
+    const prev = this.settles.get(itemId);
+    if (prev) clearTimeout(prev.timer);
+    else if (this.settles.size >= MAX_DIRTY) return;
+    const settleKind: DirtyKind = prev?.kind === "ticket" ? "ticket" : kind;
+    const timer = setTimeout(() => {
+      this.settles.delete(itemId);
+      this.queueRead(itemId, settleKind, true);
+    }, SETTLE_MS);
+    timer.unref?.();
+    this.settles.set(itemId, { kind: settleKind, timer });
+  }
+
+  // Runs every pending settle read now (tests).
+  flushSettles(): Promise<void> {
+    for (const [itemId, s] of this.settles) {
+      clearTimeout(s.timer);
+      this.queueRead(itemId, s.kind, true);
+    }
+    this.settles.clear();
+    return this.flushWebhooks();
   }
 
   // Reads every item the webhooks named (the debounce timer, and tests).
@@ -465,14 +508,15 @@ export class QueueData {
 
   private async drainWebhooks(): Promise<void> {
     while (this.dirty.size) {
-      const batch = [...this.dirty.entries()];
+      const batch = [...this.dirty.entries()].map(([id, kind]) => ({ id, kind, settle: this.settleReads.delete(id) }));
       this.dirty.clear();
       let changed = false;
       let cursor = 0;
       const worker = async () => {
         while (cursor < batch.length) {
-          const [id, kind] = batch[cursor++];
+          const { id, kind, settle } = batch[cursor++];
           if (await this.patchOne(id, kind)) changed = true;
+          if (!settle) this.scheduleSettle(id, kind);
         }
       };
       await Promise.all(Array.from({ length: WEBHOOK_CONCURRENCY }, () => worker()));
@@ -500,11 +544,13 @@ export class QueueData {
           changed = true;
         }
       } else {
-        const conv = parseConversation(raw);
+        const parsed = parseConversation(raw);
+        const parts = partsOf(raw);
+        const conv = parsed && withParts(parsed, parts);
         if (conv) {
           if (this.putConversation(conv)) changed = true;
           if (this.settings.queueFinCountsAsReply() || this.settings.queueNotesCountAsReply()) {
-            this.partsCache.set(conv.id, { updatedAt: conv.updatedAt, parts: partsOf(raw) });
+            this.partsCache.set(conv.id, { updatedAt: conv.updatedAt, parts });
           }
           if (conv.ticketId) {
             const stored = this.tickets.get(conv.ticketId);
@@ -607,13 +653,13 @@ export class QueueData {
     const tickets = new Map<string, QueueTicketInfo>();
     for (const [id, t] of this.tickets) tickets.set(id, t.ticket);
     const opts = this.classifyOptions(directory);
-    const candidates: Array<{ item: QueueItem; lastContactStat: number }> = [];
+    const candidates: Candidate[] = [];
     let scanned = 0;
     for (const conv of this.convs.values()) {
       if (conv.state === "closed") continue;
       scanned++;
       const item = classify(conv, resolveTicket(conv, tickets), opts);
-      if (item) candidates.push({ item, lastContactStat: conv.lastContactReplyAt ?? item.lastContactAt });
+      if (item) candidates.push({ item, lastContactStat: conv.lastContactReplyAt ?? item.lastContactAt, finHandedOff: conv.finHandedOff });
     }
 
     const fin = this.settings.queueFinCountsAsReply();
@@ -625,9 +671,12 @@ export class QueueData {
       items = checked.items;
       partsSkipped = checked.skipped;
     }
-    // Bounded caches: drop entries for conversations no longer waiting.
+    // Bounded caches. The parts stay for every candidate, the ones a toggle
+    // took out included: they are checked again on every derive, and
+    // re-reading them each time multiplied the Intercom calls.
+    const live = new Set(candidates.map((c) => c.item.id));
+    for (const id of this.partsCache.keys()) if (!live.has(id)) this.partsCache.delete(id);
     const open = new Set(items.map((i) => i.id));
-    for (const id of this.partsCache.keys()) if (!open.has(id)) this.partsCache.delete(id);
     for (const id of this.messageCache.keys()) if (!open.has(id)) this.messageCache.delete(id);
 
     items.sort(compareWaiting);
@@ -684,7 +733,7 @@ export class QueueData {
   }
 
   private async applyToggles(
-    candidates: Array<{ item: QueueItem; lastContactStat: number }>,
+    candidates: Candidate[],
     opts: { fin: boolean; notes: boolean; directory: QueueDirectory | null }
   ): Promise<{ items: QueueItem[]; skipped: number }> {
     const finAdminIds = this.finAdminIds(opts.directory);
@@ -721,7 +770,10 @@ export class QueueData {
           parts = partsOf(raw);
           this.partsCache.set(c.item.id, { updatedAt: c.item.updatedAt, parts });
         }
-        keep.set(c.item.id, !extraReplyAfter(parts, c.lastContactStat, { fin: opts.fin, notes: opts.notes, finAdminIds, botAdminIds }));
+        keep.set(
+          c.item.id,
+          !extraReplyAfter(parts, c.lastContactStat, { fin: opts.fin, notes: opts.notes, finAdminIds, botAdminIds, finHandedOff: c.finHandedOff })
+        );
       }
     };
     await Promise.all(Array.from({ length: PARTS_CONCURRENCY }, () => worker()));

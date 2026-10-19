@@ -1180,7 +1180,7 @@ export class SlaHub {
     } catch {
       looperLine = "❌ Enforcement looper `sla-enforce` not found; toggle the Temporal worker off/on to start it.";
     }
-    const ok = result.attributeExists && result.statusAttributeExists;
+    const ok = result.attributeExists && result.statusAttributeExists && result.targetsNotInList.length === 0;
     await interaction.editReply({
       embeds: [
         makeEmbed([`**SLA engine setup check:**`, "", ...result.runbook, looperLine].join("\n"), ok ? COLORS.success : COLORS.warn),

@@ -25,6 +25,7 @@ import {
 import { flushInflux, influxActive } from "../../metrics/InfluxWriter";
 import type { DisputesTickResult } from "../../temporal/types";
 import type Stripe from "stripe";
+import { billingAlertChannel } from "./billingAlertChannel";
 
 const monitorLog = log.child("dispute-monitor");
 
@@ -776,11 +777,12 @@ export class DisputeMonitor {
     components: ActionRowBuilder<ButtonBuilder>[] = [],
     content?: string
   ): Promise<boolean> {
-    const channelId = this.settings.billingAuditChannelId() ?? this.settings.auditLogChannelId();
-    if (!this.client || !channelId) return false;
-    const channel = await this.client.channels.fetch(channelId).catch(() => null);
-    if (!channel?.isSendable()) return false;
-    return channel
+    const target = await billingAlertChannel(this.client, {
+      billingAuditChannelId: this.settings.billingAuditChannelId(),
+      auditLogChannelId: this.settings.auditLogChannelId(),
+    });
+    if (!target) return false;
+    return target.channel
       .send({
         embeds: [embed],
         components,

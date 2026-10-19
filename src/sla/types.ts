@@ -212,3 +212,12 @@ export function hasClockDurations(t: SlaTargetEntry): boolean {
 // Case-sensitive: the value must EXACTLY match the Intercom List-attribute
 // option.
 export const SLA_TARGET_VALUE_RE = /^[A-Za-z0-9-_]{1,60}$/;
+
+// Targets a List attribute cannot hold. Intercom rejects a value outside the
+// list's options with a 400, so a target missing there fails on every write.
+// No options (not a List, or the list could not be read): nothing to compare.
+export function targetsMissingFromList(targets: readonly string[], options: readonly string[]): string[] {
+  if (options.length === 0) return [];
+  const allowed = new Set(options);
+  return [...new Set(targets)].filter((t) => !allowed.has(t));
+}

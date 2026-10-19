@@ -274,6 +274,26 @@ test("ticket states come from the ticket search: Waiting on customer drops out",
   assert.deepEqual(ids(await data.snapshot()), ["1"]);
 });
 
+test("Fin's handoff keeps a conversation waiting with Fin replies switched on; parts are read once per version", async () => {
+  const s = settings({ fin: true });
+  const src = fakeSource([
+    rawConv("1", { ai_agent: { resolution_state: "procedure_handoff" } }),
+    rawConv("2", { ai_agent: { resolution_state: "assumed_resolution" } }),
+  ]);
+  const finAnswer = (at: number): IntercomWebhookPart[] => [{ part_type: "comment", body: "Fin here", created_at: at, author: { type: "bot", id: "800", from_ai_agent: true } }];
+  src.parts.set("1", finAnswer(NOW_SEC - 50));
+  src.parts.set("2", finAnswer(NOW_SEC - 50));
+  const data = new QueueData(src, s, () => NOW);
+  assert.deepEqual(ids(await data.snapshot()), ["1"], "handed off: waiting; resolved by Fin: answered");
+  assert.equal(src.calls.get.length, 2);
+  // A webhook for something else re-derives the list: the answered one's
+  // parts are not read again (they used to be, on every derive).
+  src.conversations.push(rawConv("3", { updated_at: NOW_SEC }));
+  data.noteWebhook("conversation.user.created", "3");
+  await data.flushWebhooks();
+  assert.deepEqual(src.calls.get, ["1", "2", "3"]);
+});
+
 test("Fin counts only when switched on, checked from the parts and cached per version", async () => {
   const s = settings();
   const src = fakeSource([rawConv("1")]);
@@ -315,6 +335,49 @@ test("a webhook re-reads its one conversation and wakes the waiting pages", asyn
   data.noteWebhook("contact.created", "not-an-id");
   await data.flushWebhooks();
   assert.equal(src.calls.get.length, 2, "an id that is not a conversation id is ignored");
+});
+
+test("a customer reply whose statistics lag still brings the ticket back, and a stale search copy cannot take it away", async () => {
+  // Ticket #146041426: a teammate answered, the customer wrote again a minute
+  // later, and the read after the webhook still had the old statistics.
+  let now = NOW;
+  const answered = { last_contact_reply_at: NOW_SEC - 600, last_admin_reply_at: NOW_SEC - 120 };
+  const src = fakeSource([rawConv("1", { updated_at: NOW_SEC - 120, statistics: answered })]);
+  const data = new QueueData(src, settings(), () => now);
+  assert.deepEqual(ids(await data.snapshot()), []);
+  src.conversations[0] = rawConv("1", { updated_at: NOW_SEC - 60, statistics: answered });
+  src.parts.set("1", [
+    { part_type: "comment", body: "the answer", created_at: NOW_SEC - 120, author: { type: "admin", id: "11" } },
+    { part_type: "comment", body: "thank you, one more thing", created_at: NOW_SEC - 60, author: { type: "user", id: "c1" } },
+  ]);
+  data.noteWebhook("ticket.contact.replied", "1");
+  await data.flushWebhooks();
+  const back = data.readySnapshot();
+  assert.deepEqual(ids(back), ["1"]);
+  assert.equal(back?.items[0].kind, "followup");
+  assert.equal(back?.items[0].waitingSince, NOW_SEC - 60);
+  // The search copy (same version, the old statistics) does not undo it.
+  now += 16 * 60_000;
+  data.readySnapshot();
+  await data.idle();
+  assert.deepEqual(ids(data.readySnapshot()), ["1"]);
+});
+
+test("every webhook read is read once more after Intercom settles", async () => {
+  const src = fakeSource([rawConv("1")]);
+  const data = new QueueData(src, settings(), () => NOW);
+  await data.snapshot();
+  // The first read after the webhook still sees the conversation before the
+  // teammate's answer; the settle read sees it.
+  data.noteWebhook("conversation.admin.replied", "1");
+  await data.flushWebhooks();
+  assert.deepEqual(ids(data.readySnapshot()), ["1"]);
+  src.conversations[0] = rawConv("1", { updated_at: NOW_SEC + 5, statistics: { last_contact_reply_at: NOW_SEC - 60, last_admin_reply_at: NOW_SEC + 5 } });
+  await data.flushSettles();
+  assert.deepEqual(ids(data.readySnapshot()), []);
+  assert.deepEqual(src.calls.get, ["1", "1"]);
+  await data.flushSettles();
+  assert.deepEqual(src.calls.get, ["1", "1"], "a settle read is not settled again");
 });
 
 test("a ticket state webhook re-reads the ticket: Waiting on customer leaves at once", async () => {
@@ -420,13 +483,19 @@ test("restoreSaved keeps well-formed entries and drops the rest", () => {
       conversations: [good, { ...good, id: 7 }, { ...good, tagIds: "x" }, { ...good, slaStatus: "nope" }, null],
       tickets: [
         { ticket: { id: "1", stateId: null, stateCategory: "submitted", stateLabel: null, typeId: "8", typeName: "Billing" }, updatedAt: 5 },
+        { ticket: { id: "3", number: "146041426", stateId: null, stateCategory: "submitted", stateLabel: null, typeId: "8", typeName: "Billing" }, updatedAt: 5 },
+        { ticket: { id: "4", number: 146041426, stateId: null, stateCategory: "submitted", stateLabel: null, typeId: "8", typeName: "Billing" }, updatedAt: 5 },
         { ticket: { id: "2", stateId: 3 }, updatedAt: 5 },
       ],
     },
     NOW
   );
   assert.deepEqual(restored?.conversations, [good]);
-  assert.deepEqual(restored?.tickets.map((t) => t.ticket.id), ["1"]);
+  assert.deepEqual(restored?.tickets.map((t) => t.ticket.id), ["1", "3"], "a list saved before ticket numbers still restores");
+  assert.equal(restored?.tickets[0].ticket.number, null);
+  assert.equal(restored?.tickets[1].ticket.number, "146041426");
+  const { finHandedOff: _dropped, ...older } = good;
+  assert.equal(restoreSaved({ v: 1, conversations: [older], tickets: [] }, NOW)?.conversations[0].finHandedOff, false);
   assert.equal(restored?.truncated, true);
   assert.equal(restored?.savedAt, NOW);
   assert.equal(restoreSaved({ v: 2, conversations: [], tickets: [] }, NOW), null, "another format");
@@ -487,6 +556,24 @@ test("Global lists everything waiting, with the sidebar counts and Intercom link
   assert.equal(mine?.badge, "1");
   assert.ok(page.nav.some((n) => n.key === "inbox:unassigned"));
   assert.ok(page.nav.some((n) => n.key === "inboxes"));
+});
+
+test("rows show the Intercom ticket number, and the search box finds a ticket by it", async () => {
+  const src = fakeSource(
+    [rawConv("1", { ticket: { type: "ticket", id: 1, state: "in_progress" } }), rawConv("2")],
+    [{ id: "1", ticket_id: "146041426", created_at: NOW_SEC - 3600, ticket_state: { id: "4", category: "in_progress", internal_label: "Customer Responded" }, ticket_type: { id: "8", name: "Bug Report" } }]
+  );
+  const { v } = views(src);
+  const table = async (filters: Record<string, string>) =>
+    (await v.build(actor, { page: "global", params: {}, filters, cursor: null }))!.blocks.find((b) => b.type === "table") as QueueTableBlock;
+  const all = await table({});
+  const row = all.rows.find((r) => r.id === "1")!;
+  assert.match((row.cells[0] as { sub?: string }).sub ?? "", /^#146041426 · Body 1$/);
+  assert.equal(all.filters?.[0].kind, "search");
+  const found = await table({ q: "#146041426" });
+  assert.deepEqual(found.rows.map((r) => r.id), ["1"]);
+  assert.equal(found.filters?.[0].value, "#146041426");
+  assert.deepEqual((await table({ q: "Customer 2" })).rows.map((r) => r.id), ["2"]);
 });
 
 test("Mine, an inbox and a teammate scope the list", async () => {

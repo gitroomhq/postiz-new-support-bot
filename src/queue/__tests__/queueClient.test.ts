@@ -6,7 +6,7 @@ function client() {
   const requests: Array<(response: unknown) => void> = [];
   const bodies: Array<Record<string, unknown>> = [];
   const timers: Array<{ fn: () => void; delay: number; cancelled: boolean }> = [];
-  const elements = new Map<string, { textContent: string; appendChild: () => void }>();
+  const elements = new Map<string, { textContent: string; hidden?: boolean; appendChild: () => void }>();
   const document = { title: "", hidden: false, overlay: false, querySelector: () => (document.overlay ? {} : null) };
   const D: any = {
     state: { page: "mine", params: {}, filters: {}, cursor: null, stack: [] },
@@ -16,10 +16,11 @@ function client() {
     },
     clearFlash() {},
     el: () => ({ appendChild() {} }),
-    api: (_endpoint: string, body: Record<string, unknown>) =>
-      new Promise((resolve) => {
+    api: (_endpoint: string, body: Record<string, unknown>, signal?: AbortSignal | null) =>
+      new Promise((resolve, reject) => {
         requests.push(resolve);
         bodies.push(body);
+        signal?.addEventListener("abort", () => reject(new Error("aborted")));
       }),
     handle: (response: { j: unknown }) => response.j,
     renderBlocks() {},
@@ -106,4 +107,36 @@ test("a hidden tab stops asking until it is shown again", async () => {
   await Promise.resolve();
   assert.equal(c.requests.length, 1);
   assert.equal(c.D.watchPaused, true);
+});
+
+test("a long-poll the server never answers is dropped and asked again at once", async () => {
+  const c = client();
+  c.D.loadPage();
+  c.requests[0](response("Mine", "abcd0123.0"));
+  await Promise.resolve();
+  assert.equal(c.requests.length, 2);
+  const guard = c.lastTimer();
+  assert.equal(guard?.delay, 40000, "the server answers within 25 seconds");
+  guard!.fn();
+  await new Promise((r) => setImmediate(r));
+  assert.equal(c.lastTimer()?.delay, 0, "a dead connection is retried at once, not after the failure backoff");
+  c.lastTimer()!.fn();
+  assert.equal(c.requests.length, 3);
+  assert.equal(c.bodies[2].since, "abcd0123.0");
+});
+
+test("the top bar says when the page has not heard from the server for a minute", async () => {
+  const c = client();
+  c.D.loadPage();
+  c.requests[0](response("Mine", "abcd0123.0"));
+  await Promise.resolve();
+  c.D.checkLive();
+  assert.equal(c.elements.get("livestate")?.hidden, true);
+  c.D.lastOk = Date.now() - 61_000;
+  c.D.shownAt = Date.now() - 61_000;
+  c.D.checkLive();
+  assert.equal(c.elements.get("livestate")?.hidden, false);
+  c.requests[1]({ j: { unchanged: true } });
+  await Promise.resolve();
+  assert.equal(c.elements.get("livestate")?.hidden, true, "any answer puts it back to live");
 });

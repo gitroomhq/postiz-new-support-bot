@@ -844,7 +844,7 @@ export class IntercomClient {
         "conversation assignment"
       );
     } catch (e) {
-      if (e instanceof IntercomHttpError && e.status === 422 && /already assigned/i.test(e.message)) return;
+      if (isAlreadyAssignedError(e)) return;
       throw e;
     }
   }
@@ -861,7 +861,7 @@ export class IntercomClient {
         "conversation admin assignment"
       );
     } catch (e) {
-      if (e instanceof IntercomHttpError && e.status === 422 && /already assigned/i.test(e.message)) return;
+      if (isAlreadyAssignedError(e)) return;
       throw e;
     }
   }
@@ -944,22 +944,32 @@ export class IntercomClient {
     }
   ): Promise<{ open: boolean | null }> {
     const adminIdNum = input.adminId != null ? Number(input.adminId) : NaN;
+    const attributes = input.attributes && Object.keys(input.attributes).length > 0 ? input.attributes : null;
     // The response is the updated ticket; its open flag tells the
     // resolve-on-close flow whether the write reopened the conversation.
-    const data = await this.json<{ open?: boolean } | null>(
-      `/tickets/${encodeURIComponent(ticketId)}`,
-      "PUT",
-      {
-        ...(input.stateId ? { ticket_state_id: input.stateId } : {}),
-        ...(input.attributes && Object.keys(input.attributes).length > 0 ? { ticket_attributes: input.attributes } : {}),
-        ...(Number.isFinite(adminIdNum) ? { admin_id: adminIdNum } : {}),
-        ...(input.assigneeId ? { assignee_id: input.assigneeId } : {}),
-        ...(input.open !== undefined ? { open: input.open } : {}),
-        skip_notifications: true,
-      },
-      "ticket update"
-    );
-    return { open: typeof data?.open === "boolean" ? data.open : null };
+    try {
+      const data = await this.json<{ open?: boolean } | null>(
+        `/tickets/${encodeURIComponent(ticketId)}`,
+        "PUT",
+        {
+          ...(input.stateId ? { ticket_state_id: input.stateId } : {}),
+          ...(attributes ? { ticket_attributes: attributes } : {}),
+          ...(Number.isFinite(adminIdNum) ? { admin_id: adminIdNum } : {}),
+          ...(input.assigneeId ? { assignee_id: input.assigneeId } : {}),
+          ...(input.open !== undefined ? { open: input.open } : {}),
+          skip_notifications: true,
+        },
+        "ticket update"
+      );
+      return { open: typeof data?.open === "boolean" ? data.open : null };
+    } catch (e) {
+      // An assignee-only write to the assignee the ticket already has: the
+      // desired end state, as for the conversation assignments above. With
+      // other fields in the same write the 422 says nothing about them.
+      const assigneeOnly = input.assigneeId && !input.stateId && !attributes && input.open === undefined;
+      if (assigneeOnly && isAlreadyAssignedError(e)) return { open: null };
+      throw e;
+    }
   }
 
   async ticketExists(ticketId: string): Promise<boolean> {
@@ -1325,22 +1335,23 @@ export class IntercomClient {
   // Conversation-model data attributes (read-only: the API can list but NOT
   // create conversation attributes; creation is a manual Settings → Data →
   // Conversations step). Powers SlaService.verifySetup().
-  async listConversationDataAttributes(): Promise<Array<{ name: string; archived: boolean; dataType: string | null }>> {
+  // options: a List attribute's allowed values (empty for any other type).
+  async listConversationDataAttributes(): Promise<Array<{ name: string; archived: boolean; dataType: string | null; options: string[] }>> {
     const data = await this.json<{
-      data?: Array<{ name?: string; archived?: boolean; data_type?: string }>;
+      data?: Array<{ name?: string; archived?: boolean; data_type?: string; options?: unknown }>;
     }>("/data_attributes?model=conversation", "GET", undefined, "conversation data attributes");
     return (data.data ?? [])
       .filter((a) => a.name)
-      .map((a) => ({ name: a.name as string, archived: a.archived === true, dataType: a.data_type ?? null }));
+      .map((a) => ({ name: a.name as string, archived: a.archived === true, dataType: a.data_type ?? null, options: listOptions(a.options) }));
   }
 
-  private conversationAttrCache: { fetchedAt: number; defs: Array<{ name: string; archived: boolean; dataType: string | null }> } | null =
+  private conversationAttrCache: { fetchedAt: number; defs: Array<{ name: string; archived: boolean; dataType: string | null; options: string[] }> } | null =
     null;
 
   // Same list behind a ~60s TTL: /debug-attribute autocompletes on it, and
   // Discord fires autocomplete on every keystroke. Throws on a cold miss so
   // the write path can report the API failure; a warm cache absorbs blips.
-  async listConversationDataAttributesCached(): Promise<Array<{ name: string; archived: boolean; dataType: string | null }>> {
+  async listConversationDataAttributesCached(): Promise<Array<{ name: string; archived: boolean; dataType: string | null; options: string[] }>> {
     const TTL_MS = 60_000;
     if (this.conversationAttrCache && Date.now() - this.conversationAttrCache.fetchedAt < TTL_MS) {
       return this.conversationAttrCache.defs;
@@ -1449,6 +1460,20 @@ export interface QueueCreatedRange {
 }
 
 type SearchFilter = { field: string; operator: string; value: unknown };
+
+// A data attribute's options: plain strings, or { value } objects.
+function listOptions(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .map((o) => (typeof o === "string" ? o : o && typeof o === "object" && typeof (o as { value?: unknown }).value === "string" ? (o as { value: string }).value : null))
+    .filter((o): o is string => o != null);
+}
+
+// Intercom answers an assignment to the assignee a conversation or ticket
+// already has with 422 "already assigned to the specified assignee".
+export function isAlreadyAssignedError(e: unknown): boolean {
+  return e instanceof IntercomHttpError && e.status === 422 && /already assigned/i.test(e.message);
+}
 
 function queueQuery(filters: SearchFilter[]): object {
   return filters.length === 1 ? filters[0] : { operator: "AND", value: filters };

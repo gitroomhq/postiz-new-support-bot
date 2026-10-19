@@ -4,6 +4,7 @@ import type { QueueActor } from "./QueueAuth";
 import type { QueueData, QueueDirectory, QueueSnapshot } from "./QueueData";
 import {
   NO_PERSON,
+  QUERY_MAX,
   QueueFilters,
   QueueItem,
   QueueScope,
@@ -384,6 +385,13 @@ export class QueueViews {
       },
       filters: [
         {
+          key: "q",
+          label: "Search",
+          kind: "search",
+          placeholder: "Search ticket #, customer, email or text",
+          value: filters.query ?? "",
+        },
+        {
           key: "priority",
           label: "Priority",
           kind: "select",
@@ -437,7 +445,7 @@ export class QueueViews {
   private async card(ctx: Ctx, i: QueueItem, title: string, actions: QueueAction[], extra: Array<{ label: string; cell: QueueCell }> = []): Promise<QueueKvBlock> {
     const latest = await this.data.latestCustomerMessage(i);
     const rows: Array<{ label: string; cell: QueueCell }> = [
-      { label: "Ticket", cell: { t: "text", v: i.title, strong: true } },
+      { label: "Ticket", cell: { t: "text", v: i.title, strong: true, ...(i.ticket?.number ? { sub: `#${i.ticket.number}` } : {}) } },
       { label: "Customer", cell: customerCell(i) },
       { label: "Inbox", cell: { t: "link", v: this.teamName(ctx, i.teamId), ref: { page: "inbox.detail", params: { id: i.teamId ?? UNASSIGNED_INBOX } } } },
       { label: "Assignee", cell: { t: "link", v: this.personName(ctx, i.assigneeId), ref: { page: "person.detail", params: { id: i.assigneeId ?? NO_PERSON } } } },
@@ -671,8 +679,11 @@ export class QueueViews {
 
 // ---- cells ----
 
+// The title, then the ticket number teammates see in Intercom and the first
+// message.
 function ticketCell(i: QueueItem): QueueCell {
-  return { t: "text", v: i.title, strong: true, ...(i.excerpt && i.excerpt !== i.title ? { sub: i.excerpt } : {}) };
+  const sub = [i.ticket?.number ? `#${i.ticket.number}` : "", i.excerpt && i.excerpt !== i.title ? i.excerpt : ""].filter(Boolean).join(" · ");
+  return { t: "text", v: i.title, strong: true, ...(sub ? { sub } : {}) };
 }
 
 function customerCell(i: QueueItem): QueueCell {
@@ -701,6 +712,7 @@ function activeFilterLabels(f: QueueFilters): string[] {
   if (f.sla === "ok") out.push("SLA ok");
   if (f.sla === "none") out.push("no SLA");
   if (f.includeSnoozed) out.push("including snoozed");
+  if (f.query) out.push(`matching "${f.query}"`);
   return out;
 }
 
@@ -708,6 +720,7 @@ function activeFilterLabels(f: QueueFilters): string[] {
 // keys the URL uses).
 function filterParams(f: QueueFilters): Record<string, string> {
   return {
+    ...(f.query ? { q: f.query } : {}),
     ...(f.kind ? { kind: f.kind } : {}),
     ...(f.priorityOnly ? { priority: "only" } : {}),
     ...(f.sla ? { sla: f.sla } : {}),
@@ -717,6 +730,6 @@ function filterParams(f: QueueFilters): Record<string, string> {
 
 function stringParams(params: Record<string, unknown>): Record<string, string> {
   const out: Record<string, string> = {};
-  for (const [k, v] of Object.entries(params)) if (typeof v === "string" && v.length <= 32) out[k] = v;
+  for (const [k, v] of Object.entries(params)) if (typeof v === "string" && v.length <= QUERY_MAX) out[k] = v;
   return out;
 }

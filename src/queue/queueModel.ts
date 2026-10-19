@@ -16,6 +16,7 @@ export type QueueSla = "ok" | "at_risk" | "breached";
 
 export interface QueueTicketInfo {
   id: string;
+  number: string | null; // the number teammates see in the inbox (#146041426): the API's ticket_id
   stateId: string | null;
   stateCategory: string | null; // submitted | in_progress | waiting_on_customer | resolved
   stateLabel: string | null;
@@ -46,6 +47,9 @@ export interface QueueConversation {
   // source and this the fallback.
   ticketId: string | null;
   ticketInline: QueueTicketInfo | null;
+  // Fin escalated or handed the conversation to the team: its own answers no
+  // longer count as a reply (the bridge's relays of staff replies still do).
+  finHandedOff: boolean;
   lastContactReplyAt: number | null;
   lastAdminReplyAt: number | null;
   slaStatus: QueueSla | null;
@@ -86,7 +90,11 @@ export interface ClassifyOptions {
 }
 
 const CONTACT_TYPES = new Set(["user", "lead", "contact"]);
-const EXCLUDED_CATEGORIES = new Set(["waiting_on_customer", "resolved"]);
+// Resolved is not here: a customer who writes into an open conversation whose
+// ticket was resolved is waiting on us all the same.
+const EXCLUDED_CATEGORIES = new Set(["waiting_on_customer"]);
+// Fin's resolution states that mean "a person takes it from here".
+const FIN_HANDOFF_STATES = new Set(["escalated", "procedure_handoff", "routed_to_team"]);
 const SLA_VALUES = new Set<QueueSla>(["ok", "at_risk", "breached"]);
 const SLA_STATUS_ATTRIBUTE = "SLA Status";
 const SLA_TARGET_ATTRIBUTE = "SLA Target";
@@ -161,7 +169,15 @@ export function parseTicket(raw: unknown): QueueTicketInfo | null {
   if (!o || !id) return null;
   const state = ticketStateOf(o.ticket_state);
   const type = ticketTypeOf(o.ticket_type);
-  return { id, stateId: state.id, stateCategory: state.category, stateLabel: state.label, typeId: type.id, typeName: type.name };
+  return {
+    id,
+    number: idOf(o.ticket_id),
+    stateId: state.id,
+    stateCategory: state.category,
+    stateLabel: state.label,
+    typeId: type.id,
+    typeName: type.name,
+  };
 }
 
 // When a ticket last changed (unix seconds; 0 when it does not say). Newer
@@ -198,6 +214,7 @@ export function parseConversation(raw: unknown): QueueConversation | null {
     const type = ticketTypeOf(ticket.ticket_type);
     ticketInline = {
       id: ticketId,
+      number: idOf(ticket.ticket_id),
       stateId: state.id,
       stateCategory: state.category,
       stateLabel: state.label ?? str(ticket.ticket_custom_state_admin_label),
@@ -237,6 +254,7 @@ export function parseConversation(raw: unknown): QueueConversation | null {
       .filter((t): t is string => t != null),
     ticketId,
     ticketInline,
+    finHandedOff: FIN_HANDOFF_STATES.has(str(obj(o.ai_agent)?.resolution_state) ?? ""),
     lastContactReplyAt: unix(stats?.last_contact_reply_at),
     lastAdminReplyAt: unix(stats?.last_admin_reply_at),
     slaStatus: slaRaw && SLA_VALUES.has(slaRaw as QueueSla) ? (slaRaw as QueueSla) : null,
@@ -251,6 +269,67 @@ export function parseConversation(raw: unknown): QueueConversation | null {
 export function resolveTicket(conv: QueueConversation, tickets: ReadonlyMap<string, QueueTicketInfo>): QueueTicketInfo | null {
   if (conv.ticketId) return tickets.get(conv.ticketId) ?? conv.ticketInline;
   return tickets.get(conv.id) ?? null;
+}
+
+// ---- reply times ----
+//
+// Intercom fills in a conversation's statistics after the write that changed
+// them: a read right after a webhook can carry the customer's new message
+// while last_contact_reply_at still names the one before, and the search copy
+// can keep that stale value until the conversation changes again. So the
+// queue also reads the times from the parts whenever it has them, and no read
+// moves a reply time backwards.
+
+function later(a: number | null, b: number | null): number | null {
+  return a == null ? b : b == null ? a : Math.max(a, b);
+}
+
+// While the customer spoke last, waiting_since lies after our last reply and
+// no later than their newest message: the first candidate that fits wins.
+// Outside a wait nothing reads it, so the first candidate is kept as is.
+function fitWaitingSince(c: QueueConversation, candidates: Array<number | null>): number | null {
+  const contact = c.lastContactReplyAt;
+  const admin = c.lastAdminReplyAt;
+  if (contact == null || (admin != null && admin >= contact)) return candidates[0] ?? null;
+  for (const w of candidates) if (w != null && (admin == null || w > admin) && w <= contact) return w;
+  return null;
+}
+
+// A conversation read with its parts (a webhook re-read): the newest customer
+// message and the newest teammate message (an admin author, as Intercom's
+// statistics count them) win over older statistics, and waiting_since falls
+// back to the first customer message after our last reply.
+export function withParts(conv: QueueConversation, parts: readonly IntercomWebhookPart[]): QueueConversation {
+  let contact: number | null = null;
+  let admin: number | null = null;
+  for (const p of parts) {
+    const at = p.created_at ?? 0;
+    if (at <= 0 || !isMessagePart(p)) continue;
+    const type = p.author?.type ?? "";
+    if (CONTACT_TYPES.has(type)) contact = later(contact, at);
+    else if (type === "admin") admin = later(admin, at);
+  }
+  const next = { ...conv, lastContactReplyAt: later(conv.lastContactReplyAt, contact), lastAdminReplyAt: later(conv.lastAdminReplyAt, admin) };
+  const lastAdmin = next.lastAdminReplyAt;
+  // The opening message is the source, not a part.
+  let firstWaiting = lastAdmin == null && conv.sourceAuthorType != null && CONTACT_TYPES.has(conv.sourceAuthorType) ? conv.createdAt || null : null;
+  for (const p of parts) {
+    const at = p.created_at ?? 0;
+    if (at <= 0 || !isMessagePart(p) || !CONTACT_TYPES.has(p.author?.type ?? "")) continue;
+    if ((lastAdmin == null || at > lastAdmin) && (firstWaiting == null || at < firstWaiting)) firstWaiting = at;
+  }
+  return { ...next, waitingSince: fitWaitingSince(next, [conv.waitingSince, firstWaiting]) };
+}
+
+// Two reads of one conversation: every field from `next`, the later of each
+// reply time from both.
+export function mergeReplyTimes(prev: QueueConversation, next: QueueConversation): QueueConversation {
+  const merged = {
+    ...next,
+    lastContactReplyAt: later(prev.lastContactReplyAt, next.lastContactReplyAt),
+    lastAdminReplyAt: later(prev.lastAdminReplyAt, next.lastAdminReplyAt),
+  };
+  return { ...merged, waitingSince: fitWaitingSince(merged, [next.waitingSince, prev.waitingSince]) };
 }
 
 // ---- the decision ----
@@ -306,10 +385,13 @@ export function classify(conv: QueueConversation, ticket: QueueTicketInfo | null
 
 // The opt-in toggles: a Fin reply, or a teammate's internal note, newer than
 // the customer's last message also counts as replied. Read from the parts.
+// "Fin" is the Operator: Fin's AI answers and the bridge's relays of Discord
+// staff replies. Once Fin has handed the conversation to the team
+// (finHandedOff), its AI answers no longer count, the relays still do.
 export function extraReplyAfter(
   parts: readonly IntercomWebhookPart[],
   lastContactStat: number,
-  opts: { fin: boolean; notes: boolean; finAdminIds: ReadonlySet<string>; botAdminIds: ReadonlySet<string> }
+  opts: { fin: boolean; notes: boolean; finAdminIds: ReadonlySet<string>; botAdminIds: ReadonlySet<string>; finHandedOff?: boolean }
 ): boolean {
   if (!opts.fin && !opts.notes) return false;
   const since = Math.max(newestCustomerMessageAt(parts) ?? 0, lastContactStat);
@@ -317,7 +399,8 @@ export function extraReplyAfter(
     if ((p.created_at ?? 0) <= since) continue;
     const type = p.author?.type ?? "";
     const id = p.author?.id != null ? String(p.author.id) : "";
-    if (opts.fin && isMessagePart(p) && (type === "bot" || (type === "admin" && opts.finAdminIds.has(id)))) return true;
+    const fin = isMessagePart(p) && (type === "bot" || (type === "admin" && opts.finAdminIds.has(id)));
+    if (opts.fin && fin && !(opts.finHandedOff && p.author?.from_ai_agent === true)) return true;
     // A note by a person. The bot's own notes (SLA breach, agent-idle
     // reminders) would otherwise mark the very tickets they flag as answered.
     if (opts.notes && p.part_type === "note" && p.redacted !== true && type === "admin" && id && !opts.botAdminIds.has(id)) return true;
@@ -376,15 +459,32 @@ export interface QueueFilters {
   priorityOnly: boolean;
   sla: QueueSla | "none" | null;
   includeSnoozed: boolean;
+  query: string | null; // the search box
 }
 
+export const QUERY_MAX = 64;
+
 export function parseFilters(raw: Record<string, string>): QueueFilters {
+  const query = typeof raw.q === "string" ? raw.q.trim().slice(0, QUERY_MAX) : "";
   return {
     kind: raw.kind === "first" || raw.kind === "followup" ? raw.kind : null,
     priorityOnly: raw.priority === "only",
     sla: raw.sla === "ok" || raw.sla === "at_risk" || raw.sla === "breached" || raw.sla === "none" ? raw.sla : null,
     includeSnoozed: raw.snoozed === "include",
+    query: query || null,
   };
+}
+
+// The search box: the ticket number (with or without #), the conversation id,
+// the customer's name or email, or text from the title and first message.
+export function matchesQuery(i: QueueItem, query: string): boolean {
+  const q = query.trim().toLowerCase();
+  if (!q) return true;
+  const number = i.ticket?.number ?? "";
+  const bare = q.replace(/^#/, "");
+  if (bare && (number === bare || i.id === bare)) return true;
+  const hay = [i.title, i.excerpt, i.customerName ?? "", i.customerEmail ?? "", number ? `#${number}` : "", i.id].join("\n").toLowerCase();
+  return hay.includes(q);
 }
 
 // Everything except the kind filter (the count cards show both kinds).
@@ -393,7 +493,8 @@ export function applyBaseFilters(items: readonly QueueItem[], f: QueueFilters): 
     (i) =>
       (f.includeSnoozed || !i.snoozed) &&
       (!f.priorityOnly || i.priority) &&
-      (f.sla == null || (f.sla === "none" ? i.slaStatus == null : i.slaStatus === f.sla))
+      (f.sla == null || (f.sla === "none" ? i.slaStatus == null : i.slaStatus === f.sla)) &&
+      (f.query == null || matchesQuery(i, f.query))
   );
 }
 

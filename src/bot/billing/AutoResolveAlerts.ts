@@ -8,6 +8,7 @@ import type { AutoResolveAlerts, AutoResolveSideEffects } from "./AutoResolveSer
 import { COLORS } from "../../util/embeds";
 import { RATES_SAMPLED_AT } from "./fx";
 import { log } from "../../util/logger";
+import { billingAlertChannel } from "./billingAlertChannel";
 
 const alertLog = log.child("dispute-auto-resolve-alerts");
 
@@ -33,10 +34,12 @@ export class DiscordAutoResolveAlerts implements AutoResolveAlerts {
     embed: EmbedBuilder,
     components: ActionRowBuilder<ButtonBuilder>[] = []
   ): Promise<{ channelId: string; messageId: string } | null> {
-    const channelId = this.settings.billingAuditChannelId() ?? this.settings.auditLogChannelId();
-    if (!this.client || !channelId) return null;
-    const channel = await this.client.channels.fetch(channelId).catch(() => null);
-    if (!channel?.isSendable()) return null;
+    const target = await billingAlertChannel(this.client, {
+      billingAuditChannelId: this.settings.billingAuditChannelId(),
+      auditLogChannelId: this.settings.auditLogChannelId(),
+    });
+    if (!target) return null;
+    const { channel, channelId } = target;
     const message = await channel.send({ embeds: [embed], components }).catch((error) => {
       alertLog.warn("auto-resolve alert send failed", { "error.message": String(error) });
       return null;

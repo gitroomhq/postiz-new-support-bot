@@ -52,6 +52,7 @@ ${queueCss()}
     <header class="topbar">
       <button class="btn sm" id="menubtn" type="button" aria-label="Menu" aria-expanded="false">☰</button>
       <span class="who" id="who"></span>
+      <span class="badge warn livestate" id="livestate" title="The page lost its connection to the server and is trying again. Refresh reloads it now." hidden>Not live: reconnecting</span>
       <button class="btn sm" id="refreshbtn" type="button" title="Read the queue again">Refresh</button>
       <button class="btn sm" id="themebtn" type="button" title="Color theme: click to switch">Auto</button>
       <button class="btn sm" id="logout" type="button">Sign out</button>
@@ -100,6 +101,7 @@ function queueCss(): string {
   a.btn.wide { display:flex; }
   .agecell { font-variant-numeric: tabular-nums; }
   .topbar .who { margin-right:auto; }
+  .livestate[hidden] { display:none !important; }
   .logincard .error { margin:8px 0 12px; }
   .section.kv + .section { margin-top:28px; }
   `;

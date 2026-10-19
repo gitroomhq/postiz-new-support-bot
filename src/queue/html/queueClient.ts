@@ -128,6 +128,7 @@ D.loadPage = function (silent, refresh) {
     .then(function (res) {
       if (seq !== D.loadSeq) return;
       var v = D.handle(res); if (!v) return;
+      D.markLive();
       if (v.error) {
         if (silent) { D.watchLater(seq, 10000); return; }
         content.textContent = "";
@@ -170,11 +171,17 @@ D.renderView = function (v, silent) {
 // A long-poll on the list's version: the server answers as soon as the list
 // changes (a webhook, a read from Intercom, a randomizer pick) or after about
 // 25 seconds with "unchanged". One request waits per open page, and a hidden
-// tab stops asking until it is shown again.
+// tab stops asking until it is shown again. A request the server should have
+// answered long ago (a connection lost to sleep or a network change) is
+// dropped and asked again, and the top bar says when the page is not live.
 D.version = null;
 D.watchTimer = null;
 D.watchCtl = null;
 D.watchPaused = false;
+D.WATCH_TIMEOUT = 40000;
+D.LIVE_STALE = 60000;
+D.lastOk = Date.now();
+D.shownAt = Date.now();
 D.watch = function (seq) {
   if (seq !== D.loadSeq || !D.version) return;
   if (document.hidden) { D.watchPaused = true; return; }
@@ -182,11 +189,15 @@ D.watch = function (seq) {
   try { ctl = new AbortController(); } catch (e) {}
   D.watchCtl = ctl;
   var started = Date.now();
+  var timedOut = false;
+  var guard = ctl ? setTimeout(function () { timedOut = true; try { ctl.abort(); } catch (e) {} }, D.WATCH_TIMEOUT) : null;
   D.api("view", { page: D.state.page, params: D.state.params, filters: D.state.filters, cursor: D.state.cursor, since: D.version }, ctl ? ctl.signal : null)
     .then(function (res) {
+      if (guard) clearTimeout(guard);
       if (seq !== D.loadSeq) return;
       D.watchCtl = null;
       var v = D.handle(res); if (!v) return;
+      D.markLive();
       // An answer that came back at once without a change (a busy server):
       // wait a little before asking again.
       if (v.unchanged) { D.watchLater(seq, Date.now() - started < 2000 ? 5000 : 0); return; }
@@ -194,10 +205,30 @@ D.watch = function (seq) {
       D.renderWhenIdle(seq, v);
     })
     .catch(function () {
+      if (guard) clearTimeout(guard);
       if (seq !== D.loadSeq) return;
       D.watchCtl = null;
-      D.watchLater(seq, 10000);
+      D.watchLater(seq, timedOut ? 0 : 10000);
     });
+};
+D.markLive = function () {
+  D.lastOk = Date.now();
+  D.checkLive();
+};
+D.checkLive = function () {
+  var el = D.q("livestate");
+  if (!el) return;
+  var now = Date.now();
+  el.hidden = document.hidden || now - D.lastOk <= D.LIVE_STALE || now - D.shownAt <= 15000;
+};
+// Back from a hidden tab, sleep or a network change: catch up at once when
+// the page has not heard from the server for a while.
+D.resume = function () {
+  if (document.hidden) return;
+  if (D.watchPaused || Date.now() - D.lastOk > D.WATCH_TIMEOUT) {
+    D.watchPaused = false;
+    D.loadPage(true);
+  }
 };
 D.watchLater = function (seq, ms) {
   if (D.watchTimer) clearTimeout(D.watchTimer);
@@ -207,11 +238,12 @@ D.stopWatch = function () {
   if (D.watchTimer) { clearTimeout(D.watchTimer); D.watchTimer = null; }
   if (D.watchCtl) { try { D.watchCtl.abort(); } catch (e) {} D.watchCtl = null; }
 };
-// Never redraw under an open dialog, menu or filter popover: hold the new
-// page until it closes. A burst of changes redraws at most every 2 seconds.
+// Never redraw under an open dialog, menu or filter popover, or while the
+// search box is being typed in: hold the new page until then. A burst of
+// changes redraws at most every 2 seconds.
 D.renderWhenIdle = function (seq, v) {
   if (seq !== D.loadSeq) return;
-  if (document.querySelector("dialog[open], .fpop.open, .morepop.open")) {
+  if (document.querySelector("dialog[open], .fpop.open, .morepop.open, .tsearch input:focus")) {
     D.watchTimer = setTimeout(function () { D.watchTimer = null; D.renderWhenIdle(seq, v); }, 1000);
     return;
   }
@@ -422,14 +454,17 @@ D.startApp = function () {
   });
   D.q("refreshbtn").addEventListener("click", function () { D.loadPage(true, true); });
   window.addEventListener("popstate", D.onRouteChange);
-  // Back in a hidden tab: catch up at once, then keep watching.
   document.addEventListener("visibilitychange", function () {
-    if (document.hidden || !D.watchPaused) return;
-    D.watchPaused = false;
-    D.loadPage(true);
+    if (document.hidden) return;
+    D.shownAt = Date.now();
+    D.resume();
   });
+  window.addEventListener("focus", D.resume);
+  window.addEventListener("online", function () { D.loadPage(true); });
+  window.addEventListener("pageshow", function (e) { if (e.persisted) D.loadPage(true); });
   D.onRouteChange();
   setInterval(D.tickAges, 30000);
+  setInterval(D.checkLive, 5000);
 };
 
 D.boot = function () {

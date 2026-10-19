@@ -9,6 +9,8 @@ import {
   classify,
   extraReplyAfter,
   inScope,
+  matchesQuery,
+  mergeReplyTimes,
   parseConversation,
   parseFilters,
   parseScopeKey,
@@ -17,6 +19,7 @@ import {
   resolveTicket,
   waitLabel,
   weightedPick,
+  withParts,
 } from "../queueModel";
 import type { IntercomWebhookPart } from "../../intercom/types";
 
@@ -78,6 +81,17 @@ test("parseConversation reads the projection the queue needs and strips HTML", (
   assert.equal(c.slaTarget, "Default");
   assert.equal(c.lastContactReplyAt, 1_000_000);
   assert.equal(c.lastAdminReplyAt, null);
+  assert.equal(c.finHandedOff, false);
+});
+
+test("parseConversation reads Fin's handoff and the inline ticket number", () => {
+  for (const state of ["escalated", "procedure_handoff", "routed_to_team"]) {
+    assert.equal(conv({ ai_agent: { resolution_state: state } }).finHandedOff, true, state);
+  }
+  assert.equal(conv({ ai_agent: { resolution_state: "assumed_resolution" } }).finHandedOff, false);
+  assert.equal(conv({ ai_agent: null }).finHandedOff, false);
+  const c = conv({ ticket: { type: "ticket", id: "T1", ticket_id: "146041426", state: "in_progress" } });
+  assert.equal(c.ticketInline?.number, "146041426");
 });
 
 test("parseConversation treats 0 assignees as nobody and rejects junk", () => {
@@ -128,11 +142,12 @@ test("an outbound conversation the customer never answered waits on nobody", () 
   assert.equal(classify(c, null, NO_OPTS), null);
 });
 
-test("closed conversations, Waiting on customer and Resolved tickets are never listed", () => {
+test("closed conversations and Waiting on customer tickets are never listed; a Resolved ticket the customer wrote into is", () => {
   assert.equal(classify(conv({ state: "closed" }), null, NO_OPTS), null);
-  const ticket = (category: string): QueueTicketInfo => ({ id: "1001", stateId: "s", stateCategory: category, stateLabel: null, typeId: "tt", typeName: "Billing" });
+  const ticket = (category: string): QueueTicketInfo => ({ id: "1001", number: null, stateId: "s", stateCategory: category, stateLabel: null, typeId: "tt", typeName: "Billing" });
   assert.equal(classify(conv(), ticket("waiting_on_customer"), NO_OPTS), null);
-  assert.equal(classify(conv(), ticket("resolved"), NO_OPTS), null);
+  assert.equal(classify(conv({}, { last_admin_reply_at: 1_000_100, last_contact_reply_at: 1_000_300 }), ticket("resolved"), NO_OPTS)?.kind, "followup");
+  assert.equal(classify(conv({}, { last_admin_reply_at: 1_000_400, last_contact_reply_at: 1_000_300 }), ticket("resolved"), NO_OPTS), null);
   // Submitted and In progress (custom "Customer responded" included) stay.
   assert.ok(classify(conv(), ticket("submitted"), NO_OPTS));
   assert.ok(classify(conv(), { ...ticket("in_progress"), stateLabel: "Customer responded" }, NO_OPTS));
@@ -147,7 +162,7 @@ test("snoozed conversations are kept but flagged (the page hides them by default
 test("exclusions: team, tag, ticket type by id and by name", () => {
   assert.equal(classify(conv(), null, { ...NO_OPTS, excludedTeamIds: new Set(["22"]) }), null);
   assert.equal(classify(conv(), null, { ...NO_OPTS, excludedTagIds: new Set(["t1"]) }), null);
-  const typed: QueueTicketInfo = { id: "1001", stateId: null, stateCategory: "in_progress", stateLabel: null, typeId: "tt", typeName: "Billing" };
+  const typed: QueueTicketInfo = { id: "1001", number: null, stateId: null, stateCategory: "in_progress", stateLabel: null, typeId: "tt", typeName: "Billing" };
   assert.equal(classify(conv(), typed, { ...NO_OPTS, excludedTicketTypeIds: new Set(["tt"]) }), null);
   const nameOnly = { ...typed, typeId: null };
   assert.equal(classify(conv(), nameOnly, { ...NO_OPTS, excludedTicketTypeNames: new Set(["billing"]) }), null);
@@ -160,7 +175,7 @@ test("an assignment to Operator/Fin or the bridge admin is no person", () => {
 });
 
 test("resolveTicket: the ticket search first, the inline copy next, the conversation id last", () => {
-  const searched: QueueTicketInfo = { id: "T1", stateId: "9", stateCategory: "in_progress", stateLabel: "Customer responded", typeId: "tt", typeName: "Billing" };
+  const searched: QueueTicketInfo = { id: "T1", number: "146041426", stateId: "9", stateCategory: "in_progress", stateLabel: "Customer responded", typeId: "tt", typeName: "Billing" };
   const tickets = new Map([["T1", searched]]);
   const withInline = conv({ ticket: { type: "ticket", id: "T1", state: "submitted", ticket_type: "Billing" } });
   assert.equal(resolveTicket(withInline, tickets), searched);
@@ -172,9 +187,10 @@ test("resolveTicket: the ticket search first, the inline copy next, the conversa
   assert.equal(resolveTicket(noTicket, new Map()), null);
 });
 
-test("parseTicket reads the state object and the type", () => {
-  const t = parseTicket({ id: 77, ticket_state: { id: 4, category: "in_progress", internal_label: "Customer responded" }, ticket_type: { id: 8, name: "Bug" } });
-  assert.deepEqual(t, { id: "77", stateId: "4", stateCategory: "in_progress", stateLabel: "Customer responded", typeId: "8", typeName: "Bug" });
+test("parseTicket reads the state object, the type and the ticket number", () => {
+  const t = parseTicket({ id: 77, ticket_id: "146041426", ticket_state: { id: 4, category: "in_progress", internal_label: "Customer responded" }, ticket_type: { id: 8, name: "Bug" } });
+  assert.deepEqual(t, { id: "77", number: "146041426", stateId: "4", stateCategory: "in_progress", stateLabel: "Customer responded", typeId: "8", typeName: "Bug" });
+  assert.equal(parseTicket({ id: 78 })?.number, null);
   assert.equal(parseTicket({}), null);
 });
 
@@ -193,6 +209,61 @@ test("extraReplyAfter: Fin and notes count only when switched on, and only after
   // Operator as an admin id counts as Fin.
   const operator: IntercomWebhookPart[] = [{ part_type: "comment", body: "auto", created_at: 150, author: { type: "admin", id: "800" } }];
   assert.equal(extraReplyAfter(operator, 100, { fin: true, notes: false, ...ids }), true);
+});
+
+test("after Fin hands the conversation to the team its own answers stop counting; the bridge's relays still count", () => {
+  const ids = { finAdminIds: new Set(["800"]), botAdminIds: new Set(["800", "900"]) };
+  const handoff: IntercomWebhookPart[] = [
+    { part_type: "comment", body: "refund please", created_at: 100, author: { type: "user", id: "c1" } },
+    { part_type: "comment", body: "I'll pass this to the team", created_at: 110, author: { type: "bot", id: "800", from_ai_agent: true } },
+  ];
+  assert.equal(extraReplyAfter(handoff, 100, { fin: true, notes: false, ...ids }), true, "Fin resolved it");
+  assert.equal(extraReplyAfter(handoff, 100, { fin: true, notes: false, ...ids, finHandedOff: true }), false, "Fin handed it off");
+  const relay: IntercomWebhookPart[] = [
+    { part_type: "comment", body: "refund please", created_at: 100, author: { type: "user", id: "c1" } },
+    { part_type: "comment", body: "<b>Ada:</b> done", created_at: 120, author: { type: "bot", id: "800", from_ai_agent: false } },
+  ];
+  assert.equal(extraReplyAfter(relay, 100, { fin: true, notes: false, ...ids, finHandedOff: true }), true, "a staff reply relayed from Discord");
+});
+
+test("withParts: the parts win over statistics that lag the customer's new message", () => {
+  // A teammate answered at 1_000_100; the customer wrote again at 1_000_300,
+  // but the statistics read right after still name the opening message.
+  const stale = conv({ waiting_since: null }, { last_contact_reply_at: 1_000_000, last_admin_reply_at: 1_000_100 });
+  assert.equal(classify(stale, null, NO_OPTS), null);
+  const parts: IntercomWebhookPart[] = [
+    { part_type: "comment", body: "answer", created_at: 1_000_100, author: { type: "admin", id: "11" } },
+    { part_type: "note", body: "internal", created_at: 1_000_150, author: { type: "admin", id: "11" } },
+    { part_type: "comment", body: "thanks, one more thing", created_at: 1_000_300, author: { type: "user", id: "c1" } },
+    { part_type: "comment", body: "and another", created_at: 1_000_400, author: { type: "user", id: "c1" } },
+  ];
+  const fresh = withParts(stale, parts);
+  assert.equal(fresh.lastContactReplyAt, 1_000_400);
+  assert.equal(fresh.lastAdminReplyAt, 1_000_100, "a note is no reply");
+  assert.equal(fresh.waitingSince, 1_000_300, "waiting since the first message after our reply");
+  const item = classify(fresh, null, NO_OPTS);
+  assert.equal(item?.kind, "followup");
+  assert.equal(item?.waitingSince, 1_000_300);
+  // Never answered: waiting since the opening message, which is the source.
+  const first = withParts(conv({ waiting_since: null }, { last_contact_reply_at: null }), [
+    { part_type: "comment", body: "hello?", created_at: 1_000_200, author: { type: "user", id: "c1" } },
+  ]);
+  assert.equal(first.waitingSince, 1_000_000);
+  // Newer statistics are kept.
+  assert.equal(withParts(conv({}, { last_contact_reply_at: 1_000_900 }), parts).lastContactReplyAt, 1_000_900);
+});
+
+test("mergeReplyTimes: a later read never moves a reply time backwards", () => {
+  const fresh = conv({ updated_at: 1_000_400, waiting_since: 1_000_300 }, { last_contact_reply_at: 1_000_300, last_admin_reply_at: 1_000_100 });
+  const staleSearch = conv({ updated_at: 1_000_400, waiting_since: null, priority: "priority" }, { last_contact_reply_at: 1_000_000, last_admin_reply_at: 1_000_100 });
+  const merged = mergeReplyTimes(fresh, staleSearch);
+  assert.equal(merged.priority, true, "other fields come from the later read");
+  assert.equal(merged.lastContactReplyAt, 1_000_300);
+  assert.equal(merged.waitingSince, 1_000_300);
+  assert.equal(classify(merged, null, NO_OPTS)?.kind, "followup");
+  // A teammate's answer moves it out, whichever read carries it.
+  const answered = conv({ updated_at: 1_000_500 }, { last_contact_reply_at: 1_000_000, last_admin_reply_at: 1_000_500 });
+  assert.equal(classify(mergeReplyTimes(merged, answered), null, NO_OPTS), null);
 });
 
 test("the bot's own notes never count as a reply", () => {
@@ -261,7 +332,24 @@ test("filters: snoozed hidden by default, kind, priority and SLA", () => {
   assert.deepEqual(applyFilters(items, parseFilters({ priority: "only" })).map((i) => i.id), ["1"]);
   assert.deepEqual(applyFilters(items, parseFilters({ sla: "none" })).map((i) => i.id), ["2"]);
   // Junk values are ignored rather than trusted.
-  assert.deepEqual(parseFilters({ kind: "evil", sla: "x" }), { kind: null, priorityOnly: false, sla: null, includeSnoozed: false });
+  assert.deepEqual(parseFilters({ kind: "evil", sla: "x" }), { kind: null, priorityOnly: false, sla: null, includeSnoozed: false, query: null });
+  assert.equal(parseFilters({ q: "   " }).query, null);
+  assert.equal(parseFilters({ q: "x".repeat(100) }).query?.length, 64);
+});
+
+test("search: the ticket number with or without #, the conversation id, the customer and the text", () => {
+  const ticket: QueueTicketInfo = { id: "215476423871073", number: "146041426", stateId: null, stateCategory: "in_progress", stateLabel: null, typeId: null, typeName: "Bug Report" };
+  const grant = item({ id: "215476423871073", title: "FarmerGrant · Report a Bug", excerpt: "TikTok reconnect blocked", customerName: "FarmerGrant", ticket });
+  const other = item({ id: "215476452646387", title: "Refund", customerEmail: "victor@example.test" });
+  const search = (q: string) => applyFilters([grant, other], parseFilters({ q })).map((i) => i.id);
+  assert.deepEqual(search("146041426"), ["215476423871073"]);
+  assert.deepEqual(search("#146041426"), ["215476423871073"]);
+  assert.deepEqual(search("215476452646387"), ["215476452646387"]);
+  assert.deepEqual(search("farmergrant"), ["215476423871073"]);
+  assert.deepEqual(search("VICTOR@"), ["215476452646387"]);
+  assert.deepEqual(search("tiktok"), ["215476423871073"]);
+  assert.deepEqual(search("nothing like it"), []);
+  assert.equal(matchesQuery(grant, ""), true);
 });
 
 test("weightedPick favors the longest waiting and is driven by the injected rng", () => {

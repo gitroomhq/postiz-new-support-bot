@@ -257,6 +257,9 @@ export interface IntercomWebhookAuthor {
   name?: string | null;
   email?: string | null; // present on contact authors in webhook payloads
   avatar?: { image_url?: string | null } | string | null;
+  // True on a message Fin's AI wrote; false on the Operator's other posts
+  // (the bridge relaying a Discord staff reply).
+  from_ai_agent?: boolean | null;
 }
 
 export interface IntercomWebhookPart {

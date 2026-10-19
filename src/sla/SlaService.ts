@@ -3,7 +3,7 @@ import { SettingsStore } from "../config/SettingsStore";
 import { SlaRuleStore } from "./SlaRuleStore";
 import { SlaFactsLoader } from "./facts";
 import { evaluateRules } from "./evaluate";
-import { SlaDim, SlaEvaluation, SlaFacts, hasClockDurations } from "./types";
+import { SlaDim, SlaEvaluation, SlaFacts, hasClockDurations, targetsMissingFromList } from "./types";
 import { IntercomStore } from "../intercom/IntercomStore";
 import { IntercomClient, IntercomHttpError } from "../intercom/IntercomClient";
 import { TicketStore } from "../bot/TicketStore";
@@ -300,14 +300,23 @@ export class SlaService {
   // Hub subscriptions. Checks what the API can see; returns the manual
   // runbook for the rest. The enforcement-looper liveness check lives in the
   // SLA hub's Verify handler (it has the Temporal producers).
-  async verifySetup(): Promise<{ attributeExists: boolean; statusAttributeExists: boolean; attributeName: string; runbook: string[] }> {
+  async verifySetup(): Promise<{
+    attributeExists: boolean;
+    statusAttributeExists: boolean;
+    attributeName: string;
+    targetsNotInList: string[];
+    runbook: string[];
+  }> {
     const attributeName = this.settingsStore.slaAttributeName();
     const statusAttributeName = this.settingsStore.slaStatusAttributeName();
     let attributeExists = false;
     let statusAttributeExists = false;
+    let listOptions: string[] = [];
     try {
       const attrs = await this.intercomClient.listConversationDataAttributes();
-      attributeExists = attrs.some((a) => a.name === attributeName && !a.archived);
+      const attr = attrs.find((a) => a.name === attributeName && !a.archived);
+      attributeExists = attr != null;
+      listOptions = attr?.options ?? [];
       statusAttributeExists = attrs.some((a) => a.name === statusAttributeName && !a.archived);
     } catch (e) {
       slaLog.warn("sla.verify.attr_list_failed", { "error.message": e instanceof Error ? e.message : String(e) });
@@ -321,6 +330,10 @@ export class SlaService {
       /* informational only — the enforcer find-or-creates it */
     }
     const targets = this.settingsStore.slaTargets();
+    const targetsNotInList = targetsMissingFromList(
+      targets.map((t) => t.value),
+      listOptions
+    );
     const withClocks = targets.filter(hasClockDurations);
     const targetValues = new Set(targets.map((t) => t.value));
     const rulesMissingClocks = this.ruleStore
@@ -332,6 +345,11 @@ export class SlaService {
       attributeExists
         ? `✅ Conversation attribute **${attributeName}** exists.`
         : `❌ Create a **List** conversation attribute named exactly **${attributeName}** (Intercom → Settings → Data → Conversations; the API cannot create it). Options: ${targets.map((t) => `\`${t.value}\``).join(", ") || "add targets first"}.`,
+      ...(targetsNotInList.length > 0
+        ? [
+            `❌ Target(s) ${targetsNotInList.map((t) => `\`${t}\``).join(", ")} are not options of the **${attributeName}** list in Intercom, so every write of them fails (400). Add them as options there (Settings → Data → Conversations), or rename the target(s) here to an existing option: ${listOptions.map((o) => `\`${o}\``).join(", ")}.`,
+          ]
+        : []),
       statusAttributeExists
         ? `✅ Conversation attribute **${statusAttributeName}** exists.`
         : `❌ Create a **List** conversation attribute named exactly **${statusAttributeName}** with options \`ok\`, \`at_risk\`, \`breached\` (the enforcement looper writes it; writes 4xx until it exists).`,
@@ -352,7 +370,7 @@ export class SlaService {
       "Old Expert-tier leftovers: delete the two Apply-SLA Workflows in Intercom if they still exist; native SLAs are gone on Advanced and the bot no longer posts kick notes.",
       "Ticket-attribute mirror: /intercom → Bridge → Ensure Ticket Attributes (unchanged; bridged Customer tickets mirror the target attribute).",
     ];
-    return { attributeExists, statusAttributeExists, attributeName, runbook };
+    return { attributeExists, statusAttributeExists, attributeName, targetsNotInList, runbook };
   }
 
   // ---- internals ----

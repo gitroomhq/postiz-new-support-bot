@@ -6,6 +6,7 @@ import type { QueueViews } from "./queueViews";
 import type { QueueViewRequest } from "./contract";
 import { renderQueueShell } from "./html/queueShell";
 import { queueReadiness, type QueueReadinessSettings } from "./queueConfig";
+import { QUERY_MAX } from "./queueModel";
 
 const panelLog = log.child("queue");
 
@@ -126,5 +127,5 @@ export function viewRequest(request: Record<string, unknown>): QueueViewRequest 
   };
   const cursor = typeof request.cursor === "string" && /^\d{1,6}$/.test(request.cursor) ? request.cursor : null;
   const since = typeof request.since === "string" && VERSION_RE.test(request.since) ? request.since : null;
-  return { page, params: pick(request.params, 32), filters: pick(request.filters, 32), cursor, since };
+  return { page, params: pick(request.params, 32), filters: pick(request.filters, QUERY_MAX), cursor, since };
 }

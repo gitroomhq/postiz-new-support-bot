@@ -81,9 +81,11 @@ function restoreTicket(v: unknown): QueueTicketInfo | null {
   const o = obj(v);
   if (!o || typeof o.id !== "string" || !o.id) return null;
   const fields = [o.stateId, o.stateCategory, o.stateLabel, o.typeId, o.typeName].map(optStr);
-  if (fields.some((f) => f === undefined)) return null;
+  // Saved before the number was kept: none.
+  const number = o.number === undefined ? null : optStr(o.number);
+  if (fields.some((f) => f === undefined) || number === undefined) return null;
   const [stateId, stateCategory, stateLabel, typeId, typeName] = fields as Array<string | null>;
-  return { id: o.id, stateId, stateCategory, stateLabel, typeId, typeName };
+  return { id: o.id, number, stateId, stateCategory, stateLabel, typeId, typeName };
 }
 
 function restoreConversation(v: unknown): QueueConversation | null {
@@ -103,6 +105,8 @@ function restoreConversation(v: unknown): QueueConversation | null {
   if (o.ticketInline !== null && !ticketInline) return null;
   const slaStatus = o.slaStatus === null ? null : typeof o.slaStatus === "string" && SLA_VALUES.has(o.slaStatus) ? (o.slaStatus as QueueSla) : undefined;
   if (slaStatus === undefined) return null;
+  // Saved before the handoff was kept: none.
+  if (o.finHandedOff !== undefined && typeof o.finHandedOff !== "boolean") return null;
   return {
     id: o.id,
     state: o.state,
@@ -121,6 +125,7 @@ function restoreConversation(v: unknown): QueueConversation | null {
     tagIds: o.tagIds as string[],
     ticketId,
     ticketInline,
+    finHandedOff: o.finHandedOff === true,
     lastContactReplyAt,
     lastAdminReplyAt,
     slaStatus,
