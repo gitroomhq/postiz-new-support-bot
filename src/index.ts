@@ -565,6 +565,7 @@ async function main() {
   const queueData = new QueueData(intercomClient, settingsStore);
   queueData.setCache(new QueueCacheStore(prisma));
   queueData.setResolutions(new QueueResolutionStore(prisma));
+  replyStateService.setQueueResolvedCheck((conversationId) => queueData.isResolved(conversationId));
   intercomWebhookHandler.setQueueListener((topic, itemId) => queueData.noteWebhook(topic, itemId));
   const queueSessions = new QueueSessions(prisma);
   const queueAuth = new QueueAuth(settingsStore, queueData, queueSessions, (event) => {

@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { ReplyStateService } from "../ReplyStateService";
+import { SWEEP_CATEGORIES } from "../replyState";
 import { IntercomHttpError, type IntercomClient } from "../IntercomClient";
 import type { IntercomStore } from "../IntercomStore";
 import type { IntercomSyncService } from "../IntercomSyncService";
@@ -38,6 +39,7 @@ const TAGS = [
   { id: "t-ongoing", emoji: "🟡", label: "Ongoing", closesThread: false, reminderTarget: "SUPPORT", intercomTicketStateId: "p2" },
   { id: "t-woc", emoji: "🟠", label: "Waiting for Customer", closesThread: false, reminderTarget: "CUSTOMER", intercomTicketStateId: "w1" },
   { id: "t-wfd", emoji: "🔵", label: "Waiting for Developer", closesThread: false, reminderTarget: "SUPPORT", intercomTicketStateId: "p1" },
+  { id: "t-solved", emoji: "✅", label: "Solved", closesThread: false, reminderTarget: "SUPPORT", intercomTicketStateId: "r1" },
   { id: "t-closed", emoji: "📁", label: "Closed", closesThread: true, reminderTarget: "SUPPORT", intercomTicketStateId: "r1" },
 ];
 
@@ -52,9 +54,11 @@ function makeHarness(opts: {
   link?: { lastSyncedStateId?: string | null; lastSyncedOpen?: string | null } | null;
   ticket?: { closed?: boolean; statusTagId?: string } | null;
   rejectWrite?: boolean;
+  queueResolved?: boolean;
 }) {
   const writes: string[] = [];
   const ops: string[] = [];
+  let reads = 0;
   let row: Row | null = opts.row
     ? {
         ticketId: "T",
@@ -78,6 +82,7 @@ function makeHarness(opts: {
   });
   const client = {
     async getConversationReplyView() {
+      reads++;
       return { ticketId: "T", state: opts.convState ?? "open", parts: opts.parts ?? [] };
     },
     async getTicketStateView() {
@@ -143,7 +148,8 @@ function makeHarness(opts: {
   service.setDiscordStatusRequester(async (_t, tagId, actor) => {
     ops.push(`discord:${tagId}:${actor}`);
   });
-  return { service, writes, ops, row: () => row };
+  if (opts.queueResolved !== undefined) service.setQueueResolvedCheck(async () => opts.queueResolved!);
+  return { service, writes, ops, row: () => row, reads: () => reads };
 }
 
 const customerPart = (at: number): IntercomWebhookPart => ({ id: "c", part_type: "comment", body: "<p>hi</p>", created_at: at, author: { id: "u", type: "user" } });
@@ -170,18 +176,50 @@ test("native customer reply on an In progress ticket remembers that exact state"
   assert.deepEqual(h.ops, ["upsert:in_progress:p2:null"]);
 });
 
-test("native customer reply: already in the state, a resolved origin, a type without the state, a closed conversation do nothing", async () => {
-  const already = makeHarness({ stateId: CR });
-  await already.service.onNativeCustomerReply("T", item([customerPart(1000)]));
-  assert.deepEqual(already.writes, []);
+test("native customer reply on a Resolved ticket moves it, also after Intercom's own move to In progress", async () => {
+  const resolved = makeHarness({ stateId: "r1" });
+  await resolved.service.onNativeCustomerReply("T", item([customerPart(1000)]));
+  assert.deepEqual(resolved.writes, [CR]);
+  assert.deepEqual(resolved.ops, ["upsert:resolved:r1:null"]);
 
-  const resolved = makeHarness({
+  const moved = makeHarness({
     stateId: "p1",
     changes: [{ previous: "resolved", current: "in_progress", createdAt: 1001, authorType: "bot", authorId: OPERATOR, appPackageCode: null }],
   });
-  await resolved.service.onNativeCustomerReply("T", item([customerPart(1000)]));
-  assert.deepEqual(resolved.writes, []);
-  assert.deepEqual(resolved.ops, ["delete"]);
+  await moved.service.onNativeCustomerReply("T", item([customerPart(1000)]));
+  assert.deepEqual(moved.writes, [CR]);
+  assert.deepEqual(moved.ops, ["upsert:resolved:null:null"]);
+});
+
+test("Sync Now leaves Resolved tickets alone", async () => {
+  const h = makeHarness({ stateId: "r1" });
+  assert.equal(await h.service.applyNativeCustomerReply("T", 1000, SWEEP_CATEGORIES), "not-eligible");
+  assert.deepEqual(h.writes, []);
+  const open = makeHarness({ stateId: "p2" });
+  assert.equal(await open.service.applyNativeCustomerReply("T", 1000, SWEEP_CATEGORIES), "moved");
+});
+
+test("a conversation marked resolved on the queue is never moved, native or bridged", async () => {
+  const native = makeHarness({ stateId: "p2", queueResolved: true });
+  await native.service.onNativeCustomerReply("T", item([customerPart(1000)]));
+  assert.deepEqual(native.writes, []);
+  assert.equal(native.reads(), 0, "decided before any Intercom read");
+  assert.equal(await native.service.applyNativeCustomerReply("T", 1000), "queue-resolved");
+
+  const bridged = makeHarness({ stateId: "p1", link: { lastSyncedStateId: "p1" }, queueResolved: true });
+  await bridged.service.executeBridged("th", { kind: "customer", baseTagId: "t-woc" });
+  assert.deepEqual(bridged.writes, []);
+  assert.deepEqual(bridged.ops, []);
+
+  const unmarked = makeHarness({ stateId: "p2", queueResolved: false });
+  await unmarked.service.onNativeCustomerReply("T", item([customerPart(1000)]));
+  assert.deepEqual(unmarked.writes, [CR]);
+});
+
+test("native customer reply: already in the state, a type without the state, a closed conversation do nothing", async () => {
+  const already = makeHarness({ stateId: CR });
+  await already.service.onNativeCustomerReply("T", item([customerPart(1000)]));
+  assert.deepEqual(already.writes, []);
 
   const lacking = makeHarness({ stateId: "p2", typeStates: STATES.filter((s) => s.id !== CR) });
   await lacking.service.onNativeCustomerReply("T", item([customerPart(1000)]));
@@ -211,10 +249,14 @@ test("native teammate reply restores the remembered state and drops the row", as
   assert.deepEqual(h.ops, ["delete"]);
 });
 
-test("native teammate reply: Submitted and category-only Waiting on customer both land on Waiting on customer", async () => {
+test("native teammate reply: Submitted, Resolved and category-only Waiting on customer all land on Waiting on customer", async () => {
   const submitted = makeHarness({ stateId: CR, row: { baseStateId: "s1", baseCategory: "submitted" } });
   await submitted.service.onNativeAgentReply("T", item([agentPart]));
   assert.deepEqual(submitted.writes, ["w1"]);
+
+  const resolved = makeHarness({ stateId: CR, row: { baseStateId: "r1", baseCategory: "resolved" } });
+  await resolved.service.onNativeAgentReply("T", item([agentPart]));
+  assert.deepEqual(resolved.writes, ["w1"]);
 
   const woc = makeHarness({ stateId: CR, row: { baseStateId: null, baseCategory: "waiting_on_customer" } });
   await woc.service.onNativeAgentReply("T", item([agentPart]));
@@ -317,6 +359,28 @@ test("bridged staff reply on an unchanged Discord status only moves Intercom", a
   await h.service.executeBridged("th", { kind: "agent" });
   assert.deepEqual(h.writes, ["p2"]);
   assert.deepEqual(h.ops, ["synced:p2", "delete"]);
+});
+
+test("bridged customer message on a resolved (not closing) status moves it; Sync Now skips it", async () => {
+  const live = makeHarness({ stateId: "r1", ticket: { statusTagId: "t-solved" }, link: { lastSyncedStateId: "r1" } });
+  await live.service.executeBridged("th", { kind: "customer", baseTagId: "t-solved" });
+  assert.deepEqual(live.writes, [CR]);
+  assert.deepEqual(live.ops, [`synced:${CR}`, "upsert:resolved:r1:t-solved"]);
+
+  const sweep = makeHarness({ stateId: "r1", ticket: { statusTagId: "t-solved" }, link: { lastSyncedStateId: "r1" } });
+  await sweep.service.executeBridged("th", { kind: "customer", baseTagId: "t-solved", sweep: true });
+  assert.deepEqual(sweep.writes, []);
+});
+
+test("bridged staff reply on a ticket that was resolved lands on Waiting for Customer", async () => {
+  const h = makeHarness({
+    stateId: CR,
+    ticket: { statusTagId: "t-solved" },
+    row: { threadId: "th", baseTagId: "t-solved", baseStateId: "r1", baseCategory: "resolved" },
+  });
+  await h.service.executeBridged("th", { kind: "agent" });
+  assert.deepEqual(h.writes, ["w1"]);
+  assert.deepEqual(h.ops, ["synced:w1", "discord:t-woc:Agent reply", "delete"]);
 });
 
 test("bridged: closed tickets and closing base tags are left alone", async () => {

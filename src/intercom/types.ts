@@ -156,6 +156,7 @@ export interface MessageDeletePayload {
 export interface ReplyStatePayload {
   kind: "customer" | "agent";
   baseTagId?: string | null; // customer only
+  sweep?: boolean; // customer only: queued by Sync Now, which skips Resolved
 }
 
 export type OutboxPayload =

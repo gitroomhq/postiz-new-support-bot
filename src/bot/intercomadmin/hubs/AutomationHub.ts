@@ -120,7 +120,7 @@ export class AutomationHub {
         "",
         "**Customer responded state** (Intercom tickets, native and Discord-bridged):",
         `**Status:** ${s.replyStateEnabled() ? "**on**" : "**off**"} · **state:** ${replyStateLine} · **awaiting our reply:** ${waiting}`,
-        "A customer reply on a ticket in Submitted, In progress or Waiting on customer moves it to this state. The next teammate reply (Intercom inbox, or a staff message in the Discord thread) moves it back where it was; Submitted goes to Waiting on customer. Fin, bots and internal notes never count, and a state changed by hand wins over the restore. Bridged tickets also get their Discord status back. **Sync Now** moves every open ticket whose customer spoke last.",
+        "A customer reply on a ticket in Submitted, In progress, Waiting on customer or Resolved moves it to this state; tickets marked resolved on the Intercom Queue are left alone. The next teammate reply (Intercom inbox, or a staff message in the Discord thread) moves it back where it was; Submitted and Resolved go to Waiting on customer. Fin, bots and internal notes never count, and a state changed by hand wins over the restore. Bridged tickets also get their Discord status back. **Sync Now** moves every open ticket whose customer spoke last, Resolved ones aside.",
         "",
         "**Resolve on close** (Intercom Customer tickets, native and Discord-bridged):",
         `**Status:** ${s.resolveOnCloseEnabled() ? "**on**" : "**off**"} · **state:** ${closeStateLine} · **backfill:** ${backfilledAt ? `done ${backfilledAt.toISOString().slice(0, 10)}` : "pending"}`,

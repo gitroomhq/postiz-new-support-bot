@@ -6,9 +6,14 @@ import type { IntercomTicketState, IntercomTicketStateChange, IntercomWebhookPar
 // ReplyStateService does the I/O; everything here is deterministic and
 // unit-tested.
 
-// A customer reply only moves tickets sitting in one of these categories
-// (operator decision). Resolved tickets keep Intercom's own reopen behavior.
-export const TRIGGER_CATEGORIES: ReadonlySet<string> = new Set(["submitted", "in_progress", "waiting_on_customer"]);
+// A customer reply moves tickets sitting in any of these categories
+// (operator decision): a Resolved ticket the customer writes into is live
+// again, and our next reply sends it to Waiting on customer.
+export const TRIGGER_CATEGORIES: ReadonlySet<string> = new Set(["submitted", "in_progress", "waiting_on_customer", "resolved"]);
+
+// The one-time Sync Now sweep leaves Resolved tickets alone: an old trailing
+// "thanks" on one is no reply to chase (operator decision).
+export const SWEEP_CATEGORIES: ReadonlySet<string> = new Set(["submitted", "in_progress", "waiting_on_customer"]);
 
 // Actor names on the Discord status changes this flow causes. The customer
 // reply flip in DiscordBot (and the timer self-heal) stamps the first; the

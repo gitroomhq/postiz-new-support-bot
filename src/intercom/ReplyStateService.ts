@@ -16,6 +16,7 @@ import type {
 import {
   AGENT_REPLY_ACTOR,
   CUSTOMER_REPLY_ACTOR,
+  SWEEP_CATEGORIES,
   TRIGGER_CATEGORIES,
   autoTransitionOrigin,
   autoTransitionOriginFromParts,
@@ -45,6 +46,7 @@ export type NativeCustomerOutcome =
   | "not-eligible"
   | "type-lacks-state"
   | "rejected"
+  | "queue-resolved"
   | "gone";
 
 export interface ReplySyncReport {
@@ -73,6 +75,9 @@ export class ReplyStateService {
   // Applies a Discord status change for a bridged restore; bound from index.ts
   // (signal into the ticket workflow, direct StatusService otherwise).
   private discordStatus: ((threadId: string, tagId: string, actorName: string) => Promise<void>) | null = null;
+  // Whether a conversation is marked resolved on the Intercom Queue; bound
+  // from index.ts. A customer reply never moves those (operator decision).
+  private queueResolved: ((conversationId: string) => Promise<boolean>) | null = null;
 
   constructor(
     private client: IntercomClient,
@@ -85,6 +90,14 @@ export class ReplyStateService {
 
   setDiscordStatusRequester(fn: (threadId: string, tagId: string, actorName: string) => Promise<void>): void {
     this.discordStatus = fn;
+  }
+
+  setQueueResolvedCheck(fn: (conversationId: string) => Promise<boolean>): void {
+    this.queueResolved = fn;
+  }
+
+  private async isQueueResolved(conversationId: string): Promise<boolean> {
+    return this.queueResolved ? this.queueResolved(conversationId) : false;
   }
 
   // The configured state id while the feature is live, else null.
@@ -166,9 +179,16 @@ export class ReplyStateService {
     }
   }
 
-  async applyNativeCustomerReply(conversationId: string, replyAtSec: number): Promise<NativeCustomerOutcome> {
+  // `categories`: the base categories a reply moves; the Sync Now sweep passes
+  // a narrower set.
+  async applyNativeCustomerReply(
+    conversationId: string,
+    replyAtSec: number,
+    categories: ReadonlySet<string> = TRIGGER_CATEGORIES
+  ): Promise<NativeCustomerOutcome> {
     const cr = this.customerStateId();
     if (!cr) return "not-eligible";
+    if (await this.isQueueResolved(conversationId)) return "queue-resolved";
     const conv = await this.client.getConversationReplyView(conversationId);
     if (!conv) return "gone";
     if (!conv.ticketId) return "not-ticket";
@@ -193,7 +213,7 @@ export class ReplyStateService {
         baseCategory = origin;
       }
     }
-    if (!baseCategory || !TRIGGER_CATEGORIES.has(baseCategory)) {
+    if (!baseCategory || !categories.has(baseCategory)) {
       await this.store.deleteReplyState(view.id);
       return "not-eligible";
     }
@@ -282,7 +302,8 @@ export class ReplyStateService {
     const view = await this.client.getTicketStateView(link.ticketId);
     if (!view) return;
     if (payload.kind === "customer") {
-      await this.bridgedCustomer(threadId, link, view, cr, payload.baseTagId ?? null);
+      if (await this.isQueueResolved(link.conversationId)) return;
+      await this.bridgedCustomer(threadId, link, view, cr, payload.baseTagId ?? null, payload.sweep === true);
     } else {
       await this.bridgedAgent(threadId, link, ticket.statusTagId, view, cr);
     }
@@ -293,16 +314,18 @@ export class ReplyStateService {
     link: IntercomLink,
     view: IntercomTicketStateView,
     cr: string,
-    baseTagId: string | null
+    baseTagId: string | null,
+    sweep: boolean
   ): Promise<void> {
     if (view.stateId === cr) return; // a follow-up message: the first base stands
     const baseTag = baseTagId ? this.settingsStore.tagById(baseTagId) : undefined;
-    if (baseTag && (baseTag.closesThread || isResolvedTag(baseTag))) return;
+    // A resolved (not closing) status counts like any other; the sweep skips it.
+    if (baseTag && (baseTag.closesThread || (sweep && isResolvedTag(baseTag)))) return;
     // The Intercom state the ticket had before the message: its pre-message
     // tag's mapping, else what the bridge last pushed, else what is live now.
     const baseStateId = baseTag?.intercomTicketStateId ?? link.lastSyncedStateId ?? view.stateId;
     const baseCategory = (await this.categoryOf(baseStateId, view)) ?? view.stateCategory;
-    if (!baseCategory || !TRIGGER_CATEGORIES.has(baseCategory)) return;
+    if (!baseCategory || !(sweep ? SWEEP_CATEGORIES : TRIGGER_CATEGORIES).has(baseCategory)) return;
     if (view.typeStates && !view.typeStates.some((s) => s.id === cr)) {
       this.rsLog.info("customer-responded state not enabled on this ticket type", { "ticket.thread_id": threadId });
       return;
@@ -399,10 +422,11 @@ export class ReplyStateService {
 
   // ---- one-time sweep (/intercom → Automation → Sync Now) ----
 
-  // Moves every open ticket whose customer spoke last into the state. Native
-  // tickets are decided by the conversation statistics (Fin never counts as a
-  // reply there either); bridged ones by their parts, where the bridge's own
-  // posts are the Discord staff replies, and are queued through the outbox.
+  // Moves every open ticket whose customer spoke last into the state, Resolved
+  // ones and those marked resolved on the queue aside. Native tickets are
+  // decided by the conversation statistics (Fin never counts as a reply there
+  // either); bridged ones by their parts, where the bridge's own posts are the
+  // Discord staff replies, and are queued through the outbox.
   async syncNow(): Promise<ReplySyncReport> {
     const report: ReplySyncReport = {
       scanned: 0,
@@ -426,7 +450,11 @@ export class ReplyStateService {
           if (!link) {
             if (conv.lastAdminReplyAt && conv.lastAdminReplyAt.getTime() >= conv.lastContactReplyAt.getTime()) continue;
             report.candidates++;
-            const outcome = await this.applyNativeCustomerReply(conv.id, Math.floor(conv.lastContactReplyAt.getTime() / 1000));
+            const outcome = await this.applyNativeCustomerReply(
+              conv.id,
+              Math.floor(conv.lastContactReplyAt.getTime() / 1000),
+              SWEEP_CATEGORIES
+            );
             if (outcome === "moved") report.moved++;
             else if (outcome === "already") report.already++;
             else if (outcome === "type-lacks-state") report.typeLacksState++;
@@ -466,7 +494,7 @@ export class ReplyStateService {
     const prev = ticket.prevStatusTagId ? this.settingsStore.tagById(ticket.prevStatusTagId) : undefined;
     const baseTagId =
       replyTarget && ticket.statusTagId === replyTarget.id && prev?.reminderTarget === "CUSTOMER" ? prev.id : ticket.statusTagId;
-    await this.sync.onReplyState(link.ticketThreadId, { kind: "customer", baseTagId });
+    await this.sync.onReplyState(link.ticketThreadId, { kind: "customer", baseTagId, sweep: true });
     return "queued";
   }
 }
@@ -478,7 +506,9 @@ export function formatReplySyncReport(r: ReplySyncReport): string {
   ];
   if (r.already) lines.push(`${r.already} were already in the state.`);
   if (r.typeLacksState) lines.push(`${r.typeLacksState} skipped: their ticket type does not have the state enabled.`);
-  if (r.skipped) lines.push(`${r.skipped} skipped (not a ticket, not open, or not in Submitted / In progress / Waiting on customer).`);
+  if (r.skipped) {
+    lines.push(`${r.skipped} skipped (not a ticket, not open, marked resolved in the queue, or not in Submitted / In progress / Waiting on customer).`);
+  }
   if (r.failed) lines.push(`${r.failed} failed; rerun to retry them.`);
   return lines.join("\n");
 }

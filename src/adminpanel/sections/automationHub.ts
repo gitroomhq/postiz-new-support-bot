@@ -65,7 +65,7 @@ export function makeAutomationHub(deps: {
           key: "replyState",
           title: "Customer responded state",
           description:
-            "A customer reply on an Intercom ticket in Submitted, In progress or Waiting on customer moves it to this state. The next teammate reply (Intercom inbox, or a staff message in the Discord thread) moves it back where it was; Submitted goes to Waiting on customer. Fin, bots and internal notes never count, and a state changed by hand wins over the restore. Discord-bridged tickets also get their Discord status back.",
+            "A customer reply on an Intercom ticket in Submitted, In progress, Waiting on customer or Resolved moves it to this state; tickets marked resolved on the Intercom Queue are left alone. The next teammate reply (Intercom inbox, or a staff message in the Discord thread) moves it back where it was; Submitted and Resolved go to Waiting on customer. Fin, bots and internal notes never count, and a state changed by hand wins over the restore. Discord-bridged tickets also get their Discord status back.",
           ...(statesError ? { notice: { kind: "error" as const, text: `Could not list Intercom ticket states: ${statesError}` } } : {}),
           fields: [
             { type: "toggle", key: "replyStateEnabled", label: "Enabled", value: s.replyStateEnabled() },
