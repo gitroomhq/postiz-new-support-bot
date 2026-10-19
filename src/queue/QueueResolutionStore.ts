@@ -18,7 +18,6 @@ export class QueueResolutionStore implements QueueResolutions {
     const rows = await this.db.queueResolution.findMany({ orderBy: { resolvedAt: "desc" }, take: MAX_LOADED });
     return rows.map((r) => ({
       conversationId: r.conversationId,
-      untilReply: r.untilReply,
       lastContactAt: r.lastContactAt,
       note: r.note,
       title: r.title,
@@ -32,7 +31,9 @@ export class QueueResolutionStore implements QueueResolutions {
 
   async put(r: QueueResolution): Promise<void> {
     const data = {
-      untilReply: r.untilReply,
+      // Every mark holds until restored; the column is left from when a mark
+      // could end with the customer's next message.
+      untilReply: false,
       lastContactAt: r.lastContactAt,
       note: r.note,
       title: r.title,

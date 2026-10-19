@@ -50,8 +50,9 @@ test("put upserts by conversation; remove deletes the given ones and skips an em
   const store = new QueueResolutionStore(db);
   const [row] = await store.list();
   await store.put({ ...row, note: "tracked as a bug" });
-  const upsert = calls[1].args as { where: unknown; create: { resolvedAt: Date; note: string }; update: { note: string } };
+  const upsert = calls[1].args as { where: unknown; create: { resolvedAt: Date; note: string; untilReply: boolean }; update: { note: string } };
   assert.deepEqual(upsert.where, { conversationId: "215476423871073" });
+  assert.equal(upsert.create.untilReply, false, "every mark holds until restored");
   assert.equal(upsert.create.resolvedAt.getTime(), 1_792_391_206_000);
   assert.equal(upsert.update.note, "tracked as a bug");
   await store.remove([]);

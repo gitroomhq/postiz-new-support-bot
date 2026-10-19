@@ -66,12 +66,11 @@ export interface QueueCache {
 }
 
 // A ticket a teammate marked resolved on the queue: hidden from every page
-// for everyone. untilReply: back on the customer's next message (after
-// lastContactAt, unix seconds); otherwise hidden until restored. resolvedAt
-// is in ms.
+// for everyone until someone restores it, through new customer messages and
+// closes alike (operator decision). lastContactAt is the customer's last
+// message when it was marked (unix seconds); resolvedAt is in ms.
 export interface QueueResolution {
   conversationId: string;
-  untilReply: boolean;
   lastContactAt: number | null;
   note: string | null;
   title: string;
@@ -736,36 +735,10 @@ export class QueueData {
     });
   }
 
-  // Hides what was marked resolved. An until-reply mark ends with the
-  // customer's next message (the ticket is back), or once the conversation
-  // is closed; a never mark stays until someone restores it.
+  // Hides what was marked resolved; only a restore brings it back.
   private withoutResolved(items: QueueItem[]): QueueItem[] {
     if (!this.resolutions.size) return items;
-    const ended: string[] = [];
-    const kept = items.filter((i) => {
-      const r = this.resolutions.get(i.id);
-      if (!r) return true;
-      if (r.untilReply && i.lastContactAt > (r.lastContactAt ?? 0)) {
-        ended.push(i.id);
-        return true;
-      }
-      return false;
-    });
-    // A truncated scan may simply not have reached a conversation.
-    if (!this.truncated) {
-      for (const [id, r] of this.resolutions) {
-        const c = this.convs.get(id);
-        if (r.untilReply && (!c || c.state === "closed")) ended.push(id);
-      }
-    }
-    if (ended.length) {
-      for (const id of ended) this.resolutions.delete(id);
-      this.bump();
-      void this.resolutionStore?.remove(ended).catch((e) => {
-        queueLog.warn("queue resolutions remove failed", { "error.message": e instanceof Error ? e.message : String(e) });
-      });
-    }
-    return kept;
+    return items.filter((i) => !this.resolutions.has(i.id));
   }
 
   // A new list wakes the long-polls only when something in it changed.
@@ -947,11 +920,10 @@ export class QueueData {
 
   // Hides a waiting ticket for everyone. Stored first: a failed write throws
   // and changes nothing.
-  async resolve(by: { adminId: string; name: string }, item: QueueItem, opts: { untilReply: boolean; note: string | null }): Promise<void> {
+  async resolve(by: { adminId: string; name: string }, item: QueueItem, opts: { note: string | null }): Promise<void> {
     if (this.resolutionsLoad) await this.resolutionsLoad;
     const r: QueueResolution = {
       conversationId: item.id,
-      untilReply: opts.untilReply,
       lastContactAt: item.lastContactAt,
       note: opts.note,
       title: item.title,
@@ -978,6 +950,13 @@ export class QueueData {
     await this.derive();
     this.bump();
     return true;
+  }
+
+  // Whether a conversation is marked resolved here: the customer-responded
+  // flip leaves those alone.
+  async isResolved(conversationId: string): Promise<boolean> {
+    if (this.resolutionsLoad) await this.resolutionsLoad;
+    return this.resolutions.has(conversationId);
   }
 
   // Newest first.

@@ -156,21 +156,16 @@ export class QueueViews {
   }
 
   // Any signed-in teammate may resolve a ticket that waits on a reply; it is
-  // hidden for everyone, and Intercom is not changed.
+  // hidden for everyone until restored, and Intercom is not changed.
   private async resolveTicket(actor: QueueActor, params: Record<string, unknown>): Promise<QueueActionResult> {
     const id = typeof params.conversationId === "string" && ID_RE.test(params.conversationId) ? params.conversationId : null;
     if (!id) return { ok: false, error: "Unknown ticket." };
-    const untilReply = params.comesBack === "reply" ? true : params.comesBack === "never" ? false : null;
-    if (untilReply === null) return { ok: false, error: "Pick whether it comes back." };
     const note = cleanNote(params.note);
     if (note === undefined) return { ok: false, error: `Keep the note under ${NOTE_MAX} characters.` };
     const item = (await this.data.snapshot()).items.find((i) => i.id === id);
     if (!item) return { ok: false, error: "This ticket no longer waits on a reply." };
-    await this.data.resolve({ adminId: actor.adminId, name: actor.name }, item, { untilReply, note });
-    return {
-      ok: true,
-      text: untilReply ? "Resolved. It comes back when the customer writes again." : "Resolved. It stays hidden until someone restores it.",
-    };
+    await this.data.resolve({ adminId: actor.adminId, name: actor.name }, item, { note });
+    return { ok: true, text: "Resolved. It stays hidden, even when the customer writes again, until someone restores it." };
   }
 
   private async restoreTicket(params: Record<string, unknown>): Promise<QueueActionResult> {
@@ -181,25 +176,14 @@ export class QueueViews {
       : { ok: false, error: "It is not marked resolved any more." };
   }
 
-  // The Resolve dialog: whether it comes back, and an optional note for the
-  // Resolved list.
+  // The Resolve dialog: an optional note for the Resolved list.
   private resolveAction(i: QueueItem): QueueAction {
     return {
       key: "section:queue.resolve",
       label: "Resolve",
       params: { conversationId: i.id },
-      summary: `Hide "${i.title}" from the queue for everyone. Intercom is not changed; Restore it from Resolved in the sidebar.`,
+      summary: `Hide "${i.title}" from the queue for everyone until someone restores it from Resolved in the sidebar, even when the customer writes again. Intercom is not changed, and a customer reply does not move it to Customer responded.`,
       inputs: [
-        {
-          type: "select",
-          key: "comesBack",
-          label: "Comes back",
-          options: [
-            { value: "reply", label: "When the customer writes again" },
-            { value: "never", label: "Never, until someone restores it" },
-          ],
-          value: "reply",
-        },
         { type: "text", key: "note", label: "Note (optional)", placeholder: "Handled in Discord, duplicate, tracked as a bug...", maxLength: NOTE_MAX },
       ],
     };
@@ -642,7 +626,6 @@ export class QueueViews {
         { key: "customer", label: "Customer" },
         { key: "by", label: "Resolved by" },
         { key: "when", label: "When" },
-        { key: "back", label: "Comes back" },
         { key: "note", label: "Note" },
         { key: "open", label: "" },
       ],
@@ -655,7 +638,6 @@ export class QueueViews {
             { t: "text", v: r.customer ?? "Unknown customer" },
             { t: "text", v: r.resolvedByName },
             { t: "date", v: at, iso: at },
-            { t: "badge", b: r.untilReply ? { kind: "info", text: "On reply" } : { kind: "neutral", text: "Never" } },
             { t: "text", v: r.note ?? "" },
             { t: "external", v: "Open", href: this.data.inboxUrl(r.conversationId, ctx.workspace) },
           ],
@@ -675,7 +657,7 @@ export class QueueViews {
         {
           type: "notice",
           badge: { kind: "info", text: "Queue only" },
-          text: "Hidden from the queue for everyone; Intercom is not changed. On reply: back when the customer writes again, and gone from this list once the conversation closes. Never: hidden until restored.",
+          text: "Hidden from the queue for everyone until restored, through new customer messages and closes alike. Intercom is not changed, and a customer reply does not move the ticket to Customer responded.",
         },
         table,
       ],
