@@ -5,9 +5,8 @@ import { strandedKey, strandedRunsQuery, type StrandedRun } from "../producers";
 import type { AuditEvent } from "../../bot/AuditLogger";
 
 // A run started before the task queue setting changed never runs again and
-// silently swallows every signal. The repair terminates it and heals the
-// ticket from Discord and Intercom; nothing may be healed into a run that is
-// about to be terminated.
+// silently swallows every signal. Worker start only reports it; /ticket
+// repairs one ticket by terminating its runs, then healing it.
 
 const run = (kind: StrandedRun["kind"], key: string): StrandedRun => ({
   kind,
@@ -66,46 +65,30 @@ test("key: thread and conversation ids come off the workflow ids, odd ids are sk
   assert.equal(strandedKey("inbox", "icx-"), null);
 });
 
-test("sweep: every run is terminated before any heal, and a ticket with a stranded inbox is healed once", async () => {
+test("worker start only reports: nothing is terminated or healed, and the tickets are listed", async () => {
+  // An automatic bulk repair reopened and unassigned tickets teammates had
+  // closed in Intercom; the boot pass must stay read-only.
   const { repair, ops, audits } = harness({
     runs: [run("ticket", "t1"), run("inbox", "c1"), run("inbox", "native")],
     links: { c1: "t1" },
+    others: { refundWorkflow: 1 },
   });
-  const r = await repair.sweep();
-  const firstHeal = ops.findIndex((o) => o.startsWith("repair:"));
-  const lastTerminate = ops.map((o) => o.startsWith("terminate:")).lastIndexOf(true);
-  assert.ok(lastTerminate < firstHeal, "no heal before the last terminate");
-  assert.deepEqual(
-    ops.filter((o) => o.startsWith("repair:") || o.startsWith("inbound:")),
-    ["repair:t1", "inbound:t1:c1"]
-  );
-  assert.ok(ops.includes("nudge:t1"), "timers come back on a fresh run");
+  const r = await repair.report();
+  assert.deepEqual(ops, []);
   assert.equal(r?.tickets, 1);
   assert.equal(r?.inboxes, 2);
-  assert.deepEqual(r?.repaired, [{ threadId: "t1", recovered: 3, inbound: 1 }]);
+  assert.deepEqual(r?.threads, ["t1"]);
   assert.equal(audits.length, 1);
-  assert.match(JSON.stringify(audits[0].fields), /support-bot/);
+  const fields = JSON.stringify(audits[0].fields);
+  assert.match(fields, /support-bot/);
+  assert.match(fields, /<#t1>/);
+  assert.match(fields, /refundWorkflow ×1/);
 });
 
-test("sweep: nothing stranded posts nothing, even with other stranded types (log only)", async () => {
-  const { repair, audits, ops } = harness({ others: { stripeEventWorkflow: 2 } });
-  assert.equal(await repair.sweep(), null);
+test("worker start with nothing stranded posts nothing", async () => {
+  const { repair, audits } = harness();
+  assert.equal(await repair.report(), null);
   assert.equal(audits.length, 0);
-  assert.equal(ops.length, 0);
-});
-
-test("sweep: other stranded types are reported alongside a repair, never touched", async () => {
-  const { repair, audits, ops } = harness({ runs: [run("ticket", "t1")], others: { refundWorkflow: 1 } });
-  await repair.sweep();
-  assert.ok(!ops.some((o) => o.includes("refund")));
-  assert.match(JSON.stringify(audits[0].fields), /refundWorkflow ×1/);
-});
-
-test("sweep: a ticket whose row is gone is skipped and counted", async () => {
-  const { repair } = harness({ runs: [run("ticket", "gone"), run("ticket", "t2")] });
-  const r = await repair.sweep();
-  assert.equal(r?.gone, 1);
-  assert.deepEqual(r?.repaired.map((t) => t.threadId), ["t2"]);
 });
 
 test("one ticket: its own run and its conversation's inbox run go, then the heal", async () => {

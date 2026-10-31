@@ -239,8 +239,8 @@ export class DiscordBot {
     audit: (entry) => void this.audit.log(entry),
   });
   // Ticket and inbox workflows stranded on a task queue no worker polls:
-  // swept on every worker start (repairStrandedRuns), one ticket at a time
-  // from /ticket.
+  // reported on every worker start (reportStrandedRuns), repaired one ticket
+  // at a time from /ticket.
   private strandedRepair = new StrandedRunRepair({
     temporal: () => this.temporalProducers,
     getTicket: (threadId) => this.ticketStore.getByThreadId(threadId),
@@ -250,7 +250,6 @@ export class DiscordBot {
     repair: (ticket, messages) => this.intercomSync.repairTicket(ticket, messages, { releaseStaleClaim: false }),
     inboundHeal: (threadId, conversationId) => this.inboundHealOf(threadId, conversationId),
     audit: (entry) => void this.audit.log(entry),
-    pause: () => new Promise((r) => setTimeout(r, 150)),
   });
   private sentryFeedbackClient: SentryFeedbackClient | null = null;
   // Sentry feedback import ledger, bound late from index.ts; the /config
@@ -324,9 +323,10 @@ export class DiscordBot {
     });
   }
 
-  // Worker start (index.ts): terminate and heal every stranded run. Never throws.
-  async repairStrandedRuns(): Promise<void> {
-    await this.strandedRepair.sweep();
+  // Worker start (index.ts): post one audit entry listing stranded runs, if
+  // any. Changes nothing. Never throws.
+  async reportStrandedRuns(): Promise<void> {
+    await this.strandedRepair.report();
   }
 
   private async threadMessagesOf(threadId: string): Promise<BridgeSourceMessage[] | null> {

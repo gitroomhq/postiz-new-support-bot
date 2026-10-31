@@ -1012,8 +1012,7 @@ async function main() {
     if (enabled) {
       await temporalProducers.ensureBaseline().catch((e) => bootLog.error("temporal baseline setup failed", e));
       await workerManager.start(activities as unknown as Record<string, unknown>);
-      // After the worker polls: the heal starts fresh runs that must execute.
-      void bot.repairStrandedRuns();
+      void bot.reportStrandedRuns();
     } else {
       await workerManager.shutdown();
     }
