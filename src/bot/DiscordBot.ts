@@ -130,6 +130,7 @@ import { validateCertPair } from "../temporal/certs";
 import type { QueueRoute } from "../queue/QueuePanel";
 import { VaultMigrator, COLUMN_LABELS, type MigrateItemResult, type MigrateReport } from "../vault/VaultMigrator";
 import { EMAIL_COMMAND, EMAIL_PREFIX, EmailCommand } from "./EmailCommand";
+import { TICKET_COMMAND, TICKET_PREFIX, TicketCommand } from "./TicketCommand";
 import type { EmailDeliverabilityService } from "../resend/EmailDeliverabilityService";
 import type { ResendClient } from "../resend/ResendClient";
 import type { DeliveryLogService } from "../resend/DeliveryLogService";
@@ -203,6 +204,45 @@ export class DiscordBot {
     () => this.deliveryLog,
     (interaction) => this.isAdmin(interaction)
   );
+  // /ticket: the Intercom ticket behind a thread and its sync status. Every
+  // dependency is a closure: the constructor's stores are not bound yet when
+  // field initializers run, and Temporal arrives later still.
+  private ticketCommand = new TicketCommand({
+    authorize: async (interaction) => (await this.requireSupportOrAdmin(interaction)) != null,
+    isAdmin: (interaction) => this.isAdmin(interaction),
+    getTicket: (threadId) => this.ticketStore.getByThreadId(threadId),
+    store: {
+      getLink: (threadId) => this.intercomStore.getLink(threadId),
+      getSyncFailure: (threadId) => this.intercomStore.getSyncFailure(threadId),
+      clearSyncFailure: (threadId) => this.intercomStore.clearSyncFailure(threadId),
+      hasBackfillClaim: (threadId) => this.intercomStore.hasBackfillClaim(threadId),
+    },
+    settings: {
+      intercomMode: () => this.settingsStore.intercomMode(),
+      intercomConfigured: () => this.settingsStore.intercomConfigured(),
+      intercomRegion: () => this.settingsStore.intercomRegion(),
+    },
+    intercom: {
+      getTicketRaw: (ticketId) => this.intercomClient.getTicketRaw(ticketId),
+      getMe: () => this.intercomClient.getMe(),
+    },
+    temporal: () => this.temporalProducers,
+    sync: {
+      repairTicket: (ticket, messages, opts) => this.intercomSync.repairTicket(ticket, messages, opts),
+      liftRefundTicket: (ticket, actorName, load) => this.intercomSync.liftRefundTicket(ticket, actorName, load),
+    },
+    threadMessages: async (threadId) => {
+      const channel = await this.client.channels.fetch(threadId).catch(() => null);
+      return channel?.isThread() ? this.fetchAllThreadMessages(channel as ThreadChannel) : null;
+    },
+    inboundHeal: async (threadId, conversationId) => {
+      if (this.settingsStore.intercomMode() !== "bi") return 0;
+      const parts = await this.intercomClient.getConversationPartsSince(conversationId, 0);
+      return this.intercomWebhook.relayHealedParts(threadId, parts);
+    },
+    slaTrigger: (threadId) => void this.slaService?.onTicketTrigger(threadId, "created"),
+    audit: (entry) => void this.audit.log(entry),
+  });
   private sentryFeedbackClient: SentryFeedbackClient | null = null;
   // Sentry feedback import ledger, bound late from index.ts; the /config
   // panel reads its counters.
@@ -974,6 +1014,8 @@ export class DiscordBot {
       await this.handlePostizCommand(interaction);
     } else if (interaction.commandName === "email") {
       await this.emailCommand.handleCommand(interaction);
+    } else if (interaction.commandName === "ticket") {
+      await this.ticketCommand.handleCommand(interaction);
     }
   }
 
@@ -1547,6 +1589,13 @@ export class DiscordBot {
     // the support/admin gate itself on every press.
     if (interaction.customId.startsWith(EMAIL_PREFIX)) {
       await this.emailCommand.handleButton(interaction);
+      return;
+    }
+
+    // ticketcmd_ is the /ticket panel. It re-runs the support/admin gate (and
+    // Administrator for Mirror to Intercom) itself on every press.
+    if (interaction.customId.startsWith(TICKET_PREFIX)) {
+      await this.ticketCommand.handleButton(interaction);
       return;
     }
 
@@ -7467,6 +7516,7 @@ export class DiscordBot {
       // button: no default_member_permissions, or the support role could not
       // see it at all.
       EMAIL_COMMAND,
+      TICKET_COMMAND,
       {
         name: "charge",
         description: "Approve or deny a blocked self-service refund (support/admin only)",
