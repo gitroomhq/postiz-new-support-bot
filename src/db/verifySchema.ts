@@ -118,6 +118,7 @@ export const EXPECTED_COLUMNS: Record<string, string[]> = {
   ],
   intercom_echo_parts: ["id", "kind", "partId", "ticketThreadId", "confirmed", "createdAt"],
   intercom_pending_posts: ["id", "ticketThreadId", "kind", "bodyHash", "createdAt"],
+  intercom_sync_failures: ["ticketThreadId", "eventType", "error", "attempts", "failedAt"],
   intercom_message_maps: [
     "id", "ticketThreadId", "direction", "discordMessageId", "partId", "via", "redactedAt", "createdAt",
   ],

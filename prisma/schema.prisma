@@ -913,6 +913,20 @@ model IntercomPendingPost {
   @@map("intercom_pending_posts")
 }
 
+// The last outbound mirror event that dead-lettered, one row per ticket
+// thread, so /ticket can say why a ticket is not (fully) in Intercom. Written
+// on every dead letter (newest wins), cleared when staff re-queue the ticket
+// with Sync now and by a bridge reset.
+model IntercomSyncFailure {
+  ticketThreadId String   @id
+  eventType      String
+  error          String
+  attempts       Int
+  failedAt       DateTime @default(now())
+
+  @@map("intercom_sync_failures")
+}
+
 // Local mirror of Stripe disputes, fed by webhooks and reconciled by the
 // disputes looper. Stripe's disputes.list has no status filter, so the
 // open-disputes overview reads from here; evidenceDraft holds the staff/AI

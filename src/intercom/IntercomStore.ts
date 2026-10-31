@@ -1,4 +1,4 @@
-import { PrismaClient, IntercomLink, IntercomMessageMap, IntercomReplyState } from "../generated/prisma/client";
+import { PrismaClient, IntercomLink, IntercomMessageMap, IntercomReplyState, IntercomSyncFailure } from "../generated/prisma/client";
 
 // Relay body-hash dedup rides the echo-part table under this kind (partId =
 // "<threadId>:<bodyHash>"). Fresh window: same body seen twice within it is a
@@ -471,6 +471,25 @@ export class IntercomStore {
     return r.count;
   }
 
+  // ---- Last dead-lettered outbound event per ticket (/ticket's "why not") ----
+
+  async recordSyncFailure(ticketThreadId: string, eventType: string, error: string, attempts: number): Promise<void> {
+    const data = { eventType, error: error.slice(0, 1000), attempts, failedAt: new Date() };
+    await this.prisma.intercomSyncFailure.upsert({
+      where: { ticketThreadId },
+      create: { ticketThreadId, ...data },
+      update: data,
+    });
+  }
+
+  async getSyncFailure(ticketThreadId: string): Promise<IntercomSyncFailure | null> {
+    return this.prisma.intercomSyncFailure.findUnique({ where: { ticketThreadId } });
+  }
+
+  async clearSyncFailure(ticketThreadId: string): Promise<void> {
+    await this.prisma.intercomSyncFailure.deleteMany({ where: { ticketThreadId } });
+  }
+
   // Full bridge-state wipe (links + echo/pending ledgers). Touches NOTHING in
   // Intercom itself: use when the Intercom side was cleared/recreated and the
   // local bookkeeping is stale; the next backfill rebuilds everything.
@@ -482,6 +501,7 @@ export class IntercomStore {
       this.prisma.intercomMessageMap.deleteMany(),
       this.prisma.intercomSweepState.deleteMany(),
       this.prisma.intercomReplyState.deleteMany(),
+      this.prisma.intercomSyncFailure.deleteMany(),
     ]);
     return { links: links.count, parts: parts.count };
   }

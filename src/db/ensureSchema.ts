@@ -1304,6 +1304,14 @@ export const STATEMENTS: string[] = [
     CONSTRAINT "queue_resolutions_pkey" PRIMARY KEY ("conversationId")
   )`,
   `CREATE INDEX IF NOT EXISTS "queue_resolutions_resolvedAt_idx" ON "queue_resolutions"("resolvedAt")`,
+  `CREATE TABLE IF NOT EXISTS "intercom_sync_failures" (
+    "ticketThreadId" TEXT NOT NULL,
+    "eventType" TEXT NOT NULL,
+    "error" TEXT NOT NULL,
+    "attempts" INTEGER NOT NULL,
+    "failedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT "intercom_sync_failures_pkey" PRIMARY KEY ("ticketThreadId")
+  )`,
 ];
 
 export async function ensureSchema(prisma: PrismaClient): Promise<void> {

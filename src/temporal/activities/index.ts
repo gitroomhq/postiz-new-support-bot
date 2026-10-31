@@ -553,6 +553,10 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
       // The dead event's kept-on-ambiguous-failure reservations can no longer
       // match anything: drop them so they stop deferring inbound replies.
       await intercomStore.deletePendingPostsForThread(input.threadId).catch(() => {});
+      // /ticket reads it back to say why the ticket is not (fully) in Intercom.
+      await intercomStore
+        .recordSyncFailure(input.threadId, input.type, input.message, input.attempts)
+        .catch(() => {});
       actLog.warn("intercom.delivery.dead_letter", {
         "queue.event_type": input.type,
         "ticket.thread_id": input.threadId,
