@@ -27,7 +27,7 @@ export interface BotConfig {
   };
   // Vault and Temporal are NOT here: they live in BotSettings (/config →
   // Vault / Temporal), and SettingsStore reads the VAULT_*/TEMPORAL_* env vars
-  // directly as OVERRIDES of the stored values — the bootstrap exception
+  // directly as OVERRIDES of the stored values: the bootstrap exception
   // explained in ./env.ts, not the first-boot-fallback pattern used for
   // INTERCOM_*.
 }

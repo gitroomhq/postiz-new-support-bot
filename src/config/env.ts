@@ -6,7 +6,7 @@ import { log } from "../util/logger";
 // Every other BotSettings value is /config-only: the deploy has no editable
 // .env, so a new setting must be reachable from Discord. Vault and Temporal are
 // the exception because they are the bootstrap layer underneath everything
-// else — the Vault connection holds the KV entry with the Temporal mTLS
+// else: the Vault connection holds the KV entry with the Temporal mTLS
 // material, and a box that comes up with neither can only be repaired through
 // the very panel that depends on them. So these accept an env var, and when one
 // is set it WINS over the stored value: a deploy can pin its infrastructure
@@ -15,7 +15,7 @@ import { log } from "../util/logger";
 // postizApiKey joins them for a different reason: the deploy already supplies
 // the platform admin key as POSTIZ_ADMIN_TOKEN, so honouring that variable
 // avoids a second copy of the same credential drifting in the database. It is
-// the only pinned SECRET, so the value is never rendered — panels show only
+// the only pinned SECRET, so the value is never rendered: panels show only
 // that the pin is in force, exactly as they do for a Vault-held secret.
 //
 // The panels never pretend the pin isn't there (see envPin): they show which
@@ -58,7 +58,7 @@ const TRUE_VALUES = new Set(["1", "true", "yes", "on", "enabled"]);
 const FALSE_VALUES = new Set(["0", "false", "no", "off", "disabled"]);
 
 // Unparseable booleans are logged once per variable rather than every getter
-// call — these run on every panel render.
+// call: these run on every panel render.
 const warned = new Set<string>();
 
 /** Trimmed value, or null when unset/blank. */

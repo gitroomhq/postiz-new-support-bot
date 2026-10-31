@@ -17,7 +17,7 @@ const vaultLog = log.child("vault");
 export type VaultState = "unconfigured" | "up" | "down" | "denied";
 
 // One KV entry per integration under <kvBasePath>/<integration>. "temporal"
-// holds the mTLS client cert material (clientCertPem/clientKeyPem/caPem) —
+// holds the mTLS client cert material (clientCertPem/clientKeyPem/caPem):
 // Vault-only by design, no local-encryption fallback: a cold cache simply
 // leaves the Temporal connection down until Vault recovers.
 export type VaultIntegration = "intercom" | "stripe" | "sentry" | "influx" | "temporal" | "yubico" | "postiz" | "resend";
@@ -67,13 +67,13 @@ const UP_PROBE_IDLE_MS = 60_000;
 // directly in the Vault UI reach the cache without a /config touch.
 const KV_REFRESH_INTERVAL_MS = 10 * 60_000;
 // Rate limit for repeated-failure logging while down (transition logs are not
-// limited — they fire once by definition).
+// limited; they fire once by definition).
 const FAILURE_LOG_INTERVAL_MS = 60_000;
 
 // State machine + caches over VaultClient. Owns the up/down/denied lifecycle,
 // the in-memory KV secret cache that keeps SettingsStore getters synchronous,
 // and the probe scheduler (same start/stop + overlap-guard idiom as the other
-// schedulers). Never throws out of init/tick — Vault being down at boot means
+// schedulers). Never throws out of init/tick: Vault being down at boot means
 // the bot starts degraded, not dead.
 export class VaultService {
   private client: VaultClient | null = null;
@@ -128,7 +128,7 @@ export class VaultService {
   }
 
   // Storage cutover: secrets ROUTE to Vault only after the explicit /config
-  // migration stamped vaultMigratedAt — enabling the connection alone never
+  // migration stamped vaultMigratedAt; enabling the connection alone never
   // silently moves storage.
   storageActive(): boolean {
     return this.settings.vaultEnabled() && this.settings.vaultMigratedAt() != null;
@@ -276,7 +276,7 @@ export class VaultService {
     this.lastErrorMsg = msg;
     const prev = this.stateVal;
     if (prev === next) {
-      // Still down — keep quiet apart from a rate-limited log line.
+      // Still down: keep quiet apart from a rate-limited log line.
       const now = Date.now();
       if (now - this.lastFailureLogAtMs > FAILURE_LOG_INTERVAL_MS) {
         this.lastFailureLogAtMs = now;
@@ -297,7 +297,7 @@ export class VaultService {
       );
     });
     // Transitions only (user decision): one embed when it goes down, one on
-    // recovery. A boot-time failure has no bound Discord client yet — the
+    // recovery. A boot-time failure has no bound Discord client yet; the
     // AuditLogger no-ops in that case (Sentry + logs above still fire).
     if (prev === "up") {
       void this.audit.log({
@@ -315,7 +315,7 @@ export class VaultService {
   // ---- KV cache ----
 
   // Sync read for SettingsStore getters. null = field absent OR cache cold
-  // (Vault down since boot) — both degrade identically downstream.
+  // (Vault down since boot): both degrade identically downstream.
   getCachedKvField(integration: VaultIntegration, field: string): string | null {
     return this.kvCache.get(integration)?.[field] || null;
   }
@@ -341,7 +341,7 @@ export class VaultService {
     this.kvLoadedAtMs = Date.now();
   }
 
-  // Fresh read straight from Vault, bypassing the cache — the migrator uses it
+  // Fresh read straight from Vault, bypassing the cache: the migrator uses it
   // to verify a write round-trip before vacating a column. Refreshes the cache
   // as a side effect. null = entry missing OR read failed (either way the
   // caller's verification fails closed).
@@ -359,7 +359,7 @@ export class VaultService {
     }
   }
 
-  // Removes one integration entry entirely (all versions + metadata) — the
+  // Removes one integration entry entirely (all versions + metadata): the
   // reverse-migration cleanup.
   async kvDeleteEntry(integration: VaultIntegration): Promise<boolean> {
     if (!this.client) return false;
@@ -379,7 +379,7 @@ export class VaultService {
   // removes a field; an entry left empty is deleted outright. The cache is
   // updated BEFORE the caller stamps its sentinel column, so a sync getter can
   // never observe a sentinel with a cold cache while we're up. Returns false
-  // on failure — the caller falls back to local encryption.
+  // on failure; the caller falls back to local encryption.
   async setKvFields(integration: VaultIntegration, fields: Record<string, string | null>): Promise<boolean> {
     if (!this.client) return false;
     try {
@@ -408,7 +408,7 @@ export class VaultService {
 
   // A Transit 400 is a permanent per-item failure (bad ciphertext, missing
   // key): logged rate-limited and returned as null WITHOUT flipping the state
-  // — Vault itself is up, retrying would loop forever.
+  // (Vault itself is up, retrying would loop forever).
   private classifyTransitFailure(e: unknown, what: string): null {
     if (e instanceof VaultHttpError && e.status === 400) {
       const now = Date.now();
@@ -532,7 +532,7 @@ export class VaultService {
         report.kvEntriesFound = VAULT_INTEGRATIONS.filter(
           (_, idx) => entries[idx] != null && Object.keys(entries[idx] ?? {}).length > 0
         );
-        // A successful full read is as good as a refresh — keep the cache warm.
+        // A successful full read is as good as a refresh: keep the cache warm.
         VAULT_INTEGRATIONS.forEach((integration, idx) => this.kvCache.set(integration, entries[idx] ?? {}));
         this.kvLoadedAtMs = Date.now();
       } catch (e) {

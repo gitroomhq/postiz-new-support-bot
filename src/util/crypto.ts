@@ -6,7 +6,7 @@ import { log } from "./logger";
 // webhook signing secret. Goal: a database dump alone must not yield usable
 // credentials.
 //
-// KEY DERIVATION — the crux. The AES key is HKDF-derived from three secrets that
+// KEY DERIVATION: the crux. The AES key is HKDF-derived from three secrets that
 // are always present in the deploy environment but are NOT stored in the app's
 // own database: STRIPE_SECRET_KEY, DATABASE_URL and DISCORD_TOKEN. So decryption
 // needs the live environment, not just a table dump. Combining all three raises
@@ -62,11 +62,11 @@ export function encryptSecret(plaintext: string): string {
 
 // ---- Vault envelope discrimination ----
 // Secret columns can hold three shapes now: `enc:v1:…` (local AES-GCM above), a
-// Vault Transit ciphertext (`vault:v<N>:…`, stored verbatim — N bumps when the
+// Vault Transit ciphertext (`vault:v<N>:…`, stored verbatim; N bumps when the
 // Transit key rotates, so the regex must not pin v1), or the KV sentinel below
 // meaning "the value lives in Vault KV, not in this column". decryptSecret keeps
 // its legacy-plaintext passthrough, so callers on Vault-capable columns MUST
-// check these prefixes first — otherwise a sentinel or Transit ciphertext would
+// check these prefixes first, otherwise a sentinel or Transit ciphertext would
 // be handed out as the secret itself.
 
 export const VAULT_KV_SENTINEL = "vault:kv";
@@ -80,7 +80,7 @@ export function isTransitCiphertext(value: string): boolean {
 }
 
 // Transparent decrypt. A non-`enc:` value is legacy plaintext and is returned
-// verbatim — this is the lazy migration: old rows keep working, and the next
+// verbatim; this is the lazy migration: old rows keep working, and the next
 // write re-persists them encrypted. On any failure (tampering, or a rotated key
 // source) it logs and returns null so callers treat the secret as absent rather
 // than crashing. Vault-capable columns must check isVaultKvSentinel /
