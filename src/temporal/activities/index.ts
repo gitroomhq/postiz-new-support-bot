@@ -45,7 +45,7 @@ const actLog = log.child("temporal:activities");
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 // Politeness pacing between Intercom API deliveries (was CALL_SPACING_MS in
-// the legacy drain loop — now a worker-global limiter across activities).
+// the legacy drain loop: now a worker-global limiter across activities).
 const INTERCOM_CALL_SPACING_MS = 300;
 // Retention sweeps folded into the cleanup loop (legacy outbox-scheduler values).
 const ECHO_RETENTION_MS = 14 * DAY_MS;
@@ -93,7 +93,7 @@ export interface ActivityDeps {
 }
 
 // All activity implementations, closed over the live in-process services (the
-// worker runs inside the bot process — user decision). Payloads carry IDs;
+// worker runs inside the bot process: user decision). Payloads carry IDs;
 // activities re-read rows so retries and Continue-As-New always see fresh
 // state.
 export function createActivities(deps: ActivityDeps): CoreActivities {
@@ -181,7 +181,7 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
       recloseAtMs: ticket.recloseAt?.getTime() ?? null,
       // A ticketId-less link is a half-built bridge (ensure died between
       // conversation-create and convert). Report it as no-link so the pump
-      // keeps synthesizing the ensure that finishes the convert — requireLink
+      // keeps synthesizing the ensure that finishes the convert: requireLink
       // no longer inline-rebuilds, so nothing else would ever retry it.
       hasIntercomLink: !!link?.ticketId,
     };
@@ -220,9 +220,9 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
 
   // One reminder for one ticket. CUSTOMER reminders still ping the customer in
   // the Discord thread (they never left Discord). SUPPORT reminders never ping
-  // a Discord role — agents live in Intercom, so the nag is an internal note +
+  // a Discord role: agents live in Intercom, so the nag is an internal note +
   // reopen on the linked conversation (intercomSync.onAgentReminder); for
-  // unmirrored tickets (exempt / bridge off) there is deliberately NO route —
+  // unmirrored tickets (exempt / bridge off) there is deliberately NO route:
   // a role ping in a thread agents don't watch is pure noise.
   // Returns false when nothing went out: the caller must not record a
   // reminder that never happened.
@@ -286,7 +286,7 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
     },
 
     // One evaluation pass for one ticket: reminder / waiting-auto-close /
-    // resolved-auto-close / re-close — verbatim ports of the legacy
+    // resolved-auto-close / re-close: verbatim ports of the legacy
     // ReminderScheduler + RecloseScheduler per-ticket logic. Auto-closes are
     // RETURNED as a status-change request; the workflow runs them as a
     // statusChangeWorkflow child so the transition is durable + serialized.
@@ -347,7 +347,7 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
           await ticketStore.close(threadId);
         } else if (!thread.archived && !thread.locked) {
           // Intercom-exempt tickets (self-serve refund flow & co) have no
-          // agent working them — the customer drives everything, so they
+          // agent working them: the customer drives everything, so they
           // always use the customer-waiting machinery regardless of the shared
           // tag's reminderTarget (and never attempt agent notes). A flipped
           // refund ticket (customer typed → mirrored, flag now false) leaves
@@ -362,7 +362,7 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
           // IcEvent are kept as deploy-safe tombstones for any in-flight outbox.
           if (target === "CUSTOMER" && ticket.customerId) {
             // Agent replies bridged from Intercom land in Discord as BOT
-            // messages — invisible to the human scan. The relay ledger
+            // messages: invisible to the human scan. The relay ledger
             // ("in" message-map rows) supplies the agent's real last reply for
             // the staff-spoke-last guard in the auto-close path below.
             const relayAtMs = (await intercomSync.lastAgentRelayAt(threadId).catch(() => null))?.getTime() ?? 0;
@@ -385,14 +385,14 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
                 // Waiting-for-Customer tag can be stale when the reply-time
                 // auto-flip was missed (bot down, unusable flip target).
                 // The relay ledger gives the agent's real last Intercom reply;
-                // lastStatusChangeAt — stamped when the ticket entered this
-                // tag — stays in the max as a belt for unmirrored gaps.
+                // lastStatusChangeAt: stamped when the ticket entered this
+                // tag: stays in the max as a belt for unmirrored gaps.
                 const staffAt = await lastAwaitedMessageAt(thread, "SUPPORT", ticket.customerId);
                 const customerSpokeLast =
                   awaitedAt != null &&
                   awaitedAt > Math.max(staffAt ?? 0, relayAtMs, ticket.lastStatusChangeAt.getTime());
                 if (customerSpokeLast) {
-                  // Missed auto-flip self-heal — mirror DiscordBot.processTicketMessage.
+                  // Missed auto-flip self-heal: mirror DiscordBot.processTicketMessage.
                   const usable = (t: StatusTag | undefined): t is StatusTag =>
                     !!t && !t.closesThread && t.reminderTarget !== "CUSTOMER";
                   const replyTarget = settingsStore.customerReplyTarget();
@@ -411,7 +411,7 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
                       ],
                     });
                   }
-                  // else: no usable flip target — skip silently; next scan retries.
+                  // else: no usable flip target, skip silently; next scan retries.
                 } else {
                   statusChange = {
                     tagId: closingTag.id,
@@ -422,7 +422,7 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
               } else {
                 // Real idle time for the reminder copy: elapsed since the
                 // awaited party last acted (status changes count as
-                // activity). Deliberately EXCLUDES lastReminderAt — the fire
+                // activity). Deliberately EXCLUDES lastReminderAt: the fire
                 // reference includes it so the cadence re-arms, but counting
                 // it here would pin the displayed number at reminderDays
                 // forever ("1 day(s)" every day).
@@ -437,14 +437,14 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
         }
       }
 
-      // (The resolved-auto-close pass is gone with the resolved state itself —
+      // (The resolved-auto-close pass is gone with the resolved state itself;
       // tickets are open or closed; a closing tag locks+archives immediately.)
 
       return { statusChange, reminded, reclosed, snapshot: await buildSnapshot(threadId) };
     },
 
     // Tombstone stub (agent-rip): only reachable from the autoAnswerWorkflow
-    // repair path of runs in flight across the deploy — new tickets never
+    // repair path of runs in flight across the deploy: new tickets never
     // spawn that child (aiSolve is always false).
     async pingStaffForNewTicket(threadId) {
       actLog.info("pingStaffForNewTicket skipped (agent-rip tombstone)", { "ticket.thread_id": threadId });
@@ -452,7 +452,7 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
 
     // ================= status =================
 
-    // The whole transition via StatusService.applyStatusDirect — the exact
+    // The whole transition via StatusService.applyStatusDirect: the exact
     // legacy implementation, serialized by the parent ticket workflow.
     async statusApplyDirect(input) {
       const ticket = await ticketStore.getByThreadId(input.threadId);
@@ -464,13 +464,13 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
         return { applied: false, reason: "unknown status tag", closed: ticket.closed, isResolved: false, closesThread: false, statusTagId: input.tagId, statusLabel: null };
       }
       // Resolved state removed (agent-rip): done = the tag closes the thread.
-      // isResolved is pinned false — in-flight workflow runs still read the
+      // isResolved is pinned false: in-flight workflow runs still read the
       // field; the shape slims out in a later release.
       const isDone = tag.closesThread;
       // No-op guard mirrors handleThreadUpdate's backstop: already there.
       const thread = await fetchThread(input.threadId);
       if (!thread) {
-        // Thread gone/unreachable — reconcile DB + mirror (the legacy
+        // Thread gone/unreachable: reconcile DB + mirror (the legacy
         // member-leave else-branch).
         await ticketStore.close(input.threadId).catch(() => {});
         await intercomSync
@@ -518,8 +518,8 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
         await intercomExecutor.execute(threadId, event.type as IcEventType, payload, () => heartbeat());
       } catch (e) {
         if (e instanceof IntercomHttpError) {
-          // 404 on a non-ensure event: a linked remote object was deleted —
-          // self-heal inline (legacy handleFailure behavior), then retry.
+          // 404 on a non-ensure event: a linked remote object was deleted.
+          // Self-heal inline (legacy handleFailure behavior), then retry.
           if (e.status === 404 && event.type !== "ensure") {
             await intercomExecutor.selfHeal404(threadId, () => heartbeat()).catch((healError) => {
               actLog.error("404 self-heal failed", healError, { "ticket.thread_id": threadId });
@@ -551,7 +551,7 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
     async intercomDeadLetterAudit(input) {
       recordIntercomDeadLetter("outbox");
       // The dead event's kept-on-ambiguous-failure reservations can no longer
-      // match anything — drop them so they stop deferring inbound replies.
+      // match anything: drop them so they stop deferring inbound replies.
       await intercomStore.deletePendingPostsForThread(input.threadId).catch(() => {});
       actLog.warn("intercom.delivery.dead_letter", {
         "queue.event_type": input.type,
@@ -628,13 +628,13 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
     // signal, which bypasses the due-check.
     async kbTick(force) {
       heartbeat();
-      // Tarball downloads can outlast the 90s heartbeatTimeout — keep the
+      // Tarball downloads can outlast the 90s heartbeatTimeout: keep the
       // activity alive while a refresh is in flight.
       const keepalive = setInterval(() => {
         try {
           heartbeat();
         } catch {
-          /* worker shutting down — the refresh finishes on its own */
+          /* worker shutting down: the refresh finishes on its own */
         }
       }, 30_000);
       try {
@@ -655,7 +655,7 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
         try {
           heartbeat();
         } catch {
-          /* worker shutting down — the sweep finishes on its own */
+          /* worker shutting down: the sweep finishes on its own */
         }
       }, 30_000);
       try {
@@ -694,7 +694,7 @@ export function createActivities(deps: ActivityDeps): CoreActivities {
         try {
           heartbeat();
         } catch {
-          /* worker shutting down — the sweep finishes on its own */
+          /* worker shutting down: the sweep finishes on its own */
         }
       }, 30_000);
       try {

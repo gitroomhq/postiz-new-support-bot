@@ -50,7 +50,7 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 // after close, then completes; a later event signal-with-starts a fresh run
 // that rehydrates from Postgres (user decision).
 const RETENTION_MS = 14 * DAY_MS;
-// Reminder / resolved-auto-close scan cadence — matches the legacy
+// Reminder / resolved-auto-close scan cadence: matches the legacy
 // ReminderScheduler's 30-minute tick; also the config-freshness bound (tag
 // edits in /config are picked up within one scan).
 const TIMER_SCAN_MS = 30 * 60 * 1000;
@@ -63,7 +63,7 @@ const quick = proxyActivities<CoreActivities>({
   retry: { maximumAttempts: 3 },
 });
 
-// One evaluation does several Discord fetches and possibly sends a reminder —
+// One evaluation does several Discord fetches and possibly sends a reminder:
 // single attempt; the next scan retries naturally.
 const timers = proxyActivities<CoreActivities>({
   startToCloseTimeout: "2 minutes",
@@ -101,7 +101,7 @@ export async function ticketWorkflow(input: TicketWorkflowInput): Promise<void> 
   };
 
   // Search attributes are attached to this workflow's start only after the
-  // producer confirmed server-side registration — their presence is therefore
+  // producer confirmed server-side registration: their presence is therefore
   // the deterministic, replay-safe gate for every SA command this run issues
   // (an upsert naming an unregistered attribute fails the workflow task).
   const saEnabled = workflowInfo().typedSearchAttributes.get(SA_TICKET_THREAD_ID) != null;
@@ -109,7 +109,7 @@ export async function ticketWorkflow(input: TicketWorkflowInput): Promise<void> 
   const syncStatusSa = (label: string | null): void => {
     if (!saEnabled || label === lastStatusSa) return;
     lastStatusSa = label;
-    // null unsets — a ticket without a tag drops out of status queries.
+    // null unsets: a ticket without a tag drops out of status queries.
     upsertSearchAttributes([{ key: SA_TICKET_STATUS, value: label }]);
   };
 
@@ -176,14 +176,14 @@ export async function ticketWorkflow(input: TicketWorkflowInput): Promise<void> 
 
   // Bumped on every clear-outbox signal: an in-flight ensure that completes
   // AFTER a clear must not re-assert hasIntercomLink (the link row it created
-  // was just wiped) — the pump compares its captured epoch before latching.
+  // was just wiped): the pump compares its captured epoch before latching.
   let icClearEpoch = 0;
 
   setHandler(intercomClearOutboxSignal, () => {
     // Bridge reset/wipe: queued events would resurrect the wiped Intercom data
     // (requireLink refuses too, but dropping here avoids a dead-letter per
     // event). hasIntercomLink=false so post-wipe activity synthesizes a fresh
-    // ensure — the mode staying on means a rebuild is intended.
+    // ensure: the mode staying on means a rebuild is intended.
     outbox.length = 0;
     hasIntercomLink = false;
     icClearEpoch++;
@@ -240,7 +240,7 @@ export async function ticketWorkflow(input: TicketWorkflowInput): Promise<void> 
           continue;
         }
         // ensure-first invariant: never deliver content before the bridge
-        // exists — synthesize an ensure head (payload composed at delivery).
+        // exists: synthesize an ensure head (payload composed at delivery).
         if (outbox[0].type !== "ensure" && !hasIntercomLink) {
           outbox.unshift({ seq: outboxSeq++, type: "ensure", payload: null });
         }
@@ -255,19 +255,19 @@ export async function ticketWorkflow(input: TicketWorkflowInput): Promise<void> 
           });
         } catch (e) {
           // A delivery child can only fail like this on a non-retryable
-          // orchestration error — drop the event rather than wedging the queue.
+          // orchestration error: drop the event rather than wedging the queue.
           res = { outcome: "dead", error: e instanceof Error ? e.message : String(e) };
         }
         if (ev.type === "ensure" && res.outcome === "ok" && epochBefore === icClearEpoch) hasIntercomLink = true;
         // Identity guard: a clear-outbox signal may have emptied/replaced the
-        // queue while the delivery child ran — never shift someone else's head.
+        // queue while the delivery child ran: never shift someone else's head.
         if (outbox[0] === ev) outbox.shift();
         touch();
         if (ev.type === "ensure" && res.outcome === "dead" && patched("intercom-ensure-park")) {
           // A dead ensure is a config/data problem (revoked token, unmapped
           // ticket type, 422 …). Without parking, the head-synthesis above
           // would mint a fresh ensure for the still-queued event on the very
-          // next iteration — an infinite hot loop of delivery children and
+          // next iteration: an infinite hot loop of delivery children and
           // audit embeds. Hold the queue on the disabled-recheck cadence;
           // /config fixes are picked up on the next pass.
           await condition(() => stopping, PUMP_DISABLED_RECHECK_MS);
@@ -307,7 +307,7 @@ export async function ticketWorkflow(input: TicketWorkflowInput): Promise<void> 
       creation = null;
       if (snap.exists === false) snap = await quick.loadTicketState(threadId);
       syncStatusSa(snap.statusLabel);
-      // Static UI context for the Temporal UI (ids only — no question text).
+      // Static UI context for the Temporal UI (ids only: no question text).
       // Gated like every SA command: upsertMemo emits a history command, so an
       // ungated call would replay-mismatch runs started before this release.
       if (saEnabled) upsertMemo({ categoryId: c.categoryId, aiSolve: c.aiSolve });
@@ -348,7 +348,7 @@ export async function ticketWorkflow(input: TicketWorkflowInput): Promise<void> 
 
     const busy = statusChangesRunning > 0 || autoAnswerRunning;
 
-    // Continue-As-New before the 50k event limit — only at a drain point.
+    // Continue-As-New before the 50k event limit: only at a drain point.
     if (
       (workflowInfo().continueAsNewSuggested || workflowInfo().historyLength > HISTORY_SOFT_LIMIT) &&
       !busy &&
@@ -391,7 +391,7 @@ export async function ticketWorkflow(input: TicketWorkflowInput): Promise<void> 
         syncStatusSa(snap.statusLabel);
         if (r.statusChange) void runStatusChange(r.statusChange).catch(() => {});
       } catch {
-        // Evaluation failed (Discord hiccup) — the next scan retries.
+        // Evaluation failed (Discord hiccup): the next scan retries.
       }
     }
 

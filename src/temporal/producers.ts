@@ -79,9 +79,9 @@ export interface TemporalOpsBinding {
 // The thin facade every producer call site goes through (DiscordBot handlers,
 // StatusService/IntercomSyncService seams, CallbackServer webhooks, Vault
 // hooks). Two gates:
-// - routable(): Temporal is configured — fire-and-forget signals are sent even
+// - routable(): Temporal is configured, fire-and-forget signals are sent even
 //   while the worker is paused (they land server-side and process on resume).
-// - enabled(): the worker is meant to be active (pause toggle && configured) —
+// - enabled(): the worker is meant to be active (pause toggle && configured):
 //   gates the synchronous seams whose callers need an immediate result and
 //   fall back to their direct in-process path otherwise.
 
@@ -106,10 +106,10 @@ export class TemporalProducers {
   }
 
   // Typed-search-attribute start options, attached ONLY once registration is
-  // confirmed — a start naming an unregistered attribute fails the whole
+  // confirmed: a start naming an unregistered attribute fails the whole
   // command, so this helper is how SAs stay unable to break anything. (A
   // buffered op enqueued while ready could flush against a re-pointed
-  // namespace lacking SAs; the flush failure re-buffers — accepted edge.)
+  // namespace lacking SAs; the flush failure re-buffers: accepted edge.)
   private sa(
     pairs: Array<{ key: KeywordSaKey; value: string | null | undefined }>
   ): { typedSearchAttributes?: SearchAttributePair[] } {
@@ -155,7 +155,7 @@ export class TemporalProducers {
     return this.signalTicket(threadId, SIG_REQUEST_STATUS_CHANGE, req);
   }
 
-  // ---- updates (synchronous result; NOT buffered — null = Temporal
+  // ---- updates (synchronous result; NOT buffered: null = Temporal
   // unavailable right now, caller runs its legacy path) ----
 
   async applyStatus(threadId: string, req: StatusChangeRequest): Promise<ApplyStatusResult | null> {
@@ -209,7 +209,7 @@ export class TemporalProducers {
       args: [{ eventId, eventJson }],
       options: {
         workflowIdReusePolicy: "ALLOW_DUPLICATE_FAILED_ONLY",
-        // UI context only — the event type in the workflow list beats opening
+        // UI context only: the event type in the workflow list beats opening
         // the input payload.
         ...(eventType ? { memo: { eventType } } : {}),
       },
@@ -237,7 +237,7 @@ export class TemporalProducers {
 
   // ---- ops ----
 
-  // Start the full analytics rebuild. On demand only — it is deliberately absent
+  // Start the full analytics rebuild. On demand only: it is deliberately absent
   // from ensureBaseline's `singles`, where it would fire on every boot.
   //
   // FAIL rather than USE_EXISTING on conflict: a second press must report "one
@@ -252,7 +252,7 @@ export class TemporalProducers {
   }
 
   // Live phase for the /config panel. Null when nothing is running, which is
-  // also what a Temporal that is unreachable looks like — the panel falls back
+  // also what a Temporal that is unreachable looks like: the panel falls back
   // to the persisted phase for that case.
   async analyticsRebuildProgress(): Promise<{ phase: string; stats: unknown } | null> {
     try {
@@ -372,8 +372,8 @@ export class TemporalProducers {
 
   // Idempotent; runs before the worker starts (boot / toggle ON) and on
   // Temporal recovery. Retires agent-rip leftovers first (their workflow
-  // types are no longer registered — a surviving run would wedge on its next
-  // workflow task), then reconciles each live singleton's generation — a
+  // types are no longer registered: a surviving run would wedge on its next
+  // workflow task), then reconciles each live singleton's generation: a
   // running looper whose workflow body changed shape this release
   // (LOOPER_GENERATIONS bump) is terminated so the signal-with-start below
   // brings up a fresh run on the new code; see the note in types.ts.
@@ -429,7 +429,7 @@ export class TemporalProducers {
 
   // Agent-rip retirement: terminate retired singletons + orphaned children,
   // delete retired Schedules. Every step is idempotent and per-step
-  // best-effort — a Temporal hiccup here must never block the boot; the next
+  // best-effort: a Temporal hiccup here must never block the boot; the next
   // ensureBaseline (recovery / toggle) converges.
   private async retireDead(client: Client): Promise<void> {
     for (const { workflowId, reason } of RETIRED_SINGLETONS) {
@@ -460,7 +460,7 @@ export class TemporalProducers {
         await client.schedule.getHandle(scheduleId).delete();
         prodLog.info("retired schedule deleted", { "temporal.schedule_id": scheduleId });
       } catch {
-        // Not found (already deleted) or transient — either way the next
+        // Not found (already deleted) or transient: either way the next
         // baseline pass settles it.
       }
     }

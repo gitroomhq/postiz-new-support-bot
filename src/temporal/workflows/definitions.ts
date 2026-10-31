@@ -34,7 +34,7 @@ export const ticketCreatedSignal = defineSignal<[TicketCreatedSignal]>(SIG_TICKE
 export const humanMessageSignal = defineSignal<[HumanMessageSignal]>(SIG_HUMAN_MESSAGE);
 export const intercomEnqueueSignal = defineSignal<[{ type: IcEventType; payload: unknown | null }]>(SIG_INTERCOM_ENQUEUE);
 // Bridge reset/wipe: drop every queued (pre-wipe) Intercom event and forget the
-// link — queued events would otherwise resurrect the data the operator wiped.
+// link: queued events would otherwise resurrect the data the operator wiped.
 export const intercomClearOutboxSignal = defineSignal(SIG_INTERCOM_CLEAR_OUTBOX);
 export const remindersPausedSignal = defineSignal<[RemindersPausedSignal]>(SIG_REMINDERS_PAUSED);
 export const requestStatusChangeSignal = defineSignal<[StatusChangeRequest]>(SIG_REQUEST_STATUS_CHANGE);

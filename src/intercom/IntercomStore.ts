@@ -8,13 +8,13 @@ const RELAY_FRESH_MS = 2 * 60 * 1000;
 // Echo-handshake reservations are only meaningful while their post can still
 // plausibly be in flight: reservations are created per delivery ATTEMPT and a
 // call confirms (or its webhook lands) within seconds-to-minutes. Older rows
-// are crash/dead-letter leftovers — matching or deferring against them delays
+// are crash/dead-letter leftovers: matching or deferring against them delays
 // and can even swallow genuine agent replies. The 1h sweep still deletes them.
 const PENDING_POST_FRESH_MS = 10 * 60 * 1000;
 
 // Persistence for the Intercom bridge: thread↔conversation/ticket links and
 // the echo-part / pending-post ledgers. The durable outbox/inbox queue tables
-// are gone — per-ticket FIFO delivery lives in the ticket workflow's outbox
+// are gone: per-ticket FIFO delivery lives in the ticket workflow's outbox
 // and the per-conversation inbox workflow.
 export class IntercomStore {
   constructor(private prisma: PrismaClient) {}
@@ -128,7 +128,7 @@ export class IntercomStore {
   // Intercom has no writable content stamp, so echo suppression is id-based:
   // the outbox records every part it creates, and the webhook handler claims
   // each part it sees exactly once. A claim conflict = our own echo or a
-  // duplicate delivery — drop it. Identity-independent by design (the bridge
+  // duplicate delivery: drop it. Identity-independent by design (the bridge
   // may author as Operator OR as a real human admin).
 
   // Upsert with confirmed=true: if the webhook's transient claim row for the
@@ -155,7 +155,7 @@ export class IntercomStore {
     }
   }
 
-  // Rolls back a claimPart (defer or relay failure — the retry must be able to
+  // Rolls back a claimPart (defer or relay failure: the retry must be able to
   // claim again). Only unconfirmed rows: a confirm record is not a claim.
   async releaseClaim(kind: "c" | "t", partId: string): Promise<void> {
     await this.prisma.intercomEchoPart.deleteMany({ where: { kind, partId, confirmed: false } });
@@ -194,7 +194,7 @@ export class IntercomStore {
   }
 
   // Cheap existence probe for the "b" transcript-enqueued marker (refund-flip
-  // crash-heal gate — avoids refetching thread history per message).
+  // crash-heal gate: avoids refetching thread history per message).
   async hasBackfillClaim(ticketThreadId: string): Promise<boolean> {
     const row = await this.prisma.intercomEchoPart.findUnique({
       where: { kind_partId: { kind: "b", partId: ticketThreadId } },
@@ -208,7 +208,7 @@ export class IntercomStore {
     await this.prisma.intercomEchoPart.deleteMany({ where: { kind: "b", partId: ticketThreadId } });
   }
 
-  // Threads with a backfill replay enqueued (link may not exist yet) — these
+  // Threads with a backfill replay enqueued (link may not exist yet): these
   // hold the deepest workflow outboxes, so reset/wipe must clear them too.
   async listBackfillClaimedThreadIds(): Promise<string[]> {
     const rows = await this.prisma.intercomEchoPart.findMany({
@@ -218,7 +218,7 @@ export class IntercomStore {
     return rows.map((r) => r.ticketThreadId);
   }
 
-  // Sweeps only the ECHO kinds (c/t webhook claims, r relay dedup) — the "m"
+  // Sweeps only the ECHO kinds (c/t webhook claims, r relay dedup): the "m"
   // delivery ledger and "b" backfill markers carry indefinite-lifetime
   // semantics: edit/delete mirroring gates on hasDeliveredMessage, and sweeping
   // an "m" row would silently disable corrections for any message older than
@@ -230,7 +230,7 @@ export class IntercomStore {
     return result.count;
   }
 
-  // Cross-topic relay dedup (replaces the old in-memory map — survives
+  // Cross-topic relay dedup (replaces the old in-memory map: survives
   // restarts). true = first sighting within the fresh window, relay it.
   // relayKey is caller-built (content kind prefix + body/attachment hash) so
   // notes vs replies and different attachment sets never collide.
@@ -277,7 +277,7 @@ export class IntercomStore {
     await this.prisma.intercomPendingPost.deleteMany({ where: { id } });
   }
 
-  // Atomically consume a matching reservation (any kind — a ticket reply can
+  // Atomically consume a matching reservation (any kind: a ticket reply can
   // surface on the conversation topic). true = this part is the bridge's own.
   // Consumes AT MOST ONE row: two identical in-flight staff messages hold two
   // reservations, and each echo part may only eat one of them.
@@ -305,7 +305,7 @@ export class IntercomStore {
 
   // A dead-lettered outbound event can leave one reservation per attempt (kept
   // on ambiguous failures so a late-landing part still hash-matches). Once the
-  // event is DEAD nothing will land anymore — sweep them immediately instead of
+  // event is DEAD nothing will land anymore: sweep them immediately instead of
   // letting them defer/false-match inbound replies for up to an hour.
   async deletePendingPostsForThread(ticketThreadId: string): Promise<void> {
     await this.prisma.intercomPendingPost.deleteMany({ where: { ticketThreadId } });
@@ -362,7 +362,7 @@ export class IntercomStore {
     await this.prisma.intercomMessageMap.updateMany({ where: { id }, data: { redactedAt: at } });
   }
 
-  // Newest relayed-agent-message stamp for a thread — the ping-cadence anchor
+  // Newest relayed-agent-message stamp for a thread: the ping-cadence anchor
   // (mention the customer only on the first agent reply after their activity).
   async getLatestInboundRelayAt(ticketThreadId: string): Promise<Date | null> {
     const row = await this.prisma.intercomMessageMap.findFirst({
@@ -385,7 +385,7 @@ export class IntercomStore {
   // ---- Assignment echo damper ----
 
   // Last admin assignee the BOT set (or observed) for this thread's
-  // conversation — the conversation.admin.assigned webhook compares against it
+  // conversation: the conversation.admin.assigned webhook compares against it
   // to tell bot echoes from human reassignment.
   async setLastAssigneeId(ticketThreadId: string, adminId: string | null): Promise<void> {
     await this.prisma.intercomLink.updateMany({
@@ -472,7 +472,7 @@ export class IntercomStore {
   }
 
   // Full bridge-state wipe (links + echo/pending ledgers). Touches NOTHING in
-  // Intercom itself — use when the Intercom side was cleared/recreated and the
+  // Intercom itself: use when the Intercom side was cleared/recreated and the
   // local bookkeeping is stale; the next backfill rebuilds everything.
   async resetAll(): Promise<{ links: number; parts: number }> {
     const [links, parts] = await this.prisma.$transaction([

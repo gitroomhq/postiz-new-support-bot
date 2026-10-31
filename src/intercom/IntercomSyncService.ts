@@ -23,12 +23,12 @@ export interface BridgeSourceMessage {
 }
 
 // Discord-only tickets are not mirrored to Intercom (user decision: refund
-// requests start Discord-only — self-service flow + /charge staff resolution —
+// requests start Discord-only (self-service flow + /charge staff resolution)
 // and flip to mirrored when the customer sends a typed message, see
 // flipRefundTicket). The per-ticket flag is the primary signal and wins in
 // BOTH directions: true = exempt, false = mirrored (a flipped refund ticket).
 // The (category, question) pair is the belt ONLY for shapes that predate the
-// flag (queued pre-flag ensure payloads) — DB rows always carry the flag
+// flag (queued pre-flag ensure payloads): DB rows always carry the flag
 // (NOT NULL column, backfilled by ensureSchema), so rows are governed by the
 // flag alone. Scoping this to the flag (not the whole billing category) is
 // deliberate: "Other Billing Question" tickets DO mirror.
@@ -45,7 +45,7 @@ export const AGENT_WARNING_TEXT =
   "⚠️ One-way mirror: this conversation is pushed from Discord. Replies here are NOT delivered to the customer; answer in the Discord thread instead.";
 
 // Posted on a push→bi flip into every conversation that previously received
-// AGENT_WARNING_TEXT — that note is now the most prominent (and wrong)
+// AGENT_WARNING_TEXT: that note is now the most prominent (and wrong)
 // instruction agents see.
 export const BI_CORRECTION_TEXT =
   "✅ Bi-directional sync is now ON: replies in this conversation ARE delivered to the customer in Discord. (An earlier note here said otherwise; it no longer applies.)";
@@ -56,7 +56,7 @@ export const BI_CORRECTION_TEXT =
 // workflow's Intercom delivery children.
 export class IntercomSyncService {
   // Per-thread promise chains so concurrent hooks enqueue in call order (the
-  // outbox seq must match event order — same pattern as StatusService.chains).
+  // outbox seq must match event order: same pattern as StatusService.chains).
   private chains = new Map<string, Promise<void>>();
   // Resolves a category id to its human label ("billing" → "💳 Billing").
   // Bound from index.ts once the CategoryRegistry exists.
@@ -101,7 +101,7 @@ export class IntercomSyncService {
   }
 
   // Temporal seam: composed events are signalled into the per-ticket
-  // workflow's outbox — every hook call site stays untouched. Signals are sent
+  // workflow's outbox: every hook call site stays untouched. Signals are sent
   // whenever Temporal is CONFIGURED (routable), even while the worker is
   // paused: they land server-side and deliver on resume; outages buffer in the
   // gateway's RetryBuffer.
@@ -125,7 +125,7 @@ export class IntercomSyncService {
 
   // Single enqueue choke point: workflow signal when Temporal is configured,
   // best-effort direct delivery otherwise (a failure only costs this one
-  // mirror event — the bridge stays no-throw either way).
+  // mirror event: the bridge stays no-throw either way).
   private async emit(threadId: string, type: OutboxEventType, payload: OutboxPayload): Promise<void> {
     if (this.temporalRoutable()) {
       await this.producers!.intercomEnqueue(threadId, type, payload);
@@ -154,7 +154,7 @@ export class IntercomSyncService {
   }
 
   // Exemption gate: refund-request tickets start Discord-only (self-service +
-  // /charge) and are not mirrored — no conversation, no ticket, no events —
+  // /charge) and are not mirrored (no conversation, no ticket, no events)
   // until the customer's first typed message flips them (flipRefundTicket).
   // Applied at every outbound entry point so nothing enqueues while exempt;
   // the executor's ensure short-circuit is the second belt for the
@@ -172,7 +172,7 @@ export class IntercomSyncService {
   // as `void` side-effects after the DB write, so the refetched state is current.
 
   // The customer's question becomes the conversation's opening message (the
-  // ensure event carries it) — no separate message enqueue, no duplicate.
+  // ensure event carries it): no separate message enqueue, no duplicate.
   async onTicketCreated(threadId: string, categoryLabel: string | null, _question: string | null): Promise<void> {
     if (!this.enabled()) return;
     const ticket = await this.ticketStore.getByThreadId(threadId);
@@ -197,14 +197,14 @@ export class IntercomSyncService {
   // inside the per-thread chain so a burst of messages serializes: exactly one
   // caller wins the DB lift; the transcript enqueue is separately claimed via
   // the "b" backfill marker (crash-heal: a lost enqueue is retried by the next
-  // qualifying message — see DiscordBot.isRefundFlipCandidate). Event order
+  // qualifying message, see DiscordBot.isRefundFlipCandidate). Event order
   // through the per-ticket FIFO outbox:
-  //   ensure (explicit payload — the creation ensure was short-circuited but
+  //   ensure (explicit payload: the creation ensure was short-circuited but
   //   latched hasIntercomLink in the workflow, so the pump would never
   //   synthesize a head for us) → context note → prior typed messages
   //   (chronological) → the trigger message.
   // Returns "flipped" (this call created the sequence), "relayed" (already
-  // flipped/claimed — trigger enqueued as a normal message), or "skipped".
+  // flipped/claimed: trigger enqueued as a normal message), or "skipped".
   async flipRefundTicket(
     ticket: TicketWithTag,
     trigger: BridgeSourceMessage,
@@ -216,7 +216,7 @@ export class IntercomSyncService {
       // Refetch: the chain may have queued this behind another flip attempt.
       const fresh = await this.ticketStore.getByThreadId(ticket.threadId);
       if (!fresh || fresh.closed) return;
-      // Winner and loser both proceed — the row is non-exempt either way.
+      // Winner and loser both proceed: the row is non-exempt either way.
       await this.ticketStore.liftIntercomExempt(fresh.threadId);
       fresh.intercomExempt = false;
 
@@ -228,7 +228,7 @@ export class IntercomSyncService {
 
       if (!transcriptDue) {
         // Already flipped (or another caller claimed the sequence, queued
-        // ahead of us in the same FIFO outbox) — relay the trigger normally.
+        // ahead of us in the same FIFO outbox): relay the trigger normally.
         const composed = this.composeMessage(fresh, trigger, false);
         if (composed) {
           await this.ensureLink(fresh);
@@ -248,7 +248,7 @@ export class IntercomSyncService {
           if (message.createdAt >= trigger.createdAt) continue;
           const composed = this.composeMessage(fresh, message, message.authorId !== fresh.customerId);
           if (!composed) continue;
-          // Old signed CDN urls are likely expired — text links only (same
+          // Old signed CDN urls are likely expired: text links only (same
           // rule as backfill/heal).
           await this.emit(fresh.threadId, "message", { ...composed, attachmentMode: "links" });
         }
@@ -258,7 +258,7 @@ export class IntercomSyncService {
         }
         outcome = "flipped";
       } catch (e) {
-        // Enqueue failed partway — release the marker so the next qualifying
+        // Enqueue failed partway: release the marker so the next qualifying
         // customer message retries the sequence (delivered events stay deduped
         // by the "m" ledger).
         await this.store.releaseBackfill(fresh.threadId).catch(() => {});
@@ -269,7 +269,7 @@ export class IntercomSyncService {
   }
 
   // Internal refund-state summary posted on flip, ahead of the transcript.
-  // Discord markdown — the note executor renders it to HTML. Every line is
+  // Discord markdown: the note executor renders it to HTML. Every line is
   // best-effort: a data gap degrades to a shorter note, never a throw.
   private async buildRefundContextNote(ticket: TicketWithTag): Promise<string> {
     const lines: string[] = ["💳 **Refund ticket: flipped to mirrored** (customer sent a typed message)"];
@@ -333,7 +333,7 @@ export class IntercomSyncService {
     author: { id: string; name: string } | null
   ): Promise<void> {
     if (!this.enabled() || !this.mirrorable(ticket)) return;
-    // See onMessageEdited — no ghost ensure for unbridged tickets.
+    // See onMessageEdited: no ghost ensure for unbridged tickets.
     if (!(await this.store.getLink(ticket.threadId))) return;
     const isCustomer = author != null && ticket.customerId != null && author.id === ticket.customerId;
     await this.chained(ticket.threadId, async () => {
@@ -382,7 +382,7 @@ export class IntercomSyncService {
 
   // Agent-idle reminder for a bridged ticket (checkTicketTimers SUPPORT
   // target): internal note + conversation reopen in Intercom. Returns false
-  // when the bridge is off or the ticket is unmirrored — the caller then sends
+  // when the bridge is off or the ticket is unmirrored: the caller then sends
   // no reminder at all (the Discord role-ping fallback is gone).
   async onAgentReminder(
     ticket: TicketWithTag,
@@ -415,7 +415,7 @@ export class IntercomSyncService {
 
   // Newest relayed-agent-reply stamp for a thread (IntercomMessageMap "in"
   // rows). Agent replies land in Discord as BOT messages, invisible to the
-  // human-message scans — checkTicketTimers folds this in so an agent who
+  // human-message scans: checkTicketTimers folds this in so an agent who
   // replied via Intercom isn't nagged as idle.
   async lastAgentRelayAt(threadId: string): Promise<Date | null> {
     return this.store.getLatestInboundRelayAt(threadId);
@@ -434,7 +434,7 @@ export class IntercomSyncService {
   }
 
   // Push-mode "replies here don't reach the customer" note. Deliberately skips
-  // ensureLink — it is only ever called for conversations that already have one.
+  // ensureLink: it is only ever called for conversations that already have one.
   async enqueueAgentWarning(ticketThreadId: string): Promise<void> {
     await this.chained(ticketThreadId, async () => {
       await this.emit(ticketThreadId, "note", { content: AGENT_WARNING_TEXT });
@@ -442,7 +442,7 @@ export class IntercomSyncService {
   }
 
   // Reconcile: re-assert a closed/resolved Discord ticket's state onto its
-  // Intercom conversation, BYPASSING the open/close damper (forceOpenSync) —
+  // Intercom conversation, BYPASSING the open/close damper (forceOpenSync):
   // for drift incidents where Intercom-side auto-reopens left conversations
   // open that Discord says are done. Only ever closes; open tickets and
   // unbridged tickets are skipped. Returns true when an event was enqueued.
@@ -492,14 +492,14 @@ export class IntercomSyncService {
   // ---- Backfill ----
 
   // Sends a full historical replay for one ticket through emit(). Guarded twice:
-  // the link row (ticket already bridged) AND the backfill-enqueued marker —
+  // the link row (ticket already bridged) AND the backfill-enqueued marker:
   // the link only appears once the ensure DELIVERS, which can be minutes away
   // on a slow drain, so a re-click (or a second backfill run) would otherwise
   // enqueue the whole transcript again with no message-level dedup. Returns the
   // number of events sent, or null when the ticket is already bridged/enqueued.
   // Messages-only mirroring: the transcript replays messages; status/CSAT land
   // as ticket state + attributes, never as notes. Timestamps come from the
-  // native created_at backdating — no text prefixes.
+  // native created_at backdating: no text prefixes.
   async backfillTicket(
     ticket: TicketWithTag,
     messages: BridgeSourceMessage[] | null // null = thread no longer exists
@@ -530,7 +530,7 @@ export class IntercomSyncService {
         if (!composed) continue;
         add("message", {
           ...composed,
-          // Backfilled Discord CDN links are signed and likely expired —
+          // Backfilled Discord CDN links are signed and likely expired:
           // never hand them to attachment_urls, only as text.
           attachmentMode: "links",
         });
@@ -539,7 +539,7 @@ export class IntercomSyncService {
 
     // Tail: final state + attributes (no transcript notes). forceOpenSync: the
     // replayed contact messages auto-reopen the conversation in Intercom, so
-    // the close must be re-asserted past the lastSyncedOpen damper — without it
+    // the close must be re-asserted past the lastSyncedOpen damper: without it
     // every backfilled closed ticket floods the inbox as an open conversation.
     const tag = ticket.statusTag;
     if (tag) {
@@ -561,7 +561,7 @@ export class IntercomSyncService {
         await this.emit(event.ticketThreadId, event.type, event.payload);
       }
     } catch (e) {
-      // Enqueue failed partway — release the marker so the ticket can be
+      // Enqueue failed partway: release the marker so the ticket can be
       // retried (delivered messages are still deduped by the m-ledger).
       await this.store.releaseBackfill(ticket.threadId).catch(() => {});
       throw e;
@@ -570,7 +570,7 @@ export class IntercomSyncService {
   }
 
   // Gap heal for an already-bridged ticket: enqueue the human messages that
-  // never reached Intercom (no "m"-ledger row) — outage windows (the
+  // never reached Intercom (no "m"-ledger row): outage windows (the
   // billing-wide gate) and pre-link history (bridge enabled mid-ticket).
   // Bot messages are skipped: the question already opens the conversation,
   // and reminder/status embeds are noise in a live conversation. Old
@@ -595,7 +595,7 @@ export class IntercomSyncService {
     const healed = events.length;
     if (healed === 0) return 0;
 
-    // Replayed contact messages auto-reopen the conversation in Intercom —
+    // Replayed contact messages auto-reopen the conversation in Intercom:
     // re-assert a closed/resolved state past the open/close damper (same
     // forceOpenSync tail as backfill).
     const tag = ticket.statusTag;
@@ -636,7 +636,7 @@ export class IntercomSyncService {
     const session = await this.sessionStore.getSession(ticket.customerId).catch(() => null);
     payload.postizUserId = session?.postizUserId ?? null;
     payload.stripeCustomerId = session?.stripeCustomerId ?? null;
-    // Display only — see the note on EnsurePayload.postizResolved.
+    // Display only: see the note on EnsurePayload.postizResolved.
     payload.postizResolved = ticket.postizUserId
       ? {
           userId: ticket.postizUserId,
@@ -678,7 +678,7 @@ export class IntercomSyncService {
   private async ensureLink(ticket: TicketWithTag, categoryLabel?: string | null): Promise<void> {
     // Temporal path: the per-ticket workflow synthesizes the ensure event
     // itself (ensure-first pump invariant, payload composed fresh at delivery
-    // time) — nothing to send here.
+    // time): nothing to send here.
     if (this.temporalRoutable()) return;
     // Direct fallback: create the remote objects now so the following
     // message/note event has something to land on.
@@ -704,7 +704,7 @@ export class IntercomSyncService {
     let content: string;
     if (message.authorIsBot) {
       // Bot messages only reach this path via backfill (live handleMessage
-      // filters bots) — mark them so the imported transcript doesn't read as a
+      // filters bots): mark them so the imported transcript doesn't read as a
       // human staff reply. Historical AI answers may already carry the marker.
       direction = "outgoing";
       content = text.startsWith("🤖") ? text : `🤖 ${text}`;
@@ -745,7 +745,7 @@ export class IntercomSyncService {
 // session carried one (ticket creation requires OAuth, so this is the
 // overwhelmingly common case), then discord:{userId}, then a thread-scoped last
 // resort. The contact resolver cascades down this list when a higher id is
-// unusable (e.g. locked inside a prior wipe's 7-day permanent-deletion grace) —
+// unusable (e.g. locked inside a prior wipe's 7-day permanent-deletion grace):
 // the thread-scoped tail is unique per ticket, so it is effectively always free.
 export function externalIdCandidates(payload: EnsurePayload, threadId: string): string[] {
   const ids: string[] = [];
@@ -763,7 +763,7 @@ export function externalIdFor(payload: EnsurePayload, threadId: string): string 
 // gone (agent-rip: tickets are open or closed, and the boot migration flips
 // these tags to closesThread=true), but the predicate stays for inbound
 // Intercom states whose category reads resolved and for pre-migration queued
-// events. Matched by the ✅ convention OR by label — the emoji-only convention
+// events. Matched by the ✅ convention OR by label: the emoji-only convention
 // silently stopped closing conversations the moment a Resolved tag was
 // re-emojied.
 export function isResolvedTag(tag: StatusTag): boolean {

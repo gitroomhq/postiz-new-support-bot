@@ -3,7 +3,7 @@
 // IntercomOutboxScheduler. Payloads are stored as JSON, so keep them plain.
 //
 // Bridge object model: one Discord ticket maps to an Intercom CONVERSATION
-// (the transcript — customer messages as contact-authored comments, staff/AI
+// (the transcript: customer messages as contact-authored comments, staff/AI
 // mirror + agent replies as admin comments, notes as conversation notes) plus
 // a linked customer TICKET created via convert (type = bot category, custom
 // ticket state = bot status tag, CSAT as ticket attributes).
@@ -14,7 +14,7 @@ export type OutboxEventType =
   | "note"
   | "status"
   // Legacy skip-only member: the priority axis is removed, but durable queued
-  // events may still carry the type — the executor skips it. Removable once
+  // events may still carry the type: the executor skips it. Removable once
   // no queued events can still carry it.
   | "priority"
   | "csat"
@@ -23,7 +23,7 @@ export type OutboxEventType =
   | "agent_reminder"
   | "message_edit"
   | "message_delete"
-  // SLA re-evaluation (payload always null — target computed at delivery
+  // SLA re-evaluation (payload always null: target computed at delivery
   // time by SlaService.applyForBridged).
   | "sla"
   // Customer-responded ticket state: the customer's message moves the ticket
@@ -53,8 +53,8 @@ export interface EnsurePayload {
   categoryId: string | null; // ticket-type map key ("howto" | "bugs" | "billing")
   categoryLabel?: string | null;
   // Discord-only ticket (refund flow): true = the executor short-circuits the
-  // ensure; explicit false = a flipped refund ticket (customer typed — must
-  // ensure normally). Absent on payloads queued before the flag existed — the
+  // ensure; explicit false = a flipped refund ticket (customer typed: must
+  // ensure normally). Absent on payloads queued before the flag existed: the
   // executor falls back to the legacy (categoryId, question) refund predicate.
   intercomExempt?: boolean;
   question?: string | null; // _default_description_ of the converted ticket
@@ -62,14 +62,14 @@ export interface EnsurePayload {
   // opening message. false (backfill): the transcript replay carries the
   // content, so the opening message is a generic import header.
   questionAsOpening?: boolean;
-  // https://discord.com/channels/{guildId}/{threadId} — context note + canvas.
+  // https://discord.com/channels/{guildId}/{threadId}, context note + canvas.
   threadUrl?: string | null;
   statusTagId: string | null; // initial ticket state resolved at execute time
   statusLabel: string;
   closed: boolean;
   resolved: boolean;
   createdAtIso: string; // backdates conversation (created_at)
-  // Current Discord avatar URL — refreshed onto the Intercom contact so repeat
+  // Current Discord avatar URL: refreshed onto the Intercom contact so repeat
   // customers don't show under a blank avatar / years-old identity.
   customerAvatarUrl?: string | null;
 }
@@ -86,8 +86,8 @@ export interface MessagePayload {
   discordMessageId?: string;
   externalCreatedAtIso?: string; // → created_at on the reply (real backdating)
   attachments?: MessageAttachmentRef[];
-  // "urls": pass image CDN links as attachment_urls (live mirror — Intercom
-  // ingests them immediately). "links": append all as text (backfill — signed
+  // "urls": pass image CDN links as attachment_urls (live mirror: Intercom
+  // ingests them immediately). "links": append all as text (backfill: signed
   // Discord URLs are likely expired by then).
   attachmentMode?: "urls" | "links";
 }
@@ -99,7 +99,7 @@ export interface NotePayload {
 
 // Messages-only mirroring: status events update the ticket object
 // (state / attributes) but never post transcript notes. Old queued payloads
-// may still carry a legacy `note` field — executors ignore it.
+// may still carry a legacy `note` field: executors ignore it.
 export interface StatusPayload {
   // Mapping to an Intercom ticket state is resolved at execute time (the
   // /config mapping can change while the event is queued).
@@ -110,7 +110,7 @@ export interface StatusPayload {
   closed: boolean;
   resolved: boolean;
   // Backfill tail: re-assert conversation open/close even when the damper says
-  // it's already there — the replayed contact messages auto-reopen the
+  // it's already there: the replayed contact messages auto-reopen the
   // conversation in Intercom behind the damper's back.
   forceOpenSync?: boolean;
 }
@@ -136,7 +136,7 @@ export interface AgentReminderPayload {
 // ledger has confirmed as mirrored produce these (checked at execute time).
 export interface MessageEditPayload {
   discordMessageId: string;
-  editedAtIso: string; // dedup stamp — repeated edits of one message each mirror once
+  editedAtIso: string; // dedup stamp: repeated edits of one message each mirror once
   direction: "incoming" | "outgoing";
   authorName: string;
   content: string; // the NEW message content, Discord markdown
@@ -178,7 +178,7 @@ export interface IntercomSweepConversation {
   createdAt: Date | null;
   waitingSince: Date | null; // customer waiting for a teammate since (NRT clock anchor)
   snoozedUntil: Date | null;
-  firstAdminReplyAt: Date | null; // raw statistics — may be Fin/Operator
+  firstAdminReplyAt: Date | null; // raw statistics: may be Fin/Operator
   lastContactReplyAt: Date | null;
   lastAdminReplyAt: Date | null;
   teamAssigneeId: string | null;
@@ -270,7 +270,7 @@ export interface IntercomWebhookPart {
   created_at?: number;
   author?: IntercomWebhookAuthor;
   attachments?: Array<{ url?: string | null; name?: string | null }>;
-  // True once an agent deleted the part — set both in conversation_part.redacted
+  // True once an agent deleted the part: set both in conversation_part.redacted
   // payloads and on parts fetched via the conversation GET.
   redacted?: boolean;
   // Set on parts an API app created (this bot's own writes); null otherwise.
@@ -281,7 +281,7 @@ export interface IntercomWebhookPart {
 export interface IntercomConversationItem {
   type?: string;
   id?: string | number;
-  // Opening message, present in created payloads — the forwarded-email
+  // Opening message, present in created payloads: the forwarded-email
   // converter's cheap pre-filter (authoritative data comes from a fresh GET).
   source?: { subject?: string | null; author?: IntercomWebhookAuthor };
   conversation_parts?: { conversation_parts?: IntercomWebhookPart[] };
@@ -293,7 +293,7 @@ export interface IntercomConversationItem {
   team_assignee_id?: number | string | null; // scopes the balanced-assignment pool + per-team config
   snoozed_until?: number | null;
   tags?: { tags?: Array<{ id?: string | number; name?: string | null }> };
-  // Native priority level (none/low/medium/high/urgent) — READ-only via the
+  // Native priority level (none/low/medium/high/urgent): READ-only via the
   // public API; older payloads may carry the legacy "priority"/"not_priority".
   priority?: string | null;
   // The ticket this conversation is, when it is one. state is the category
@@ -313,7 +313,7 @@ export interface IntercomTicketItem {
 
 export interface IntercomWebhookEvent {
   type?: string; // "notification_event"
-  id?: string; // notification event id — inbox dedup key for Intercom's retry
+  id?: string; // notification event id: inbox dedup key for Intercom's retry
   topic?: string;
   data?: { item?: IntercomConversationItem | IntercomTicketItem };
 }

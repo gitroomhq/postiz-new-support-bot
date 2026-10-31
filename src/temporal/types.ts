@@ -1,6 +1,6 @@
 // Pure shared types + constants for the Temporal layer. This module is
 // imported by BOTH workflow code (sandboxed, webpack-bundled) and Node-side
-// code (producers, activities, panel) — it must never import anything beyond
+// code (producers, activities, panel): it must never import anything beyond
 // type-level TS. No Node builtins, no app modules.
 
 // Type-only deep import: the SearchAttributeKey interface itself is not
@@ -46,7 +46,7 @@ export const STATUS_REPORT_SCHEDULE_ID = "status-report";
 
 // ---- Retired workflows/schedules (agent-rip release) ----
 // ensureBaseline terminates/deletes these BEFORE the worker starts, every boot
-// (idempotent). A retired id must never reappear in SINGLETONS — their workflow
+// (idempotent). A retired id must never reappear in SINGLETONS: their workflow
 // types are no longer registered, so a surviving run would wedge on its next
 // workflow task until the next boot retires it again.
 export const RETIRED_SINGLETONS = [
@@ -64,13 +64,13 @@ export const RETIRED_SCHEDULES = [STATUS_REPORT_SCHEDULE_ID] as const;
 // Bump a looper's generation IN THE SAME COMMIT as any history-incompatible
 // change to its workflow body (changed activity order/types, new children,
 // different timers). ensureBaseline() terminates a running singleton whose
-// memo generation differs and starts a fresh run stamped with the new one —
+// memo generation differs and starts a fresh run stamped with the new one:
 // that IS the upgrade path for loopers, because every deploy replays running
 // workflows on the new bundle (AUTO_UPGRADE, single in-process worker) and a
 // replay mismatch wedges the workflow with nondeterminism task failures.
 // Safe: all loopers are stateless between iterations (state re-derived from
 // Postgres each tick). Stateful long-lived workflows (ticketWorkflow,
-// intercomInboxWorkflow) must use patched() instead — see README.
+// intercomInboxWorkflow) must use patched() instead: see README.
 export const LOOPER_GEN_MEMO_KEY = "looperGen";
 export const LOOPER_GENERATIONS: Record<string, number> = {
   [SINGLETONS.kbRefresh]: 1,
@@ -91,7 +91,7 @@ export const LOOPER_GENERATIONS: Record<string, number> = {
 // ---- Custom search attributes ----
 // Registered idempotently by ensureSearchAttributes() (operator gRPC API over
 // the existing mTLS connection); producers attach them ONLY after
-// TemporalService.searchAttributesReady() confirms registration — a start or
+// TemporalService.searchAttributesReady() confirms registration: a start or
 // upsert naming an UNREGISTERED attribute fails the whole command. Names are
 // permanent: SQL visibility cannot rename or re-type an attribute.
 export const SA_TICKET_THREAD_ID = { name: "ticketThreadId", type: "KEYWORD" } as const satisfies KeywordSaKey;
@@ -140,18 +140,18 @@ export type IcEventType =
   | "note"
   | "status"
   // Legacy skip-only member: the priority axis is removed, but events queued
-  // in in-flight ticket workflows may still carry the type — the executor
+  // in in-flight ticket workflows may still carry the type: the executor
   // skips them. Removable once no in-flight workflow can still carry it.
   | "priority"
   | "csat"
   // Retired bridged agent-idle reminder (internal note + reopen). No longer
-  // emitted — the SLA enforcer owns agent nags — but the executor still handles
+  // emitted (the SLA enforcer owns agent nags) but the executor still handles
   // it so any event queued in an in-flight ticket outbox across the deploy
   // still delivers. Removable once no in-flight workflow can carry it.
   | "agent_reminder"
   | "message_edit"
   | "message_delete"
-  // SLA re-evaluation: payload is always null — the target is computed at
+  // SLA re-evaluation: payload is always null, the target is computed at
   // delivery time from the then-current rules, so stale queued events
   // converge. Riding the outbox gives conversation-before-sla ordering for
   // free (ensure-head synthesis) and the delivery retry machinery.
@@ -163,7 +163,7 @@ export type IcEventType =
 export interface IcEvent {
   seq: number;
   type: IcEventType;
-  // The composed OutboxPayload (src/intercom/types.ts shape) — carried
+  // The composed OutboxPayload (src/intercom/types.ts shape): carried
   // verbatim because Discord message content is not re-fetchable from
   // Postgres. `null` for ensure: the delivery activity composes it fresh.
   payload: unknown | null;
@@ -194,7 +194,7 @@ export interface TicketSnapshot {
   closed: boolean;
   closedAtMs: number | null;
   statusTagId: string | null;
-  // Human status tag label (StatusTag.label) — the ticketStatus search
+  // Human status tag label (StatusTag.label): the ticketStatus search
   // attribute value. Renames apply on the ticket's next transition/scan.
   statusLabel: string | null;
   tagClosesThread: boolean;
@@ -287,7 +287,7 @@ export interface IntercomDeliveryResult {
 
 // Structured details thrown by the executeIntercomEvent activity (as
 // ApplicationFailure details[0]) so the delivery workflow can classify without
-// string parsing — mirrors the legacy outbox handleFailure() logic.
+// string parsing: mirrors the legacy outbox handleFailure() logic.
 export interface IntercomFailureDetails {
   status: number | null;
   retryAfterSeconds: number | null;
@@ -318,7 +318,7 @@ export interface AutoAnswerInput {
 export interface AiRunInput {
   // Key into the in-process live-interaction registry (interaction.id). The
   // activity edits the deferred ephemeral reply through it; after a process
-  // crash the registry entry is gone and the run is lost — same behavior as
+  // crash the registry entry is gone and the run is lost: same behavior as
   // the legacy in-memory path (maximumAttempts: 1, deliberate).
   runKey: string;
   sub: "ask" | "cause" | "draft" | "summarize";
@@ -389,7 +389,7 @@ export interface MoneyOutTickResult {
   scanned: number;
   created: number;
   errors: number;
-  // The sweep hit its page cap and has NOT seen everything up to now — the
+  // The sweep hit its page cap and has NOT seen everything up to now: the
   // cursor deliberately does not advance on a truncated pass.
   truncated: boolean;
   skipped: boolean; // the money-out ledger is disabled in /config
@@ -411,7 +411,7 @@ export interface SentryFeedbackTickResult {
   replayed: number;
   replayExhausted: number;
   errors: number;
-  capped: boolean; // per-tick import cap hit — remainder picked up next tick
+  capped: boolean; // per-tick import cap hit: remainder picked up next tick
   skipped: boolean; // disabled / not configured / no watermark / Intercom unconfigured
   // Why a skipped tick was skipped, null when it ran (or when the feature is
   // simply switched off, which the panel already states).
@@ -431,7 +431,7 @@ export interface SlaSweepResult {
 }
 
 // Bot-native SLA enforcement + assignment stray sweep + customer-idle
-// nag/auto-close (5-min looper — the former inactivity sweep folded in).
+// nag/auto-close (5-min looper: the former inactivity sweep folded in).
 export interface SlaEnforceResult {
   scanned: number;
   assigned: number;
@@ -443,7 +443,7 @@ export interface SlaEnforceResult {
   closed: number; // conversations auto-closed after N unanswered nags
   verifies: number;
   errors: number;
-  capped: boolean; // write budget exhausted — later ticks finish
+  capped: boolean; // write budget exhausted: later ticks finish
   skipped: boolean; // all passes disabled or Intercom unconfigured
 }
 
@@ -462,7 +462,7 @@ export interface CoreActivities {
   checkTicketTimers(threadId: string): Promise<TimerCheckResult>;
   pingStaffForNewTicket(threadId: string): Promise<void>;
 
-  // status change: the whole transition (StatusService.applyStatusDirect —
+  // status change: the whole transition (StatusService.applyStatusDirect,
   // one implementation shared with the legacy chain; the child workflow owns
   // durability + serialization)
   statusApplyDirect(input: StatusChangeInput): Promise<StatusChangeResult>;
@@ -491,7 +491,7 @@ export interface CoreActivities {
   publishStatusReport(force: boolean): Promise<ReportTickResult>;
   scoreOneNow(threadId: string): Promise<string>;
 
-  // AI (tombstone stubs — see above)
+  // AI (tombstone stubs: see above)
   runAutoAnswer(input: AutoAnswerInput): Promise<{ ok: boolean; apiLimit: boolean }>;
   runStaffAiCommand(input: AiRunInput): Promise<void>;
 
@@ -500,7 +500,7 @@ export interface CoreActivities {
   executeRefundCore(input: RefundWorkflowInput): Promise<RefundOutcome>;
   runVaultUpgradeJob(): Promise<void>;
 
-  // analytics rebuild — one activity per phase, so a failure retries that phase
+  // analytics rebuild: one activity per phase, so a failure retries that phase
   // rather than restarting an hour of Stripe paging.
   analyticsRebuildPreflight(): Promise<void>;
   analyticsRebuildBegin(): Promise<void>;

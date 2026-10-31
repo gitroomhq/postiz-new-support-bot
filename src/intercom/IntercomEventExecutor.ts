@@ -44,7 +44,7 @@ export const CONV_ATTR_ORIGIN = "Origin";
 //  - Temporal: the executeIntercomEvent activity wraps execute() and the
 //    intercomDeliveryWorkflow owns the retry loop.
 // Every step is idempotent / crash-resumable (link ladder, reserve→call→confirm
-// pending posts, lastSynced* dampers) — a retry resumes whatever is missing.
+// pending posts, lastSynced* dampers): a retry resumes whatever is missing.
 // Postiz account fields mirrored onto the Intercom CONTACT, so they render in
 // Intercom's own sidebar next to the Discord and Stripe ids rather than only
 // inside the canvas app. Values come from the identity stamped on the ticket;
@@ -63,12 +63,12 @@ export function postizContactAttributes(payload: EnsurePayload): Record<string, 
 export class IntercomEventExecutor {
   private contactAttrsEnsured = false;
   private discordTagId: string | null = null;
-  // Last identity (name|avatar) pushed per contact — ensures re-run routinely
+  // Last identity (name|avatar) pushed per contact: ensures re-run routinely
   // (every Continue-As-New re-synthesizes one), and a no-op PUT per re-ensure
   // across the fleet would waste real rate-limit budget.
   private contactIdentityPushed = new Map<string, string>();
   private execLog = log.child("intercom:exec");
-  // SLA manager brain — late-bound (constructed after the executor in
+  // SLA manager brain: late-bound (constructed after the executor in
   // index.ts); handles the "sla" outbox event. Same pattern as
   // IntercomSyncService.setExecutor.
   private slaService: { applyForBridged(threadId: string, reason: string): Promise<unknown> } | null = null;
@@ -116,7 +116,7 @@ export class IntercomEventExecutor {
   // Every admin-side call needs an admin_id. Preferred author: the auto-detected
   // Operator/Fin bot (no seat cost). Whether Intercom accepts bot authorship is
   // not guaranteed, so on a rejection-shaped error we retry with the configured
-  // human admin — and only persist the "Operator rejected" verdict when the
+  // human admin, and only persist the "Operator rejected" verdict when the
   // fallback actually succeeded (a 404 for a deleted conversation would
   // otherwise falsely disable the Operator forever).
   async withAuthor<T>(fn: (adminId: string) => Promise<T>): Promise<T> {
@@ -128,12 +128,12 @@ export class IntercomEventExecutor {
       return await fn(primary);
     } catch (e) {
       // Only permission-shaped statuses count as authorship rejection. 422 is a
-      // generic validation error (bad state transition, etc.) — treating it as
+      // generic validation error (bad state transition, etc.): treating it as
       // "Operator can't author" could permanently disable the Operator on a
       // coincidental fallback success.
       const rejectable = e instanceof IntercomHttpError && (e.status === 403 || e.status === 404);
       if (!rejectable || !operator || !fallback || operator === fallback || primary !== operator) throw e;
-      const result = await fn(fallback); // a failure here propagates — the admin wasn't the problem
+      const result = await fn(fallback); // a failure here propagates: the admin wasn't the problem
       await this.settingsStore.updateIntercom({ intercomOperatorAdminId: null });
       void this.audit.log({
         title: "🌉 Intercom Operator authorship rejected",
@@ -147,7 +147,7 @@ export class IntercomEventExecutor {
 
   // ---- Entry point ----
 
-  // `beat` (optional): Temporal activity heartbeat, called between API steps —
+  // `beat` (optional): Temporal activity heartbeat, called between API steps:
   // multi-call events (ensure ≈ up to 15 sequential calls of up to 30s each)
   // would otherwise outlive the heartbeat timeout and retry CONCURRENTLY with
   // the still-running attempt, duplicating conversations.
@@ -156,7 +156,7 @@ export class IntercomEventExecutor {
       case "ensure": {
         // Exempt refund tickets aren't mirrored (emit-layer gate); the ONE
         // event that reaches this executor for them anyway is the ticket
-        // workflow's creation-synthesized ensure — short-circuit it as a
+        // workflow's creation-synthesized ensure: short-circuit it as a
         // success so the pump drains without creating anything. Payloads
         // composed since the per-ticket flag carry it resolved (explicit
         // false = a flipped refund ticket, which MUST ensure); stale queued
@@ -200,7 +200,7 @@ export class IntercomEventExecutor {
         await this.executeMessageDelete(threadId, payload as MessageDeletePayload);
         return;
       case "sla":
-        // Payload is always null — the target is computed NOW from the
+        // Payload is always null: the target is computed NOW from the
         // current rules (stale queued events converge). Unbridged/exempt
         // tickets come back as a skipped result, never an error, so the
         // event drains without dead-lettering. Transient Intercom failures
@@ -221,7 +221,7 @@ export class IntercomEventExecutor {
 
   // A linked remote object was deleted in Intercom (404 on a non-ensure event).
   // Figure out which half died and rebuild it; the caller then retries the
-  // original event. Checks CONTACT and TICKET halves explicitly — a contact
+  // original event. Checks CONTACT and TICKET halves explicitly: a contact
   // merged/hard-deleted by an agent 404s every replyAsContact, and re-converting
   // an already-converted conversation can never fix that (it just mints junk
   // standalone tickets).
@@ -271,7 +271,7 @@ export class IntercomEventExecutor {
       const { contactId, externalId } = await this.resolveContact(externalIdCandidates(payload, threadId), payload, beat);
       beat?.();
       // Live tickets: the customer's rendered question IS the opening message
-      // (native created_at carries the timestamp — no text prefixes). Backfill:
+      // (native created_at carries the timestamp: no text prefixes). Backfill:
       // a generic import header; the transcript replay supplies the content.
       const opening =
         payload.questionAsOpening !== false && payload.question?.trim()
@@ -282,7 +282,7 @@ export class IntercomEventExecutor {
       created = true;
     } else {
       // Reused link (re-ensure after Continue-As-New / self-heal): refresh the
-      // contact's display identity — Discord names drift and the avatar was
+      // contact's display identity: Discord names drift and the avatar was
       // historically never set. Best-effort, deduped per process.
       await this.refreshContactIdentity(link.contactId, payload).catch(() => {});
     }
@@ -323,7 +323,7 @@ export class IntercomEventExecutor {
     beat?.();
 
     // Ticket attributes; the definitions may not exist yet ("/config → Ensure
-    // Attributes" or a one-time manual creation fixes that) — degrade.
+    // Attributes" or a one-time manual creation fixes that): degrade.
     const attributes: Record<string, unknown> = { [TICKET_ATTR_THREAD]: threadId };
     try {
       await this.withAuthor((a) => this.client.updateTicket(ticketId, { attributes, adminId: a }));
@@ -332,7 +332,7 @@ export class IntercomEventExecutor {
     }
 
     // Initial ticket state. A freshly converted ticket often already sits in
-    // the mapped state (the type's default) — Intercom rejects that with
+    // the mapped state (the type's default): Intercom rejects that with
     // 400 "Cannot transition ticket to the same state", which for the bridge
     // means: already done.
     let stateId = payload.statusTagId
@@ -359,8 +359,8 @@ export class IntercomEventExecutor {
 
     // Team routing (Intercom's workflow triggers can't see API-created
     // conversations/tickets, so the bridge assigns directly). Permanent
-    // failures degrade with an audit warning — a wrong/deleted team id must
-    // not dead-letter tickets — and only apply on creation: later reassignment
+    // failures degrade with an audit warning (a wrong/deleted team id must
+    // not dead-letter tickets) and only apply on creation: later reassignment
     // by agents is never overridden.
     const teamId = this.settingsStore.intercomTeamId();
     if (teamId) {
@@ -370,7 +370,7 @@ export class IntercomEventExecutor {
       } catch (e) {
         if (!isPermanent4xx(e)) throw e;
         // Re-ensure after a partial failure: "already assigned" IS the desired
-        // end state — swallow it instead of spamming the audit channel.
+        // end state: swallow it instead of spamming the audit channel.
         if (!isAlreadyAssignedError(e)) {
           void this.audit.log({
             title: "🌉 Intercom team assignment failed",
@@ -388,7 +388,7 @@ export class IntercomEventExecutor {
     beat?.();
 
     // Balanced assignment (bot-native, Advanced tier): pick a teammate WITHIN
-    // the routing team right after team routing — creation only, so later
+    // the routing team right after team routing: creation only, so later
     // human reassignment is never overridden (the enforcement sweep owns
     // strays). Best-effort. Uses the same routing team the bridge just
     // assigned (teamId), so per-team config resolves correctly.
@@ -400,7 +400,7 @@ export class IntercomEventExecutor {
     }
 
     // Conversation open/close parity: API-created conversations start open.
-    // The ticket's own open flag follows suit — resolved state alone leaves it
+    // The ticket's own open flag follows suit: resolved state alone leaves it
     // listed among open tickets.
     const target: "open" | "closed" = payload.closed || payload.resolved ? "closed" : "open";
     if (target === "closed" && link.lastSyncedOpen !== "closed") {
@@ -424,7 +424,7 @@ export class IntercomEventExecutor {
       const tagId = this.discordTagId;
       await this.withAuthor((a) => this.client.tagConversation(conversationId, tagId, a));
     } catch (e) {
-      this.discordTagId = null; // stale cache (tag deleted in Intercom) — recreate next time
+      this.discordTagId = null; // stale cache (tag deleted in Intercom): recreate next time
       this.execLog.warn("conversation tagging failed", {
         "intercom.conversation_id": conversationId,
         "error.message": e instanceof Error ? e.message : String(e),
@@ -463,7 +463,7 @@ export class IntercomEventExecutor {
       beat?.();
       const existing = await this.client.findContactByExternalId(externalId);
       if (existing) {
-        // Refresh display identity on reuse — name drift, missing avatar.
+        // Refresh display identity on reuse: name drift, missing avatar.
         await this.refreshContactIdentity(existing.id, payload).catch(() => {});
         return { contactId: existing.id, externalId };
       }
@@ -481,12 +481,12 @@ export class IntercomEventExecutor {
     // Create under the first candidate that isn't locked. A blocked id 409s with
     // the conflicting record's id in the body; if it's merely archived we
     // unarchive and reuse it, but if it's mid-permanent-deletion (a prior wipe's
-    // DELETE — "not restorable") we can neither reuse nor recreate under it for
+    // DELETE: "not restorable") we can neither reuse nor recreate under it for
     // ~7 days, so we fall through to the next namespace.
     for (let i = 0; i < candidates.length; i++) {
       const externalId = candidates[i];
       beat?.();
-      // Custom attributes only on the canonical attempt — a fallback create must
+      // Custom attributes only on the canonical attempt: a fallback create must
       // not be derailed by a missing attribute definition.
       const contactId = await this.resolveContactForId(externalId, name, i === 0 ? customAttributes : undefined, payload);
       if (contactId) return { contactId, externalId };
@@ -495,8 +495,8 @@ export class IntercomEventExecutor {
       });
     }
 
-    // Every candidate is in the grace window (all namespaces wiped within 7 days
-    // — practically impossible given the unique thread-scoped tail).
+    // Every candidate is in the grace window (all namespaces wiped within 7 days,
+    // practically impossible given the unique thread-scoped tail).
     throw new IntercomHttpError(422, "Intercom contact resolve: all external_id candidates are in the deletion grace window");
   }
 
@@ -528,10 +528,10 @@ export class IntercomEventExecutor {
         }
       }
 
-      // A create race (contact now exists) or a custom-attribute rejection —
+      // A create race (contact now exists) or a custom-attribute rejection:
       // search, then retry the create once without custom attributes. The retry
       // itself can conflict too (a differently-shaped 409/422 whose body didn't
-      // parse above) — never let that dead-letter the ensure permanently; fall
+      // parse above): never let that dead-letter the ensure permanently; fall
       // through to the next external_id namespace instead.
       const found = await this.client.searchContactByExternalId(externalId);
       if (found) return found.id;
@@ -616,7 +616,7 @@ export class IntercomEventExecutor {
   ): Promise<string> {
     const ticketTypeId = this.settingsStore.intercomTicketTypeIdFor(payload.categoryId);
     if (!ticketTypeId) {
-      // Config gap, not a data error — retry transiently until a mapping exists.
+      // Config gap, not a data error: retry transiently until a mapping exists.
       throw new IntercomHttpError(503, "No Intercom ticket type mapped (configure /config → Intercom → Ticket types)");
     }
     const title = `${payload.customerDisplayName ?? payload.customerId ?? "Discord"} · ${payload.categoryLabel ?? payload.categoryId ?? "Support"}`;
@@ -630,7 +630,7 @@ export class IntercomEventExecutor {
       ticketId = (await this.client.convertToTicket(conversationId, ticketTypeId, attributes)).ticketId;
     } catch (e) {
       if (!isPermanent4xx(e)) throw e;
-      // A conversation can only be converted once — a heal retry hitting an
+      // A conversation can only be converted once: a heal retry hitting an
       // already-converted conversation must ADOPT the existing ticket, not
       // degrade down the ladder into a junk standalone one.
       const existingTicketId = await this.client.getConversationTicketId(conversationId).catch(() => null);
@@ -643,7 +643,7 @@ export class IntercomEventExecutor {
       } catch (e2) {
         if (!isPermanent4xx(e2)) throw e2;
         try {
-          // create+link is valid for back-office/tracker types — still a real
+          // create+link is valid for back-office/tracker types: still a real
           // Intercom-side link, just not via convert. For CUSTOMER types this
           // rung is expected to 4xx (conversation_to_link_id is rejected) and
           // fall through to the standalone rung below.
@@ -682,7 +682,7 @@ export class IntercomEventExecutor {
   // A ticketId-less link is fine for most events (they need the conversation;
   // the pending convert is the ensure's job to finish). NO inline rebuild when
   // the link is missing entirely: the pump's ensure-first invariant means a
-  // missing link is a reset/wipe race — rebuilding here would resurrect the
+  // missing link is a reset/wipe race: rebuilding here would resurrect the
   // bridge the operator just wiped. 410 is permanent → the event drops.
   private async requireLink(threadId: string): Promise<IntercomLink> {
     const link = await this.store.getLink(threadId);
@@ -693,7 +693,7 @@ export class IntercomEventExecutor {
   // Reserve → call → confirm: the pending-post row is written BEFORE the API
   // call so a webhook that beats the confirm still recognizes the part as our
   // own (body-hash match). The reservation is released on success and on a
-  // DEFINITE rejection (a 4xx response proves no part was created) — but kept
+  // DEFINITE rejection (a 4xx response proves no part was created), but kept
   // on ambiguous failures (timeout/network/5xx): the part may have landed, and
   // its webhook must still hash-match. The 1h sweep collects leftovers.
   private async releasePendingPost(pendingId: string, error?: unknown): Promise<void> {
@@ -734,8 +734,8 @@ export class IntercomEventExecutor {
   }
 
   // Image URLs (Intercom documents attachment_urls as image URLs, ≤10) go as
-  // real attachments in "urls" mode; everything else — and everything in
-  // "links" mode (backfill: signed Discord URLs are expired) — as body lines.
+  // real attachments in "urls" mode; everything else (and everything in
+  // "links" mode, backfill: signed Discord URLs are expired) as body lines.
   private splitAttachments(payload: MessagePayload): { urls: string[]; lines: string } {
     const urls: string[] = [];
     const lineList: string[] = [];
@@ -758,7 +758,7 @@ export class IntercomEventExecutor {
 
   // Shared delivery core for message / message_edit / message_delete.
   // deliveryKey (kind "m" ledger): Intercom has no idempotency keys, so a
-  // timeout-after-success retry would double-post — check before, record after.
+  // timeout-after-success retry would double-post: check before, record after.
   // The remaining duplicate window (crash between call and record) is the same
   // one the pending-post handshake already tolerates.
   private async deliverMessage(threadId: string, payload: MessagePayload, deliveryKey: string | null): Promise<void> {
@@ -770,7 +770,7 @@ export class IntercomEventExecutor {
     const send = async (attachmentUrls: string[], finalBody: string): Promise<string | null> => {
       if (payload.direction === "incoming") {
         // Contact-authored parts are never relayed back (the webhook handler
-        // only processes admin/bot authors) — no echo bookkeeping needed.
+        // only processes admin/bot authors): no echo bookkeeping needed.
         const { partId } = await this.client.replyAsContact(link.conversationId, {
           intercomUserId: link.contactId,
           body: finalBody,
@@ -814,7 +814,7 @@ export class IntercomEventExecutor {
       }
     }
     // Message map (delete/edit → redact reflection). Only for real Discord
-    // message ids (snowflakes) — synthetic keys ("ai:…") aren't deletable.
+    // message ids (snowflakes): synthetic keys ("ai:…") aren't deletable.
     // Best-effort: a lost map row only degrades a later delete to the
     // appended-note fallback.
     if (partId && payload.discordMessageId && /^\d+$/.test(payload.discordMessageId)) {
@@ -859,7 +859,7 @@ export class IntercomEventExecutor {
     );
   }
 
-  // Deletes: redact the mirrored part (native Intercom tombstone — the content
+  // Deletes: redact the mirrored part (native Intercom tombstone: the content
   // actually disappears, which is the point for the leaked-secret case).
   // Pre-feature messages have no map row and fall back to the appended note.
   private async executeMessageDelete(threadId: string, payload: MessageDeletePayload): Promise<void> {
@@ -868,7 +868,7 @@ export class IntercomEventExecutor {
     if (await this.store.hasDeliveredMessage(deliveryKey)) return;
     const map = await this.store.getOutboundMessageMap(payload.discordMessageId);
     if (map?.redactedAt) {
-      // Already redacted — this Discord delete IS the reflection of an
+      // Already redacted: this Discord delete IS the reflection of an
       // Intercom-side redaction (or a retried attempt). Nothing to mirror.
       await this.store.recordDeliveredMessage(deliveryKey, threadId).catch(() => {});
       return;
@@ -886,12 +886,12 @@ export class IntercomEventExecutor {
 
   // Redact one mapped part. Pre-mark → call → rollback-only-on-DEFINITE-reject:
   // the redact triggers a conversation_part.redacted webhook, and the inbound
-  // handler must find the stamp already set — otherwise it treats the bridge's
+  // handler must find the stamp already set: otherwise it treats the bridge's
   // own redaction as an agent action and deletes the (edited, still existing)
   // Discord original. Ambiguous failures (timeout/5xx) KEEP the stamp for the
   // same reason: the redact may have landed and its webhook must still be
   // recognized as ours (mirrors the releasePendingPost contract). false =
-  // definite rejection (no redact permission / part gone) — the caller
+  // definite rejection (no redact permission / part gone): the caller
   // degrades to the appended-note mirror.
   private async tryRedactPart(threadId: string, map: IntercomMessageMap): Promise<boolean> {
     const link = await this.requireLink(threadId);
@@ -936,7 +936,7 @@ export class IntercomEventExecutor {
         await this.withAuthor((a) => this.client.updateTicket(link.ticketId!, { stateId, adminId: a }));
         statePutHappened = true;
       } catch (e) {
-        // "Cannot transition ticket to the same state" — already there
+        // "Cannot transition ticket to the same state": already there
         // (e.g. an agent moved it while the mode was push, or two bot tags
         // map to one Intercom state). Success for the bridge.
         if (!isSameStateError(e)) throw e;
@@ -949,7 +949,7 @@ export class IntercomEventExecutor {
 
     // Conversation open/close parity (closing statuses close the conversation),
     // same damper pattern via lastSyncedOpen. Messages-only mirroring: no
-    // transition note — the ticket state itself is the record. forceOpenSync
+    // transition note: the ticket state itself is the record. forceOpenSync
     // (backfill tail) bypasses the damper: the replay's contact messages
     // auto-reopened the conversation, and "already closed/open" is success.
     const target: "open" | "closed" = payload.closed || payload.resolved ? "closed" : "open";
@@ -963,7 +963,7 @@ export class IntercomEventExecutor {
       await this.store.setLastSyncedOpen(threadId, target);
     } else if (target === "closed" && statePutHappened) {
       // The state PUT above auto-reopened the conversation in Intercom (any
-      // ticket update does) but the parity damper says it's already closed —
+      // ticket update does) but the parity damper says it's already closed:
       // re-assert the close or it sits open in the inbox.
       await this.reassertConversationClosed(threadId, link);
     }
@@ -971,20 +971,20 @@ export class IntercomEventExecutor {
 
   // Intercom auto-reopens a conversation when the bridge updates the linked
   // ticket (state or attributes). When the bridge's last synced state is
-  // closed, restore it — otherwise every post-close CSAT write leaves
+  // closed, restore it: otherwise every post-close CSAT write leaves
   // the conversation open for agents (and fires an opened webhook).
   private async reassertConversationClosed(threadId: string, link: IntercomLink): Promise<void> {
     if (link.lastSyncedOpen !== "closed") return;
     try {
       await this.withAuthor((a) => this.client.setConversationOpen(link.conversationId, false, a));
     } catch (e) {
-      if (!isPermanent4xx(e)) throw e; // "already closed" & co — desired end state
+      if (!isPermanent4xx(e)) throw e; // "already closed" & co: desired end state
     }
     await this.setTicketOpenParity(link.ticketId, false);
   }
 
   // Ticket open/closed parity: the ticket's open flag is SEPARATE from its
-  // state — a resolved state alone leaves the ticket listed among open
+  // state: a resolved state alone leaves the ticket listed among open
   // tickets. Best-effort: parity must never dead-letter an event ("already
   // closed" and other rejection shapes are the desired end state). The flip's
   // webhook echo is bridge-authored, so the inbound attribution gate drops it.
@@ -999,14 +999,14 @@ export class IntercomEventExecutor {
 
   // CSAT: score + the customer's comment. Intercom's native conversation_rating
   // is READ-ONLY via the public REST API (no rate endpoint; ratings originate
-  // in Messenger, which these customers never see — verified against the API
+  // in Messenger, which these customers never see: verified against the API
   // docs, 1.0–2.15 + Preview), so attributes are the native ceiling:
   //  - ticket attributes "CSAT" + "CSAT Comment" (definitions auto-creatable
   //    via /config → Intercom → Ensure Attributes);
   //  - conversation custom attributes with the same names (definitions can NOT
-  //    be API-created — Origin-marker pattern: 4xx-degrade until they are
+  //    be API-created: Origin-marker pattern: 4xx-degrade until they are
   //    hand-created in Settings → Data → Conversations).
-  // CSAT typically arrives AFTER the close — without the re-assert the
+  // CSAT typically arrives AFTER the close: without the re-assert the
   // attribute writes reopen the conversation in Intercom.
   private async executeCsat(threadId: string, payload: CsatPayload): Promise<void> {
     const link = await this.requireLink(threadId);
@@ -1031,7 +1031,7 @@ export class IntercomEventExecutor {
     try {
       await this.client.setConversationAttributes(link.conversationId, conversationAttributes);
     } catch (e) {
-      // Conversation attribute definitions are UI-only — degrade silently
+      // Conversation attribute definitions are UI-only: degrade silently
       // until they exist (same contract as markDiscordOrigin).
       if (!isPermanent4xx(e)) throw e;
     }
@@ -1040,13 +1040,13 @@ export class IntercomEventExecutor {
 
   // Agent-idle reminder (bridged ticket, SUPPORT reminder target): internal
   // note + reopen so the conversation resurfaces in the Intercom inbox. The
-  // reopen intentionally bypasses the lastSyncedOpen damper — surfacing the
-  // conversation IS the point — and updates it afterwards so status parity
+  // reopen intentionally bypasses the lastSyncedOpen damper (surfacing the
+  // conversation IS the point) and updates it afterwards so status parity
   // stays coherent. Echo safety: both parts are bridge-authored (attribution
   // gate drops the webhooks) and the note rides the pending-post handshake.
   private async executeAgentReminder(threadId: string, payload: AgentReminderPayload): Promise<void> {
     const link = await this.requireLink(threadId);
-    // Team resolved at post time, not enqueue time — the payload can sit in
+    // Team resolved at post time, not enqueue time: the payload can sit in
     // the outbox while the assignment changes.
     const teamName = await this.resolveAssignedTeamName(link.conversationId);
     // Per-tag override (operator-entered plain text → escaped) replaces the
@@ -1057,13 +1057,13 @@ export class IntercomEventExecutor {
     try {
       await this.withAuthor((a) => this.client.setConversationOpen(link.conversationId, true, a));
     } catch (e) {
-      if (!isPermanent4xx(e)) throw e; // "already open" & co — desired end state
+      if (!isPermanent4xx(e)) throw e; // "already open" & co: desired end state
     }
     await this.store.setLastSyncedOpen(threadId, "open");
   }
 
   // Name of the team currently assigned to the conversation, falling back to
-  // the configured routing team, then a generic label. Never throws — the
+  // the configured routing team, then a generic label. Never throws: the
   // team name only decorates the reminder note, which must post regardless.
   private async resolveAssignedTeamName(conversationId: string): Promise<string> {
     const stats = await this.client.getConversationIdleStats(conversationId).catch(() => null);
@@ -1077,14 +1077,14 @@ export function isPermanent4xx(e: unknown): boolean {
   return e instanceof IntercomHttpError && e.status >= 400 && e.status < 500 && e.status !== 408 && e.status !== 429;
 }
 
-// Intercom rejects a transition to the ticket's current state with a 400 —
+// Intercom rejects a transition to the ticket's current state with a 400:
 // for the bridge that outcome IS the desired end state.
 export function isSameStateError(e: unknown): boolean {
   return e instanceof IntercomHttpError && e.status === 400 && /same state/i.test(e.message);
 }
 
 // Assigning a ticket/conversation to the assignee it already has is rejected
-// with a 422 — also the desired end state (routine on ensure re-runs).
+// with a 422: also the desired end state (routine on ensure re-runs).
 function isAlreadyAssignedError(e: unknown): boolean {
   return e instanceof IntercomHttpError && e.status === 422 && /already assigned/i.test(e.message);
 }
@@ -1104,7 +1104,7 @@ export function archivedContactId(e: unknown): string | null {
 // id=X" while the email path says "A contact matching those details already
 // exists with id=X". The second wording is the one the Sentry feedback import
 // hits, and reading only the first is why a single archived submitter could
-// dead-letter that import forever — search is blind to archived contacts, so
+// dead-letter that import forever: search is blind to archived contacts, so
 // the id in the error body is the ONLY way back to the record.
 export function conflictingContactId(e: unknown): string | null {
   if (!(e instanceof IntercomHttpError)) return null;
@@ -1112,7 +1112,7 @@ export function conflictingContactId(e: unknown): string | null {
 }
 
 // Unarchive rejects a contact already inside Intercom's permanent-deletion grace
-// ("...marked for permanent deletion and is not restorable") — its external_id
+// ("...marked for permanent deletion and is not restorable"): its external_id
 // stays locked for ~7 days, so the resolver must fall through to another id.
 function isContactNotRestorable(e: unknown): boolean {
   return e instanceof IntercomHttpError && /(not restorable|permanent deletion)/i.test(e.message);
