@@ -112,6 +112,7 @@ export const SIG_TICKET_CREATED = "ticketCreated";
 export const SIG_HUMAN_MESSAGE = "humanMessage";
 export const SIG_INTERCOM_ENQUEUE = "intercomEnqueue";
 export const SIG_INTERCOM_CLEAR_OUTBOX = "intercomClearOutbox";
+export const SIG_INTERCOM_RETRY_NOW = "intercomRetryNow";
 
 // Echo-defer budget shared by intercomInboxWorkflow (its defer-retry loop) and
 // IntercomWebhookHandler (which stops THROWING DeferEcho at this count). One

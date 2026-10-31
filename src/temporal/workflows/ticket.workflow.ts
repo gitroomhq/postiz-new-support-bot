@@ -36,6 +36,7 @@ import {
   humanMessageSignal,
   intercomClearOutboxSignal,
   intercomEnqueueSignal,
+  intercomRetryNowSignal,
   noopSignal,
   remindersPausedSignal,
   requestStatusChangeSignal,
@@ -190,6 +191,12 @@ export async function ticketWorkflow(input: TicketWorkflowInput): Promise<void> 
     touch();
   });
 
+  // Set by /ticket Sync now; only a dead-ensure park listens (patched below).
+  let retryNow = false;
+  setHandler(intercomRetryNowSignal, () => {
+    retryNow = true;
+  });
+
   setHandler(remindersPausedSignal, (p) => {
     if (snap) snap.remindersPaused = p.paused;
     touch();
@@ -246,6 +253,8 @@ export async function ticketWorkflow(input: TicketWorkflowInput): Promise<void> 
         }
         const ev = outbox[0];
         const epochBefore = icClearEpoch;
+        // A wake request only counts for a park that follows this delivery.
+        retryNow = false;
         let res: IntercomDeliveryResult;
         try {
           res = await executeChild(intercomDeliveryWorkflow, {
@@ -269,8 +278,14 @@ export async function ticketWorkflow(input: TicketWorkflowInput): Promise<void> 
           // would mint a fresh ensure for the still-queued event on the very
           // next iteration: an infinite hot loop of delivery children and
           // audit embeds. Hold the queue on the disabled-recheck cadence;
-          // /config fixes are picked up on the next pass.
-          await condition(() => stopping, PUMP_DISABLED_RECHECK_MS);
+          // /config fixes are picked up on the next pass. /ticket Sync now
+          // ends the park early (intercomRetryNowSignal).
+          if (patched("intercom-park-wake")) {
+            await condition(() => stopping || retryNow, PUMP_DISABLED_RECHECK_MS);
+            retryNow = false;
+          } else {
+            await condition(() => stopping, PUMP_DISABLED_RECHECK_MS);
+          }
           if (stopping) return;
         }
       }

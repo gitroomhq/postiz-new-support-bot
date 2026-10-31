@@ -5,6 +5,7 @@ import {
   SIG_INBOUND_EVENT,
   SIG_INTERCOM_CLEAR_OUTBOX,
   SIG_INTERCOM_ENQUEUE,
+  SIG_INTERCOM_RETRY_NOW,
   SIG_KB_REFRESH_NOW,
   SIG_MONEY_OUT_RUN_NOW,
   SIG_NOOP,
@@ -36,6 +37,9 @@ export const intercomEnqueueSignal = defineSignal<[{ type: IcEventType; payload:
 // Bridge reset/wipe: drop every queued (pre-wipe) Intercom event and forget the
 // link: queued events would otherwise resurrect the data the operator wiped.
 export const intercomClearOutboxSignal = defineSignal(SIG_INTERCOM_CLEAR_OUTBOX);
+// /ticket Sync now: end a dead-ensure park early, so the repair it just
+// queued delivers now instead of at the next 30-minute re-check.
+export const intercomRetryNowSignal = defineSignal(SIG_INTERCOM_RETRY_NOW);
 export const remindersPausedSignal = defineSignal<[RemindersPausedSignal]>(SIG_REMINDERS_PAUSED);
 export const requestStatusChangeSignal = defineSignal<[StatusChangeRequest]>(SIG_REQUEST_STATUS_CHANGE);
 export const noopSignal = defineSignal(SIG_NOOP);

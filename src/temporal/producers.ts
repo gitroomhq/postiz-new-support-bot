@@ -1,5 +1,5 @@
 import { WithStartWorkflowOperation, type Client } from "@temporalio/client";
-import type { SearchAttributePair } from "@temporalio/common";
+import { WorkflowNotFoundError, type SearchAttributePair } from "@temporalio/common";
 import type { SettingsStore } from "../config/SettingsStore";
 import { log } from "../util/logger";
 import type { GatewayResult, TemporalService } from "./TemporalService";
@@ -11,7 +11,7 @@ import {
   retireByQuery,
   retireWorkflowId,
 } from "./looperGeneration";
-import { analyticsRebuildProgressQuery } from "./workflows/definitions";
+import { analyticsRebuildProgressQuery, getStateQuery } from "./workflows/definitions";
 import {
   inboxWorkflowId,
   LOOPER_GENERATIONS,
@@ -29,6 +29,7 @@ import {
   SIG_INBOUND_EVENT,
   SIG_INTERCOM_CLEAR_OUTBOX,
   SIG_INTERCOM_ENQUEUE,
+  SIG_INTERCOM_RETRY_NOW,
   SIG_KB_REFRESH_NOW,
   SIG_MONEY_OUT_RUN_NOW,
   SIG_NOOP,
@@ -149,6 +150,41 @@ export class TemporalProducers {
   // they can't resurrect the data the operator just wiped.
   async intercomClearOutbox(threadId: string): Promise<GatewayResult> {
     return this.signalTicket(threadId, SIG_INTERCOM_CLEAR_OUTBOX);
+  }
+
+  // /ticket Sync now: wake a queue parked after a dead ensure (no-op otherwise).
+  async intercomRetryNow(threadId: string): Promise<GatewayResult> {
+    return this.signalTicket(threadId, SIG_INTERCOM_RETRY_NOW);
+  }
+
+  // The ticket's queued Intercom events for /ticket. Not running = nothing
+  // queued (a run only completes with an empty outbox). Null when Temporal
+  // did not answer in time: a paused worker leaves queries unanswered.
+  async ticketOutbox(threadId: string, timeoutMs = 3_000): Promise<{ depth: number; head: string | null } | null> {
+    try {
+      const client = await this.temporal.client();
+      if (!client) return null;
+      const handle = client.workflow.getHandle(ticketWorkflowId(threadId));
+      const ask = async () => {
+        const desc = await handle.describe();
+        if (desc.status.name !== "RUNNING") return { depth: 0, head: null };
+        const state = await handle.query(getStateQuery);
+        return { depth: state.outboxDepth, head: state.outbox[0]?.type ?? null };
+      };
+      let timer: NodeJS.Timeout | undefined;
+      const timeout = new Promise<null>((resolve) => {
+        timer = setTimeout(() => resolve(null), timeoutMs);
+      });
+      try {
+        return await Promise.race([ask(), timeout]);
+      } finally {
+        clearTimeout(timer);
+      }
+    } catch (e) {
+      // A ticket whose workflow never started has nothing queued either.
+      if (e instanceof WorkflowNotFoundError) return { depth: 0, head: null };
+      return null;
+    }
   }
 
   async requestStatusChange(threadId: string, req: StatusChangeRequest): Promise<GatewayResult> {
