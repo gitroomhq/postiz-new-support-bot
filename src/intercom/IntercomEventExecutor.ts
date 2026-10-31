@@ -289,6 +289,12 @@ export class IntercomEventExecutor {
     }
 
     beat?.();
+    // Fresh = this ensure made the conversation or its ticket. A re-ensure of
+    // a bridge that already has both (Sync now's verify, the stranded-run
+    // repair) writes no state and no routing: Intercom is the newer side by
+    // then, and a ticket state write or an assignment reopens a conversation
+    // a teammate closed.
+    const fresh = created || link.ticketId == null;
     const ticketId = link.ticketId ?? (await this.attachTicket(threadId, link.conversationId, link.contactId, payload));
     beat?.();
 
@@ -344,7 +350,7 @@ export class IntercomEventExecutor {
     if ((payload.closed || payload.resolved) && this.closeStates) {
       stateId = await this.closeStates.closingStateFor(ticketId, stateId);
     }
-    if (stateId) {
+    if (stateId && fresh) {
       const initialStateId = stateId;
       try {
         await this.withAuthor((a) => this.client.updateTicket(ticketId, { stateId: initialStateId, adminId: a }));
@@ -364,7 +370,7 @@ export class IntercomEventExecutor {
     // not dead-letter tickets) and only apply on creation: later reassignment
     // by agents is never overridden.
     const teamId = this.settingsStore.intercomTeamId();
-    if (teamId) {
+    if (teamId && fresh) {
       try {
         await this.withAuthor((a) => this.client.assignConversationToTeam(link.conversationId, teamId, a));
         await this.withAuthor((a) => this.client.updateTicket(ticketId, { assigneeId: teamId, adminId: a }));
