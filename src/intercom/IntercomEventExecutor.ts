@@ -170,6 +170,7 @@ export class IntercomEventExecutor {
           });
           return;
         }
+        if (ensurePayload?.verify) await this.selfHeal404(threadId, beat);
         await this.ensureBridge(threadId, ensurePayload, beat);
         return;
       }

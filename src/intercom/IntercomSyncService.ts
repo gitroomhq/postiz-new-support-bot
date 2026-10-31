@@ -141,11 +141,13 @@ export class IntercomSyncService {
     try {
       await this.executor.execute(threadId, type, payload);
     } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
       syncLog.warn("intercom direct delivery failed: event dropped (temporal unconfigured)", {
         "ticket.thread_id": threadId,
         "queue.event_type": type,
-        "error.message": e instanceof Error ? e.message : String(e),
+        "error.message": message,
       });
+      await this.store.recordSyncFailure(threadId, type, message, 1).catch(() => {});
     }
   }
 
@@ -209,13 +211,35 @@ export class IntercomSyncService {
     ticket: TicketWithTag,
     trigger: BridgeSourceMessage,
     loadPriorMessages: () => Promise<BridgeSourceMessage[]>
-  ): Promise<"flipped" | "relayed" | "skipped"> {
+  ): Promise<"flipped" | "relayed" | "skipped" | "failed"> {
+    return this.mirrorExemptTicket(ticket, trigger, loadPriorMessages, "customer sent a typed message");
+  }
+
+  // /ticket → Mirror to Intercom (admins): the same flip, started by staff
+  // instead of the customer's message, so there is no trigger to relay. A
+  // closed ticket is allowed here and gets the backfill's state tail, or the
+  // replayed customer messages would leave it open in Intercom. "relayed"
+  // means it was already mirrored or queued: nothing new was sent.
+  async liftRefundTicket(
+    ticket: TicketWithTag,
+    actorName: string,
+    loadPriorMessages: () => Promise<BridgeSourceMessage[]>
+  ): Promise<"flipped" | "relayed" | "skipped" | "failed"> {
+    return this.mirrorExemptTicket(ticket, null, loadPriorMessages, `lifted by ${actorName}`);
+  }
+
+  private async mirrorExemptTicket(
+    ticket: TicketWithTag,
+    trigger: BridgeSourceMessage | null,
+    loadPriorMessages: () => Promise<BridgeSourceMessage[]>,
+    cause: string
+  ): Promise<"flipped" | "relayed" | "skipped" | "failed"> {
     if (!this.enabled()) return "skipped";
-    let outcome: "flipped" | "relayed" | "skipped" = "skipped";
+    let outcome: "flipped" | "relayed" | "skipped" | "failed" = "skipped";
     await this.chained(ticket.threadId, async () => {
       // Refetch: the chain may have queued this behind another flip attempt.
       const fresh = await this.ticketStore.getByThreadId(ticket.threadId);
-      if (!fresh || fresh.closed) return;
+      if (!fresh || (trigger && fresh.closed)) return;
       // Winner and loser both proceed: the row is non-exempt either way.
       await this.ticketStore.liftIntercomExempt(fresh.threadId);
       fresh.intercomExempt = false;
@@ -229,7 +253,7 @@ export class IntercomSyncService {
       if (!transcriptDue) {
         // Already flipped (or another caller claimed the sequence, queued
         // ahead of us in the same FIFO outbox): relay the trigger normally.
-        const composed = this.composeMessage(fresh, trigger, false);
+        const composed = trigger ? this.composeMessage(fresh, trigger, false) : null;
         if (composed) {
           await this.ensureLink(fresh);
           await this.emit(fresh.threadId, "message", { ...composed, attachmentMode: "urls" });
@@ -240,21 +264,24 @@ export class IntercomSyncService {
 
       try {
         await this.emit(fresh.threadId, "ensure", await this.buildEnsurePayloadWithSession(fresh));
-        await this.emit(fresh.threadId, "note", { content: await this.buildRefundContextNote(fresh) });
+        await this.emit(fresh.threadId, "note", { content: await this.buildRefundContextNote(fresh, cause) });
         const prior = await loadPriorMessages();
         for (const message of prior) {
           if (message.authorIsBot) continue;
-          if (message.discordMessageId === trigger.discordMessageId) continue;
-          if (message.createdAt >= trigger.createdAt) continue;
+          if (trigger && message.discordMessageId === trigger.discordMessageId) continue;
+          if (trigger && message.createdAt >= trigger.createdAt) continue;
           const composed = this.composeMessage(fresh, message, message.authorId !== fresh.customerId);
           if (!composed) continue;
           // Old signed CDN urls are likely expired: text links only (same
           // rule as backfill/heal).
           await this.emit(fresh.threadId, "message", { ...composed, attachmentMode: "links" });
         }
-        const composedTrigger = this.composeMessage(fresh, trigger, false);
+        const composedTrigger = trigger ? this.composeMessage(fresh, trigger, false) : null;
         if (composedTrigger) {
           await this.emit(fresh.threadId, "message", { ...composedTrigger, attachmentMode: "urls" });
+        }
+        if (fresh.closed) {
+          for (const event of this.stateTail(fresh)) await this.emit(fresh.threadId, event.type, event.payload);
         }
         outcome = "flipped";
       } catch (e) {
@@ -262,6 +289,7 @@ export class IntercomSyncService {
         // customer message retries the sequence (delivered events stay deduped
         // by the "m" ledger).
         await this.store.releaseBackfill(fresh.threadId).catch(() => {});
+        outcome = "failed";
         throw e;
       }
     });
@@ -271,8 +299,8 @@ export class IntercomSyncService {
   // Internal refund-state summary posted on flip, ahead of the transcript.
   // Discord markdown: the note executor renders it to HTML. Every line is
   // best-effort: a data gap degrades to a shorter note, never a throw.
-  private async buildRefundContextNote(ticket: TicketWithTag): Promise<string> {
-    const lines: string[] = ["💳 **Refund ticket: flipped to mirrored** (customer sent a typed message)"];
+  private async buildRefundContextNote(ticket: TicketWithTag, cause: string): Promise<string> {
+    const lines: string[] = [`💳 **Refund ticket: flipped to mirrored** (${cause})`];
     const review = await this.sessionStore.getChargeReviewAnyStatus(ticket.threadId).catch(() => null);
     const action = ticket.customerId
       ? await this.sessionStore.latestBillingActionForUserSince(ticket.customerId, ticket.createdAt).catch(() => null)
@@ -537,24 +565,7 @@ export class IntercomSyncService {
       }
     }
 
-    // Tail: final state + attributes (no transcript notes). forceOpenSync: the
-    // replayed contact messages auto-reopen the conversation in Intercom, so
-    // the close must be re-asserted past the lastSyncedOpen damper: without it
-    // every backfilled closed ticket floods the inbox as an open conversation.
-    const tag = ticket.statusTag;
-    if (tag) {
-      add("status", {
-        statusTagId: tag.id,
-        statusLabel: `${tag.emoji} ${tag.label}`,
-        actorName: "Backfill",
-        closed: tag.closesThread,
-        resolved: tag.closesThread || isResolvedTag(tag),
-        forceOpenSync: true,
-      });
-    }
-    if (ticket.csatScore != null) {
-      add("csat", { score: ticket.csatScore, comment: ticket.csatComment });
-    }
+    for (const event of this.stateTail(ticket)) add(event.type, event.payload);
 
     try {
       for (const event of events) {
@@ -567,6 +578,56 @@ export class IntercomSyncService {
       throw e;
     }
     return events.length;
+  }
+
+  // Tail of a transcript replay: final state + attributes (no transcript
+  // notes). forceOpenSync: the replayed contact messages auto-reopen the
+  // conversation in Intercom, so the close must be re-asserted past the
+  // lastSyncedOpen damper: without it every backfilled closed ticket floods
+  // the inbox as an open conversation.
+  private stateTail(ticket: TicketWithTag): Array<{ type: OutboxEventType; payload: OutboxPayload }> {
+    const events: Array<{ type: OutboxEventType; payload: OutboxPayload }> = [];
+    const tag = ticket.statusTag;
+    if (tag) {
+      events.push({
+        type: "status",
+        payload: {
+          statusTagId: tag.id,
+          statusLabel: `${tag.emoji} ${tag.label}`,
+          actorName: "Backfill",
+          closed: tag.closesThread,
+          resolved: tag.closesThread || isResolvedTag(tag),
+          forceOpenSync: true,
+        },
+      });
+    }
+    if (ticket.csatScore != null) {
+      events.push({ type: "csat", payload: { score: ticket.csatScore, comment: ticket.csatComment } });
+    }
+    return events;
+  }
+
+  // /ticket → Sync now: one ticket's repair, staff-triggered. Unbridged →
+  // the backfill (link + transcript); releaseStaleClaim drops a "b" marker a
+  // dead push left behind, which would otherwise make the backfill a no-op
+  // forever. Bridged → an ensure with verify (re-checks the conversation,
+  // contact and ticket in Intercom and rebuilds whichever half died), then the
+  // missed-message heal. The caller decides staleness: only it can see the
+  // ticket's queue and failure record. Idempotent like the ops it reuses.
+  async repairTicket(
+    ticket: TicketWithTag,
+    messages: BridgeSourceMessage[] | null,
+    opts: { releaseStaleClaim: boolean }
+  ): Promise<{ kind: "backfill"; events: number } | { kind: "heal"; messages: number } | { kind: "queued" } | { kind: "skipped" }> {
+    if (!this.enabled() || !this.mirrorable(ticket)) return { kind: "skipped" };
+    if (!(await this.store.getLink(ticket.threadId))) {
+      if (opts.releaseStaleClaim) await this.store.releaseBackfill(ticket.threadId);
+      const events = await this.backfillTicket(ticket, messages);
+      return events == null ? { kind: "queued" } : { kind: "backfill", events };
+    }
+    await this.emit(ticket.threadId, "ensure", { ...(await this.buildEnsurePayloadWithSession(ticket)), verify: true });
+    const healed = messages ? await this.healMessageGaps(ticket, messages) : 0;
+    return { kind: "heal", messages: healed ?? 0 };
   }
 
   // Gap heal for an already-bridged ticket: enqueue the human messages that

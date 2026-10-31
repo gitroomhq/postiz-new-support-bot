@@ -72,6 +72,10 @@ export interface EnsurePayload {
   // Current Discord avatar URL: refreshed onto the Intercom contact so repeat
   // customers don't show under a blank avatar / years-old identity.
   customerAvatarUrl?: string | null;
+  // /ticket Sync now: re-check the linked conversation, contact and ticket in
+  // Intercom first and rebuild whichever died (an ordinary ensure trusts the
+  // link row).
+  verify?: boolean;
 }
 
 export interface MessageAttachmentRef {
