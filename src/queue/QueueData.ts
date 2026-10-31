@@ -12,7 +12,7 @@ import {
   clip,
   compareWaiting,
   extraReplyAfter,
-  intercomAppHost,
+  intercomInboxUrl,
   mergeReplyTimes,
   parseConversation,
   parseTicket,
@@ -889,9 +889,7 @@ export class QueueData {
 
   // The teammate-facing Intercom link for one conversation.
   inboxUrl(conversationId: string, workspaceIdCode: string | null): string {
-    const host = intercomAppHost(this.settings.intercomRegion());
-    const ws = workspaceIdCode && /^[a-z0-9]{4,20}$/i.test(workspaceIdCode) ? workspaceIdCode : "_";
-    return `${host}/a/inbox/${ws}/inbox/conversation/${encodeURIComponent(conversationId)}`;
+    return intercomInboxUrl(this.settings.intercomRegion(), workspaceIdCode, conversationId);
   }
 
   // The customer's newest message, plain text (the big cards). Cached per

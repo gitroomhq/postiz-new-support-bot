@@ -525,6 +525,14 @@ export function intercomAppHost(region: "us" | "eu" | "au"): string {
   return region === "eu" ? "https://app.eu.intercom.com" : region === "au" ? "https://app.au.intercom.com" : "https://app.intercom.com";
 }
 
+// The teammate-facing inbox link for one conversation (customer tickets share
+// their conversation's id). An unusable workspace id degrades to "_", which
+// Intercom redirects to the teammate's own workspace.
+export function intercomInboxUrl(region: "us" | "eu" | "au", workspaceIdCode: string | null, conversationId: string): string {
+  const ws = workspaceIdCode && /^[a-z0-9]{4,20}$/i.test(workspaceIdCode) ? workspaceIdCode : "_";
+  return `${intercomAppHost(region)}/a/inbox/${ws}/inbox/conversation/${encodeURIComponent(conversationId)}`;
+}
+
 // "just now", "12m", "3h 12m", "2d 4h".
 export function waitLabel(seconds: number): string {
   const s = Math.max(0, Math.floor(seconds));
