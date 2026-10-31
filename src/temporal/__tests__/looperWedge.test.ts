@@ -13,6 +13,7 @@ function makeClient(opts: {
   gen?: number | null;
   taskAttempt?: number;
   taskAgeMs?: number;
+  taskQueue?: string;
 }): { client: Client; terminated: string[] } {
   const terminated: string[] = [];
   const client = {
@@ -21,6 +22,7 @@ function makeClient(opts: {
         describe: async () => {
           return {
             status: { name: opts.status ?? "RUNNING" },
+            taskQueue: opts.taskQueue ?? "main",
             memo: opts.gen == null ? {} : { [LOOPER_GEN_MEMO_KEY]: opts.gen },
             raw:
               opts.taskAttempt == null
@@ -117,4 +119,17 @@ test("a closed run is absent: signal-with-start re-creates it, no terminate", as
   assert.equal(r.action, "absent");
   assert.equal(r.health.wedged, false, "a closed run cannot be wedged");
   assert.deepEqual(terminated, []);
+});
+
+test("a looper stranded on a queue no worker polls is restarted, though its task never fails", async () => {
+  // A stranded task is never picked up, so it sits at attempt 1 and the wedge
+  // check cannot see it; the queue comparison does.
+  const { client, terminated } = makeClient({ gen: 1, taskAttempt: 1, taskAgeMs: 60 * 24 * 60 * MINUTES, taskQueue: "support-bot" });
+  const r = await reconcileLooperGeneration(client, "sla-enforce", 1, "main");
+  assert.equal(r.action, "terminated");
+  assert.equal(r.cause, "stranded");
+  assert.match(terminated[0], /stranded on task queue support-bot/);
+
+  const home = makeClient({ gen: 1, taskQueue: "main" });
+  assert.equal((await reconcileLooperGeneration(home.client, "sla-enforce", 1, "main")).action, "kept");
 });

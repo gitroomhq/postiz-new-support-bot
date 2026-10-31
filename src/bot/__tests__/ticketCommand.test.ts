@@ -17,6 +17,7 @@ function facts(over: Partial<SyncFacts> = {}): SyncFacts {
     remote: { kind: "none" },
     failure: null,
     queue: { depth: 0, head: null },
+    stranded: null,
     workerPaused: false,
     backfillClaimed: false,
     ...over,
@@ -120,6 +121,38 @@ test("diagnose: a failure before the link is history, one after it makes the tic
   assert.equal(later.canSync, true);
 });
 
+test("diagnose: a run stranded on a queue no worker polls is named; Repair sync replaces Sync now (which would feed it)", () => {
+  const linked = diagnoseSync(
+    facts({
+      link: { conversationId: "c1", ticketId: "c1", createdAt: LINKED_AT },
+      remote: { kind: "found", number: "120379947", stateLabel: "In progress" },
+      queue: null,
+      stranded: "support-bot",
+    })
+  );
+  assert.equal(linked.synced, "partly");
+  assert.match(linked.why!, /stuck on the task queue `support-bot`/);
+  assert.equal(linked.canSync, false);
+  assert.equal(linked.canRepair, true);
+  const never = diagnoseSync(facts({ queue: null, stranded: "support-bot" }));
+  assert.equal(never.synced, "no");
+  assert.equal(never.canSync, false);
+  assert.equal(never.canRepair, true);
+  assert.equal(diagnoseSync(facts()).canRepair, false);
+});
+
+test("diagnose: a mirrored ticket whose queue Temporal could not read says so instead of a bare Yes", () => {
+  const base = {
+    link: { conversationId: "c1", ticketId: "c1", createdAt: LINKED_AT },
+    remote: { kind: "found" as const, number: "1", stateLabel: null },
+    queue: null,
+  };
+  const silent = diagnoseSync(facts(base));
+  assert.equal(silent.synced, "yes");
+  assert.match(silent.note!, /did not answer/);
+  assert.match(diagnoseSync(facts({ ...base, workerPaused: true })).note!, /worker is paused/);
+});
+
 test("inbox link: the region's host, and an unusable workspace id degrades to _", () => {
   assert.equal(intercomInboxUrl("eu", "abcd1234", "55"), "https://app.eu.intercom.com/a/inbox/abcd1234/inbox/conversation/55");
   assert.equal(intercomInboxUrl("us", "../evil", "55"), "https://app.intercom.com/a/inbox/_/inbox/conversation/55");
@@ -139,7 +172,9 @@ function ticketRow(over: Record<string, unknown> = {}) {
   };
 }
 
-function harness(opts: { allowed?: boolean; admin?: boolean; ticket?: Record<string, unknown> | null; failure?: boolean } = {}) {
+function harness(
+  opts: { allowed?: boolean; admin?: boolean; ticket?: Record<string, unknown> | null; failure?: boolean; stranded?: boolean } = {}
+) {
   const calls: string[] = [];
   const deps: TicketCommandDeps = {
     authorize: async () => opts.allowed ?? true,
@@ -159,7 +194,8 @@ function harness(opts: { allowed?: boolean; admin?: boolean; ticket?: Record<str
     temporal: () => ({
       routable: () => true,
       enabled: () => true,
-      ticketOutbox: async () => ({ depth: 0, head: null }),
+      ticketOutbox: async () =>
+        opts.stranded ? { kind: "stranded", taskQueue: "support-bot" } : { kind: "queue", depth: 0, head: null },
       intercomRetryNow: async () => void calls.push("wake"),
     }),
     sync: {
@@ -174,6 +210,10 @@ function harness(opts: { allowed?: boolean; admin?: boolean; ticket?: Record<str
     },
     threadMessages: async () => [],
     inboundHeal: async () => 0,
+    repairStranded: async (threadId) => {
+      calls.push(`repairStranded:${threadId}`);
+      return { terminated: 2, recovered: 6, inbound: 1 };
+    },
     slaTrigger: () => void calls.push("sla"),
     audit: () => void calls.push("audit"),
   };
@@ -245,4 +285,31 @@ test("/ticket: Mirror to Intercom is admin-only, on the button too", async () =>
   await admin.cmd.handleButton(button("ticketcmd_lift").interaction as never);
   assert.ok(admin.calls.includes("lift"));
   assert.ok(admin.calls.includes("sla"));
+});
+
+test("/ticket: a stranded ticket offers Repair sync, which replaces the run, heals and audits", async () => {
+  const { cmd, calls } = harness({ stranded: true });
+  const shown: unknown[] = [];
+  await cmd.handleCommand({
+    channelId: "t1",
+    reply: async () => {},
+    deferReply: async () => {},
+    editReply: async (p: unknown) => void shown.push(p),
+  } as never);
+  const ids = customIds(shown.at(-1));
+  assert.ok(ids.includes("ticketcmd_repair"));
+  assert.ok(!ids.includes("ticketcmd_sync"), "Sync now would only feed the stranded run");
+
+  const b = button("ticketcmd_repair");
+  await cmd.handleButton(b.interaction as never);
+  assert.deepEqual(
+    calls.filter((c) => c.startsWith("repairStranded") || c === "audit"),
+    ["repairStranded:t1", "audit"]
+  );
+});
+
+test("/ticket: Repair sync on a healthy ticket does nothing", async () => {
+  const { cmd, calls } = harness();
+  await cmd.handleButton(button("ticketcmd_repair").interaction as never);
+  assert.ok(!calls.some((c) => c.startsWith("repairStranded")));
 });

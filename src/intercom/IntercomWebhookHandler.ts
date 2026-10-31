@@ -730,15 +730,19 @@ export class IntercomWebhookHandler {
   // `assignment` shape before the candidate filter covered it). Deliberately
   // NO API fallback and NO "not relayable" audit: most healed tickets have no
   // new agent content, which is the expected case, not a warning. Returns the
-  // number of candidate parts fed through: already-relayed and bridge-created
-  // ones no-op on the part-id claim, so the count is "re-checked", not
-  // "reposted". bi-only: relaying is meaningless in push/none, and a heal in
-  // push mode must not blast agent warnings across every conversation.
+  // number of candidate parts fed through. Parts with a message map row were
+  // relayed already ("in") or created from Discord ("out") and are skipped:
+  // the map is kept for good, while the part-id claims only live 14 days
+  // (cleanup-loop), so they alone would let a full-history heal relay every
+  // older reply again; anything the map missed still no-ops on the claim.
+  // bi-only: relaying is meaningless in push/none, and a heal in push mode
+  // must not blast agent warnings across every conversation.
   async relayHealedParts(threadId: string, parts: IntercomWebhookPart[]): Promise<number> {
     if (this.settingsStore.intercomMode() !== "bi") return 0;
     let candidates = 0;
     for (const part of parts) {
       if (!this.isRelayCandidate(part)) continue;
+      if (await this.store.getMessageMapByPartId(String(part.id))) continue;
       candidates++;
       // Defer budget exhausted (like the none→bi gap heal): this is a manual
       // pass with no retry loop behind it; layers 1+2 still cover in-flight

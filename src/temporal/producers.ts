@@ -55,6 +55,37 @@ import {
 
 const prodLog = log.child("temporal:producers");
 
+export type TicketOutbox =
+  | { kind: "queue"; depth: number; head: string | null }
+  | { kind: "stranded"; taskQueue: string };
+
+// A ticket or inbox workflow run bound to a task queue this worker does not
+// poll; key is the thread id (ticket) or the conversation id (inbox).
+export interface StrandedRun {
+  kind: "ticket" | "inbox";
+  workflowId: string;
+  key: string;
+  taskQueue: string;
+}
+
+const STRANDED_TYPES = { ticket: "ticketWorkflow", inbox: "intercomInboxWorkflow" } as const;
+
+// Visibility query for running workflows (of one type, or of any type for
+// null) on any other task queue; TaskQueue is a system search attribute.
+// Quotes are escaped: the queue name comes from configuration.
+export function strandedRunsQuery(workflowType: string | null, taskQueue: string): string {
+  const q = taskQueue.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  const running = `ExecutionStatus="Running" AND TaskQueue!="${q}"`;
+  return workflowType ? `WorkflowType="${workflowType}" AND ${running}` : running;
+}
+
+// Thread or conversation id behind a ticket/inbox workflow id; null for an id
+// that does not have the expected shape.
+export function strandedKey(kind: StrandedRun["kind"], workflowId: string): string | null {
+  const prefix = kind === "ticket" ? ticketWorkflowId("") : inboxWorkflowId("");
+  return workflowId.startsWith(prefix) && workflowId.length > prefix.length ? workflowId.slice(prefix.length) : null;
+}
+
 // Thrown by webhook seams when an operation was only buffered (Temporal
 // unreachable): the HTTP route answers 5xx so the sender redelivers.
 export class TemporalBufferedError extends Error {}
@@ -152,6 +183,60 @@ export class TemporalProducers {
     return this.signalTicket(threadId, SIG_INTERCOM_CLEAR_OUTBOX);
   }
 
+  // Every running ticket and inbox workflow bound to another task queue: the
+  // queue setting changed while they ran, so no worker will ever run them.
+  async listStrandedRuns(): Promise<StrandedRun[]> {
+    const client = await this.temporal.client();
+    if (!client) return [];
+    const taskQueue = this.temporal.envConfig().taskQueue;
+    const runs: StrandedRun[] = [];
+    for (const kind of ["ticket", "inbox"] as const) {
+      for await (const wf of client.workflow.list({ query: strandedRunsQuery(STRANDED_TYPES[kind], taskQueue) })) {
+        const key = strandedKey(kind, wf.workflowId);
+        if (key) runs.push({ kind, workflowId: wf.workflowId, key, taskQueue: wf.taskQueue });
+      }
+    }
+    return runs;
+  }
+
+  // Top-level running workflows of any other type on another task queue, by
+  // type: the repair leaves them alone and only reports them. Children are
+  // skipped: they end with their parent (delivery and status children of a
+  // terminated ticket run).
+  async countOtherStranded(): Promise<Record<string, number>> {
+    const client = await this.temporal.client();
+    if (!client) return {};
+    const taskQueue = this.temporal.envConfig().taskQueue;
+    const counts: Record<string, number> = {};
+    for await (const wf of client.workflow.list({ query: strandedRunsQuery(null, taskQueue) })) {
+      if (wf.parentExecution || (Object.values(STRANDED_TYPES) as string[]).includes(wf.type)) continue;
+      counts[wf.type] = (counts[wf.type] ?? 0) + 1;
+    }
+    return counts;
+  }
+
+  // Terminates the current run of workflowId only if it is still running on
+  // another task queue (described first, so a healthy run is never hit).
+  async terminateStranded(workflowId: string, reason: string): Promise<boolean> {
+    const client = await this.temporal.client();
+    if (!client) return false;
+    try {
+      const desc = await client.workflow.getHandle(workflowId).describe();
+      if (desc.status.name !== "RUNNING" || desc.taskQueue === this.temporal.envConfig().taskQueue) return false;
+      await client.workflow.getHandle(workflowId, desc.runId).terminate(reason);
+      return true;
+    } catch (e) {
+      if (e instanceof WorkflowNotFoundError) return false;
+      throw e;
+    }
+  }
+
+  // Starts the ticket's workflow if none is running (a no-op signal otherwise):
+  // brings timers back for a ticket whose stranded run was just terminated.
+  async nudgeTicket(threadId: string): Promise<GatewayResult> {
+    return this.signalTicket(threadId, SIG_NOOP);
+  }
+
   // /ticket Sync now: wake a queue parked after a dead ensure (no-op otherwise).
   async intercomRetryNow(threadId: string): Promise<GatewayResult> {
     return this.signalTicket(threadId, SIG_INTERCOM_RETRY_NOW);
@@ -160,16 +245,21 @@ export class TemporalProducers {
   // The ticket's queued Intercom events for /ticket. Not running = nothing
   // queued (a run only completes with an empty outbox). Null when Temporal
   // did not answer in time: a paused worker leaves queries unanswered.
-  async ticketOutbox(threadId: string, timeoutMs = 3_000): Promise<{ depth: number; head: string | null } | null> {
+  // Stranded: the run is bound to a task queue this worker does not poll (the
+  // queue setting changed while it ran). Temporal still takes its signals, so
+  // the bridge keeps feeding it, but nothing ever executes them; a query
+  // would only time out, so it is not asked.
+  async ticketOutbox(threadId: string, timeoutMs = 3_000): Promise<TicketOutbox | null> {
     try {
       const client = await this.temporal.client();
       if (!client) return null;
       const handle = client.workflow.getHandle(ticketWorkflowId(threadId));
-      const ask = async () => {
+      const ask = async (): Promise<TicketOutbox> => {
         const desc = await handle.describe();
-        if (desc.status.name !== "RUNNING") return { depth: 0, head: null };
+        if (desc.status.name !== "RUNNING") return { kind: "queue", depth: 0, head: null };
+        if (desc.taskQueue !== this.temporal.envConfig().taskQueue) return { kind: "stranded", taskQueue: desc.taskQueue };
         const state = await handle.query(getStateQuery);
-        return { depth: state.outboxDepth, head: state.outbox[0]?.type ?? null };
+        return { kind: "queue", depth: state.outboxDepth, head: state.outbox[0]?.type ?? null };
       };
       let timer: NodeJS.Timeout | undefined;
       const timeout = new Promise<null>((resolve) => {
@@ -182,7 +272,7 @@ export class TemporalProducers {
       }
     } catch (e) {
       // A ticket whose workflow never started has nothing queued either.
-      if (e instanceof WorkflowNotFoundError) return { depth: 0, head: null };
+      if (e instanceof WorkflowNotFoundError) return { kind: "queue", depth: 0, head: null };
       return null;
     }
   }
@@ -429,7 +519,7 @@ export class TemporalProducers {
     for (const [type, id] of singles) {
       if (client) {
         try {
-          const r = await reconcileLooperGeneration(client, id, LOOPER_GENERATIONS[id] ?? 1);
+          const r = await reconcileLooperGeneration(client, id, LOOPER_GENERATIONS[id] ?? 1, this.temporal.envConfig().taskQueue);
           if (r.action === "terminated" && r.cause === "generation") {
             prodLog.info("looper generation changed: restarting singleton", {
               "temporal.workflow_id": id,
@@ -445,6 +535,12 @@ export class TemporalProducers {
               "temporal.workflow_id": id,
               "temporal.task_attempt": r.health.taskAttempt,
               "looper.wedged_since": r.health.taskScheduledAt?.toISOString() ?? "unknown",
+            });
+          }
+          if (r.action === "terminated" && r.cause === "stranded") {
+            prodLog.warn("looper was stranded on an old task queue: restarted", {
+              "temporal.workflow_id": id,
+              "looper.waiting_since": r.health.taskScheduledAt?.toISOString() ?? "unknown",
             });
           }
         } catch (e) {

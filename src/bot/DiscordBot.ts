@@ -131,6 +131,7 @@ import type { QueueRoute } from "../queue/QueuePanel";
 import { VaultMigrator, COLUMN_LABELS, type MigrateItemResult, type MigrateReport } from "../vault/VaultMigrator";
 import { EMAIL_COMMAND, EMAIL_PREFIX, EmailCommand } from "./EmailCommand";
 import { TICKET_COMMAND, TICKET_PREFIX, TicketCommand } from "./TicketCommand";
+import { StrandedRunRepair } from "../temporal/strandedRuns";
 import type { EmailDeliverabilityService } from "../resend/EmailDeliverabilityService";
 import type { ResendClient } from "../resend/ResendClient";
 import type { DeliveryLogService } from "../resend/DeliveryLogService";
@@ -231,17 +232,25 @@ export class DiscordBot {
       repairTicket: (ticket, messages, opts) => this.intercomSync.repairTicket(ticket, messages, opts),
       liftRefundTicket: (ticket, actorName, load) => this.intercomSync.liftRefundTicket(ticket, actorName, load),
     },
-    threadMessages: async (threadId) => {
-      const channel = await this.client.channels.fetch(threadId).catch(() => null);
-      return channel?.isThread() ? this.fetchAllThreadMessages(channel as ThreadChannel) : null;
-    },
-    inboundHeal: async (threadId, conversationId) => {
-      if (this.settingsStore.intercomMode() !== "bi") return 0;
-      const parts = await this.intercomClient.getConversationPartsSince(conversationId, 0);
-      return this.intercomWebhook.relayHealedParts(threadId, parts);
-    },
+    threadMessages: (threadId) => this.threadMessagesOf(threadId),
+    inboundHeal: (threadId, conversationId) => this.inboundHealOf(threadId, conversationId),
+    repairStranded: (threadId) => this.strandedRepair.repairTicket(threadId),
     slaTrigger: (threadId) => void this.slaService?.onTicketTrigger(threadId, "created"),
     audit: (entry) => void this.audit.log(entry),
+  });
+  // Ticket and inbox workflows stranded on a task queue no worker polls:
+  // swept on every worker start (repairStrandedRuns), one ticket at a time
+  // from /ticket.
+  private strandedRepair = new StrandedRunRepair({
+    temporal: () => this.temporalProducers,
+    getTicket: (threadId) => this.ticketStore.getByThreadId(threadId),
+    getLink: (threadId) => this.intercomStore.getLink(threadId),
+    getLinkByConversationId: (conversationId) => this.intercomStore.getLinkByConversationId(conversationId),
+    threadMessages: (threadId) => this.threadMessagesOf(threadId),
+    repair: (ticket, messages) => this.intercomSync.repairTicket(ticket, messages, { releaseStaleClaim: false }),
+    inboundHeal: (threadId, conversationId) => this.inboundHealOf(threadId, conversationId),
+    audit: (entry) => void this.audit.log(entry),
+    pause: () => new Promise((r) => setTimeout(r, 150)),
   });
   private sentryFeedbackClient: SentryFeedbackClient | null = null;
   // Sentry feedback import ledger, bound late from index.ts; the /config
@@ -313,6 +322,22 @@ export class DiscordBot {
       client: this.client,
       fetchAllThreadMessages: (t) => this.fetchAllThreadMessages(t),
     });
+  }
+
+  // Worker start (index.ts): terminate and heal every stranded run. Never throws.
+  async repairStrandedRuns(): Promise<void> {
+    await this.strandedRepair.sweep();
+  }
+
+  private async threadMessagesOf(threadId: string): Promise<BridgeSourceMessage[] | null> {
+    const channel = await this.client.channels.fetch(threadId).catch(() => null);
+    return channel?.isThread() ? this.fetchAllThreadMessages(channel as ThreadChannel) : null;
+  }
+
+  private async inboundHealOf(threadId: string, conversationId: string): Promise<number> {
+    if (this.settingsStore.intercomMode() !== "bi") return 0;
+    const parts = await this.intercomClient.getConversationPartsSince(conversationId, 0);
+    return this.intercomWebhook.relayHealedParts(threadId, parts);
   }
 
   // Wires the Temporal stack in after construction (index.ts builds it later)

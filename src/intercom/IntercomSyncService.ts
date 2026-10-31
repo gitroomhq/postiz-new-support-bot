@@ -646,15 +646,18 @@ export class IntercomSyncService {
     if (!(await this.store.getLink(ticket.threadId))) return null;
 
     const events: Array<{ type: OutboxEventType; payload: OutboxPayload }> = [];
+    const recovered: BridgeSourceMessage[] = [];
     for (const message of messages) {
       if (message.authorIsBot) continue;
       if (await this.store.hasDeliveredMessage(message.discordMessageId)) continue;
       const composed = this.composeMessage(ticket, message, !message.authorIsBot && message.authorId !== ticket.customerId);
       if (!composed) continue;
       events.push({ type: "message", payload: { ...composed, attachmentMode: "links" } });
+      recovered.push(message);
     }
     const healed = events.length;
     if (healed === 0) return 0;
+    events.push(...recoveryTail(ticket, messages, recovered, this.settingsStore.replyStateActive()));
 
     // Replayed contact messages auto-reopen the conversation in Intercom:
     // re-assert a closed/resolved state past the open/close damper (same
@@ -818,6 +821,49 @@ export function externalIdCandidates(payload: EnsurePayload, threadId: string): 
 
 export function externalIdFor(payload: EnsurePayload, threadId: string): string {
   return externalIdCandidates(payload, threadId)[0];
+}
+
+// Recovered messages keep their original timestamps, so they land mid-history
+// where nobody would notice them: one internal note after them says so, and
+// when the customer had the last word and that word is among the recovered
+// ones, the ticket moves to Customer responded like a live reply would.
+export function recoveryTail(
+  ticket: { closed: boolean; customerId: string | null; statusTagId: string | null },
+  messages: BridgeSourceMessage[],
+  recovered: BridgeSourceMessage[],
+  replyStateActive: boolean
+): Array<{ type: OutboxEventType; payload: OutboxPayload }> {
+  if (recovered.length === 0) return [];
+  const n = recovered.length;
+  const times = recovered.map((m) => m.createdAt.getTime());
+  const day = (ms: number) => new Date(ms).toISOString().slice(0, 10);
+  const first = day(Math.min(...times));
+  const last = day(Math.max(...times));
+  const range = first === last ? `on ${first}` : `from ${first} to ${last}`;
+  const tail: Array<{ type: OutboxEventType; payload: OutboxPayload }> = [
+    {
+      type: "note",
+      payload: {
+        content:
+          `🔁 ${n} message${n === 1 ? "" : "s"} from the Discord thread reached Intercom late (sync outage). ` +
+          `${n === 1 ? "It sits" : "They sit"} at ${n === 1 ? "its" : "their"} original time ${range}: scroll up to read ${n === 1 ? "it" : "them"}.`,
+      },
+    },
+  ];
+  const humans = messages.filter((m) => !m.authorIsBot);
+  const newest = humans.reduce<BridgeSourceMessage | null>(
+    (a, m) => (a == null || m.createdAt.getTime() >= a.createdAt.getTime() ? m : a),
+    null
+  );
+  const customerLast =
+    newest != null &&
+    ticket.customerId != null &&
+    newest.authorId === ticket.customerId &&
+    recovered.some((m) => m.discordMessageId === newest.discordMessageId);
+  if (replyStateActive && !ticket.closed && customerLast) {
+    tail.push({ type: "reply_state", payload: { kind: "customer", baseTagId: ticket.statusTagId } });
+  }
+  return tail;
 }
 
 // A resolved-style tag closes the Intercom conversation. The resolved STATE is

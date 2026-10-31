@@ -11,9 +11,10 @@ import { LOOPER_GEN_MEMO_KEY, LOOPER_GENERATIONS } from "./types";
 
 export interface LooperReconcileResult {
   action: "kept" | "terminated" | "absent";
-  // Why a run was terminated: a generation change, or a workflow task that has
-  // been failing long enough that the run will never make progress again.
-  cause: "generation" | "wedged" | null;
+  // Why a run was terminated: a generation change, a workflow task that has
+  // been failing long enough that the run will never make progress again, or
+  // a run bound to a task queue this worker does not poll.
+  cause: "generation" | "wedged" | "stranded" | null;
   runningGen: number | null;
   wantedGen: number;
   health: LooperHealth;
@@ -89,7 +90,8 @@ export async function describeLooper(client: Client, workflowId: string): Promis
 export async function reconcileLooperGeneration(
   client: Client,
   workflowId: string,
-  wantedGen: number
+  wantedGen: number,
+  taskQueue?: string
 ): Promise<LooperReconcileResult> {
   const handle = client.workflow.getHandle(workflowId);
   try {
@@ -108,6 +110,13 @@ export async function reconcileLooperGeneration(
     if (health.wedged) {
       await handle.terminate(`looper wedged: workflow task attempt ${health.taskAttempt}`);
       return { action: "terminated", cause: "wedged", runningGen, wantedGen, health };
+    }
+    // A run started before the task queue setting changed: its task sits at
+    // attempt 1 forever (nobody polls that queue), so the wedge check above
+    // never fires and the same generation would keep it alive for good.
+    if (taskQueue && desc.taskQueue && desc.taskQueue !== taskQueue) {
+      await handle.terminate(`looper stranded on task queue ${desc.taskQueue}`);
+      return { action: "terminated", cause: "stranded", runningGen, wantedGen, health };
     }
     return { action: "kept", cause: null, runningGen, wantedGen, health };
   } catch (e) {

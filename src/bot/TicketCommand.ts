@@ -12,6 +12,7 @@ import type { IntercomMode, IntercomRegion } from "../config/SettingsStore";
 import type { TicketWithTag } from "./TicketStore";
 import { intercomInboxUrl, parseTicket } from "../queue/queueModel";
 import { log } from "../util/logger";
+import type { TicketOutbox } from "../temporal/producers";
 
 // /ticket, run inside a ticket thread: the Intercom ticket behind it (the
 // number teammates see in the inbox, a link, its live state) and whether the
@@ -25,9 +26,11 @@ import { log } from "../util/logger";
 //
 // Sync now (staff) re-queues the ticket's mirror: the backfill for a ticket
 // that never reached Intercom, a verify-ensure plus the missed-message heal
-// for one that did, and it wakes a queue parked after a failed push. Mirror
-// to Intercom (Administrator) lifts a Discord-only refund ticket's exemption
-// and runs the same sequence the customer's first typed message would.
+// for one that did, and it wakes a queue parked after a failed push. Repair
+// sync (staff) replaces a workflow stranded on a task queue no worker polls,
+// then runs the same heal (see temporal/strandedRuns.ts). Mirror to Intercom
+// (Administrator) lifts a Discord-only refund ticket's exemption and runs the
+// same sequence the customer's first typed message would.
 
 export const TICKET_PREFIX = "ticketcmd_";
 const ME_TTL_MS = 60 * 60_000;
@@ -62,6 +65,9 @@ export interface SyncFacts {
   // null = unknown (Temporal did not answer). Without Temporal nothing can be
   // queued, so the caller passes an empty queue.
   queue: { depth: number; head: string | null } | null;
+  // The task queue a stranded workflow run is bound to (one this worker does
+  // not poll), else null.
+  stranded: string | null;
   workerPaused: boolean;
   backfillClaimed: boolean;
 }
@@ -76,6 +82,7 @@ export interface SyncReport {
   // provably gone (nothing queued), so keeping it would block a new one.
   releaseStaleClaim: boolean;
   canLift: boolean;
+  canRepair: boolean;
 }
 
 const PAUSED = "The Temporal worker is paused (/config → Temporal), so nothing delivers until it resumes.";
@@ -98,6 +105,7 @@ export function diagnoseSync(f: SyncFacts): SyncReport {
     canSync: false,
     releaseStaleClaim: false,
     canLift: false,
+    canRepair: false,
   };
   const mirrored = f.link != null && f.remote.kind === "found";
 
@@ -116,6 +124,16 @@ export function diagnoseSync(f: SyncFacts): SyncReport {
   if (f.exempt) {
     report.why = "Discord-only refund ticket. It mirrors to Intercom once the customer sends a typed message.";
     report.canLift = true;
+    return report;
+  }
+  // Ahead of the link checks: the run swallows the creation push as well.
+  // Sync now would queue into the same run; Repair sync replaces it first.
+  if (f.stranded) {
+    report.synced = mirrored ? "partly" : "no";
+    report.why =
+      `This ticket's Temporal workflow is stuck on the task queue \`${f.stranded}\`, which no worker polls. ` +
+      "Everything sent to Intercom since the queue changed went into it and was never delivered.";
+    report.canRepair = true;
     return report;
   }
 
@@ -172,8 +190,10 @@ export function diagnoseSync(f: SyncFacts): SyncReport {
         return report;
       }
       report.synced = "yes";
-      if ((f.queue?.depth ?? 0) > 0) {
-        report.note = `${events(f.queue!.depth)} still waiting to deliver.${f.workerPaused ? ` ${PAUSED}` : ""}`;
+      if (f.queue == null) {
+        report.note = f.workerPaused ? PAUSED : "Temporal did not answer, so whether anything is still waiting to deliver is unknown.";
+      } else if (f.queue.depth > 0) {
+        report.note = `${events(f.queue.depth)} still waiting to deliver.${f.workerPaused ? ` ${PAUSED}` : ""}`;
       }
       return report;
   }
@@ -205,7 +225,7 @@ export interface TicketCommandDeps {
   temporal(): {
     routable(): boolean;
     enabled(): boolean;
-    ticketOutbox(threadId: string): Promise<{ depth: number; head: string | null } | null>;
+    ticketOutbox(threadId: string): Promise<TicketOutbox | null>;
     intercomRetryNow(threadId: string): Promise<unknown>;
   } | null;
   sync: {
@@ -224,6 +244,8 @@ export interface TicketCommandDeps {
   threadMessages(threadId: string): Promise<BridgeSourceMessage[] | null>;
   // Agent replies whose relay into the thread was dropped (bi mode only).
   inboundHeal(threadId: string, conversationId: string): Promise<number>;
+  // Terminates the ticket's stranded runs, then heals it (StrandedRunRepair).
+  repairStranded(threadId: string): Promise<{ terminated: number; recovered: number; inbound: number }>;
   // SLA rules for a ticket that just started mirroring.
   slaTrigger(threadId: string): void;
   audit(entry: {
@@ -266,6 +288,7 @@ export class TicketCommand {
     await interaction.deferUpdate();
     let notice: string | null = null;
     if (action === "sync") notice = await this.syncNow(interaction, ticket);
+    else if (action === "repair") notice = await this.repairNow(interaction, ticket);
     else if (action === "lift") notice = admin ? await this.lift(interaction, ticket) : "Administrator permission required.";
     // "refresh" and anything unknown just re-read the state.
     const fresh = (await this.deps.getTicket(ticket.threadId)) ?? ticket;
@@ -319,6 +342,33 @@ export class TicketCommand {
     return summary;
   }
 
+  private async repairNow(interaction: ButtonInteraction, ticket: TicketWithTag): Promise<string> {
+    const report = diagnoseSync(await this.facts(ticket));
+    if (!report.canRepair) return `Nothing to repair. ${report.why ?? "This ticket's workflow is running normally."}`;
+    let result: Awaited<ReturnType<TicketCommandDeps["repairStranded"]>>;
+    try {
+      result = await this.deps.repairStranded(ticket.threadId);
+    } catch (e) {
+      cmdLog.error("ticket repair failed", e, { "ticket.thread_id": ticket.threadId });
+      return "Repair failed partway. It is safe to press it again.";
+    }
+    const summary =
+      `Repaired: the stuck workflow was replaced, ${result.recovered} missed message${result.recovered === 1 ? "" : "s"} re-queued for Intercom` +
+      `${result.inbound > 0 ? `, ${result.inbound} Intercom repl${result.inbound === 1 ? "y" : "ies"} re-checked` : ""}.`;
+    this.deps.audit({
+      title: "🧵 Intercom sync repaired",
+      severity: "info",
+      actor: interaction.user.displayName,
+      actorIconUrl: interaction.user.displayAvatarURL(),
+      threadId: ticket.threadId,
+      fields: [
+        { name: "Was", value: report.why ?? "stranded", inline: false },
+        { name: "Result", value: summary, inline: false },
+      ],
+    });
+    return summary;
+  }
+
   private async lift(interaction: ButtonInteraction, ticket: TicketWithTag): Promise<string> {
     if (!isIntercomExempt(ticket)) return "This ticket is no longer Discord-only.";
     if (this.deps.settings.intercomMode() === "none" || !this.deps.settings.intercomConfigured()) {
@@ -347,11 +397,12 @@ export class TicketCommand {
   private async facts(ticket: TicketWithTag): Promise<SyncFacts> {
     const temporal = this.deps.temporal();
     const routable = temporal?.routable() ?? false;
-    const [link, failure, claimed, queue] = await Promise.all([
+    const idle: TicketOutbox = { kind: "queue", depth: 0, head: null };
+    const [link, failure, claimed, outbox] = await Promise.all([
       this.deps.store.getLink(ticket.threadId),
       this.deps.store.getSyncFailure(ticket.threadId),
       this.deps.store.hasBackfillClaim(ticket.threadId),
-      routable ? temporal!.ticketOutbox(ticket.threadId) : Promise.resolve({ depth: 0, head: null }),
+      routable ? temporal!.ticketOutbox(ticket.threadId) : Promise.resolve(idle),
     ]);
     let remote: RemoteTicket = { kind: "none" };
     if (link?.ticketId) {
@@ -370,7 +421,8 @@ export class TicketCommand {
       link,
       remote,
       failure,
-      queue,
+      queue: outbox?.kind === "queue" ? { depth: outbox.depth, head: outbox.head } : null,
+      stranded: outbox?.kind === "stranded" ? outbox.taskQueue : null,
       workerPaused: routable && !temporal!.enabled(),
       backfillClaimed: claimed,
     };
@@ -423,6 +475,9 @@ export class TicketCommand {
     }
     if (report.canSync) {
       buttons.push(new ButtonBuilder().setCustomId(`${TICKET_PREFIX}sync`).setLabel("Sync now").setStyle(ButtonStyle.Primary));
+    }
+    if (report.canRepair) {
+      buttons.push(new ButtonBuilder().setCustomId(`${TICKET_PREFIX}repair`).setLabel("Repair sync").setStyle(ButtonStyle.Primary));
     }
     if (report.canLift && admin) {
       buttons.push(new ButtonBuilder().setCustomId(`${TICKET_PREFIX}lift`).setLabel("Mirror to Intercom").setStyle(ButtonStyle.Primary));
