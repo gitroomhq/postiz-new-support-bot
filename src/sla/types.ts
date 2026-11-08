@@ -221,3 +221,19 @@ export function targetsMissingFromList(targets: readonly string[], options: read
   const allowed = new Set(options);
   return [...new Set(targets)].filter((t) => !allowed.has(t));
 }
+
+// Rules and the default name a target by value, so renaming a target they use
+// leaves them pointing at nothing, and their conversations run no clocks.
+export function targetRenameBlocker(input: {
+  from: string;
+  to: string;
+  existing: readonly string[];
+  usedByRule: boolean;
+  isDefault: boolean;
+}): string | null {
+  if (input.from === input.to) return null;
+  if (input.existing.includes(input.to)) return "That target value already exists.";
+  if (input.usedByRule) return "That target is used by a rule. Reassign it first.";
+  if (input.isDefault) return "That target is the default. Change the default first.";
+  return null;
+}

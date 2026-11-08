@@ -1,5 +1,5 @@
 import { SlaRuleStore } from "../../sla/SlaRuleStore";
-import { SlaTargetEntry, SLA_TARGET_VALUE_RE } from "../../sla/types";
+import { SlaTargetEntry, SLA_TARGET_VALUE_RE, targetRenameBlocker } from "../../sla/types";
 import { ActionButton, ActionResult, Opt, Section, SaveResult } from "../renderer/contract";
 import { AdminHubContext, ActionRequest, HubModule, SaveRequest, asBoundedInt, asString } from "./types";
 
@@ -186,6 +186,14 @@ export function makeSlaHub(deps: { ruleStore: SlaRuleStore }): HubModule {
             } else {
               const idx = targets.findIndex((t) => t.value === id);
               if (idx < 0) return { ok: false, error: "Target not found." };
+              const blocker = targetRenameBlocker({
+                from: id,
+                to: value,
+                existing: targets.map((t) => t.value),
+                usedByRule: rs.targetInUse(id),
+                isDefault: s.slaDefaultTarget() === id,
+              });
+              if (blocker) return { ok: false, error: blocker };
               targets[idx] = entry;
             }
             await s.updateSlaTargets(targets);
