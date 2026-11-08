@@ -18,7 +18,7 @@ import type { SlaTargetEntry } from "./types";
 // - next_reply (NRT): runs while the customer is waiting (waiting_since set).
 //   FR owns the FIRST wait when an FR clock exists; each new waiting_since
 //   value starts a fresh cycle with fresh warn/breach markers (re-alert per
-//   cycle). The stored anchor can be moved forward (unsnooze re-anchor) — the
+//   cycle). The stored anchor can be moved forward (unsnooze re-anchor): the
 //   later of waiting_since/stored anchor wins.
 // - resolution (RES): createdAt → close. The enforcer only scans open
 //   conversations, so a closed subject simply leaves the population (status
@@ -39,7 +39,7 @@ export interface ClockInput {
   createdAt: Date;
   waitingSince: Date | null;
   firstAdminReplyAt: Date | null; // raw statistics (may be Fin/Operator on native)
-  lastAdminReplyAt: Date | null; // raw statistics — drives native re-verify
+  lastAdminReplyAt: Date | null; // raw statistics, drives native re-verify
   snoozed: boolean;
 }
 
@@ -71,7 +71,7 @@ export interface ClockEvaluation {
   overall: ClockState;
   clocks: ClockStatus[];
   // Native only: a raw admin reply exists but humanness is unverified while a
-  // threshold is crossed — the enforcer must parts-verify before any FR alert.
+  // threshold is crossed: the enforcer must parts-verify before any FR alert.
   needsFirstReplyVerify: boolean;
   actions: {
     newMarkers: Partial<ClockMarkers>;
@@ -120,6 +120,10 @@ export function evaluateClocks(
   // nagRepeatMs of BUSINESS time has elapsed since the last nag.
   const nagDue = (lastNaggedAt: Date | null): boolean =>
     lastNaggedAt == null || businessMsBetween(schedule, lastNaggedAt, now) >= nagRepeatMs;
+  // A deadline that passed before the target was added never alerts.
+  const alertsSinceMs = target.alertsSince ? Date.parse(target.alertsSince) : NaN;
+  const muted = (deadline: Date | null): boolean =>
+    deadline != null && Number.isFinite(alertsSinceMs) && deadline.getTime() < alertsSinceMs;
 
   // ---- first reply ----
   const frTargetMs = (target.firstReplyMins ?? 0) * MIN_MS;
@@ -149,7 +153,7 @@ export function evaluateClocks(
         if (state !== "ok" && markers.frWarnedAt == null) newMarkers.frWarnedAt = now;
         if (state === "breached") {
           if (markers.frBreachedAt == null) newMarkers.frBreachedAt = now;
-          if (nagDue(markers.frLastNaggedAt)) {
+          if (!muted(deadline) && nagDue(markers.frLastNaggedAt)) {
             newMarkers.frLastNaggedAt = now;
             breachNotes.push({ clock: "first_reply", deadline });
           }
@@ -199,7 +203,7 @@ export function evaluateClocks(
       if (state !== "ok" && warned == null) newMarkers.nrWarnedAt = now;
       if (state === "breached") {
         if (breached == null) newMarkers.nrBreachedAt = now;
-        if (nagDue(lastNagged)) {
+        if (!muted(deadline) && nagDue(lastNagged)) {
           newMarkers.nrLastNaggedAt = now;
           breachNotes.push({ clock: "next_reply", deadline });
         }
@@ -219,7 +223,7 @@ export function evaluateClocks(
     if (state !== "ok" && markers.resWarnedAt == null) newMarkers.resWarnedAt = now;
     if (state === "breached" && markers.resBreachedAt == null) {
       newMarkers.resBreachedAt = now;
-      breachNotes.push({ clock: "resolution", deadline });
+      if (!muted(deadline)) breachNotes.push({ clock: "resolution", deadline });
     }
   }
 

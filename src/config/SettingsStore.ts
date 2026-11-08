@@ -1032,6 +1032,7 @@ export class SettingsStore {
           nextReplyMins: mins(e.nextReplyMins),
           resolveMins: mins(e.resolveMins),
           warnPct: warn !== undefined ? Math.min(99, Math.max(1, warn)) : undefined,
+          alertsSince: typeof e.alertsSince === "string" ? e.alertsSince : undefined,
         };
       });
   }

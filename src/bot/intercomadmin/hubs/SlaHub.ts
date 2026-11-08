@@ -29,7 +29,7 @@ const PAGE_SIZE = 10;
 // priority-ordered list (first match wins) whose winning target is written to
 // the "SLA Target" conversation attribute; the bot IS the SLA engine
 // (Advanced tier has no native SLAs): targets carry business-minute clock
-// durations and the 5-min enforcement looper runs them — at-risk flips the
+// durations and the 5-min enforcement looper runs them: at-risk flips the
 // "SLA Status" attribute, breach adds the tag + one internal note. Office
 // hours (weekly schedule + holidays) pause the clocks. Authoring: guided
 // builder (selects/modals) AND a text-expression escape hatch with a
@@ -521,7 +521,7 @@ export class SlaHub {
   }
 
   // Step 3: value UI by descriptor kind. showModal must be the FIRST response
-  // for modal kinds — both button and select interactions support it.
+  // for modal kinds: both button and select interactions support it.
   private async renderValueStep(
     interaction: ButtonInteraction | StringSelectMenuInteraction,
     token: string,
@@ -560,7 +560,7 @@ export class SlaHub {
       return;
     }
 
-    // enum kind: options may need an API call — defer, then render the select.
+    // enum kind: options may need an API call: defer, then render the select.
     await interaction.deferUpdate();
     let options: DescriptorOption[] = [];
     try {
@@ -779,7 +779,7 @@ export class SlaHub {
 
   // ---- expression escape hatch ----
 
-  // Opens the expression modal — from the builder (draft) or straight from the
+  // Opens the expression modal, from the builder (draft) or straight from the
   // rule detail (seeds a draft first). Pre-fills the last failed attempt when
   // re-opened via the "Fix Expression" button.
   private async handleExprOpen(interaction: ButtonInteraction): Promise<void> {
@@ -821,7 +821,7 @@ export class SlaHub {
       const text = interaction.fields.getTextInputValue("expression");
       const parsed = parseExpression(text, this.ctx.slaRules.buildParseContext());
       if (!parsed.ok) {
-        // A modal submit cannot open another modal — store the failed text and
+        // A modal submit cannot open another modal: store the failed text and
         // offer a "Fix Expression" button that re-opens the modal pre-filled.
         session.lastExprAttempt = text;
         await interaction.reply({
@@ -920,7 +920,7 @@ export class SlaHub {
     await interaction.update(this.buildTargetsPanel(page));
   }
 
-  // Discord modals cap at 5 rows — value + note + the 3 clock durations.
+  // Discord modals cap at 5 rows: value + note + the 3 clock durations.
   private targetModalRows(prefill?: SlaTargetEntry): ActionRowBuilder<TextInputBuilder>[] {
     const minStr = (n?: number) => (n != null ? String(n) : "");
     return [
@@ -979,7 +979,7 @@ export class SlaHub {
       await interaction.reply({ embeds: [makeEmbed("Durations must be blank or a whole number of minutes greater than 0.", COLORS.danger)], flags: 64 });
       return;
     }
-    await this.ctx.settingsStore.updateSlaTargets([...targets, { value, note, ...durations }]);
+    await this.ctx.settingsStore.updateSlaTargets([...targets, { value, note, ...durations, alertsSince: new Date().toISOString() }]);
     this.ctx.auditConfig(interaction, `SLA target added: \`${value}\` (${this.clockSummary({ value, note, ...durations })})`);
     await this.ctx.sessions.ackModal(interaction);
     await interaction.editReply(this.buildTargetsPanel(0));
@@ -1020,7 +1020,13 @@ export class SlaHub {
       await interaction.reply({ embeds: [makeEmbed("Durations must be blank or a whole number of minutes greater than 0.", COLORS.danger)], flags: 64 });
       return;
     }
-    const updated: SlaTargetEntry = { value, note, ...durations, ...(existing.warnPct != null ? { warnPct: existing.warnPct } : {}) };
+    const updated: SlaTargetEntry = {
+      value,
+      note,
+      ...durations,
+      ...(existing.warnPct != null ? { warnPct: existing.warnPct } : {}),
+      ...(existing.alertsSince ? { alertsSince: existing.alertsSince } : {}),
+    };
     await this.ctx.settingsStore.updateSlaTargets(targets.map((t) => (t.value === value ? updated : t)));
     this.ctx.auditConfig(interaction, `SLA target \`${value}\` clocks → ${this.clockSummary(updated)}`);
     await this.ctx.sessions.ackModal(interaction);
@@ -1163,7 +1169,7 @@ export class SlaHub {
   private async handleVerify(interaction: ButtonInteraction): Promise<void> {
     await interaction.deferReply({ flags: 64 });
     const result = await this.ctx.slaService.verifySetup();
-    // Enforcement-looper liveness — checked here because the hub has the
+    // Enforcement-looper liveness, checked here because the hub has the
     // Temporal producers (SlaService deliberately doesn't).
     let looperLine = "▫️ Enforcement looper: Temporal not routable; clocks run only while the worker is active.";
     try {

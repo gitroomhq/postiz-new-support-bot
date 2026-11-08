@@ -182,7 +182,7 @@ export function makeSlaHub(deps: { ruleStore: SlaRuleStore }): HubModule {
             const targets = s.slaTargets().slice();
             if (req.key === "target_add") {
               if (targets.some((t) => t.value === value)) return { ok: false, error: "That target value already exists." };
-              targets.push(entry);
+              targets.push({ ...entry, alertsSince: new Date().toISOString() });
             } else {
               const idx = targets.findIndex((t) => t.value === id);
               if (idx < 0) return { ok: false, error: "Target not found." };
@@ -194,7 +194,7 @@ export function makeSlaHub(deps: { ruleStore: SlaRuleStore }): HubModule {
                 isDefault: s.slaDefaultTarget() === id,
               });
               if (blocker) return { ok: false, error: blocker };
-              targets[idx] = entry;
+              targets[idx] = { ...entry, ...(targets[idx].alertsSince ? { alertsSince: targets[idx].alertsSince } : {}) };
             }
             await s.updateSlaTargets(targets);
             await ctx.audit(`${req.key === "target_add" ? "add" : "edit"} sla target ${value}`);

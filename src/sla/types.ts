@@ -7,7 +7,7 @@ import { z } from "zod";
 // SlaCondition[] (guided builder) and the canonical expression text
 // ("category=billing AND stripe.paying=true AND keyword~\"refund\"").
 //
-// Evaluation semantics: missing data = condition FALSE, uniformly — a
+// Evaluation semantics: missing data = condition FALSE, uniformly: a
 // stripe.paying=true rule can never match a subject without a Stripe link;
 // authors gate explicitly with stripe.linked=true (linked itself is always
 // computable for bridged tickets, and always false-y for native conversations).
@@ -95,7 +95,7 @@ export const slaConditionsSchema = z.array(slaConditionSchema).min(1);
 export interface SlaPostizFacts {
   linked: boolean;
   // Set only when a lookup ran; `unavailable` marks a disabled, refused or
-  // failed lookup — every postiz.* condition except `linked` then evaluates
+  // failed lookup: every postiz.* condition except `linked` then evaluates
   // false, mirroring the stripe.* convention.
   unavailable?: boolean;
   tier?: string | null;
@@ -107,12 +107,12 @@ export interface SlaPostizFacts {
 export interface SlaStripeFacts {
   linked: boolean;
   // Set only when a Stripe fetch ran; `unavailable` marks a timed-out/errored
-  // fetch — every stripe.* condition except `linked` then evaluates false.
+  // fetch: every stripe.* condition except `linked` then evaluates false.
   unavailable?: boolean;
   paying?: boolean;
   planKeys?: string[]; // price ids + nicknames + lookup keys of active subs
   spendMajor?: number; // lifetime captured charge sum, major units
-  truncatedSpend?: boolean; // page cap hit — spendMajor is a partial sum
+  truncatedSpend?: boolean; // page cap hit: spendMajor is a partial sum
   openDispute?: boolean;
   refundReview?: boolean;
 }
@@ -194,7 +194,7 @@ export interface ExpressionError {
 export type ParseResult = { ok: true; conditions: SlaCondition[] } | { ok: false; errors: ExpressionError[] };
 
 // Managed target registry entry (BotSettings.slaTargetsJson). Durations are
-// BUSINESS minutes for the bot-native clocks — a clock left unset is disabled
+// BUSINESS minutes for the bot-native clocks: a clock left unset is disabled
 // for that target; a target with no durations gets no clocks at all.
 export interface SlaTargetEntry {
   value: string;
@@ -203,6 +203,10 @@ export interface SlaTargetEntry {
   nextReplyMins?: number;
   resolveMins?: number;
   warnPct?: number; // per-target at_risk threshold override (default: BotSettings.slaWarnPct)
+  // ISO instant the target was added. A deadline that passed before it is
+  // still breached (status, tag) but never noted or nagged, so adding a
+  // target does not alert on every conversation already over its clocks.
+  alertsSince?: string;
 }
 
 export function hasClockDurations(t: SlaTargetEntry): boolean {

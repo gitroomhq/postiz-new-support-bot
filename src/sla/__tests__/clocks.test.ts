@@ -301,6 +301,25 @@ test("resolution clock runs from createdAt and notes once (no re-nag)", () => {
   assert.equal(later.actions.breachNotes.length, 0);
 });
 
+test("deadlines that passed before the target was added breach without notes", () => {
+  // Target added 10h after T0: FR (1h) and resolution (2h) deadlines are already past.
+  const t = target({ firstReplyMins: 60, nextReplyMins: 30, resolveMins: 120, alertsSince: at(10 * HOUR).toISOString() });
+  const ev = evaluateClocks(input(), t, 80, null, markers(), at(10 * HOUR + MIN), NAG);
+  assert.equal(ev.overall, "breached");
+  assert.equal(ev.actions.breachNotes.length, 0);
+  assert.ok(ev.actions.newMarkers.frBreachedAt && ev.actions.newMarkers.resBreachedAt);
+  assert.equal(ev.actions.newMarkers.frLastNaggedAt, undefined, "no nag cadence for a muted breach");
+
+  // A later re-nag window stays silent too.
+  const later = evaluateClocks(input(), t, 80, null, markers({ frBreachedAt: at(10 * HOUR), resBreachedAt: at(10 * HOUR) }), at(10 * HOUR + 2 * NAG), NAG);
+  assert.equal(later.actions.breachNotes.length, 0);
+
+  // A customer wait that starts after the target was added alerts as usual.
+  const replied = input({ firstAdminReplyAt: at(11 * HOUR), waitingSince: at(12 * HOUR) });
+  const nr = evaluateClocks(replied, t, 80, null, markers({ resBreachedAt: at(10 * HOUR) }), at(12 * HOUR + 31 * MIN), NAG);
+  assert.deepEqual(nr.actions.breachNotes.map((n) => n.clock), ["next_reply"]);
+});
+
 test("snoozed conversations are inert", () => {
   const t = target({ firstReplyMins: 60, nextReplyMins: 30, resolveMins: 120 });
   const ev = evaluateClocks(input({ snoozed: true, waitingSince: T0 }), t, 80, null, markers(), at(10 * HOUR), NAG);
@@ -331,7 +350,7 @@ test("office-hours schedule pauses elapsed time", () => {
   const ev = evaluateClocks(input({ createdAt: friday16 }), t, 80, s, markers(), monday0930, NAG);
   const fr = clock(ev, "first_reply");
   assert.ok(fr);
-  // 1h Friday + 0.5h Monday = 1.5h elapsed — far from the 4h target
+  // 1h Friday + 0.5h Monday = 1.5h elapsed, far from the 4h target
   assert.equal(fr.elapsedBizMs, 1.5 * HOUR);
   assert.equal(fr.state, "ok");
   // Deadline = Monday 12:00 (3h remaining after Friday's 1h)
