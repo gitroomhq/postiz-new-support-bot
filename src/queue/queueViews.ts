@@ -1,6 +1,7 @@
 import type { Badge, ObjectRef } from "../dashboard/renderer/contract";
 import type { QueueExclusions } from "../config/SettingsStore";
 import type { QueueActor } from "./QueueAuth";
+import { breachLabel, type SlaBreachSource } from "../sla/breachBoard";
 import type { QueueData, QueueDirectory, QueueResolution, QueueSnapshot } from "./QueueData";
 import {
   NO_PERSON,
@@ -66,7 +67,8 @@ export class QueueViews {
   constructor(
     private data: QueueData,
     private settings: QueueViewSettings,
-    private now: () => number = Date.now
+    private now: () => number = Date.now,
+    private breaches: SlaBreachSource | null = null
   ) {}
 
   async build(actor: QueueActor, req: QueueViewRequest, options?: { waitForSnapshot: boolean }): Promise<QueuePageView | null> {
@@ -473,7 +475,7 @@ export class QueueViews {
   private flags(ctx: Ctx, i: QueueItem): Badge[] {
     const out: Badge[] = [i.kind === "first" ? { kind: "info", text: "First reply" } : { kind: "neutral", text: "Follow-up" }];
     if (i.priority) out.push({ kind: "warn", text: "Priority" });
-    if (i.slaStatus === "breached") out.push({ kind: "error", text: "SLA breached" });
+    if (i.slaStatus === "breached") out.push({ kind: "error", text: breachLabel(this.breaches?.breached(i.id) ?? null) });
     else if (i.slaStatus === "at_risk") out.push({ kind: "warn", text: "SLA at risk" });
     const holder = this.data.reservedBy(i.id);
     if (holder) {

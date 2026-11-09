@@ -61,6 +61,7 @@ import { SentryFeedbackStore } from "./sentry/SentryFeedbackStore";
 import { SentryFeedbackImporter } from "./sentry/SentryFeedbackImporter";
 import { SlaSweeper } from "./intercom/SlaSweeper";
 import { SlaEnforcer } from "./intercom/SlaEnforcer";
+import { SlaBreachBoard } from "./sla/breachBoard";
 import { AssignmentService } from "./intercom/AssignmentService";
 import { ReplyStateService, formatReplySyncReport } from "./intercom/ReplyStateService";
 import { CloseStateService, formatCloseSweep } from "./intercom/CloseStateService";
@@ -520,6 +521,8 @@ async function main() {
   );
   intercomExecutor.setAssignmentService(assignmentService);
   intercomWebhookHandler.setAssignmentService(assignmentService);
+  // Which clock each conversation breached, for the queue's badge.
+  const slaBreachBoard = new SlaBreachBoard();
   const slaEnforcer = new SlaEnforcer(
     prisma,
     intercomClient,
@@ -527,7 +530,8 @@ async function main() {
     settingsStore,
     (fn) => intercomExecutor.withAuthor(fn),
     assignmentService,
-    sentryFeedbackStore
+    sentryFeedbackStore,
+    slaBreachBoard
   );
   intercomWebhookHandler.setSlaEnforcer(slaEnforcer);
   // Customer-responded ticket state (/intercom → Automation): native tickets
@@ -584,7 +588,7 @@ async function main() {
       ],
     });
   });
-  const queuePanel = new QueuePanel(settingsStore, queueAuth, new QueueViews(queueData, settingsStore));
+  const queuePanel = new QueuePanel(settingsStore, queueAuth, new QueueViews(queueData, settingsStore, Date.now, slaBreachBoard));
   const queueOps = {
     liveSessions: () => queueSessions.countLive(settingsStore.queueEpoch()),
     signOutAll: async () => {

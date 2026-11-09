@@ -9,6 +9,7 @@ import type { SentryFeedbackStore } from "../sentry/SentryFeedbackStore";
 import type { SlaEnforceResult } from "../temporal/types";
 import { evaluateClocks, CLOCK_LABELS, type ClockEvaluation, type ClockInput, type ClockKind, type ClockMarkers } from "../sla/clocks";
 import { hasClockDurations, type SlaTargetEntry } from "../sla/types";
+import type { SlaBreachBoard } from "../sla/breachBoard";
 import { exportSlaEnforce } from "../metrics/MetricsExporter";
 import { formatDuration } from "../util/format";
 import { log } from "../util/logger";
@@ -96,7 +97,8 @@ export class SlaEnforcer {
     private settingsStore: SettingsStore,
     private withAuthor: WithAuthor,
     private assignment: AssignmentService,
-    private feedbackStore: SentryFeedbackStore | null = null
+    private feedbackStore: SentryFeedbackStore | null = null,
+    private breachBoard: SlaBreachBoard | null = null
   ) {}
 
   // Unsnooze re-anchor: the next-reply clock restarts from the unsnooze
@@ -425,6 +427,11 @@ export class SlaEnforcer {
       markers = { ...markers, ...verifyMarkers } as ClockMarkers;
       ev = evaluateClocks(input, target, warnPct, schedule, markers, now, ctx.nagRepeatMs);
     }
+
+    this.breachBoard?.record(
+      conv.id,
+      ev.clocks.filter((c) => c.state === "breached").map((c) => c.kind)
+    );
 
     const statusValue = ev.overall;
     const wantTag = statusValue === "breached";

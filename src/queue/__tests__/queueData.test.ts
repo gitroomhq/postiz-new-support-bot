@@ -805,3 +805,26 @@ test("the Resolved page: newest first, searchable, 25 to a page", async () => {
   assert.deepEqual((await page({ q: "#512" })).rows.map((r) => r.id), ["112"]);
   assert.deepEqual((await page({ q: "duplicate" })).rows.map((r) => r.id), ["107"]);
 });
+
+test("an SLA breach badge names the clock the enforcer found breached", async () => {
+  const breachedConv = (id: string) => rawConv(id, { custom_attributes: { "SLA Status": "breached" } });
+  const src = fakeSource([breachedConv("1"), breachedConv("2"), breachedConv("3")]);
+  const s = settings();
+  const data = new QueueData(src, s, () => NOW);
+  await data.snapshot();
+  const board = {
+    breached: (id: string) => (id === "1" ? (["next_reply"] as const).slice() : id === "2" ? (["resolution"] as const).slice() : null),
+  };
+  const views = new QueueViews(data, { intercomConfigured: () => true, queueExclusions: () => s.state.exclusions }, () => NOW, board);
+  const page = await views.build({ adminId: "11", name: "Ada", sessionIdHash: "h" }, { page: "global", params: {}, filters: {}, cursor: null }, { waitForSnapshot: false });
+  const table = page!.blocks.find((b) => b.type === "table") as QueueTableBlock;
+  const slaBadge = (id: string) => {
+    const row = table.rows.find((r) => r.id === id)!;
+    const flags = row.cells.find((c) => c.t === "flags") as { badges: Array<{ text: string }> };
+    return flags.badges.map((b) => b.text).find((t) => /SLA/.test(t));
+  };
+  assert.equal(slaBadge("1"), "Reply SLA breached");
+  assert.equal(slaBadge("2"), "Resolution SLA breached");
+  // Nothing known yet (just after a restart): the plain badge.
+  assert.equal(slaBadge("3"), "SLA breached");
+});
