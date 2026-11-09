@@ -42,7 +42,9 @@ export interface ScopedBinding {
   discordCustomerId: string | null;
   ticketThreadId: string | null;
   conversationId: string | null;
-  origin: "dashboard";
+  // "support": the support dashboard. Its requests always queue for an admin,
+  // whatever the action's level says.
+  origin: "dashboard" | "support";
 }
 
 // The Discord-independent brain behind every canvas/panel billing action.
@@ -66,6 +68,10 @@ export class BillingActionService {
   // after this one). Absent means concessions simply go unrecorded; it never
   // blocks the action.
   private moneyOut?: MoneyOutService;
+
+  // Told about every approval an admin closed (approved, failed, refused,
+  // rejected): the support dashboard DMs its requesters from here.
+  private outcomeListener?: (approvalId: string) => void;
 
   constructor(
     private approvalStore: ApprovalStore,
@@ -93,6 +99,18 @@ export class BillingActionService {
 
   bindMoneyOut(service: MoneyOutService): void {
     this.moneyOut = service;
+  }
+
+  bindOutcomeListener(listener: (approvalId: string) => void): void {
+    this.outcomeListener = listener;
+  }
+
+  private notifyOutcome(approvalId: string): void {
+    try {
+      this.outcomeListener?.(approvalId);
+    } catch (e) {
+      actionLog.warn("approval outcome listener failed", { "error.message": e instanceof Error ? e.message : String(e) });
+    }
   }
 
   // Resolves how THIS actor may run THIS action right now.
@@ -176,8 +194,11 @@ export class BillingActionService {
     const parsed = def.parseParams(rawParams);
     if (!parsed.ok) return { kind: "invalid", error: parsed.error };
 
-    const mode = this.effectiveMode(actionKey, actor);
-    if (mode === "denied") return { kind: "denied", error: "This action is disabled (/config → Billing → Intercom Actions)." };
+    const level = this.effectiveMode(actionKey, actor);
+    if (level === "denied") return { kind: "denied", error: "This action is disabled (/config → Billing → Intercom Actions)." };
+    // Every support-dashboard change waits for an admin, even where the level
+    // would let a teammate run it directly.
+    const mode = binding.origin === "support" ? "queue" : level;
 
     const ctx = this.buildScopedCtx(binding, actor, randomUUID());
     const summary = def.summarize(parsed.params, this.stripe);
@@ -219,7 +240,12 @@ export class BillingActionService {
   // /billing hub). Works cross-surface in both directions: an Intercom-origin
   // approval can be approved from the dashboard and vice versa — the ctx is
   // rebuilt per the approval's ORIGIN, not the reviewer's surface.
-  async actOnApproval(approvalId: string, reviewer: ActionActor, decision: "approve" | "reject"): Promise<ApprovalOutcome> {
+  async actOnApproval(
+    approvalId: string,
+    reviewer: ActionActor,
+    decision: "approve" | "reject",
+    note?: string | null
+  ): Promise<ApprovalOutcome> {
     const approval = await this.approvalStore.get(approvalId);
     if (!approval) return { kind: "already_handled", error: "Approval not found." };
     const reviewerId = `${reviewer.kind}:${reviewer.id}`;
@@ -230,8 +256,9 @@ export class BillingActionService {
       if (!reviewer.isAdmin && !(reviewer.kind === "intercom" && reviewer.id === approval.requestedById)) {
         return { kind: "denied", error: "Only admins (or the requester) can reject an approval." };
       }
-      const rejected = await this.approvalStore.reject(approvalId, reviewerId, reviewer.name);
+      const rejected = await this.approvalStore.reject(approvalId, reviewerId, reviewer.name, note?.trim() || null);
       if (!rejected) return { kind: "already_handled", error: "Approval was already handled." };
+      this.notifyOutcome(approvalId);
       const ctx = await this.ctxForApproval(approval, reviewer, approvalId);
       if (ctx) await this.postNote(ctx, `🚫 **Approval rejected** by ${reviewer.name}: ${approval.summary}`);
       await this.postBillingAudit({
@@ -241,6 +268,7 @@ export class BillingActionService {
         fields: [
           { name: "Requested by", value: approval.requestedByName, inline: true },
           { name: "Rejected by", value: reviewer.name, inline: true },
+          ...(note?.trim() ? [{ name: "Reason", value: note.trim().slice(0, 500), inline: false }] : []),
         ],
       });
       return { kind: "rejected" };
@@ -281,10 +309,36 @@ export class BillingActionService {
     const result = await this.executeNow(def, ctx, parsed.params, approval.summary, approval);
     if (result.ok) {
       await this.approvalStore.markExecuted(approvalId, result.text);
+      this.notifyOutcome(approvalId);
       return { kind: "executed", text: result.text };
+    }
+    if (result.refused && def.refusalIsFinal) {
+      await this.approvalStore.markRefused(approvalId, result.error);
+      this.notifyOutcome(approvalId);
+      return { kind: "failed", error: `Refused: ${result.error}` };
     }
     await this.approvalStore.markFailed(approvalId, result.error);
     return { kind: "failed", error: result.error };
+  }
+
+  // The support dashboard's requester takes back their own request. Nobody
+  // else may: admins reject instead.
+  async withdraw(approvalId: string, actor: ActionActor): Promise<{ ok: true } | { ok: false; error: string }> {
+    if (actor.kind !== "support") return { ok: false, error: "Only the requester can withdraw a request." };
+    const approval = await this.approvalStore.get(approvalId);
+    if (!approval || approval.origin !== "support" || approval.requestedById !== actor.id) {
+      return { ok: false, error: "That request is not yours." };
+    }
+    if (!(await this.approvalStore.withdraw(approvalId, "support", actor.id))) {
+      return { ok: false, error: "That request was already handled." };
+    }
+    await this.postBillingAudit({
+      title: "Billing: Approval withdrawn (support)",
+      summary: approval.summary,
+      ctx: null,
+      fields: [{ name: "Withdrawn by", value: actor.name, inline: true }],
+    });
+    return { ok: true };
   }
 
   async pendingForConversation(conversationId: string, limit: number): Promise<BillingApproval[]> {
@@ -362,7 +416,8 @@ export class BillingActionService {
   // itself; the Discord link is re-derived fresh (it may have changed since
   // queue time) and revalidation still re-checks live ownership.
   private async ctxForApproval(approval: BillingApproval, actor: ActionActor, idemScope: string): Promise<ActionExecCtx | null> {
-    if (approval.origin !== "dashboard" && approval.conversationId) {
+    const scoped = approval.origin === "dashboard" || approval.origin === "support";
+    if (!scoped && approval.conversationId) {
       return this.buildCtx(approval.conversationId, actor, idemScope);
     }
     const discordIds = approval.stripeCustomerId
@@ -374,7 +429,7 @@ export class BillingActionService {
         discordCustomerId: discordIds[0] ?? null,
         ticketThreadId: approval.ticketThreadId,
         conversationId: approval.conversationId,
-        origin: "dashboard",
+        origin: approval.origin === "support" ? "support" : "dashboard",
       },
       actor,
       idemScope
@@ -389,7 +444,7 @@ export class BillingActionService {
     params: unknown,
     summary: string,
     approval?: BillingApproval
-  ): Promise<{ ok: true; text: string } | { ok: false; error: string }> {
+  ): Promise<{ ok: true; text: string } | { ok: false; error: string; refused?: boolean }> {
     // Dashboard requests have no conversation — scope the double-click guard
     // to the customer (or globally for unscoped actions).
     const flightKey = `${ctx.conversationId ?? ctx.stripeCustomerId ?? ctx.ticketThreadId ?? "global"}:${def.key}`;
@@ -397,7 +452,7 @@ export class BillingActionService {
     this.inFlight.add(flightKey);
     try {
       const refusal = await def.revalidate(ctx, params).catch((e) => `Revalidation failed: ${e instanceof Error ? e.message : String(e)}`);
-      if (refusal) return { ok: false, error: refusal };
+      if (refusal) return { ok: false, error: refusal, refused: true };
 
       let result: { ok: true; text: string } | { ok: false; error: string };
       try {

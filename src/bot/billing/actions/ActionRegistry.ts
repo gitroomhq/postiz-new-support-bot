@@ -15,6 +15,15 @@ import {
 import type { PostizDriftService } from "../../../postiz/PostizDriftService";
 import type { MoneyOutService } from "../MoneyOutService";
 import { exportBillingEvent, type BillingEventSurface } from "../../../metrics/MetricsExporter";
+import {
+  type CustomerDetails,
+  changedFields,
+  detailsOf,
+  fieldList,
+  parseStoredDetails,
+  primaryVat,
+  stripeAddress,
+} from "../customerDetails";
 
 // Single source of truth for every canvas/panel billing action: the panel UI,
 // the canvas card, the /config levels panel and the approval executor all
@@ -31,7 +40,7 @@ import { exportBillingEvent, type BillingEventSurface } from "../../../metrics/M
 export type { BillingActionLevel };
 
 export interface ActionActor {
-  kind: "intercom" | "discord" | "dashboard";
+  kind: "intercom" | "discord" | "dashboard" | "support";
   id: string;
   name: string;
   isAdmin: boolean;
@@ -89,6 +98,9 @@ export interface BillingActionDef<P = unknown> {
   // null = still executable; a string = human-readable refusal.
   revalidate: (ctx: ActionExecCtx, params: P) => Promise<string | null>;
   execute: (ctx: ActionExecCtx, params: P) => Promise<ActionResult>;
+  // A queued request this action's revalidation refuses is closed as REFUSED
+  // instead of FAILED (retryable): a retry would only be refused again.
+  refusalIsFinal?: boolean;
 }
 
 // ---- param helpers (hostile input) ----
@@ -1818,6 +1830,85 @@ const customerBlock = defineAction<CustomerBlockParams>({
   },
 });
 
+// ---- support dashboard: name, billing address and VAT ID ----
+
+export const CUSTOMER_UPDATE_DETAILS = "customer.update_details";
+
+interface CustomerUpdateDetailsParams {
+  customerId: string;
+  // What the teammate saw when they asked. Approval applies the change only
+  // while the customer still matches it, so nobody overwrites an edit they
+  // never saw.
+  before: CustomerDetails;
+  after: CustomerDetails;
+  reason: string;
+  intercomRef: string | null;
+  // Display only (summaries, the requester's list): never used to find the customer.
+  customerName: string | null;
+}
+
+const customerUpdateDetails = defineAction<CustomerUpdateDetailsParams>({
+  key: CUSTOMER_UPDATE_DETAILS,
+  label: "Change billing details",
+  group: "Customer",
+  defaultLevel: "approval",
+  dangerous: false,
+  refusalIsFinal: true,
+  parseParams: (raw) => {
+    const o = obj(raw);
+    const customerId = o ? idWithPrefix(o.customerId, "cus_") : null;
+    if (!o || !customerId || !/^cus_[A-Za-z0-9]{1,64}$/.test(customerId)) return { ok: false, error: "customerId (cus_…) required" };
+    const before = parseStoredDetails(o.before);
+    const after = parseStoredDetails(o.after);
+    if (!before || !after) return { ok: false, error: "before and after details required" };
+    const reason = str(o.reason, 500);
+    if (!reason) return { ok: false, error: "A reason is required." };
+    const refGiven = o.intercomRef != null && o.intercomRef !== "";
+    const intercomRef = refGiven ? str(o.intercomRef, 300) : null;
+    if (refGiven && !intercomRef) return { ok: false, error: "The Intercom link or ticket ID is too long." };
+    if (changedFields(before, after).length === 0) return { ok: false, error: "Nothing changed." };
+    const customerName = typeof o.customerName === "string" ? o.customerName.trim().slice(0, 256) || null : null;
+    return { ok: true, params: { customerId, before, after, reason, intercomRef, customerName } };
+  },
+  summarize: (p) =>
+    `Change ${fieldList(changedFields(p.before, p.after)).toLowerCase()} of ${p.customerName ? `${p.customerName} (${p.customerId})` : p.customerId}`,
+  revalidate: async (ctx, p) => {
+    if (requireCustomer(ctx) !== p.customerId) return "This request belongs to a different customer.";
+    const customer = await ctx.stripe.getCustomer(p.customerId).catch(() => null);
+    if (!customer) return "Customer no longer exists in Stripe.";
+    const drift = changedFields(p.before, detailsOf(customer, await ctx.stripe.listTaxIds(p.customerId)));
+    if (drift.length) return `Changed since requested: ${fieldList(drift)}.`;
+    return null;
+  },
+  // The new VAT ID goes first: it is what Stripe rejects (format), and a
+  // rejection then leaves the customer as it was. The old VAT ID goes last.
+  execute: async (ctx, p) => {
+    const changed = changedFields(p.before, p.after);
+    const updates: Stripe.CustomerUpdateParams = {};
+    if (changed.includes("name")) updates.name = p.after.name;
+    if (changed.includes("address")) updates.address = stripeAddress(p.after);
+    const oldVat = changed.includes("vat") ? primaryVat(await ctx.stripe.listTaxIds(p.customerId)) : null;
+    let addedVat: string | null = null;
+    if (changed.includes("vat") && p.after.vat) {
+      try {
+        addedVat = (await ctx.stripe.addTaxId(p.customerId, p.after.vat.type, p.after.vat.value)).id;
+      } catch (e) {
+        return { ok: false, error: `Stripe rejected the VAT ID ${p.after.vat.value}: ${errText(e).slice(0, 200)}` };
+      }
+    }
+    if (Object.keys(updates).length) {
+      try {
+        await ctx.stripe.updateCustomer(p.customerId, updates);
+      } catch (e) {
+        if (addedVat) await ctx.stripe.removeTaxId(p.customerId, addedVat).catch(() => undefined);
+        return { ok: false, error: `Stripe refused the update: ${errText(e).slice(0, 200)}` };
+      }
+    }
+    if (oldVat) await ctx.stripe.removeTaxId(p.customerId, oldVat.id);
+    return { ok: true, text: `Billing details updated: ${fieldList(changed)}.` };
+  },
+});
+
 export const BILLING_ACTIONS: BillingActionDef[] = [
   chargeReview,
   refundFull,
@@ -1844,6 +1935,7 @@ export const BILLING_ACTIONS: BillingActionDef[] = [
   customerBalance,
   customerPaymentMethod,
   customerBlock,
+  customerUpdateDetails,
 ];
 
 export function actionByKey(key: string): BillingActionDef | null {

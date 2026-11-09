@@ -93,7 +93,7 @@ export class ApprovalsHub {
     const lines = rows.map((approval, i) => {
       const age = Math.max(0, Math.floor((Date.now() - approval.createdAt.getTime()) / (60 * 60 * 1000)));
       const state = approval.status === "FAILED" ? " · **FAILED (retryable)**" : "";
-      return `**${page * PAGE_SIZE + i + 1}.** ${approval.summary}\n· ${approval.requestedByName} · ${age}h ago${state}`;
+      return `**${page * PAGE_SIZE + i + 1}.** ${approval.summary}\n· ${approval.requestedByName} (${approval.origin}) · ${age}h ago${state}`;
     });
 
     const embed = new EmbedBuilder()
@@ -101,7 +101,7 @@ export class ApprovalsHub {
       .setColor(COLORS.brand)
       .setDescription(
         total === 0
-          ? "No pending approvals. Support agents queue actions from the Intercom canvas or the Stripe panel; they land here (and in the canvas/panel Approvals views)."
+          ? "No pending approvals. Actions queued from the Intercom canvas, the Stripe panel, the billing dashboard or the support dashboard land here."
           : lines.join("\n")
       )
       .setFooter({ text: `${total} pending · page ${page + 1}/${pages} · expire after 7 days` });
