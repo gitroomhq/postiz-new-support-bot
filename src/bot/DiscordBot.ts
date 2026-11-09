@@ -128,6 +128,8 @@ import { SINGLETONS } from "../temporal/types";
 import { buildIdIsDegenerate } from "../temporal/buildId";
 import { validateCertPair } from "../temporal/certs";
 import type { QueueRoute } from "../queue/QueuePanel";
+import type { MountedPanelRoute } from "../server/panelMount";
+import { SUPPORT_COMMAND, type SupportDiscord } from "../support/SupportDiscord";
 import { VaultMigrator, COLUMN_LABELS, type MigrateItemResult, type MigrateReport } from "../vault/VaultMigrator";
 import { EMAIL_COMMAND, EMAIL_PREFIX, EmailCommand } from "./EmailCommand";
 import { TICKET_COMMAND, TICKET_PREFIX, TicketCommand } from "./TicketCommand";
@@ -187,6 +189,8 @@ export class DiscordBot {
   private dashboard?: Dashboard;
   private dashboardDiscord?: DashboardDiscord;
   private queuePanel?: QueueRoute;
+  private supportPanel?: MountedPanelRoute;
+  private supportDiscord?: SupportDiscord;
   // SLA manager, bound late from index.ts; hooks fire-and-forget on ticket
   // creation and customer replies.
   private slaService: {
@@ -416,6 +420,31 @@ export class DiscordBot {
   // (CallbackServer route) only; its settings live in /intercom → Queue.
   bindQueue(route: QueueRoute): void {
     this.queuePanel = route;
+  }
+
+  // Late-bound from index.ts: the support dashboard (/support). start() mounts
+  // the panel; /support in Discord hands out its sign-in codes.
+  bindSupport(deps: { panel: MountedPanelRoute; discord: SupportDiscord }): void {
+    this.supportPanel = deps.panel;
+    this.supportDiscord = deps.discord;
+  }
+
+  // The support dashboard's staff check, outside any interaction: the member's
+  // display name when they are staff (Administrator or a support tier role),
+  // null when they are not or left the server. Throws when Discord cannot be
+  // asked, so a session survives a short outage instead of ending.
+  async staffMemberById(discordUserId: string): Promise<{ name: string } | null> {
+    const guild = this.client.guilds.cache.first();
+    if (!guild) throw new Error("not in a server yet");
+    let member: GuildMember;
+    try {
+      member = await guild.members.fetch(discordUserId);
+    } catch (e) {
+      const code = (e as { code?: number }).code;
+      if (code === 10007 || code === 10013) return null; // Unknown Member / Unknown User
+      throw e;
+    }
+    return this.isStaffMember(member) ? { name: member.displayName } : null;
   }
 
   private setupEventHandlers(): void {
@@ -1041,6 +1070,13 @@ export class DiscordBot {
       await this.emailCommand.handleCommand(interaction);
     } else if (interaction.commandName === "ticket") {
       await this.ticketCommand.handleCommand(interaction);
+    } else if (interaction.commandName === "support") {
+      if (!(await this.requireSupportOrAdmin(interaction))) return;
+      if (!this.supportDiscord) {
+        await interaction.reply({ content: "The support dashboard is not available on this instance.", flags: 64 });
+        return;
+      }
+      await this.supportDiscord.handleCommand(interaction);
     }
   }
 
@@ -7542,6 +7578,7 @@ export class DiscordBot {
       // see it at all.
       EMAIL_COMMAND,
       TICKET_COMMAND,
+      SUPPORT_COMMAND,
       {
         name: "charge",
         description: "Approve or deny a blocked self-service refund (support/admin only)",
@@ -7716,7 +7753,8 @@ export class DiscordBot {
       this.deliveryLog
         ? { handle: (raw, headers) => this.deliveryLog!.handleWebhook(raw, headers) }
         : undefined,
-      this.queuePanel
+      this.queuePanel,
+      this.supportPanel
     );
     callbackServer.start();
   }

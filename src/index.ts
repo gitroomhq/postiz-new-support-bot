@@ -118,6 +118,14 @@ import { makeMaintenanceHub } from "./adminpanel/sections/maintenanceHub";
 import { makeSlaHub } from "./adminpanel/sections/slaHub";
 import { makeAssignmentHub } from "./adminpanel/sections/assignmentHub";
 import { makeQueueHub } from "./adminpanel/sections/queueHub";
+import { makeSupportHub } from "./adminpanel/sections/supportHub";
+import { SupportSessions } from "./support/SupportSessions";
+import { SupportCredentials, SupportLookupLog } from "./support/SupportStores";
+import { SupportAuth, SUPPORT_BASE_PATH } from "./support/SupportAuth";
+import { SupportData } from "./support/SupportData";
+import { SupportViews } from "./support/supportViews";
+import { SupportPanel } from "./support/SupportPanel";
+import { SupportDiscord } from "./support/SupportDiscord";
 import { QueueData } from "./queue/QueueData";
 import { QueueSessions } from "./queue/QueueSessions";
 import { QueueAuth } from "./queue/QueueAuth";
@@ -779,6 +787,32 @@ async function main() {
   // "Run Now" buttons trigger the same merged sweep.
   const runSlaNow = async () => fmtReport(await temporalProducers.slaEnforceRunNow());
   const runInactivityNow = runSlaNow;
+
+  // Support dashboard (/support): staff look customers up and request name,
+  // address and VAT ID changes, each queued for an admin in /billing →
+  // Approvals. Signed in with a code from /support in Discord, a DM code and a
+  // password. Ships on; switched in the web /config Support Dashboard hub.
+  const supportSessions = new SupportSessions(prisma);
+  const supportCredentials = new SupportCredentials(prisma);
+  const supportLookups = new SupportLookupLog(prisma);
+  const supportDiscord = new SupportDiscord(settingsStore, approvalStore, (id) => bot.staffMemberById(id));
+  supportDiscord.bindClient(bot.client);
+  const supportAuth = new SupportAuth(settingsStore, supportDiscord, supportSessions, supportCredentials);
+  supportDiscord.bindAuth(supportAuth);
+  billingActionService.bindOutcomeListener((approvalId) => supportDiscord.onOutcome(approvalId));
+  const supportPanel = new SupportPanel(
+    settingsStore,
+    supportAuth,
+    new SupportViews({
+      data: new SupportData(stripeClient, postizIdentity),
+      approvals: approvalStore,
+      actions: billingActionService,
+      lookups: supportLookups,
+      money: stripeClient,
+    })
+  );
+  bot.bindSupport({ panel: supportPanel, discord: supportDiscord });
+
   const adminHubs = [
     generalHub,
     makeWorkflowHub({ tiers: tierStore }),
@@ -855,6 +889,20 @@ async function main() {
       listTags: () => intercomClient.listTags(),
       listTicketTypes: () => intercomClient.listTicketTypes(),
       ...queueOps,
+    }),
+    makeSupportHub({
+      liveSessions: () => supportSessions.countLive(settingsStore.supportDashEpoch()),
+      signOutAll: async () => {
+        await settingsStore.bumpSupportDashEpoch();
+        return supportSessions.deleteAll();
+      },
+      listPasswords: (offset, limit) => supportCredentials.list(offset, limit),
+      resetPassword: (id) => supportAuth.resetPassword(id),
+      listLookups: (offset, limit) => supportLookups.list(offset, limit),
+      pageUrl: () => {
+        const base = settingsStore.resolvedPublicBaseUrl();
+        return base && base.startsWith("https://") ? `${base}${SUPPORT_BASE_PATH}` : null;
+      },
     }),
   ];
   const adminPanel = new AdminPanel(settingsStore, adminPanelTokens, adminPanelSessions, guildSnapshot, adminHubs);
@@ -946,6 +994,9 @@ async function main() {
   // endpoint can point at a reachable URL. Idempotent + non-fatal.
   if (!workerOnly) {
     stripeWebhookHandler.ensureEndpoint().catch((e) => bootLog.error("stripe webhook registration failed", e));
+    // Outcome DMs for support change requests that expired (no event of
+    // their own) or whose DM a restart dropped.
+    supportDiscord.startSweep();
     // Restore the saved queue list and start its first scan before anyone
     // opens /queue.
     queueData.start();

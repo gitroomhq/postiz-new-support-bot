@@ -103,7 +103,8 @@ export class CallbackServer {
     private dashboard?: DashboardRoute,
     private sentryWebhook?: SentryWebhookRoute,
     private resendWebhook?: ResendWebhookRoute,
-    private queue?: QueueRoute
+    private queue?: QueueRoute,
+    private support?: MountedPanelRoute
   ) {
     this.app = express();
     // req.ip drives the panel per-IP throttle. Without this, req.ip is the
@@ -379,6 +380,19 @@ export class CallbackServer {
       jsonLimit: "32kb",
       spaWildcard: true,
       route: () => this.queue,
+    });
+
+    // Support dashboard (/support): its own shell and cookie; signed in with
+    // a code from /support in Discord, a DM code and a password.
+    mountPanel(this.app, allowIp, {
+      pagePath: "/support",
+      apiPath: "/support/api/:endpoint",
+      cookieName: "__Host-support",
+      metricName: "support.auth_failures",
+      logLabel: "support dashboard",
+      jsonLimit: "32kb",
+      spaWildcard: true,
+      route: () => this.support,
     });
 
     // Stripe webhook. Stripe signs with `Stripe-Signature` over the RAW body;
