@@ -102,6 +102,7 @@ export interface ActionButton {
   label: string;
   style?: "primary" | "secondary" | "danger";
   dangerous?: boolean; // typed-CONFIRM in the web modal (T1)
+  confirm?: boolean; // open the dialog (summary + submit) even with nothing to type
   stepUp?: boolean; // fresh-factor re-assert required (T2): client runs the step-up flow first
   reverseConfirm?: boolean; // ALSO requires the Discord reverse code (T3)
   mode?: "direct" | "queue"; // advisory rendering ("(request approval)"): server re-checks

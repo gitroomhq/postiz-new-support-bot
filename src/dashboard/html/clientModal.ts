@@ -33,7 +33,7 @@ D.actionBtn = function (a) {
     });
     return b;
   }
-  var simple = !(a.inputs && a.inputs.length) && !a.dangerous && !a.reverseConfirm && a.mode !== "queue";
+  var simple = !(a.inputs && a.inputs.length) && !a.dangerous && !a.reverseConfirm && a.mode !== "queue" && !a.confirm;
   b.addEventListener("click", function (e) {
     e.stopPropagation();
     if (D.closeAllPops) D.closeAllPops();

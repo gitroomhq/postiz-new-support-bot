@@ -1,4 +1,7 @@
 import type { ActionActor } from "../../bot/billing/actions/BillingActionService";
+import { actionByKey, CUSTOMER_UPDATE_DETAILS } from "../../bot/billing/actions/ActionRegistry";
+import type { BillingApproval } from "../../bot/billing/ApprovalStore";
+import { changedFields, FIELD_LABEL, fieldValue, parseStoredDetails } from "../../bot/billing/customerDetails";
 import { Block, Cell } from "../renderer/contract";
 import { DashboardCtx, DashboardSectionModule, SectionPage, str } from "./types";
 import { amount, badgeCell, idCell, isoDateCell, text } from "./cells";
@@ -40,15 +43,19 @@ export function makeApprovalsSection(): DashboardSectionModule {
           { key: "status", label: "Status" },
         ],
         rows: approvals.rows.map((a) => {
+          const def = actionByKey(a.actionKey);
+          const change = detailsChange(a);
           return {
             id: a.id,
             cells: [
               {
                 t: "text",
                 v: a.summary,
-                sub: `by ${a.requestedByName} · ${a.actionKey} · ${JSON.stringify(a.paramsJson).slice(0, 100)}`,
+                sub: change
+                  ? `by ${a.requestedByName} · ${change.fields.join(", ")}`
+                  : `by ${a.requestedByName} · ${a.actionKey} · ${JSON.stringify(a.paramsJson).slice(0, 100)}`,
               },
-              badgeCell(a.origin === "dashboard" ? "info" : "neutral", a.origin),
+              badgeCell(a.origin === "intercom" ? "neutral" : "info", a.origin),
               a.stripeCustomerId
                 ? idCell(a.stripeCustomerId, { ref: { page: "customers.detail", params: { id: a.stripeCustomerId } } })
                 : text("N/A"),
@@ -62,14 +69,22 @@ export function makeApprovalsSection(): DashboardSectionModule {
                 key: "section:approvals.act",
                 label: "Approve",
                 style: "primary" as const,
-                dangerous: true,
+                // Typed CONFIRM for actions that move money; a detail change
+                // is one click, with the change in the dialog.
+                dangerous: def?.dangerous ?? true,
                 params: { id: a.id, decision: "approve" },
-                summary: `${a.summary}\nRequested by ${a.requestedByName} (${a.origin}). Approval revalidates against live Stripe state before executing.`,
+                summary: change
+                  ? `${change.full}\nRequested by ${a.requestedByName} (${a.origin}).`
+                  : `${a.summary}\nRequested by ${a.requestedByName} (${a.origin}). Approval revalidates against live Stripe state before executing.`,
+                ...(change ? { submitLabel: "Approve", confirm: true } : {}),
               },
               {
                 key: "section:approvals.act",
                 label: "Reject",
                 params: { id: a.id, decision: "reject" },
+                submitLabel: "Reject",
+                inputs: [{ type: "text" as const, key: "note", label: "Reason (optional)", maxLength: 500 }],
+                summary: change ? change.full : a.summary,
               },
               {
                 key: "section:approvals.preview",
@@ -144,11 +159,15 @@ export function makeApprovalsSection(): DashboardSectionModule {
           const id = str(p.id, 40);
           const decision = p.decision === "approve" ? "approve" : p.decision === "reject" ? "reject" : null;
           if (!id || !decision) return { ok: false, error: "Bad request." };
-          // T1 belt server-side: approving moves money.
+          // T1 belt server-side: approving an action that moves money (or one
+          // this build no longer knows) needs the typed CONFIRM.
           if (decision === "approve" && req.confirmWord !== "CONFIRM") {
-            return { ok: false, error: "Type CONFIRM to approve." };
+            const approval = await ctx.billing.actions.getApproval(id);
+            const def = approval ? actionByKey(approval.actionKey) : null;
+            if (!def || def.dangerous) return { ok: false, error: "Type CONFIRM to approve." };
           }
-          const outcome = await ctx.billing.actions.actOnApproval(id, actor(ctx), decision);
+          const note = decision === "reject" ? str(p.note, 500).trim() || null : null;
+          const outcome = await ctx.billing.actions.actOnApproval(id, actor(ctx), decision, note);
           switch (outcome.kind) {
             case "executed":
               await ctx.audit(`Approval ${id} approved`);
@@ -185,6 +204,22 @@ export function makeApprovalsSection(): DashboardSectionModule {
       return total > 0 ? String(total) : null;
     },
   };
+}
+
+// A support-dashboard detail change, readable: one "Field: now → requested"
+// line per field, plus the teammate's reason and Intercom reference.
+function detailsChange(a: BillingApproval): { fields: string[]; full: string } | null {
+  if (a.actionKey !== CUSTOMER_UPDATE_DETAILS) return null;
+  const p = a.paramsJson && typeof a.paramsJson === "object" && !Array.isArray(a.paramsJson) ? (a.paramsJson as Record<string, unknown>) : null;
+  const before = p ? parseStoredDetails(p.before) : null;
+  const after = p ? parseStoredDetails(p.after) : null;
+  if (!p || !before || !after) return null;
+  const fields = changedFields(before, after);
+  const lines = fields.map((f) => `${FIELD_LABEL[f]}: ${fieldValue(before, f)} → ${fieldValue(after, f)}`);
+  const reason = typeof p.reason === "string" ? p.reason : "";
+  const ref = typeof p.intercomRef === "string" ? p.intercomRef : "";
+  const full = [...lines, reason ? `Reason: ${reason}` : "", ref ? `Intercom: ${ref}` : ""].filter(Boolean).join("\n");
+  return { fields: fields.map((f) => FIELD_LABEL[f]), full };
 }
 
 function actor(ctx: DashboardCtx): ActionActor {
