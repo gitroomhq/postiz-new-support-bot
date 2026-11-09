@@ -1,4 +1,4 @@
-// Stripe-look design system for the billing dashboard (/billing) ONLY — the
+// Stripe-look design system for the billing dashboard (/billing) ONLY: the
 // admin/intercom panels keep panelTheme.ts. Values sampled from a real Stripe
 // sandbox capture (2026-07-18): accent #533AFD, body text #545969, headings
 // #30313D, gray panel fill #F4F7FA, hairlines #ECF1F6, white page background,
@@ -7,11 +7,11 @@
 //
 // Theme selection: LIGHT is the source of truth (it's the actual Stripe
 // capture). The dark tokens apply when the system prefers dark AND the user
-// hasn't forced light, or when the user forces dark — the client stamps
+// hasn't forced light, or when the user forces dark: the client stamps
 // data-theme="light"|"dark" on <html> from localStorage (absent = follow the
 // system).
 //
-// CSP-safe: colours/gradients/keyframes only — no url()/data:, no @import,
+// CSP-safe: colours/gradients/keyframes only: no url()/data:, no @import,
 // no external fonts (Stripe itself falls back to this system stack).
 
 const DARK_TOKENS = `
@@ -108,7 +108,7 @@ ${DARK_TOKENS}
   .badge.error { color:var(--danger); background:var(--danger-weak); }
   .badge.neutral { color:var(--neutral); background:var(--neutral-weak); }
 
-  /* Stripe layout: content sits FLAT on the page — a "section" is a heading +
+  /* Stripe layout: content sits FLAT on the page: a "section" is a heading +
      content separated by whitespace, not a boxed card. Panels that DO need a
      surface (notices, empty states, QR) use the borderless gray fill. */
   .section { background:transparent; border:none; border-radius:0; padding:0; margin:0 0 32px; box-shadow:none; }
@@ -144,6 +144,17 @@ ${DARK_TOKENS}
   dialog .summary { color:var(--muted); margin-bottom:14px; font-size:14px; white-space:pre-wrap; }
   dialog label { display:block; margin:12px 0 5px; font-weight:500; font-size:13px; color:var(--heading); }
   dialog .drow { margin-top:18px; display:flex; gap:8px; justify-content:flex-end; }
+  #modalInputs { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); column-gap:10px; }
+  #modalInputs > .mfield { grid-column:1 / -1; min-width:0; }
+  #modalInputs > .mfield.half { grid-column:auto; }
+  .mrows { display:flex; flex-direction:column; gap:8px; }
+  .mrows:not(:empty) { margin-bottom:8px; }
+  .mrow { display:grid; grid-template-columns:150px minmax(0,1fr) auto; gap:8px; align-items:center; }
+  input.mono { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
+  @media (max-width:560px) {
+    .mrow { grid-template-columns:minmax(0,1fr) auto; }
+    .mrow select { grid-column:1 / -1; }
+  }
 
   .overlay { position:fixed; inset:0; background:var(--bg); display:flex; align-items:center; justify-content:center;
     padding:20px; z-index:50; }

@@ -3,7 +3,7 @@
 
 export const clientBlocks = `
 // Real copyable path hrefs: delegates to the router's D.hrefFor
-// (defined in clientApp — modules all share one IIFE, calls happen at render
+// (defined in clientApp: modules all share one IIFE, calls happen at render
 // time). Anchors carry /billing/… URLs; D.bindLinks SPA-intercepts left
 // clicks while ctrl/middle-click open real tabs.
 D.refHref = function (ref) {
@@ -11,7 +11,7 @@ D.refHref = function (ref) {
   return D.hrefFor(ref.page, ref.params || {}, ref.filters || {});
 };
 
-// Card-brand chip label (text stand-in for the brand logo — CSP forbids images).
+// Card-brand chip label (text stand-in for the brand logo: CSP forbids images).
 D.cardLabel = function (brand) {
   var b = (brand || "").toLowerCase();
   if (b === "visa") return "VISA";
@@ -58,6 +58,7 @@ D.renderCell = function (td, cell) {
     if (cell.pre) td.appendChild(D.el("span", "pretext", cell.v));
     else if (cell.strong) td.appendChild(D.el("span", "strongname", cell.v));
     else td.appendChild(document.createTextNode(cell.v));
+    if (cell.badge) td.appendChild(D.badge(cell.badge));
     if (cell.sub) td.appendChild(D.el("span", "sub", cell.sub));
   } else if (cell.t === "money") {
     td.classList.add("money");
@@ -73,7 +74,7 @@ D.renderCell = function (td, cell) {
     var bkey = (cell.brand || "").toLowerCase().replace(/[^a-z]/g, "");
     var ccell = D.el("span", "cardcell");
     ccell.appendChild(D.el("span", "cardchip" + (KNOWN[bkey] ? " " + bkey : ""), D.cardLabel(cell.brand)));
-    // Wallet chips (Link, PayPal, SEPA…) have no last4 — chip only.
+    // Wallet chips (Link, PayPal, SEPA…) have no last4: chip only.
     if (cell.last4) ccell.appendChild(D.el("span", "cardnum", "\\u00b7\\u00b7\\u00b7\\u00b7 " + cell.last4));
     td.appendChild(ccell);
     if (cell.sub) td.appendChild(D.el("span", "sub", cell.sub));
@@ -220,7 +221,7 @@ D.renderHeader = function (b) {
   head.appendChild(titles);
   if (b.actions && b.actions.length) {
     var acts = D.el("div", "headactions");
-    // Stripe shows 1–2 named actions + a "···" More menu — never a button row.
+    // Stripe shows 1-2 named actions + a "···" More menu: never a button row.
     var inline = b.actions, overflow = [];
     if (b.actions.length > 3) { inline = b.actions.slice(0, 2); overflow = b.actions.slice(2); }
     inline.forEach(function (a) { acts.appendChild(D.actionBtn(a)); });
@@ -311,7 +312,7 @@ D.exportCsv = function (b, visIdx, ids) {
   D.saveBlob((b.key || "export") + ".csv", "text/csv;charset=utf-8", lines.join("\\r\\n"));
 };
 
-// "Edit columns" popover — show/hide, persisted per table key; re-renders in place.
+// "Edit columns" popover: show/hide, persisted per table key; re-renders in place.
 D.colMenu = function (b, boxRef) {
   var wrap = D.el("span", "morewrap");
   var btn = D.el("button", "btn sm", "Edit columns");
@@ -416,7 +417,7 @@ D.renderTable = function (b) {
     exps.type = "button";
     exps.addEventListener("click", function () { D.exportCsv(b, visIdx, ids); });
     bulkbar.appendChild(exps);
-    // Per-currency totals of the selected rows' first amount column — the
+    // Per-currency totals of the selected rows' first amount column: the
     // ceremony summary must list count + total (server re-derives from LIVE
     // objects; this is the advisory display).
     var totals = {};
@@ -483,7 +484,7 @@ D.renderTable = function (b) {
     if (row.ref) {
       tr.className = "clickable";
       tr.addEventListener("click", function (e) {
-        // Selecting text in a row must never navigate — copying an email or
+        // Selecting text in a row must never navigate: copying an email or
         // id out of a table is a first-class action.
         if (window.getSelection && String(window.getSelection())) return;
         var t = e.target;

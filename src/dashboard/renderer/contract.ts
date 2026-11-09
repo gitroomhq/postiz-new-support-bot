@@ -2,12 +2,12 @@
 // The SERVER (section modules in ../sections/*) decides every block, cell and
 // button; the CLIENT (inline JS assembled in ../html/) is a dumb renderer that
 // draws whatever it's handed and posts interactions back. All dynamic text is
-// rendered via textContent on the client — never innerHTML with data.
+// rendered via textContent on the client: never innerHTML with data.
 //
 // Deliberately independent from the admin panel's renderer/contract.ts: that
 // one is form-centric (settings fields), this one is read-centric (tables,
 // detail pages, timelines) with actions attached. The two panels must be able
-// to evolve without breaking each other — the shared part is the transport
+// to evolve without breaking each other: the shared part is the transport
 // (panelMount.ts), not the UI contract.
 //
 // Keep this file dependency-free: it is imported by server code and is the
@@ -16,14 +16,14 @@
 export type Badge = { kind: "info" | "warn" | "error" | "ok" | "neutral"; text: string };
 export type Opt = { value: string; label: string };
 
-// Internal navigation target — the ONLY thing the client router accepts. The
+// Internal navigation target: the ONLY thing the client router accepts. The
 // client resolves it to a hash route (#/<page>/<params.id>?f_…); free-form
 // URLs never come from the server except explicit external links.
 export interface ObjectRef {
   page: string; // e.g. "customers.detail"
   params?: Record<string, string>; // e.g. { id: "cus_…" }
   // Pre-applied list filters ("view this customer's payments", the change-plan
-  // row picker) — serialized as f_<key> hash params.
+  // row picker): serialized as f_<key> hash params.
   filters?: Record<string, string>;
 }
 
@@ -33,10 +33,10 @@ export type Cell =
   // text is written in paragraphs and read by a bank analyst, so the operator
   // has to see the shape they will see; every other text cell is one line and
   // collapses as before.
-  | { t: "text"; v: string; sub?: string; strong?: boolean; pre?: boolean } // strong = Stripe's bold dark object name
+  | { t: "text"; v: string; sub?: string; strong?: boolean; pre?: boolean; badge?: Badge } // strong = Stripe's bold dark object name
   | { t: "money"; v: string; tone?: "pos" | "neg" | "muted" }
   // Stripe amount atom: bold amount + faint ISO code, optionally the status
-  // pill in the SAME cell ("€29.00 EUR  [Succeeded ✓]" — the Payments look).
+  // pill in the SAME cell ("€29.00 EUR  [Succeeded ✓]": the Payments look).
   // major carries the numeric major-unit value so the client can sum selected
   // rows for bulk-action ceremonies without parsing formatted strings.
   | { t: "amount"; v: string; cur: string; badge?: Badge; major?: number }
@@ -54,7 +54,8 @@ export type Cell =
 export type InputField =
   // `value` prefills the control, which a textarea needs for an EDIT dialog:
   // retyping three thousand characters of policy text is not an edit. `rows`
-  // sizes a multiline control.
+  // sizes a multiline control. `half` puts the field in one column of a
+  // two-column row with the next half field (postal code beside city).
   | {
       type: "text";
       key: string;
@@ -64,9 +65,31 @@ export type InputField =
       maxLength?: number;
       value?: string;
       rows?: number;
+      half?: boolean;
+      mono?: boolean;
     }
   | { type: "number"; key: string; label: string; min?: number; max?: number; placeholder?: string }
-  | { type: "select"; key: string; label: string; options: Opt[]; value?: string }
+  | { type: "select"; key: string; label: string; options: Opt[]; value?: string; half?: boolean }
+  // An editable list of small records (a customer's tax IDs): one line of
+  // controls per record, a remove button on each and an add button below,
+  // up to `max`. Posted as an array of { <column key>: string } objects.
+  | {
+      type: "rows";
+      key: string;
+      label: string;
+      columns: Array<{
+        key: string;
+        label: string;
+        kind: "text" | "select";
+        options?: Opt[];
+        placeholder?: string;
+        maxLength?: number;
+        mono?: boolean;
+      }>;
+      value?: Array<Record<string, string>>;
+      max: number;
+      addLabel: string;
+    }
   | { type: "toggle"; key: string; label: string; value?: boolean }
   // A file the browser reads and sends inline. The action receives three keys
   // derived from this one: `<key>B64`, `<key>Name` and `<key>Type`. Bounds are
@@ -79,11 +102,13 @@ export interface ActionButton {
   label: string;
   style?: "primary" | "secondary" | "danger";
   dangerous?: boolean; // typed-CONFIRM in the web modal (T1)
-  stepUp?: boolean; // fresh-factor re-assert required (T2) — client runs the step-up flow first
+  stepUp?: boolean; // fresh-factor re-assert required (T2): client runs the step-up flow first
   reverseConfirm?: boolean; // ALSO requires the Discord reverse code (T3)
-  mode?: "direct" | "queue"; // advisory rendering ("(request approval)") — server re-checks
+  mode?: "direct" | "queue"; // advisory rendering ("(request approval)"): server re-checks
   inputs?: InputField[];
-  // Server-baked binding (object ids). The client may only ADD input values —
+  // The modal's submit button text; "Run" when absent.
+  submitLabel?: string;
+  // Server-baked binding (object ids). The client may only ADD input values:
   // baked params always win server-side.
   params?: Record<string, unknown>;
   summary?: string;
@@ -92,7 +117,7 @@ export interface ActionButton {
   // generic modal: "passkey-register" runs the create() ceremony.
   special?: "passkey-register";
   // Link-button: navigates to a page instead of POSTing an action (composer
-  // entry points). Mutually exclusive with inputs/params — nothing is posted.
+  // entry points). Mutually exclusive with inputs/params: nothing is posted.
   ref?: ObjectRef;
 }
 
@@ -194,7 +219,7 @@ export interface EmptyBlock {
 }
 // Inline-SVG QR (TOTP enrollment). The server pre-renders the module matrix
 // into one path string; the client just draws <svg viewBox><path d>. Geometry
-// only — CSP-safe, no images.
+// only: CSP-safe, no images.
 export interface QrBlock {
   type: "qr";
   path: string; // SVG path data
@@ -208,10 +233,10 @@ export interface ChartBlock {
   key: string; // HomeMetrics series key ("gross_volume", …)
   title: string;
   kind: "area" | "bars" | "line";
-  window: string; // "7d" | "30d" | "90d" — baked from the page's window filter
+  window: string; // "7d" | "30d" | "90d": baked from the page's window filter
 }
 // Stripe tab row under the H1 (active = blurple underline). Tabs write a page
-// filter, exactly like count-cards — value "" is the first/default tab. A tab
+// filter, exactly like count-cards: value "" is the first/default tab. A tab
 // with a ref navigates to another page instead (cross-section tab rows, e.g.
 // Payments → Payouts).
 export interface TabsBlock {
@@ -249,7 +274,7 @@ export interface EvidenceFileSlotView {
 // The interactive evidence editor. Field edits autosave to the local draft
 // (section action, T0); staging/upload/remove are separate ceremonied actions
 // the client builds from the baked ids. Files travel as base64 JSON on the
-// normal api route — never multipart.
+// normal api route: never multipart.
 export interface EvidenceBlock {
   type: "evidence";
   disputeId: string;
@@ -352,13 +377,13 @@ export interface ActionResult {
   error?: string;
   fieldErrors?: Record<string, string>;
   needsReverse?: boolean; // destructive reverseConfirm gate not yet satisfied
-  needsStepUp?: boolean; // fresh-factor re-assert (T2) not fresh — client runs step-up, then retries
+  needsStepUp?: boolean; // fresh-factor re-assert (T2) not fresh: client runs step-up, then retries
   queued?: boolean; // routed into the approval queue
   // Small binary download riding the JSON action channel (quote PDFs). The
   // client decodes b64 → Blob → <a download>; old clients ignore unknown keys.
   file?: { name: string; mime: string; b64: string };
   // Follow-up anchor rendered into the success flash (short-lived report
-  // links). textContent + rel="noopener" on the client — never innerHTML.
+  // links). textContent + rel="noopener" on the client: never innerHTML.
   link?: { href: string; label: string };
 }
 
@@ -376,7 +401,7 @@ export interface NavBadgesResponse {
   badges: Record<string, string>; // NavItem.key → count label
   // Needs-attention items for the topbar bell (collected from module
   // attention() hooks, newest-first, capped at 15). Rides the same 60s poll
-  // as the badges — one request feeds both.
+  // as the badges: one request feeds both.
   attention?: AttentionItem[];
 }
 
@@ -388,7 +413,7 @@ export interface AttentionItem {
   ref: ObjectRef;
 }
 
-// Hover peek card payload (the `peek` endpoint). Lines are plain text —
+// Hover peek card payload (the `peek` endpoint). Lines are plain text:
 // last4 at most, never full PANs or secrets.
 export interface PeekResponse {
   title: string;

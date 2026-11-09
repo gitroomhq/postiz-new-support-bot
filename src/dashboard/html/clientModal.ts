@@ -1,5 +1,5 @@
 // Client module: action buttons + the action modal (inputs, typed CONFIRM,
-// Discord reverse-code slot). Ported from the admin panel's modal — the same
+// Discord reverse-code slot). Ported from the admin panel's modal: the same
 // three ceremony slots, plus the queue notice for approval-routed actions.
 
 export const clientModal = `
@@ -8,7 +8,7 @@ D.modalState = null;
 D.actionBtn = function (a) {
   var b = document.createElement("button");
   b.type = "button";
-  // Color comes from style ONLY — "dangerous" is the typed-CONFIRM ceremony
+  // Color comes from style ONLY: "dangerous" is the typed-CONFIRM ceremony
   // flag, not a color (a primary Refund button must stay a primary button).
   b.className = "btn" + (a.style === "primary" ? " primary" : "") + (a.style === "danger" ? " danger" : "");
   b.textContent = a.label;
@@ -26,7 +26,7 @@ D.actionBtn = function (a) {
     return b;
   }
   if (a.ref) {
-    // Link-button: pure navigation (composer entry points) — nothing is posted.
+    // Link-button: pure navigation (composer entry points): nothing is posted.
     b.addEventListener("click", function (e) {
       e.stopPropagation();
       D.navigateRef(a.ref);
@@ -50,7 +50,7 @@ D.dispatchAction = function (body, onErr) {
     var modal = D.q("modal");
     if (j.ok) {
       if (modal.open) modal.close();
-      // ActionResult.file: small binary riding the JSON channel (quote PDFs) —
+      // ActionResult.file: small binary riding the JSON channel (quote PDFs):
       // b64 → bytes → Blob download.
       if (j.file && j.file.b64) {
         try {
@@ -60,7 +60,7 @@ D.dispatchAction = function (body, onErr) {
           D.saveBlob(j.file.name || "download", j.file.mime || "application/octet-stream", bytes);
         } catch (e) {}
       }
-      // loadPage clears the flash on entry — flash AFTER so the message (and
+      // loadPage clears the flash on entry: flash AFTER so the message (and
       // any short-lived j.link anchor) survives the reload.
       D.loadPage();
       D.flashOk(j.queued ? (j.text || "Queued for admin approval.") : (j.text || "Done."), j.link || null);
@@ -72,10 +72,46 @@ D.dispatchAction = function (body, onErr) {
       if (onErr) onErr("reverse");
       else D.flashErr("This action needs the Discord reverse code; reopen it.");
     } else {
-      if (onErr) onErr(j.error || "Action failed.");
-      else D.flashErr(j.error || "Action failed.");
+      // A section may answer with per-field messages only; show those rather
+      // than a bare "Action failed.".
+      var fe = j.fieldErrors || {};
+      var feText = Object.keys(fe).map(function (k) { return fe[k]; }).filter(Boolean).join(" ");
+      var msg = j.error || feText || "Action failed.";
+      if (onErr) onErr(msg);
+      else D.flashErr(msg);
     }
   });
+};
+
+// One line of a "rows" input: a control per column plus its remove button.
+D.modalRow = function (inp, list, addBtn, values) {
+  var row = D.el("div", "mrow");
+  (inp.columns || []).forEach(function (col) {
+    var c;
+    if (col.kind === "select") {
+      c = document.createElement("select");
+      (col.options || []).forEach(function (o) { c.appendChild(new Option(o.label, o.value)); });
+      if (values && values[col.key] != null) c.value = values[col.key];
+    } else {
+      c = document.createElement("input"); c.type = "text"; c.autocomplete = "off";
+      if (col.placeholder) c.placeholder = col.placeholder;
+      if (col.maxLength) c.maxLength = col.maxLength;
+      if (values && values[col.key] != null) c.value = values[col.key];
+    }
+    if (col.mono) c.classList.add("mono");
+    c.setAttribute("aria-label", col.label);
+    c.setAttribute("data-col", col.key);
+    row.appendChild(c);
+  });
+  var rm = document.createElement("button");
+  rm.type = "button"; rm.className = "btn sm"; rm.textContent = "Remove";
+  rm.addEventListener("click", function () {
+    row.remove();
+    addBtn.hidden = list.children.length >= inp.max;
+  });
+  row.appendChild(rm);
+  list.appendChild(row);
+  addBtn.hidden = list.children.length >= inp.max;
 };
 
 D.openModal = function (a) {
@@ -84,15 +120,29 @@ D.openModal = function (a) {
   var summary = a.summary || "";
   D.q("modalSummary").textContent = summary;
   D.q("modalQueue").hidden = a.mode !== "queue";
-  var inputsEl = D.q("modalInputs"); inputsEl.textContent = "";
+  var inputsBox = D.q("modalInputs"); inputsBox.textContent = "";
   (a.inputs || []).forEach(function (inp) {
+    // Each field gets its own wrapper so a half field can share a row.
+    var inputsEl = D.el("div", "mfield" + (inp.half ? " half" : ""));
+    inputsBox.appendChild(inputsEl);
     if (inp.type === "toggle") {
       var tl = document.createElement("label"); tl.className = "switch";
       var cb = document.createElement("input"); cb.type = "checkbox"; cb.id = "mi_" + inp.key; cb.checked = !!inp.value;
       tl.appendChild(cb); tl.appendChild(document.createTextNode(" " + inp.label)); inputsEl.appendChild(tl);
       return;
     }
-    var l = document.createElement("label"); l.textContent = inp.label; inputsEl.appendChild(l);
+    var l = document.createElement("label"); l.textContent = inp.label; l.htmlFor = "mi_" + inp.key; inputsEl.appendChild(l);
+    if (inp.type === "rows") {
+      var list = D.el("div", "mrows"); list.id = "mi_" + inp.key;
+      var addBtn = document.createElement("button");
+      addBtn.type = "button"; addBtn.className = "btn sm"; addBtn.textContent = inp.addLabel || "Add";
+      addBtn.addEventListener("click", function () { D.modalRow(inp, list, addBtn, null); });
+      inputsEl.appendChild(list);
+      inputsEl.appendChild(addBtn);
+      (inp.value || []).forEach(function (v) { D.modalRow(inp, list, addBtn, v); });
+      addBtn.hidden = list.children.length >= inp.max;
+      return;
+    }
     if (inp.type === "file") {
       // The bytes are read on Run, not on pick: a modal the operator cancels
       // must not have base64 of their file sitting in the action body.
@@ -118,6 +168,7 @@ D.openModal = function (a) {
     if (inp.value != null) ctrl.value = inp.value;
     if (inp.multiline) ctrl.rows = inp.rows || 8;
     if (inp.maxLength) ctrl.maxLength = inp.maxLength;
+    if (inp.mono) ctrl.classList.add("mono");
     if (inp.type === "number") {
       if (inp.min !== undefined) ctrl.min = String(inp.min);
       if (inp.max !== undefined) ctrl.max = String(inp.max);
@@ -128,6 +179,7 @@ D.openModal = function (a) {
   D.q("reverseCode").value = "";
   D.q("modalConfirm").hidden = !a.dangerous;
   D.q("confirmWord").value = "";
+  D.q("modalGo").textContent = a.submitLabel || "Run";
   var errEl = D.q("modalErr"); errEl.hidden = true; errEl.textContent = "";
   D.q("modal").showModal();
 };
@@ -147,6 +199,15 @@ D.bindModal = function () {
       var c = D.q("mi_" + inp.key);
       if (!c) return;
       if (inp.type === "toggle") params[inp.key] = c.checked;
+      else if (inp.type === "rows") {
+        params[inp.key] = Array.prototype.map.call(c.children, function (row) {
+          var rec = {};
+          Array.prototype.forEach.call(row.querySelectorAll("[data-col]"), function (ctl) {
+            rec[ctl.getAttribute("data-col")] = ctl.value;
+          });
+          return rec;
+        });
+      }
       else if (inp.type === "number") params[inp.key] = c.value === "" ? null : Number(c.value);
       else if (inp.type === "file") pending = { inp: inp, el: c };
       else params[inp.key] = c.value;
