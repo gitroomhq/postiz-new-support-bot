@@ -48,7 +48,9 @@ export interface HubModule {
   readonly hub: string; // stable key, e.g. "general"
   readonly group: AdminPanelGroup;
   readonly title: string;
-  buildSections(ctx: AdminHubContext, opts: { tab?: string; scope?: string }): Promise<Section[]>;
+  // cursor: a list page the client asked for ("<list key>:<offset>"), echoed
+  // from a list field's nextCursor/prevCursor.
+  buildSections(ctx: AdminHubContext, opts: { tab?: string; scope?: string; cursor?: string }): Promise<Section[]>;
   // Per-team hubs (Assignment, office hours) return a scope selector rendered
   // above the sections; changing it reloads the hub with the chosen scope.
   buildScope?(

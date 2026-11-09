@@ -41,6 +41,7 @@ ${panelThemeCss()}
   .brand .dot { width:24px; height:24px; border-radius:7px; background:var(--accent); color:#fff;
     display:inline-flex; align-items:center; justify-content:center; font-size:13px; }
   #tabs { display:flex; flex-direction:column; gap:2px; overflow-y:auto; }
+  .lpager { display:flex; gap:8px; justify-content:flex-end; margin-top:10px; }
   #tabs button { all:unset; display:block; padding:9px 12px; border-radius:8px; cursor:pointer;
     color:var(--muted); font-weight:500; font-size:13.5px; transition:background .12s,color .12s; }
   #tabs button:hover { background:var(--accent-weak); color:var(--text); }
@@ -180,11 +181,11 @@ ${panelThemeCss()}
   function flashErr(msg) { flashEl.textContent = msg; flashEl.className = "flash error"; }
 
   // ---- hub load / render ----
-  function loadHub(hub, tab, scope) {
+  function loadHub(hub, tab, scope, cursor) {
     clearFlash();
     contentEl.textContent = "";
     contentEl.appendChild(el("p", "note", "Loading…"));
-    api("view", { hub: hub, tab: tab, scope: scope }).then(function (res) {
+    api("view", { hub: hub, tab: tab, scope: scope, cursor: cursor || "" }).then(function (res) {
       var v = handle(res); if (!v) return;
       if (v.error) { contentEl.textContent = ""; contentEl.appendChild(el("p", "error", v.error)); return; }
       state.hub = v.hub; state.view = v;
@@ -345,7 +346,20 @@ ${panelThemeCss()}
       tr.appendChild(act); tbody.appendChild(tr);
     });
     table.appendChild(tbody);
-    return table;
+    if (!f.nextCursor && !f.prevCursor) return table;
+    // Paged list: the hub reads the cursor back from the view request.
+    var box = el("div", null);
+    box.appendChild(table);
+    var pager = el("div", "lpager");
+    [["‹ Previous", f.prevCursor], ["Next ›", f.nextCursor]].forEach(function (p) {
+      var b = el("button", "btn sm", p[0]);
+      b.type = "button";
+      b.disabled = !p[1];
+      b.addEventListener("click", function () { loadHub(state.hub, undefined, state.scope, p[1]); });
+      pager.appendChild(b);
+    });
+    box.appendChild(pager);
+    return box;
   }
 
   // ---- save ----

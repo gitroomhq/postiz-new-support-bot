@@ -4,7 +4,7 @@ import { ActionResult, Opt, Section, SaveResult } from "../renderer/contract";
 import { AdminHubContext, HubModule, SaveRequest, oneOf } from "./types";
 
 // Access hub (intercom group): who counts as an Intercom "admin" for canvas/panel
-// billing actions, and the per-action access level for all 17 billing actions.
+// billing actions, and the per-action access level for every billing action.
 // Shared authorization surface (mirrors /intercom → Intercom Admins / Actions).
 
 const LEVEL_OPTS: Opt[] = [

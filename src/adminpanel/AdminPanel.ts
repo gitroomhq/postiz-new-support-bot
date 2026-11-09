@@ -194,7 +194,13 @@ export class AdminPanel implements AdminPanelRoute {
 
       switch (endpoint) {
         case "view": {
-          const view = await this.buildView(session, this.str(request.hub), this.str(request.tab), this.str(request.scope));
+          const view = await this.buildView(
+            session,
+            this.str(request.hub),
+            this.str(request.tab),
+            this.str(request.scope),
+            this.str(request.cursor).slice(0, 80)
+          );
           if (!view) return { status: 404, json: { error: "unknown hub" } };
           return { status: 200, json: view };
         }
@@ -244,12 +250,13 @@ export class AdminPanel implements AdminPanelRoute {
     session: AdminSession,
     hub: string,
     tab?: string,
-    scope?: string
+    scope?: string,
+    cursor?: string
   ): Promise<HubView | null> {
     const module = this.modules.get(hub) ?? this.modules.get(this.defaultHub(session.panel) ?? "");
     if (!module) return null;
     const ctx = this.ctxFor(session);
-    const sections = await module.buildSections(ctx, { tab, scope });
+    const sections = await module.buildSections(ctx, { tab, scope, ...(cursor ? { cursor } : {}) });
     const scopeSel = module.buildScope ? await module.buildScope(ctx, { tab, scope }) : undefined;
     const tabs = [...this.modules.values()]
       .filter((m) => m.group === module.group)
