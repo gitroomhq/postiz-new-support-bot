@@ -8,7 +8,7 @@ import { Dashboard } from "../Dashboard";
 import { DashboardActionGateway } from "../DashboardActions";
 import { DashboardCtx, DashboardSectionModule } from "../sections/types";
 import { chargeBadge, estimateMrr, formatPerCurrency, refForId, sentence } from "../sections/cells";
-import { makeCustomersSection } from "../sections/customersSection";
+import { detectTaxIdType, makeCustomersSection } from "../sections/customersSection";
 import { makePaymentsSection, buildGuardrailPanel } from "../sections/paymentsSection";
 import { makeHomeSection } from "../sections/homeSection";
 import { makeMoneyOutSection } from "../sections/moneyOutSection";
@@ -5144,12 +5144,17 @@ test("payments section actions: top-up belts + Stripe error surfacing; instant p
 
 // ---- customer depth ----
 
-test("customer 360: tax IDs + addresses rail cards, balance history, cash balance in Insights", async () => {
+test("customer 360: Address card (name, address, tax IDs, email), balance history, cash balance in Insights", async () => {
   const section = makeCustomersSection();
   const ctx = fakeCustomerCtx();
+  const baseGet = (ctx.stripe as unknown as { getCustomer: () => Promise<Record<string, unknown>> }).getCustomer;
+  (ctx.stripe as unknown as Record<string, unknown>).getCustomer = async () => ({
+    ...(await baseGet()),
+    address: { line1: "Virág utca 4.", line2: null, postal_code: "6100", city: "Kiskunfélegyháza", state: null, country: "HU" },
+  });
   (ctx.stripe as unknown as Record<string, unknown>).listTaxIds = async () => [
     { id: "txi_1", type: "eu_vat", value: "DE123456789", verification: { status: "verified" } },
-    { id: "txi_2", type: "gb_vat", value: "GB999999973", verification: null },
+    { id: "txi_2", type: "za_vat", value: "4123456789", verification: null },
   ];
   (ctx.stripe as unknown as Record<string, unknown>).listBalanceTransactions = async () => ({
     data: [
@@ -5159,17 +5164,42 @@ test("customer 360: tax IDs + addresses rail cards, balance history, cash balanc
   (ctx.stripe as unknown as Record<string, unknown>).getCashBalance = async () => ({ available: { eur: 5000 } });
   const page = await customer360(section, ctx);
   const card = (title: string) =>
-    page.blocks.find((b) => b.type === "kv" && (b as KeyValueBlock).title?.startsWith(title)) as KeyValueBlock;
+    page.blocks.find((b) => b.type === "kv" && (b as KeyValueBlock).title === title) as KeyValueBlock | undefined;
 
-  const taxCard = card("Tax IDs");
-  assert.equal(taxCard.rows.length, 2);
-  assert.deepEqual(taxCard.rows[0].cell, { t: "text", v: "DE123456789", sub: "Verified" });
-  const removeAction = taxCard.actions!.find((a) => a.key === "section:customers.tax_id_remove")!;
-  const removeOptions = (removeAction.inputs![0] as { options: Array<{ value: string }> }).options;
-  assert.deepEqual(removeOptions.map((o) => o.value), ["txi_1", "txi_2"]);
+  // The old split cards are gone; one Address card leads the Details tab.
+  assert.equal(card("Tax IDs"), undefined);
+  assert.equal(card("Addresses"), undefined);
+  const address = card("Address")!;
+  const detailsTab = page.blocks.filter((b) => b.type === "kv");
+  assert.ok(detailsTab.indexOf(address) < detailsTab.indexOf(card("Details")!), "Address sits above Details");
+  assert.deepEqual(address.rows.map((r) => r.label), ["Name", "Address", "EU VAT", "ZA VAT", "Billing email"]);
+  assert.deepEqual(address.rows[0].cell, { t: "text", v: "Ada Lovelace", strong: true });
+  assert.deepEqual(address.rows[1].cell, { t: "text", v: "Virág utca 4.\n6100 Kiskunfélegyháza\nHungary", pre: true });
+  assert.deepEqual(address.rows[2].cell, { t: "text", v: "DE123456789", badge: { kind: "ok", text: "Verified" } });
+  assert.deepEqual(address.rows[3].cell, { t: "text", v: "4123456789" });
+  assert.ok(!card("Details")!.rows.some((r) => r.label === "Billing email"), "billing email moved to the Address card");
 
-  const addrCard = card("Addresses");
-  assert.deepEqual(addrCard.actions!.map((a) => a.key), ["section:customers.address_billing", "section:customers.address_shipping"]);
+  // One dialog, prefilled, every field the card shows.
+  assert.equal(address.actions!.length, 1);
+  const edit = address.actions![0];
+  assert.equal(edit.key, "section:customers.address_save");
+  assert.equal(edit.submitLabel, "Save");
+  const inputs = Object.fromEntries(edit.inputs!.map((i) => [i.key, i]));
+  assert.deepEqual(Object.keys(inputs), ["name", "line1", "line2", "postal", "city", "state", "country", "taxIds", "email"]);
+  assert.equal((inputs.city as { value?: string }).value, "Kiskunfélegyháza");
+  assert.equal((inputs.country as { value?: string }).value, "HU");
+  const countryOpts = (inputs.country as { options: Array<{ value: string; label: string }> }).options;
+  assert.deepEqual(countryOpts[0], { value: "", label: "None" });
+  assert.ok(countryOpts.some((o) => o.value === "HU" && o.label === "Hungary"));
+  const taxRows = inputs.taxIds as { value: Array<Record<string, string>>; columns: Array<{ options?: Array<{ value: string }> }> };
+  assert.deepEqual(taxRows.value, [
+    { type: "eu_vat", value: "DE123456789" },
+    { type: "za_vat", value: "4123456789" },
+  ]);
+  // An uncurated type already on the customer stays selectable for its row.
+  const typeValues = taxRows.columns[0].options!.map((o) => o.value);
+  assert.equal(typeValues[0], "detect");
+  assert.ok(typeValues.includes("za_vat"));
 
   const history = page!.blocks.find((b) => b.type === "table" && (b as TableBlock).key === "balancehistory") as TableBlock;
   assert.equal(history.rows.length, 1);
@@ -5179,109 +5209,159 @@ test("customer 360: tax IDs + addresses rail cards, balance history, cash balanc
   assert.ok(cashRow);
   assert.equal((cashRow!.cell as { v: string }).v, "50.00 EUR");
 
-  // Without any of it: no history table, no cash row, tax card shows "none".
+  // Without any of it: no history table, no cash row, no address, tax ID "none".
   const bare = await customer360(section, fakeCustomerCtx());
   assert.ok(!bare!.blocks.some((b) => b.type === "table" && (b as TableBlock).key === "balancehistory"));
   assert.ok(!(bare!.rail![0] as KeyValueBlock).rows.some((r) => r.label === "Cash balance"));
+  const bareAddress = bare.blocks.find((b) => b.type === "kv" && (b as KeyValueBlock).title === "Address") as KeyValueBlock;
+  assert.deepEqual(
+    bareAddress.rows.map((r) => [r.label, (r.cell as { v: string }).v]),
+    [
+      ["Name", "Ada Lovelace"],
+      ["Address", "N/A"],
+      ["Tax ID", "none"],
+      ["Billing email", "ada@example.com"],
+    ]
+  );
 });
 
-test("customer tax-id + address actions: curated-type spoof refused, live re-list on remove, address parse matrix", async () => {
+test("customer address save: diffed write, tax ID add/remove/detect, refusals leave the customer untouched", async () => {
   const section = makeCustomersSection();
-  const added: Array<[string, string]> = [];
-  const removed: string[] = [];
+  type Tax = { id: string; type: string; value: string };
+  const state = {
+    customer: {
+      id: "cus_1",
+      name: "Ada Lovelace",
+      email: "ada@example.com",
+      address: { line1: "1 Main St", line2: null, postal_code: "10115", city: "Berlin", state: null, country: "DE" },
+    } as Record<string, unknown>,
+    tax: [{ id: "txi_old", type: "eu_vat", value: "DE123456789" }] as Tax[],
+  };
+  const calls: string[] = [];
   const updates: Array<Record<string, unknown>> = [];
+  const audits: string[] = [];
+  let rejectAdd: string | null = null;
   const ctx = {
     actor: { id: "42", name: "Ada", role: "admin", isAdmin: true },
     stripe: {
+      getCustomer: async () => state.customer,
+      listTaxIds: async () => state.tax,
       addTaxId: async (_c: string, type: string, value: string) => {
-        added.push([type, value]);
-        return { id: "txi_new" };
+        if (rejectAdd && value === rejectAdd) throw new Error("Invalid value for eu_vat.");
+        calls.push(`add ${type} ${value}`);
+        return { id: `txi_${value}` };
       },
-      listTaxIds: async () => [{ id: "txi_mine", type: "eu_vat", value: "DE1" }],
       removeTaxId: async (_c: string, id: string) => {
-        removed.push(id);
+        calls.push(`remove ${id}`);
       },
-      updateCustomer: async (_c: string, p: Record<string, unknown>) => updates.push(p),
+      updateCustomer: async (_c: string, p: Record<string, unknown>) => {
+        calls.push("update");
+        updates.push(p);
+      },
     },
-    audit: async () => {},
+    audit: async (m: string) => {
+      audits.push(m);
+    },
   } as unknown as DashboardCtx;
-
-  // Tax add: CONFIRM, curated type only, Stripe error → fieldErrors.value.
-  const noConfirm = await section.action!(ctx, {
-    key: "section:customers.tax_id_add",
-    params: { customerId: "cus_1", type: "eu_vat", value: "DE123" },
-  });
-  assert.match(noConfirm.error ?? "", /CONFIRM/);
-  const spoof = await section.action!(ctx, {
-    key: "section:customers.tax_id_add",
-    params: { customerId: "cus_1", type: "xx_evil", value: "DE123" },
-    confirmWord: "CONFIRM",
-  });
-  assert.equal(spoof.ok, false);
-  assert.equal(added.length, 0);
-  const okAdd = await section.action!(ctx, {
-    key: "section:customers.tax_id_add",
-    params: { customerId: "cus_1", type: "eu_vat", value: "DE123456789" },
-    confirmWord: "CONFIRM",
-  });
-  assert.equal(okAdd.ok, true);
-  assert.deepEqual(added, [["eu_vat", "DE123456789"]]);
-  (ctx.stripe as unknown as Record<string, unknown>).addTaxId = async () => {
-    throw new Error("Invalid value for eu_vat.");
+  const current = {
+    name: "Ada Lovelace",
+    email: "ada@example.com",
+    line1: "1 Main St",
+    line2: "",
+    postal: "10115",
+    city: "Berlin",
+    state: "",
+    country: "DE",
+    taxIds: [{ type: "eu_vat", value: "DE123456789" }],
   };
-  const stripeErr = await section.action!(ctx, {
-    key: "section:customers.tax_id_add",
-    params: { customerId: "cus_1", type: "eu_vat", value: "BADVALUE" },
-    confirmWord: "CONFIRM",
-  });
-  assert.match(stripeErr.fieldErrors?.value ?? "", /Invalid value/);
+  const save = (params: Record<string, unknown>) =>
+    section.action!(ctx, { key: "section:customers.address_save", params: { customerId: "cus_1", ...current, ...params } });
 
-  // Tax remove: foreign id refused via the live re-list.
-  const foreign = await section.action!(ctx, {
-    key: "section:customers.tax_id_remove",
-    params: { customerId: "cus_1", taxIdId: "txi_other" },
-    confirmWord: "CONFIRM",
-  });
-  assert.equal(foreign.ok, false);
-  const okRemove = await section.action!(ctx, {
-    key: "section:customers.tax_id_remove",
-    params: { customerId: "cus_1", taxIdId: "txi_mine" },
-    confirmWord: "CONFIRM",
-  });
-  assert.equal(okRemove.ok, true);
-  assert.deepEqual(removed, ["txi_mine"]);
+  // Unchanged dialog: nothing written.
+  const noop = await save({});
+  assert.equal(noop.ok, true);
+  assert.equal(noop.text, "Nothing changed.");
+  assert.deepEqual(calls, []);
 
-  // Addresses: parse matrix.
-  const billing = await section.action!(ctx, {
-    key: "section:customers.address_billing",
-    params: { customerId: "cus_1", address: "1 Main St | | Berlin | | 10115 | de" },
+  // The FREEBEUNIQUE case: company name, Hungarian address, VAT typed with
+  // spaces and the type left on Detect. Old VAT replaced: add first, then the
+  // customer update, then the removal. No CONFIRM needed.
+  const saved = await save({
+    name: "FREEBEUNIQUE Kft.",
+    line1: "Virág utca 4.",
+    postal: "6100",
+    city: "Kiskunfélegyháza",
+    country: "hu",
+    taxIds: [{ type: "detect", value: "HU 3207 2121" }],
   });
-  assert.equal(billing.ok, true);
-  assert.deepEqual(updates[0], { address: { line1: "1 Main St", city: "Berlin", postal_code: "10115", country: "DE" } });
-  const cleared = await section.action!(ctx, {
-    key: "section:customers.address_billing",
-    params: { customerId: "cus_1", address: "-" },
+  assert.equal(saved.ok, true, saved.error);
+  assert.deepEqual(calls, ["add eu_vat HU32072121", "update", "remove txi_old"]);
+  assert.deepEqual(updates[0], {
+    name: "FREEBEUNIQUE Kft.",
+    address: { line1: "Virág utca 4.", line2: "", postal_code: "6100", city: "Kiskunfélegyháza", state: "", country: "HU" },
   });
+  assert.match(audits[0], /name; address; tax ID added \(eu_vat\); tax ID removed \(txi_old\)/);
+
+  // Same number with different spacing is not a change.
+  calls.length = 0;
+  const spaced = await save({ taxIds: [{ type: "eu_vat", value: "de 123 456 789" }] });
+  assert.equal(spaced.text, "Nothing changed.");
+  assert.deepEqual(calls, []);
+
+  // Clearing every address field clears the address; blank email clears it.
+  calls.length = 0;
+  updates.length = 0;
+  const cleared = await save({ line1: "", postal: "", city: "", country: "", email: "" });
   assert.equal(cleared.ok, true);
-  assert.deepEqual(updates[1], { address: "" });
-  const noCountry = await section.action!(ctx, {
-    key: "section:customers.address_billing",
-    params: { customerId: "cus_1", address: "1 Main St | | Berlin" },
-  });
-  assert.equal(noCountry.ok, false);
-  const noName = await section.action!(ctx, {
-    key: "section:customers.address_shipping",
-    params: { customerId: "cus_1", address: "| 1 Main St | | Berlin | | 10115 | de" },
-  });
-  assert.equal(noName.ok, false);
-  const shipping = await section.action!(ctx, {
-    key: "section:customers.address_shipping",
-    params: { customerId: "cus_1", address: "Ada Lovelace | 1 Main St | | Berlin | | 10115 | de" },
-  });
-  assert.equal(shipping.ok, true);
-  assert.deepEqual(updates[2], {
-    shipping: { name: "Ada Lovelace", address: { line1: "1 Main St", city: "Berlin", postal_code: "10115", country: "DE" } },
-  });
+  assert.deepEqual(updates[0], { email: "", address: "" });
+
+  // Refusals: nothing reaches Stripe.
+  calls.length = 0;
+  const refusals: Array<[Record<string, unknown>, RegExp]> = [
+    [{ country: "" }, /Pick a country/],
+    [{ country: "ZZ" }, /country from the list/],
+    [{ email: "not-an-email" }, /billing email/],
+    [{ taxIds: [{ type: "detect", value: "12-3456789" }] }, /Pick a type for 12-3456789/],
+    [{ taxIds: [{ type: "xx_evil", value: "DE123456789" }] }, /Pick a tax ID type/],
+    [{ taxIds: [{ type: "eu_vat", value: "DE<script>" }] }, /2-30 letters/],
+    [{ taxIds: Array.from({ length: 11 }, (_, i) => ({ type: "eu_vat", value: `DE10000000${i}` })) }, /At most 10/],
+  ];
+  for (const [params, why] of refusals) {
+    const r = await save(params);
+    assert.equal(r.ok, false, `expected a refusal for ${JSON.stringify(params)}`);
+    assert.match(r.error ?? "", why);
+  }
+  assert.deepEqual(calls, []);
+
+  // Stripe rejects the new number: its message comes back, and the address
+  // and the old tax ID are left as they were.
+  rejectAdd = "DE999";
+  const rejected = await save({ city: "Hamburg", taxIds: [{ type: "eu_vat", value: "DE999" }] });
+  assert.equal(rejected.ok, false);
+  assert.match(rejected.error ?? "", /EU VAT DE999: Invalid value for eu_vat/);
+  assert.deepEqual(calls, []);
+
+  // An uncurated type already on the customer is kept as it is.
+  state.tax = [{ id: "txi_za", type: "za_vat", value: "4123456789" }];
+  const kept = await save({ taxIds: [{ type: "za_vat", value: "4123456789" }] });
+  assert.equal(kept.text, "Nothing changed.");
+
+  // The old one-line address and tax ID actions are gone.
+  for (const key of ["section:customers.address_billing", "section:customers.address_shipping", "section:customers.tax_id_add", "section:customers.tax_id_remove"]) {
+    const gone = await section.action!(ctx, { key, params: { customerId: "cus_1" }, confirmWord: "CONFIRM" });
+    assert.equal(gone.ok, false, key);
+  }
+});
+
+test("detectTaxIdType reads the country prefix and nothing else", () => {
+  assert.equal(detectTaxIdType("HU32072121"), "eu_vat");
+  assert.equal(detectTaxIdType("EL123456789"), "eu_vat");
+  assert.equal(detectTaxIdType("XI123456789"), "eu_vat");
+  assert.equal(detectTaxIdType("GB123456789"), "gb_vat");
+  assert.equal(detectTaxIdType("CHE123456789"), "ch_vat");
+  assert.equal(detectTaxIdType("NO123456789MVA"), "no_vat");
+  assert.equal(detectTaxIdType("12-3456789"), null);
+  assert.equal(detectTaxIdType("US123"), null);
 });
 
 // ---- subscription schedules ----

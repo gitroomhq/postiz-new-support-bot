@@ -4,6 +4,7 @@ import { StripeClient } from "../../bot/StripeClient";
 import type { ActionActor } from "../../bot/billing/actions/BillingActionService";
 import { ActionButton, Badge, Block, Cell, TableBlock } from "../renderer/contract";
 import { DashboardCtx, DashboardSectionModule, SectionPage, str, validCursor, validId } from "./types";
+import { countryName, countryOptions, isCountryCode } from "./countries";
 import { bookmarkButton, isBookmarkedSafe, toggleBookmarkAction } from "./bookmarks";
 import { isGitroomSub, readPostizMeta } from "../../bot/billing/postizPlan";
 import type { PostizIdentityService, PostizOrgLookup, PostizOrgSummary } from "../../postiz/PostizIdentityService";
@@ -38,7 +39,7 @@ import {
 } from "./cells";
 
 // Customers: account-wide browse/search, the Customer 360 and the edit
-// surface — create, edit details/tax/locale/metadata, Discord↔Stripe
+// surface: create, edit details/tax/locale/metadata, Discord↔Stripe
 // link/unlink (T1) and DELETE (typed CONFIRM + Discord reverse code, then
 // unlinkStripeCustomerEverywhere exactly like CustomersHub). Layout follows
 // the Stripe DETAIL archetype: flat tables in the main column,
@@ -46,7 +47,7 @@ import {
 
 const PAGE_SIZE = 25;
 
-// Curated tax-ID types — the Stripe union is 100+ entries; support
+// Curated tax-ID types: the Stripe union is 100+ entries; support
 // workflows need these. Server-side membership check beats trusting the select.
 const TAX_ID_TYPES = [
   { value: "eu_vat", label: "EU VAT" },
@@ -66,41 +67,130 @@ const TAX_ID_TYPES = [
   { value: "tr_tin", label: "TR TIN" },
 ];
 
-// Parse the one-line address input: "line1 | line2 | city | state | postal |
-// country(2)" — shipping prepends "name |". Blank segments are omitted; a
-// lone "-" clears (Stripe Emptyable "").
-function parseAddressInput(
-  raw: string,
-  shipping: boolean
-): { ok: true; value: "" | Record<string, unknown> } | { ok: false; error: string } {
-  const input = raw.trim();
-  if (!input) return { ok: false, error: "Enter the address, or '-' to clear." };
-  if (input === "-") return { ok: true, value: "" };
-  const parts = input.split("|").map((s) => s.trim());
-  const expected = shipping ? 7 : 6;
-  if (parts.length > expected) return { ok: false, error: `Too many segments: expected at most ${expected} '|'-separated parts.` };
-  while (parts.length < expected) parts.push("");
-  const name = shipping ? parts.shift()! : null;
-  if (shipping && !name) return { ok: false, error: "Shipping needs a recipient name as the first segment." };
-  const [line1, line2, city, state, postal, country] = parts;
-  if (!line1) return { ok: false, error: "line1 is required." };
-  if (!/^[A-Za-z]{2}$/.test(country)) return { ok: false, error: "Country must be a 2-letter code (last segment)." };
-  const address = {
-    line1,
-    ...(line2 ? { line2 } : {}),
-    ...(city ? { city } : {}),
-    ...(state ? { state } : {}),
-    ...(postal ? { postal_code: postal } : {}),
-    country: country.toUpperCase(),
+export function taxTypeLabel(type: string): string {
+  return TAX_ID_TYPES.find((t) => t.value === type)?.label ?? type.replace(/_/g, " ").toUpperCase();
+}
+
+// The select value that asks the server to work the type out from the number.
+export const TAX_TYPE_DETECT = "detect";
+
+// VAT numbers carry their country: an EU member prefix (Greece writes EL,
+// Northern Ireland XI) is an EU VAT number, GB a UK one, CHE Swiss, NO…MVA
+// Norwegian. Anything else (an EIN, an ABN) has no prefix to read and needs
+// its type picked.
+const EU_VAT_PREFIXES = new Set([
+  "AT", "BE", "BG", "CY", "CZ", "DE", "DK", "EE", "EL", "ES", "FI", "FR", "HR", "HU", "IE", "IT",
+  "LT", "LU", "LV", "MT", "NL", "PL", "PT", "RO", "SE", "SI", "SK", "XI",
+]);
+export function detectTaxIdType(value: string): string | null {
+  const v = value.toUpperCase();
+  if (/^CHE[0-9]/.test(v)) return "ch_vat";
+  if (/^NO[0-9]{9}(MVA)?$/.test(v)) return "no_vat";
+  if (/^GB[0-9]/.test(v)) return "gb_vat";
+  const prefix = v.slice(0, 2);
+  if (EU_VAT_PREFIXES.has(prefix) && /^[A-Z]{2}[0-9A-Z]{2,13}$/.test(v)) return "eu_vat";
+  return null;
+}
+
+// Stripe validates every format itself; this only keeps junk out of the call.
+// VAT-style numbers lose their spaces and dots so "HU 3207 2121" and
+// "HU32072121" are the same number when diffing against what Stripe holds.
+export function normalizeTaxIdValue(type: string, raw: string): string {
+  const v = raw.trim();
+  return /_(vat|gst|hst)$/.test(type) || type === "ch_vat" ? v.replace(/[\s.]/g, "").toUpperCase() : v;
+}
+
+type AddressSaveInput = {
+  name: string;
+  email: string;
+  line1: string;
+  line2: string;
+  postal: string;
+  city: string;
+  state: string;
+  country: string;
+  taxIds: Array<{ type: string; value: string }>;
+};
+
+// Read and check the Edit address dialog. Every field is prefilled with the
+// current value, so a blank field means "clear it".
+export function parseAddressSave(
+  p: Record<string, unknown>,
+  existingTypes: ReadonlySet<string>
+): { ok: true; value: AddressSaveInput } | { ok: false; error: string } {
+  const field = (k: string, max: number) => str(p[k], max).trim();
+  const value: AddressSaveInput = {
+    name: field("name", 256),
+    email: field("email", 512),
+    line1: field("line1", 200),
+    line2: field("line2", 200),
+    postal: field("postal", 40),
+    city: field("city", 200),
+    state: field("state", 200),
+    country: field("country", 2).toUpperCase(),
+    taxIds: [],
   };
-  return { ok: true, value: shipping ? { name, address } : address };
+  if (value.email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value.email)) {
+    return { ok: false, error: "That billing email doesn't look like an email address." };
+  }
+  if (value.country && !isCountryCode(value.country)) return { ok: false, error: "Pick a country from the list." };
+  const anyAddress = [value.line1, value.line2, value.postal, value.city, value.state].some(Boolean);
+  if (anyAddress && !value.country) return { ok: false, error: "Pick a country for the address." };
+
+  const rows = Array.isArray(p.taxIds) ? p.taxIds : [];
+  if (rows.length > MAX_TAX_IDS) return { ok: false, error: `At most ${MAX_TAX_IDS} tax IDs.` };
+  const seen = new Set<string>();
+  for (const row of rows) {
+    if (!row || typeof row !== "object") continue;
+    const r = row as Record<string, unknown>;
+    const raw = str(r.value, 40).trim();
+    if (!raw) continue;
+    let type = str(r.type, 20);
+    if (type === TAX_TYPE_DETECT) {
+      const detected = detectTaxIdType(raw.replace(/[\s.]/g, ""));
+      if (!detected) return { ok: false, error: `Pick a type for ${raw.slice(0, 30)}: it has no country prefix to read.` };
+      type = detected;
+    }
+    // Curated types, plus whatever type a tax ID already on this customer has
+    // (so an existing, uncurated one survives a save untouched).
+    if (!TAX_ID_TYPES.some((t) => t.value === type) && !existingTypes.has(type)) {
+      return { ok: false, error: `Pick a tax ID type for ${raw.slice(0, 30)}.` };
+    }
+    const normalized = normalizeTaxIdValue(type, raw);
+    if (!/^[A-Za-z0-9 .\-/]{2,30}$/.test(normalized)) {
+      return { ok: false, error: `${raw.slice(0, 30)}: 2-30 letters, digits, spaces, dots, dashes or slashes.` };
+    }
+    const id = `${type}:${normalized}`;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    value.taxIds.push({ type, value: normalized });
+  }
+  return { ok: true, value };
+}
+
+const MAX_TAX_IDS = 10;
+
+const TAX_STATUS_BADGE: Record<string, Badge> = {
+  verified: { kind: "ok", text: "Verified" },
+  pending: { kind: "neutral", text: "Pending" },
+  unverified: { kind: "warn", text: "Unverified" },
+  unavailable: { kind: "neutral", text: "Not checkable" },
+};
+
+// The address as the customer's documents print it, one part per line.
+function addressLines(a: Stripe.Address | null | undefined): string | null {
+  if (!a) return null;
+  const lines = [a.line1, a.line2, [a.postal_code, a.city].filter(Boolean).join(" "), a.state, countryName(a.country)]
+    .map((l) => (l ? String(l).trim() : ""))
+    .filter(Boolean);
+  return lines.length ? lines.join("\n") : null;
 }
 
 // PM identity cell. Stripe exposes `fingerprint` on the types that
 // carry the instrument directly (cards + bank-debit rails); only CARD
 // fingerprints link into the reverse-card hunt (charges.search indexes only
 // those). Wallets (Link/PayPal…) vault the card on their side and expose NO
-// fingerprint — but the wallet ACCOUNT EMAIL is their stable cross-customer
+// fingerprint: but the wallet ACCOUNT EMAIL is their stable cross-customer
 // identity (it lands in billing_details.email on every charge), so it links
 // into the Payments whole-account email sweep instead.
 const WALLET_PM_TYPES = new Set(["link", "paypal", "klarna", "cashapp", "amazon_pay", "revolut_pay"]);
@@ -204,7 +294,7 @@ async function customerAction(
 }> {
   const confirmed = confirmWord === "CONFIRM";
 
-  // T0 — shared team bookmark toggle (bookmark helper validates its own id).
+  // T0: shared team bookmark toggle (bookmark helper validates its own id).
   if (key === "section:customers.bookmark") return toggleBookmarkAction(ctx, "customer", p);
 
   // Create has no target id; everything else validates one.
@@ -285,7 +375,7 @@ async function customerAction(
   }
 
   switch (key) {
-    // T0 — mint an off-session SetupIntent for saving a card later. Only the
+    // T0: mint an off-session SetupIntent for saving a card later. Only the
     // seti_ id is surfaced; the client_secret never leaves the server (it is
     // only useful to a Stripe.js confirm flow on the customer's device).
     case "section:customers.setup_intent": {
@@ -297,7 +387,7 @@ async function customerAction(
       };
     }
 
-    // T0 — core details. Blank = keep as-is; a single "-" clears the field
+    // T0: core details. Blank = keep as-is; a single "-" clears the field
     // (web modals can't prefill text inputs, so absent ≠ clear).
     case "section:customers.update": {
       const updates: Stripe.CustomerUpdateParams = {};
@@ -318,7 +408,7 @@ async function customerAction(
       return { ok: true, text: "Customer updated." };
     }
 
-    // T0 — tax exemption + preferred locale.
+    // T0: tax exemption + preferred locale.
     case "section:customers.tax_locale": {
       const taxExempt = str(p.taxExempt, 10);
       const locale = str(p.locale, 12).trim();
@@ -331,7 +421,7 @@ async function customerAction(
       return { ok: true, text: "Tax settings updated." };
     }
 
-    // T0 — metadata: key=value per line; a single "-" clears everything.
+    // T0: metadata: key=value per line; a single "-" clears everything.
     case "section:customers.metadata": {
       const raw = str(p.metadata, 2000).trim();
       if (!raw) return { ok: false, error: "Enter key=value lines, or '-' to clear all metadata." };
@@ -357,56 +447,83 @@ async function customerAction(
       return { ok: true, text: `Metadata updated (${Object.keys(metadata).length} key(s)).` };
     }
 
-    // T1 — add a tax ID (prints on every future invoice; can flip
-    // reverse-charge). Type is validated against the curated set — the
-    // select options are advisory only (hostile client).
-    case "section:customers.tax_id_add": {
-      if (!confirmed) return { ok: false, error: "Type CONFIRM to run this action." };
-      const type = str(p.type, 20);
-      if (!TAX_ID_TYPES.some((t) => t.value === type)) return { ok: false, fieldErrors: { type: "Pick a tax ID type." } };
-      const value = str(p.value, 30).trim();
-      if (!/^[A-Za-z0-9 .-]{2,30}$/.test(value)) return { ok: false, fieldErrors: { value: "2-30 chars: letters, digits, space, dot, dash." } };
-      try {
-        const taxId = await ctx.stripe.addTaxId(customerId, type, value);
-        await ctx.audit(`Customer ${customerId}: tax ID ${taxId.id} added (${type})`);
-        return { ok: true, text: `Tax ID added (${type.replace(/_/g, " ")} ${value}).` };
-      } catch (e) {
-        // Stripe validates per-type formats with useful messages.
-        return { ok: false, fieldErrors: { value: (e as Error).message?.slice(0, 200) ?? "Stripe rejected the value." } };
+    // T0: the customer's address card in one save: name, billing email,
+    // address and every tax ID. Diffed against a fresh read so only what
+    // changed is written. Tax IDs cannot be edited at Stripe, so a changed
+    // number is the new one added, then the old one removed. Adds go first:
+    // they are what Stripe rejects (format, VIES shape), and a rejection then
+    // leaves the rest of the customer as it was.
+    case "section:customers.address_save": {
+      const [customer, currentTax] = await Promise.all([
+        ctx.stripe.getCustomer(customerId),
+        ctx.stripe.listTaxIds(customerId),
+      ]);
+      if (!customer) return { ok: false, error: "That customer no longer exists." };
+      const parsed = parseAddressSave(p, new Set(currentTax.map((t) => t.type)));
+      if (!parsed.ok) return { ok: false, error: parsed.error };
+      const next = parsed.value;
+
+      const updates: Stripe.CustomerUpdateParams = {};
+      const changed: string[] = [];
+      if (next.name !== (customer.name ?? "")) {
+        updates.name = next.name;
+        changed.push("name");
       }
+      if (next.email !== (customer.email ?? "")) {
+        updates.email = next.email;
+        changed.push("email");
+      }
+      const cur = customer.address;
+      const nextAddress = {
+        line1: next.line1,
+        line2: next.line2,
+        postal_code: next.postal,
+        city: next.city,
+        state: next.state,
+        country: next.country,
+      };
+      const addressChanged = (Object.keys(nextAddress) as Array<keyof typeof nextAddress>).some(
+        (k) => nextAddress[k] !== ((cur?.[k] ?? "") as string)
+      );
+      if (addressChanged) {
+        const empty = Object.values(nextAddress).every((v) => !v);
+        updates.address = empty ? "" : nextAddress;
+        changed.push(empty ? "address cleared" : "address");
+      }
+
+      const key = (type: string, value: string) => `${type}:${normalizeTaxIdValue(type, value)}`;
+      const wanted = new Set(next.taxIds.map((t) => key(t.type, t.value)));
+      const have = new Set(currentTax.map((t) => key(t.type, t.value)));
+      const toAdd = next.taxIds.filter((t) => !have.has(key(t.type, t.value)));
+      const toRemove = currentTax.filter((t) => !wanted.has(key(t.type, t.value)));
+
+      if (changed.length === 0 && toAdd.length === 0 && toRemove.length === 0) return { ok: true, text: "Nothing changed." };
+
+      const added: string[] = [];
+      for (const t of toAdd) {
+        try {
+          const created = await ctx.stripe.addTaxId(customerId, t.type, t.value);
+          added.push(created.id);
+        } catch (e) {
+          if (added.length) await ctx.audit(`Customer ${customerId}: tax ID(s) ${added.join(", ")} added before a rejection`);
+          const why = (e as Error).message?.slice(0, 200) || "Stripe rejected it.";
+          return {
+            ok: false,
+            error: `${taxTypeLabel(t.type)} ${t.value}: ${why}${added.length ? ` (${added.length} other tax ID already added)` : ""}`,
+          };
+        }
+      }
+      if (Object.keys(updates).length) await ctx.stripe.updateCustomer(customerId, updates);
+      for (const t of toRemove) await ctx.stripe.removeTaxId(customerId, t.id);
+
+      const parts = [...changed];
+      if (toAdd.length) parts.push(`tax ID added (${toAdd.map((t) => t.type).join(", ")})`);
+      if (toRemove.length) parts.push(`tax ID removed (${toRemove.map((t) => t.id).join(", ")})`);
+      await ctx.audit(`Customer ${customerId}: address card saved: ${parts.join("; ")}`);
+      return { ok: true, text: "Address saved." };
     }
 
-    // T1 — remove a tax ID; live re-list proves it belongs to THIS customer.
-    case "section:customers.tax_id_remove": {
-      if (!confirmed) return { ok: false, error: "Type CONFIRM to run this action." };
-      const taxIdId = typeof p.taxIdId === "string" && /^(txi|atxi)_[A-Za-z0-9]{1,64}$/.test(p.taxIdId) ? p.taxIdId : null;
-      if (!taxIdId) return { ok: false, error: "Bad tax ID id." };
-      const existing = await ctx.stripe.listTaxIds(customerId).catch(() => [] as Stripe.TaxId[]);
-      if (!existing.some((t) => t.id === taxIdId)) return { ok: false, error: "That tax ID is not on this customer." };
-      await ctx.stripe.removeTaxId(customerId, taxIdId);
-      await ctx.audit(`Customer ${customerId}: tax ID ${taxIdId} removed`);
-      return { ok: true, text: "Tax ID removed." };
-    }
-
-    // T0 — billing address as ONE structured line ('-' clears).
-    case "section:customers.address_billing": {
-      const parsed = parseAddressInput(str(p.address, 400), false);
-      if (!parsed.ok) return { ok: false, fieldErrors: { address: parsed.error } };
-      await ctx.stripe.updateCustomer(customerId, { address: parsed.value as Stripe.CustomerUpdateParams["address"] });
-      await ctx.audit(`Customer ${customerId}: billing address ${parsed.value === "" ? "cleared" : "updated"}`);
-      return { ok: true, text: parsed.value === "" ? "Billing address cleared." : "Billing address updated." };
-    }
-
-    // T0 — shipping (leading recipient-name segment, required by Stripe).
-    case "section:customers.address_shipping": {
-      const parsed = parseAddressInput(str(p.address, 400), true);
-      if (!parsed.ok) return { ok: false, fieldErrors: { address: parsed.error } };
-      await ctx.stripe.updateCustomer(customerId, { shipping: parsed.value as Stripe.CustomerUpdateParams["shipping"] });
-      await ctx.audit(`Customer ${customerId}: shipping address ${parsed.value === "" ? "cleared" : "updated"}`);
-      return { ok: true, text: parsed.value === "" ? "Shipping address cleared." : "Shipping address updated." };
-    }
-
-    // T1 + T2 — grant monetary credits against METERED usage. Money-adjacent
+    // T1 + T2: grant monetary credits against METERED usage. Money-adjacent
     // (credits shrink future usage bills), so typed CONFIRM plus fresh factor.
     case "section:customers.credit_grant": {
       if (!confirmed) return { ok: false, error: "Type CONFIRM to run this action." };
@@ -455,7 +572,7 @@ async function customerAction(
       return { ok: true, text: `Granted ${ctx.stripe.formatAmount(amountMinor, currency)} in billing credits (${grant.id}).` };
     }
 
-    // T1 — void a grant: zeroes the REMAINING credit (applied credit stays).
+    // T1: void a grant: zeroes the REMAINING credit (applied credit stays).
     case "section:customers.credit_grant_void": {
       if (!confirmed) return { ok: false, error: "Type CONFIRM to run this action." };
       const grantId = typeof p.grantId === "string" && /^credgr_[A-Za-z0-9_]{1,80}$/.test(p.grantId) ? p.grantId : null;
@@ -473,7 +590,7 @@ async function customerAction(
       return { ok: true, text: `Credit grant ${grantId} voided: remaining credit is gone; already-applied credit stays.` };
     }
 
-    // T1 — link a Discord user to this Stripe customer.
+    // T1: link a Discord user to this Stripe customer.
     case "section:customers.link": {
       if (!confirmed) return { ok: false, error: "Type CONFIRM to run this action." };
       const discordId = str(p.discordUserId, 32).trim();
@@ -486,7 +603,7 @@ async function customerAction(
       return { ok: true, text: `Linked Discord user ${discordId} to ${customerId}.` };
     }
 
-    // T1 — clear the link on every Discord user pointing at this customer.
+    // T1: clear the link on every Discord user pointing at this customer.
     case "section:customers.unlink": {
       if (!confirmed) return { ok: false, error: "Type CONFIRM to run this action." };
       const cleared = await ctx.stores.session.unlinkStripeCustomerEverywhere(customerId);
@@ -494,8 +611,8 @@ async function customerAction(
       return { ok: true, text: cleared ? `Cleared the link on ${cleared} Discord user session(s).` : "No Discord users were linked." };
     }
 
-    // T1 + T3 — delete the customer in Stripe (permanent, cancels subs),
-    // then clear every Discord link — exactly the CustomersHub sequence.
+    // T1 + T3: delete the customer in Stripe (permanent, cancels subs),
+    // then clear every Discord link: exactly the CustomersHub sequence.
     case "section:customers.delete": {
       if (!confirmed) return { ok: false, error: "Type CONFIRM to run this action." };
       if (!ctx.reverse?.satisfied) return { ok: false, needsReverse: true };
@@ -544,7 +661,7 @@ async function list(ctx: DashboardCtx, filters: Record<string, string>, cursor: 
       const has = ((c as { subscriptions?: { data?: unknown[] } }).subscriptions?.data?.length ?? 0) > 0;
       if (has !== (hasSubF === "yes")) return false;
     }
-    // Search results can't take a server-side created param — cut here.
+    // Search results can't take a server-side created param: cut here.
     if (q && createdGte && c.created < createdGte) return false;
     if (q && createdLt && c.created >= createdLt) return false;
     return true;
@@ -854,7 +971,7 @@ async function detail(
     return notFound("This customer does not exist (or was deleted).");
   }
 
-  // Note: 12 parallel STRIPE reads is the ceiling here — consolidate
+  // Note: 12 parallel STRIPE reads is the ceiling here: consolidate
   // before adding more (every new one is .catch-guarded and independent; the
   // bookmark flag is a local DB read, not a Stripe call).
   const [subsAndPostiz, invoices, methods, chargesPage, disputes, blocks, discordLinks, notes, creditGrants, taxIds, balanceTxns, cashBalance, bookmarked] =
@@ -987,13 +1104,83 @@ async function detail(
       ? customer.invoice_settings.default_payment_method
       : (customer.invoice_settings?.default_payment_method as Stripe.PaymentMethod | null)?.id ?? null;
   const defaultPmObj = defaultPm ? methods.find((m) => m.id === defaultPm) ?? null : null;
+
+  // ---- Details tab: Address (name, address, tax IDs, billing email) ----
+  // One card and one dialog for everything that identifies the customer on
+  // their documents. Shipping is deliberately absent: Postiz ships nothing,
+  // and a shipping address already in Stripe is left as it is.
+  const addr = customer.address;
+  // A tax ID already on the customer keeps its type even when it is not one
+  // of the curated ones, or its row would reopen on "Detect" and fail.
+  const taxOptions = (existing: string[]) => {
+    const opts = [{ value: TAX_TYPE_DETECT, label: "Detect from number" }, ...TAX_ID_TYPES];
+    for (const type of existing) {
+      if (!opts.some((o) => o.value === type)) opts.push({ value: type, label: taxTypeLabel(type) });
+    }
+    return opts;
+  };
+  tabs.details.push({
+    type: "kv",
+    title: "Address",
+    rows: [
+      { label: "Name", cell: customer.name ? { t: "text", v: customer.name, strong: true } : text("N/A") },
+      { label: "Address", cell: (() => {
+        const lines = addressLines(addr);
+        return lines ? { t: "text", v: lines, pre: true } : text("N/A");
+      })() },
+      ...(taxIds.length
+        ? taxIds.slice(0, MAX_TAX_IDS).map((t) => {
+            const badge = t.verification?.status ? TAX_STATUS_BADGE[t.verification.status] : undefined;
+            return { label: taxTypeLabel(t.type), cell: { t: "text", v: t.value, ...(badge ? { badge } : {}) } as Cell };
+          })
+        : [{ label: "Tax ID", cell: text("none") }]),
+      { label: "Billing email", cell: text(customer.email ?? "N/A") },
+    ],
+    actions: [
+      {
+        key: "section:customers.address_save",
+        label: "Edit address",
+        submitLabel: "Save",
+        params: { customerId: id },
+        inputs: [
+          { type: "text", key: "name", label: "Name or company", value: customer.name ?? "", maxLength: 256 },
+          { type: "text", key: "line1", label: "Street", value: addr?.line1 ?? "", maxLength: 200 },
+          { type: "text", key: "line2", label: "Line 2", value: addr?.line2 ?? "", maxLength: 200 },
+          { type: "text", key: "postal", label: "Postal code", value: addr?.postal_code ?? "", maxLength: 40, half: true },
+          { type: "text", key: "city", label: "City", value: addr?.city ?? "", maxLength: 200, half: true },
+          { type: "text", key: "state", label: "State or region", value: addr?.state ?? "", maxLength: 200, half: true },
+          {
+            type: "select",
+            key: "country",
+            label: "Country",
+            value: addr?.country ?? "",
+            options: [{ value: "", label: "None" }, ...countryOptions()],
+            half: true,
+          },
+          {
+            type: "rows",
+            key: "taxIds",
+            label: "VAT or tax IDs",
+            max: MAX_TAX_IDS,
+            addLabel: "Add tax ID",
+            columns: [
+              { key: "type", label: "Type", kind: "select", options: taxOptions(taxIds.map((t) => t.type)) },
+              { key: "value", label: "Number", kind: "text", placeholder: "HU32072121", maxLength: 40, mono: true },
+            ],
+            value: taxIds.slice(0, MAX_TAX_IDS).map((t) => ({ type: t.type, value: t.value })),
+          },
+          { type: "text", key: "email", label: "Billing email", value: customer.email ?? "", maxLength: 512 },
+        ],
+      },
+    ],
+  });
+
   tabs.details.push({
     type: "kv",
     title: "Details",
     rows: [
       { label: "Customer ID", cell: idCell(customer.id, { copy: true }) },
       { label: "Customer since", cell: dateCell(customer.created) },
-      { label: "Billing email", cell: text(customer.email ?? "N/A") },
       { label: "Currency", cell: text(customer.currency?.toUpperCase() ?? "N/A") },
       ...(customer.delinquent ? [{ label: "Delinquent", cell: badgeCell("warn", "Yes") }] : []),
       ...(customer.tax_exempt && customer.tax_exempt !== "none"
@@ -1021,19 +1208,17 @@ async function detail(
         : []),
       ...(customer.description ? [{ label: "Description", cell: text(customer.description) }] : []),
     ],
-    // Inline edit (replaces the customers.edit page): the same modals,
-    // with current values embedded in the labels (web modals can't prefill).
+    // Name and billing email are edited on the Address card; this one keeps
+    // the internal description.
     actions: [
       {
         key: "section:customers.update",
-        label: "Edit details",
+        label: "Edit description",
+        submitLabel: "Save",
         params: { customerId: id },
         inputs: [
-          { type: "text", key: "name", label: `Name (now: ${customer.name ?? "N/A"}) · blank keeps, '-' clears` },
-          { type: "text", key: "email", label: `Email (now: ${customer.email ?? "N/A"})` },
-          { type: "text", key: "description", label: `Description (now: ${customer.description?.slice(0, 60) ?? "N/A"})` },
+          { type: "text", key: "description", label: "Description · '-' clears", value: customer.description ?? "", maxLength: 300 },
         ],
-        summary: "Blank fields stay unchanged; a single '-' clears the field.",
       },
       {
         key: "section:customers.tax_locale",
@@ -1086,94 +1271,6 @@ async function detail(
       rows: metaEntries.slice(0, 20).map(([k, v]) => ({ label: k, cell: text(String(v).slice(0, 120)) })),
     });
   }
-
-  // ---- rail: Tax IDs (print on every invoice → both actions T1) ----
-  tabs.details.push({
-    type: "kv",
-    title: taxIds.length ? `Tax IDs (${taxIds.length})` : "Tax IDs",
-    rows: taxIds.length
-      ? taxIds.slice(0, 10).map((t) => ({
-          label: sentence(t.type.replace(/_/g, " ")),
-          cell: text(t.value, t.verification?.status ? sentence(t.verification.status) : undefined),
-        }))
-      : [{ label: "Tax ID", cell: text("none") }],
-    actions: [
-      {
-        key: "section:customers.tax_id_add",
-        label: "Add tax ID",
-        dangerous: true,
-        params: { customerId: id },
-        inputs: [
-          { type: "select", key: "type", label: "Type", options: TAX_ID_TYPES },
-          { type: "text", key: "value", label: "Value (e.g. DE123456789)", maxLength: 30 },
-        ],
-        summary: "Prints on every future invoice and can flip reverse-charge treatment.",
-      },
-      ...(taxIds.length
-        ? [
-            {
-              key: "section:customers.tax_id_remove",
-              label: "Remove tax ID",
-              dangerous: true,
-              params: { customerId: id },
-              inputs: [
-                {
-                  type: "select" as const,
-                  key: "taxIdId",
-                  label: "Tax ID",
-                  options: taxIds.slice(0, 25).map((t) => ({ value: t.id, label: `${t.type.replace(/_/g, " ")} · ${t.value}` })),
-                },
-              ],
-              summary: "Removes the tax ID from future invoices (already-issued invoices keep it).",
-            },
-          ]
-        : []),
-    ],
-  });
-
-  // ---- rail: Addresses ----
-  const billAddr = fmtAddress(customer.address);
-  const shipAddr = fmtAddress(customer.shipping?.address ?? null);
-  tabs.details.push({
-    type: "kv",
-    title: "Addresses",
-    rows: [
-      { label: "Billing", cell: text(billAddr ?? "N/A") },
-      { label: "Shipping", cell: text(shipAddr ?? "N/A", customer.shipping?.name ?? undefined) },
-    ],
-    actions: [
-      {
-        key: "section:customers.address_billing",
-        label: "Edit billing address",
-        params: { customerId: id },
-        inputs: [
-          {
-            type: "text",
-            key: "address",
-            label: "line1 | line2 | city | state | postal | country(2) · '-' clears",
-            multiline: true,
-            maxLength: 400,
-          },
-        ],
-        summary: "Blank segments are omitted; line1 + 2-letter country are required.",
-      },
-      {
-        key: "section:customers.address_shipping",
-        label: "Edit shipping address",
-        params: { customerId: id },
-        inputs: [
-          {
-            type: "text",
-            key: "address",
-            label: "name | line1 | line2 | city | state | postal | country(2) · '-' clears",
-            multiline: true,
-            maxLength: 400,
-          },
-        ],
-        summary: "The leading segment is the recipient name (required by Stripe).",
-      },
-    ],
-  });
 
   // ---- rail: Linked accounts (Discord / Postiz) ----
   const linkRows: Array<{ label: string; cell: Cell }> = [];
@@ -1330,7 +1427,7 @@ async function detail(
     ...(subs.length > 25 ? { notice: `Showing 25 of ${subs.length} subscriptions.` } : {}),
   });
 
-  // ---- main: Payments (from the lifetime-spend fetch — no extra API call) ----
+  // ---- main: Payments (from the lifetime-spend fetch: no extra API call) ----
   const recentCharges = chargesPage.charges.slice(0, 10);
   tabs.overview.push({
     type: "table",
@@ -1451,7 +1548,7 @@ async function detail(
       : {}),
   });
 
-  // ---- main: credit grants (only when any exist — Grant lives in Manage) ----
+  // ---- main: credit grants (only when any exist: Grant lives in Manage) ----
   if (creditGrants.length > 0) {
     const now = Math.floor(Date.now() / 1000);
     const grantBadge = (g: Stripe.Billing.CreditGrant): Badge =>
@@ -1693,7 +1790,7 @@ function pmIntentId(charge: Stripe.Charge): string | null {
   return typeof charge.payment_intent === "string" ? charge.payment_intent : charge.payment_intent?.id ?? null;
 }
 
-// Status-appropriate invoice lifecycle buttons for 360 rows — the same
+// Status-appropriate invoice lifecycle buttons for 360 rows: the same
 // registry keys/params the invoice detail uses (belts enforced there).
 function invoiceRowActions(ctx: DashboardCtx, invoice: Stripe.Invoice): ActionButton[] {
   const invoiceId = invoice.id!;
@@ -1745,7 +1842,7 @@ function invoiceRowActions(ctx: DashboardCtx, invoice: Stripe.Invoice): ActionBu
 }
 
 // ---- customer portal login link ----
-// Rendering the page MINTS a fresh billing_portal session — the link is
+// Rendering the page MINTS a fresh billing_portal session: the link is
 // short-lived and single-session, so a per-view mint is the safe shape (no
 // stored secret, nothing to revoke). Audited because the link grants the
 // customer's self-serve billing access to whoever holds it.
