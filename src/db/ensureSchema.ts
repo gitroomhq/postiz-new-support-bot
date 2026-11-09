@@ -1304,6 +1304,50 @@ export const STATEMENTS: string[] = [
     CONSTRAINT "queue_resolutions_pkey" PRIMARY KEY ("conversationId")
   )`,
   `CREATE INDEX IF NOT EXISTS "queue_resolutions_resolvedAt_idx" ON "queue_resolutions"("resolvedAt")`,
+  // Support dashboard (/support): settings (ships ON), passwords, sign-ins,
+  // the lookup log, and the approval columns its change requests use.
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "supportDashEnabled" BOOLEAN NOT NULL DEFAULT true`,
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "supportDashEpoch" INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE "billing_approvals" ADD COLUMN IF NOT EXISTS "reviewNote" TEXT`,
+  `ALTER TABLE "billing_approvals" ADD COLUMN IF NOT EXISTS "notifiedAt" TIMESTAMP(3)`,
+  `CREATE INDEX IF NOT EXISTS "billing_approvals_origin_requestedById_createdAt_idx" ON "billing_approvals"("origin", "requestedById", "createdAt")`,
+  `CREATE TABLE IF NOT EXISTS "support_credentials" (
+    "discordUserId" TEXT NOT NULL,
+    "name" TEXT NOT NULL,
+    "passwordHash" TEXT NOT NULL,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "lastLoginAt" TIMESTAMP(3),
+    CONSTRAINT "support_credentials_pkey" PRIMARY KEY ("discordUserId")
+  )`,
+  `CREATE TABLE IF NOT EXISTS "support_sessions" (
+    "id" TEXT NOT NULL,
+    "discordUserId" TEXT NOT NULL,
+    "name" TEXT NOT NULL,
+    "epoch" INTEGER NOT NULL,
+    "uaFirst" TEXT,
+    "ipFirst" TEXT,
+    "ipLast" TEXT,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "lastSeenAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "lastVerifiedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "absoluteExpiresAt" TIMESTAMP(3) NOT NULL,
+    CONSTRAINT "support_sessions_pkey" PRIMARY KEY ("id")
+  )`,
+  `CREATE INDEX IF NOT EXISTS "support_sessions_discordUserId_idx" ON "support_sessions"("discordUserId")`,
+  `CREATE INDEX IF NOT EXISTS "support_sessions_absoluteExpiresAt_idx" ON "support_sessions"("absoluteExpiresAt")`,
+  `CREATE TABLE IF NOT EXISTS "support_lookups" (
+    "id" TEXT NOT NULL,
+    "discordUserId" TEXT NOT NULL,
+    "actorName" TEXT NOT NULL,
+    "customerId" TEXT NOT NULL,
+    "customerName" TEXT,
+    "via" TEXT NOT NULL,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT "support_lookups_pkey" PRIMARY KEY ("id")
+  )`,
+  `CREATE INDEX IF NOT EXISTS "support_lookups_createdAt_idx" ON "support_lookups"("createdAt")`,
+  `CREATE INDEX IF NOT EXISTS "support_lookups_discordUserId_customerId_createdAt_idx" ON "support_lookups"("discordUserId", "customerId", "createdAt")`,
   `CREATE TABLE IF NOT EXISTS "intercom_sync_failures" (
     "ticketThreadId" TEXT NOT NULL,
     "eventType" TEXT NOT NULL,

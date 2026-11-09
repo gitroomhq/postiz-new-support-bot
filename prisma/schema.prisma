@@ -56,23 +56,26 @@ model BillingApproval {
   paramsJson       Json
   summary          String // human-readable summary rendered at queue time
   conversationId   String? // Intercom conversation the request came from (null for dashboard-origin)
-  origin           String    @default("intercom") // "intercom" | "dashboard": decides ctx rebuild at approval time
+  origin           String    @default("intercom") // "intercom" | "dashboard" | "support": decides ctx rebuild at approval time
   ticketThreadId   String?
   stripeCustomerId String?
-  requestedById    String // Intercom teammate id (or Discord id for dashboard-origin)
+  requestedById    String // Intercom teammate id (or Discord id for dashboard- and support-origin)
   requestedByName  String
-  status           String    @default("PENDING") // PENDING | EXECUTING | EXECUTED | REJECTED | EXPIRED | FAILED
+  status           String    @default("PENDING") // PENDING | EXECUTING | EXECUTED | REJECTED | EXPIRED | FAILED | REFUSED | WITHDRAWN
   reviewerId       String? // "intercom:<id>" or "discord:<id>"
   reviewerName     String?
   claimedAt        DateTime? // last claimForExecution stamp: stale-EXECUTING reclaim window
   resultText       String?
   errorText        String?
+  reviewNote       String? // the reviewer's optional reject reason, shown to the requester
+  notifiedAt       DateTime? // support-origin: when the requester was DMed the outcome
   expiresAt        DateTime // createdAt + 7 days; lazily flipped to EXPIRED
   resolvedAt       DateTime?
   createdAt        DateTime  @default(now())
 
   @@index([status, createdAt])
   @@index([conversationId, status])
+  @@index([origin, requestedById, createdAt])
   @@map("billing_approvals")
 }
 
@@ -459,6 +462,12 @@ model BotSettings {
   // OAuth instead of the dashboard login. Ships OFF (routes answer 404).
   // The OAuth app is its own Developer Hub app: client id here, client secret
   // encrypted (crypto.ts/Vault). Bumping queueEpoch signs everyone out.
+  // Support dashboard (/support, the web /config Support Dashboard hub):
+  // staff look customers up and request detail changes for admin approval.
+  // Signed in through /support in Discord, a DM code and a password. Ships
+  // ON. Bumping supportDashEpoch signs everyone out.
+  supportDashEnabled      Boolean @default(true)
+  supportDashEpoch        Int     @default(0)
   queueEnabled            Boolean @default(false)
   queueOauthClientId      String?
   queueOauthClientSecret  String?
@@ -1690,6 +1699,56 @@ model QueueSession {
   @@index([adminId])
   @@index([absoluteExpiresAt])
   @@map("queue_sessions")
+}
+
+// Support dashboard (/support) passwords: one per Discord user, set at their
+// first sign-in (scrypt, see dashboard/auth/passphrase.ts). An admin resets
+// one from the web /config Support Dashboard hub by deleting the row.
+model SupportCredential {
+  discordUserId String    @id
+  name          String
+  passwordHash  String
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  lastLoginAt   DateTime?
+
+  @@map("support_credentials")
+}
+
+// Support dashboard sign-ins, the queue_sessions pattern: row id = SHA-256 hex
+// of the cookie token, 7d sliding idle / 30d absolute, epoch-revocable.
+model SupportSession {
+  id                String   @id
+  discordUserId     String
+  name              String
+  epoch             Int
+  uaFirst           String?
+  ipFirst           String?
+  ipLast            String?
+  createdAt         DateTime @default(now())
+  lastSeenAt        DateTime @default(now())
+  lastVerifiedAt    DateTime @default(now())
+  absoluteExpiresAt DateTime
+
+  @@index([discordUserId])
+  @@index([absoluteExpiresAt])
+  @@map("support_sessions")
+}
+
+// Which customer each support teammate opened (who, whom, when, found how).
+// Kept 180 days; read in the web /config Support Dashboard hub.
+model SupportLookup {
+  id            String   @id @default(cuid())
+  discordUserId String
+  actorName     String
+  customerId    String
+  customerName  String?
+  via           String // email | customer | postiz | card | link
+  createdAt     DateTime @default(now())
+
+  @@index([createdAt])
+  @@index([discordUserId, customerId, createdAt])
+  @@map("support_lookups")
 }
 
 // The Intercom Queue's last list (/queue), one row (id 1): the open

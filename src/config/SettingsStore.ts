@@ -833,6 +833,30 @@ export class SettingsStore {
     return this.settings.dashboardEpoch;
   }
 
+  // ---- Support dashboard (/support, edited in the web /config) ----
+
+  // Kill switch: off = every /support route answers 404 and /support in
+  // Discord refuses.
+  supportDashEnabled(): boolean {
+    return this.settings.supportDashEnabled;
+  }
+
+  supportDashEpoch(): number {
+    return this.settings.supportDashEpoch;
+  }
+
+  async bumpSupportDashEpoch(): Promise<number> {
+    this.settings = await this.prisma.botSettings.update({
+      where: { id: "global" },
+      data: { supportDashEpoch: { increment: 1 } },
+    });
+    return this.settings.supportDashEpoch;
+  }
+
+  async updateSupportDash(data: { supportDashEnabled?: boolean }): Promise<void> {
+    this.settings = await this.prisma.botSettings.update({ where: { id: "global" }, data });
+  }
+
   // ---- Intercom Queue (/queue, edited via /intercom → Queue) ----
 
   // Kill switch: off = every /queue route answers 404.

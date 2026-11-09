@@ -20,7 +20,7 @@ export const EXPECTED_COLUMNS: Record<string, string[]> = {
   billing_approvals: [
     "id", "actionKey", "paramsJson", "summary", "conversationId", "origin", "ticketThreadId", "stripeCustomerId",
     "requestedById", "requestedByName", "status", "reviewerId", "reviewerName", "claimedAt", "resultText",
-    "errorText", "expiresAt", "resolvedAt", "createdAt",
+    "errorText", "reviewNote", "notifiedAt", "expiresAt", "resolvedAt", "createdAt",
   ],
   pending_auths: ["id", "state", "discordUserId", "channelId", "interactionToken", "createdAt"],
   dashboard_credentials: [
@@ -85,6 +85,7 @@ export const EXPECTED_COLUMNS: Record<string, string[]> = {
     "resolveOnCloseEnabled", "resolveOnCloseStateId", "resolveOnCloseBackfilledAt", "refundMaxChargeAgeDays",
     "agentRipMigratedAt", "intercomPanelAdminsJson", "billingActionLevelsJson", "panelTokenSecret",
     "panelTokenEpoch", "adminPanelEpoch", "dashboardEnabled", "dashboardAdminsJson", "dashboardTokenSecret", "dashboardEpoch",
+    "supportDashEnabled", "supportDashEpoch",
     "queueEnabled", "queueOauthClientId", "queueOauthClientSecret", "queueEpoch", "queueFinCountsAsReply",
     "queueNotesCountAsReply", "queueExclusionsJson",
     "yubicoClientId", "yubicoApiSecret", "yubicoValidationUrl",
@@ -194,6 +195,12 @@ export const EXPECTED_COLUMNS: Record<string, string[]> = {
     "absoluteExpiresAt",
   ],
   queue_cache: ["id", "data", "savedAt"],
+  support_credentials: ["discordUserId", "name", "passwordHash", "createdAt", "updatedAt", "lastLoginAt"],
+  support_sessions: [
+    "id", "discordUserId", "name", "epoch", "uaFirst", "ipFirst", "ipLast", "createdAt", "lastSeenAt", "lastVerifiedAt",
+    "absoluteExpiresAt",
+  ],
+  support_lookups: ["id", "discordUserId", "actorName", "customerId", "customerName", "via", "createdAt"],
   queue_resolutions: [
     "conversationId", "untilReply", "lastContactAt", "note", "title", "ticketNumber", "customer", "resolvedById",
     "resolvedByName", "resolvedAt",
