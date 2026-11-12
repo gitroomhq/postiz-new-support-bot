@@ -382,11 +382,11 @@ export class StripeClient {
     return { charges: res.data, nextPage: res.next_page ?? null };
   }
 
-  // last4 is far from unique — callers should aggregate by fingerprint for exact
+  // last4 is far from unique: callers should aggregate by fingerprint for exact
   // identification. Both string inputs are validated by the caller (digits /
   // [a-z_]) since they are interpolated into the query string; status is a
   // closed union for the same reason. Declined/blocked attempts on a confirmed
-  // PI DO exist here as status:"failed" charges — only attempts that never
+  // PI DO exist here as status:"failed" charges; only attempts that never
   // reached confirmation (abandoned checkout, unfinished 3DS) have no charge
   // at all and need the amount-based PI search instead.
   async searchChargesByCardLast4(
@@ -404,9 +404,26 @@ export class StripeClient {
     return { charges: res.data, nextPage: res.next_page ?? null };
   }
 
+  // Succeeded charges on a card ending in last4, made in [fromUnix, toUnix):
+  // what a bank reference narrows a charge down to (bankReference.ts).
+  async searchCardChargesBetween(
+    last4: string,
+    fromUnix: number,
+    toUnix: number,
+    limit = 100,
+    page?: string
+  ): Promise<{ charges: Stripe.Charge[]; nextPage: string | null }> {
+    if (!/^\d{4}$/.test(last4)) return { charges: [], nextPage: null };
+    const query =
+      `payment_method_details.card.last4:"${last4}" AND status:"succeeded"` +
+      ` AND created>=${Math.floor(fromUnix)} AND created<${Math.floor(toUnix)}`;
+    const res = await this.stripe.charges.search({ query, limit, ...(page ? { page } : {}) });
+    return { charges: res.data, nextPage: res.next_page ?? null };
+  }
+
   // Account-wide search over PaymentIntents by exact amount (minor units) and
   // optional currency. Unlike charges.search, this reaches attempts that never
-  // produced ANY charge (abandoned checkout, unfinished 3DS) — the slice the
+  // produced ANY charge (abandoned checkout, unfinished 3DS), the slice the
   // last4/charge searches are structurally blind to. latest_charge is expanded so
   // callers can read the card + decline reason off the failed charge when present.
   // amountMinor is interpolated into the query, so callers must pass a number.
@@ -426,7 +443,7 @@ export class StripeClient {
     return { paymentIntents: res.data, nextPage: res.next_page ?? null };
   }
 
-  // Fuzzy customer lookup by name OR email substring (Search API's ~ operator) —
+  // Fuzzy customer lookup by name OR email substring (Search API's ~ operator):
   // the exact-match customers.list({ email }) can't do partial or company-name
   // hits (Postiz stores the org name as the Stripe customer name). term is
   // interpolated into the query string, so callers must strip quotes/backslashes.
@@ -438,7 +455,7 @@ export class StripeClient {
     const query = `name~"${safe}" OR email~"${safe}"`;
     try {
       // Same expansion as listCustomersPage so the list's has-subscription
-      // filter works on search results too — but search endpoints can refuse
+      // filter works on search results too, but search endpoints can refuse
       // sub-list expansions that list endpoints allow, so degrade rather
       // than kill the search box.
       const res = await this.stripe.customers.search({ query, limit, expand: ["data.subscriptions"] });
@@ -883,13 +900,13 @@ export class StripeClient {
     return res.data;
   }
 
-  // Plain upcoming-invoice preview for a live subscription (no plan change) —
+  // Plain upcoming-invoice preview for a live subscription (no plan change):
   // the "Upcoming invoice" panel on the subscription detail page.
   async previewUpcomingInvoice(customerId: string, subscriptionId: string): Promise<Stripe.Invoice | null> {
     try {
       return await this.stripe.invoices.createPreview({ customer: customerId, subscription: subscriptionId });
     } catch {
-      // No upcoming invoice (canceled / fully-ended subs) — not an error.
+      // No upcoming invoice (canceled / fully-ended subs): not an error.
       return null;
     }
   }
@@ -917,7 +934,7 @@ export class StripeClient {
     const safe = term.replace(/["\\]/g, "").trim();
     if (safe.length < 2) return [];
     // billing_details.email is NOT a supported charges.search field on this
-    // API version (Stripe refusal observed in prod) — the old email clause
+    // API version (Stripe refusal observed in prod): the old email clause
     // made this whole query fail silently. Email terms find their hits via
     // the customers group instead; charges match on description only.
     const res = await this.stripe.charges.search({
