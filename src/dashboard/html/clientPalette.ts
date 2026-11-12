@@ -1,7 +1,7 @@
 // Client module: the ⌘K command palette living on the topbar search box.
 // Instant id fast-path (client-side), 400ms-debounced server search, keyboard
 // navigation, sessionStorage recents, static go-to commands. Defines
-// D.bindJump — called by startApp in place of the plain jump box.
+// D.bindJump, called by startApp in place of the plain jump box.
 
 export const clientPalette = `
 D.pal = { hits: [], sel: -1, timer: null, seq: 0 };
@@ -80,13 +80,13 @@ D.palEmptyState = function () {
   var recents = D.palRecents();
   if (recents.length) groups.push({ label: "Recent", hits: recents });
   groups.push({ label: "Go to", hits: D.NAV_COMMANDS });
-  D.palPaint(groups, "Type a name, email, amount, last4 or any Stripe id.");
+  D.palPaint(groups, "Type a name, email, amount, last4, bank reference or any Stripe id.");
 };
 
 D.palQuery = function (term) {
   if (D.pal.timer) { clearTimeout(D.pal.timer); D.pal.timer = null; }
   if (!term) { D.palEmptyState(); return; }
-  // Instant id fast-path — no server round-trip for a pasted id.
+  // Instant id fast-path: no server round-trip for a pasted id.
   for (var i = 0; i < D.ID_ROUTES.length; i++) {
     if (D.ID_ROUTES[i].re.test(term)) {
       D.palPaint([{ label: "Go to", hits: [{ title: "Open " + term, id: term, ref: { page: D.ID_ROUTES[i].page, params: { id: term } } }] }]);

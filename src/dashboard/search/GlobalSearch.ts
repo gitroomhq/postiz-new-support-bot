@@ -6,11 +6,12 @@ import { BlockStore } from "../../bot/billing/BlockStore";
 import { BillingQolStore } from "../../bot/billing/BillingQolStore";
 import { ObjectRef } from "../renderer/contract";
 import type { PostizIdentityService } from "../../postiz/PostizIdentityService";
+import { distanceFromBooking, parseBankReference, type BankReference } from "../../bot/billing/bankReference";
 
 // Global search behind the ⌘K palette. Pipeline: id fast-path (no network) →
 // local DB hits (notes/bookmarks/blocklist/dispute mirror/Discord links) →
 // Stripe fan-out (allSettled + per-call time-box + per-group truncation).
-// Search API is eventually consistent (~1min) and rate-limited — the caller
+// Search API is eventually consistent (~1min) and rate-limited: the caller
 // throttles per actor, the client debounces 400ms, and this module never
 // exceeds 3 Stripe calls per query.
 
@@ -34,7 +35,7 @@ export interface SearchResponse {
 const GROUP_LIMIT = 5;
 const STRIPE_TIMEBOX_MS = 3000;
 
-// Recognized ids jump straight to their page — zero network.
+// Recognized ids jump straight to their page, zero network.
 const ID_JUMPS: Array<{ re: RegExp; page: string; label: string }> = [
   { re: /^cus_[A-Za-z0-9]+$/, page: "customers.detail", label: "Customer" },
   { re: /^(ch|py)_[A-Za-z0-9]+$/, page: "payments.detail", label: "Payment" },
@@ -44,6 +45,10 @@ const ID_JUMPS: Array<{ re: RegExp; page: string; label: string }> = [
   { re: /^in_[A-Za-z0-9]+$/, page: "invoices.detail", label: "Invoice" },
   { re: /^(dp|du)_[A-Za-z0-9]+$/, page: "disputes.detail", label: "Dispute" },
 ];
+
+// A bank's own reference for a card charge, optionally followed by the card's
+// last 4 ("FT26307B8P5M 4242"). See bankReference.ts.
+const BANK_REFERENCE_TERM = /^([A-Za-z]{2}\d{5}[A-Za-z0-9]{5})(?:[\s,]+(\d{4}))?$/;
 
 export class GlobalSearch {
   constructor(
@@ -60,7 +65,7 @@ export class GlobalSearch {
 
   // Postiz accounts matching the term. The platform is the only place a name
   // or organization id resolves to a person, and its account email is what
-  // finds the Stripe customer to open — the platform does not expose the
+  // finds the Stripe customer to open; the platform does not expose the
   // customer id itself, so a hit without a matching customer is shown as
   // context rather than as a dead link.
   //
@@ -111,6 +116,12 @@ export class GlobalSearch {
       };
     }
 
+    // A bank reference only finds a charge together with the card's last 4;
+    // the name, invoice and platform searches have nothing to match it on.
+    const bank = BANK_REFERENCE_TERM.exec(term);
+    const ref = bank ? parseBankReference(bank[1], Date.now()) : null;
+    if (bank && ref) return this.bankReference(ref, bank[2]);
+
     // 2) local hits (cheap, always run) + 3) Stripe fan-out (classified) +
     //    4) the platform account lookup (its own failure never sinks the rest).
     const [local, stripeGroups, postizGroup] = await Promise.all([
@@ -123,6 +134,29 @@ export class GlobalSearch {
       groups,
       notice: "Stripe search can lag by ~1 minute. Showing the top matches per group.",
     };
+  }
+
+  // ---- bank reference ----
+
+  private async bankReference(ref: BankReference, last4: string | undefined): Promise<SearchResponse> {
+    const range = `${day(ref.from)} and ${day(ref.to - 1)}`;
+    if (!last4) return { groups: [], notice: `Booked by the bank on ${day(ref.bookedDay)}. Add the card's last 4 after the reference.` };
+    const group = await this.timeboxed(async () => {
+      const res = await this.stripe.searchCardChargesBetween(last4, ref.from, ref.to, 100);
+      const nearest = [...res.charges].sort((a, b) => distanceFromBooking(ref, a.created) - distanceFromBooking(ref, b.created));
+      return {
+        label: `Payments · card ····${last4}, ${day(ref.from)} to ${day(ref.to - 1)}`,
+        hits: nearest.slice(0, GROUP_LIMIT).map((c) => ({
+          title: this.stripe.formatAmount(c.amount, c.currency),
+          sub: [day(c.created), c.billing_details?.email ?? c.description].filter(Boolean).join(" · "),
+          id: c.id,
+          ref: { page: "payments.detail", params: { id: c.id } },
+        })),
+      };
+    });
+    if (!group) return { groups: [], notice: "Search failed." };
+    if (!group.hits.length) return { groups: [], notice: `No payments on a card ending ${last4} between ${range}.` };
+    return { groups: [group] };
   }
 
   // ---- local (DB only) ----
@@ -161,7 +195,7 @@ export class GlobalSearch {
       .filter((b) => b.value.toLowerCase().includes(lower) || (b.customerId ?? "").toLowerCase().includes(lower))
       .slice(0, GROUP_LIMIT)
       .flatMap((b): SearchHit[] => {
-        if (!b.customerId) return []; // navigable hits only — raw-value blocks have no customer detail to open
+        if (!b.customerId) return []; // navigable hits only: raw-value blocks have no customer detail to open
         return [
           {
             title: `Blocked ${b.kind}: ${b.value}`,
@@ -180,7 +214,7 @@ export class GlobalSearch {
     return groups;
   }
 
-  // A 17–19 digit term is a Discord user id — resolve the linked customer.
+  // A 17-19 digit term is a Discord user id: resolve the linked customer.
   private async discordLink(term: string): Promise<SearchHit | null> {
     if (!/^\d{17,19}$/.test(term)) return null;
     const session = await this.stores.session.getSession(term).catch(() => null);
@@ -199,7 +233,7 @@ export class GlobalSearch {
 
     if (/^\d{4}$/.test(term)) {
       // Four digits → card last4 hunt: one group for all attempts, one for
-      // failed-only (declined attempts DO exist as failed charges — surfaced
+      // failed-only (declined attempts DO exist as failed charges, surfaced
       // separately with their PI + decline reason so card-testing pops out).
       tasks.push(
         this.timeboxed(async () => {
@@ -291,7 +325,7 @@ export class GlobalSearch {
       .filter((g): g is SearchGroup => g !== null && g.hits.length > 0);
   }
 
-  // One Stripe call, boxed to 3s — a slow search degrades to "no group", never
+  // One Stripe call, boxed to 3s: a slow search degrades to "no group", never
   // a hung palette.
   private async timeboxed(fn: () => Promise<SearchGroup>): Promise<SearchGroup | null> {
     return Promise.race([
@@ -311,10 +345,14 @@ export class GlobalSearch {
 // alone is never one of those.
 export function looksLikePostizTerm(term: string): boolean {
   if (term.includes("@")) return true; // email, or the start of one
-  // cuid/uuid-shaped user or organization id — mixed case and digits, but a
+  // cuid/uuid-shaped user or organization id: mixed case and digits, but a
   // letter must be present so a Discord id or an order number never qualifies.
   if (/^[A-Za-z0-9_-]{10,}$/.test(term) && /[A-Za-z]/.test(term)) return true;
   return /[A-Za-z]{3,}/.test(term); // a name worth disambiguating
+}
+
+function day(unix: number): string {
+  return new Date(unix * 1000).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric", timeZone: "UTC" });
 }
 
 function chargeHit(stripe: StripeClient, c: Stripe.Charge): SearchHit {

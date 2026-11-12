@@ -1117,10 +1117,13 @@ test("charge detail: an open dispute surfaces a banner + Dispute rail card + sin
 
 // ---- global search ----
 
-function searchFixture(overrides: { customersThrow?: boolean; postizTerms?: string[] } = {}) {
+function searchFixture(
+  overrides: { customersThrow?: boolean; postizTerms?: string[]; bankCalls?: Array<[string, number, number]>; calls?: string[] } = {}
+) {
   const stripe = {
     formatAmount: (a: number, c: string) => `${(a / 100).toFixed(2)} ${c.toUpperCase()}`,
     searchCustomersByTerm: async () => {
+      overrides.calls?.push("customers");
       if (overrides.customersThrow) throw new Error("stripe down");
       return [{ id: "cus_1", name: "Ada Lovelace", email: "ada@x.com" }];
     },
@@ -1129,6 +1132,17 @@ function searchFixture(overrides: { customersThrow?: boolean; postizTerms?: stri
     ],
     findCustomersByEmail: async () => [{ id: "cus_1", email: "ada@x.com" }],
     searchInvoicesByNumber: async () => [{ id: "in_1", number: "INV-0001", total: 2900, currency: "eur", status: "paid" }],
+    searchCardChargesBetween: async (l4: string, from: number, to: number) => {
+      overrides.bankCalls?.push([l4, from, to]);
+      const nov3 = Date.UTC(2026, 10, 3) / 1000;
+      return {
+        charges: [
+          { id: "ch_far", amount: 2900, currency: "usd", created: nov3 - 2 * 86_400, billing_details: { email: "far@x.com" } },
+          { id: "ch_near", amount: 18666, currency: "aed", created: nov3 + 3600, billing_details: { email: "near@x.com" } },
+        ],
+        nextPage: null,
+      };
+    },
     searchChargesByCardLast4: async (_l4: string, _brand?: string, _limit?: number, _page?: string, status?: string) => ({
       charges:
         status === "failed"
@@ -1221,6 +1235,32 @@ test("global search: the platform is only asked about terms that could be an acc
     assert.equal(group.hits[0].id, "usr_1");
     assert.deepEqual(group.hits[0].ref, { page: "customers.detail", params: { id: "cus_1" } });
   }
+});
+
+test("global search: a bank reference with the card's last 4 lists that card's payments around the booked day", async () => {
+  const nov3 = Date.UTC(2026, 10, 3) / 1000;
+  const bankCalls: Array<[string, number, number]> = [];
+  const calls: string[] = [];
+  const res = await searchFixture({ bankCalls, calls }).run("ft26307b8p5m 4242");
+  assert.deepEqual(bankCalls, [["4242", nov3 - 3 * 86_400, nov3 + 2 * 86_400]]);
+  assert.equal(res.groups.length, 1);
+  assert.equal(res.groups[0].label, "Payments · card ····4242, Oct 31, 2026 to Nov 4, 2026");
+  assert.deepEqual(res.groups[0].hits.map((h) => h.id), ["ch_near", "ch_far"]);
+  assert.equal(res.groups[0].hits[0].sub, "Nov 3, 2026 · near@x.com");
+  assert.deepEqual(res.groups[0].hits[0].ref, { page: "payments.detail", params: { id: "ch_near" } });
+  // The name, invoice and platform searches have nothing to match a reference on.
+  assert.deepEqual(calls, []);
+
+  // Without the last 4 the palette says what the reference told it and what it needs.
+  const bare = await searchFixture({ bankCalls }).run("FT26307B8P5M");
+  assert.equal(bare.groups.length, 0);
+  assert.equal(bare.notice, "Booked by the bank on Nov 3, 2026. Add the card's last 4 after the reference.");
+  assert.equal(bankCalls.length, 1);
+
+  // A shape that names no real day is ordinary free text.
+  const terms: string[] = [];
+  const free = await searchFixture({ postizTerms: terms }).run("FT26400B8P5M");
+  assert.ok(free.groups.some((g) => g.label === "Customers"));
 });
 
 // ---- Home v1 + Balances rendering ----
