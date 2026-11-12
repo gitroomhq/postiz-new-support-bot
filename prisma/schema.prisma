@@ -1743,7 +1743,7 @@ model SupportLookup {
   actorName     String
   customerId    String
   customerName  String?
-  via           String // email | customer | postiz | card | link
+  via           String // email | customer | postiz | card | reference | link
   createdAt     DateTime @default(now())
 
   @@index([createdAt])

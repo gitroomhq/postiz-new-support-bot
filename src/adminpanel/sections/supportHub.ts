@@ -130,7 +130,7 @@ export function makeSupportHub(deps: {
   };
 }
 
-const VIA_LABEL: Record<string, string> = { email: "Email", customer: "Customer ID", postiz: "Postiz", card: "Card", link: "Link" };
+const VIA_LABEL: Record<string, string> = { email: "Email", customer: "Customer ID", postiz: "Postiz", card: "Card", reference: "Bank reference", link: "Link" };
 
 function offsetFor(cursor: string | undefined, list: string): number {
   const m = /^([a-z]+):(\d{1,6})$/.exec(cursor ?? "");

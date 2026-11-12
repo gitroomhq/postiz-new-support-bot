@@ -2,6 +2,7 @@ import type Stripe from "stripe";
 import type { StripeClient } from "../bot/StripeClient";
 import type { PostizIdentityService, PostizOrgLookup } from "../postiz/PostizIdentityService";
 import { derivePostizPlan, isGitroomSub, readPostizMeta } from "../bot/billing/postizPlan";
+import { distanceFromBooking, parseBankReference, type BankReference } from "../bot/billing/bankReference";
 import type { Badge } from "../dashboard/renderer/contract";
 import { subStatusFlags } from "../dashboard/sections/cells";
 import { log } from "../util/logger";
@@ -18,7 +19,8 @@ const CACHE_MAX = 200;
 const LIST_LIMIT = 100;
 const TIMEBOX_MS = 5_000;
 const MAX_HITS = 50;
-// Card lookups read at most this many charges on that last 4 (3 search pages).
+// Card and reference lookups read at most this many pages of charges on that
+// last 4 (100 a page).
 const CARD_SEARCH_PAGES = 3;
 
 export interface CustomerSnapshot {
@@ -48,6 +50,9 @@ export interface LookupHit {
 }
 
 export type LookupOutcome = { ok: true; hits: LookupHit[] } | { ok: false; error: string };
+
+// A card or reference lookup also returns the charge it matched per customer.
+export type ChargeLookupOutcome = LookupOutcome & { charges?: Map<string, Stripe.Charge>; window?: BankReference };
 
 export class SupportData {
   private cache = new Map<string, { at: number; snap: CustomerSnapshot }>();
@@ -154,14 +159,14 @@ export class SupportData {
   }
 
   // Customers charged on a card ending in these digits with this expiry.
-  async lookupCard(last4: string, expiry: string): Promise<LookupOutcome & { lastCharge?: Map<string, Stripe.Charge> }> {
+  async lookupCard(last4: string, expiry: string): Promise<ChargeLookupOutcome> {
     const digits = last4.trim();
     const exp = /^(\d{1,2})\s*\/\s*(\d{2}|\d{4})$/.exec(expiry.trim());
     if (!/^\d{4}$/.test(digits) || !exp) return { ok: false, error: "Enter the last 4 digits and the expiry as MM/YY." };
     const month = Number(exp[1]);
     const year = exp[2].length === 2 ? 2000 + Number(exp[2]) : Number(exp[2]);
     if (month < 1 || month > 12) return { ok: false, error: "The expiry month is 01 to 12." };
-    const lastCharge = new Map<string, Stripe.Charge>();
+    const charges = new Map<string, Stripe.Charge>();
     let page: string | undefined;
     for (let i = 0; i < CARD_SEARCH_PAGES; i++) {
       const res = await timebox(this.stripe.searchChargesByCardLast4(digits, undefined, 100, page), null);
@@ -170,16 +175,43 @@ export class SupportData {
         const card = ch.payment_method_details?.card;
         const cus = typeof ch.customer === "string" ? ch.customer : ch.customer?.id ?? null;
         if (!card || !cus || card.exp_month !== month || card.exp_year !== year) continue;
-        const prev = lastCharge.get(cus);
-        if (!prev || prev.created < ch.created) lastCharge.set(cus, ch);
+        const prev = charges.get(cus);
+        if (!prev || prev.created < ch.created) charges.set(cus, ch);
       }
-      if (!res.nextPage || lastCharge.size >= MAX_HITS) break;
+      if (!res.nextPage || charges.size >= MAX_HITS) break;
       page = res.nextPage;
     }
     const hits = new HitList();
-    const ordered = [...lastCharge.entries()].sort((a, b) => b[1].created - a[1].created);
+    const ordered = [...charges.entries()].sort((a, b) => b[1].created - a[1].created);
     for (const [cus] of ordered) hits.addId(cus, "Card");
-    return { ok: true, hits: await this.fill(hits), lastCharge };
+    return { ok: true, hits: await this.fill(hits), charges };
+  }
+
+  // Customers charged on a card ending in these digits around the day a bank
+  // reference carries (bankReference.ts), nearest charge first.
+  async lookupReference(reference: string, last4: string): Promise<ChargeLookupOutcome> {
+    const ref = parseBankReference(reference, this.now());
+    const digits = last4.trim();
+    if (!ref) return { ok: false, error: "Enter the reference as the bank shows it, like FT26307B8P5M." };
+    if (!/^\d{4}$/.test(digits)) return { ok: false, error: "Enter the last 4 digits of the card." };
+    const charges = new Map<string, Stripe.Charge>();
+    let page: string | undefined;
+    for (let i = 0; i < CARD_SEARCH_PAGES; i++) {
+      const res = await timebox(this.stripe.searchCardChargesBetween(digits, ref.from, ref.to, 100, page), null);
+      if (!res) break;
+      for (const ch of res.charges) {
+        const cus = typeof ch.customer === "string" ? ch.customer : ch.customer?.id ?? null;
+        if (!cus) continue;
+        const prev = charges.get(cus);
+        if (!prev || distanceFromBooking(ref, ch.created) < distanceFromBooking(ref, prev.created)) charges.set(cus, ch);
+      }
+      if (!res.nextPage || charges.size >= MAX_HITS) break;
+      page = res.nextPage;
+    }
+    const hits = new HitList();
+    const ordered = [...charges.entries()].sort((a, b) => distanceFromBooking(ref, a[1].created) - distanceFromBooking(ref, b[1].created));
+    for (const [cus] of ordered) hits.addId(cus, "Reference");
+    return { ok: true, hits: await this.fill(hits), charges, window: ref };
   }
 
   // The plan line for a list of customers (result rows), read in parallel.

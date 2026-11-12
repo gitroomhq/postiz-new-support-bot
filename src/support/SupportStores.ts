@@ -42,7 +42,7 @@ export class SupportCredentials {
   }
 }
 
-export type LookupVia = "email" | "customer" | "postiz" | "card" | "link";
+export type LookupVia = "email" | "customer" | "postiz" | "card" | "reference" | "link";
 
 const LOOKUP_RETENTION_MS = 180 * 24 * 60 * 60 * 1000;
 // The same teammate reopening the same customer (tab switches, paging) is one

@@ -19,7 +19,7 @@ import { amount, cardCell, chargeBadge, dateCell, idCell, invoiceBadge, isoDateC
 import { countryName, countryOptions } from "../dashboard/sections/countries";
 import { log } from "../util/logger";
 import type { SupportActor } from "./SupportAuth";
-import type { CustomerSnapshot, LookupHit, PlanSummary, SupportData } from "./SupportData";
+import type { ChargeLookupOutcome, CustomerSnapshot, LookupHit, PlanSummary, SupportData } from "./SupportData";
 import { planOf } from "./SupportData";
 import type { LookupVia, SupportLookupLog } from "./SupportStores";
 import type { SupportActionResult, SupportBlock, SupportPageView, SupportViewRequest } from "./contract";
@@ -30,12 +30,14 @@ const PAGE_SIZE = 10;
 const LOOKUP_CACHE_MS = 60_000;
 const CUSTOMER_ID_RE = /^cus_[A-Za-z0-9]{1,64}$/;
 
-type LookupBy = "" | "customer" | "postiz" | "card";
+type LookupBy = "" | "customer" | "postiz" | "card" | "reference";
+const LOOKUP_BY: LookupBy[] = ["customer", "postiz", "card", "reference"];
 
 interface LookupEntry {
   at: number;
   hits: LookupHit[];
-  cards?: Map<string, Stripe.Charge>;
+  charges?: Map<string, Stripe.Charge>;
+  window?: { from: number; to: number };
   plans: Map<string, PlanSummary | null>;
 }
 
@@ -99,7 +101,7 @@ export class SupportViews {
 
   private async lookupBlocks(req: SupportViewRequest): Promise<SupportBlock[]> {
     const f = req.filters;
-    const by: LookupBy = f.by === "customer" || f.by === "postiz" || f.by === "card" ? f.by : "";
+    const by: LookupBy = LOOKUP_BY.find((b) => b === f.by) ?? "";
     const blocks: SupportBlock[] = [
       { type: "header", title: "Look up" },
       {
@@ -111,6 +113,7 @@ export class SupportViews {
           { value: "customer", label: "Customer ID" },
           { value: "postiz", label: "Postiz" },
           { value: "card", label: "Card" },
+          { value: "reference", label: "Reference" },
         ],
       },
     ];
@@ -123,6 +126,15 @@ export class SupportViews {
           { key: "exp", label: "Expiry", value: f.exp ?? "", placeholder: "MM/YY", mono: true, narrow: true },
         ],
       });
+    } else if (by === "reference") {
+      blocks.push({
+        type: "searchform",
+        submitLabel: "Search",
+        fields: [
+          { key: "ref", label: "Bank reference", value: f.ref ?? "", placeholder: "FT26307B8P5M", mono: true },
+          { key: "l4", label: "Last 4", value: f.l4 ?? "", placeholder: "4242", mono: true, narrow: true },
+        ],
+      });
     } else {
       const field =
         by === "customer"
@@ -133,29 +145,30 @@ export class SupportViews {
       blocks.push({ type: "searchform", submitLabel: "Search", fields: [{ ...field, value: f.q ?? "" }] });
     }
 
-    const ready = by === "card" ? !!(f.l4 || f.exp) : !!f.q;
+    const ready = by === "card" ? !!(f.l4 || f.exp) : by === "reference" ? !!(f.ref || f.l4) : !!f.q;
     if (!ready) return blocks;
 
-    const key = JSON.stringify([by, f.q ?? "", f.l4 ?? "", f.exp ?? ""]);
+    const key = JSON.stringify([by, f.q ?? "", f.l4 ?? "", f.exp ?? "", f.ref ?? ""]);
     const cached = this.lookupCache.get(key);
     let entry: LookupEntry;
     if (cached && this.now() - cached.at <= LOOKUP_CACHE_MS) {
       entry = cached;
     } else {
-      const outcome =
+      const outcome: ChargeLookupOutcome =
         by === "card"
           ? await this.deps.data.lookupCard(f.l4 ?? "", f.exp ?? "")
-          : by === "customer"
+          : by === "reference"
+            ? await this.deps.data.lookupReference(f.ref ?? "", f.l4 ?? "")
+            : by === "customer"
             ? await this.deps.data.lookupCustomerId(f.q ?? "")
-            : by === "postiz"
-              ? await this.deps.data.lookupPostiz(f.q ?? "")
-              : await this.deps.data.lookupEmail(f.q ?? "");
+              : by === "postiz"
+                ? await this.deps.data.lookupPostiz(f.q ?? "")
+                : await this.deps.data.lookupEmail(f.q ?? "");
       if (!outcome.ok) {
         blocks.push({ type: "notice", badge: { kind: "warn", text: "Check the search" }, text: outcome.error });
         return blocks;
       }
-      const cards = "lastCharge" in outcome ? (outcome.lastCharge as Map<string, Stripe.Charge> | undefined) : undefined;
-      entry = { at: this.now(), hits: outcome.hits, cards, plans: new Map() };
+      entry = { at: this.now(), hits: outcome.hits, charges: outcome.charges, window: outcome.window, plans: new Map() };
       this.lookupCache.set(key, entry);
       if (this.lookupCache.size > 200) {
         const oldest = this.lookupCache.keys().next().value;
@@ -169,21 +182,22 @@ export class SupportViews {
     if (missing.length) for (const [id, plan] of await this.deps.data.plans(missing)) entry.plans.set(id, plan);
 
     const total = entry.hits.length;
-    const cards = entry.cards;
+    const charges = entry.charges;
     const via: LookupVia = by === "" ? "email" : by;
+    const win = entry.window;
     blocks.push({
       type: "table",
       key: "results",
-      title: `${total} customer${total === 1 ? "" : "s"}`,
+      title: `${total} customer${total === 1 ? "" : "s"}` + (win ? `, charged ${shortDate(win.from)} to ${shortDate(win.to - 1)}` : ""),
       columns: [
         { key: "customer", label: "Customer" },
         { key: "id", label: "Customer ID" },
         { key: "plan", label: "Plan" },
-        { key: "found", label: by === "card" ? "Last charge on this card" : "Found by" },
+        { key: "found", label: by === "card" ? "Last charge on this card" : by === "reference" ? "Charge" : "Found by" },
       ],
       rows: slice.map((h) => {
         const plan = entry.plans.get(h.customerId) ?? null;
-        const charge = cards?.get(h.customerId);
+        const charge = charges?.get(h.customerId);
         return {
           id: h.customerId,
           ref: { page: "customer", params: { id: h.customerId }, filters: { via } },
@@ -192,7 +206,11 @@ export class SupportViews {
             idCell(h.customerId, { copy: true }),
             plan ? ({ t: "badge", b: { kind: plan.badge.kind, text: plan.ended ? plan.badge.text : plan.label } } as Cell) : text("None"),
             charge
-              ? text(`${cardBrand(charge.payment_method_details?.card?.brand)}, ${shortDate(charge.created)}`)
+              ? text(
+                  by === "reference"
+                    ? `${this.deps.money.formatAmount(charge.amount, charge.currency)}, ${shortDate(charge.created)}`
+                    : `${cardBrand(charge.payment_method_details?.card?.brand)}, ${shortDate(charge.created)}`
+                )
               : text(h.foundBy),
           ] as Cell[],
         };
@@ -217,7 +235,7 @@ export class SupportViews {
         { type: "empty", title: "Stripe has no customer with this ID." },
       ]);
     }
-    const via = (["email", "customer", "postiz", "card"] as const).find((v) => v === req.filters.via) ?? "link";
+    const via = (["email", "customer", "postiz", "card", "reference"] as const).find((v) => v === req.filters.via) ?? "link";
     void this.deps.lookups
       .record({ discordUserId: actor.id, actorName: actor.name, customerId: id, customerName: snap.customer.name ?? snap.customer.email ?? null, via })
       .catch((e) => viewLog.warn("lookup log failed", { "error.message": e instanceof Error ? e.message : String(e) }));
