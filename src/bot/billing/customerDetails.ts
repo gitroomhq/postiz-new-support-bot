@@ -59,6 +59,12 @@ export function fieldList(fields: DetailField[]): string {
   return fields.map((f) => FIELD_LABEL[f]).join(", ");
 }
 
+// For a sentence: "name, address and VAT ID".
+export function fieldPhrase(fields: DetailField[]): string {
+  const words = fields.map((f) => (f === "vat" ? FIELD_LABEL[f] : FIELD_LABEL[f].toLowerCase()));
+  return words.length > 1 ? `${words.slice(0, -1).join(", ")} and ${words[words.length - 1]}` : words.join("");
+}
+
 // One line: "Torstraße 109, 10119 Berlin, DE".
 export function addressText(d: CustomerDetails): string {
   const parts = [d.line1, d.line2, [d.postal, d.city].filter(Boolean).join(" "), d.state, d.country].filter(Boolean);

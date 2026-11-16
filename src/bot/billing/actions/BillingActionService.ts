@@ -42,9 +42,16 @@ export interface ScopedBinding {
   discordCustomerId: string | null;
   ticketThreadId: string | null;
   conversationId: string | null;
-  // "support": the support dashboard. Its requests always queue for an admin,
-  // whatever the action's level says.
+  // "support": the support dashboard. Its requests run at once while the
+  // action's level is approval or all, or queue for an admin while
+  // /config → Support Dashboard → Needs admin approval is on.
   origin: "dashboard" | "support";
+}
+
+// Why a teammate ran an action, for the billing audit entry.
+export interface ActionContext {
+  reason?: string | null;
+  intercomRef?: string | null;
 }
 
 // The Discord-independent brain behind every canvas/panel billing action.
@@ -188,7 +195,13 @@ export class BillingActionService {
   // Entry point for the web dashboard: same level/queue/execute/audit
   // internals as request(), but the scope comes from a server-derived binding
   // (target object → customer) instead of an Intercom conversation link.
-  async requestScoped(binding: ScopedBinding, actor: ActionActor, actionKey: string, rawParams: unknown): Promise<RequestOutcome> {
+  async requestScoped(
+    binding: ScopedBinding,
+    actor: ActionActor,
+    actionKey: string,
+    rawParams: unknown,
+    context: ActionContext = {}
+  ): Promise<RequestOutcome> {
     const def = actionByKey(actionKey);
     if (!def) return { kind: "invalid", error: "Unknown action." };
     const parsed = def.parseParams(rawParams);
@@ -196,9 +209,10 @@ export class BillingActionService {
 
     const level = this.effectiveMode(actionKey, actor);
     if (level === "denied") return { kind: "denied", error: "This action is disabled (/config → Billing → Intercom Actions)." };
-    // Every support-dashboard change waits for an admin, even where the level
-    // would let a teammate run it directly.
-    const mode = binding.origin === "support" ? "queue" : level;
+    // Support teammates are never admins, so "approval" reads as queue for
+    // them; the support dashboard's own switch decides instead.
+    const mode = binding.origin === "support" ? (this.settingsStore.supportDashApproval() ? "queue" : "direct") : level;
+    const contextFields = contextFieldsOf(context);
 
     const ctx = this.buildScopedCtx(binding, actor, randomUUID());
     const summary = def.summarize(parsed.params, this.stripe);
@@ -222,6 +236,7 @@ export class BillingActionService {
         fields: [
           { name: "Requested by", value: actor.name, inline: true },
           { name: "Action", value: def.label, inline: true },
+          ...contextFields,
         ],
       });
       actionLog.info("billing.action.queued", {
@@ -232,7 +247,7 @@ export class BillingActionService {
       return { kind: "queued", approvalId: approval.id };
     }
 
-    const result = await this.executeNow(def, ctx, parsed.params, summary);
+    const result = await this.executeNow(def, ctx, parsed.params, summary, undefined, contextFields);
     return result.ok ? { kind: "executed", text: result.text } : { kind: "failed", error: result.error };
   }
 
@@ -443,7 +458,8 @@ export class BillingActionService {
     ctx: ActionExecCtx,
     params: unknown,
     summary: string,
-    approval?: BillingApproval
+    approval?: BillingApproval,
+    contextFields: { name: string; value: string; inline?: boolean }[] = []
   ): Promise<{ ok: true; text: string } | { ok: false; error: string; refused?: boolean }> {
     // Dashboard requests have no conversation — scope the double-click guard
     // to the customer (or globally for unscoped actions).
@@ -476,6 +492,7 @@ export class BillingActionService {
         fields: [
           ...(approval ? [{ name: "Requested by", value: approval.requestedByName, inline: true }] : []),
           { name: approval ? "Approved by" : "Actor", value: ctx.actor.name, inline: true },
+          ...contextFields,
           { name: "Outcome", value: result.ok ? result.text : `FAILED: ${result.error}`, inline: false },
         ],
       });
@@ -539,4 +556,11 @@ export class BillingActionService {
       }
     }
   }
+}
+
+function contextFieldsOf(context: ActionContext): { name: string; value: string; inline?: boolean }[] {
+  const out: { name: string; value: string; inline?: boolean }[] = [];
+  if (context.reason?.trim()) out.push({ name: "Reason", value: context.reason.trim().slice(0, 500), inline: false });
+  if (context.intercomRef?.trim()) out.push({ name: "Intercom", value: context.intercomRef.trim().slice(0, 300), inline: true });
+  return out;
 }

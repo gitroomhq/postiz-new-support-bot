@@ -179,6 +179,28 @@ export class ApprovalStore {
     });
   }
 
+  // Every open request of one kind for one customer.
+  async listActionableFor(actionKey: string, stripeCustomerId: string): Promise<BillingApproval[]> {
+    await this.expireOverdue();
+    return this.prisma.billingApproval.findMany({
+      where: { actionKey, stripeCustomerId, status: { in: ["PENDING", "EXECUTING", "FAILED"] } },
+      orderBy: { createdAt: "desc" },
+      take: 50,
+    });
+  }
+
+  async getMany(ids: string[]): Promise<BillingApproval[]> {
+    if (!ids.length) return [];
+    await this.expireOverdue();
+    return this.prisma.billingApproval.findMany({ where: { id: { in: ids } } });
+  }
+
+  // Every support-origin request, oldest first (the activity log's import of
+  // requests filed before it existed).
+  async listByOrigin(origin: ApprovalOrigin, offset: number, limit: number): Promise<BillingApproval[]> {
+    return this.prisma.billingApproval.findMany({ where: { origin }, orderBy: { createdAt: "asc" }, skip: offset, take: limit });
+  }
+
   // One requester's own requests, newest first, optionally one status group.
   async listByRequester(
     origin: ApprovalOrigin,
