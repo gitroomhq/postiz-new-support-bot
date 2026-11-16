@@ -25,6 +25,24 @@ D.actionBtn = function (a) {
     });
     return b;
   }
+  if (a.href) {
+    // External link-button (an invoice PDF): https only, new tab.
+    var link = document.createElement("a");
+    link.className = b.className;
+    link.textContent = a.label;
+    if (String(a.href).indexOf("https://") === 0) { link.href = a.href; link.target = "_blank"; link.rel = "noopener noreferrer"; }
+    link.addEventListener("click", function (e) { e.stopPropagation(); });
+    return link;
+  }
+  if (a.copyText) {
+    b.addEventListener("click", function (e) {
+      e.stopPropagation();
+      var done = function () { D.flashOk("Copied."); };
+      if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(a.copyText).then(done, function () { D.flashErr("Could not copy."); });
+      else D.flashErr("Could not copy.");
+    });
+    return b;
+  }
   if (a.ref) {
     // Link-button: pure navigation (composer entry points): nothing is posted.
     b.addEventListener("click", function (e) {
@@ -153,6 +171,30 @@ D.openModal = function (a) {
       inputsEl.appendChild(fi);
       return;
     }
+    if (inp.type === "choice") {
+      // Segmented control: one pressed button, its value read on Run.
+      var seg = D.el("div", "mchoice"); seg.id = "mi_" + inp.key;
+      seg.setAttribute("role", "group");
+      l.id = "mil_" + inp.key; seg.setAttribute("aria-labelledby", l.id);
+      l.htmlFor = "";
+      var opts = inp.options || [];
+      var current = inp.value != null ? inp.value : (opts[0] ? opts[0].value : "");
+      opts.forEach(function (o) {
+        var ob = D.el("button", null, o.label);
+        ob.type = "button";
+        ob.setAttribute("data-value", o.value);
+        var on = o.value === current;
+        ob.setAttribute("aria-pressed", on ? "true" : "false");
+        if (on) ob.classList.add("on");
+        ob.addEventListener("click", function () {
+          Array.prototype.forEach.call(seg.children, function (x) { x.classList.remove("on"); x.setAttribute("aria-pressed", "false"); });
+          ob.classList.add("on"); ob.setAttribute("aria-pressed", "true");
+        });
+        seg.appendChild(ob);
+      });
+      inputsEl.appendChild(seg);
+      return;
+    }
     if (inp.type === "select") {
       var sel = document.createElement("select"); sel.id = "mi_" + inp.key;
       (inp.options || []).forEach(function (o) { sel.appendChild(new Option(o.label, o.value)); });
@@ -172,6 +214,7 @@ D.openModal = function (a) {
     if (inp.type === "number") {
       if (inp.min !== undefined) ctrl.min = String(inp.min);
       if (inp.max !== undefined) ctrl.max = String(inp.max);
+      if (inp.step !== undefined) ctrl.step = String(inp.step);
     }
     inputsEl.appendChild(ctrl);
   });
@@ -180,6 +223,7 @@ D.openModal = function (a) {
   D.q("modalConfirm").hidden = !a.dangerous;
   D.q("confirmWord").value = "";
   D.q("modalGo").textContent = a.submitLabel || "Run";
+  D.q("modalCancel").textContent = a.cancelLabel || "Cancel";
   var errEl = D.q("modalErr"); errEl.hidden = true; errEl.textContent = "";
   D.q("modal").showModal();
 };
@@ -209,6 +253,10 @@ D.bindModal = function () {
         });
       }
       else if (inp.type === "number") params[inp.key] = c.value === "" ? null : Number(c.value);
+      else if (inp.type === "choice") {
+        var pressed = c.querySelector("button.on");
+        params[inp.key] = pressed ? pressed.getAttribute("data-value") : "";
+      }
       else if (inp.type === "file") pending = { inp: inp, el: c };
       else params[inp.key] = c.value;
     });

@@ -92,6 +92,7 @@ D.renderCell = function (td, cell) {
     if (cell.sub) td.appendChild(D.el("span", "sub subindent", cell.sub));
   } else if (cell.t === "badge") {
     td.appendChild(D.badge(cell.b));
+    if (cell.sub) td.appendChild(D.el("span", "sub", cell.sub));
   } else if (cell.t === "flags") {
     var set = D.el("span", "flagset");
     (cell.badges || []).forEach(function (b) { set.appendChild(D.badge(b)); });
@@ -343,8 +344,14 @@ D.colMenu = function (b, boxRef) {
 };
 
 // Hybrid row actions: first action inline, the rest behind a "···" menu.
-D.rowActions = function (td, actions) {
+D.rowActions = function (td, actions, inline) {
   if (!actions || !actions.length) return;
+  if (inline) {
+    var row = D.el("span", "inlineacts");
+    actions.forEach(function (a) { var ib = D.actionBtn(a); ib.classList.add("sm"); row.appendChild(ib); });
+    td.appendChild(row);
+    return;
+  }
   var first = D.actionBtn(actions[0]); first.classList.add("sm"); td.appendChild(first);
   if (actions.length === 1) return;
   var wrap = D.el("span", "morewrap");
@@ -511,7 +518,7 @@ D.renderTable = function (b) {
     });
     if (hasRowActions) {
       var act = document.createElement("td"); act.className = "act";
-      D.rowActions(act, row.actions || []);
+      D.rowActions(act, row.actions || [], !!b.inlineActions);
       tr.appendChild(act);
     }
     tbody.appendChild(tr);

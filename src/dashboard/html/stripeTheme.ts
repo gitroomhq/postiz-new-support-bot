@@ -85,6 +85,12 @@ ${DARK_TOKENS}
     border-radius:50%; background:#fff; box-shadow:0 1px 2px rgba(0,0,0,.3); transition:transform .15s; }
   .switch input[type=checkbox]:checked { background:var(--accent); }
   .switch input[type=checkbox]:checked::after { transform:translateX(16px); }
+  .mchoice { display:flex; background:var(--fill); border:1px solid var(--border); border-radius:8px; padding:3px; gap:3px; }
+  .mchoice button { flex:1 1 0; border:none; background:none; border-radius:6px; padding:7px 10px; font:inherit; font-size:14px;
+    font-weight:500; color:var(--text); cursor:pointer; min-height:36px; }
+  .mchoice button.on { background:var(--surface); color:var(--heading); font-weight:600; box-shadow:0 1px 2px rgba(33,37,44,.12); }
+  .mchoice button:focus-visible { outline:2px solid var(--accent); outline-offset:1px; }
+  .inlineacts { display:inline-flex; gap:6px; }
 
   .btn { display:inline-flex; align-items:center; justify-content:center; gap:6px; margin:0; padding:6px 14px;
     font:inherit; font-size:14px; font-weight:600; border:1px solid var(--border-strong);

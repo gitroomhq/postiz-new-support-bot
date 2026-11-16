@@ -40,7 +40,7 @@ export type Cell =
   // major carries the numeric major-unit value so the client can sum selected
   // rows for bulk-action ceremonies without parsing formatted strings.
   | { t: "amount"; v: string; cur: string; badge?: Badge; major?: number }
-  | { t: "badge"; b: Badge }
+  | { t: "badge"; b: Badge; sub?: string }
   | { t: "flags"; badges: Badge[] }
   | { t: "date"; v: string; iso: string } // v = preformatted absolute; client renders relative w/ hover
   | { t: "id"; v: string; ref?: ObjectRef; copy?: boolean }
@@ -68,7 +68,10 @@ export type InputField =
       half?: boolean;
       mono?: boolean;
     }
-  | { type: "number"; key: string; label: string; min?: number; max?: number; placeholder?: string }
+  // value prefills; a string keeps its decimals ("49.00").
+  | { type: "number"; key: string; label: string; min?: number; max?: number; step?: number; value?: number | string; placeholder?: string }
+  // One of a few options as a segmented control (posted as the option's value).
+  | { type: "choice"; key: string; label: string; options: Opt[]; value?: string }
   | { type: "select"; key: string; label: string; options: Opt[]; value?: string; half?: boolean }
   // An editable list of small records (a customer's tax IDs): one line of
   // controls per record, a remove button on each and an add button below,
@@ -109,6 +112,9 @@ export interface ActionButton {
   inputs?: InputField[];
   // The modal's submit button text; "Run" when absent.
   submitLabel?: string;
+  // The modal's dismiss button text; "Cancel" when absent ("Close" beside a
+  // "Cancel subscription" submit).
+  cancelLabel?: string;
   // Server-baked binding (object ids). The client may only ADD input values:
   // baked params always win server-side.
   params?: Record<string, unknown>;
@@ -120,6 +126,10 @@ export interface ActionButton {
   // Link-button: navigates to a page instead of POSTing an action (composer
   // entry points). Mutually exclusive with inputs/params: nothing is posted.
   ref?: ObjectRef;
+  // Client-only buttons, nothing is posted: copyText copies the text,
+  // href opens an https link in a new tab.
+  copyText?: string;
+  href?: string;
 }
 
 export interface HeaderBlock {
@@ -176,6 +186,8 @@ export interface TableBlock {
   selectable?: boolean; // leading checkbox column + a "N selected" bulk bar
   exportable?: boolean; // header "Export" → client CSV of the currently-rendered rows
   editableColumns?: boolean; // header "Edit columns" → client show/hide, persisted per `key`
+  // Every row action inline instead of the first plus a "···" menu.
+  inlineActions?: boolean;
   // Optional server actions over the selected row ids. The client injects the
   // selected ids as params.ids (money-moving bulk ops still ride the tier ladder
   // server-side); the built-in "Export selected" is always available when selectable.
