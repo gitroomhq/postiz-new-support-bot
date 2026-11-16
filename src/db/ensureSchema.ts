@@ -1348,6 +1348,30 @@ export const STATEMENTS: string[] = [
   )`,
   `CREATE INDEX IF NOT EXISTS "support_lookups_createdAt_idx" ON "support_lookups"("createdAt")`,
   `CREATE INDEX IF NOT EXISTS "support_lookups_discordUserId_customerId_createdAt_idx" ON "support_lookups"("discordUserId", "customerId", "createdAt")`,
+  // Support dashboard actions: the approval switch (ships off) and the log of
+  // what each teammate did.
+  `ALTER TABLE "bot_settings" ADD COLUMN IF NOT EXISTS "supportDashApproval" BOOLEAN NOT NULL DEFAULT false`,
+  `CREATE TABLE IF NOT EXISTS "support_actions" (
+    "id" TEXT NOT NULL,
+    "discordUserId" TEXT NOT NULL,
+    "actorName" TEXT NOT NULL,
+    "customerId" TEXT NOT NULL,
+    "customerName" TEXT,
+    "kind" TEXT NOT NULL,
+    "summary" TEXT NOT NULL,
+    "status" TEXT NOT NULL,
+    "outcome" TEXT,
+    "approvalId" TEXT,
+    "reason" TEXT,
+    "intercomRef" TEXT,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT "support_actions_pkey" PRIMARY KEY ("id")
+  )`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS "support_actions_approvalId_key" ON "support_actions"("approvalId")`,
+  `CREATE INDEX IF NOT EXISTS "support_actions_createdAt_idx" ON "support_actions"("createdAt")`,
+  `CREATE INDEX IF NOT EXISTS "support_actions_discordUserId_createdAt_idx" ON "support_actions"("discordUserId", "createdAt")`,
+  `CREATE INDEX IF NOT EXISTS "support_actions_status_idx" ON "support_actions"("status")`,
   `CREATE TABLE IF NOT EXISTS "intercom_sync_failures" (
     "ticketThreadId" TEXT NOT NULL,
     "eventType" TEXT NOT NULL,

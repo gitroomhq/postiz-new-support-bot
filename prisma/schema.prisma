@@ -463,11 +463,13 @@ model BotSettings {
   // The OAuth app is its own Developer Hub app: client id here, client secret
   // encrypted (crypto.ts/Vault). Bumping queueEpoch signs everyone out.
   // Support dashboard (/support, the web /config Support Dashboard hub):
-  // staff look customers up and request detail changes for admin approval.
+  // staff look customers up, refund, cancel and change billing details.
   // Signed in through /support in Discord, a DM code and a password. Ships
-  // ON. Bumping supportDashEpoch signs everyone out.
+  // ON. Bumping supportDashEpoch signs everyone out. supportDashApproval on
+  // queues every support billing action for an admin (ships off).
   supportDashEnabled      Boolean @default(true)
   supportDashEpoch        Int     @default(0)
+  supportDashApproval     Boolean @default(false)
   queueEnabled            Boolean @default(false)
   queueOauthClientId      String?
   queueOauthClientSecret  String?
@@ -1743,12 +1745,38 @@ model SupportLookup {
   actorName     String
   customerId    String
   customerName  String?
-  via           String // email | customer | postiz | card | reference | link
+  via           String // email | customer | postiz | card | reference | recent | link
   createdAt     DateTime @default(now())
 
   @@index([createdAt])
   @@index([discordUserId, customerId, createdAt])
   @@map("support_lookups")
+}
+
+// What each support teammate did from /support: refunds, cancellations,
+// detail changes, suppression removals. A queued row (approval on) points at
+// its billing_approvals row and is settled from it once an admin closes it.
+// Read on the teammate's My activity page and in the web /config hub.
+model SupportAction {
+  id            String   @id @default(cuid())
+  discordUserId String
+  actorName     String
+  customerId    String
+  customerName  String?
+  kind          String // refund | cancel | uncancel | details | unsuppress
+  summary       String // "Refund $49.00, Visa 4242": imperative, shown per row
+  status        String // done | failed | queued | rejected | refused | expired | withdrawn
+  outcome       String? // error, reviewer note or refusal
+  approvalId    String?  @unique
+  reason        String?
+  intercomRef   String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@index([createdAt])
+  @@index([discordUserId, createdAt])
+  @@index([status])
+  @@map("support_actions")
 }
 
 // The Intercom Queue's last list (/queue), one row (id 1): the open

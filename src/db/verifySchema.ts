@@ -85,7 +85,7 @@ export const EXPECTED_COLUMNS: Record<string, string[]> = {
     "resolveOnCloseEnabled", "resolveOnCloseStateId", "resolveOnCloseBackfilledAt", "refundMaxChargeAgeDays",
     "agentRipMigratedAt", "intercomPanelAdminsJson", "billingActionLevelsJson", "panelTokenSecret",
     "panelTokenEpoch", "adminPanelEpoch", "dashboardEnabled", "dashboardAdminsJson", "dashboardTokenSecret", "dashboardEpoch",
-    "supportDashEnabled", "supportDashEpoch",
+    "supportDashEnabled", "supportDashEpoch", "supportDashApproval",
     "queueEnabled", "queueOauthClientId", "queueOauthClientSecret", "queueEpoch", "queueFinCountsAsReply",
     "queueNotesCountAsReply", "queueExclusionsJson",
     "yubicoClientId", "yubicoApiSecret", "yubicoValidationUrl",
@@ -201,6 +201,10 @@ export const EXPECTED_COLUMNS: Record<string, string[]> = {
     "absoluteExpiresAt",
   ],
   support_lookups: ["id", "discordUserId", "actorName", "customerId", "customerName", "via", "createdAt"],
+  support_actions: [
+    "id", "discordUserId", "actorName", "customerId", "customerName", "kind", "summary", "status", "outcome", "approvalId",
+    "reason", "intercomRef", "createdAt", "updatedAt",
+  ],
   queue_resolutions: [
     "conversationId", "untilReply", "lastContactAt", "note", "title", "ticketNumber", "customer", "resolvedById",
     "resolvedByName", "resolvedAt",

@@ -853,7 +853,13 @@ export class SettingsStore {
     return this.settings.supportDashEpoch;
   }
 
-  async updateSupportDash(data: { supportDashEnabled?: boolean }): Promise<void> {
+  // On: every support billing action (refund, cancel, detail change) queues
+  // for an admin in /billing → Approvals. Off (the default): it runs at once.
+  supportDashApproval(): boolean {
+    return this.settings.supportDashApproval;
+  }
+
+  async updateSupportDash(data: { supportDashEnabled?: boolean; supportDashApproval?: boolean }): Promise<void> {
     this.settings = await this.prisma.botSettings.update({ where: { id: "global" }, data });
   }
 
