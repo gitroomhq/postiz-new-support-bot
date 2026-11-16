@@ -37,7 +37,7 @@ export type RemoveResult =
   | { kind: "error"; error: string };
 
 export interface DeliveryActor {
-  surface: "intercom" | "discord" | "dashboard" | "config";
+  surface: "intercom" | "discord" | "dashboard" | "config" | "support";
   id: string;
   name: string;
 }
@@ -340,4 +340,5 @@ const SURFACE_LABELS: Record<DeliveryActor["surface"], string> = {
   discord: "Discord /email",
   dashboard: "Web customer page",
   config: "/config",
+  support: "Support dashboard",
 };
