@@ -2,14 +2,17 @@ import type { ActionButton, Badge, Block, Crumb, NavItem } from "../dashboard/re
 
 // The support dashboard's page contract: the dashboard's blocks (rendered by
 // the shared clientBlocks), plus three the support client draws itself:
-//  - strip: a row of label-over-value facts on a gray fill (Billing details);
+//  - strip: a row of label-over-value facts on a gray fill (Billing details,
+//    Postiz);
 //  - change: the pending change request, field by field, with its actions;
 //  - searchform: inline fields and a Search button that write page filters.
 
 export interface StripBlock {
   type: "strip";
   title?: string;
-  items: Array<{ label: string; value: string; mono?: boolean }>;
+  // copy: a copy button after the value; badge and action: a line under it
+  // (an address's suppression and its Remove).
+  items: Array<{ label: string; value: string; mono?: boolean; copy?: boolean; badge?: Badge; action?: ActionButton }>;
 }
 
 export interface ChangeBlock {

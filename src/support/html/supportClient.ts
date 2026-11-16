@@ -8,7 +8,7 @@
 //
 // URLs (real, copyable paths):
 //   /support                 page "lookup"
-//   /support/requests        page "requests"
+//   /support/activity        page "activity"
 //   /support/customer/<id>   page "customer", params { id }
 // Filters ride the query string as f_<key>=<value>; cursors stay in memory.
 
@@ -169,7 +169,16 @@ D.renderStrip = function (b) {
   (b.items || []).forEach(function (it) {
     var cell = D.el("div", null);
     cell.appendChild(D.el("div", "slab", it.label));
-    cell.appendChild(D.el("div", "sval" + (it.mono ? " mono" : ""), it.value));
+    var val = D.el("div", "sval");
+    val.appendChild(D.el("span", it.mono ? "mono" : null, it.value));
+    if (it.copy) val.appendChild(D.copyBtn(it.value));
+    cell.appendChild(val);
+    if (it.badge || it.action) {
+      var line = D.el("div", "sline");
+      if (it.badge) line.appendChild(D.badge(it.badge));
+      if (it.action) { var ab = D.actionBtn(it.action); ab.classList.add("linkbtn"); line.appendChild(ab); }
+      cell.appendChild(line);
+    }
     grid.appendChild(cell);
   });
   box.appendChild(grid);
@@ -236,7 +245,7 @@ D.renderSearchForm = function (b) {
 // ---- sidebar ----
 D.NAV_ICONS = {
   lookup: "M7 12.2a5.2 5.2 0 1 0 0-10.4 5.2 5.2 0 0 0 0 10.4ZM10.8 10.8l3.4 3.4",
-  requests: "M3.2 2.4h9.6v11.2H3.2ZM5.6 5.6h4.8M5.6 8h4.8M5.6 10.4h2.8"
+  activity: "M3.2 2.4h9.6v11.2H3.2ZM5.6 5.6h4.8M5.6 8h4.8M5.6 10.4h2.8"
 };
 D.navIcon = function (page) {
   var d = D.NAV_ICONS[page || ""];

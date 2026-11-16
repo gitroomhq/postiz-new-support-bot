@@ -115,7 +115,12 @@ function supportCss(): string {
     border-radius:10px; padding:16px 18px; }
   .stripgrid .slab { color:var(--muted); font-size:13px; margin:0 0 2px; }
   .stripgrid .sval { color:var(--heading); overflow-wrap:anywhere; }
-  .stripgrid .sval.mono { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; }
+  .stripgrid .sval .mono { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; }
+  .stripgrid .sval .copybtn { margin-left:4px; vertical-align:middle; }
+  .stripgrid .sline { display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-top:4px; }
+  .btn.linkbtn { all:unset; cursor:pointer; color:var(--accent); font-size:13px; font-weight:600; }
+  .btn.linkbtn:hover { color:var(--accent-hover); text-decoration:underline; }
+  .btn.linkbtn:focus-visible { outline:2px solid var(--accent); outline-offset:2px; border-radius:3px; }
 
   .changecard { background:var(--warn-weak); border-radius:10px; padding:14px 16px; margin:0 0 28px; }
   .changecard .chead { display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; }

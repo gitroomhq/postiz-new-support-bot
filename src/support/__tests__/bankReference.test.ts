@@ -6,7 +6,7 @@ import type { StripeClient } from "../../bot/StripeClient";
 import type { ApprovalStore } from "../../bot/billing/ApprovalStore";
 import type { BillingActionService } from "../../bot/billing/actions/BillingActionService";
 import { SupportData } from "../SupportData";
-import type { SupportLookupLog } from "../SupportStores";
+import type { SupportActionLog, SupportLookupLog } from "../SupportStores";
 import { SupportViews } from "../supportViews";
 import type { TableBlock } from "../../dashboard/renderer/contract";
 
@@ -90,9 +90,11 @@ test("the Reference tab shows the window and each customer's charge with its amo
   const { stripe } = fakeStripe(CHARGES);
   const views = new SupportViews({
     data: new SupportData(stripe, null, () => NOW),
-    approvals: { countByRequesterStatus: async () => ({}) } as unknown as ApprovalStore,
+    approvals: {} as ApprovalStore,
     actions: {} as BillingActionService,
     lookups: {} as SupportLookupLog,
+    activity: { counts: async () => ({}) } as unknown as SupportActionLog,
+    settings: { supportDashApproval: () => false },
     money: stripe as unknown as { formatAmount(a: number, c: string): string },
     now: () => NOW,
   });

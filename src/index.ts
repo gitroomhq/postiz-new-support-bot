@@ -120,7 +120,7 @@ import { makeAssignmentHub } from "./adminpanel/sections/assignmentHub";
 import { makeQueueHub } from "./adminpanel/sections/queueHub";
 import { makeSupportHub } from "./adminpanel/sections/supportHub";
 import { SupportSessions } from "./support/SupportSessions";
-import { SupportCredentials, SupportLookupLog } from "./support/SupportStores";
+import { SupportActionLog, SupportCredentials, SupportLookupLog } from "./support/SupportStores";
 import { SupportAuth, SUPPORT_BASE_PATH } from "./support/SupportAuth";
 import { SupportData } from "./support/SupportData";
 import { SupportViews } from "./support/supportViews";
@@ -788,15 +788,22 @@ async function main() {
   const runSlaNow = async () => fmtReport(await temporalProducers.slaEnforceRunNow());
   const runInactivityNow = runSlaNow;
 
-  // Support dashboard (/support): staff look customers up and request name,
-  // address and VAT ID changes, each queued for an admin in /billing →
-  // Approvals. Signed in with a code from /support in Discord, a DM code and a
-  // password. Ships on; switched in the web /config Support Dashboard hub.
+  // Support dashboard (/support): staff look customers up, refund, cancel,
+  // change name, address and VAT ID, and take an address off Resend's
+  // suppression list. Billing actions run at once, or queue for an admin in
+  // /billing → Approvals while the hub's approval switch is on. Signed in with
+  // a code from /support in Discord, a DM code and a password. Ships on;
+  // switched in the web /config Support Dashboard hub.
   const supportSessions = new SupportSessions(prisma);
   const supportCredentials = new SupportCredentials(prisma);
   const supportLookups = new SupportLookupLog(prisma);
+  const supportActions = new SupportActionLog(prisma, approvalStore);
+  void supportActions
+    .importLegacy()
+    .catch((e) => bootLog.warn("support activity import failed", { "error.message": e instanceof Error ? e.message : String(e) }));
   const supportDiscord = new SupportDiscord(settingsStore, approvalStore, (id) => bot.staffMemberById(id));
   supportDiscord.bindClient(bot.client);
+  supportDiscord.bindActivity(supportActions);
   const supportAuth = new SupportAuth(settingsStore, supportDiscord, supportSessions, supportCredentials);
   supportDiscord.bindAuth(supportAuth);
   billingActionService.bindOutcomeListener((approvalId) => supportDiscord.onOutcome(approvalId));
@@ -808,6 +815,9 @@ async function main() {
       approvals: approvalStore,
       actions: billingActionService,
       lookups: supportLookups,
+      activity: supportActions,
+      settings: settingsStore,
+      email: emailDelivery,
       money: stripeClient,
     })
   );
@@ -899,6 +909,7 @@ async function main() {
       listPasswords: (offset, limit) => supportCredentials.list(offset, limit),
       resetPassword: (id) => supportAuth.resetPassword(id),
       listLookups: (offset, limit) => supportLookups.list(offset, limit),
+      listActions: (offset, limit) => supportActions.list(null, null, offset, limit),
       pageUrl: () => {
         const base = settingsStore.resolvedPublicBaseUrl();
         return base && base.startsWith("https://") ? `${base}${SUPPORT_BASE_PATH}` : null;

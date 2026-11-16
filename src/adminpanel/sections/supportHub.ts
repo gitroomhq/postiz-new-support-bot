@@ -1,10 +1,10 @@
-import type { SupportCredential, SupportLookup } from "../../generated/prisma/client";
+import type { SupportAction, SupportCredential, SupportLookup } from "../../generated/prisma/client";
 import { ActionResult, SaveResult, Section } from "../renderer/contract";
 import { AdminHubContext, ActionRequest, HubModule, SaveRequest } from "./types";
 
-// Support Dashboard hub (config group): the /support page. Kill switch,
-// signing everyone out, resetting a teammate's password, and the log of which
-// customer each teammate opened.
+// Support Dashboard hub (config group): the /support page. Kill switch, the
+// approval switch, signing everyone out, resetting a teammate's password, and
+// the logs of what each teammate did and which customer they opened.
 
 const PAGE_SIZE = 10;
 const DISCORD_ID_RE = /^\d{15,21}$/;
@@ -15,6 +15,7 @@ export function makeSupportHub(deps: {
   listPasswords: (offset: number, limit: number) => Promise<{ rows: SupportCredential[]; total: number }>;
   resetPassword: (discordUserId: string) => Promise<{ removed: boolean; sessions: number }>;
   listLookups: (offset: number, limit: number) => Promise<{ rows: SupportLookup[]; total: number }>;
+  listActions: (offset: number, limit: number) => Promise<{ rows: SupportAction[]; total: number }>;
   pageUrl: () => string | null;
 }): HubModule {
   return {
@@ -26,18 +27,26 @@ export function makeSupportHub(deps: {
       const s = ctx.settings;
       const pwOffset = offsetFor(opts.cursor, "pw");
       const logOffset = offsetFor(opts.cursor, "log");
-      const [live, passwords, lookups] = await Promise.all([
+      const actOffset = offsetFor(opts.cursor, "act");
+      const [live, passwords, lookups, actions] = await Promise.all([
         deps.liveSessions().catch(() => null),
         deps.listPasswords(pwOffset, PAGE_SIZE),
         deps.listLookups(logOffset, PAGE_SIZE),
+        deps.listActions(actOffset, PAGE_SIZE),
       ]);
       return [
         {
           key: "support",
           title: "Support dashboard",
-          description: "Change requests from /support wait for an admin in /billing → Approvals.",
           fields: [
             { type: "toggle", key: "supportDashEnabled", label: "Enabled", value: s.supportDashEnabled(), help: "Off: every /support route answers 404 and /support in Discord refuses." },
+            {
+              type: "toggle",
+              key: "supportDashApproval",
+              label: "Needs admin approval",
+              value: s.supportDashApproval(),
+              help: "On: refunds, cancellations and detail changes from /support wait in /billing → Approvals. Off: they run at once. Either way the level in /config → Billing → Intercom Actions must be approval or all.",
+            },
             { type: "static", key: "supportPage", label: "Page", value: deps.pageUrl() ?? "Needs an https public URL" },
             { type: "static", key: "supportLive", label: "Signed in", value: live == null ? "Unknown" : `${live} session(s)` },
           ],
@@ -79,6 +88,30 @@ export function makeSupportHub(deps: {
           ],
         },
         {
+          key: "supportActions",
+          title: "Activity",
+          fields: [
+            {
+              type: "list",
+              key: "supportActionList",
+              label: "Actions",
+              columns: ["When", "Teammate", "Customer", "Action", "Status"],
+              rows: actions.rows.map((r) => ({
+                id: r.id,
+                cells: [
+                  stamp(r.createdAt),
+                  r.actorName,
+                  r.customerName ? `${r.customerName} (${r.customerId})` : r.customerId,
+                  r.reason ? `${r.summary}: ${r.reason}` : r.summary,
+                  [STATUS_LABEL[r.status] ?? r.status, r.outcome].filter(Boolean).join(", "),
+                ],
+                rowActions: [],
+              })),
+              ...pager("act", actOffset, actions.total),
+            },
+          ],
+        },
+        {
           key: "supportLookups",
           title: "Lookup log",
           description: "Kept 180 days.",
@@ -107,6 +140,12 @@ export function makeSupportHub(deps: {
         await ctx.audit(`support dashboard ${on ? "enabled" : "disabled"}`);
         return { ok: true };
       }
+      if (req.field === "supportDashApproval") {
+        const on = req.value === true;
+        await ctx.settings.updateSupportDash({ supportDashApproval: on });
+        await ctx.audit(`support dashboard: admin approval ${on ? "required" : "not required"}`);
+        return { ok: true };
+      }
       return { ok: false, error: "Unknown field." };
     },
 
@@ -130,7 +169,25 @@ export function makeSupportHub(deps: {
   };
 }
 
-const VIA_LABEL: Record<string, string> = { email: "Email", customer: "Customer ID", postiz: "Postiz", card: "Card", reference: "Bank reference", link: "Link" };
+const VIA_LABEL: Record<string, string> = {
+  email: "Email",
+  customer: "Customer ID",
+  postiz: "Postiz",
+  card: "Card",
+  reference: "Bank reference",
+  recent: "Recently opened",
+  link: "Link",
+};
+
+const STATUS_LABEL: Record<string, string> = {
+  done: "Done",
+  failed: "Failed",
+  queued: "Waiting for approval",
+  rejected: "Rejected",
+  refused: "Not applied",
+  expired: "Expired",
+  withdrawn: "Withdrawn",
+};
 
 function offsetFor(cursor: string | undefined, list: string): number {
   const m = /^([a-z]+):(\d{1,6})$/.exec(cursor ?? "");

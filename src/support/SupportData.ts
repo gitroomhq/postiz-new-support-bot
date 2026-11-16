@@ -16,6 +16,9 @@ const dataLog = log.child("support:data");
 
 const CACHE_TTL_MS = 60_000;
 const CACHE_MAX = 200;
+// Names, emails and plan lines of result and Recently opened rows.
+const ROW_TTL_MS = 3 * 60_000;
+const ROW_CACHE_MAX = 1000;
 const LIST_LIMIT = 100;
 const TIMEBOX_MS = 5_000;
 const MAX_HITS = 50;
@@ -35,6 +38,7 @@ export interface CustomerSnapshot {
 }
 
 export interface PlanSummary {
+  subscriptionId: string;
   label: string; // "Pro, monthly"
   badge: Badge; // Active, Trialing, Canceled at period end, ...
   renews: number | null; // unix seconds of the current period end
@@ -57,6 +61,8 @@ export type ChargeLookupOutcome = LookupOutcome & { charges?: Map<string, Stripe
 export class SupportData {
   private cache = new Map<string, { at: number; snap: CustomerSnapshot }>();
   private inflight = new Map<string, Promise<CustomerSnapshot | null>>();
+  private briefs = new Map<string, { at: number; name: string | null; email: string | null }>();
+  private planRows = new Map<string, { at: number; plan: PlanSummary | null }>();
 
   constructor(
     private stripe: StripeClient,
@@ -78,6 +84,16 @@ export class SupportData {
 
   invalidate(customerId: string): void {
     this.cache.delete(customerId);
+    this.briefs.delete(customerId);
+    this.planRows.delete(customerId);
+  }
+
+  // A charge as Stripe has it now (a refund re-checks it, never the cache).
+  async charge(chargeId: string): Promise<Stripe.Charge | null> {
+    return this.stripe.getCharge(chargeId).catch((e) => {
+      if ((e as { code?: string })?.code === "resource_missing") return null;
+      throw e;
+    });
   }
 
   private async load(customerId: string): Promise<CustomerSnapshot | null> {
@@ -224,8 +240,15 @@ export class SupportData {
           out.set(id, planOf(cached.snap.subs));
           return;
         }
+        const row = this.planRows.get(id);
+        if (row && this.now() - row.at < ROW_TTL_MS) {
+          out.set(id, row.plan);
+          return;
+        }
         const res = await timebox(this.stripe.listAllSubscriptions({ customerId: id, status: "all", limit: 10 }), null);
-        out.set(id, res ? planOf(res.subscriptions) : null);
+        const plan = res ? planOf(res.subscriptions) : null;
+        if (res) remember(this.planRows, id, { at: this.now(), plan });
+        out.set(id, plan);
       })
     );
     return out;
@@ -247,6 +270,26 @@ export class SupportData {
       dataLog.info("postiz lookup refused", { "error.message": e instanceof Error ? e.message : String(e) });
       return [];
     }
+  }
+
+  // Name and email for customers known only by id (Recently opened); ids
+  // Stripe no longer knows drop out.
+  async brief(customerIds: string[]): Promise<LookupHit[]> {
+    const now = this.now();
+    const out: LookupHit[] = [];
+    const missing = new HitList();
+    for (const id of customerIds) {
+      const snap = this.cache.get(id);
+      const known = this.briefs.get(id);
+      if (snap && now - snap.at < CACHE_TTL_MS) out.push({ customerId: id, name: snap.snap.customer.name ?? null, email: snap.snap.customer.email ?? null, foundBy: "" });
+      else if (known && now - known.at < ROW_TTL_MS) out.push({ customerId: id, name: known.name, email: known.email, foundBy: "" });
+      else missing.addId(id, "");
+    }
+    for (const h of await this.fill(missing)) {
+      remember(this.briefs, h.customerId, { at: now, name: h.name, email: h.email });
+      out.push(h);
+    }
+    return out;
   }
 
   // Ids found without a customer object (Postiz, card) get their name and
@@ -285,6 +328,10 @@ class HitList {
 // the most recent.
 const LIVE: Stripe.Subscription.Status[] = ["active", "trialing", "past_due", "unpaid", "paused", "incomplete"];
 
+export function liveSubs(subs: Stripe.Subscription[]): Stripe.Subscription[] {
+  return subs.filter((s) => LIVE.includes(s.status));
+}
+
 export function planOf(subs: Stripe.Subscription[]): PlanSummary | null {
   if (!subs.length) return null;
   const sorted = [...subs].sort((a, b) => b.created - a.created);
@@ -301,6 +348,7 @@ export function planOf(subs: Stripe.Subscription[]): PlanSummary | null {
   }
   const ended = sub.status === "canceled" || sub.status === "incomplete_expired";
   return {
+    subscriptionId: sub.id,
     label,
     badge: subStatusFlags(sub)[0],
     renews: !ended && !sub.cancel_at && !sub.cancel_at_period_end ? item?.current_period_end ?? null : null,
@@ -312,6 +360,15 @@ export function planOf(subs: Stripe.Subscription[]): PlanSummary | null {
 function cap(s: string): string {
   const v = s.toLowerCase();
   return v.charAt(0).toUpperCase() + v.slice(1);
+}
+
+function remember<V>(map: Map<string, V>, key: string, value: V): void {
+  map.delete(key);
+  map.set(key, value);
+  if (map.size > ROW_CACHE_MAX) {
+    const oldest = map.keys().next().value;
+    if (oldest !== undefined) map.delete(oldest);
+  }
 }
 
 function timebox<T, F>(p: Promise<T>, fallback: F): Promise<T | F> {
