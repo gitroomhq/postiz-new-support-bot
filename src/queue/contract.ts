@@ -9,6 +9,7 @@ import type {
   NoticeBlock,
   ObjectRef,
   StatsBlock,
+  TableColumn,
   TabsBlock,
 } from "../dashboard/renderer/contract";
 
@@ -43,7 +44,7 @@ export interface QueueTableBlock {
   type: "table";
   key: string;
   title?: string;
-  columns: Array<{ key: string; label: string; align?: "left" | "right" }>;
+  columns: TableColumn[];
   rows: Array<{ id: string; cells: QueueCell[]; ref?: ObjectRef; actions?: QueueAction[] }>;
   counts?: { key: string; items: Array<{ value: string; label: string; count: number | string }> };
   filters?: FilterDef[];

@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { QueuePanel, viewRequest } from "../QueuePanel";
 import { renderQueueShell } from "../html/queueShell";
+import { queueClient } from "../html/queueClient";
 import { renderQueueNavigation } from "../html/queueNavigation";
 import { queueReadiness } from "../queueConfig";
 import { makeQueueHub } from "../../adminpanel/sections/queueHub";
@@ -118,6 +119,49 @@ test("the shell parses, carries the nonce on both tags and has no leftover templ
     assert.match(html, new RegExp(`id="${id}"`), id);
   }
   assert.match(html, /href="\/queue\/oauth\/start"/);
+});
+
+test("the ticket lists' order: a flip is remembered in the browser and written into the link of a list opened without one", () => {
+  // The real client code: the router plus the order helpers.
+  const router = queueClient.slice(queueClient.indexOf("D.BASE"), queueClient.indexOf("D.go ="));
+  const order = queueClient.slice(queueClient.indexOf("D.ORDER_KEY"), queueClient.indexOf("D.onRouteChange ="));
+  assert.ok(router && order);
+  type Route = { page: string; params: Record<string, string>; filters: Record<string, string> };
+  const make = (href: string, stored: Map<string, string>) => {
+    const qi = href.indexOf("?");
+    const location = { pathname: qi < 0 ? href : href.slice(0, qi), search: qi < 0 ? "" : href.slice(qi) };
+    const replaced: string[] = [];
+    const applied: Array<[string, string]> = [];
+    const localStorage = { getItem: (k: string) => stored.get(k) ?? null, setItem: (k: string, v: string) => void stored.set(k, v), removeItem: (k: string) => void stored.delete(k) };
+    const history = { replaceState: (_s: unknown, _t: string, url: string) => void replaced.push(url) };
+    const D = new Function("location", "localStorage", "history", "applied", `var D = {}; D.applyFilter = function (k, v) { applied.push([k, v]); };\n${router}\n${order}\nreturn D;`)(
+      location,
+      localStorage,
+      history,
+      applied
+    ) as { parseRoute(): Route; withStoredOrder(r: Route): Route; applySort(s: { key: string; flip: string }): void };
+    return { D, open: () => D.withStoredOrder(D.parseRoute()), replaced, applied };
+  };
+
+  const stored = new Map<string, string>();
+  const fresh = make("/queue/global", stored);
+  assert.deepEqual(fresh.open().filters, {}, "nothing picked yet: longest waiting first");
+  fresh.D.applySort({ key: "order", flip: "newest" });
+  assert.equal(stored.get("queue-order"), "newest");
+  assert.deepEqual(fresh.applied, [["order", "newest"]]);
+
+  const next = make("/queue/inbox/23?f_kind=first", stored);
+  assert.deepEqual(next.open(), { page: "inbox.detail", params: { id: "23" }, filters: { kind: "first", order: "newest" } });
+  assert.deepEqual(next.replaced, ["/queue/inbox/23?f_kind=first&f_order=newest"]);
+  for (const href of ["/queue/global?f_order=oldest", "/queue/global?f_view=longest", "/queue/resolved", "/queue/people"]) {
+    const other = make(href, stored);
+    assert.equal(other.open().filters.order, href.includes("f_order=oldest") ? "oldest" : undefined, href);
+    assert.deepEqual(other.replaced, [], href);
+  }
+
+  make("/queue", stored).D.applySort({ key: "order", flip: "oldest" });
+  assert.equal(stored.has("queue-order"), false, "back to longest waiting first forgets the pick");
+  assert.deepEqual(make("/queue", stored).open().filters, {});
 });
 
 test("readiness names what is missing and only offers https URLs", () => {

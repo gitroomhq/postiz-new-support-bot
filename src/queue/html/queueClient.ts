@@ -81,11 +81,36 @@ D.applyFilter = function (key, value) {
 D.clearFilters = function () {
   var f = {};
   if (D.state.filters.view) f.view = D.state.filters.view;
+  if (D.state.filters.order) f.order = D.state.filters.order;
   D.go(D.hrefFor(D.state.page, D.state.params, f));
 };
 
+// The ticket lists' order (the Waiting header): the last one picked holds in
+// this browser. A list opened without an order in its link takes it, written
+// into the link so a copied URL shows the same order.
+D.ORDER_KEY = "queue-order";
+D.ORDER_PAGES = { mine: true, global: true, "inbox.detail": true, "person.detail": true };
+D.storedOrder = function () {
+  try { return localStorage.getItem(D.ORDER_KEY) === "newest" ? "newest" : null; } catch (e) { return null; }
+};
+D.applySort = function (s) {
+  if (s.key === "order") {
+    try {
+      if (s.flip === "newest") localStorage.setItem(D.ORDER_KEY, "newest");
+      else localStorage.removeItem(D.ORDER_KEY);
+    } catch (e) {}
+  }
+  D.applyFilter(s.key, s.flip);
+};
+D.withStoredOrder = function (parsed) {
+  if (parsed.filters.order || parsed.filters.view || !D.ORDER_PAGES[parsed.page] || !D.storedOrder()) return parsed;
+  parsed.filters.order = "newest";
+  try { history.replaceState({}, "", D.hrefFor(parsed.page, parsed.params, parsed.filters)); } catch (e) {}
+  return parsed;
+};
+
 D.onRouteChange = function () {
-  var parsed = D.parseRoute();
+  var parsed = D.withStoredOrder(D.parseRoute());
   var samePage = D.state.page === parsed.page && JSON.stringify(D.state.params) === JSON.stringify(parsed.params);
   var sameFilters = JSON.stringify(D.state.filters) === JSON.stringify(parsed.filters);
   D.state.page = parsed.page;

@@ -390,7 +390,9 @@ export class QueueViews {
 
   private allTable(ctx: Ctx, base: QueueItem[], list: QueueItem[], filters: QueueFilters, req: QueueViewRequest): QueueTableBlock {
     const offset = req.cursor && OFFSET_RE.test(req.cursor) ? Math.min(Number(req.cursor), Math.max(0, list.length - 1)) : 0;
-    const page = list.slice(offset, offset + QUEUE_PAGE_SIZE);
+    // Longest waiting first, or newest first once the Waiting header flips it.
+    const newest = req.filters.order === "newest";
+    const page = (newest ? [...list].reverse() : list).slice(offset, offset + QUEUE_PAGE_SIZE);
     const first = base.filter((i) => i.kind === "first").length;
     return {
       type: "table",
@@ -401,7 +403,7 @@ export class QueueViews {
         { key: "inbox", label: "Inbox" },
         { key: "assignee", label: "Assignee" },
         { key: "state", label: "State" },
-        { key: "waiting", label: "Waiting" },
+        { key: "waiting", label: "Waiting", sort: { key: "order", dir: newest ? "asc" : "desc", flip: newest ? "oldest" : "newest" } },
         { key: "flags", label: "" },
         { key: "open", label: "" },
       ],

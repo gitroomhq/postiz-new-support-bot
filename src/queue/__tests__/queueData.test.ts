@@ -600,6 +600,33 @@ test("All paginates 25 to a page", async () => {
   assert.equal(second.nextCursor, null);
 });
 
+test("the Waiting header flips All to newest first across pages; the header and Longest waiting keep the longest wait", async () => {
+  const many = Array.from({ length: 30 }, (_, k) => rawConv(String(100 + k), { waiting_since: Math.floor(NOW / 1000) - 10_000 + k }));
+  const { v } = views(fakeSource(many));
+  const build = (filters: Record<string, string>, cursor: string | null = null) => v.build(actor, { page: "global", params: {}, filters, cursor });
+  const tableOf = (page: Awaited<ReturnType<typeof build>>) => page!.blocks.find((b) => b.type === "table") as QueueTableBlock;
+  const waiting = (t: QueueTableBlock) => t.columns.find((c) => c.key === "waiting")!;
+
+  const oldest = tableOf(await build({}));
+  assert.equal(oldest.rows[0].id, "100");
+  assert.deepEqual(waiting(oldest).sort, { key: "order", dir: "desc", flip: "newest" });
+
+  const page = await build({ order: "newest" });
+  const newest = tableOf(page);
+  assert.equal(newest.rows[0].id, "129", "newest waiting first");
+  assert.equal(newest.rows[24].id, "105");
+  assert.deepEqual(waiting(newest).sort, { key: "order", dir: "asc", flip: "oldest" });
+  const header = page!.blocks[0] as { sub?: string };
+  assert.match(header.sub ?? "", /oldest 2h 46m$/, "the header still names the longest wait");
+  const rest = tableOf(await build({ order: "newest" }, "25"));
+  assert.deepEqual(rest.rows.map((r) => r.id), ["104", "103", "102", "101", "100"]);
+
+  assert.equal(tableOf(await build({ order: "oldest" })).rows[0].id, "100", "anything else is longest waiting first");
+  const longest = (await build({ order: "newest", view: "longest" }))!.blocks.find((b) => b.type === "kv") as QueueKvBlock;
+  assert.match(longest.title ?? "", /#1 of 10/);
+  assert.equal((longest.rows[0].cell as { v: string }).v, "Subject 100");
+});
+
 test("Longest waiting shows one card with the latest customer message, stepping through the top ten", async () => {
   const src = fakeSource([rawConv("1", { waiting_since: Math.floor(NOW / 1000) - 50 }), rawConv("2", { waiting_since: Math.floor(NOW / 1000) - 500 })]);
   const { v } = views(src);
