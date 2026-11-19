@@ -222,6 +222,9 @@ export function dashboardCss(): string {
   tbody tr.clickable { cursor:pointer; }
   td .flagset { display:flex; gap:4px; flex-wrap:wrap; }
   th.aright, td.aright { text-align:right; }
+  .thsort { all:unset; display:inline-flex; align-items:center; gap:4px; cursor:pointer; color:inherit; font:inherit; }
+  .thsort:hover { color:var(--heading); }
+  .thsort:focus-visible { box-shadow:0 0 0 3px var(--ring); border-radius:4px; }
 
   /* Stripe tab row (under the H1): quiet labels, blurple underline. */
   .tabrow { display:flex; gap:22px; border-bottom:1px solid var(--border); margin:0 0 18px; }

@@ -167,11 +167,25 @@ export interface FilterDef {
   value?: string; // current value (echoed back by the client)
   placeholder?: string; // text/search only
 }
+// The column the server sorted the list by: its header shows the direction
+// and a click writes filters[key] = flip (the other direction). The server
+// does the sorting, so the order holds across pages.
+export interface ColumnSort {
+  key: string;
+  dir: "asc" | "desc"; // as the column's values read top to bottom
+  flip: string;
+}
+export interface TableColumn {
+  key: string;
+  label: string;
+  align?: "left" | "right";
+  sort?: ColumnSort;
+}
 export interface TableBlock {
   type: "table";
   key: string; // reload scope for filter/cursor changes (one table per page may paginate)
   title?: string;
-  columns: Array<{ key: string; label: string; align?: "left" | "right" }>;
+  columns: TableColumn[];
   rows: Array<{ id: string; cells: Cell[]; ref?: ObjectRef; actions?: ActionButton[] }>;
   // Stripe count-card segmented filter (the LIST-archetype status row). A card
   // click sets filters[counts.key] = value; value "" = the All card.

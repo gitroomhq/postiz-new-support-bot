@@ -479,8 +479,11 @@ D.renderTable = function (b) {
   }
   visIdx.forEach(function (i) {
     var th = document.createElement("th");
-    th.textContent = cols[i].label;
     if (cols[i].align === "right") th.className = "aright";
+    if (cols[i].sort) {
+      th.setAttribute("aria-sort", cols[i].sort.dir === "asc" ? "ascending" : "descending");
+      th.appendChild(D.sortHeader(cols[i]));
+    } else th.textContent = cols[i].label;
     htr.appendChild(th);
   });
   var hasRowActions = b.rows.some(function (r) { return r.actions && r.actions.length; });
@@ -530,6 +533,21 @@ D.renderTable = function (b) {
   if (b.notice) box.appendChild(D.el("p", "tnotice", b.notice));
   if (b.footer || b.nextCursor || D.state.stack.length > 0) box.appendChild(D.renderFootRow(b, true));
   return box;
+};
+
+// The sorted column's header: a button that flips the order (the WAI-ARIA
+// sortable table pattern: aria-sort on the th, the arrow hidden from readers).
+D.applySort = function (s) { D.applyFilter(s.key, s.flip); };
+D.sortHeader = function (col) {
+  var s = col.sort;
+  var b = D.el("button", "thsort");
+  b.type = "button";
+  b.appendChild(D.el("span", null, col.label));
+  var arrow = D.el("span", "thdir", s.dir === "asc" ? "\\u2191" : "\\u2193");
+  arrow.setAttribute("aria-hidden", "true");
+  b.appendChild(arrow);
+  b.addEventListener("click", function () { D.applySort(s); });
+  return b;
 };
 
 // "N items" footer + prev/next chevrons on one quiet row under the table.
